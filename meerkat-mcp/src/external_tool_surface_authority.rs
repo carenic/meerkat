@@ -789,8 +789,7 @@ impl ExternalToolSurfaceAuthority {
                     return Err(ExternalToolSurfaceError {
                         input_name: "ApplyBoundary".into(),
                         reason: format!(
-                            "staged lineage mismatch for surface '{surface_id}': expected {}, got {}",
-                            expected_staged_intent_sequence, staged_intent_sequence
+                            "staged lineage mismatch for surface '{surface_id}': expected {expected_staged_intent_sequence}, got {staged_intent_sequence}"
                         ),
                     });
                 }

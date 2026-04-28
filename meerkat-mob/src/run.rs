@@ -1,11 +1,12 @@
 //! Flow run data model and MobMachine-owned runtime projections.
 
+use crate::MobMachineCatalogInput;
 use crate::definition::{
     DependencyMode, FlowNodeSpec, FlowSpec, FrameSpec, LimitsSpec, SupervisorSpec, TopologySpec,
 };
 use crate::error::MobError;
 use crate::ids::{
-    AgentIdentity, BranchId, FlowId, FlowNodeId, FrameId, LoopId, LoopInstanceId, MobId,
+    AgentIdentity, BranchId, FlowId, FlowNodeId, FrameId, LoopId, LoopInstanceId, MeerkatId, MobId,
     ProfileName, RunId, StepId,
 };
 use crate::machines::mob_machine as mob_dsl;
@@ -29,17 +30,23 @@ pub struct FlowProjectionKernelAudit {
     pub canonical_owner: &'static str,
     pub role: FlowProjectionKernelRole,
     pub canonical_machine: bool,
-    pub owning_inputs: &'static [&'static str],
+    pub owning_inputs: &'static [MobMachineCatalogInput],
 }
 
-const FLOW_RUN_OWNING_INPUTS: &[&str] = &["CreateRunSeed", "AuthorizeFlowRunReducerCommand"];
-const FLOW_FRAME_OWNING_INPUTS: &[&str] = &["CreateFrameSeed", "AuthorizeFlowFrameReducerCommand"];
-const LOOP_ITERATION_OWNING_INPUTS: &[&str] = &[
-    "CreateLoopSeed",
-    "RecordLoopBodyFrameCompleted",
-    "RecordLoopUntilConditionMet",
-    "RecordLoopUntilConditionFailed",
-    "AuthorizeLoopIterationReducerCommand",
+const FLOW_RUN_OWNING_INPUTS: &[MobMachineCatalogInput] = &[
+    MobMachineCatalogInput::CreateRunSeed,
+    MobMachineCatalogInput::AuthorizeFlowRunReducerCommand,
+];
+const FLOW_FRAME_OWNING_INPUTS: &[MobMachineCatalogInput] = &[
+    MobMachineCatalogInput::CreateFrameSeed,
+    MobMachineCatalogInput::AuthorizeFlowFrameReducerCommand,
+];
+const LOOP_ITERATION_OWNING_INPUTS: &[MobMachineCatalogInput] = &[
+    MobMachineCatalogInput::CreateLoopSeed,
+    MobMachineCatalogInput::RecordLoopBodyFrameCompleted,
+    MobMachineCatalogInput::RecordLoopUntilConditionMet,
+    MobMachineCatalogInput::RecordLoopUntilConditionFailed,
+    MobMachineCatalogInput::AuthorizeLoopIterationReducerCommand,
 ];
 
 const FLOW_PROJECTION_KERNEL_AUDIT: &[FlowProjectionKernelAudit] = &[
@@ -104,7 +111,25 @@ impl MobMachineFlowAuthorityToken {
                 let source = match command {
                     mob_dsl::FlowRunReducerCommandKind::StartRun
                     | mob_dsl::FlowRunReducerCommandKind::DispatchStep
+                    | mob_dsl::FlowRunReducerCommandKind::CompleteStep
+                    | mob_dsl::FlowRunReducerCommandKind::RecordStepOutput
+                    | mob_dsl::FlowRunReducerCommandKind::ConditionPassed
+                    | mob_dsl::FlowRunReducerCommandKind::ConditionRejected
+                    | mob_dsl::FlowRunReducerCommandKind::FailStep
+                    | mob_dsl::FlowRunReducerCommandKind::SkipStep
+                    | mob_dsl::FlowRunReducerCommandKind::ProjectFrameStepStatus
                     | mob_dsl::FlowRunReducerCommandKind::CancelStep
+                    | mob_dsl::FlowRunReducerCommandKind::RegisterTargets
+                    | mob_dsl::FlowRunReducerCommandKind::RecordTargetSuccess
+                    | mob_dsl::FlowRunReducerCommandKind::RecordTargetTerminalFailure
+                    | mob_dsl::FlowRunReducerCommandKind::RecordTargetCanceled
+                    | mob_dsl::FlowRunReducerCommandKind::RecordTargetFailure
+                    | mob_dsl::FlowRunReducerCommandKind::RegisterReadyFrame
+                    | mob_dsl::FlowRunReducerCommandKind::PumpNodeScheduler
+                    | mob_dsl::FlowRunReducerCommandKind::RegisterPendingBodyFrame
+                    | mob_dsl::FlowRunReducerCommandKind::PumpFrameScheduler
+                    | mob_dsl::FlowRunReducerCommandKind::NodeExecutionReleased
+                    | mob_dsl::FlowRunReducerCommandKind::FrameTerminated
                     | mob_dsl::FlowRunReducerCommandKind::TerminalizeCompleted
                     | mob_dsl::FlowRunReducerCommandKind::TerminalizeFailed
                     | mob_dsl::FlowRunReducerCommandKind::TerminalizeCanceled => {
@@ -130,7 +155,13 @@ impl MobMachineFlowAuthorityToken {
             )),
             mob_dsl::MobMachineInput::AuthorizeFlowFrameReducerCommand { command, .. } => {
                 let source = match command {
-                    mob_dsl::FlowFrameReducerCommandKind::SealFrame => {
+                    mob_dsl::FlowFrameReducerCommandKind::AdmitNextReadyNode
+                    | mob_dsl::FlowFrameReducerCommandKind::CompleteNode
+                    | mob_dsl::FlowFrameReducerCommandKind::RecordNodeOutput
+                    | mob_dsl::FlowFrameReducerCommandKind::FailNode
+                    | mob_dsl::FlowFrameReducerCommandKind::SkipNode
+                    | mob_dsl::FlowFrameReducerCommandKind::CancelNode
+                    | mob_dsl::FlowFrameReducerCommandKind::SealFrame => {
                         MobMachineFlowAuthoritySource::MachineOwnedInput(input_name(input))
                     }
                     _ => MobMachineFlowAuthoritySource::AuthorizationOnlyInput(input_name(input)),
@@ -306,7 +337,7 @@ impl MobMachineFlowRunCommand {
                 mob_dsl::RunStepKey::from(format!("{}\u{0}{}", run_id, step_id.as_str()))
             }),
             step_status: self.step_status(),
-            target_count: self.target_count(),
+            target_count: self.target_count().map(u64::from),
             frame_id: self
                 .frame_id()
                 .map(|frame_id| mob_dsl::FrameId::from(frame_id.as_str())),
@@ -408,6 +439,7 @@ impl MobMachineFlowRunCommand {
     fn frame_id(&self) -> Option<&FrameId> {
         match self {
             Self::RegisterReadyFrame(payload) => Some(&payload.frame_id),
+            Self::PumpNodeScheduler(payload) => Some(&payload.frame_id),
             Self::NodeExecutionReleased(payload) => Some(&payload.frame_id),
             Self::FrameTerminated(payload) => Some(&payload.frame_id),
             _ => None,
@@ -417,6 +449,7 @@ impl MobMachineFlowRunCommand {
     fn loop_instance_id(&self) -> Option<&LoopInstanceId> {
         match self {
             Self::RegisterPendingBodyFrame(payload) => Some(&payload.loop_instance_id),
+            Self::PumpFrameScheduler(payload) => Some(&payload.loop_instance_id),
             _ => None,
         }
     }
@@ -450,8 +483,10 @@ impl MobMachineFlowFrameCommand {
             node_id: self
                 .node_id()
                 .map(|node_id| mob_dsl::FlowNodeId::from(node_id.as_str())),
+            frame_node_key: self.node_id().map(|node_id| {
+                mob_dsl::FrameNodeKey::from(format!("{frame_id}\u{0}{}", node_id.as_str()))
+            }),
             node_status: self.node_status(),
-            ready_queue: None,
             terminal_status: self.terminal_status(),
         }
     }
@@ -472,6 +507,7 @@ impl MobMachineFlowFrameCommand {
 
     fn node_id(&self) -> Option<&FlowNodeId> {
         match self {
+            Self::AdmitNextReadyNode(payload) => Some(&payload.node_id),
             Self::CompleteNode(payload) => Some(&payload.node_id),
             Self::RecordNodeOutput(payload) => Some(&payload.node_id),
             Self::FailNode(payload) => Some(&payload.node_id),
@@ -483,6 +519,7 @@ impl MobMachineFlowFrameCommand {
 
     fn node_status(&self) -> Option<mob_dsl::NodeRunStatus> {
         let status = match self {
+            Self::AdmitNextReadyNode(_) => flow_frame::NodeRunStatus::Running,
             Self::CompleteNode(_) => flow_frame::NodeRunStatus::Completed,
             Self::FailNode(_) => flow_frame::NodeRunStatus::Failed,
             Self::SkipNode(_) => flow_frame::NodeRunStatus::Skipped,
@@ -622,12 +659,14 @@ pub(crate) fn apply_mob_machine_flow_run_command(
             })
         }
         MobMachineFlowRunCommand::StartRun(_) => {
-            let next_state = project_flow_run_phase_from_machine(
-                state,
-                machine_state,
-                run_id,
-                flow_run::Phase::Running,
-            )?;
+            let next_state = project_flow_run_state_from_machine(machine_state, run_id)?;
+            if next_state.phase != flow_run::Phase::Running {
+                return Err(MobError::Internal(format!(
+                    "MobMachine run '{run_id}' projected phase {:?}, expected {:?}",
+                    next_state.phase,
+                    flow_run::Phase::Running
+                )));
+            }
             Ok(flow_run::Outcome {
                 transition_id: flow_run::TransitionId::StartRun,
                 next_state,
@@ -648,6 +687,66 @@ pub(crate) fn apply_mob_machine_flow_run_command(
                 flow_run::TransitionId::DispatchStep,
             )
         }
+        MobMachineFlowRunCommand::CompleteStep(payload) => {
+            project_flow_run_completed_step_from_machine(
+                state,
+                machine_state,
+                run_id,
+                &payload.step_id,
+            )
+        }
+        MobMachineFlowRunCommand::RecordStepOutput(payload) => {
+            project_flow_run_step_output_from_machine(
+                state,
+                machine_state,
+                run_id,
+                &payload.step_id,
+            )
+        }
+        MobMachineFlowRunCommand::ConditionPassed(payload) => {
+            project_flow_run_condition_from_machine(
+                state,
+                machine_state,
+                run_id,
+                &payload.step_id,
+                true,
+                flow_run::TransitionId::ConditionPassed,
+            )
+        }
+        MobMachineFlowRunCommand::ConditionRejected(payload) => {
+            project_flow_run_condition_from_machine(
+                state,
+                machine_state,
+                run_id,
+                &payload.step_id,
+                false,
+                flow_run::TransitionId::ConditionRejected,
+            )
+        }
+        MobMachineFlowRunCommand::FailStep(payload) => project_flow_run_failed_step_from_machine(
+            state,
+            machine_state,
+            run_id,
+            &payload.step_id,
+        ),
+        MobMachineFlowRunCommand::SkipStep(payload) => project_flow_run_step_status_from_machine(
+            state,
+            machine_state,
+            run_id,
+            &payload.step_id,
+            flow_run::StepRunStatus::Skipped,
+            flow_run::TransitionId::SkipStep,
+        ),
+        MobMachineFlowRunCommand::ProjectFrameStepStatus(payload) => {
+            project_flow_run_frame_step_status_from_machine(
+                state,
+                machine_state,
+                run_id,
+                &payload.step_id,
+                payload.step_status,
+                payload.append_failure_ledger,
+            )
+        }
         MobMachineFlowRunCommand::CancelStep(payload) => project_flow_run_step_status_from_machine(
             state,
             machine_state,
@@ -656,6 +755,98 @@ pub(crate) fn apply_mob_machine_flow_run_command(
             flow_run::StepRunStatus::Canceled,
             flow_run::TransitionId::CancelStep,
         ),
+        MobMachineFlowRunCommand::RegisterTargets(payload) => {
+            project_flow_run_target_count_from_machine(
+                state,
+                machine_state,
+                run_id,
+                &payload.step_id,
+                payload.target_count,
+            )
+        }
+        MobMachineFlowRunCommand::RecordTargetSuccess(payload) => {
+            project_flow_run_target_success_from_machine(
+                state,
+                machine_state,
+                run_id,
+                &payload.step_id,
+                &payload.target_id,
+            )
+        }
+        MobMachineFlowRunCommand::RecordTargetTerminalFailure(payload) => {
+            project_flow_run_target_terminal_failure_from_machine(
+                state,
+                machine_state,
+                run_id,
+                &payload.step_id,
+            )
+        }
+        MobMachineFlowRunCommand::RecordTargetCanceled(payload) => {
+            project_flow_run_target_canceled_from_machine(
+                state,
+                machine_state,
+                run_id,
+                &payload.step_id,
+                &payload.target_id,
+            )
+        }
+        MobMachineFlowRunCommand::RecordTargetFailure(payload) => {
+            project_flow_run_target_failure_from_machine(
+                state,
+                machine_state,
+                run_id,
+                &payload.step_id,
+                &payload.target_id,
+                &payload.retry_key,
+            )
+        }
+        MobMachineFlowRunCommand::RegisterReadyFrame(payload) => {
+            project_flow_run_ready_frames_from_machine(
+                state,
+                machine_state,
+                run_id,
+                flow_run::TransitionId::RegisterReadyFrame,
+                None,
+                Some(&payload.frame_id),
+            )
+        }
+        MobMachineFlowRunCommand::PumpNodeScheduler(_) => {
+            project_flow_run_node_scheduler_from_machine(state, machine_state, run_id)
+        }
+        MobMachineFlowRunCommand::RegisterPendingBodyFrame(payload) => {
+            project_flow_run_pending_body_frames_from_machine(
+                state,
+                machine_state,
+                run_id,
+                flow_run::TransitionId::RegisterPendingBodyFrame,
+                None,
+                Some(&payload.loop_instance_id),
+            )
+        }
+        MobMachineFlowRunCommand::PumpFrameScheduler(_) => {
+            project_flow_run_frame_scheduler_from_machine(state, machine_state, run_id)
+        }
+        MobMachineFlowRunCommand::NodeExecutionReleased(payload) => {
+            project_flow_run_ready_frames_from_machine(
+                state,
+                machine_state,
+                run_id,
+                flow_run::TransitionId::NodeExecutionReleased,
+                None,
+                Some(&payload.frame_id),
+            )
+        }
+        MobMachineFlowRunCommand::FrameTerminated(payload) => {
+            let _ = payload.frame_id;
+            project_flow_run_pending_body_frames_from_machine(
+                state,
+                machine_state,
+                run_id,
+                flow_run::TransitionId::FrameTerminated,
+                None,
+                None,
+            )
+        }
         MobMachineFlowRunCommand::TerminalizeCompleted(_) => {
             project_flow_run_terminal_from_machine(
                 state,
@@ -682,7 +873,6 @@ pub(crate) fn apply_mob_machine_flow_run_command(
             flow_run::FlowRunStatus::Canceled,
             flow_run::TransitionId::TerminalizeCanceled,
         ),
-        command => fail_closed_unmigrated_projection("flow_run", command.kind()),
     }
 }
 
@@ -708,10 +898,43 @@ pub(crate) fn apply_mob_machine_flow_frame_command(
                 flow_frame::TransitionId::StartBodyFrame,
             )
         }
+        MobMachineFlowFrameCommand::AdmitNextReadyNode(_) => {
+            project_flow_frame_admit_from_machine(state, machine_state)
+        }
+        MobMachineFlowFrameCommand::CompleteNode(payload) => project_flow_frame_node_from_machine(
+            state,
+            machine_state,
+            &payload.node_id,
+            flow_frame::NodeRunStatus::Completed,
+            flow_frame::TransitionId::CompleteNode,
+        ),
+        MobMachineFlowFrameCommand::RecordNodeOutput(payload) => {
+            project_flow_frame_node_output_from_machine(state, machine_state, &payload.node_id)
+        }
+        MobMachineFlowFrameCommand::FailNode(payload) => project_flow_frame_node_from_machine(
+            state,
+            machine_state,
+            &payload.node_id,
+            flow_frame::NodeRunStatus::Failed,
+            flow_frame::TransitionId::FailNode,
+        ),
+        MobMachineFlowFrameCommand::SkipNode(payload) => project_flow_frame_node_from_machine(
+            state,
+            machine_state,
+            &payload.node_id,
+            flow_frame::NodeRunStatus::Skipped,
+            flow_frame::TransitionId::SkipNode,
+        ),
+        MobMachineFlowFrameCommand::CancelNode(payload) => project_flow_frame_node_from_machine(
+            state,
+            machine_state,
+            &payload.node_id,
+            flow_frame::NodeRunStatus::Canceled,
+            flow_frame::TransitionId::CancelNode,
+        ),
         MobMachineFlowFrameCommand::SealFrame(payload) => {
             project_flow_frame_seal_from_machine(state, machine_state, payload.terminal_status)
         }
-        command => fail_closed_unmigrated_projection("flow_frame", command.kind()),
     }
 }
 
@@ -904,6 +1127,13 @@ pub(crate) fn project_flow_run_state_from_machine(
             .cloned()
             .unwrap_or_default(),
     );
+    for (key, status) in &machine_state.run_step_status_flat {
+        if let Some(step_id) = project_run_step_key_for_run(key, run_id) {
+            state
+                .step_status
+                .insert(step_id, Some(project_step_run_status(*status)));
+        }
+    }
     state.output_recorded = project_step_map(
         machine_state
             .run_output_recorded
@@ -912,6 +1142,11 @@ pub(crate) fn project_flow_run_state_from_machine(
             .unwrap_or_default(),
         |v| v,
     );
+    for (key, recorded) in &machine_state.run_output_recorded_flat {
+        if let Some(step_id) = project_run_step_key_for_run(key, run_id) {
+            state.output_recorded.insert(step_id, *recorded);
+        }
+    }
     state.step_condition_results = project_step_map(
         machine_state
             .run_step_condition_results
@@ -920,6 +1155,11 @@ pub(crate) fn project_flow_run_state_from_machine(
             .unwrap_or_default(),
         |v| v,
     );
+    for (key, result) in &machine_state.run_step_condition_results_flat {
+        if let Some(step_id) = project_run_step_key_for_run(key, run_id) {
+            state.step_condition_results.insert(step_id, *result);
+        }
+    }
     state.step_has_conditions = project_step_map(
         required_machine_value(
             &machine_state.run_step_has_conditions,
@@ -980,29 +1220,54 @@ pub(crate) fn project_flow_run_state_from_machine(
             .get(&run_key)
             .cloned()
             .unwrap_or_default(),
-        |v| v,
+        saturating_u64_to_u32,
     );
+    for (key, count) in &machine_state.run_step_target_counts_flat {
+        if let Some(step_id) = project_run_step_key_for_run(key, run_id) {
+            state
+                .step_target_counts
+                .insert(step_id, saturating_u64_to_u32(*count));
+        }
+    }
     state.step_target_success_counts = project_step_map(
         machine_state
             .run_step_target_success_counts
             .get(&run_key)
             .cloned()
             .unwrap_or_default(),
-        |v| v,
+        saturating_u64_to_u32,
     );
+    for (key, count) in &machine_state.run_step_target_success_counts_flat {
+        if let Some(step_id) = project_run_step_key_for_run(key, run_id) {
+            state
+                .step_target_success_counts
+                .insert(step_id, saturating_u64_to_u32(*count));
+        }
+    }
     state.step_target_terminal_failure_counts = project_step_map(
         machine_state
             .run_step_target_terminal_failure_counts
             .get(&run_key)
             .cloned()
             .unwrap_or_default(),
-        |v| v,
+        saturating_u64_to_u32,
     );
+    for (key, count) in &machine_state.run_step_target_terminal_failure_counts_flat {
+        if let Some(step_id) = project_run_step_key_for_run(key, run_id) {
+            state
+                .step_target_terminal_failure_counts
+                .insert(step_id, saturating_u64_to_u32(*count));
+        }
+    }
     state.target_retry_counts = machine_state
         .run_target_retry_counts
         .get(&run_key)
         .cloned()
-        .unwrap_or_default();
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(key, value)| (key, saturating_u64_to_u32(value)))
+        .collect();
+    project_flow_run_counters_from_machine(&mut state, machine_state, &run_key)?;
     state.escalation_threshold = *required_machine_value(
         &machine_state.run_escalation_threshold,
         &run_key,
@@ -1029,6 +1294,16 @@ pub(crate) fn project_flow_run_state_from_machine(
         .iter()
         .map(project_frame_id)
         .collect();
+    for frame_id in &machine_state.run_ready_frame_membership_flat {
+        if machine_state.frame_run.get(frame_id) == Some(&run_key) {
+            state
+                .ready_frame_membership
+                .insert(project_frame_id(frame_id));
+        }
+    }
+    if !state.ready_frame_membership.is_empty() {
+        state.ready_frames = state.ready_frame_membership.iter().cloned().collect();
+    }
     state.pending_body_frame_loops = machine_state
         .run_pending_body_frame_loops
         .get(&run_key)
@@ -1037,7 +1312,7 @@ pub(crate) fn project_flow_run_state_from_machine(
         .iter()
         .map(project_loop_instance_id)
         .collect();
-    state.pending_body_frame_loop_membership = machine_state
+    let mut pending_body_frame_loop_membership: BTreeSet<LoopInstanceId> = machine_state
         .run_pending_body_frame_loop_membership
         .get(&run_key)
         .cloned()
@@ -1045,21 +1320,60 @@ pub(crate) fn project_flow_run_state_from_machine(
         .iter()
         .map(project_loop_instance_id)
         .collect();
-    state.max_active_nodes = *required_machine_value(
+    for loop_instance_id in &machine_state.run_pending_body_frame_loop_membership_flat {
+        if machine_state
+            .loop_parent_frame
+            .get(loop_instance_id)
+            .and_then(|frame_id| machine_state.frame_run.get(frame_id))
+            == Some(&run_key)
+        {
+            pending_body_frame_loop_membership.insert(project_loop_instance_id(loop_instance_id));
+        }
+    }
+    state.pending_body_frame_loop_membership = pending_body_frame_loop_membership;
+    if !state.pending_body_frame_loop_membership.is_empty() {
+        state.pending_body_frame_loops = state
+            .pending_body_frame_loop_membership
+            .iter()
+            .cloned()
+            .collect();
+    }
+    state.active_node_count = required_machine_value(
+        &machine_state.run_active_node_count,
+        &run_key,
+        "run_active_node_count",
+    )
+    .map(|value| saturating_u64_to_u32(*value))?;
+    state.active_frame_count = required_machine_value(
+        &machine_state.run_active_frame_count,
+        &run_key,
+        "run_active_frame_count",
+    )
+    .map(|value| saturating_u64_to_u32(*value))?;
+    if let Some(frame_id) = machine_state.run_last_granted_frame.get(&run_key) {
+        state.last_granted_frame = project_frame_id(frame_id);
+    }
+    if let Some(loop_instance_id) = machine_state.run_last_granted_loop.get(&run_key) {
+        state.last_granted_loop = project_loop_instance_id(loop_instance_id);
+    }
+    state.max_active_nodes = required_machine_value(
         &machine_state.run_max_active_nodes,
         &run_key,
         "run_max_active_nodes",
-    )?;
-    state.max_active_frames = *required_machine_value(
+    )
+    .map(|value| saturating_u64_to_u32(*value))?;
+    state.max_active_frames = required_machine_value(
         &machine_state.run_max_active_frames,
         &run_key,
         "run_max_active_frames",
-    )?;
-    state.max_frame_depth = *required_machine_value(
+    )
+    .map(|value| saturating_u64_to_u32(*value))?;
+    state.max_frame_depth = required_machine_value(
         &machine_state.run_max_frame_depth,
         &run_key,
         "run_max_frame_depth",
-    )?;
+    )
+    .map(|value| saturating_u64_to_u32(*value))?;
 
     for step_id in state.tracked_steps.clone() {
         state.step_status.entry(step_id.clone()).or_insert(None);
@@ -1099,34 +1413,21 @@ pub(crate) fn project_flow_run_state_from_machine(
     Ok(state)
 }
 
-fn project_flow_run_phase_from_machine(
-    state: &flow_run::State,
-    machine_state: &mob_dsl::MobMachineState,
-    run_id: &RunId,
-    expected_phase: flow_run::Phase,
-) -> Result<flow_run::State, MobError> {
-    let projected = project_flow_run_state_from_machine(machine_state, run_id)?;
-    if projected.phase != expected_phase {
-        return Err(MobError::Internal(format!(
-            "MobMachine run '{run_id}' projected phase {:?}, expected {:?}",
-            projected.phase, expected_phase
-        )));
-    }
-    let mut next_state = state.clone();
-    next_state.phase = expected_phase;
-    Ok(next_state)
-}
-
 fn project_flow_run_terminal_from_machine(
-    state: &flow_run::State,
+    _state: &flow_run::State,
     machine_state: &mob_dsl::MobMachineState,
     run_id: &RunId,
     expected_phase: flow_run::Phase,
     run_status: flow_run::FlowRunStatus,
     transition_id: flow_run::TransitionId,
 ) -> Result<flow_run::Outcome, MobError> {
-    let next_state =
-        project_flow_run_phase_from_machine(state, machine_state, run_id, expected_phase)?;
+    let next_state = project_flow_run_state_from_machine(machine_state, run_id)?;
+    if next_state.phase != expected_phase {
+        return Err(MobError::Internal(format!(
+            "MobMachine run '{run_id}' projected phase {:?}, expected {:?}",
+            next_state.phase, expected_phase
+        )));
+    }
     Ok(flow_run::Outcome {
         transition_id,
         next_state,
@@ -1156,8 +1457,7 @@ fn project_flow_run_step_status_from_machine(
     let projected_status = project_step_run_status(*status);
     if projected_status != expected_status {
         return Err(MobError::Internal(format!(
-            "MobMachine run_step_status_flat projected {:?} for run '{run_id}' step '{step_id}', expected {:?}",
-            projected_status, expected_status
+            "MobMachine run_step_status_flat projected {projected_status:?} for run '{run_id}' step '{step_id}', expected {expected_status:?}"
         )));
     }
     let mut next_state = state.clone();
@@ -1167,13 +1467,622 @@ fn project_flow_run_step_status_from_machine(
     Ok(flow_run::Outcome {
         transition_id,
         next_state,
-        effects: vec![flow_run::Effect::EmitStepNotice(
-            flow_run::effects::EmitStepNotice {
+        effects: flow_run_step_status_effects(step_id, projected_status, transition_id),
+    })
+}
+
+fn flow_run_step_status_effects(
+    step_id: &StepId,
+    projected_status: flow_run::StepRunStatus,
+    transition_id: flow_run::TransitionId,
+) -> Vec<flow_run::Effect> {
+    let mut effects = vec![flow_run::Effect::EmitStepNotice(
+        flow_run::effects::EmitStepNotice {
+            step_id: step_id.clone(),
+            step_status: projected_status,
+        },
+    )];
+    if transition_id == flow_run::TransitionId::DispatchStep {
+        effects.push(flow_run::Effect::AdmitStepWork(
+            flow_run::effects::AdmitStepWork {
                 step_id: step_id.clone(),
-                step_status: projected_status,
+            },
+        ));
+    }
+    effects
+}
+
+fn project_flow_run_completed_step_from_machine(
+    state: &flow_run::State,
+    machine_state: &mob_dsl::MobMachineState,
+    run_id: &RunId,
+    step_id: &StepId,
+) -> Result<flow_run::Outcome, MobError> {
+    let mut outcome = project_flow_run_step_status_from_machine(
+        state,
+        machine_state,
+        run_id,
+        step_id,
+        flow_run::StepRunStatus::Completed,
+        flow_run::TransitionId::CompleteStep,
+    )?;
+    let run_key = mob_dsl::RunId::from(run_id.to_string());
+    project_flow_run_counters_from_machine(&mut outcome.next_state, machine_state, &run_key)?;
+    Ok(outcome)
+}
+
+fn project_flow_run_failed_step_from_machine(
+    state: &flow_run::State,
+    machine_state: &mob_dsl::MobMachineState,
+    run_id: &RunId,
+    step_id: &StepId,
+) -> Result<flow_run::Outcome, MobError> {
+    let mut outcome = project_flow_run_step_status_from_machine(
+        state,
+        machine_state,
+        run_id,
+        step_id,
+        flow_run::StepRunStatus::Failed,
+        flow_run::TransitionId::FailStep,
+    )?;
+    let run_key = mob_dsl::RunId::from(run_id.to_string());
+    project_flow_run_counters_from_machine(&mut outcome.next_state, machine_state, &run_key)?;
+    outcome.effects.push(flow_run::Effect::AppendFailureLedger(
+        flow_run::effects::AppendFailureLedger {
+            step_id: step_id.clone(),
+        },
+    ));
+    if outcome.next_state.escalation_threshold > 0
+        && outcome.next_state.consecutive_failure_count >= outcome.next_state.escalation_threshold
+    {
+        outcome.effects.push(flow_run::Effect::EscalateSupervisor(
+            flow_run::effects::EscalateSupervisor {
+                step_id: step_id.clone(),
+            },
+        ));
+    }
+    Ok(outcome)
+}
+
+fn project_flow_run_frame_step_status_from_machine(
+    state: &flow_run::State,
+    machine_state: &mob_dsl::MobMachineState,
+    run_id: &RunId,
+    step_id: &StepId,
+    expected_status: flow_run::StepRunStatus,
+    append_failure_ledger: bool,
+) -> Result<flow_run::Outcome, MobError> {
+    let mut outcome = project_flow_run_step_status_from_machine(
+        state,
+        machine_state,
+        run_id,
+        step_id,
+        expected_status,
+        flow_run::TransitionId::ProjectFrameStepStatus,
+    )?;
+    match expected_status {
+        flow_run::StepRunStatus::Failed => {
+            let run_key = mob_dsl::RunId::from(run_id.to_string());
+            project_flow_run_counters_from_machine(
+                &mut outcome.next_state,
+                machine_state,
+                &run_key,
+            )?;
+            if append_failure_ledger {
+                outcome.effects.push(flow_run::Effect::AppendFailureLedger(
+                    flow_run::effects::AppendFailureLedger {
+                        step_id: step_id.clone(),
+                    },
+                ));
+            }
+            if outcome.next_state.escalation_threshold > 0
+                && outcome.next_state.consecutive_failure_count
+                    >= outcome.next_state.escalation_threshold
+            {
+                outcome.effects.push(flow_run::Effect::EscalateSupervisor(
+                    flow_run::effects::EscalateSupervisor {
+                        step_id: step_id.clone(),
+                    },
+                ));
+            }
+        }
+        flow_run::StepRunStatus::Completed => {
+            let run_key = mob_dsl::RunId::from(run_id.to_string());
+            project_flow_run_counters_from_machine(
+                &mut outcome.next_state,
+                machine_state,
+                &run_key,
+            )?;
+        }
+        _ => {}
+    }
+    Ok(outcome)
+}
+
+fn project_flow_run_counters_from_machine(
+    state: &mut flow_run::State,
+    machine_state: &mob_dsl::MobMachineState,
+    run_key: &mob_dsl::RunId,
+) -> Result<(), MobError> {
+    state.failure_count = required_machine_value(
+        &machine_state.run_failure_count,
+        run_key,
+        "run_failure_count",
+    )
+    .map(|value| saturating_u64_to_u32(*value))?;
+    state.consecutive_failure_count = required_machine_value(
+        &machine_state.run_consecutive_failure_count,
+        run_key,
+        "run_consecutive_failure_count",
+    )
+    .map(|value| saturating_u64_to_u32(*value))?;
+    Ok(())
+}
+
+fn project_flow_run_step_output_from_machine(
+    state: &flow_run::State,
+    machine_state: &mob_dsl::MobMachineState,
+    run_id: &RunId,
+    step_id: &StepId,
+) -> Result<flow_run::Outcome, MobError> {
+    let key = mob_dsl::RunStepKey::from(format!("{run_id}\u{0}{}", step_id.as_str()));
+    let recorded = machine_state
+        .run_output_recorded_flat
+        .get(&key)
+        .copied()
+        .or_else(|| {
+            machine_state
+                .run_output_recorded
+                .get(&mob_dsl::RunId::from(run_id.to_string()))
+                .and_then(|outputs| outputs.get(&mob_dsl::StepId::from(step_id.as_str())))
+                .copied()
+        })
+        .ok_or_else(|| {
+            MobError::Internal(format!(
+                "MobMachine output projection missing accepted record for run '{run_id}' step '{step_id}'"
+            ))
+        })?;
+    if !recorded {
+        return Err(MobError::Internal(format!(
+            "MobMachine output projection for run '{run_id}' step '{step_id}' was false"
+        )));
+    }
+    let mut next_state = state.clone();
+    next_state.output_recorded.insert(step_id.clone(), true);
+    Ok(flow_run::Outcome {
+        transition_id: flow_run::TransitionId::RecordStepOutput,
+        next_state,
+        effects: vec![flow_run::Effect::PersistStepOutput(
+            flow_run::effects::PersistStepOutput {
+                step_id: step_id.clone(),
             },
         )],
     })
+}
+
+fn project_flow_run_condition_from_machine(
+    state: &flow_run::State,
+    machine_state: &mob_dsl::MobMachineState,
+    run_id: &RunId,
+    step_id: &StepId,
+    expected: bool,
+    transition_id: flow_run::TransitionId,
+) -> Result<flow_run::Outcome, MobError> {
+    let run_key = mob_dsl::RunId::from(run_id.to_string());
+    let step_key = mob_dsl::StepId::from(step_id.as_str());
+    let flat_key = mob_dsl::RunStepKey::from(format!("{run_id}\u{0}{}", step_id.as_str()));
+    let projected = machine_state
+        .run_step_condition_results_flat
+        .get(&flat_key)
+        .copied()
+        .flatten()
+        .or_else(|| {
+            machine_state
+        .run_step_condition_results
+        .get(&run_key)
+        .and_then(|conditions| conditions.get(&step_key))
+        .copied()
+        .flatten()
+        })
+        .ok_or_else(|| {
+            MobError::Internal(format!(
+                "MobMachine condition projection missing accepted result for run '{run_id}' step '{step_id}'"
+            ))
+        })?;
+    if projected != expected {
+        return Err(MobError::Internal(format!(
+            "MobMachine condition projection for run '{run_id}' step '{step_id}' was {projected}, expected {expected}"
+        )));
+    }
+    let mut next_state = state.clone();
+    next_state
+        .step_condition_results
+        .insert(step_id.clone(), Some(projected));
+    Ok(flow_run::Outcome {
+        transition_id,
+        next_state,
+        effects: Vec::new(),
+    })
+}
+
+fn project_flow_run_target_count_from_machine(
+    state: &flow_run::State,
+    machine_state: &mob_dsl::MobMachineState,
+    run_id: &RunId,
+    step_id: &StepId,
+    expected_count: u32,
+) -> Result<flow_run::Outcome, MobError> {
+    let count = projected_run_step_value(
+        Some(&machine_state.run_step_target_counts_flat),
+        &machine_state.run_step_target_counts,
+        run_id,
+        step_id,
+        "run_step_target_counts",
+    )?;
+    if count != u64::from(expected_count) {
+        return Err(MobError::Internal(format!(
+            "MobMachine target count projection for run '{run_id}' step '{step_id}' was {count}, expected {expected_count}"
+        )));
+    }
+    let mut next_state = state.clone();
+    next_state
+        .step_target_counts
+        .insert(step_id.clone(), expected_count);
+    Ok(flow_run::Outcome {
+        transition_id: flow_run::TransitionId::RegisterTargets,
+        next_state,
+        effects: Vec::new(),
+    })
+}
+
+fn project_flow_run_target_success_from_machine(
+    state: &flow_run::State,
+    machine_state: &mob_dsl::MobMachineState,
+    run_id: &RunId,
+    step_id: &StepId,
+    target_id: &MeerkatId,
+) -> Result<flow_run::Outcome, MobError> {
+    let count = projected_run_step_value(
+        Some(&machine_state.run_step_target_success_counts_flat),
+        &machine_state.run_step_target_success_counts,
+        run_id,
+        step_id,
+        "run_step_target_success_counts",
+    )?;
+    let mut next_state = state.clone();
+    next_state
+        .step_target_success_counts
+        .insert(step_id.clone(), saturating_u64_to_u32(count));
+    Ok(flow_run::Outcome {
+        transition_id: flow_run::TransitionId::RecordTargetSuccess,
+        next_state,
+        effects: vec![flow_run::Effect::ProjectTargetSuccess(
+            flow_run::effects::ProjectTargetSuccess {
+                step_id: step_id.clone(),
+                target_id: target_id.clone(),
+            },
+        )],
+    })
+}
+
+fn project_flow_run_target_terminal_failure_from_machine(
+    state: &flow_run::State,
+    machine_state: &mob_dsl::MobMachineState,
+    run_id: &RunId,
+    step_id: &StepId,
+) -> Result<flow_run::Outcome, MobError> {
+    let count = projected_run_step_value(
+        Some(&machine_state.run_step_target_terminal_failure_counts_flat),
+        &machine_state.run_step_target_terminal_failure_counts,
+        run_id,
+        step_id,
+        "run_step_target_terminal_failure_counts",
+    )?;
+    let mut next_state = state.clone();
+    next_state
+        .step_target_terminal_failure_counts
+        .insert(step_id.clone(), saturating_u64_to_u32(count));
+    Ok(flow_run::Outcome {
+        transition_id: flow_run::TransitionId::RecordTargetTerminalFailure,
+        next_state,
+        effects: Vec::new(),
+    })
+}
+
+fn project_flow_run_target_canceled_from_machine(
+    state: &flow_run::State,
+    machine_state: &mob_dsl::MobMachineState,
+    run_id: &RunId,
+    step_id: &StepId,
+    target_id: &MeerkatId,
+) -> Result<flow_run::Outcome, MobError> {
+    let run_key = mob_dsl::RunId::from(run_id.to_string());
+    required_machine_value(&machine_state.run_status, &run_key, "run_status")?;
+    let mut next_state = state.clone();
+    next_state
+        .step_status
+        .entry(step_id.clone())
+        .or_insert(None);
+    Ok(flow_run::Outcome {
+        transition_id: flow_run::TransitionId::RecordTargetCanceled,
+        next_state,
+        effects: vec![flow_run::Effect::ProjectTargetCanceled(
+            flow_run::effects::ProjectTargetCanceled {
+                step_id: step_id.clone(),
+                target_id: target_id.clone(),
+            },
+        )],
+    })
+}
+
+fn project_flow_run_target_failure_from_machine(
+    state: &flow_run::State,
+    machine_state: &mob_dsl::MobMachineState,
+    run_id: &RunId,
+    step_id: &StepId,
+    target_id: &MeerkatId,
+    retry_key: &str,
+) -> Result<flow_run::Outcome, MobError> {
+    let run_key = mob_dsl::RunId::from(run_id.to_string());
+    let flat_key = mob_dsl::RunStepKey::from(format!("{run_id}\u{0}{}", step_id.as_str()));
+    let count = machine_state
+        .run_target_retry_counts_flat
+        .get(&flat_key)
+        .copied()
+        .or_else(|| {
+            machine_state
+                .run_target_retry_counts
+                .get(&run_key)
+                .and_then(|counts| counts.get(retry_key))
+                .copied()
+        })
+        .ok_or_else(|| {
+            MobError::Internal(format!(
+                "MobMachine target retry projection missing key '{retry_key}' for run '{run_id}'"
+            ))
+        })?;
+    let mut next_state = state.clone();
+    next_state
+        .target_retry_counts
+        .insert(retry_key.to_owned(), saturating_u64_to_u32(count));
+    Ok(flow_run::Outcome {
+        transition_id: flow_run::TransitionId::RecordTargetFailure,
+        next_state,
+        effects: vec![flow_run::Effect::ProjectTargetFailure(
+            flow_run::effects::ProjectTargetFailure {
+                step_id: step_id.clone(),
+                target_id: target_id.clone(),
+            },
+        )],
+    })
+}
+
+fn project_flow_run_ready_frames_from_machine(
+    state: &flow_run::State,
+    machine_state: &mob_dsl::MobMachineState,
+    run_id: &RunId,
+    transition_id: flow_run::TransitionId,
+    last_granted_frame: Option<FrameId>,
+    expected_frame: Option<&FrameId>,
+) -> Result<flow_run::Outcome, MobError> {
+    let run_key = mob_dsl::RunId::from(run_id.to_string());
+    let ready_frames = machine_state
+        .run_ready_frames
+        .get(&run_key)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(project_frame_id)
+        .collect::<Vec<_>>();
+    let mut ready_frame_membership = machine_state
+        .run_ready_frame_membership
+        .get(&run_key)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(project_frame_id)
+        .collect::<BTreeSet<_>>();
+    for frame_id in &machine_state.run_ready_frame_membership_flat {
+        if machine_state.frame_run.get(frame_id) == Some(&run_key) {
+            ready_frame_membership.insert(project_frame_id(frame_id));
+        }
+    }
+    let ready_frames = if ready_frame_membership.is_empty() {
+        ready_frames
+    } else {
+        ready_frame_membership.iter().cloned().collect()
+    };
+    if let Some(expected_frame) = expected_frame {
+        required_machine_value(&machine_state.run_status, &run_key, "run_status")?;
+        if transition_id == flow_run::TransitionId::RegisterReadyFrame
+            && !ready_frame_membership.contains(expected_frame)
+        {
+            return Err(MobError::Internal(format!(
+                "MobMachine ready-frame projection did not contain frame '{expected_frame}' for run '{run_id}'"
+            )));
+        }
+    }
+    let mut next_state = state.clone();
+    next_state.ready_frames = ready_frames;
+    next_state.ready_frame_membership = ready_frame_membership;
+    next_state.active_node_count = required_machine_value(
+        &machine_state.run_active_node_count,
+        &run_key,
+        "run_active_node_count",
+    )
+    .map(|value| saturating_u64_to_u32(*value))?;
+    if let Some(last_granted_frame) = last_granted_frame.or_else(|| {
+        machine_state
+            .run_last_granted_frame
+            .get(&run_key)
+            .map(project_frame_id)
+    }) {
+        next_state.last_granted_frame = last_granted_frame;
+    }
+    Ok(flow_run::Outcome {
+        transition_id,
+        next_state,
+        effects: Vec::new(),
+    })
+}
+
+fn project_flow_run_pending_body_frames_from_machine(
+    state: &flow_run::State,
+    machine_state: &mob_dsl::MobMachineState,
+    run_id: &RunId,
+    transition_id: flow_run::TransitionId,
+    last_granted_loop: Option<LoopInstanceId>,
+    expected_loop: Option<&LoopInstanceId>,
+) -> Result<flow_run::Outcome, MobError> {
+    let run_key = mob_dsl::RunId::from(run_id.to_string());
+    let pending_body_frame_loops = machine_state
+        .run_pending_body_frame_loops
+        .get(&run_key)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(project_loop_instance_id)
+        .collect::<Vec<_>>();
+    let mut pending_body_frame_loop_membership = machine_state
+        .run_pending_body_frame_loop_membership
+        .get(&run_key)
+        .cloned()
+        .unwrap_or_default()
+        .iter()
+        .map(project_loop_instance_id)
+        .collect::<BTreeSet<_>>();
+    for loop_instance_id in &machine_state.run_pending_body_frame_loop_membership_flat {
+        if machine_state
+            .loop_parent_frame
+            .get(loop_instance_id)
+            .and_then(|frame_id| machine_state.frame_run.get(frame_id))
+            == Some(&run_key)
+        {
+            pending_body_frame_loop_membership.insert(project_loop_instance_id(loop_instance_id));
+        }
+    }
+    let pending_body_frame_loops = if pending_body_frame_loop_membership.is_empty() {
+        pending_body_frame_loops
+    } else {
+        pending_body_frame_loop_membership.iter().cloned().collect()
+    };
+    if let Some(expected_loop) = expected_loop
+        && transition_id == flow_run::TransitionId::RegisterPendingBodyFrame
+        && !pending_body_frame_loop_membership.contains(expected_loop)
+    {
+        return Err(MobError::Internal(format!(
+            "MobMachine pending-body-frame projection did not contain loop '{expected_loop}' for run '{run_id}'"
+        )));
+    }
+    let mut next_state = state.clone();
+    next_state.pending_body_frame_loops = pending_body_frame_loops;
+    next_state.pending_body_frame_loop_membership = pending_body_frame_loop_membership;
+    next_state.active_frame_count = required_machine_value(
+        &machine_state.run_active_frame_count,
+        &run_key,
+        "run_active_frame_count",
+    )
+    .map(|value| saturating_u64_to_u32(*value))?;
+    if let Some(last_granted_loop) = last_granted_loop.or_else(|| {
+        machine_state
+            .run_last_granted_loop
+            .get(&run_key)
+            .map(project_loop_instance_id)
+    }) {
+        next_state.last_granted_loop = last_granted_loop;
+    }
+    Ok(flow_run::Outcome {
+        transition_id,
+        next_state,
+        effects: Vec::new(),
+    })
+}
+
+fn project_flow_run_node_scheduler_from_machine(
+    state: &flow_run::State,
+    machine_state: &mob_dsl::MobMachineState,
+    run_id: &RunId,
+) -> Result<flow_run::Outcome, MobError> {
+    let run_key = mob_dsl::RunId::from(run_id.to_string());
+    required_machine_value(&machine_state.run_status, &run_key, "run_status")?;
+    let granted = machine_state
+        .run_last_granted_frame
+        .get(&run_key)
+        .map(project_frame_id)
+        .ok_or_else(|| {
+            MobError::Internal(format!(
+                "MobMachine node scheduler projection did not grant a frame for run '{run_id}'"
+            ))
+        })?;
+    let mut outcome = project_flow_run_ready_frames_from_machine(
+        state,
+        machine_state,
+        run_id,
+        flow_run::TransitionId::PumpNodeScheduler,
+        Some(granted.clone()),
+        None,
+    )?;
+    outcome.effects.push(flow_run::Effect::GrantNodeSlot(
+        flow_run::effects::GrantNodeSlot { frame_id: granted },
+    ));
+    Ok(outcome)
+}
+
+fn project_flow_run_frame_scheduler_from_machine(
+    state: &flow_run::State,
+    machine_state: &mob_dsl::MobMachineState,
+    run_id: &RunId,
+) -> Result<flow_run::Outcome, MobError> {
+    let run_key = mob_dsl::RunId::from(run_id.to_string());
+    required_machine_value(&machine_state.run_status, &run_key, "run_status")?;
+    let granted = machine_state
+        .run_last_granted_loop
+        .get(&run_key)
+        .map(project_loop_instance_id)
+        .ok_or_else(|| {
+            MobError::Internal(format!(
+                "MobMachine frame scheduler projection did not grant a loop for run '{run_id}'"
+            ))
+        })?;
+    let mut outcome = project_flow_run_pending_body_frames_from_machine(
+        state,
+        machine_state,
+        run_id,
+        flow_run::TransitionId::PumpFrameScheduler,
+        Some(granted.clone()),
+        None,
+    )?;
+    outcome.effects.push(flow_run::Effect::GrantBodyFrameStart(
+        flow_run::effects::GrantBodyFrameStart {
+            loop_instance_id: granted,
+        },
+    ));
+    Ok(outcome)
+}
+
+fn projected_run_step_value<V: Copy>(
+    flat_map: Option<&BTreeMap<mob_dsl::RunStepKey, V>>,
+    map: &BTreeMap<mob_dsl::RunId, BTreeMap<mob_dsl::StepId, V>>,
+    run_id: &RunId,
+    step_id: &StepId,
+    field: &'static str,
+) -> Result<V, MobError> {
+    let run_key = mob_dsl::RunId::from(run_id.to_string());
+    let step_key = mob_dsl::StepId::from(step_id.as_str());
+    let flat_key = mob_dsl::RunStepKey::from(format!("{run_id}\u{0}{}", step_id.as_str()));
+    flat_map
+        .and_then(|values| values.get(&flat_key))
+        .copied()
+        .or_else(|| {
+            map.get(&run_key)
+                .and_then(|values| values.get(&step_key))
+                .copied()
+        })
+        .ok_or_else(|| {
+            MobError::Internal(format!(
+                "MobMachine projection field {field} missing run '{run_id}' step '{step_id}'"
+            ))
+        })
 }
 
 fn project_flow_frame_seed_from_machine(
@@ -1181,6 +2090,19 @@ fn project_flow_frame_seed_from_machine(
     frame_id: &FrameId,
     transition_id: flow_frame::TransitionId,
 ) -> Result<flow_frame::Outcome, MobError> {
+    let state = project_flow_frame_state_from_machine(machine_state, frame_id, BTreeSet::new())?;
+    Ok(flow_frame::Outcome {
+        transition_id,
+        next_state: state,
+        effects: Vec::new(),
+    })
+}
+
+pub(crate) fn project_flow_frame_state_from_machine(
+    machine_state: &mob_dsl::MobMachineState,
+    frame_id: &FrameId,
+    branch_winners: BTreeSet<BranchId>,
+) -> Result<flow_frame::State, MobError> {
     let frame_key = mob_dsl::FrameId::from(frame_id.as_str());
     let phase = match required_machine_value(&machine_state.frame_phase, &frame_key, "frame_phase")?
     {
@@ -1227,7 +2149,11 @@ fn project_flow_frame_seed_from_machine(
         frame_scope,
         loop_instance_id,
         iteration,
-        last_admitted_node: FlowNodeId::from(String::new()),
+        last_admitted_node: machine_state
+            .frame_last_admitted_node
+            .get(&frame_key)
+            .map(project_flow_node_id)
+            .unwrap_or_else(|| FlowNodeId::from(String::new())),
         tracked_nodes,
         ordered_nodes,
         node_kind: project_node_map(
@@ -1266,7 +2192,7 @@ fn project_flow_frame_seed_from_machine(
             .clone(),
             |branch| branch.as_ref().map(project_branch_id),
         ),
-        branch_winners: BTreeSet::new(),
+        branch_winners,
         node_status: project_node_map(
             machine_state
                 .frame_node_status
@@ -1300,11 +2226,179 @@ fn project_flow_frame_seed_from_machine(
             |v| v,
         ),
     };
-    initialize_frame_projection_frontier(&mut state);
+    for node_id in state.tracked_nodes.clone() {
+        let node_key = mob_dsl::FrameNodeKey::from(format!("{frame_id}\u{0}{}", node_id.as_str()));
+        if let Some(recorded) = machine_state
+            .frame_output_recorded_flat
+            .get(&node_key)
+            .copied()
+        {
+            state.output_recorded.insert(node_id, recorded);
+        }
+    }
+    for node_id in state.tracked_nodes.clone() {
+        state
+            .node_status
+            .entry(node_id.clone())
+            .or_insert(flow_frame::NodeRunStatus::Pending);
+        state
+            .output_recorded
+            .entry(node_id.clone())
+            .or_insert(false);
+        state.node_condition_results.entry(node_id).or_insert(None);
+    }
+    for node_id in state.ready_queue.clone() {
+        if state.node_status.get(&node_id) == Some(&flow_frame::NodeRunStatus::Pending) {
+            state
+                .node_status
+                .insert(node_id, flow_frame::NodeRunStatus::Ready);
+        }
+    }
+    Ok(state)
+}
+
+pub(crate) fn project_flow_frame_authority_state_from_machine(
+    machine_state: &mob_dsl::MobMachineState,
+    frame_id: &FrameId,
+) -> Result<flow_frame::State, MobError> {
+    let state = project_flow_frame_state_from_machine(machine_state, frame_id, BTreeSet::new())?;
+    let branch_winners = state
+        .node_status
+        .iter()
+        .filter(|(_, status)| **status == flow_frame::NodeRunStatus::Completed)
+        .filter_map(|(node_id, _)| state.node_branches.get(node_id).and_then(Clone::clone))
+        .collect();
+    project_flow_frame_state_from_machine(machine_state, frame_id, branch_winners)
+}
+
+fn project_flow_frame_admit_from_machine(
+    state: &flow_frame::State,
+    machine_state: &mob_dsl::MobMachineState,
+) -> Result<flow_frame::Outcome, MobError> {
+    let next_state = project_flow_frame_state_from_machine(
+        machine_state,
+        &state.frame_id,
+        state.branch_winners.clone(),
+    )?;
+    let admitted_node = if !next_state.last_admitted_node.as_str().is_empty() {
+        next_state.last_admitted_node.clone()
+    } else {
+        state
+            .node_status
+            .iter()
+            .find_map(|(node_id, previous)| {
+                let next = next_state.node_status.get(node_id)?;
+                (*previous == flow_frame::NodeRunStatus::Ready
+                    && *next == flow_frame::NodeRunStatus::Running)
+                    .then(|| node_id.clone())
+            })
+            .or_else(|| {
+                next_state.node_status.iter().find_map(|(node_id, next)| {
+                    (*next == flow_frame::NodeRunStatus::Running
+                        && state.node_status.get(node_id)
+                            != Some(&flow_frame::NodeRunStatus::Running))
+                    .then(|| node_id.clone())
+                })
+            })
+            .ok_or_else(|| {
+                MobError::Internal(format!(
+                    "MobMachine frame '{}' did not project an admitted running node",
+                    state.frame_id
+                ))
+            })?
+    };
+    let effect = match next_state.node_kind.get(&admitted_node).copied() {
+        Some(flow_frame::FlowNodeKind::Step) => {
+            flow_frame::Effect::AdmitStepWork(flow_frame::effects::AdmitStepWork {
+                frame_id: state.frame_id.clone(),
+                node_id: admitted_node,
+            })
+        }
+        Some(flow_frame::FlowNodeKind::Loop) => {
+            flow_frame::Effect::StartLoopNode(flow_frame::effects::StartLoopNode {
+                frame_id: state.frame_id.clone(),
+                node_id: admitted_node,
+            })
+        }
+        None => {
+            return Err(MobError::Internal(format!(
+                "MobMachine frame '{}' admitted unknown node '{}'",
+                state.frame_id, admitted_node
+            )));
+        }
+    };
+    Ok(flow_frame::Outcome {
+        transition_id: flow_frame::TransitionId::AdmitNextReadyNode,
+        next_state,
+        effects: vec![effect],
+    })
+}
+
+fn project_flow_frame_node_from_machine(
+    state: &flow_frame::State,
+    machine_state: &mob_dsl::MobMachineState,
+    node_id: &FlowNodeId,
+    expected_status: flow_frame::NodeRunStatus,
+    transition_id: flow_frame::TransitionId,
+) -> Result<flow_frame::Outcome, MobError> {
+    let next_state = project_flow_frame_state_from_machine(
+        machine_state,
+        &state.frame_id,
+        state.branch_winners.clone(),
+    )?;
+    let projected = next_state
+        .node_status
+        .get(node_id)
+        .copied()
+        .ok_or_else(|| {
+            MobError::Internal(format!(
+                "MobMachine frame '{}' missing node '{}' status projection",
+                state.frame_id, node_id
+            ))
+        })?;
+    if projected != expected_status {
+        return Err(MobError::Internal(format!(
+            "MobMachine frame '{}' projected node '{}' as {:?}, expected {:?}",
+            state.frame_id, node_id, projected, expected_status
+        )));
+    }
     Ok(flow_frame::Outcome {
         transition_id,
-        next_state: state,
-        effects: Vec::new(),
+        next_state,
+        effects: vec![flow_frame::Effect::NodeExecutionReleased(
+            flow_frame::effects::NodeExecutionReleased {
+                frame_id: state.frame_id.clone(),
+                node_id: node_id.clone(),
+            },
+        )],
+    })
+}
+
+fn project_flow_frame_node_output_from_machine(
+    state: &flow_frame::State,
+    machine_state: &mob_dsl::MobMachineState,
+    node_id: &FlowNodeId,
+) -> Result<flow_frame::Outcome, MobError> {
+    let next_state = project_flow_frame_state_from_machine(
+        machine_state,
+        &state.frame_id,
+        state.branch_winners.clone(),
+    )?;
+    if next_state.output_recorded.get(node_id) != Some(&true) {
+        return Err(MobError::Internal(format!(
+            "MobMachine frame '{}' did not project output recorded for node '{}'",
+            state.frame_id, node_id
+        )));
+    }
+    Ok(flow_frame::Outcome {
+        transition_id: flow_frame::TransitionId::RecordNodeOutput,
+        effects: vec![flow_frame::Effect::PersistStepOutput(
+            flow_frame::effects::PersistStepOutput {
+                frame_id: state.frame_id.clone(),
+                node_id: node_id.clone(),
+            },
+        )],
+        next_state,
     })
 }
 
@@ -1379,62 +2473,6 @@ fn project_flow_frame_seal_from_machine(
         next_state,
         effects: vec![effect],
     })
-}
-
-fn initialize_frame_projection_frontier(state: &mut flow_frame::State) {
-    for node_id in state.ordered_nodes.clone() {
-        state
-            .node_status
-            .entry(node_id.clone())
-            .or_insert(flow_frame::NodeRunStatus::Pending);
-        state
-            .output_recorded
-            .entry(node_id.clone())
-            .or_insert(false);
-        state.node_condition_results.entry(node_id).or_insert(None);
-    }
-    state.ready_queue.clear();
-    for node_id in state.ordered_nodes.clone() {
-        if state.node_status.get(&node_id) != Some(&flow_frame::NodeRunStatus::Pending) {
-            continue;
-        }
-        let deps = state
-            .node_dependencies
-            .get(&node_id)
-            .cloned()
-            .unwrap_or_default();
-        let dep_mode = state
-            .node_dependency_modes
-            .get(&node_id)
-            .copied()
-            .unwrap_or(flow_frame::DependencyMode::All);
-        let ready = if deps.is_empty() {
-            true
-        } else {
-            match dep_mode {
-                flow_frame::DependencyMode::All => deps.iter().all(|dep| {
-                    state
-                        .node_status
-                        .get(dep)
-                        .copied()
-                        .is_some_and(|status| status == flow_frame::NodeRunStatus::Completed)
-                }),
-                flow_frame::DependencyMode::Any => deps.iter().any(|dep| {
-                    state
-                        .node_status
-                        .get(dep)
-                        .copied()
-                        .is_some_and(|status| status == flow_frame::NodeRunStatus::Completed)
-                }),
-            }
-        };
-        if ready {
-            state
-                .node_status
-                .insert(node_id.clone(), flow_frame::NodeRunStatus::Ready);
-            state.ready_queue.push(node_id);
-        }
-    }
 }
 
 fn project_loop_iteration_from_machine(
@@ -1565,6 +2603,15 @@ fn project_step_id(step_id: &mob_dsl::StepId) -> StepId {
     StepId::from(step_id.as_str())
 }
 
+fn project_run_step_key_for_run(key: &mob_dsl::RunStepKey, run_id: &RunId) -> Option<StepId> {
+    let (projected_run_id, step_id) = key.0.split_once('\0')?;
+    (projected_run_id == run_id.to_string()).then(|| StepId::from(step_id))
+}
+
+fn saturating_u64_to_u32(value: u64) -> u32 {
+    u32::try_from(value).unwrap_or(u32::MAX)
+}
+
 fn project_frame_id(frame_id: &mob_dsl::FrameId) -> FrameId {
     FrameId::from(frame_id.as_str())
 }
@@ -1636,18 +2683,6 @@ fn project_node_run_status(status: mob_dsl::NodeRunStatus) -> flow_frame::NodeRu
         mob_dsl::NodeRunStatus::Skipped => flow_frame::NodeRunStatus::Skipped,
         mob_dsl::NodeRunStatus::Canceled => flow_frame::NodeRunStatus::Canceled,
     }
-}
-
-fn fail_closed_unmigrated_projection<T>(
-    projection: &'static str,
-    command: impl std::fmt::Debug,
-) -> Result<T, MobError> {
-    // Reducer transition tables are quarantined until MobMachine can hand back
-    // typed projection outcomes; authorization alone must not compute effects.
-    Err(MobError::Internal(format!(
-        "MobMachine-owned {projection} command {command:?} has no typed transition outcome; \
-         reducer-visible state changes are fail-closed"
-    )))
 }
 
 fn input_name(input: &mob_dsl::MobMachineInput) -> &'static str {
@@ -2054,23 +3089,58 @@ impl MobRun {
                 .limits
                 .as_ref()
                 .and_then(|l| l.max_active_nodes)
-                .unwrap_or(0)
-                .try_into()
-                .map_err(|_| MobError::Internal("max_active_nodes exceeds u32".to_string()))?,
+                .unwrap_or(0),
             max_active_frames: config
                 .limits
                 .as_ref()
                 .and_then(|l| l.max_active_frames)
-                .unwrap_or(0)
-                .try_into()
-                .map_err(|_| MobError::Internal("max_active_frames exceeds u32".to_string()))?,
+                .unwrap_or(0),
             max_frame_depth: config
                 .limits
                 .as_ref()
                 .and_then(|l| l.max_frame_depth)
-                .unwrap_or(0)
-                .try_into()
-                .map_err(|_| MobError::Internal("max_frame_depth exceeds u32".to_string()))?,
+                .unwrap_or(0),
+        })
+    }
+
+    pub(crate) fn run_flow_input(
+        run_id: &RunId,
+        config: &FlowRunConfig,
+    ) -> Result<mob_dsl::MobMachineInput, MobError> {
+        let mob_dsl::MobMachineInput::CreateRunSeed {
+            run_id,
+            step_ids,
+            ordered_steps,
+            step_has_conditions,
+            step_dependencies,
+            step_dependency_modes,
+            step_branches,
+            step_collection_policies,
+            step_quorum_thresholds,
+            escalation_threshold,
+            max_step_retries,
+            max_active_nodes,
+            max_active_frames,
+            max_frame_depth,
+        } = Self::create_run_seed_input(run_id, config)?
+        else {
+            unreachable!("create_run_seed_input always returns CreateRunSeed")
+        };
+        Ok(mob_dsl::MobMachineInput::RunFlow {
+            run_id,
+            step_ids,
+            ordered_steps,
+            step_has_conditions,
+            step_dependencies,
+            step_dependency_modes,
+            step_branches,
+            step_collection_policies,
+            step_quorum_thresholds,
+            escalation_threshold,
+            max_step_retries,
+            max_active_nodes,
+            max_active_frames,
+            max_frame_depth,
         })
     }
 
@@ -2137,6 +3207,7 @@ impl MobRun {
                 }
             }
         }
+        let (node_status, ready_queue) = initial_frame_node_projection(ordered, &node_dependencies);
 
         Ok(mob_dsl::MobMachineInput::CreateFrameSeed {
             run_id: mob_dsl::RunId::from(run_id.to_string()),
@@ -2150,6 +3221,8 @@ impl MobRun {
             node_dependencies,
             node_dependency_modes,
             node_branches,
+            node_status,
+            ready_queue,
         })
     }
 
@@ -2258,6 +3331,28 @@ impl MobRun {
             .map_err(|error| MobError::Internal(format!("test CreateRunSeed rejected: {error}")))?;
         Self::flow_state_for_config_with_authority(&run_id, &config, &authority.state)
     }
+}
+
+fn initial_frame_node_projection(
+    ordered: &[FlowNodeId],
+    node_dependencies: &BTreeMap<mob_dsl::FlowNodeId, Vec<mob_dsl::FlowNodeId>>,
+) -> (
+    BTreeMap<mob_dsl::FlowNodeId, mob_dsl::NodeRunStatus>,
+    Vec<mob_dsl::FlowNodeId>,
+) {
+    let mut node_status = BTreeMap::new();
+    let mut ready_queue = Vec::new();
+    for node_id in ordered {
+        let key = mob_dsl::FlowNodeId::from(node_id.as_str());
+        let status = if node_dependencies.get(&key).is_none_or(Vec::is_empty) {
+            ready_queue.push(key.clone());
+            mob_dsl::NodeRunStatus::Ready
+        } else {
+            mob_dsl::NodeRunStatus::Pending
+        };
+        node_status.insert(key, status);
+    }
+    (node_status, ready_queue)
 }
 
 fn dependency_mode_value(mode: crate::definition::DependencyMode) -> flow_run::DependencyMode {
@@ -2550,10 +3645,9 @@ mod tests {
             );
             assert!(!record.canonical_machine);
             assert!(
-                record
-                    .owning_inputs
-                    .iter()
-                    .any(|input| input.starts_with("Authorize") || input.ends_with("Seed")),
+                record.owning_inputs.iter().any(|input| {
+                    input.as_str().starts_with("Authorize") || input.as_str().ends_with("Seed")
+                }),
                 "projection {} must name the MobMachine input that authorizes it",
                 record.module
             );
@@ -2577,6 +3671,8 @@ mod tests {
             node_dependencies: Default::default(),
             node_dependency_modes: Default::default(),
             node_branches: Default::default(),
+            node_status: Default::default(),
+            ready_queue: Default::default(),
         };
         let frame_token =
             MobMachineFlowAuthorityToken::from_accepted_mob_machine_input(&frame_authority_input)
@@ -2596,7 +3692,7 @@ mod tests {
     }
 
     #[test]
-    fn flow_reducer_apply_fails_closed_with_matching_authority_until_typed_outcomes_exist() {
+    fn flow_reducer_apply_fails_closed_when_machine_projection_is_missing() {
         let run_state = flow_run::initial_state();
         let machine_state = mob_dsl::MobMachineState::default();
         let run_id = RunId::new();
@@ -2622,9 +3718,9 @@ mod tests {
             MobMachineFlowRunCommand::CompleteStep(flow_run::inputs::CompleteStep { step_id }),
             run_token,
         )
-        .expect_err("authorization-only reducer authority must still fail closed");
+        .expect_err("machine-owned reducer authority must still require accepted projection state");
         assert!(
-            err.to_string().contains("only authorized"),
+            err.to_string().contains("run_step_status_flat missing"),
             "unexpected error: {err}"
         );
     }

@@ -14,14 +14,19 @@ use meerkat_client::{
 use meerkat_core::ProviderId;
 use meerkat_core::image_generation::{
     GenerateImageExecutionPlan, GenerateImageRequest, ImageContinuityTokenSupport,
-    ImageFormatPreference, ImageGenerationIntent, ImageGenerationTargetCapabilities,
-    ImageGenerationTargetPreference, ImageOperationId, ImageQualityPreference, ImageSizePreference,
-    OpenAiImageOutputOptions, OpenAiImagesApiEndpoint, OpenAiImagesApiPlan,
-    OpenAiResponsesImagePlan, PromptSource, PromptText, ToolCallId,
+    ImageFormatPreference, ImageGenerationBackendKind, ImageGenerationIntent,
+    ImageGenerationTargetCapabilities, ImageGenerationTargetPreference, ImageOperationId,
+    ImageQualityPreference, ImageSizePreference, ProjectionSnapshotId, PromptSource, PromptText,
+    ToolCallId,
 };
 use meerkat_core::lifecycle::run_primitive::ModelId;
 use meerkat_core::{Message, StopReason, UserMessage};
+use meerkat_gemini::{GeminiImageOutputOptions, GeminiImageTurnPlan};
 use meerkat_llm_core::{ImageGenerationExecutor, ProviderImageGenerationRequest};
+use meerkat_openai::{
+    OpenAiImageOutputOptions, OpenAiImageProviderParams, OpenAiImagesApiEndpoint,
+    OpenAiImagesApiPlan, OpenAiResponsesImagePlan,
+};
 use schemars::JsonSchema;
 use serde_json::{Map, Value};
 use std::net::SocketAddr;
@@ -210,27 +215,34 @@ async fn e2e_smoke_openai_live_image_generation() -> Result<(), Box<dyn std::err
     let (provider_model, execution_plan) = if image_model == "gpt-image-2" {
         (
             "gpt-5.4".to_string(),
-            GenerateImageExecutionPlan::OpenAiHostedResponsesImageTool {
+            GenerateImageExecutionPlan {
+                provider: ProviderId::new("openai"),
+                backend: ImageGenerationBackendKind::HostedTool,
                 max_count: std::num::NonZeroU32::new(1).unwrap(),
                 capabilities: image_capabilities(),
-                plan: OpenAiResponsesImagePlan {
+                requires_scoped_override: false,
+                provider_plan: serde_json::to_value(OpenAiResponsesImagePlan {
                     tool_name: "image_generation".into(),
                     model: ModelId::new(image_model.clone()),
                     output: OpenAiImageOutputOptions::default(),
-                },
+                    provider_params: OpenAiImageProviderParams::default(),
+                })?,
             },
         )
     } else {
         (
             image_model.clone(),
-            GenerateImageExecutionPlan::OpenAiImagesApi {
-                model: ModelId::new(image_model.clone()),
+            GenerateImageExecutionPlan {
+                provider: ProviderId::new("openai"),
+                backend: ImageGenerationBackendKind::ProviderApi,
                 max_count: std::num::NonZeroU32::new(1).unwrap(),
                 capabilities: image_capabilities(),
-                plan: OpenAiImagesApiPlan {
+                requires_scoped_override: false,
+                provider_plan: serde_json::to_value(OpenAiImagesApiPlan {
                     endpoint: OpenAiImagesApiEndpoint::Generations,
                     output: OpenAiImageOutputOptions::default(),
-                },
+                    provider_params: OpenAiImageProviderParams::default(),
+                })?,
             },
         )
     };
@@ -275,16 +287,16 @@ async fn e2e_smoke_gemini_live_image_generation() -> Result<(), Box<dyn std::err
         operation_id: ImageOperationId::new(uuid::Uuid::new_v4()),
         model: model.clone(),
         generate_request: tiny_image_request("gemini", &model),
-        execution_plan: GenerateImageExecutionPlan::GeminiNativeImageModel {
-            model: ModelId::new(model),
+        execution_plan: GenerateImageExecutionPlan {
+            provider: ProviderId::new("gemini"),
+            backend: ImageGenerationBackendKind::NativeModel,
             max_count: std::num::NonZeroU32::new(1).unwrap(),
             capabilities: image_capabilities(),
-            plan: meerkat_core::image_generation::GeminiImageTurnPlan {
-                projection_snapshot_id: meerkat_core::image_generation::ProjectionSnapshotId::new(
-                    uuid::Uuid::new_v4(),
-                ),
-                output: meerkat_core::image_generation::GeminiImageOutputOptions::default(),
-            },
+            requires_scoped_override: true,
+            provider_plan: serde_json::to_value(GeminiImageTurnPlan {
+                projection_snapshot_id: ProjectionSnapshotId::new(uuid::Uuid::new_v4()),
+                output: GeminiImageOutputOptions::default(),
+            })?,
         },
         projected_messages: Vec::new(),
     };

@@ -1,5 +1,8 @@
+#![allow(clippy::expect_used)]
+
 use meerkat_machine_schema::catalog::dsl::{
-    dsl_auth_machine, dsl_meerkat_machine, dsl_mob_machine, dsl_occurrence_lifecycle_machine,
+    dsl_auth_machine_production_schema, dsl_meerkat_machine, dsl_meerkat_machine_production_schema,
+    dsl_mob_machine, dsl_mob_machine_production_schema, dsl_occurrence_lifecycle_machine,
     dsl_schedule_lifecycle_machine,
 };
 use meerkat_machine_schema::identity::{EnumVariantId, IdentityError, InputVariantId};
@@ -7,7 +10,9 @@ use meerkat_machine_schema::{
     EffectDispositionRule, FieldSchema, MachineSchema, NamedTypeBinding, TransitionSchema,
     VariantSchema, canonical_machine_schemas,
 };
+use meerkat_mob::MobMachineCatalogInput;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 fn input_alphabet(schema: &MachineSchema) -> Result<BTreeSet<InputVariantId>, IdentityError> {
     schema
@@ -41,6 +46,9 @@ fn schema_shape_mismatches_for_schemas(
     }
     if catalog.version != production.version {
         mismatches.push("version".to_owned());
+    }
+    if catalog.rust != production.rust {
+        mismatches.push("rust binding metadata".to_owned());
     }
     if catalog.state != production.state {
         mismatches.push("state".to_owned());
@@ -89,17 +97,17 @@ fn phase1_schema_parity_cases() -> [SchemaParityCase; 5] {
     [
         SchemaParityCase {
             machine: "MeerkatMachine",
-            catalog_schema: dsl_meerkat_machine,
+            catalog_schema: dsl_meerkat_machine_production_schema,
             production_schema: meerkat_runtime::machine_schema_exports::meerkat_machine_schema,
         },
         SchemaParityCase {
             machine: "AuthMachine",
-            catalog_schema: dsl_auth_machine,
+            catalog_schema: dsl_auth_machine_production_schema,
             production_schema: meerkat_runtime::machine_schema_exports::auth_machine_schema,
         },
         SchemaParityCase {
             machine: "MobMachine",
-            catalog_schema: dsl_mob_machine,
+            catalog_schema: dsl_mob_machine_production_schema,
             production_schema: meerkat_mob::machine_schema_exports::mob_machine_schema,
         },
         SchemaParityCase {
@@ -182,10 +190,10 @@ fn describe_key_diff<T: PartialEq + std::fmt::Debug>(
         }
     }
     for (name, catalog_item) in &catalog {
-        if let Some(production_item) = production.get(name) {
-            if *catalog_item != *production_item {
-                out.push(format!("{label}.changed.{name}"));
-            }
+        if let Some(production_item) = production.get(name)
+            && *catalog_item != *production_item
+        {
+            out.push(format!("{label}.changed.{name}"));
         }
     }
 }
@@ -294,62 +302,155 @@ fn phase1_schema_drift_item_counts() -> BTreeMap<String, usize> {
     counts
 }
 
-const MOB_RUNTIME_PARITY_PROBED_INPUT_VARIANTS: &[&str] = &[
-    "Spawn",
-    "SubmitWork",
-    "RunFlow",
-    "CancelFlow",
-    "Retire",
-    "Respawn",
-    "RetireAll",
-    "CancelWork",
-    "CancelAllWork",
-    "Stop",
-    "Resume",
-    "Complete",
-    "Reset",
-    "Destroy",
-    "TaskCreate",
-    "TaskUpdate",
-    "SubscribeAgentEvents",
-    "SubscribeAllAgentEvents",
-    "SubscribeMobEvents",
-    "RecordOperatorActionProvenance",
-    "SetSpawnPolicy",
-    "Shutdown",
-    "ForceCancel",
+const MOB_RUNTIME_PARITY_PROBED_INPUT_VARIANTS: &[MobMachineCatalogInput] = &[
+    MobMachineCatalogInput::Spawn,
+    MobMachineCatalogInput::SubmitWork,
+    MobMachineCatalogInput::RunFlow,
+    MobMachineCatalogInput::CancelFlow,
+    MobMachineCatalogInput::Retire,
+    MobMachineCatalogInput::Respawn,
+    MobMachineCatalogInput::RetireAll,
+    MobMachineCatalogInput::CancelWork,
+    MobMachineCatalogInput::CancelAllWork,
+    MobMachineCatalogInput::Stop,
+    MobMachineCatalogInput::Resume,
+    MobMachineCatalogInput::Complete,
+    MobMachineCatalogInput::Reset,
+    MobMachineCatalogInput::Destroy,
+    MobMachineCatalogInput::TaskCreate,
+    MobMachineCatalogInput::TaskUpdate,
+    MobMachineCatalogInput::SubscribeAgentEvents,
+    MobMachineCatalogInput::SubscribeAllAgentEvents,
+    MobMachineCatalogInput::SubscribeMobEvents,
+    MobMachineCatalogInput::RecordOperatorActionProvenance,
+    MobMachineCatalogInput::SetSpawnPolicy,
+    MobMachineCatalogInput::Shutdown,
+    MobMachineCatalogInput::ForceCancel,
 ];
 
-const MOB_RUNTIME_PARITY_CARRY_FORWARD_UNPROBED_INPUTS: &[&str] = &[
-    "CreateRunSeed",
-    "CreateFrameSeed",
-    "CreateLoopSeed",
-    "RecordLoopBodyFrameCompleted",
-    "RecordLoopUntilConditionMet",
-    "RecordLoopUntilConditionFailed",
-    "AuthorizeFlowRunReducerCommand",
-    "AuthorizeFlowFrameReducerCommand",
-    "AuthorizeLoopIterationReducerCommand",
-    "EnsureMember",
-    "Reconcile",
-    "WireMembers",
-    "UnwireMembers",
-    "WireExternalPeer",
-    "UnwireExternalPeer",
-    "BindMemberSession",
-    "RotateMemberSession",
-    "ReleaseMemberSession",
-    "SessionIngressDetachedForMobDestroy",
-    "SessionIngressDetachFailedForMobDestroy",
-    "KickoffMarkPending",
-    "KickoffMarkStarting",
-    "StartupMarkReady",
-    "KickoffResolveStarted",
-    "KickoffResolveCallbackPending",
-    "KickoffResolveFailed",
-    "KickoffResolveCancelled",
-    "KickoffCancelRequested",
-    "KickoffClear",
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MobRuntimeParityCarryForwardReason {
+    FlowProjectionKernel,
+    MemberRuntimeBinding,
+    SessionIngressDetachHandoff,
+    StartupKickoffLifecycle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MobRuntimeParityCarryForwardInput {
+    input: MobMachineCatalogInput,
+    reason: MobRuntimeParityCarryForwardReason,
+}
+
+const fn carry_forward_input(
+    input: MobMachineCatalogInput,
+    reason: MobRuntimeParityCarryForwardReason,
+) -> MobRuntimeParityCarryForwardInput {
+    MobRuntimeParityCarryForwardInput { input, reason }
+}
+
+const FLOW_PROJECTION_MECHANIC: MobRuntimeParityCarryForwardReason =
+    MobRuntimeParityCarryForwardReason::FlowProjectionKernel;
+const MEMBER_RUNTIME_BINDING_MECHANIC: MobRuntimeParityCarryForwardReason =
+    MobRuntimeParityCarryForwardReason::MemberRuntimeBinding;
+const SESSION_INGRESS_DETACH_MECHANIC: MobRuntimeParityCarryForwardReason =
+    MobRuntimeParityCarryForwardReason::SessionIngressDetachHandoff;
+const STARTUP_KICKOFF_LIFECYCLE_MECHANIC: MobRuntimeParityCarryForwardReason =
+    MobRuntimeParityCarryForwardReason::StartupKickoffLifecycle;
+
+const MOB_RUNTIME_PARITY_CARRY_FORWARD_UNPROBED_INPUTS: &[MobRuntimeParityCarryForwardInput] = &[
+    carry_forward_input(
+        MobMachineCatalogInput::CreateRunSeed,
+        FLOW_PROJECTION_MECHANIC,
+    ),
+    carry_forward_input(
+        MobMachineCatalogInput::CreateFrameSeed,
+        FLOW_PROJECTION_MECHANIC,
+    ),
+    carry_forward_input(
+        MobMachineCatalogInput::CreateLoopSeed,
+        FLOW_PROJECTION_MECHANIC,
+    ),
+    carry_forward_input(
+        MobMachineCatalogInput::RecordLoopBodyFrameCompleted,
+        FLOW_PROJECTION_MECHANIC,
+    ),
+    carry_forward_input(
+        MobMachineCatalogInput::RecordLoopUntilConditionMet,
+        FLOW_PROJECTION_MECHANIC,
+    ),
+    carry_forward_input(
+        MobMachineCatalogInput::RecordLoopUntilConditionFailed,
+        FLOW_PROJECTION_MECHANIC,
+    ),
+    carry_forward_input(
+        MobMachineCatalogInput::AuthorizeFlowRunReducerCommand,
+        FLOW_PROJECTION_MECHANIC,
+    ),
+    carry_forward_input(
+        MobMachineCatalogInput::AuthorizeFlowFrameReducerCommand,
+        FLOW_PROJECTION_MECHANIC,
+    ),
+    carry_forward_input(
+        MobMachineCatalogInput::AuthorizeLoopIterationReducerCommand,
+        FLOW_PROJECTION_MECHANIC,
+    ),
+    carry_forward_input(
+        MobMachineCatalogInput::BindMemberSession,
+        MEMBER_RUNTIME_BINDING_MECHANIC,
+    ),
+    carry_forward_input(
+        MobMachineCatalogInput::RotateMemberSession,
+        MEMBER_RUNTIME_BINDING_MECHANIC,
+    ),
+    carry_forward_input(
+        MobMachineCatalogInput::ReleaseMemberSession,
+        MEMBER_RUNTIME_BINDING_MECHANIC,
+    ),
+    carry_forward_input(
+        MobMachineCatalogInput::SessionIngressDetachedForMobDestroy,
+        SESSION_INGRESS_DETACH_MECHANIC,
+    ),
+    carry_forward_input(
+        MobMachineCatalogInput::SessionIngressDetachFailedForMobDestroy,
+        SESSION_INGRESS_DETACH_MECHANIC,
+    ),
+    carry_forward_input(
+        MobMachineCatalogInput::KickoffMarkPending,
+        STARTUP_KICKOFF_LIFECYCLE_MECHANIC,
+    ),
+    carry_forward_input(
+        MobMachineCatalogInput::KickoffMarkStarting,
+        STARTUP_KICKOFF_LIFECYCLE_MECHANIC,
+    ),
+    carry_forward_input(
+        MobMachineCatalogInput::StartupMarkReady,
+        STARTUP_KICKOFF_LIFECYCLE_MECHANIC,
+    ),
+    carry_forward_input(
+        MobMachineCatalogInput::KickoffResolveStarted,
+        STARTUP_KICKOFF_LIFECYCLE_MECHANIC,
+    ),
+    carry_forward_input(
+        MobMachineCatalogInput::KickoffResolveCallbackPending,
+        STARTUP_KICKOFF_LIFECYCLE_MECHANIC,
+    ),
+    carry_forward_input(
+        MobMachineCatalogInput::KickoffResolveFailed,
+        STARTUP_KICKOFF_LIFECYCLE_MECHANIC,
+    ),
+    carry_forward_input(
+        MobMachineCatalogInput::KickoffResolveCancelled,
+        STARTUP_KICKOFF_LIFECYCLE_MECHANIC,
+    ),
+    carry_forward_input(
+        MobMachineCatalogInput::KickoffCancelRequested,
+        STARTUP_KICKOFF_LIFECYCLE_MECHANIC,
+    ),
+    carry_forward_input(
+        MobMachineCatalogInput::KickoffClear,
+        STARTUP_KICKOFF_LIFECYCLE_MECHANIC,
+    ),
 ];
 
 fn mob_runtime_parity_probe_inventory_mismatches(schema: &MachineSchema) -> Vec<String> {
@@ -362,15 +463,23 @@ fn mob_runtime_parity_probe_inventory_mismatches(schema: &MachineSchema) -> Vec<
     let surface_only_inputs = schema
         .surface_only_inputs
         .iter()
-        .map(|name| name.as_str())
+        .map(InputVariantId::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime_internal_inputs = schema
+        .runtime_internal_inputs
+        .iter()
+        .map(InputVariantId::as_str)
         .collect::<BTreeSet<_>>();
     let probed = MOB_RUNTIME_PARITY_PROBED_INPUT_VARIANTS
         .iter()
-        .copied()
+        .map(|input| input.as_str())
+        .collect::<BTreeSet<_>>();
+    let production_runtime_path = meerkat_mob::canonical_mob_machine_command_manifest()
+        .into_iter()
         .collect::<BTreeSet<_>>();
     let carry_forward = MOB_RUNTIME_PARITY_CARRY_FORWARD_UNPROBED_INPUTS
         .iter()
-        .copied()
+        .map(|record| record.input.as_str())
         .collect::<BTreeSet<_>>();
     let mut mismatches = Vec::new();
 
@@ -379,18 +488,73 @@ fn mob_runtime_parity_probe_inventory_mismatches(schema: &MachineSchema) -> Vec<
             mismatches.push(format!("runtime_probe_only.{input}"));
         }
     }
+    for input in &production_runtime_path {
+        if !catalog_inputs.contains(input) {
+            mismatches.push(format!("production_runtime_path_only.{input}"));
+        }
+    }
     for input in &carry_forward {
         if !catalog_inputs.contains(input) {
             mismatches.push(format!("carry_forward_only.{input}"));
         }
+        if !runtime_internal_inputs.contains(input) {
+            mismatches.push(format!("carry_forward_not_runtime_internal.{input}"));
+        }
+        if production_runtime_path.contains(input) {
+            mismatches.push(format!("carry_forward_has_production_runtime_path.{input}"));
+        }
+        if probed.contains(input) {
+            mismatches.push(format!("carry_forward_has_runtime_probe.{input}"));
+        }
     }
     for input in catalog_inputs.difference(&surface_only_inputs) {
-        if !probed.contains(input) && !carry_forward.contains(input) {
+        if !probed.contains(input)
+            && !production_runtime_path.contains(input)
+            && !carry_forward.contains(input)
+        {
             mismatches.push(format!("catalog_input_unprobed.{input}"));
         }
     }
 
     mismatches
+}
+
+fn mob_runtime_parity_carry_forward_inputs_by_reason(
+    reason: MobRuntimeParityCarryForwardReason,
+) -> BTreeSet<&'static str> {
+    MOB_RUNTIME_PARITY_CARRY_FORWARD_UNPROBED_INPUTS
+        .iter()
+        .filter_map(|record| (record.reason == reason).then_some(record.input.as_str()))
+        .collect()
+}
+
+fn repo_root() -> PathBuf {
+    if let Some(root) = std::env::var_os("WORKSPACE_ROOT") {
+        return PathBuf::from(root);
+    }
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("repo root")
+        .to_path_buf()
+}
+
+fn mob_catalog_input_names(
+    inputs: impl IntoIterator<Item = MobMachineCatalogInput>,
+) -> BTreeSet<&'static str> {
+    inputs
+        .into_iter()
+        .map(MobMachineCatalogInput::as_str)
+        .collect()
+}
+
+fn critical_mob_runtime_command_inputs() -> BTreeSet<&'static str> {
+    mob_catalog_input_names([
+        MobMachineCatalogInput::RunFlow,
+        MobMachineCatalogInput::CancelFlow,
+        MobMachineCatalogInput::TaskCreate,
+        MobMachineCatalogInput::SetSpawnPolicy,
+        MobMachineCatalogInput::ForceCancel,
+    ])
 }
 
 #[test]
@@ -491,13 +655,193 @@ fn mob_flow_projection_kernels_are_audited_as_non_canonical_support() {
             entry.module
         );
         for owning_input in entry.owning_inputs {
-            let owning_input = *owning_input;
+            let owning_input = owning_input.as_str();
             assert!(
                 mob_inputs.contains(owning_input),
                 "{} owning input `{owning_input}` must exist on canonical MobMachine",
                 entry.module
             );
         }
+    }
+}
+
+#[test]
+fn mob_runtime_parity_production_command_manifest_closes_command_backed_inputs() {
+    let schema = dsl_mob_machine();
+    let catalog_inputs = schema
+        .inputs
+        .variants
+        .iter()
+        .map(|variant| variant.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let production_runtime_path = meerkat_mob::canonical_mob_machine_command_manifest()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let carry_forward = MOB_RUNTIME_PARITY_CARRY_FORWARD_UNPROBED_INPUTS
+        .iter()
+        .map(|record| record.input.as_str())
+        .collect::<BTreeSet<_>>();
+    let command_backed_runtime_inputs = mob_catalog_input_names([
+        MobMachineCatalogInput::RunFlow,
+        MobMachineCatalogInput::CancelFlow,
+        MobMachineCatalogInput::EnsureMember,
+        MobMachineCatalogInput::Reconcile,
+        MobMachineCatalogInput::WireMembers,
+        MobMachineCatalogInput::UnwireMembers,
+        MobMachineCatalogInput::WireExternalPeer,
+        MobMachineCatalogInput::UnwireExternalPeer,
+        MobMachineCatalogInput::TaskCreate,
+        MobMachineCatalogInput::SetSpawnPolicy,
+        MobMachineCatalogInput::ForceCancel,
+    ]);
+
+    assert!(
+        production_runtime_path.is_subset(&catalog_inputs),
+        "production mob command classifications must name only catalog inputs"
+    );
+    assert!(
+        command_backed_runtime_inputs.is_subset(&production_runtime_path),
+        "command-backed MobMachine inputs must be proved by the production command manifest"
+    );
+    assert!(
+        command_backed_runtime_inputs.is_disjoint(&carry_forward),
+        "command-backed MobMachine inputs must not remain in the carry-forward ledger"
+    );
+}
+
+#[test]
+fn mob_runtime_parity_critical_command_inputs_cannot_be_shell_mechanics() {
+    let production_runtime_path = meerkat_mob::canonical_mob_machine_command_manifest()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    let carry_forward = MOB_RUNTIME_PARITY_CARRY_FORWARD_UNPROBED_INPUTS
+        .iter()
+        .map(|record| record.input.as_str())
+        .collect::<BTreeSet<_>>();
+    let critical = critical_mob_runtime_command_inputs();
+
+    assert!(
+        critical.is_subset(&production_runtime_path),
+        "critical runtime commands must be catalog-command backed, not hidden behind shell-mechanic carry-forward debt"
+    );
+    assert!(
+        critical.is_disjoint(&carry_forward),
+        "critical runtime commands must never be carried forward as typed shell mechanics"
+    );
+}
+
+#[test]
+fn mob_runtime_parity_carry_forward_inputs_have_typed_shell_mechanic_reasons() {
+    let schema = dsl_mob_machine();
+    let surface_only_inputs = schema
+        .surface_only_inputs
+        .iter()
+        .map(InputVariantId::as_str)
+        .collect::<BTreeSet<_>>();
+    let runtime_internal_inputs = schema
+        .runtime_internal_inputs
+        .iter()
+        .map(InputVariantId::as_str)
+        .collect::<BTreeSet<_>>();
+    let carry_forward = MOB_RUNTIME_PARITY_CARRY_FORWARD_UNPROBED_INPUTS
+        .iter()
+        .map(|record| record.input.as_str())
+        .collect::<BTreeSet<_>>();
+    let production_runtime_path = meerkat_mob::canonical_mob_machine_command_manifest()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(
+        carry_forward.len(),
+        MOB_RUNTIME_PARITY_CARRY_FORWARD_UNPROBED_INPUTS.len(),
+        "carry-forward inputs must be unique"
+    );
+    assert!(
+        carry_forward.is_subset(&runtime_internal_inputs),
+        "carry-forward inputs must be runtime-internal shell mechanics, not public runtime paths"
+    );
+    assert!(
+        carry_forward.is_disjoint(&surface_only_inputs),
+        "surface-only inputs do not need carry-forward debt"
+    );
+    assert!(
+        carry_forward.is_disjoint(&production_runtime_path),
+        "inputs with production mob command coverage must not be carried forward"
+    );
+
+    let audited_flow_projection_inputs = meerkat_mob::run::flow_projection_kernel_audit()
+        .iter()
+        .flat_map(|entry| entry.owning_inputs.iter().copied())
+        .map(MobMachineCatalogInput::as_str)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        mob_runtime_parity_carry_forward_inputs_by_reason(
+            MobRuntimeParityCarryForwardReason::FlowProjectionKernel
+        ),
+        audited_flow_projection_inputs,
+        "flow projection carry-forward must match the production flow projection audit"
+    );
+    assert_eq!(
+        mob_runtime_parity_carry_forward_inputs_by_reason(
+            MobRuntimeParityCarryForwardReason::MemberRuntimeBinding
+        ),
+        mob_catalog_input_names([
+            MobMachineCatalogInput::BindMemberSession,
+            MobMachineCatalogInput::RotateMemberSession,
+            MobMachineCatalogInput::ReleaseMemberSession,
+        ]),
+        "member runtime-binding carry-forward must stay explicitly classified"
+    );
+    assert_eq!(
+        mob_runtime_parity_carry_forward_inputs_by_reason(
+            MobRuntimeParityCarryForwardReason::SessionIngressDetachHandoff
+        ),
+        mob_catalog_input_names([
+            MobMachineCatalogInput::SessionIngressDetachedForMobDestroy,
+            MobMachineCatalogInput::SessionIngressDetachFailedForMobDestroy,
+        ]),
+        "session ingress detach carry-forward must stay explicitly classified"
+    );
+    assert_eq!(
+        mob_runtime_parity_carry_forward_inputs_by_reason(
+            MobRuntimeParityCarryForwardReason::StartupKickoffLifecycle
+        ),
+        mob_catalog_input_names([
+            MobMachineCatalogInput::KickoffMarkPending,
+            MobMachineCatalogInput::KickoffMarkStarting,
+            MobMachineCatalogInput::StartupMarkReady,
+            MobMachineCatalogInput::KickoffResolveStarted,
+            MobMachineCatalogInput::KickoffResolveCallbackPending,
+            MobMachineCatalogInput::KickoffResolveFailed,
+            MobMachineCatalogInput::KickoffResolveCancelled,
+            MobMachineCatalogInput::KickoffCancelRequested,
+            MobMachineCatalogInput::KickoffClear,
+        ]),
+        "startup kickoff carry-forward must stay explicitly classified"
+    );
+}
+
+#[test]
+fn mob_machine_native_reducer_helpers_are_formally_defined() {
+    let model = std::fs::read_to_string(repo_root().join("specs/machines/mob_machine/model.tla"))
+        .expect("read generated MobMachine TLA");
+    for helper in [
+        "mob_machine_node_terminal",
+        "mob_machine_frame_node_status_after_admit",
+        "mob_machine_frame_ready_queue_after_admit",
+        "mob_machine_frame_node_status_after_terminal",
+        "mob_machine_frame_ready_queue_after_terminal",
+    ] {
+        assert!(
+            model.contains(&format!("{helper}(")),
+            "MobMachine TLA must call or define native helper `{helper}`"
+        );
+        assert!(
+            model
+                .lines()
+                .any(|line| line.starts_with(&format!("{helper}(")) && line.contains("==")),
+            "native helper `{helper}` must have a generated TLA operator definition"
+        );
     }
 }
 
@@ -570,6 +914,24 @@ fn schema_parity_gate_rejects_named_type_metadata_drift() {
         input_alphabet(&catalog_schema).expect("catalog alphabet"),
         input_alphabet(&production_schema).expect("production alphabet"),
         "the old input-only gate would miss named-type metadata drift"
+    );
+}
+
+#[test]
+fn schema_parity_gate_rejects_rust_binding_metadata_drift() {
+    let catalog_schema = dsl_mob_machine();
+    let mut production_schema = catalog_schema.clone();
+    production_schema.rust.module = "wrong::module".to_owned();
+
+    assert_eq!(
+        schema_shape_mismatches_for_schemas(&catalog_schema, &production_schema),
+        vec!["rust binding metadata"],
+        "full schema parity comparator must reject production rust binding drift"
+    );
+    assert_eq!(
+        input_alphabet(&catalog_schema).expect("catalog alphabet"),
+        input_alphabet(&production_schema).expect("production alphabet"),
+        "the old input-only gate would miss rust binding metadata drift"
     );
 }
 

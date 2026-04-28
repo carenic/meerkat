@@ -39,7 +39,7 @@ pub mod occurrence_lifecycle;
 pub mod schedule_lifecycle;
 
 use crate::identity::InputVariantId;
-use crate::{MachineSchema, NamedTypeBinding};
+use crate::{MachineSchema, NamedTypeBinding, RustBinding};
 
 pub struct MachineSchemaMetadata {
     pub named_types: Vec<NamedTypeBinding>,
@@ -59,6 +59,25 @@ impl MachineSchemaMetadata {
         self.ci_step_limit = Some(ci_step_limit);
         self
     }
+}
+
+pub const AUTH_MACHINE_PRODUCTION_RUST_CRATE: &str = "meerkat-runtime";
+pub const AUTH_MACHINE_PRODUCTION_RUST_MODULE: &str = "auth_machine::dsl";
+pub const MEERKAT_MACHINE_PRODUCTION_RUST_CRATE: &str = "meerkat-runtime";
+pub const MEERKAT_MACHINE_PRODUCTION_RUST_MODULE: &str = "meerkat_machine::dsl";
+pub const MOB_MACHINE_PRODUCTION_RUST_CRATE: &str = "meerkat-mob";
+pub const MOB_MACHINE_PRODUCTION_RUST_MODULE: &str = "machines::mob_machine";
+
+fn with_production_rust_binding(
+    mut schema: MachineSchema,
+    crate_name: &str,
+    module: &str,
+) -> MachineSchema {
+    schema.rust = RustBinding {
+        crate_name: crate_name.to_owned(),
+        module: module.to_owned(),
+    };
+    schema
 }
 
 trait RuntimeInternalInputVariant: Copy {
@@ -111,12 +130,28 @@ pub fn dsl_auth_machine() -> MachineSchema {
     auth_machine_schema_metadata().attach_to(auth_machine::AuthMachineState::schema())
 }
 
+pub fn dsl_auth_machine_production_schema() -> MachineSchema {
+    with_production_rust_binding(
+        dsl_auth_machine(),
+        AUTH_MACHINE_PRODUCTION_RUST_CRATE,
+        AUTH_MACHINE_PRODUCTION_RUST_MODULE,
+    )
+}
+
 pub fn auth_machine_schema_metadata() -> MachineSchemaMetadata {
     machine_schema_metadata(vec![NamedTypeBinding::string("AuthLifecyclePhase")], vec![])
 }
 
 pub fn dsl_meerkat_machine() -> MachineSchema {
     meerkat_machine_schema_metadata().attach_to(meerkat_machine::MeerkatMachineState::schema())
+}
+
+pub fn dsl_meerkat_machine_production_schema() -> MachineSchema {
+    with_production_rust_binding(
+        dsl_meerkat_machine(),
+        MEERKAT_MACHINE_PRODUCTION_RUST_CRATE,
+        MEERKAT_MACHINE_PRODUCTION_RUST_MODULE,
+    )
 }
 
 pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
@@ -376,6 +411,14 @@ pub fn dsl_mob_machine() -> MachineSchema {
     mob_machine_schema_metadata().attach_to(mob_machine::MobMachineState::schema())
 }
 
+pub fn dsl_mob_machine_production_schema() -> MachineSchema {
+    with_production_rust_binding(
+        dsl_mob_machine(),
+        MOB_MACHINE_PRODUCTION_RUST_CRATE,
+        MOB_MACHINE_PRODUCTION_RUST_MODULE,
+    )
+}
+
 pub fn mob_machine_schema_metadata() -> MachineSchemaMetadata {
     machine_schema_metadata(
         vec![
@@ -393,6 +436,7 @@ pub fn mob_machine_schema_metadata() -> MachineSchemaMetadata {
                 "crate::catalog::dsl::mob_machine::ExternalPeerEndpoint",
             ),
             NamedTypeBinding::string("FlowNodeId"),
+            NamedTypeBinding::string("FrameNodeKey"),
             NamedTypeBinding::string("FrameId"),
             NamedTypeBinding::string("KickoffPhase"),
             NamedTypeBinding::string("LoopId"),

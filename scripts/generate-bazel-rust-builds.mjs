@@ -741,6 +741,13 @@ for (const pkg of localPackages.values()) {
       if (scansWorkspaceRustSources) {
         data.push("//:workspace_rust_sources");
       }
+      if (key === "meerkat-machine-codegen" && target.name === "runtime_schema_parity") {
+        data.push("//:workspace_runfiles");
+        env.push(`        "WORKSPACE_ROOT": ".",`);
+      }
+      if (key === "xtask" && target.name === "buildbuddy_static_lanes") {
+        data.push("BUILD.bazel");
+      }
       if (needsLiveWorkspaceRunfiles || isE2eLaneHarness) {
         data.push("//:workspace_runfiles");
         env.push(`        "WORKSPACE_ROOT": ".",`);
@@ -784,11 +791,13 @@ for (const pkg of localPackages.values()) {
       const cargoManifestDir = packageRunfilesDir !== "."
         ? `./${packageRunfilesDir}`
         : packageRunfilesDir;
-      const unitDepsExpr = depsWithOptionalExternal.length
-        ? `${listExpr(depsWithOptionalExternal)} + ${externalNormalWithDev}`
+      const unitDeps = [...new Set([...depsWithOptionalExternal, ...localDeps(pkg, false, true)])].sort();
+      const unitProcDeps = [...new Set([...procMacroDeps, ...localDeps(pkg, true, true)])].sort();
+      const unitDepsExpr = unitDeps.length
+        ? `${listExpr(unitDeps)} + ${externalNormalWithDev}`
         : externalNormalWithDev;
-      const unitProcExpr = procMacroDeps.length
-        ? `${listExpr(procMacroDeps)} + ${externalProcWithDev}`
+      const unitProcExpr = unitProcDeps.length
+        ? `${listExpr(unitProcDeps)} + ${externalProcWithDev}`
         : externalProcWithDev;
       const currentPackageRunfiles = `//${relative(root, dir)}:package_runfiles`;
       const unitData = [
@@ -796,6 +805,7 @@ for (const pkg of localPackages.values()) {
         ...workspaceDataLabels(target).filter((label) => label !== currentPackageRunfiles),
       ];
       const unitEnv = [`        "RUST_MIN_STACK": "16777216",`];
+      const unitSize = key === "meerkat-mob" ? "large" : "small";
       if (key === "xtask") {
         const rustfmt = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin";
         const rustfmtLib = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustc_lib";
@@ -817,7 +827,7 @@ for (const pkg of localPackages.values()) {
         `    visibility = ["//visibility:public"],`,
         `    rustc_env = {\n        "CARGO_MANIFEST_DIR": ${q(cargoManifestDir)},\n    },`,
         `    tags = ${listExpr(["fast", "unit"])},`,
-        `    size = "small",`,
+        `    size = ${q(unitSize)},`,
         `    data = ${listExpr([...new Set(unitData)].sort())},`,
         `    env = {\n${unitEnv.join("\n")}\n    },`,
         `    proc_macro_deps = ${unitProcExpr},`,

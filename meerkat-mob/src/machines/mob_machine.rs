@@ -114,7 +114,16 @@ impl<T: Into<String>> From<T> for RunId {
 
 /// Bridging type for frame identity. Maps to `crate::ids::FrameId`.
 #[derive(
-    Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
 )]
 pub struct FrameId(pub String);
 
@@ -260,6 +269,27 @@ impl StepId {
 pub struct RunStepKey(pub String);
 
 impl<T: Into<String>> From<T> for RunStepKey {
+    fn from(s: T) -> Self {
+        Self(s.into())
+    }
+}
+
+/// Composite key for frame-scoped node state projected into MobMachine.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Default,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct FrameNodeKey(pub String);
+
+impl<T: Into<String>> From<T> for FrameNodeKey {
     fn from(s: T) -> Self {
         Self(s.into())
     }
@@ -804,6 +834,63 @@ meerkat_machine_schema::mob_catalog_machine_dsl!("meerkat-mob", "machines::mob_m
 mod tests {
     use super::*;
 
+    fn seed_run(authority: &mut MobMachineAuthority, run_id: &RunId) {
+        MobMachineMutator::apply(
+            authority,
+            MobMachineInput::CreateRunSeed {
+                run_id: run_id.clone(),
+                step_ids: Default::default(),
+                ordered_steps: Vec::new(),
+                step_has_conditions: Default::default(),
+                step_dependencies: Default::default(),
+                step_dependency_modes: Default::default(),
+                step_branches: Default::default(),
+                step_collection_policies: Default::default(),
+                step_quorum_thresholds: Default::default(),
+                escalation_threshold: 0,
+                max_step_retries: 0,
+                max_active_nodes: 0,
+                max_active_frames: 0,
+                max_frame_depth: 0,
+            },
+        )
+        .expect("CreateRunSeed should be accepted before child seed");
+    }
+
+    fn seed_root_frame(
+        authority: &mut MobMachineAuthority,
+        run_id: &RunId,
+        frame_id: &FrameId,
+        node_id: &FlowNodeId,
+    ) {
+        seed_run(authority, run_id);
+        MobMachineMutator::apply(
+            authority,
+            MobMachineInput::CreateFrameSeed {
+                run_id: run_id.clone(),
+                frame_id: frame_id.clone(),
+                frame_scope: FrameScope::Root,
+                loop_instance_id: None,
+                iteration: 0,
+                tracked_nodes: [node_id.clone()].into_iter().collect(),
+                ordered_nodes: vec![node_id.clone()],
+                node_kind: [(node_id.clone(), FlowNodeKind::Loop)]
+                    .into_iter()
+                    .collect(),
+                node_dependencies: [(node_id.clone(), Vec::new())].into_iter().collect(),
+                node_dependency_modes: [(node_id.clone(), DependencyMode::All)]
+                    .into_iter()
+                    .collect(),
+                node_branches: [(node_id.clone(), None)].into_iter().collect(),
+                node_status: [(node_id.clone(), NodeRunStatus::Ready)]
+                    .into_iter()
+                    .collect(),
+                ready_queue: vec![node_id.clone()],
+            },
+        )
+        .expect("CreateFrameSeed should be accepted before child loop seed");
+    }
+
     #[test]
     fn create_run_seed_populates_canonical_run_maps() {
         let mut authority = MobMachineAuthority::new();
@@ -864,6 +951,7 @@ mod tests {
         let run_id = RunId::from("run-1");
         let frame_id = FrameId::from("frame-root");
         let node_id = FlowNodeId::from("node-a");
+        seed_run(&mut authority, &run_id);
 
         let transition = MobMachineMutator::apply(
             &mut authority,
@@ -883,6 +971,10 @@ mod tests {
                     .into_iter()
                     .collect(),
                 node_branches: [(node_id.clone(), None)].into_iter().collect(),
+                node_status: [(node_id.clone(), NodeRunStatus::Ready)]
+                    .into_iter()
+                    .collect(),
+                ready_queue: vec![node_id.clone()],
             },
         )
         .expect("CreateFrameSeed should be accepted");
@@ -914,6 +1006,7 @@ mod tests {
         let frame_id = FrameId::from("frame-root");
         let node_id = FlowNodeId::from("loop-node");
         let loop_id = LoopId::from("repeat");
+        seed_root_frame(&mut authority, &RunId::from("run-1"), &frame_id, &node_id);
 
         let transition = MobMachineMutator::apply(
             &mut authority,
@@ -965,13 +1058,21 @@ mod tests {
     fn loop_until_feedback_is_recorded_by_mob_machine() {
         let mut authority = MobMachineAuthority::new();
         let loop_instance_id = LoopInstanceId::from("loop-1");
+        let parent_frame_id = FrameId::from("frame-root");
+        let parent_node_id = FlowNodeId::from("loop-node");
+        seed_root_frame(
+            &mut authority,
+            &RunId::from("run-1"),
+            &parent_frame_id,
+            &parent_node_id,
+        );
 
         MobMachineMutator::apply(
             &mut authority,
             MobMachineInput::CreateLoopSeed {
                 loop_instance_id: loop_instance_id.clone(),
-                parent_frame_id: FrameId::from("frame-root"),
-                parent_node_id: FlowNodeId::from("loop-node"),
+                parent_frame_id,
+                parent_node_id,
                 loop_id: LoopId::from("repeat"),
                 depth: 1,
                 max_iterations: 2,

@@ -3370,6 +3370,8 @@ async fn seed_test_body_frame_in_mob_machine(
                 node_dependencies: Default::default(),
                 node_dependency_modes: Default::default(),
                 node_branches: Default::default(),
+                node_status: Default::default(),
+                ready_queue: Vec::new(),
             },
         )
         .await
@@ -20255,8 +20257,6 @@ async fn test_resume_running_loop_node_does_not_duplicate_iteration_ledger_entry
         3,
     )
     .await;
-    seed_test_body_frame_in_mob_machine(&handle, &run_id, &body_frame_id, &loop_instance_id, 0)
-        .await;
     store
         .upsert_loop_snapshot(
             &run_id,
@@ -20284,20 +20284,64 @@ async fn test_resume_running_loop_node_does_not_duplicate_iteration_ledger_entry
         )
         .await
         .expect("seed running loop snapshot with ledger entry");
-    let root_body_frame = frame_kernel
-        .start_frame(&run_id, &body_frame_id, &body_spec)
+    handle
+        .project_machine_input(
+            MobRun::create_frame_seed_input(
+                &run_id,
+                &body_frame_id,
+                Some(&loop_instance_id),
+                0,
+                crate::machines::mob_machine::FrameScope::Body,
+                &body_spec,
+                &[FlowNodeId::from("body-step")],
+            )
+            .expect("body frame seed input"),
+        )
         .await
-        .expect("seed body frame");
-    let mut body_frame = root_body_frame.clone();
-    body_frame.kernel_state.frame_scope = crate::run::flow_frame::FrameScope::Body;
-    body_frame.kernel_state.loop_instance_id = loop_instance_id.clone();
-    body_frame.kernel_state.iteration = 0;
+        .expect("seed body frame in MobMachine");
+    let body_node_id = FlowNodeId::from("body-step");
+    let body_frame = crate::run::FrameSnapshot {
+        kernel_state: crate::run::flow_frame::State {
+            phase: crate::run::flow_frame::Phase::Running,
+            frame_id: body_frame_id.clone(),
+            frame_scope: crate::run::flow_frame::FrameScope::Body,
+            loop_instance_id: loop_instance_id.clone(),
+            iteration: 0,
+            last_admitted_node: FlowNodeId::from(String::new()),
+            tracked_nodes: [body_node_id.clone()].into_iter().collect(),
+            ordered_nodes: vec![body_node_id.clone()],
+            node_kind: [(
+                body_node_id.clone(),
+                crate::run::flow_frame::FlowNodeKind::Step,
+            )]
+            .into_iter()
+            .collect(),
+            node_dependencies: [(body_node_id.clone(), Vec::new())].into_iter().collect(),
+            node_dependency_modes: [(
+                body_node_id.clone(),
+                crate::run::flow_frame::DependencyMode::All,
+            )]
+            .into_iter()
+            .collect(),
+            node_branches: [(body_node_id.clone(), None)].into_iter().collect(),
+            branch_winners: Default::default(),
+            node_status: [(
+                body_node_id.clone(),
+                crate::run::flow_frame::NodeRunStatus::Ready,
+            )]
+            .into_iter()
+            .collect(),
+            ready_queue: vec![body_node_id.clone()],
+            output_recorded: [(body_node_id.clone(), false)].into_iter().collect(),
+            node_condition_results: [(body_node_id, None)].into_iter().collect(),
+        },
+    };
     assert!(
         store
-            .cas_frame_state(&run_id, &body_frame_id, Some(&root_body_frame), body_frame)
+            .cas_frame_state(&run_id, &body_frame_id, None, body_frame)
             .await
-            .expect("promote body frame scope"),
-        "body frame scope update should succeed"
+            .expect("seed body frame snapshot"),
+        "body frame snapshot insert should succeed"
     );
 
     let engine = FlowFrameEngine::new(
@@ -21369,6 +21413,7 @@ struct MobRuntimeParityProbeReport {
 #[derive(Debug, Serialize)]
 struct MobRuntimeParityRowReport {
     input_variant: String,
+    probe_required: bool,
     schema_classification: MobRuntimeParityClassification,
     schema_left: Vec<MobRuntimeParitySchemaTransitionSummary>,
     schema_right: Vec<MobRuntimeParitySchemaTransitionSummary>,
@@ -21383,6 +21428,7 @@ struct MobRuntimeParityPairSummary {
     aligned_rows: usize,
     mismatched_rows: usize,
     unprobed_rows: usize,
+    surface_only_unprobed_rows: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -21401,6 +21447,7 @@ struct MobRuntimeParityAuditSummary {
     aligned_rows: usize,
     mismatched_rows: usize,
     unprobed_rows: usize,
+    surface_only_unprobed_rows: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -22046,6 +22093,85 @@ fn mob_runtime_parity_field_value(
         "coordinator_bound" => snapshot
             .coordinator_bound
             .map(MobRuntimeParityExprValue::Bool),
+        "run_ready_frame_membership_flat"
+        | "run_pending_body_frame_loop_membership_flat"
+        | "member_startup_binding_requested"
+        | "member_startup_runtime_ready"
+        | "member_startup_ready"
+        | "member_kickoff_pending"
+        | "member_kickoff_starting"
+        | "member_kickoff_callback_pending"
+        | "member_kickoff_started"
+        | "member_kickoff_failed"
+        | "member_kickoff_cancelled" => Some(MobRuntimeParityExprValue::Set(BTreeSet::new())),
+        "run_status"
+        | "run_ordered_steps"
+        | "run_tracked_steps"
+        | "run_step_status"
+        | "run_step_status_flat"
+        | "run_output_recorded"
+        | "run_step_condition_results_flat"
+        | "run_step_condition_results"
+        | "run_step_has_conditions"
+        | "run_step_dependencies"
+        | "run_step_dependency_modes"
+        | "run_step_branches"
+        | "run_step_collection_policies"
+        | "run_step_quorum_thresholds"
+        | "run_step_target_counts"
+        | "run_step_target_success_counts"
+        | "run_step_target_terminal_failure_counts"
+        | "run_output_recorded_flat"
+        | "run_step_target_counts_flat"
+        | "run_step_target_success_counts_flat"
+        | "run_step_target_terminal_failure_counts_flat"
+        | "run_target_retry_counts"
+        | "run_target_retry_counts_flat"
+        | "run_failure_count"
+        | "run_consecutive_failure_count"
+        | "run_escalation_threshold"
+        | "run_max_step_retries"
+        | "run_ready_frames"
+        | "run_ready_frame_membership"
+        | "run_pending_body_frame_loops"
+        | "run_pending_body_frame_loop_membership"
+        | "run_active_node_count"
+        | "run_active_frame_count"
+        | "run_last_granted_frame"
+        | "run_last_granted_loop"
+        | "run_max_active_nodes"
+        | "run_max_active_frames"
+        | "run_max_frame_depth"
+        | "frame_scope"
+        | "frame_phase"
+        | "frame_run"
+        | "frame_parent_loop"
+        | "frame_iteration"
+        | "frame_tracked_nodes"
+        | "frame_ordered_nodes"
+        | "frame_node_kind"
+        | "frame_node_dependencies"
+        | "frame_node_dependency_modes"
+        | "frame_node_step_ids"
+        | "frame_node_loop_ids"
+        | "frame_node_status"
+        | "frame_ready_queue"
+        | "frame_output_recorded"
+        | "frame_output_recorded_flat"
+        | "frame_last_admitted_node"
+        | "frame_node_condition_results"
+        | "frame_node_branches"
+        | "loop_phase"
+        | "loop_parent_frame"
+        | "loop_parent_node"
+        | "loop_definition"
+        | "loop_depth"
+        | "loop_stage"
+        | "loop_current_iteration"
+        | "loop_last_completed_iteration"
+        | "loop_max_iterations"
+        | "loop_active_body_frame"
+        | "member_kickoff_error" => Some(MobRuntimeParityExprValue::Map(BTreeMap::new())),
         _ => None,
     }
 }
@@ -22845,6 +22971,11 @@ async fn build_mob_runtime_parity_pair_report(
     right_phase: MobRuntimeParityPhase,
 ) -> MobRuntimeParityPairReport {
     let mut rows = Vec::new();
+    let surface_only_inputs = schema
+        .surface_only_inputs
+        .iter()
+        .map(|v| v.as_str())
+        .collect::<BTreeSet<_>>();
 
     for input_variant in &schema.inputs.variants {
         println!(
@@ -22853,6 +22984,7 @@ async fn build_mob_runtime_parity_pair_report(
             right_phase.schema_name(),
             input_variant.name,
         );
+        let probe_required = !surface_only_inputs.contains(input_variant.name.as_str());
         let (mut probe, note) =
             match mob_runtime_parity_probe_for_input_variant(input_variant.name.as_str()) {
                 Some(probe_input) => {
@@ -22868,7 +23000,17 @@ async fn build_mob_runtime_parity_pair_report(
                         Err(error) => (None, Some(format!("probe setup failed: {error}"))),
                     }
                 }
-                None => (None, Some("no runtime probe implemented".to_string())),
+                None if probe_required => (
+                    None,
+                    Some(
+                        "required runtime probe missing; non-surface-only omissions fail closed"
+                            .to_string(),
+                    ),
+                ),
+                None => (
+                    None,
+                    Some("surface-only input: runtime probe not required".to_string()),
+                ),
             };
 
         let Some(schema_row) = mob_runtime_parity_schema_row_for_input(
@@ -22889,6 +23031,7 @@ async fn build_mob_runtime_parity_pair_report(
 
         rows.push(MobRuntimeParityRowReport {
             input_variant: schema_row.input_variant,
+            probe_required,
             schema_classification: schema_row.classification,
             schema_left: schema_row.left,
             schema_right: schema_row.right,
@@ -22912,7 +23055,8 @@ async fn build_mob_runtime_parity_pair_report(
                         summary.mismatched_rows += 1;
                     }
                 }
-                None => summary.unprobed_rows += 1,
+                None if row.probe_required => summary.unprobed_rows += 1,
+                None => summary.surface_only_unprobed_rows += 1,
             }
             summary
         },
@@ -22932,6 +23076,11 @@ async fn build_mob_runtime_full_pair_report(
     right_phase: MobRuntimeParityPhase,
 ) -> MobRuntimeParityPairReport {
     let mut rows = Vec::new();
+    let surface_only_inputs = schema
+        .surface_only_inputs
+        .iter()
+        .map(|v| v.as_str())
+        .collect::<BTreeSet<_>>();
 
     for input_variant in &schema.inputs.variants {
         println!(
@@ -22940,6 +23089,7 @@ async fn build_mob_runtime_full_pair_report(
             right_phase.schema_name(),
             input_variant.name,
         );
+        let probe_required = !surface_only_inputs.contains(input_variant.name.as_str());
         let (probe, note) =
             match mob_runtime_parity_probe_for_input_variant(input_variant.name.as_str()) {
                 Some(probe_input) => {
@@ -22955,7 +23105,17 @@ async fn build_mob_runtime_full_pair_report(
                         Err(error) => (None, Some(format!("probe setup failed: {error}"))),
                     }
                 }
-                None => (None, Some("no runtime probe implemented".to_string())),
+                None if probe_required => (
+                    None,
+                    Some(
+                        "required runtime probe missing; non-surface-only omissions fail closed"
+                            .to_string(),
+                    ),
+                ),
+                None => (
+                    None,
+                    Some("surface-only input: runtime probe not required".to_string()),
+                ),
             };
 
         let Some(schema_row) = mob_runtime_parity_schema_row_for_input(
@@ -22985,6 +23145,7 @@ async fn build_mob_runtime_full_pair_report(
 
         rows.push(MobRuntimeParityRowReport {
             input_variant: schema_row.input_variant,
+            probe_required,
             schema_classification: effective_schema_classification,
             schema_left: schema_row.left,
             schema_right: schema_row.right,
@@ -23008,7 +23169,8 @@ async fn build_mob_runtime_full_pair_report(
                         summary.mismatched_rows += 1;
                     }
                 }
-                None => summary.unprobed_rows += 1,
+                None if row.probe_required => summary.unprobed_rows += 1,
+                None => summary.surface_only_unprobed_rows += 1,
             }
             summary
         },
@@ -23811,12 +23973,16 @@ async fn write_mob_runtime_modeled_state_audit_report(path: PathBuf) -> MobModel
                         outcome_kind: MobModeledStateOutcomeKind::Err,
                         before: None,
                         after: None,
-                        result_summary: "no runtime probe implemented".to_string(),
+                        result_summary:
+                            "required runtime probe missing; non-surface-only omissions fail closed"
+                                .to_string(),
                     },
                     schema: MobModeledStateSchemaReport {
                         outcome_kind: MobModeledStateOutcomeKind::Err,
                         after: None,
-                        detail: "no runtime probe implemented".to_string(),
+                        detail:
+                            "required runtime probe missing; non-surface-only omissions fail closed"
+                                .to_string(),
                         result_summary: None,
                     },
                 });
@@ -23848,7 +24014,9 @@ async fn write_mob_runtime_modeled_state_audit_report(path: PathBuf) -> MobModel
         MobModeledStateAuditSummary::default(),
         |mut summary, row| {
             summary.row_count += 1;
-            if row.runtime.result_summary == "no runtime probe implemented" {
+            if row.runtime.result_summary
+                == "required runtime probe missing; non-surface-only omissions fail closed"
+            {
                 summary.unprobed_rows += 1;
             } else if row.aligned {
                 summary.aligned_rows += 1;
@@ -23871,6 +24039,12 @@ async fn write_mob_runtime_modeled_state_audit_report(path: PathBuf) -> MobModel
         serde_json::to_vec_pretty(&report).expect("serialize modeled-state audit report"),
     )
     .expect("write modeled-state audit report");
+    assert_eq!(
+        report.summary.unprobed_rows,
+        0,
+        "MobMachine modeled-state parity report has required non-surface-only inputs without probes; report written to {}",
+        path.display()
+    );
 
     report
 }
@@ -23894,6 +24068,7 @@ async fn write_mob_runtime_full_parity_audit_report(path: PathBuf) -> MobRuntime
             summary.aligned_rows += pair.summary.aligned_rows;
             summary.mismatched_rows += pair.summary.mismatched_rows;
             summary.unprobed_rows += pair.summary.unprobed_rows;
+            summary.surface_only_unprobed_rows += pair.summary.surface_only_unprobed_rows;
             summary
         },
     );
@@ -23910,6 +24085,12 @@ async fn write_mob_runtime_full_parity_audit_report(path: PathBuf) -> MobRuntime
         serde_json::to_vec_pretty(&report).expect("serialize mob runtime full parity report"),
     )
     .expect("write mob runtime full parity report");
+    assert_eq!(
+        report.summary.unprobed_rows,
+        0,
+        "MobMachine runtime parity report has required non-surface-only inputs without probes; report written to {}",
+        path.display()
+    );
 
     report
 }

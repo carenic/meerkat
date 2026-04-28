@@ -3297,6 +3297,29 @@ mod tests {
         (state, session_id)
     }
 
+    fn seed_active_external_surface(
+        handle: &dyn meerkat_core::handles::ExternalToolSurfaceHandle,
+        surface_id: &str,
+    ) {
+        handle
+            .stage_add(surface_id.to_string(), 0)
+            .expect("seed stage add");
+        let staged_sequence = handle
+            .surface_snapshot(surface_id)
+            .and_then(|snapshot| snapshot.staged_intent_sequence)
+            .expect("seed staged sequence");
+        handle
+            .apply_boundary(surface_id.to_string(), 0, staged_sequence, staged_sequence)
+            .expect("seed apply boundary");
+        let pending_sequence = handle
+            .surface_snapshot(surface_id)
+            .and_then(|snapshot| snapshot.pending_task_sequence)
+            .expect("seed pending sequence");
+        handle
+            .mark_pending_succeeded(surface_id.to_string(), pending_sequence, staged_sequence)
+            .expect("seed active surface");
+    }
+
     async fn cancelled_request_context(key: &str) -> RequestContext {
         use meerkat::surface::CancelOutcome;
         let executor = SurfaceRequestExecutor::new(Duration::from_millis(1));
@@ -4531,10 +4554,18 @@ mod tests {
     async fn test_mcp_handlers_add_remove_reload_after_adapter_registration() {
         let (state, session_id) = state_with_persisted_session().await;
         let parsed = meerkat::SessionId::parse(&session_id).expect("valid session id");
+        let bindings = state
+            .runtime_adapter
+            .prepare_bindings(parsed.clone())
+            .await
+            .expect("session runtime bindings");
+        seed_active_external_surface(bindings.external_tool_surface.as_ref(), "demo");
         state
             .upsert_mcp_adapter(
                 &parsed,
-                Arc::new(meerkat_mcp::McpRouterAdapter::new(McpRouter::new())),
+                Arc::new(meerkat_mcp::McpRouterAdapter::new(
+                    McpRouter::new_with_surface_handle(Arc::clone(&bindings.external_tool_surface)),
+                )),
             )
             .await;
 

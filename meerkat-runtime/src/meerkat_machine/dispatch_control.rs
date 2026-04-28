@@ -178,26 +178,37 @@ impl MeerkatMachine {
                 if matches!(state, RuntimeState::Destroyed | RuntimeState::Stopped) {
                     return Err(RuntimeControlPlaneError::InvalidState { state });
                 }
-                let previous_dsl_state = self
-                    .stage_session_dsl_input(
-                        &session_id,
-                        crate::meerkat_machine::dsl::MeerkatMachineInput::Retire {
-                            session_id: crate::meerkat_machine::dsl::SessionId::from_domain(
-                                &session_id,
-                            ),
-                        },
-                        "Retire",
+                let previous_dsl_state = if state == RuntimeState::Retired {
+                    // The DSL Retire transition is intentionally not
+                    // self-looping. Command-level idempotence belongs here,
+                    // after reading the DSL-authoritative phase, while the
+                    // driver still owns retire realization and reporting.
+                    None
+                } else {
+                    Some(
+                        self.stage_session_dsl_input(
+                            &session_id,
+                            crate::meerkat_machine::dsl::MeerkatMachineInput::Retire {
+                                session_id: crate::meerkat_machine::dsl::SessionId::from_domain(
+                                    &session_id,
+                                ),
+                            },
+                            "Retire",
+                        )
+                        .await
+                        .map_err(RuntimeControlPlaneError::Internal)?,
                     )
-                    .await
-                    .map_err(RuntimeControlPlaneError::Internal)?;
+                };
 
                 let mut drv = driver.lock().await;
                 let mut report = match machine_retire(&mut drv).await {
                     Ok(report) => report,
                     Err(err) => {
                         drop(drv);
-                        self.restore_session_dsl_state(&session_id, previous_dsl_state)
-                            .await;
+                        if let Some(previous_dsl_state) = previous_dsl_state {
+                            self.restore_session_dsl_state(&session_id, previous_dsl_state)
+                                .await;
+                        }
                         return Err(RuntimeControlPlaneError::Internal(err.to_string()));
                     }
                 };
@@ -446,7 +457,7 @@ impl MeerkatMachine {
             MeerkatMachineCommand::RuntimeState { runtime_id } => {
                 let session_id = Self::resolve_session_id(&runtime_id)?;
                 let state = self
-                    .existing_session_runtime_state(&session_id)
+                    .existing_session_visible_runtime_state(&session_id)
                     .await
                     .ok_or(RuntimeControlPlaneError::NotFound(runtime_id))?;
                 Ok(MeerkatMachineCommandResult::RuntimeState(state))

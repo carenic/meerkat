@@ -1,8 +1,8 @@
 //! Recovery reconciliation for FlowRun state after crash/restart.
 //!
-//! `reconcile_run_state` must be called before resuming a run to ensure the
-//! scheduler's `ready_frames` and `pending_body_frame_loops` fields are
-//! consistent with the per-frame and per-loop kernel snapshots.
+//! `reconcile_run_state` must be called before resuming a run to ensure stored
+//! scheduler projections already agree with the per-frame and per-loop kernel
+//! snapshots.
 
 use crate::ids::{FlowNodeId, FrameId, LoopInstanceId};
 use crate::run::{FrameSnapshot, LoopSnapshot, MobRun, MobRunStatus};
@@ -15,19 +15,18 @@ pub enum RestoreIncompatible {
     PreV3Schema { schema_version: u32 },
     #[error("frame invariant violated: frame {frame_id} has Ready nodes not in ready_queue")]
     FrameInvariantViolation { frame_id: FrameId },
-    #[error("stale queue entries could not be reconciled")]
-    StaleQueueState,
+    #[error("run projection mismatch: {field}")]
+    ProjectionMismatch { field: &'static str },
 }
 
-/// Reconcile run scheduler state from frame/loop snapshots.
+/// Validate run scheduler state against frame/loop snapshots.
 ///
 /// Must be called before resuming a run after a crash or restart.
 ///
-/// RMAT exception:
-/// `ready_frames`, `pending_body_frame_loops`, `active_node_count`, and
-/// `active_frame_count` are rebuildable scheduler projections, not canonical
-/// semantic truth. Recovery is therefore allowed to overwrite them directly
-/// from the authoritative frame/loop snapshots after a crash.
+/// Recovery may not rewrite machine-owned scheduler fields from projections.
+/// If the persisted projections disagree with frame/loop snapshots, the run is
+/// incompatible with machine-authority recovery and must be repaired by replaying
+/// accepted MobMachine transitions, not by seeding canonical fields here.
 ///
 /// Returns `Err(RestoreIncompatible)` if the persisted state is irrecoverable.
 pub fn reconcile_run_state(run: &mut MobRun) -> Result<(), RestoreIncompatible> {
@@ -43,18 +42,11 @@ pub fn reconcile_run_state(run: &mut MobRun) -> Result<(), RestoreIncompatible> 
         check_frame_invariant(frame_id, frame_snap)?;
     }
 
-    // 3. Reconcile ready_frames in flow_state from frame snapshots.
-    //
-    //    A frame belongs in ready_frames iff its ready_queue is non-empty.
-    //    We rebuild both ready_frames (Seq) and ready_frame_membership (Set)
-    //    from scratch to avoid partial state.
-    reconcile_ready_frames(run);
+    validate_ready_frames(run)?;
 
-    // 4. Reconcile pending_body_frame_loops in flow_state from loop snapshots.
-    reconcile_pending_body_frame_loops(run);
+    validate_pending_body_frame_loops(run)?;
 
-    // 5. Reconcile active scheduler counters from persisted frame/loop snapshots.
-    reconcile_active_counts(run);
+    validate_active_counts(run)?;
 
     Ok(())
 }
@@ -84,13 +76,7 @@ fn check_frame_invariant(
     Ok(())
 }
 
-/// Rebuild `ready_frames` and `ready_frame_membership` in `run.flow_state`
-/// from the per-frame snapshots.
-///
-/// A frame is active (belongs in ready_frames) iff:
-/// - it exists in `run.frames`, AND
-/// - its `ready_queue` is non-empty.
-fn reconcile_ready_frames(run: &mut MobRun) {
+fn validate_ready_frames(run: &MobRun) -> Result<(), RestoreIncompatible> {
     let mut active_frame_ids: Vec<FrameId> = run
         .frames
         .iter()
@@ -98,18 +84,21 @@ fn reconcile_ready_frames(run: &mut MobRun) {
         .map(|(frame_id, _)| frame_id.clone())
         .collect();
     active_frame_ids.sort();
-    run.flow_state.ready_frames = active_frame_ids.clone();
-    run.flow_state.ready_frame_membership = active_frame_ids.into_iter().collect();
+    let active_frame_membership = active_frame_ids.iter().cloned().collect();
+    if run.flow_state.ready_frames != active_frame_ids {
+        return Err(RestoreIncompatible::ProjectionMismatch {
+            field: "ready_frames",
+        });
+    }
+    if run.flow_state.ready_frame_membership != active_frame_membership {
+        return Err(RestoreIncompatible::ProjectionMismatch {
+            field: "ready_frame_membership",
+        });
+    }
+    Ok(())
 }
 
-/// Rebuild `pending_body_frame_loops` and `pending_body_frame_loop_membership`
-/// in `run.flow_state` from the per-loop snapshots.
-///
-/// A loop instance belongs in pending_body_frame_loops iff:
-/// - it exists in `run.loops`
-/// - its kernel state phase is "Running"
-/// - its `active_body_frame_id` field is `None` (requested body frame but not yet started)
-fn reconcile_pending_body_frame_loops(run: &mut MobRun) {
+fn validate_pending_body_frame_loops(run: &MobRun) -> Result<(), RestoreIncompatible> {
     let mut pending_loop_ids: Vec<LoopInstanceId> = run
         .loops
         .iter()
@@ -117,22 +106,21 @@ fn reconcile_pending_body_frame_loops(run: &mut MobRun) {
         .map(|(loop_id, _)| loop_id.clone())
         .collect();
     pending_loop_ids.sort();
-    run.flow_state.pending_body_frame_loops = pending_loop_ids.clone();
-    run.flow_state.pending_body_frame_loop_membership = pending_loop_ids.into_iter().collect();
+    let pending_loop_membership = pending_loop_ids.iter().cloned().collect();
+    if run.flow_state.pending_body_frame_loops != pending_loop_ids {
+        return Err(RestoreIncompatible::ProjectionMismatch {
+            field: "pending_body_frame_loops",
+        });
+    }
+    if run.flow_state.pending_body_frame_loop_membership != pending_loop_membership {
+        return Err(RestoreIncompatible::ProjectionMismatch {
+            field: "pending_body_frame_loop_membership",
+        });
+    }
+    Ok(())
 }
 
-/// Rebuild the run-level active counters from persisted snapshots.
-///
-/// `active_node_count` counts running step nodes across all frames. Loop nodes
-/// are excluded because once a loop hands off to MobMachine-owned loop state, the
-/// run scheduler tracks the active body frame/step work instead of charging the
-/// parent loop node indefinitely.
-///
-/// `active_frame_count` counts body-frame grants that have not yet been released
-/// through `FrameTerminated`. A loop with `active_body_frame_id = Some(frame)`
-/// still owns that slot even if the body frame snapshot itself is already
-/// terminal and recovery must finish the handoff.
-fn reconcile_active_counts(run: &mut MobRun) {
+fn validate_active_counts(run: &MobRun) -> Result<(), RestoreIncompatible> {
     let active_node_count = run
         .frames
         .values()
@@ -145,8 +133,17 @@ fn reconcile_active_counts(run: &mut MobRun) {
         .filter(|frame_id| run.frames.contains_key(frame_id))
         .count() as u32;
 
-    run.flow_state.active_node_count = active_node_count;
-    run.flow_state.active_frame_count = active_frame_count;
+    if run.flow_state.active_node_count != active_node_count {
+        return Err(RestoreIncompatible::ProjectionMismatch {
+            field: "active_node_count",
+        });
+    }
+    if run.flow_state.active_frame_count != active_frame_count {
+        return Err(RestoreIncompatible::ProjectionMismatch {
+            field: "active_frame_count",
+        });
+    }
+    Ok(())
 }
 
 /// Return true if a loop snapshot represents a loop that is pending a body frame start.
@@ -315,7 +312,9 @@ mod tests {
             },
         );
 
-        reconcile_run_state(&mut run).expect("reconcile");
+        run.flow_state.active_node_count = 1;
+        run.flow_state.active_frame_count = 1;
+        reconcile_run_state(&mut run).expect("validate");
         assert_eq!(run.flow_state.active_node_count, 1);
         assert_eq!(run.flow_state.active_frame_count, 1);
     }
@@ -363,12 +362,13 @@ mod tests {
         run.flow_state
             .ready_frame_membership
             .insert(FrameId::from("frame-1"));
-        reconcile_run_state(&mut run).expect("reconcile");
-        assert!(
-            !run.flow_state
-                .ready_frames
-                .contains(&FrameId::from("frame-1"))
-        );
+        let result = reconcile_run_state(&mut run);
+        assert!(matches!(
+            result,
+            Err(RestoreIncompatible::ProjectionMismatch {
+                field: "ready_frames"
+            })
+        ));
     }
 
     #[test]
@@ -376,11 +376,12 @@ mod tests {
         let mut run = minimal_v2_run_running();
         let active = frame_snapshot_with_ready_queue("frame-2", vec!["node-a"], true);
         run.frames.insert(crate::FrameId::from("frame-2"), active);
-        reconcile_run_state(&mut run).expect("reconcile");
-        assert!(
-            run.flow_state
-                .ready_frames
-                .contains(&FrameId::from("frame-2"))
-        );
+        let result = reconcile_run_state(&mut run);
+        assert!(matches!(
+            result,
+            Err(RestoreIncompatible::ProjectionMismatch {
+                field: "ready_frames"
+            })
+        ));
     }
 }

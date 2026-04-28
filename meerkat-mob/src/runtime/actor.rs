@@ -12,6 +12,7 @@ use super::*;
 use crate::generated::protocol_mob_destroying_session_ingress::MobDestroyingSessionIngressObligation;
 use crate::ids::{AgentIdentity, Generation};
 use crate::machines::mob_machine as mob_dsl;
+use crate::run::{MobMachineFlowAuthorityToken, MobMachineFlowRunCommand, flow_run};
 #[cfg(target_arch = "wasm32")]
 use crate::tokio;
 use futures::FutureExt;
@@ -1062,8 +1063,13 @@ impl MobActor {
         input: mob_dsl::MobMachineInput,
         context: &str,
     ) -> Result<Vec<mob_dsl::MobMachineEffect>, MobError> {
+        let input_debug = format!("{input:?}");
         let transition = mob_dsl::MobMachineMutator::apply(&mut self.dsl_authority, input)
-            .map_err(|e| MobError::Internal(format!("DSL authority ({context}): {e}")))?;
+            .map_err(|e| {
+                MobError::Internal(format!(
+                    "DSL authority ({context}) rejected {input_debug}: {e}"
+                ))
+            })?;
         let effects = transition.effects.clone();
         self.queue_routed_effects_from(&transition.effects);
         if transition.from_phase != transition.to_phase {
@@ -1073,6 +1079,25 @@ impl MobActor {
             let _ = self.phase_watch_tx.send(self.state());
         }
         Ok(effects)
+    }
+
+    fn preview_dsl_input(
+        &self,
+        input: mob_dsl::MobMachineInput,
+        context: &str,
+    ) -> Result<mob_dsl::MobMachineState, MobError> {
+        let input_debug = format!("{input:?}");
+        let mut authority =
+            mob_dsl::MobMachineAuthority::from_state(self.dsl_authority.state.clone());
+        let transition = mob_dsl::MobMachineMutator::apply(&mut authority, input).map_err(|e| {
+            MobError::Internal(format!(
+                "DSL authority preview ({context}) rejected {input_debug}: {e}"
+            ))
+        })?;
+        if transition.from_phase != transition.to_phase {
+            authority.state.lifecycle_phase = transition.to_phase;
+        }
+        Ok(authority.state)
     }
 
     fn apply_dsl_signal(
@@ -2828,8 +2853,15 @@ impl MobActor {
                 MobCommand::ProjectMachineInput { input, reply_tx } => {
                     let result = self
                         .apply_dsl_input(*input, "project_machine_input")
-                        .map(|_| self.dsl_authority.state.clone());
+                        .map(|()| self.dsl_authority.state.clone());
                     let _ = reply_tx.send(result);
+                }
+                MobCommand::PreviewMachineInput { input, reply_tx } => {
+                    let result = self.preview_dsl_input(*input, "preview_machine_input");
+                    let _ = reply_tx.send(result);
+                }
+                MobCommand::QueryMachineState { reply_tx } => {
+                    let _ = reply_tx.send(self.dsl_authority.state.clone());
                 }
                 MobCommand::ProjectMachineSignal { signal } => {
                     if let Err(error) = self.apply_dsl_signal(signal, "project_machine_signal") {
@@ -3335,8 +3367,19 @@ impl MobActor {
                     let _ = reply_tx.send(result);
                 }
                 MobCommand::SetSpawnPolicy { policy, reply_tx } => {
-                    self.spawn_policy.set(policy).await;
-                    let _ = reply_tx.send(());
+                    let result = self.apply_dsl_input(
+                        mob_dsl::MobMachineInput::SetSpawnPolicy,
+                        "set_spawn_policy",
+                    )
+                    .map_err(|error| {
+                        MobError::Internal(format!(
+                            "SetSpawnPolicy rejected by MobMachine guards before shell policy write: {error}"
+                        ))
+                    });
+                    if result.is_ok() {
+                        self.spawn_policy.set(policy).await;
+                    }
+                    let _ = reply_tx.send(result);
                 }
                 MobCommand::QueryPhase { reply_tx } => {
                     let _ = reply_tx.send(self.state());
@@ -5089,7 +5132,7 @@ impl MobActor {
     ///
     /// Does NOT retire the member — the member remains in the roster and can
     /// receive new turns. Use [`handle_retire`] to fully remove a member.
-    async fn handle_force_cancel(&self, agent_identity: MeerkatId) -> Result<(), MobError> {
+    async fn handle_force_cancel(&mut self, agent_identity: MeerkatId) -> Result<(), MobError> {
         let roster = self.roster.read().await;
         let entry = roster
             .get(&agent_identity)
@@ -5097,7 +5140,10 @@ impl MobActor {
         let member_ref = entry.member_ref.clone();
         drop(roster);
 
-        self.provisioner.interrupt_member(&member_ref).await
+        self.preview_dsl_input(mob_dsl::MobMachineInput::ForceCancel, "force_cancel")?;
+        self.provisioner.interrupt_member(&member_ref).await?;
+        self.apply_dsl_input(mob_dsl::MobMachineInput::ForceCancel, "force_cancel")?;
+        Ok(())
     }
 
     /// D-wire-handler (#26) + #31 D-trust-reconciliation (Wave D): forward a
@@ -7851,12 +7897,12 @@ impl MobActor {
                 return Err(MobDestroyError::Incomplete { report });
             }
         }
+        self.cancel_all_flow_tasks()
+            .await
+            .map_err(MobDestroyError::from)?;
         self.apply_dsl_input(mob_dsl::MobMachineInput::Destroy, "destroy_input")
             .map_err(MobDestroyError::from)?;
         self.flush_routed_effects()
-            .await
-            .map_err(MobDestroyError::from)?;
-        self.cancel_all_flow_tasks_after_destroy()
             .await
             .map_err(MobDestroyError::from)?;
         self.notify_orchestrator_lifecycle(format!("Mob '{}' is destroying.", self.definition.id))
@@ -8296,30 +8342,30 @@ impl MobActor {
         description: String,
         blocked_by: Vec<TaskId>,
     ) -> Result<TaskId, MobError> {
-        let task_id = self
-            .task_board_service
-            .create_task(subject.clone(), description.clone(), blocked_by.clone())
-            .await?;
-        // Route the authoritative creation through the DSL so
-        // `MobMachine::tasks` and the guard-visible id set stay in lock
-        // step with the event-sourced shell projection. Guard rejects
-        // duplicates via the id-uniqueness check; the event-sourced
-        // TaskId is a fresh UUID, so insertion always succeeds here on
-        // the happy path.
-        if let Err(error) = self.apply_dsl_input(
-            mob_dsl::MobMachineInput::TaskCreate {
-                task_id: mob_dsl::TaskId::from(task_id.as_str()),
-                task_payload: Self::task_payload_to_dsl(&subject, &description, &blocked_by),
-            },
-            "handle_task_create",
-        ) {
-            tracing::warn!(
-                mob_id = %self.definition.id,
-                task_id = %task_id,
-                %error,
-                "TaskCreate DSL input rejected; DSL and event-sourced task board may diverge"
-            );
+        if subject.trim().is_empty() {
+            return Err(MobError::Internal(
+                "task subject cannot be empty".to_string(),
+            ));
         }
+        let task_id = TaskId::from(uuid::Uuid::new_v4().to_string());
+        let dsl_input = mob_dsl::MobMachineInput::TaskCreate {
+            task_id: mob_dsl::TaskId::from(task_id.as_str()),
+            task_payload: Self::task_payload_to_dsl(&subject, &description, &blocked_by),
+        };
+        // MobMachine is the admission authority. Allocate the id in the
+        // actor, fail closed through the DSL, then append/project the
+        // shell task-board event using the same id. This prevents the
+        // prior event-sourced-board/DSL split-brain where DSL rejection
+        // was only logged after the shell write.
+        self.apply_dsl_input(dsl_input, "handle_task_create")
+            .map_err(|error| {
+                MobError::Internal(format!(
+                    "task create rejected by MobMachine guards before task-board write: {error}"
+                ))
+            })?;
+        self.task_board_service
+            .create_task_with_id(task_id.clone(), subject, description, blocked_by)
+            .await?;
         Ok(task_id)
     }
 
@@ -8625,12 +8671,14 @@ impl MobActor {
             .await?;
         let config = FlowRunConfig::from_definition(flow_id, &self.definition)?;
         let run_id = RunId::new();
-        let create_run_seed = MobRun::create_run_seed_input(&run_id, &config)?;
-        if let Err(error) = self.apply_dsl_input(create_run_seed, "create_run_seed") {
-            return Err(MobError::Internal(format!(
-                "canonical CreateRunSeed transition failed during flow admission: {error}"
-            )));
-        }
+        let run_flow = MobRun::run_flow_input(&run_id, &config)?;
+        debug_assert!(matches!(run_flow, mob_dsl::MobMachineInput::RunFlow { .. }));
+        self.apply_dsl_input(run_flow, "run_flow")
+            .map_err(|error| {
+                MobError::Internal(format!(
+                    "canonical RunFlow transition failed during flow admission: {error}"
+                ))
+            })?;
         self.create_pending_run(
             run_id.clone(),
             &config,
@@ -8638,34 +8686,15 @@ impl MobActor {
             activation_params.clone(),
         )
         .await?;
-        if self.has_orchestrator
-            && let Err(error) =
-                self.apply_dsl_signal(mob_dsl::MobMachineSignal::StartFlow, "start_flow")
-        {
-            let reason =
-                format!("orchestrator StartFlow transition failed during flow admission: {error}");
-            if let Err(terminalize_error) = self
-                .flow_engine
-                .terminalize_failed(run_id.clone(), config.flow_id.clone(), reason.clone())
-                .await
-            {
-                return Err(MobError::Internal(format!(
-                    "{reason}; additionally failed to terminalize pending run: {terminalize_error}"
-                )));
-            }
-            return Err(MobError::Internal(reason));
-        }
         if let Err(error) = self.apply_dsl_signal(mob_dsl::MobMachineSignal::StartRun, "start_run")
         {
             let mut details = Vec::new();
-            if self.has_orchestrator
-                && let Err(rollback_error) = self.apply_dsl_signal(
-                    mob_dsl::MobMachineSignal::CompleteFlow,
-                    "complete_flow_rollback",
-                )
-            {
+            if let Err(rollback_error) = self.apply_dsl_signal(
+                mob_dsl::MobMachineSignal::CompleteFlow,
+                "complete_flow_rollback",
+            ) {
                 details.push(format!(
-                    "orchestrator CompleteFlow rollback failed: {rollback_error}"
+                    "RunFlow CompleteFlow rollback failed: {rollback_error}"
                 ));
             }
             if let Err(terminalize_error) = self
@@ -8867,6 +8896,12 @@ impl MobActor {
 
     async fn handle_cancel_flow(&mut self, run_id: RunId) -> Result<(), MobError> {
         self.ensure_pending_spawn_alignment("handle_cancel_flow preflight")?;
+        self.apply_dsl_input(
+            mob_dsl::MobMachineInput::CancelFlow {
+                run_id: mob_dsl::RunId::from(run_id.to_string()),
+            },
+            "cancel_flow",
+        )?;
         let Some((cancel_token, flow_id)) = self
             .run_cancel_tokens
             .get(&run_id)
@@ -8993,6 +9028,64 @@ impl MobActor {
         Ok(())
     }
 
+    async fn apply_flow_run_command_in_actor(
+        &mut self,
+        run_id: &RunId,
+        command: MobMachineFlowRunCommand,
+        context: &'static str,
+    ) -> Result<(), MobError> {
+        let authority_input = command.authority_input(run_id);
+        self.apply_dsl_input(authority_input.clone(), context)?;
+        let machine_state = self.dsl_authority.state.clone();
+        let authority =
+            MobMachineFlowAuthorityToken::from_accepted_mob_machine_input(&authority_input)?;
+        let _ = self
+            .flow_engine
+            .apply_command_with_machine_state(run_id, command, machine_state, authority, context)
+            .await?;
+        Ok(())
+    }
+
+    async fn cancel_dispatched_steps_in_actor(&mut self, run_id: &RunId) -> Result<(), MobError> {
+        let run = self
+            .run_store
+            .get_run(run_id)
+            .await?
+            .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
+        for step_id in run.ordered_steps()? {
+            if matches!(
+                run.flow_state.step_status.get(&step_id),
+                Some(Some(flow_run::StepRunStatus::Dispatched))
+            ) {
+                self.apply_flow_run_command_in_actor(
+                    run_id,
+                    MobMachineFlowRunCommand::CancelStep(flow_run::inputs::CancelStep { step_id }),
+                    "actor_cancel_dispatched_step",
+                )
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    async fn terminalize_canceled_in_actor(
+        &mut self,
+        run_id: RunId,
+        flow_id: FlowId,
+        context: &'static str,
+    ) -> Result<(), MobError> {
+        let authority_input =
+            MobMachineFlowRunCommand::TerminalizeCanceled(flow_run::inputs::TerminalizeCanceled {})
+                .authority_input(&run_id);
+        self.apply_dsl_input(authority_input, context)?;
+        let machine_state = self.dsl_authority.state.clone();
+        let _ = self
+            .flow_engine
+            .terminalize_canceled_with_machine_state(run_id, flow_id, machine_state)
+            .await?;
+        Ok(())
+    }
+
     async fn cancel_all_flow_tasks(&mut self) -> Result<(), MobError> {
         self.ensure_pending_spawn_alignment("cancel_all_flow_tasks preflight")?;
         let tracked_run_ids = self.run_cancel_tokens.keys().cloned().collect::<Vec<_>>();
@@ -9011,10 +9104,13 @@ impl MobActor {
             }
             self.flow_streams.lock().await.remove(&run_id);
 
-            self.flow_engine.cancel_dispatched_steps(&run_id).await?;
-            self.flow_engine
-                .terminalize_canceled(run_id.clone(), flow_id.clone())
-                .await?;
+            self.cancel_dispatched_steps_in_actor(&run_id).await?;
+            self.terminalize_canceled_in_actor(
+                run_id.clone(),
+                flow_id.clone(),
+                "cancel_all_flow_terminalize_canceled",
+            )
+            .await?;
 
             // CompleteFlow / FinishRun accept `active_run_count == 0` as
             // a legitimate terminal convergence (see
@@ -9028,35 +9124,6 @@ impl MobActor {
             let _ = self.run_cancel_tokens.remove(&run_id);
         }
         self.ensure_flow_tracker_alignment("cancel_all_flow_tasks completion")
-            .await?;
-        Ok(())
-    }
-
-    async fn cancel_all_flow_tasks_after_destroy(&mut self) -> Result<(), MobError> {
-        self.ensure_pending_spawn_alignment("cancel_all_flow_tasks_after_destroy preflight")?;
-        let tracked_run_ids = self.run_cancel_tokens.keys().cloned().collect::<Vec<_>>();
-        for run_id in tracked_run_ids {
-            let Some((token, flow_id)) = self
-                .run_cancel_tokens
-                .get(&run_id)
-                .map(|(token, flow_id)| (token.clone(), flow_id.clone()))
-            else {
-                continue;
-            };
-
-            token.cancel();
-            if let Some(handle) = self.run_tasks.remove(&run_id) {
-                handle.abort();
-            }
-            self.flow_streams.lock().await.remove(&run_id);
-
-            self.flow_engine.cancel_dispatched_steps(&run_id).await?;
-            self.flow_engine
-                .terminalize_canceled(run_id.clone(), flow_id)
-                .await?;
-            let _ = self.run_cancel_tokens.remove(&run_id);
-        }
-        self.ensure_flow_tracker_alignment("cancel_all_flow_tasks_after_destroy completion")
             .await?;
         Ok(())
     }

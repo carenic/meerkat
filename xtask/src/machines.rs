@@ -281,6 +281,7 @@ pub fn machine_check_drift(args: SelectionArgs) -> Result<()> {
     mismatches.extend(collect_authority_language_mismatches(&root)?);
     mismatches.extend(collect_stale_cfg_mismatches(&root)?);
     mismatches.extend(collect_direct_flow_reducer_transition_mismatches(&root)?);
+    mismatches.extend(collect_mob_runtime_catalog_command_gate_mismatches(&root)?);
 
     if !mismatches.is_empty() {
         bail!(
@@ -498,6 +499,7 @@ fn ensure_no_drift(root: &Path, selection: &Selection) -> Result<()> {
     mismatches.extend(collect_authority_language_mismatches(root)?);
     mismatches.extend(collect_stale_cfg_mismatches(root)?);
     mismatches.extend(collect_direct_flow_reducer_transition_mismatches(root)?);
+    mismatches.extend(collect_mob_runtime_catalog_command_gate_mismatches(root)?);
 
     if !mismatches.is_empty() {
         bail!(
@@ -649,13 +651,48 @@ pub fn collect_authority_language_mismatches(root: &Path) -> Result<Vec<String>>
 pub fn collect_direct_flow_reducer_transition_mismatches(root: &Path) -> Result<Vec<String>> {
     let mut mismatches = Vec::new();
     let forbidden_modules = ["flow_run", "flow_frame", "loop_iteration"];
-    let forbidden_projection_field_writes = [
-        ".flow_state.phase =",
-        ".flow_state.max_frame_depth =",
-        ".flow_state.max_active_frames =",
+    let forbidden_flow_projection_fields = [
+        "phase",
+        "step_status",
+        "output_recorded",
+        "step_condition_results",
+        "target_counts",
+        "target_success_counts",
+        "target_terminal_failure_counts",
+        "target_retry_counts",
+        "failure_count",
+        "consecutive_failure_count",
+        "ready_frames",
+        "ready_frame_membership",
+        "pending_body_frame_loops",
+        "pending_body_frame_loop_membership",
+        "active_node_count",
+        "active_frame_count",
+        "last_granted_frame",
+        "last_granted_loop",
+        "max_active_nodes",
+        "max_active_frames",
+        "max_frame_depth",
     ];
-    let forbidden_projection_cas_writes =
-        [".cas_flow_state(", ".cas_frame_state(", ".cas_loop_state("];
+    let forbidden_frame_projection_fields = [
+        "phase",
+        "last_admitted_node",
+        "node_status",
+        "ready_queue",
+        "output_recorded",
+        "node_condition_results",
+    ];
+    let forbidden_projection_cas_writes = [
+        ".cas_flow_state(",
+        ".cas_frame_state(",
+        ".cas_loop_state(",
+        ".cas_grant_node_slot(",
+        ".cas_start_loop(",
+        ".cas_grant_body_frame_start(",
+        ".cas_complete_body_frame(",
+        ".cas_loop_request_body_frame(",
+        ".cas_complete_loop(",
+    ];
 
     for path in production_rust_source_paths(root)? {
         let rel = relative_slash_path(root, &path)?;
@@ -664,8 +701,8 @@ pub fn collect_direct_flow_reducer_transition_mismatches(root: &Path) -> Result<
         })?;
         let lines = contents.lines().collect::<Vec<_>>();
         let mut module_aliases = BTreeMap::new();
-        let mut bare_transition_aliases = BTreeSet::new();
-        let mut bare_input_aliases = BTreeSet::new();
+        let mut bare_transition_aliases = BTreeMap::new();
+        let mut bare_input_aliases = BTreeMap::new();
 
         for module in forbidden_modules {
             module_aliases.insert(module.to_string(), module.to_string());
@@ -713,10 +750,10 @@ pub fn collect_direct_flow_reducer_transition_mismatches(root: &Path) -> Result<
                     }
                 }
             }
-            for alias in &bare_transition_aliases {
+            for (alias, module) in &bare_transition_aliases {
                 if line.contains(&format!("{alias}("))
                     && !flow_reducer_direct_use_is_structurally_allowed(
-                        &rel, &lines, line_index, alias, alias,
+                        &rel, &lines, line_index, module, alias,
                     )
                 {
                     mismatches.push(format!(
@@ -725,10 +762,11 @@ pub fn collect_direct_flow_reducer_transition_mismatches(root: &Path) -> Result<
                     ));
                 }
             }
-            for alias in &bare_input_aliases {
-                if line.contains(&format!("{alias}::"))
+            for (alias, module) in &bare_input_aliases {
+                let token = format!("{alias}::");
+                if line.contains(&token)
                     && !flow_reducer_direct_use_is_structurally_allowed(
-                        &rel, &lines, line_index, alias, alias,
+                        &rel, &lines, line_index, module, &token,
                     )
                 {
                     mismatches.push(format!(
@@ -737,8 +775,18 @@ pub fn collect_direct_flow_reducer_transition_mismatches(root: &Path) -> Result<
                     ));
                 }
             }
-            for token in forbidden_projection_field_writes {
-                if line.contains(token) && !line.contains("==") {
+            for field in forbidden_flow_projection_fields {
+                let token = format!(".flow_state.{field}");
+                if projection_field_is_directly_written(line, &token) {
+                    mismatches.push(format!(
+                        "direct live-flow projection mutation `{token}` is not MobMachine-command gated: {rel}:{}",
+                        line_index + 1
+                    ));
+                }
+            }
+            for field in forbidden_frame_projection_fields {
+                let token = format!(".kernel_state.{field}");
+                if projection_field_is_directly_written(line, &token) {
                     mismatches.push(format!(
                         "direct live-flow projection mutation `{token}` is not MobMachine-command gated: {rel}:{}",
                         line_index + 1
@@ -747,7 +795,9 @@ pub fn collect_direct_flow_reducer_transition_mismatches(root: &Path) -> Result<
             }
             for token in forbidden_projection_cas_writes {
                 if line.contains(token)
-                    && !flow_reducer_projection_commit_is_structurally_allowed(&lines, line_index)
+                    && !flow_reducer_projection_commit_is_structurally_allowed(
+                        &rel, &lines, line_index,
+                    )
                 {
                     mismatches.push(format!(
                         "direct live-flow projection mutation `{token}` is not MobMachine-command gated: {rel}:{}",
@@ -759,6 +809,77 @@ pub fn collect_direct_flow_reducer_transition_mismatches(root: &Path) -> Result<
     }
 
     Ok(mismatches)
+}
+
+pub fn collect_mob_runtime_catalog_command_gate_mismatches(root: &Path) -> Result<Vec<String>> {
+    let actor_path = root.join("meerkat-mob/src/runtime/actor.rs");
+    if !actor_path.exists() {
+        return Ok(Vec::new());
+    }
+
+    let contents = fs::read_to_string(&actor_path)
+        .with_context(|| format!("read Mob runtime actor {}", actor_path.display()))?;
+    let lines = contents.lines().collect::<Vec<_>>();
+    let rel = relative_slash_path(root, &actor_path)?;
+    let critical_inputs = [
+        MobCatalogCommandGateSpec {
+            input: "RunFlow",
+            scope: MobCatalogCommandGateScope::Function("handle_run_flow"),
+        },
+        MobCatalogCommandGateSpec {
+            input: "CancelFlow",
+            scope: MobCatalogCommandGateScope::Function("handle_cancel_flow"),
+        },
+        MobCatalogCommandGateSpec {
+            input: "TaskCreate",
+            scope: MobCatalogCommandGateScope::Function("handle_task_create"),
+        },
+        MobCatalogCommandGateSpec {
+            input: "SetSpawnPolicy",
+            scope: MobCatalogCommandGateScope::CommandArm("SetSpawnPolicy"),
+        },
+        MobCatalogCommandGateSpec {
+            input: "ForceCancel",
+            scope: MobCatalogCommandGateScope::Function("handle_force_cancel"),
+        },
+    ];
+    let mut mismatches = Vec::new();
+
+    for spec in critical_inputs {
+        let scope = spec.scope.resolve(&lines);
+        let gated = scope.is_some_and(|(start, end)| {
+            mob_catalog_input_has_fail_closed_gate(&lines[start..=end], spec.input)
+        });
+        if !gated {
+            mismatches.push(format!(
+                "MobCommand::{} is catalog-classified but does not fail-close on MobMachineInput::{} in {}",
+                spec.input, spec.input, rel
+            ));
+        }
+    }
+
+    Ok(mismatches)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MobCatalogCommandGateSpec {
+    input: &'static str,
+    scope: MobCatalogCommandGateScope,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MobCatalogCommandGateScope {
+    Function(&'static str),
+    CommandArm(&'static str),
+}
+
+impl MobCatalogCommandGateScope {
+    fn resolve(self, lines: &[&str]) -> Option<(usize, usize)> {
+        match self {
+            Self::Function(name) => function_scope_bounds(lines, name),
+            Self::CommandArm(variant) => command_arm_scope_bounds(lines, variant),
+        }
+    }
 }
 
 fn reducer_module_alias(line: &str, module: &str) -> Option<String> {
@@ -776,24 +897,198 @@ fn reducer_module_alias(line: &str, module: &str) -> Option<String> {
 fn collect_reducer_bare_aliases(
     line: &str,
     module: &str,
-    transition_aliases: &mut BTreeSet<String>,
-    input_aliases: &mut BTreeSet<String>,
+    transition_aliases: &mut BTreeMap<String, String>,
+    input_aliases: &mut BTreeMap<String, String>,
 ) {
-    if let Some((_, imports)) = line.split_once(&format!("{module}::{{")) {
-        if let Some((imports, _)) = imports.split_once('}') {
-            for item in imports.split(',').map(str::trim) {
-                if let Some(alias) = item.strip_prefix("transition as ") {
-                    let alias = alias.trim();
-                    if !alias.is_empty() {
-                        transition_aliases.insert(alias.to_string());
-                    }
-                } else if let Some(alias) = item.strip_prefix("Input as ") {
-                    let alias = alias.trim();
-                    if !alias.is_empty() {
-                        input_aliases.insert(alias.to_string());
-                    }
+    if let Some((_, after)) = line.split_once(&format!("{module}::transition")) {
+        if let Some(alias) = after
+            .trim_start()
+            .strip_prefix("as ")
+            .map(|value| {
+                value
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                    .collect::<String>()
+            })
+            .filter(|alias| !alias.is_empty())
+        {
+            transition_aliases.insert(alias, module.to_string());
+        } else {
+            transition_aliases.insert("transition".to_string(), module.to_string());
+        }
+    }
+    if let Some((_, after)) = line.split_once(&format!("{module}::Input")) {
+        if let Some(alias) = after
+            .trim_start()
+            .strip_prefix("as ")
+            .map(|value| {
+                value
+                    .chars()
+                    .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                    .collect::<String>()
+            })
+            .filter(|alias| !alias.is_empty())
+        {
+            input_aliases.insert(alias, module.to_string());
+        } else {
+            input_aliases.insert("Input".to_string(), module.to_string());
+        }
+    }
+    if line.contains(&format!("{module}::*")) {
+        transition_aliases.insert("transition".to_string(), module.to_string());
+        input_aliases.insert("Input".to_string(), module.to_string());
+    }
+    if let Some((_, imports)) = line.split_once(&format!("{module}::{{"))
+        && let Some((imports, _)) = imports.split_once('}')
+    {
+        for item in imports.split(',').map(str::trim) {
+            if let Some(alias) = item.strip_prefix("transition as ") {
+                let alias = alias.trim();
+                if !alias.is_empty() {
+                    transition_aliases.insert(alias.to_string(), module.to_string());
                 }
+            } else if item == "transition" {
+                transition_aliases.insert("transition".to_string(), module.to_string());
+            } else if let Some(alias) = item.strip_prefix("Input as ") {
+                let alias = alias.trim();
+                if !alias.is_empty() {
+                    input_aliases.insert(alias.to_string(), module.to_string());
+                }
+            } else if item == "Input" {
+                input_aliases.insert("Input".to_string(), module.to_string());
             }
+        }
+    }
+}
+
+fn projection_field_is_directly_written(line: &str, token: &str) -> bool {
+    let Some(index) = line.find(token) else {
+        return false;
+    };
+    let tail = &line[index + token.len()..];
+    let tail = tail.trim_start();
+    (tail.starts_with('=') && !tail.starts_with("==") && !tail.starts_with("=>"))
+        || tail.starts_with("+=")
+        || tail.starts_with("-=")
+        || tail.starts_with(".insert(")
+        || tail.starts_with(".remove(")
+        || tail.starts_with(".clear(")
+        || tail.starts_with(".push(")
+        || tail.starts_with(".retain(")
+}
+
+fn mob_catalog_input_has_fail_closed_gate(lines: &[&str], input: &str) -> bool {
+    let token = format!("MobMachineInput::{input}");
+    lines
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.contains(&token))
+        .any(|(line_index, _)| mob_catalog_input_occurrence_is_fail_closed(lines, line_index))
+}
+
+fn mob_catalog_input_occurrence_is_fail_closed(lines: &[&str], line_index: usize) -> bool {
+    let start = line_index.saturating_sub(4);
+    let end = (line_index + 18).min(lines.len());
+    let window = lines[start..end].join("\n");
+    let compact = window.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    if compact.contains("let _ = self.apply_dsl_input")
+        || compact.contains("tracing::warn")
+        || compact.contains("may diverge")
+    {
+        return false;
+    }
+
+    compact.contains("probe_mob_machine_input(")
+        || (compact.contains("apply_dsl_input(")
+            && (compact.contains('?')
+                || compact.contains("return Err")
+                || compact.contains("continue;")
+                || compact.contains(".map_err(")))
+}
+
+fn function_scope_bounds(lines: &[&str], function_name: &str) -> Option<(usize, usize)> {
+    let needle = format!("fn{function_name}(");
+    let start = lines.iter().position(|line| {
+        let compact = line.split_whitespace().collect::<String>();
+        compact.contains(&needle)
+    })?;
+    brace_scope_bounds(lines, start)
+}
+
+fn command_arm_scope_bounds(lines: &[&str], variant: &str) -> Option<(usize, usize)> {
+    let needle = format!("MobCommand::{variant}");
+    let start = lines.iter().position(|line| line.contains(&needle))?;
+    brace_scope_bounds(lines, start)
+}
+
+fn brace_scope_bounds(lines: &[&str], start: usize) -> Option<(usize, usize)> {
+    let mut depth = 0usize;
+    let mut opened = false;
+    for (index, line) in lines.iter().enumerate().skip(start) {
+        for ch in line.chars() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    opened = true;
+                }
+                '}' if depth > 0 => depth -= 1,
+                _ => {}
+            }
+        }
+        if opened && depth == 0 {
+            return Some((start, index));
+        }
+    }
+    None
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlowReducerFamily {
+    FlowRun,
+    FlowFrame,
+    LoopIteration,
+}
+
+impl FlowReducerFamily {
+    fn from_module(module: &str) -> Option<Self> {
+        match module {
+            "flow_run" => Some(Self::FlowRun),
+            "flow_frame" => Some(Self::FlowFrame),
+            "loop_iteration" => Some(Self::LoopIteration),
+            _ => None,
+        }
+    }
+
+    fn module(self) -> &'static str {
+        match self {
+            Self::FlowRun => "flow_run",
+            Self::FlowFrame => "flow_frame",
+            Self::LoopIteration => "loop_iteration",
+        }
+    }
+
+    fn apply_function(self) -> &'static str {
+        match self {
+            Self::FlowRun => "apply_mob_machine_flow_run_command",
+            Self::FlowFrame => "apply_mob_machine_flow_frame_command",
+            Self::LoopIteration => "apply_mob_machine_loop_iteration_command",
+        }
+    }
+
+    fn command_type(self) -> &'static str {
+        match self {
+            Self::FlowRun => "MobMachineFlowRunCommand",
+            Self::FlowFrame => "MobMachineFlowFrameCommand",
+            Self::LoopIteration => "MobMachineLoopIterationCommand",
+        }
+    }
+
+    fn authority_kind(self) -> &'static str {
+        match self {
+            Self::FlowRun => "MobMachineFlowAuthorityKind::FlowRun",
+            Self::FlowFrame => "MobMachineFlowAuthorityKind::FlowFrame",
+            Self::LoopIteration => "MobMachineFlowAuthorityKind::LoopIteration",
         }
     }
 }
@@ -817,51 +1112,149 @@ fn flow_reducer_direct_use_is_structurally_allowed(
     if path != "meerkat-mob/src/run.rs" {
         return false;
     }
+    let Some(family) = FlowReducerFamily::from_module(module) else {
+        return false;
+    };
 
     let Some(function_start) = nearest_function_start(lines, line_index) else {
         return false;
     };
-    let function_signature = lines[function_start].split_whitespace().collect::<String>();
-    let prefix = match module {
-        "flow_run" => "apply_mob_machine_flow_run_command",
-        "flow_frame" => "apply_mob_machine_flow_frame_command",
-        "loop_iteration" => "apply_mob_machine_loop_iteration_command",
-        _ => "",
-    };
+    let function_name = function_name_from_signature(lines[function_start]);
 
-    if !prefix.is_empty()
-        && function_signature.contains(prefix)
+    if function_name.as_deref() == Some(family.apply_function())
         && token.contains("transition")
         && lines[function_start..=line_index]
             .iter()
-            .any(|line| line.contains("authority.require(MobMachineFlowAuthorityKind::"))
+            .any(|line| line.contains(&format!("authority.require({}", family.authority_kind())))
     {
         return true;
     }
 
-    let expected_input_return = format!("->{module}::Input");
-    function_signature.contains("fninto_input(self)")
+    let function_signature = lines[function_start].split_whitespace().collect::<String>();
+    let expected_input_return = format!("->{}::Input", family.module());
+    function_name.as_deref() == Some("into_input")
+        && nearest_impl_start(lines, function_start)
+            .is_some_and(|impl_start| lines[impl_start].contains(family.command_type()))
         && function_signature.contains(expected_input_return.as_str())
         && token.contains("Input::")
 }
 
 fn flow_reducer_projection_commit_is_structurally_allowed(
+    path: &str,
     lines: &[&str],
     line_index: usize,
 ) -> bool {
-    let window_start = line_index.saturating_sub(16);
-    let window = &lines[window_start..=line_index];
+    let Some(function_start) = nearest_function_start(lines, line_index) else {
+        return false;
+    };
+    let function_name = function_name_from_signature(lines[function_start]);
+    let scope = &lines[function_start..=line_index];
 
-    window.iter().any(|line| {
-        line.contains("apply_mob_machine_flow_")
-            || line.contains("authorize_frame_command(")
-            || line.contains("authorize_run_command(")
-            || line.contains("authorize_loop_command(")
-            || line.contains("project_mob_machine_input(")
-            || line.contains("project_machine_input(")
-            || line.contains("from_accepted_mob_machine_input(")
-            || line.contains("FlowFrameLoopStorePlan::")
-    })
+    match path {
+        "meerkat-mob/src/runtime/flow.rs" => {
+            let signature = compact_function_signature(lines, function_start);
+            let has_authority_setup = scope
+                .iter()
+                .any(|line| line.contains("project_machine_input("))
+                && scope
+                    .iter()
+                    .any(|line| line.contains("from_accepted_mob_machine_input("));
+            let has_typed_authority_args = signature.contains("MobMachineFlowRunCommand")
+                && signature.contains("MobMachineFlowAuthorityToken");
+            scope
+                .iter()
+                .any(|line| line.contains("apply_mob_machine_flow_run_command("))
+                && (has_authority_setup || has_typed_authority_args)
+                && lines[line_index].contains("outcome.next_state")
+        }
+        "meerkat-mob/src/runtime/flow_frame_engine.rs" => {
+            let Some(name) = function_name.as_deref() else {
+                return false;
+            };
+            match name {
+                "transition_frame" | "admit_next_ready_node_with_retry" | "terminalize_frame" => {
+                    scope
+                        .iter()
+                        .any(|line| line.contains("authorize_frame_command("))
+                        && scope
+                            .iter()
+                            .any(|line| line.contains("apply_mob_machine_flow_frame_command("))
+                        && lines
+                            .iter()
+                            .skip(function_start)
+                            .take(80)
+                            .any(|line| line.contains("commit_mob_machine_inputs("))
+                        && lines[line_index].contains("next")
+                }
+                "start_frame" | "start_frame_snapshot" => {
+                    scope
+                        .iter()
+                        .any(|line| line.contains("preview_mob_machine_input("))
+                        && scope
+                            .iter()
+                            .any(|line| line.contains("from_accepted_mob_machine_input("))
+                        && scope
+                            .iter()
+                            .any(|line| line.contains("apply_mob_machine_flow_frame_command("))
+                        && lines
+                            .iter()
+                            .skip(function_start)
+                            .take(90)
+                            .any(|line| line.contains("commit_mob_machine_inputs("))
+                        && lines[line_index].contains("snapshot")
+                }
+                "execute_store_plan" => {
+                    let function_commits_machine_inputs = lines
+                        .iter()
+                        .skip(function_start)
+                        .take(240)
+                        .any(|line| line.contains("commit_mob_machine_inputs(machine_inputs)"));
+                    if !function_commits_machine_inputs {
+                        return false;
+                    }
+                    let window_start = line_index.saturating_sub(24);
+                    let local_scope = &lines[window_start..=line_index];
+                    let line = lines[line_index];
+                    (line.contains(".cas_flow_state(")
+                        && line.contains("next_run_state")
+                        && local_scope
+                            .iter()
+                            .any(|line| line.contains("FlowFrameLoopStorePlan::RunStateOnly")))
+                        || (line.contains(".cas_frame_state(")
+                            && line.contains("next_frame")
+                            && local_scope
+                                .iter()
+                                .any(|line| line.contains("FlowFrameLoopStorePlan::SealFrame")))
+                        || (line.contains(".cas_grant_node_slot(")
+                            && local_scope
+                                .iter()
+                                .any(|line| line.contains("FlowFrameLoopStorePlan::GrantNodeSlot")))
+                        || (line.contains(".cas_start_loop(")
+                            && local_scope
+                                .iter()
+                                .any(|line| line.contains("FlowFrameLoopStorePlan::StartLoop")))
+                        || (line.contains(".cas_grant_body_frame_start(")
+                            && local_scope.iter().any(|line| {
+                                line.contains("FlowFrameLoopStorePlan::GrantBodyFrameStart")
+                            }))
+                        || (line.contains(".cas_complete_body_frame(")
+                            && local_scope.iter().any(|line| {
+                                line.contains("FlowFrameLoopStorePlan::CompleteBodyFrame")
+                            }))
+                        || (line.contains(".cas_loop_request_body_frame(")
+                            && local_scope.iter().any(|line| {
+                                line.contains("FlowFrameLoopStorePlan::LoopRequestBodyFrame")
+                            }))
+                        || (line.contains(".cas_complete_loop(")
+                            && local_scope
+                                .iter()
+                                .any(|line| line.contains("FlowFrameLoopStorePlan::CompleteLoop")))
+                }
+                _ => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 fn nearest_function_start(lines: &[&str], line_index: usize) -> Option<usize> {
@@ -876,6 +1269,36 @@ fn nearest_function_start(lines: &[&str], line_index: usize) -> Option<usize> {
     })
 }
 
+fn nearest_impl_start(lines: &[&str], line_index: usize) -> Option<usize> {
+    (0..=line_index).rev().find(|index| {
+        let compact = lines[*index].split_whitespace().collect::<String>();
+        compact.starts_with("impl")
+    })
+}
+
+fn compact_function_signature(lines: &[&str], function_start: usize) -> String {
+    let mut signature = String::new();
+    for line in &lines[function_start..] {
+        for part in line.split_whitespace() {
+            signature.push_str(part);
+        }
+        if line.contains('{') {
+            break;
+        }
+    }
+    signature
+}
+
+fn function_name_from_signature(line: &str) -> Option<String> {
+    let compact = line.split_whitespace().collect::<String>();
+    let after_fn = compact.split_once("fn")?.1;
+    let name = after_fn
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+        .collect::<String>();
+    (!name.is_empty()).then_some(name)
+}
+
 pub fn collect_generated_kernel_boundary_mismatches(root: &Path) -> Result<Vec<String>> {
     let registry = CanonicalRegistry::load();
     let mut mismatches = Vec::new();
@@ -885,8 +1308,7 @@ pub fn collect_generated_kernel_boundary_mismatches(root: &Path) -> Result<Vec<S
         let retired_path = root.join(retired);
         if retired_path.exists() {
             mismatches.push(format!(
-                "retired generated-source/bridge path must be removed {}",
-                retired
+                "retired generated-source/bridge path must be removed {retired}"
             ));
         }
     }

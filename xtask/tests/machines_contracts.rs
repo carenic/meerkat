@@ -423,14 +423,14 @@ fn phase1_production_body_audit_rejects_machine_body_hidden_in_wrapper_macro() {
     fs::create_dir_all(wrapped_body.parent().expect("wrapped body parent")).expect("create parent");
     fs::write(
         &wrapped_body,
-        r#"
+        r"
 macro_rules! prod_body {
     () => {
         meerkat_machine_dsl::machine! { machine MeerkatMachine {} }
     };
 }
 prod_body!();
-"#,
+",
     )
     .expect("write wrapped body");
 
@@ -543,6 +543,18 @@ fn live_flow_runtime_reducer_transitions_are_mob_machine_command_gated() {
 }
 
 #[test]
+fn live_mob_runtime_catalog_commands_fail_close_on_matching_machine_inputs() {
+    require_live_workspace_runfiles();
+    let root = repo_root().expect("repo root");
+    let mismatches = collect_mob_runtime_catalog_command_gate_mismatches(&root)
+        .expect("catalog command gate mismatches");
+    assert!(
+        mismatches.is_empty(),
+        "catalog-classified Mob runtime commands must fail-close on their matching MobMachine inputs, got {mismatches:#?}"
+    );
+}
+
+#[test]
 fn live_flow_runtime_reducer_transition_ratchet_rejects_direct_runtime_calls() {
     let dir = tempdir().expect("tempdir");
     let runtime = dir.path().join("meerkat-mob/src/runtime");
@@ -593,14 +605,24 @@ fn live_flow_runtime_reducer_transition_ratchet_rejects_aliases_and_projection_w
     fs::create_dir_all(&runtime).expect("create runtime dir");
     fs::write(
         runtime.join("aliased.rs"),
-        "use crate::run::flow_run as fr;\nuse crate::run::flow_frame::{transition as frame_transition, Input as FrameInput};\nfn bad() { let _ = fr::transition(&state, input, &ctx); let _ = frame_transition(&state, input, &ctx); let _ = FrameInput::SealFrame(payload); }",
+        "use crate::run::flow_run as fr;\nuse crate::run::flow_run::transition as run_transition;\nuse crate::run::flow_frame::{transition as frame_transition, Input as FrameInput};\nuse crate::run::flow_frame::*;\nuse crate::run::loop_iteration::{transition, Input};\nfn bad() { let _ = fr::transition(&state, input, &ctx); let _ = run_transition(&state, input, &ctx); let _ = frame_transition(&state, input, &ctx); let _ = FrameInput::SealFrame(payload); let _ = transition(&state, input, &ctx); let _ = Input::CancelLoop(payload); }",
     )
     .expect("write aliased reducer use");
     fs::write(
         runtime.join("projection_write.rs"),
-        "async fn bad(mut run: MobRun, store: Store) { run.flow_state.phase = flow_run::Phase::Running; let _ = store.cas_flow_state(&id, &old, &run.flow_state).await; }",
+        "async fn bad(mut run: MobRun, mut frame: FrameSnapshot, store: Store) { run.flow_state.phase = flow_run::Phase::Running; run.flow_state.active_node_count = 99; frame.kernel_state.node_status.insert(node, NodeRunStatus::Ready); frame.kernel_state.ready_queue.push(node); let _ = store.cas_flow_state(&id, &old, &run.flow_state).await; }",
     )
     .expect("write projection write");
+    fs::write(
+        runtime.join("compound_projection_write.rs"),
+        "async fn bad(store: Store) { let _ = store.cas_grant_node_slot(a).await; let _ = store.cas_start_loop(b).await; let _ = store.cas_grant_body_frame_start(c).await; let _ = store.cas_complete_body_frame(d).await; let _ = store.cas_loop_request_body_frame(e).await; let _ = store.cas_complete_loop(f).await; }",
+    )
+    .expect("write compound projection write");
+    fs::write(
+        runtime.join("projection_helper_wrapper.rs"),
+        "async fn persist_body_frame(store: Store) { let _ = store.cas_grant_body_frame_start(c).await; }\nasync fn bad(store: Store) { persist_body_frame(store).await; }",
+    )
+    .expect("write projection helper wrapper");
 
     let mismatches = collect_direct_flow_reducer_transition_mismatches(dir.path())
         .expect("flow reducer transition mismatches");
@@ -617,15 +639,48 @@ fn live_flow_runtime_reducer_transition_ratchet_rejects_aliases_and_projection_w
         "expected imported transition alias to be rejected, got {mismatches:#?}"
     );
     assert!(
+        mismatches.iter().any(|mismatch| mismatch
+            .contains("direct live-flow reducer transition alias `run_transition`")),
+        "expected direct imported transition alias to be rejected, got {mismatches:#?}"
+    );
+    assert!(
         mismatches
             .iter()
             .any(|mismatch| mismatch.contains("direct live-flow reducer input alias `FrameInput`")),
         "expected imported input alias to be rejected, got {mismatches:#?}"
     );
     assert!(
+        mismatches
+            .iter()
+            .any(|mismatch| mismatch
+                .contains("direct live-flow reducer transition alias `transition`")),
+        "expected bare imported transition to be rejected, got {mismatches:#?}"
+    );
+    assert!(
+        mismatches
+            .iter()
+            .any(|mismatch| mismatch.contains("direct live-flow reducer input alias `Input`")),
+        "expected bare imported input to be rejected, got {mismatches:#?}"
+    );
+    assert!(
         mismatches.iter().any(|mismatch| mismatch
-            .contains("direct live-flow projection mutation `.flow_state.phase =`")),
+            .contains("direct live-flow projection mutation `.flow_state.phase`")),
         "expected direct flow_state mutation to be rejected, got {mismatches:#?}"
+    );
+    assert!(
+        mismatches.iter().any(|mismatch| mismatch
+            .contains("direct live-flow projection mutation `.flow_state.active_node_count`")),
+        "expected direct active_node_count mutation to be rejected, got {mismatches:#?}"
+    );
+    assert!(
+        mismatches.iter().any(|mismatch| mismatch
+            .contains("direct live-flow projection mutation `.kernel_state.node_status`")),
+        "expected direct frame node_status mutation to be rejected, got {mismatches:#?}"
+    );
+    assert!(
+        mismatches.iter().any(|mismatch| mismatch
+            .contains("direct live-flow projection mutation `.kernel_state.ready_queue`")),
+        "expected direct frame ready_queue mutation to be rejected, got {mismatches:#?}"
     );
     assert!(
         mismatches
@@ -633,6 +688,141 @@ fn live_flow_runtime_reducer_transition_ratchet_rejects_aliases_and_projection_w
             .any(|mismatch| mismatch
                 .contains("direct live-flow projection mutation `.cas_flow_state(")),
         "expected direct cas_flow_state write to be rejected, got {mismatches:#?}"
+    );
+    for token in [
+        ".cas_grant_node_slot(",
+        ".cas_start_loop(",
+        ".cas_grant_body_frame_start(",
+        ".cas_complete_body_frame(",
+        ".cas_loop_request_body_frame(",
+        ".cas_complete_loop(",
+    ] {
+        assert!(
+            mismatches.iter().any(|mismatch| mismatch.contains(token)),
+            "expected compound projection CAS write {token} to be rejected, got {mismatches:#?}"
+        );
+    }
+    assert!(
+        mismatches.iter().any(|mismatch| {
+            mismatch.contains("meerkat-mob/src/runtime/projection_helper_wrapper.rs")
+                && mismatch.contains(".cas_grant_body_frame_start(")
+        }),
+        "expected helper wrapper around compound projection CAS to be rejected, got {mismatches:#?}"
+    );
+}
+
+#[test]
+fn mob_runtime_catalog_command_gate_ratchet_rejects_missing_and_warning_only_gates() {
+    let dir = tempdir().expect("tempdir");
+    let runtime = dir.path().join("meerkat-mob/src/runtime");
+    fs::create_dir_all(&runtime).expect("create runtime dir");
+    fs::write(
+        runtime.join("actor.rs"),
+        r#"
+async fn handle_run_flow(&mut self) -> Result<RunId, MobError> {
+    self.apply_dsl_input(MobMachineInput::CreateRunSeed, "create_run_seed")?;
+    Ok(RunId::new())
+}
+
+async fn handle_cancel_flow(&mut self) -> Result<(), MobError> {
+    Ok(())
+}
+
+async fn handle_task_create(&mut self) -> Result<TaskId, MobError> {
+    let task_id = self.task_board_service.create_task().await?;
+    if let Err(error) = self.apply_dsl_input(MobMachineInput::TaskCreate { task_id }, "handle_task_create") {
+        tracing::warn!(%error, "TaskCreate DSL input rejected; DSL and event-sourced task board may diverge");
+    }
+    Ok(task_id)
+}
+
+async fn handle_force_cancel(&mut self) -> Result<(), MobError> {
+    self.cancel_runtime().await
+}
+
+async fn dispatch(&mut self, command: MobCommand) {
+    match command {
+        MobCommand::SetSpawnPolicy { policy, reply_tx } => {
+            self.spawn_policy.set(policy).await;
+            let _ = reply_tx.send(());
+        }
+        _ => {}
+    }
+}
+"#,
+    )
+    .expect("write actor");
+
+    let mismatches = collect_mob_runtime_catalog_command_gate_mismatches(dir.path())
+        .expect("catalog command gate mismatches");
+    for input in [
+        "RunFlow",
+        "CancelFlow",
+        "TaskCreate",
+        "SetSpawnPolicy",
+        "ForceCancel",
+    ] {
+        assert!(
+            mismatches.iter().any(|mismatch| {
+                mismatch.contains(&format!("MobCommand::{input}"))
+                    && mismatch.contains(&format!("MobMachineInput::{input}"))
+            }),
+            "expected missing/fail-open {input} command gate to be rejected, got {mismatches:#?}"
+        );
+    }
+}
+
+#[test]
+fn mob_runtime_catalog_command_gate_ratchet_accepts_fail_closed_gates() {
+    let dir = tempdir().expect("tempdir");
+    let runtime = dir.path().join("meerkat-mob/src/runtime");
+    fs::create_dir_all(&runtime).expect("create runtime dir");
+    fs::write(
+        runtime.join("actor.rs"),
+        r#"
+async fn handle_run_flow(&mut self) -> Result<RunId, MobError> {
+    self.apply_dsl_input(MobMachineInput::RunFlow, "run_flow_input")?;
+    Ok(RunId::new())
+}
+
+async fn handle_cancel_flow(&mut self) -> Result<(), MobError> {
+    self.apply_dsl_input(MobMachineInput::CancelFlow, "cancel_flow_input")?;
+    Ok(())
+}
+
+async fn handle_task_create(&mut self) -> Result<TaskId, MobError> {
+    let task_id = TaskId::new();
+    self.apply_dsl_input(MobMachineInput::TaskCreate { task_id }, "handle_task_create")
+        .map_err(|error| MobError::Internal(format!("task create rejected by MobMachine guards: {error}")))?;
+    self.task_board_service.create_task().await?;
+    Ok(task_id)
+}
+
+async fn handle_force_cancel(&mut self) -> Result<(), MobError> {
+    self.apply_dsl_input(MobMachineInput::ForceCancel, "force_cancel_input")?;
+    self.cancel_runtime().await
+}
+
+async fn dispatch(&mut self, command: MobCommand) -> Result<(), MobError> {
+    match command {
+        MobCommand::SetSpawnPolicy { policy, reply_tx } => {
+            self.apply_dsl_input(MobMachineInput::SetSpawnPolicy, "set_spawn_policy")?;
+            self.spawn_policy.set(policy).await;
+            let _ = reply_tx.send(());
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+"#,
+    )
+    .expect("write actor");
+
+    let mismatches = collect_mob_runtime_catalog_command_gate_mismatches(dir.path())
+        .expect("catalog command gate mismatches");
+    assert!(
+        mismatches.is_empty(),
+        "expected fail-closed catalog command gates to be accepted, got {mismatches:#?}"
     );
 }
 
@@ -643,7 +833,7 @@ fn live_flow_runtime_reducer_transition_ratchet_accepts_typed_authority_wrappers
     fs::create_dir_all(run.parent().expect("run parent")).expect("create run dir");
     fs::write(
         &run,
-        r#"
+        r"
 pub(crate) fn apply_mob_machine_flow_run_command(
     state: &flow_run::State,
     command: MobMachineFlowRunCommand,
@@ -660,7 +850,7 @@ impl MobMachineFlowRunCommand {
         }
     }
 }
-"#,
+",
     )
     .expect("write typed wrapper");
 
@@ -679,13 +869,13 @@ fn live_flow_runtime_projection_ratchet_accepts_typed_outcome_commits() {
     fs::create_dir_all(&runtime).expect("create runtime dir");
     fs::write(
         runtime.join("flow.rs"),
-        r#"
+        r"
 async fn good(run_store: Store, run_id: &RunId, run: MobRun, command: MobMachineFlowRunCommand, authority: MobMachineFlowAuthorityToken) -> Result<(), MobError> {
     let outcome = apply_mob_machine_flow_run_command(&run.flow_state, command, authority)?;
     run_store.cas_flow_state(run_id, &run.flow_state, &outcome.next_state).await?;
     Ok(())
 }
-"#,
+",
     )
     .expect("write typed outcome commit");
 

@@ -645,6 +645,7 @@ pub enum MeerkatMachineCatalogInput {
     Destroy,
     RuntimeState,
     RuntimeRealtimeAttachmentStatus,
+    ModelRoutingStatus,
     SetModelRoutingBaseline,
     RequestFiniteSwitchTurn,
     RequestUntilChangedSwitchTurn,
@@ -697,6 +698,7 @@ impl MeerkatMachineCatalogInput {
             Self::Destroy => "Destroy",
             Self::RuntimeState => "RuntimeState",
             Self::RuntimeRealtimeAttachmentStatus => "RuntimeRealtimeAttachmentStatus",
+            Self::ModelRoutingStatus => "ModelRoutingStatus",
             Self::SetModelRoutingBaseline => "SetModelRoutingBaseline",
             Self::RequestFiniteSwitchTurn => "RequestFiniteSwitchTurn",
             Self::RequestUntilChangedSwitchTurn => "RequestUntilChangedSwitchTurn",
@@ -760,13 +762,13 @@ const fn meerkat_machine_command_classification(
             ])
         }
         MeerkatMachineCommandVariant::RuntimeRealtimeChannelStatus => {
-            MeerkatMachineCommandClassification::ShellMechanic(
-                MeerkatMachineShellMechanicReason::RealtimeTransportObservation,
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::RuntimeRealtimeAttachmentStatus,
             )
         }
         MeerkatMachineCommandVariant::SessionModelRoutingStatus => {
-            MeerkatMachineCommandClassification::ShellMechanic(
-                MeerkatMachineShellMechanicReason::SessionModelRoutingObservation,
+            MeerkatMachineCommandClassification::CatalogInput(
+                MeerkatMachineCatalogInput::ModelRoutingStatus,
             )
         }
         MeerkatMachineCommandVariant::PrepareLocalSessionBindings => {

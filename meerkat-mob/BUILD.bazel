@@ -94,7 +94,7 @@ rust_test(
         "fast",
         "unit",
     ],
-    size = "small",
+    size = "large",
     data = [
         ":package_runfiles",
     ],
@@ -118,6 +118,7 @@ rust_test(
         "//meerkat-machine-schema:meerkat_machine_schema",
         "//meerkat-runtime:meerkat_runtime",
         "//meerkat-session:meerkat_session",
+        "//meerkat-store:meerkat_store",
         "//meerkat:meerkat",
     ] + all_crate_deps(
         package_name = "meerkat-mob",

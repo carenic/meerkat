@@ -1814,7 +1814,7 @@ macro_rules! meerkat_catalog_machine_dsl {
             RetireCompletedOp { operation_id: String, outcome: Enum<OperationTerminalOutcomeKind>, payload: String },
             TerminateOp { operation_id: String, outcome: Enum<OperationTerminalOutcomeKind>, payload: String },
             RequestWaitAll { wait_request_id: WaitRequestId, operation_ids: Set<String>, operation_id_tokens: Set<OperationId> },
-            SatisfyWaitAll,
+            SatisfyWaitAll { wait_request_id: WaitRequestId, operation_id_tokens: Set<OperationId> },
             CancelWaitAll,
             // Comms drain inputs
             SpawnDrain { mode: DrainMode },
@@ -5949,8 +5949,10 @@ macro_rules! meerkat_catalog_machine_dsl {
         // each op terminalization; the guard serves as the fixed point.
         transition SatisfyWaitAll {
             per_phase [Idle, Attached, Running, Retired, Stopped]
-            on input SatisfyWaitAll
+            on input SatisfyWaitAll { wait_request_id, operation_id_tokens }
             guard "wait_is_active" { self.wait_active == true }
+            guard "wait_request_matches" { self.wait_request_id == Some(wait_request_id) }
+            guard "operation_tokens_match" { self.wait_operation_id_tokens == operation_id_tokens }
             guard "all_members_terminal" {
                 for_all(member_id in self.wait_operation_ids,
                     self.op_statuses.get_copied(member_id) == Some(OperationStatus::Completed)
@@ -5962,11 +5964,14 @@ macro_rules! meerkat_catalog_machine_dsl {
             }
             update {
                 self.wait_active = false;
+                self.wait_request_id = None;
+                self.wait_operation_ids = EmptySet;
+                self.wait_operation_id_tokens = EmptySet;
             }
             to Idle
             emit WaitAllSatisfied {
-                wait_request_id: self.wait_request_id.get("value"),
-                operation_ids: self.wait_operation_id_tokens
+                wait_request_id: wait_request_id,
+                operation_ids: operation_id_tokens
             }
         }
 

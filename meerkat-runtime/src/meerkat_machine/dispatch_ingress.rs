@@ -1,6 +1,24 @@
 use super::*;
 
 impl MeerkatMachine {
+    fn classify_ingress_dsl_rejection(state: RuntimeState, reason: String) -> RuntimeDriverError {
+        match state {
+            RuntimeState::Destroyed => RuntimeDriverError::Destroyed,
+            RuntimeState::Retired | RuntimeState::Stopped => RuntimeDriverError::NotReady { state },
+            _ => RuntimeDriverError::ValidationFailed { reason },
+        }
+    }
+
+    fn reject_visible_terminal_ingress(state: RuntimeState) -> Result<(), RuntimeDriverError> {
+        match state {
+            RuntimeState::Destroyed => Err(RuntimeDriverError::Destroyed),
+            RuntimeState::Retired | RuntimeState::Stopped => {
+                Err(RuntimeDriverError::NotReady { state })
+            }
+            _ => Ok(()),
+        }
+    }
+
     pub(super) async fn execute_meerkat_machine_ingress_command(
         &self,
         command: MeerkatMachineCommand,
@@ -32,18 +50,11 @@ impl MeerkatMachine {
                     .existing_session_runtime_state(&session_id)
                     .await
                     .unwrap_or(RuntimeState::Destroyed);
-                if matches!(
-                    state,
-                    RuntimeState::Retired | RuntimeState::Stopped | RuntimeState::Destroyed
-                ) {
-                    return Err(match state {
-                        RuntimeState::Destroyed => RuntimeDriverError::Destroyed,
-                        RuntimeState::Retired | RuntimeState::Stopped => {
-                            RuntimeDriverError::NotReady { state }
-                        }
-                        _ => unreachable!("guard only matches retired/stopped/destroyed"),
-                    });
-                }
+                let visible_state = self
+                    .existing_session_visible_runtime_state(&session_id)
+                    .await
+                    .unwrap_or(RuntimeState::Destroyed);
+                Self::reject_visible_terminal_ingress(visible_state)?;
 
                 let (resolved, outcome, handle, accepted_input_id, signal) = {
                     let mut driver = driver.lock().await;
@@ -64,14 +75,15 @@ impl MeerkatMachine {
                         "AcceptWithCompletion",
                     )
                     .await
-                    .map_err(|reason| RuntimeDriverError::ValidationFailed {
-                        reason: format!(
+                    .map_err(|reason| {
+                        let reason = format!(
                             "{reason}; input_kind={}; immediate={}; interrupt_yielding={}; wake_if_idle={}",
                             input.kind(),
                             resolved.coarse_flags.request_immediate_processing,
                             resolved.coarse_flags.interrupt_yielding,
                             resolved.coarse_flags.wake_if_idle,
-                        ),
+                        );
+                        Self::classify_ingress_dsl_rejection(state, reason)
                     })?;
                     let result = match driver
                         .accept_resolved_input(input, resolved.clone())
@@ -213,18 +225,11 @@ impl MeerkatMachine {
                     .existing_session_runtime_state(&session_id)
                     .await
                     .unwrap_or(RuntimeState::Destroyed);
-                if matches!(
-                    state,
-                    RuntimeState::Retired | RuntimeState::Stopped | RuntimeState::Destroyed
-                ) {
-                    return Err(match state {
-                        RuntimeState::Destroyed => RuntimeDriverError::Destroyed,
-                        RuntimeState::Retired | RuntimeState::Stopped => {
-                            RuntimeDriverError::NotReady { state }
-                        }
-                        _ => unreachable!("guard only matches retired/stopped/destroyed"),
-                    });
-                }
+                let visible_state = self
+                    .existing_session_visible_runtime_state(&session_id)
+                    .await
+                    .unwrap_or(RuntimeState::Destroyed);
+                Self::reject_visible_terminal_ingress(visible_state)?;
 
                 let (outcome, accepted_input_id) = {
                     let mut driver = driver.lock().await;
@@ -240,7 +245,7 @@ impl MeerkatMachine {
                         "AcceptWithoutWake",
                     )
                     .await
-                    .map_err(|reason| RuntimeDriverError::ValidationFailed { reason })?;
+                    .map_err(|reason| Self::classify_ingress_dsl_rejection(state, reason))?;
                     let mut resolved = resolved;
                     resolved.policy.wake_mode = crate::policy::WakeMode::None;
                     let result = match driver
@@ -322,43 +327,47 @@ impl MeerkatMachine {
                     None => None,
                 };
 
-                {
-                    let driver = driver.lock().await;
-                    if !driver.is_idle_or_attached() {
-                        return Err(Self::normalize_destroyed_error(
-                            RuntimeDriverError::NotReady {
-                                state: self
-                                    .existing_session_runtime_state(&session_id)
-                                    .await
-                                    .unwrap_or(RuntimeState::Destroyed),
-                            },
-                        ));
-                    }
+                let visible_state = self
+                    .existing_session_visible_runtime_state(&session_id)
+                    .await
+                    .unwrap_or(RuntimeState::Destroyed);
+                Self::reject_visible_terminal_ingress(visible_state)?;
 
-                    let active_input_ids = driver.as_driver().active_input_ids();
-                    if !active_input_ids.is_empty() {
+                let prepare_precheck_error = {
+                    let driver = driver.lock().await;
+                    let state = driver.runtime_state();
+                    if !driver.is_idle_or_attached() {
+                        Some(Self::normalize_destroyed_error(
+                            RuntimeDriverError::NotReady { state },
+                        ))
+                    } else if !driver.as_driver().active_input_ids().is_empty() {
                         let duplicate_active_input = input
                             .header()
                             .idempotency_key
                             .as_ref()
                             .and_then(|key| driver.input_id_for_idempotency_key(key));
                         if let Some(existing_id) = duplicate_active_input {
-                            return Err(RuntimeDriverError::ValidationFailed {
+                            Some(RuntimeDriverError::ValidationFailed {
                                 reason: format!(
                                     "accept_input_and_run does not support deduplicated admission; existing input {existing_id} already owns execution"
                                 ),
-                            });
+                            })
+                        } else {
+                            Some(RuntimeDriverError::NotReady { state })
                         }
-                        return Err(RuntimeDriverError::NotReady {
-                            state: self
-                                .existing_session_runtime_state(&session_id)
-                                .await
-                                .unwrap_or(RuntimeState::Destroyed),
-                        });
+                    } else {
+                        None
                     }
+                };
+                if let Some(err) = prepare_precheck_error {
+                    return Err(err);
                 }
 
-                // DSL-first: validate Prepare transition before driver realizes the effect.
+                // Driver preconditions above are read-only and run before the
+                // machine transition. Once `Prepare` is accepted, every later
+                // failure is an effect-realization failure and must explicitly
+                // unwind both sides rather than treating driver projection as a
+                // veto over an accepted transition.
                 let run_id = RunId::new();
                 let previous_dsl_state = match self
                     .stage_session_dsl_input(

@@ -255,7 +255,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RetireCompletedOp`(operation_id: String, outcome: OperationTerminalOutcomeKind, payload: String)
 - `TerminateOp`(operation_id: String, outcome: OperationTerminalOutcomeKind, payload: String)
 - `RequestWaitAll`(wait_request_id: WaitRequestId, operation_ids: Set<String>, operation_id_tokens: Set<OperationId>)
-- `SatisfyWaitAll`
+- `SatisfyWaitAll`(wait_request_id: WaitRequestId, operation_id_tokens: Set<OperationId>)
 - `CancelWaitAll`
 - `SpawnDrain`(mode: DrainMode)
 - `StopDrain`
@@ -3695,45 +3695,55 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `SatisfyWaitAllIdle`
 - From: `Idle`
-- On: `SatisfyWaitAll`()
+- On: `SatisfyWaitAll`(wait_request_id, operation_id_tokens)
 - Guards:
   - `wait_is_active`
+  - `wait_request_matches`
+  - `operation_tokens_match`
   - `all_members_terminal`
 - Emits: `WaitAllSatisfied`
 - To: `Idle`
 
 ### `SatisfyWaitAllAttached`
 - From: `Attached`
-- On: `SatisfyWaitAll`()
+- On: `SatisfyWaitAll`(wait_request_id, operation_id_tokens)
 - Guards:
   - `wait_is_active`
+  - `wait_request_matches`
+  - `operation_tokens_match`
   - `all_members_terminal`
 - Emits: `WaitAllSatisfied`
 - To: `Attached`
 
 ### `SatisfyWaitAllRunning`
 - From: `Running`
-- On: `SatisfyWaitAll`()
+- On: `SatisfyWaitAll`(wait_request_id, operation_id_tokens)
 - Guards:
   - `wait_is_active`
+  - `wait_request_matches`
+  - `operation_tokens_match`
   - `all_members_terminal`
 - Emits: `WaitAllSatisfied`
 - To: `Running`
 
 ### `SatisfyWaitAllRetired`
 - From: `Retired`
-- On: `SatisfyWaitAll`()
+- On: `SatisfyWaitAll`(wait_request_id, operation_id_tokens)
 - Guards:
   - `wait_is_active`
+  - `wait_request_matches`
+  - `operation_tokens_match`
   - `all_members_terminal`
 - Emits: `WaitAllSatisfied`
 - To: `Retired`
 
 ### `SatisfyWaitAllStopped`
 - From: `Stopped`
-- On: `SatisfyWaitAll`()
+- On: `SatisfyWaitAll`(wait_request_id, operation_id_tokens)
 - Guards:
   - `wait_is_active`
+  - `wait_request_matches`
+  - `operation_tokens_match`
   - `all_members_terminal`
 - Emits: `WaitAllSatisfied`
 - To: `Stopped`

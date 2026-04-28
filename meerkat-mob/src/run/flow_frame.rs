@@ -191,7 +191,10 @@ pub(crate) mod inputs {
         pub node_branches: std::collections::BTreeMap<FlowNodeId, Option<BranchId>>,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub struct AdmitNextReadyNode {}
+    pub struct AdmitNextReadyNode {
+        pub node_id: FlowNodeId,
+        pub ready_queue: Vec<FlowNodeId>,
+    }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct CompleteNode {
         pub node_id: FlowNodeId,
@@ -468,7 +471,7 @@ fn is_terminal(status: NodeRunStatus) -> bool {
     )
 }
 
-pub(crate) fn terminal_status_from_node_projection(state: &State) -> Option<FrameTerminalStatus> {
+fn terminal_status_from_node_projection(state: &State) -> Option<FrameTerminalStatus> {
     if !state.ordered_nodes.iter().all(|node_id| {
         state
             .node_status

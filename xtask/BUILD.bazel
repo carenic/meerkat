@@ -199,6 +199,7 @@ rust_test(
         "//meerkat:cargo_manifest",
         "//meerkat:package_runfiles",
         "//xtask:cargo_manifest",
+        "BUILD.bazel",
         "//:workspace_runfiles",
         "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin",
         "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustc_lib",

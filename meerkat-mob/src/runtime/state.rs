@@ -234,6 +234,13 @@ pub(super) enum MobCommand {
         input: Box<mob_dsl::MobMachineInput>,
         reply_tx: oneshot::Sender<Result<mob_dsl::MobMachineState, MobError>>,
     },
+    PreviewMachineInput {
+        input: Box<mob_dsl::MobMachineInput>,
+        reply_tx: oneshot::Sender<Result<mob_dsl::MobMachineState, MobError>>,
+    },
+    QueryMachineState {
+        reply_tx: oneshot::Sender<mob_dsl::MobMachineState>,
+    },
     ProjectMachineSignal {
         signal: mob_dsl::MobMachineSignal,
     },
@@ -376,7 +383,7 @@ pub(super) enum MobCommand {
     },
     SetSpawnPolicy {
         policy: Option<Arc<dyn super::spawn_policy::SpawnPolicy>>,
-        reply_tx: oneshot::Sender<()>,
+        reply_tx: oneshot::Sender<Result<(), MobError>>,
     },
     Shutdown {
         reply_tx: oneshot::Sender<Result<(), MobError>>,

@@ -14,6 +14,7 @@ use crate::definition::{
 };
 use crate::error::MobError;
 use crate::ids::{AgentIdentity, FlowId, MeerkatId, RunId, StepId};
+use crate::machines::mob_machine as mob_dsl;
 use crate::run::flow_run;
 use crate::run::{
     FailureLedgerEntry, FlowContext, FlowRunConfig, MobMachineFlowAuthorityToken,
@@ -176,11 +177,8 @@ impl FlowEngine {
                         .await?
                         .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
 
-                    if matches!(
-                        frame_outcome.root_phase,
-                        FlowFrameTerminalPhase::Failed | FlowFrameTerminalPhase::Canceled
-                    ) {
-                        if frame_outcome.root_phase == FlowFrameTerminalPhase::Failed {
+                    match frame_outcome.root_phase {
+                        FlowFrameTerminalPhase::Failed => {
                             for (step_id, status) in &frame_outcome.step_statuses {
                                 if *status != StepRunStatus::Failed
                                     || run_step_has_terminal_projection(&projected_run, step_id)
@@ -219,25 +217,25 @@ impl FlowEngine {
                                     )
                                     .await?;
                             }
-                        }
-                        return self
-                            .fail_run(
-                                &run_id,
-                                &config.flow_id,
-                                MobError::FlowFailed {
-                                    run_id: run_id.clone(),
-                                    reason: match frame_outcome.root_phase {
-                                        FlowFrameTerminalPhase::Failed => {
-                                            "root frame sealed failed".into()
-                                        }
-                                        FlowFrameTerminalPhase::Canceled => {
-                                            "root frame sealed canceled".into()
-                                        }
-                                        FlowFrameTerminalPhase::Completed => unreachable!(),
+                            return self
+                                .fail_run(
+                                    &run_id,
+                                    &config.flow_id,
+                                    MobError::FlowFailed {
+                                        run_id: run_id.clone(),
+                                        reason: "root frame sealed failed".into(),
                                     },
-                                },
-                            )
-                            .await;
+                                )
+                                .await;
+                        }
+                        FlowFrameTerminalPhase::Canceled => {
+                            self.cancel_dispatched_steps(&run_id).await?;
+                            let _ = self
+                                .terminalize_canceled(run_id.clone(), config.flow_id.clone())
+                                .await?;
+                            return Ok(());
+                        }
+                        FlowFrameTerminalPhase::Completed => {}
                     }
 
                     // Project the typed frame outcome into MobMachine-owned run state once at the
@@ -1645,6 +1643,39 @@ impl FlowEngine {
         )))
     }
 
+    pub(super) async fn apply_command_with_machine_state(
+        &self,
+        run_id: &RunId,
+        command: MobMachineFlowRunCommand,
+        machine_state: mob_dsl::MobMachineState,
+        authority: MobMachineFlowAuthorityToken,
+        context: &'static str,
+    ) -> Result<Vec<flow_run::Effect>, MobError> {
+        for attempt in 0..5u32 {
+            let run = self.run_snapshot(run_id).await?;
+            let outcome = apply_mob_machine_flow_run_command(
+                &run.flow_state,
+                &machine_state,
+                run_id,
+                command.clone(),
+                authority,
+            )?;
+            let transitioned = self
+                .run_store
+                .cas_flow_state(run_id, &run.flow_state, &outcome.next_state)
+                .await?;
+            if transitioned {
+                return Ok(outcome.effects);
+            }
+            if attempt < 4 {
+                tracing::debug!(attempt, context, "flow.rs CAS contention, retrying");
+            }
+        }
+        Err(MobError::Internal(format!(
+            "{context}: CAS contention after 5 attempts for run {run_id}"
+        )))
+    }
+
     async fn condition_passed(&self, run_id: &RunId, step_id: &StepId) -> Result<bool, MobError> {
         Ok(self
             .cas_flow_input_with_effects(
@@ -1926,6 +1957,28 @@ impl FlowEngine {
             .await
     }
 
+    pub(super) async fn terminalize_canceled_with_machine_state(
+        &self,
+        run_id: RunId,
+        flow_id: FlowId,
+        machine_state: mob_dsl::MobMachineState,
+    ) -> Result<TerminalizationOutcome, MobError> {
+        let input =
+            MobMachineFlowRunCommand::TerminalizeCanceled(flow_run::inputs::TerminalizeCanceled {});
+        let authority_input = input.authority_input(&run_id);
+        let authority =
+            MobMachineFlowAuthorityToken::from_accepted_mob_machine_input(&authority_input)?;
+        self.terminalize_with_machine_state(
+            run_id,
+            flow_id,
+            TerminalizationTarget::Canceled,
+            input,
+            machine_state,
+            authority,
+        )
+        .await
+    }
+
     async fn terminalize(
         &self,
         run_id: RunId,
@@ -1951,7 +2004,27 @@ impl FlowEngine {
             .await?;
         let authority =
             MobMachineFlowAuthorityToken::from_accepted_mob_machine_input(&authority_input)?;
+        self.terminalize_with_machine_state(
+            run_id,
+            flow_id,
+            target,
+            input,
+            machine_state,
+            authority,
+        )
+        .await
+    }
 
+    async fn terminalize_with_machine_state(
+        &self,
+        run_id: RunId,
+        flow_id: FlowId,
+        target: TerminalizationTarget,
+        input: MobMachineFlowRunCommand,
+        machine_state: mob_dsl::MobMachineState,
+        authority: MobMachineFlowAuthorityToken,
+    ) -> Result<TerminalizationOutcome, MobError> {
+        let next_status = target.status();
         for attempt in 0..5u32 {
             let run = self.run_snapshot(&run_id).await?;
             if run.status.is_terminal()

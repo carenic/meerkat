@@ -1,4 +1,8 @@
-#![allow(clippy::redundant_closure_for_method_calls)]
+#![allow(
+    clippy::expect_used,
+    clippy::panic,
+    clippy::redundant_closure_for_method_calls
+)]
 
 use meerkat_machine_schema::TriggerKind;
 use meerkat_machine_schema::catalog::dsl::{
@@ -159,21 +163,38 @@ fn catalog_input_as_str_arms(source: &str, enum_name: &str) -> BTreeSet<(String,
     let function_start = impl_tail
         .find("fn as_str")
         .unwrap_or_else(|| panic!("missing `{enum_name}::as_str`"));
-    impl_tail[function_start..]
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim();
-            let arm = trimmed.strip_prefix("Self::")?;
-            let (variant, literal_tail) = arm.split_once("=>")?;
-            let literal = literal_tail
-                .trim()
-                .strip_prefix('"')?
-                .split_once('"')?
-                .0
-                .to_owned();
-            Some((variant.trim().to_owned(), literal))
-        })
-        .collect()
+    let mut arms = BTreeSet::new();
+    let mut pending_variant = None::<String>;
+    for line in impl_tail[function_start..].lines() {
+        let trimmed = line.trim();
+        if let Some(arm) = trimmed.strip_prefix("Self::") {
+            if let Some((variant, literal_tail)) = arm.split_once("=>") {
+                pending_variant = Some(variant.trim().to_owned());
+                if let Some(literal) = literal_tail
+                    .trim()
+                    .strip_prefix('"')
+                    .and_then(|tail| tail.split_once('"'))
+                    .map(|(literal, _)| literal.to_owned())
+                {
+                    let variant = pending_variant.take().expect("variant just assigned");
+                    arms.insert((variant, literal));
+                }
+            }
+            continue;
+        }
+        if let Some(variant) = pending_variant.take() {
+            if let Some(literal) = trimmed
+                .strip_prefix('"')
+                .and_then(|tail| tail.split_once('"'))
+                .map(|(literal, _)| literal.to_owned())
+            {
+                arms.insert((variant, literal));
+            } else {
+                pending_variant = Some(variant);
+            }
+        }
+    }
+    arms
 }
 
 fn assert_catalog_input_enum_is_name_identity(source_path: &Path, enum_name: &str) {

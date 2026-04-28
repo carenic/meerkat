@@ -254,14 +254,18 @@ pub(crate) mod inputs {
         pub frame_id: FrameId,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub struct PumpNodeScheduler {}
+    pub struct PumpNodeScheduler {
+        pub frame_id: FrameId,
+    }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct RegisterPendingBodyFrame {
         pub loop_instance_id: LoopInstanceId,
         pub depth: u32,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub struct PumpFrameScheduler {}
+    pub struct PumpFrameScheduler {
+        pub loop_instance_id: LoopInstanceId,
+    }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct NodeExecutionReleased {
         pub frame_id: FrameId,

@@ -5372,6 +5372,9 @@ impl<'a> MachineTlaCompiler<'a> {
         for helper in helper_dependency_order(self.schema) {
             self.render_helper(&mut out, helper);
         }
+        if self.schema.machine.as_str() == "MobMachine" {
+            self.render_mob_machine_native_helpers(&mut out);
+        }
         if !self.schema.helpers.is_empty() || !self.schema.derived.is_empty() {
             pushln!(&mut out);
         }
@@ -5581,6 +5584,160 @@ impl<'a> MachineTlaCompiler<'a> {
             )
             .expect("write to string");
         }
+    }
+
+    fn render_mob_machine_native_helpers(&self, out: &mut String) {
+        let prefix = |name: &str| self.scoped_helper_name(name);
+        writeln!(
+            out,
+            "{}(status) == status \\in {{\"Completed\", \"Failed\", \"Skipped\", \"Canceled\"}}",
+            prefix("mob_machine_node_terminal")
+        )
+        .expect("write to string");
+        writeln!(
+            out,
+            "{}(all_statuses, frame_id, node_id) ==",
+            prefix("mob_machine_frame_node_status_after_admit")
+        )
+        .expect("write to string");
+        pushln!(
+            out,
+            "    LET current == IF frame_id \\in DOMAIN all_statuses THEN all_statuses[frame_id] ELSE [x \\in {{}} |-> None]"
+        );
+        pushln!(
+            out,
+            "    IN MapSet(all_statuses, frame_id, MapSet(current, node_id, \"Running\"))"
+        );
+        writeln!(
+            out,
+            "{}(all_ready_queues, frame_id, node_id) ==",
+            prefix("mob_machine_frame_ready_queue_after_admit")
+        )
+        .expect("write to string");
+        pushln!(
+            out,
+            "    LET ready == IF frame_id \\in DOMAIN all_ready_queues THEN all_ready_queues[frame_id] ELSE <<>>"
+        );
+        pushln!(
+            out,
+            "    IN MapSet(all_ready_queues, frame_id, SelectSeq(ready, LAMBDA candidate: candidate # node_id))"
+        );
+        writeln!(
+            out,
+            "{}(all_statuses, frame_branches, ordered_nodes_by_frame, dependencies_by_frame, dependency_modes_by_frame, frame_id, node_id, terminal_status) ==",
+            prefix("mob_machine_frame_node_status_after_terminal")
+        )
+        .expect("write to string");
+        pushln!(
+            out,
+            "    LET current == IF frame_id \\in DOMAIN all_statuses THEN all_statuses[frame_id] ELSE [x \\in {{}} |-> None]"
+        );
+        pushln!(
+            out,
+            "        ordered == IF frame_id \\in DOMAIN ordered_nodes_by_frame THEN ordered_nodes_by_frame[frame_id] ELSE <<>>"
+        );
+        pushln!(
+            out,
+            "        branches == IF frame_id \\in DOMAIN frame_branches THEN frame_branches[frame_id] ELSE [x \\in {{}} |-> None]"
+        );
+        pushln!(
+            out,
+            "        dependencies == IF frame_id \\in DOMAIN dependencies_by_frame THEN dependencies_by_frame[frame_id] ELSE [x \\in {{}} |-> <<>>]"
+        );
+        pushln!(
+            out,
+            "        dependency_modes == IF frame_id \\in DOMAIN dependency_modes_by_frame THEN dependency_modes_by_frame[frame_id] ELSE [x \\in {{}} |-> \"All\"]"
+        );
+        pushln!(
+            out,
+            "        after_terminal == MapSet(current, node_id, terminal_status)"
+        );
+        writeln!(
+            out,
+            "        after_branch == [candidate \\in DOMAIN after_terminal |->"
+        )
+        .expect("write to string");
+        pushln!(
+            out,
+            "            IF terminal_status = \"Completed\" /\\ candidate # node_id"
+        );
+        pushln!(
+            out,
+            "                /\\ candidate \\in DOMAIN branches /\\ node_id \\in DOMAIN branches"
+        );
+        pushln!(
+            out,
+            "                /\\ branches[candidate] = branches[node_id]"
+        );
+        writeln!(
+            out,
+            "                /\\ ~{}(after_terminal[candidate])",
+            prefix("mob_machine_node_terminal")
+        )
+        .expect("write to string");
+        pushln!(
+            out,
+            "                /\\ after_terminal[candidate] # \"Running\""
+        );
+        pushln!(
+            out,
+            "            THEN \"Skipped\" ELSE after_terminal[candidate]]"
+        );
+        pushln!(
+            out,
+            "        after_dependencies == [candidate \\in DOMAIN after_branch |->"
+        );
+        pushln!(
+            out,
+            "            IF after_branch[candidate] # \"Pending\" THEN after_branch[candidate]"
+        );
+        pushln!(
+            out,
+            "            ELSE LET deps == IF candidate \\in DOMAIN dependencies THEN dependencies[candidate] ELSE <<>>"
+        );
+        pushln!(
+            out,
+            "                     mode == IF candidate \\in DOMAIN dependency_modes THEN dependency_modes[candidate] ELSE \"All\""
+        );
+        pushln!(
+            out,
+            "                     failed == \\E dep_index \\in DOMAIN deps: LET dep == deps[dep_index] IN dep \\in DOMAIN after_branch /\\ after_branch[dep] \\in {{\"Failed\", \"Skipped\", \"Canceled\"}}"
+        );
+        pushln!(out, "                     satisfied == Len(deps) = 0");
+        pushln!(
+            out,
+            "                         \\/ (mode = \"All\" /\\ \\A dep_index \\in DOMAIN deps: LET dep == deps[dep_index] IN dep \\in DOMAIN after_branch /\\ after_branch[dep] = \"Completed\")"
+        );
+        pushln!(
+            out,
+            "                         \\/ (mode = \"Any\" /\\ \\E dep_index \\in DOMAIN deps: LET dep == deps[dep_index] IN dep \\in DOMAIN after_branch /\\ after_branch[dep] = \"Completed\")"
+        );
+        pushln!(
+            out,
+            "                 IN IF failed THEN \"Skipped\" ELSE IF satisfied THEN \"Ready\" ELSE after_branch[candidate]]"
+        );
+        pushln!(
+            out,
+            "    IN MapSet(all_statuses, frame_id, after_dependencies)"
+        );
+        writeln!(
+            out,
+            "{}(all_ready_queues, all_statuses, ordered_nodes_by_frame, frame_id) ==",
+            prefix("mob_machine_frame_ready_queue_after_terminal")
+        )
+        .expect("write to string");
+        pushln!(
+            out,
+            "    LET statuses == IF frame_id \\in DOMAIN all_statuses THEN all_statuses[frame_id] ELSE [x \\in {{}} |-> None]"
+        );
+        pushln!(
+            out,
+            "        ordered == IF frame_id \\in DOMAIN ordered_nodes_by_frame THEN ordered_nodes_by_frame[frame_id] ELSE <<>>"
+        );
+        pushln!(
+            out,
+            "    IN MapSet(all_ready_queues, frame_id, SelectSeq(ordered, LAMBDA candidate: candidate \\in DOMAIN statuses /\\ statuses[candidate] = \"Ready\"))"
+        );
     }
 
     fn render_transition(&mut self, out: &mut String, transition: &TransitionSchema) {

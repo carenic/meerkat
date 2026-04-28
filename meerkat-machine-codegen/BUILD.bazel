@@ -91,6 +91,9 @@ rust_test(
     ),
     deps = [
         "//meerkat-machine-schema:meerkat_machine_schema",
+        "//meerkat-mob:meerkat_mob",
+        "//meerkat-runtime:meerkat_runtime",
+        "//meerkat-schedule:meerkat_schedule",
     ] + all_crate_deps(
         package_name = "meerkat-machine-codegen",
         normal = True,
@@ -387,9 +390,13 @@ rust_test(
         "fast",
     ],
     size = "small",
-    data = [],
+    data = [
+        ":package_runfiles",
+        "//:workspace_runfiles",
+    ],
     env = {
         "RUST_MIN_STACK": "16777216",
+        "WORKSPACE_ROOT": ".",
     },
     proc_macro_deps = all_crate_deps(
         package_name = "meerkat-machine-codegen",

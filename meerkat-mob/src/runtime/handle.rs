@@ -1419,7 +1419,7 @@ impl MobHandle {
             }
             MobMachineCommand::SetSpawnPolicy { policy } => {
                 self.send_actor_command(|reply_tx| MobCommand::SetSpawnPolicy { policy, reply_tx })
-                    .await?;
+                    .await??;
                 Ok(MobMachineCommandResult::Unit)
             }
             MobMachineCommand::Shutdown => {
@@ -3548,6 +3548,24 @@ impl MobHandle {
             reply_tx,
         })
         .await?
+    }
+
+    pub(crate) async fn preview_machine_input(
+        &self,
+        input: crate::machines::mob_machine::MobMachineInput,
+    ) -> Result<crate::machines::mob_machine::MobMachineState, MobError> {
+        self.send_actor_command(|reply_tx| MobCommand::PreviewMachineInput {
+            input: Box::new(input),
+            reply_tx,
+        })
+        .await?
+    }
+
+    pub(crate) async fn query_machine_state(
+        &self,
+    ) -> Result<crate::machines::mob_machine::MobMachineState, MobError> {
+        self.send_actor_command(|reply_tx| MobCommand::QueryMachineState { reply_tx })
+            .await
     }
 }
 

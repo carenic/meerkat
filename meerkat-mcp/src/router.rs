@@ -129,10 +129,12 @@ pub(crate) struct CompatExternalToolSurfaceHandle {
     authority: Mutex<ExternalToolSurfaceAuthority>,
 }
 
+#[cfg(not(test))]
 struct UnboundExternalToolSurfaceHandle {
     removal_timeout: Duration,
 }
 
+#[cfg(not(test))]
 impl UnboundExternalToolSurfaceHandle {
     fn new(removal_timeout: Duration) -> Self {
         Self { removal_timeout }
@@ -146,6 +148,7 @@ impl UnboundExternalToolSurfaceHandle {
     }
 }
 
+#[cfg(not(test))]
 impl ExternalToolSurfaceHandle for UnboundExternalToolSurfaceHandle {
     fn apply_surface_input(
         &self,
@@ -671,8 +674,11 @@ impl SurfaceOwner {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .diagnostic_snapshot(),
-            Self::Runtime { .. } => {
-                let handle = self.runtime_handle().expect("runtime surface owner");
+            Self::Runtime { handle_slot, .. } => {
+                let handle = handle_slot
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
                 snapshot_from_handle(handle.diagnostic_snapshot())
             }
         }
@@ -725,8 +731,11 @@ impl SurfaceOwner {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .apply(input),
-            Self::Runtime { .. } => {
-                let handle = self.runtime_handle().expect("runtime surface owner");
+            Self::Runtime { handle_slot, .. } => {
+                let handle = handle_slot
+                    .read()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
                 Self::apply_runtime(handle.as_ref(), input)
             }
         }
@@ -1568,7 +1577,7 @@ impl McpRouter {
     /// handwritten surface authority.
     #[cfg(test)]
     #[allow(dead_code)]
-    fn new_with_compat_standalone_authority_for_testing() -> Self {
+    pub(crate) fn new_with_compat_standalone_authority_for_testing() -> Self {
         Self::with_surface_owner(SurfaceOwner::compat_standalone(
             ExternalToolSurfaceAuthority::new(),
         ))
@@ -1970,11 +1979,16 @@ impl McpRouter {
                     Ok(transition) => {
                         self.notify_lifecycle_connected(&server_name);
                         self.pending_obligations.remove(&server_name);
-                        let operation = lifecycle_operation_from_effects(
+                        let Some(operation) = lifecycle_operation_from_effects(
                             &transition.effects,
                             SurfaceDeltaPhase::Applied,
-                        )
-                        .expect("DSL pending success must emit an applied lifecycle delta");
+                        ) else {
+                            tracing::error!(
+                                server = %server_name,
+                                "Surface owner accepted PendingSucceeded without an applied lifecycle delta"
+                            );
+                            return None;
+                        };
                         let snapshot_alignment = latest_snapshot_alignment(&transition.effects);
 
                         // For reload: close old connection.
@@ -2040,36 +2054,38 @@ impl McpRouter {
             Err(err) => {
                 self.notify_lifecycle_failed(&server_name, &err.to_string());
 
-                let (snapshot_alignment, operation) =
-                    match self
-                        .surface_owner
-                        .apply(ExternalToolSurfaceInput::PendingFailed {
-                            surface_id: SurfaceId(obligation.surface_id.clone()),
-                            operation: local_surface_operation(obligation.operation),
-                            pending_task_sequence: obligation.pending_task_sequence,
-                            staged_intent_sequence: obligation.staged_intent_sequence,
-                            applied_at_turn: TurnNumber(obligation.applied_at_turn),
-                        }) {
-                        Ok(transition) => {
-                            self.pending_obligations.remove(&server_name);
-                            (
-                                latest_snapshot_alignment(&transition.effects),
-                                lifecycle_operation_from_effects(
-                                    &transition.effects,
-                                    SurfaceDeltaPhase::Failed,
-                                )
-                                .expect("DSL pending failure must emit a failed lifecycle delta"),
-                            )
-                        }
-                        Err(e) => {
-                            tracing::warn!(
+                let (snapshot_alignment, operation) = match self.surface_owner.apply(
+                    ExternalToolSurfaceInput::PendingFailed {
+                        surface_id: SurfaceId(obligation.surface_id.clone()),
+                        operation: local_surface_operation(obligation.operation),
+                        pending_task_sequence: obligation.pending_task_sequence,
+                        staged_intent_sequence: obligation.staged_intent_sequence,
+                        applied_at_turn: TurnNumber(obligation.applied_at_turn),
+                    },
+                ) {
+                    Ok(transition) => {
+                        self.pending_obligations.remove(&server_name);
+                        let Some(operation) = lifecycle_operation_from_effects(
+                            &transition.effects,
+                            SurfaceDeltaPhase::Failed,
+                        ) else {
+                            tracing::error!(
                                 server = %server_name,
-                                error = %e,
-                                "Surface owner rejected PendingFailed"
+                                "Surface owner accepted PendingFailed without a failed lifecycle delta"
                             );
                             return None;
-                        }
-                    };
+                        };
+                        (latest_snapshot_alignment(&transition.effects), operation)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            server = %server_name,
+                            error = %e,
+                            "Surface owner rejected PendingFailed"
+                        );
+                        return None;
+                    }
+                };
 
                 tracing::warn!(
                     server = %server_name,

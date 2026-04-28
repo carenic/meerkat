@@ -103,8 +103,10 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//meerkat-comms:meerkat_comms",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
+        "//meerkat-machine-kernels:meerkat_machine_kernels",
         "//meerkat-machine-schema:meerkat_machine_schema",
         "//meerkat-store:meerkat_store",
     ] + all_crate_deps(

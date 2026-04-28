@@ -759,22 +759,32 @@ impl ShellState {
     /// in the DSL: `wait_operation_ids` carries the set, `wait_active`
     /// signals a pending barrier, and `SatisfyWaitAll`'s
     /// `all_members_terminal` guard owns the fixed-point test. The shell
-    /// fires `SatisfyWaitAll` idempotently on every terminal transition and
-    /// lets the DSL guard reject early firings as a no-op. On acceptance
-    /// (transition returns `Ok`), the shell selects the correlated oneshot
-    /// and delivers the `WaitAllSatisfied` obligation token.
+    /// echoes the DSL-owned request id and typed operation tokens into
+    /// `SatisfyWaitAll` so the transition can clear the barrier before
+    /// rendering the handoff effect. It still fires idempotently on every
+    /// terminal transition and lets the DSL guard reject early firings as a
+    /// no-op. On acceptance (transition returns `Ok`), the shell selects the
+    /// correlated oneshot and delivers the `WaitAllSatisfied` obligation
+    /// token.
     ///
     /// `wait_request_id` is the shell-owned oneshot correlation id that
     /// selects which sender to notify; when the DSL barrier satisfies
     /// without a live correlation (post-recovery, or duplicate resolution),
     /// the oneshot simply remains pending.
     fn maybe_satisfy_wait(&mut self) {
-        // Capture membership *before* applying — `SatisfyWaitAll`'s update
-        // clause resets `wait_operation_ids` to empty, so a post-apply read
-        // would lose the member list carried on the obligation token.
+        // Capture membership *before* applying — `SatisfyWaitAll` clears the
+        // DSL barrier, so a post-apply read would lose the member list carried
+        // on the obligation token.
         let ids = self.wait_operation_ids();
+        let Some(dsl_wait_request_id) = self.dsl.0.state.wait_request_id.clone() else {
+            return;
+        };
+        let dsl_operation_id_tokens = self.dsl.0.state.wait_operation_id_tokens.clone();
         if self
-            .dsl_apply_raw(mm_dsl::MeerkatMachineInput::SatisfyWaitAll)
+            .dsl_apply_raw(mm_dsl::MeerkatMachineInput::SatisfyWaitAll {
+                wait_request_id: dsl_wait_request_id,
+                operation_id_tokens: dsl_operation_id_tokens,
+            })
             .is_err()
         {
             // Guard rejection (barrier inactive, or members not all terminal

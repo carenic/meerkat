@@ -96,6 +96,7 @@ rust_test(
     deps = [
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
+        "//meerkat-runtime:meerkat_runtime",
         "//meerkat-skills:meerkat_skills",
     ] + all_crate_deps(
         package_name = "meerkat-mcp",
@@ -145,6 +146,7 @@ rust_test(
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
         "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-runtime:meerkat_runtime",
         "//meerkat-skills:meerkat_skills",
     ] + all_crate_deps(
         package_name = "meerkat-mcp",
@@ -197,6 +199,7 @@ rust_test(
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
         "//meerkat-mcp:meerkat_mcp",
+        "//meerkat-runtime:meerkat_runtime",
         "//meerkat-skills:meerkat_skills",
     ] + all_crate_deps(
         package_name = "meerkat-mcp",

@@ -369,13 +369,70 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `AuthorizeFlowRunReducerCommandStartRun`
   - anchors: `mob_actor_authority`
   - scenarios: `task-flow-and-run-lifecycle`
-- `AuthorizeFlowRunReducerCommandActiveRun`
-  - anchors: `mob_actor_authority`
-  - scenarios: `task-flow-and-run-lifecycle`, `event-subscriptions-and-notices`
 - `AuthorizeFlowRunReducerCommandDispatchStep`
   - anchors: `mob_actor_authority`
   - scenarios: `task-flow-and-run-lifecycle`, `event-subscriptions-and-notices`
+- `AuthorizeFlowRunReducerCommandCompleteStep`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `AuthorizeFlowRunReducerCommandRecordStepOutput`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`, `event-subscriptions-and-notices`
+- `AuthorizeFlowRunReducerCommandConditionPassed`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`, `event-subscriptions-and-notices`
+- `AuthorizeFlowRunReducerCommandConditionRejected`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`, `event-subscriptions-and-notices`
+- `AuthorizeFlowRunReducerCommandFailStep`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `AuthorizeFlowRunReducerCommandSkipStep`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`, `event-subscriptions-and-notices`
+- `AuthorizeFlowRunReducerCommandProjectFrameStepStatus`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
 - `AuthorizeFlowRunReducerCommandCancelStep`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `AuthorizeFlowRunReducerCommandRegisterTargets`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`, `event-subscriptions-and-notices`
+- `AuthorizeFlowRunReducerCommandRecordTargetSuccess`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`, `event-subscriptions-and-notices`
+- `AuthorizeFlowRunReducerCommandRecordTargetTerminalFailure`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`, `event-subscriptions-and-notices`
+- `AuthorizeFlowRunReducerCommandRecordTargetCanceled`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`, `event-subscriptions-and-notices`
+- `AuthorizeFlowRunReducerCommandRecordTargetFailure`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`, `event-subscriptions-and-notices`, `operator-provenance-and-peer-input`
+- `AuthorizeFlowRunReducerCommandRegisterReadyFrame`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `AuthorizeFlowRunReducerCommandRegisterReadyFrameAlreadyReady`
+  - anchors: `mob_actor_authority`
+  - scenarios: `spawn-work-terminal`, `task-flow-and-run-lifecycle`
+- `AuthorizeFlowRunReducerCommandPumpNodeScheduler`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`, `event-subscriptions-and-notices`
+- `AuthorizeFlowRunReducerCommandRegisterPendingBodyFrame`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `AuthorizeFlowRunReducerCommandPumpFrameScheduler`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `AuthorizeFlowRunReducerCommandNodeExecutionReleased`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`, `event-subscriptions-and-notices`
+- `AuthorizeFlowRunReducerCommandFrameTerminated`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `AuthorizeFlowRunReducerCommandFrameTerminatedNoActiveFrame`
   - anchors: `mob_actor_authority`
   - scenarios: `task-flow-and-run-lifecycle`
 - `AuthorizeFlowRunReducerCommandTerminalCompleted`
@@ -387,7 +444,22 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `AuthorizeFlowRunReducerCommandTerminalCanceled`
   - anchors: `mob_actor_authority`
   - scenarios: `task-flow-and-run-lifecycle`, `event-subscriptions-and-notices`
-- `AuthorizeFlowFrameReducerCommandActiveFrame`
+- `AuthorizeFlowFrameReducerCommandAdmitNextReadyNode`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `AuthorizeFlowFrameReducerCommandCompleteNode`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `AuthorizeFlowFrameReducerCommandRecordNodeOutput`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `AuthorizeFlowFrameReducerCommandFailNode`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `AuthorizeFlowFrameReducerCommandSkipNode`
+  - anchors: `mob_actor_authority`
+  - scenarios: `task-flow-and-run-lifecycle`
+- `AuthorizeFlowFrameReducerCommandCancelNode`
   - anchors: `mob_actor_authority`
   - scenarios: `task-flow-and-run-lifecycle`
 - `AuthorizeFlowFrameReducerCommandSealFrame`

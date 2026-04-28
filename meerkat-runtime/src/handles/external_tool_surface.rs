@@ -30,8 +30,10 @@ impl RuntimeExternalToolSurfaceHandle {
 
     /// Construct a handle backed by an ephemeral DSL authority.
     pub fn ephemeral() -> Self {
-        let mut state = mm_dsl::MeerkatMachineState::default();
-        state.lifecycle_phase = mm_dsl::MeerkatPhase::Attached;
+        let state = mm_dsl::MeerkatMachineState {
+            lifecycle_phase: mm_dsl::MeerkatPhase::Attached,
+            ..Default::default()
+        };
         let shared = Arc::new(std::sync::Mutex::new(
             mm_dsl::MeerkatMachineAuthority::from_state(state),
         ));
@@ -488,16 +490,20 @@ mod tests {
     use super::*;
 
     fn handle_in_phase(phase: mm_dsl::MeerkatPhase) -> RuntimeExternalToolSurfaceHandle {
-        let mut state = mm_dsl::MeerkatMachineState::default();
-        state.lifecycle_phase = phase;
+        let state = mm_dsl::MeerkatMachineState {
+            lifecycle_phase: phase,
+            ..Default::default()
+        };
         let authority = mm_dsl::MeerkatMachineAuthority::from_state(state);
         let shared = Arc::new(Mutex::new(authority));
         RuntimeExternalToolSurfaceHandle::new(Arc::new(HandleDslAuthority::from_shared(shared)))
     }
 
     fn handle_with_active_surface(surface_id: &str) -> RuntimeExternalToolSurfaceHandle {
-        let mut state = mm_dsl::MeerkatMachineState::default();
-        state.lifecycle_phase = mm_dsl::MeerkatPhase::Attached;
+        let mut state = mm_dsl::MeerkatMachineState {
+            lifecycle_phase: mm_dsl::MeerkatPhase::Attached,
+            ..Default::default()
+        };
         state.known_surfaces.insert(surface_id.to_owned());
         state.active_surfaces.insert(surface_id.to_owned());
         state.surface_base_state.insert(

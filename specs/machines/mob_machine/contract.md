@@ -17,6 +17,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `run_step_status`: `Map<RunId, Map<StepId, Option<StepRunStatus>>>`
 - `run_step_status_flat`: `Map<RunStepKey, StepRunStatus>`
 - `run_output_recorded`: `Map<RunId, Map<StepId, Bool>>`
+- `run_step_condition_results_flat`: `Map<RunStepKey, Option<Bool>>`
 - `run_step_condition_results`: `Map<RunId, Map<StepId, Option<Bool>>>`
 - `run_step_has_conditions`: `Map<RunId, Map<StepId, Bool>>`
 - `run_step_dependencies`: `Map<RunId, Map<StepId, Seq<StepId>>>`
@@ -24,20 +25,32 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `run_step_branches`: `Map<RunId, Map<StepId, Option<BranchId>>>`
 - `run_step_collection_policies`: `Map<RunId, Map<StepId, CollectionPolicyKind>>`
 - `run_step_quorum_thresholds`: `Map<RunId, Map<StepId, u32>>`
-- `run_step_target_counts`: `Map<RunId, Map<StepId, u32>>`
-- `run_step_target_success_counts`: `Map<RunId, Map<StepId, u32>>`
-- `run_step_target_terminal_failure_counts`: `Map<RunId, Map<StepId, u32>>`
+- `run_step_target_counts`: `Map<RunId, Map<StepId, u64>>`
+- `run_step_target_success_counts`: `Map<RunId, Map<StepId, u64>>`
+- `run_step_target_terminal_failure_counts`: `Map<RunId, Map<StepId, u64>>`
 - `run_output_recorded_flat`: `Map<RunStepKey, Bool>`
-- `run_target_retry_counts`: `Map<RunId, Map<String, u32>>`
+- `run_step_target_counts_flat`: `Map<RunStepKey, u64>`
+- `run_step_target_success_counts_flat`: `Map<RunStepKey, u64>`
+- `run_step_target_terminal_failure_counts_flat`: `Map<RunStepKey, u64>`
+- `run_target_retry_counts`: `Map<RunId, Map<String, u64>>`
+- `run_target_retry_counts_flat`: `Map<RunStepKey, u64>`
+- `run_failure_count`: `Map<RunId, u64>`
+- `run_consecutive_failure_count`: `Map<RunId, u64>`
 - `run_escalation_threshold`: `Map<RunId, u32>`
 - `run_max_step_retries`: `Map<RunId, u32>`
 - `run_ready_frames`: `Map<RunId, Seq<FrameId>>`
 - `run_ready_frame_membership`: `Map<RunId, Set<FrameId>>`
+- `run_ready_frame_membership_flat`: `Set<FrameId>`
 - `run_pending_body_frame_loops`: `Map<RunId, Seq<LoopInstanceId>>`
 - `run_pending_body_frame_loop_membership`: `Map<RunId, Set<LoopInstanceId>>`
-- `run_max_active_nodes`: `Map<RunId, u32>`
-- `run_max_active_frames`: `Map<RunId, u32>`
-- `run_max_frame_depth`: `Map<RunId, u32>`
+- `run_pending_body_frame_loop_membership_flat`: `Set<LoopInstanceId>`
+- `run_active_node_count`: `Map<RunId, u64>`
+- `run_active_frame_count`: `Map<RunId, u64>`
+- `run_last_granted_frame`: `Map<RunId, FrameId>`
+- `run_last_granted_loop`: `Map<RunId, LoopInstanceId>`
+- `run_max_active_nodes`: `Map<RunId, u64>`
+- `run_max_active_frames`: `Map<RunId, u64>`
+- `run_max_frame_depth`: `Map<RunId, u64>`
 - `frame_scope`: `Map<FrameId, FrameScope>`
 - `frame_phase`: `Map<FrameId, FrameStatus>`
 - `frame_run`: `Map<FrameId, RunId>`
@@ -53,6 +66,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `frame_node_status`: `Map<FrameId, Map<FlowNodeId, NodeRunStatus>>`
 - `frame_ready_queue`: `Map<FrameId, Seq<FlowNodeId>>`
 - `frame_output_recorded`: `Map<FrameId, Map<FlowNodeId, Bool>>`
+- `frame_output_recorded_flat`: `Map<FrameNodeKey, Bool>`
+- `frame_last_admitted_node`: `Map<FrameId, FlowNodeId>`
 - `frame_node_condition_results`: `Map<FrameId, Map<FlowNodeId, Option<Bool>>>`
 - `frame_node_branches`: `Map<FrameId, Map<FlowNodeId, Option<BranchId>>>`
 - `loop_phase`: `Map<LoopInstanceId, LoopStatus>`
@@ -90,17 +105,17 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `topology_epoch`: `u64`
 
 ## Inputs
-- `RunFlow`
-- `CreateRunSeed`(run_id: RunId, step_ids: Set<StepId>, ordered_steps: Seq<StepId>, step_has_conditions: Map<StepId, Bool>, step_dependencies: Map<StepId, Seq<StepId>>, step_dependency_modes: Map<StepId, DependencyMode>, step_branches: Map<StepId, Option<BranchId>>, step_collection_policies: Map<StepId, CollectionPolicyKind>, step_quorum_thresholds: Map<StepId, u32>, escalation_threshold: u32, max_step_retries: u32, max_active_nodes: u32, max_active_frames: u32, max_frame_depth: u32)
-- `CreateFrameSeed`(run_id: RunId, frame_id: FrameId, frame_scope: FrameScope, loop_instance_id: Option<LoopInstanceId>, iteration: u32, tracked_nodes: Set<FlowNodeId>, ordered_nodes: Seq<FlowNodeId>, node_kind: Map<FlowNodeId, FlowNodeKind>, node_dependencies: Map<FlowNodeId, Seq<FlowNodeId>>, node_dependency_modes: Map<FlowNodeId, DependencyMode>, node_branches: Map<FlowNodeId, Option<BranchId>>)
+- `RunFlow`(run_id: RunId, step_ids: Set<StepId>, ordered_steps: Seq<StepId>, step_has_conditions: Map<StepId, Bool>, step_dependencies: Map<StepId, Seq<StepId>>, step_dependency_modes: Map<StepId, DependencyMode>, step_branches: Map<StepId, Option<BranchId>>, step_collection_policies: Map<StepId, CollectionPolicyKind>, step_quorum_thresholds: Map<StepId, u32>, escalation_threshold: u32, max_step_retries: u32, max_active_nodes: u64, max_active_frames: u64, max_frame_depth: u64)
+- `CreateRunSeed`(run_id: RunId, step_ids: Set<StepId>, ordered_steps: Seq<StepId>, step_has_conditions: Map<StepId, Bool>, step_dependencies: Map<StepId, Seq<StepId>>, step_dependency_modes: Map<StepId, DependencyMode>, step_branches: Map<StepId, Option<BranchId>>, step_collection_policies: Map<StepId, CollectionPolicyKind>, step_quorum_thresholds: Map<StepId, u32>, escalation_threshold: u32, max_step_retries: u32, max_active_nodes: u64, max_active_frames: u64, max_frame_depth: u64)
+- `CreateFrameSeed`(run_id: RunId, frame_id: FrameId, frame_scope: FrameScope, loop_instance_id: Option<LoopInstanceId>, iteration: u32, tracked_nodes: Set<FlowNodeId>, ordered_nodes: Seq<FlowNodeId>, node_kind: Map<FlowNodeId, FlowNodeKind>, node_dependencies: Map<FlowNodeId, Seq<FlowNodeId>>, node_dependency_modes: Map<FlowNodeId, DependencyMode>, node_branches: Map<FlowNodeId, Option<BranchId>>, node_status: Map<FlowNodeId, NodeRunStatus>, ready_queue: Seq<FlowNodeId>)
 - `CreateLoopSeed`(loop_instance_id: LoopInstanceId, parent_frame_id: FrameId, parent_node_id: FlowNodeId, loop_id: LoopId, depth: u32, max_iterations: u64)
 - `RecordLoopBodyFrameCompleted`(loop_instance_id: LoopInstanceId, iteration: u64)
 - `RecordLoopUntilConditionMet`(loop_instance_id: LoopInstanceId, iteration: u64)
 - `RecordLoopUntilConditionFailed`(loop_instance_id: LoopInstanceId, iteration: u64)
-- `AuthorizeFlowRunReducerCommand`(run_id: RunId, command: FlowRunReducerCommandKind, step_id: Option<StepId>, run_step_key: Option<RunStepKey>, step_status: Option<StepRunStatus>, target_count: Option<u32>, frame_id: Option<FrameId>, loop_instance_id: Option<LoopInstanceId>, retry_key: Option<String>)
-- `AuthorizeFlowFrameReducerCommand`(frame_id: FrameId, command: FlowFrameReducerCommandKind, node_id: Option<FlowNodeId>, node_status: Option<NodeRunStatus>, ready_queue: Option<Seq<FlowNodeId>>, terminal_status: Option<FrameStatus>)
+- `AuthorizeFlowRunReducerCommand`(run_id: RunId, command: FlowRunReducerCommandKind, step_id: Option<StepId>, run_step_key: Option<RunStepKey>, step_status: Option<StepRunStatus>, target_count: Option<u64>, frame_id: Option<FrameId>, loop_instance_id: Option<LoopInstanceId>, retry_key: Option<String>)
+- `AuthorizeFlowFrameReducerCommand`(frame_id: FrameId, command: FlowFrameReducerCommandKind, node_id: Option<FlowNodeId>, frame_node_key: Option<FrameNodeKey>, node_status: Option<NodeRunStatus>, terminal_status: Option<FrameStatus>)
 - `AuthorizeLoopIterationReducerCommand`(loop_instance_id: LoopInstanceId, command: LoopIterationReducerCommandKind, body_frame_id: Option<FrameId>, body_frame_iteration: Option<u64>)
-- `CancelFlow`
+- `CancelFlow`(run_id: RunId)
 - `FlowStatus`
 - `Spawn`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: Bool, bridge_session_id: SessionId, replacing: Option<SessionId>)
 - `EnsureMember`(agent_identity: AgentIdentity)
@@ -839,8 +854,10 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `CancelFlowRunning`
 - From: `Running`
-- On: `CancelFlow`()
-- Emits: `FlowTerminalized`
+- On: `CancelFlow`(run_id)
+- Guards:
+  - `run_known`
+- Emits: `NotifyCoordinator`
 - To: `Running`
 
 ### `InitializeOrchestratorRunning`
@@ -979,29 +996,39 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `RunFlowRunning`
 - From: `Running`
-- On: `RunFlow`()
+- On: `RunFlow`(run_id, step_ids, ordered_steps, step_has_conditions, step_dependencies, step_dependency_modes, step_branches, step_collection_policies, step_quorum_thresholds, escalation_threshold, max_step_retries, max_active_nodes, max_active_frames, max_frame_depth)
 - Guards:
   - `coordinator_bound`
+  - `run_seed_is_new`
 - Emits: `EmitFlowRunNotice`
 - To: `Running`
 
 ### `CreateRunSeedRunning`
 - From: `Running`
 - On: `CreateRunSeed`(run_id, step_ids, ordered_steps, step_has_conditions, step_dependencies, step_dependency_modes, step_branches, step_collection_policies, step_quorum_thresholds, escalation_threshold, max_step_retries, max_active_nodes, max_active_frames, max_frame_depth)
+- Guards:
+  - `run_seed_is_new`
 - Emits: `EmitRunLifecycleNotice`
 - To: `Running`
 
 ### `CreateFrameSeedRunning`
 - From: `Running`
-- On: `CreateFrameSeed`(run_id, frame_id, frame_scope, loop_instance_id, iteration, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches)
+- On: `CreateFrameSeed`(run_id, frame_id, frame_scope, loop_instance_id, iteration, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, node_status, ready_queue)
 - Guards:
+  - `frame_seed_is_new`
+  - `run_known`
   - `body_frame_has_parent_loop`
+  - `frame_seed_status_covers_tracked_nodes`
+  - `frame_seed_ready_queue_matches_dependency_roots`
 - Emits: `EmitRunLifecycleNotice`
 - To: `Running`
 
 ### `CreateLoopSeedRunning`
 - From: `Running`
 - On: `CreateLoopSeed`(loop_instance_id, parent_frame_id, parent_node_id, loop_id, depth, max_iterations)
+- Guards:
+  - `loop_seed_is_new`
+  - `parent_frame_known`
 - Emits: `EmitRunLifecycleNotice`
 - To: `Running`
 
@@ -1061,17 +1088,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `EmitRunLifecycleNotice`
 - To: `Running`
 
-### `AuthorizeFlowRunReducerCommandActiveRun`
-- From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
-- Guards:
-  - `known_run`
-  - `run_running`
-  - `blocked_until_machine_owned_payload_transition_exists`
-  - `active_run_command`
-- Emits: `EmitRunLifecycleNotice`
-- To: `Running`
-
 ### `AuthorizeFlowRunReducerCommandDispatchStep`
 - From: `Running`, `Stopped`, `Completed`
 - On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
@@ -1081,7 +1097,103 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `dispatch_step_command`
   - `has_step_id`
   - `has_run_step_key`
+  - `step_tracked`
   - `dispatched_step_status`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandCompleteStep`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `complete_step_command`
+  - `has_step_id`
+  - `has_run_step_key`
+  - `completed_step_status`
+  - `step_tracked`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandRecordStepOutput`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `record_step_output_command`
+  - `has_step_id`
+  - `has_run_step_key`
+  - `step_tracked`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandConditionPassed`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `condition_passed_command`
+  - `has_step_id`
+  - `has_run_step_key`
+  - `step_tracked`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandConditionRejected`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `condition_rejected_command`
+  - `has_step_id`
+  - `has_run_step_key`
+  - `step_tracked`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandFailStep`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `fail_step_command`
+  - `has_step_id`
+  - `has_run_step_key`
+  - `failed_step_status`
+  - `step_tracked`
+- Emits: `EmitRunLifecycleNotice`, `AppendFailureLedger`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandSkipStep`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `skip_step_command`
+  - `has_step_id`
+  - `has_run_step_key`
+  - `skipped_step_status`
+  - `step_tracked`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandProjectFrameStepStatus`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `project_frame_step_status_command`
+  - `has_step_id`
+  - `has_run_step_key`
+  - `has_step_status`
+  - `step_tracked`
 - Emits: `EmitRunLifecycleNotice`
 - To: `Running`
 
@@ -1094,7 +1206,178 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `cancel_step_command`
   - `has_step_id`
   - `has_run_step_key`
+  - `step_tracked`
   - `canceled_step_status`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandRegisterTargets`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `register_targets_command`
+  - `has_step_id`
+  - `has_run_step_key`
+  - `has_target_count`
+  - `step_tracked`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandRecordTargetSuccess`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `record_target_success_command`
+  - `has_step_id`
+  - `has_run_step_key`
+  - `step_tracked`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandRecordTargetTerminalFailure`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `record_target_terminal_failure_command`
+  - `has_step_id`
+  - `has_run_step_key`
+  - `step_tracked`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandRecordTargetCanceled`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `record_target_canceled_command`
+  - `has_step_id`
+  - `has_run_step_key`
+  - `step_tracked`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandRecordTargetFailure`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `record_target_failure_command`
+  - `has_step_id`
+  - `has_run_step_key`
+  - `has_retry_key`
+  - `step_tracked`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandRegisterReadyFrame`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `register_ready_frame_command`
+  - `has_frame_id`
+  - `known_frame`
+  - `frame_not_already_ready`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandRegisterReadyFrameAlreadyReady`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `register_ready_frame_command`
+  - `has_frame_id`
+  - `known_frame`
+  - `frame_already_ready`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandPumpNodeScheduler`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `pump_node_scheduler_command`
+  - `has_frame_id`
+  - `ready_frame_registered`
+  - `machine_selected_ready_frame`
+  - `node_capacity_available`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandRegisterPendingBodyFrame`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `register_pending_body_frame_command`
+  - `has_loop_instance_id`
+  - `known_loop`
+  - `loop_not_already_pending_body_frame`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandPumpFrameScheduler`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `pump_frame_scheduler_command`
+  - `has_loop_instance_id`
+  - `pending_body_frame_registered`
+  - `machine_selected_pending_body_frame_loop`
+  - `frame_capacity_available`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandNodeExecutionReleased`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `node_execution_released_command`
+  - `active_node_count_present`
+  - `active_node_count_positive`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandFrameTerminated`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `frame_terminated_command`
+  - `active_frame_count_present`
+  - `active_frame_count_positive`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowRunReducerCommandFrameTerminatedNoActiveFrame`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- Guards:
+  - `known_run`
+  - `run_running`
+  - `frame_terminated_command`
+  - `active_frame_count_present`
+  - `active_frame_count_zero`
 - Emits: `EmitRunLifecycleNotice`
 - To: `Running`
 
@@ -1128,26 +1411,105 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `EmitRunLifecycleNotice`
 - To: `Running`
 
-### `AuthorizeFlowFrameReducerCommandActiveFrame`
+### `AuthorizeFlowFrameReducerCommandAdmitNextReadyNode`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowFrameReducerCommand`(frame_id, command, node_id, node_status, ready_queue, terminal_status)
+- On: `AuthorizeFlowFrameReducerCommand`(frame_id, command, node_id, frame_node_key, node_status, terminal_status)
 - Guards:
   - `known_frame`
   - `frame_running`
-  - `blocked_until_machine_owned_payload_transition_exists`
+  - `admit_next_ready_node_command`
   - `no_terminal_status`
-  - `active_frame_command`
+  - `has_node_id`
+  - `running_node_status`
+  - `node_tracked`
+  - `node_currently_ready`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowFrameReducerCommandCompleteNode`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowFrameReducerCommand`(frame_id, command, node_id, frame_node_key, node_status, terminal_status)
+- Guards:
+  - `known_frame`
+  - `frame_running`
+  - `complete_node_command`
+  - `no_terminal_status`
+  - `has_node_id`
+  - `completed_node_status`
+  - `node_tracked`
+  - `node_currently_running`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowFrameReducerCommandRecordNodeOutput`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowFrameReducerCommand`(frame_id, command, node_id, frame_node_key, node_status, terminal_status)
+- Guards:
+  - `known_frame`
+  - `frame_running`
+  - `record_node_output_command`
+  - `no_terminal_status`
+  - `has_node_id`
+  - `has_frame_node_key`
+  - `node_tracked`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowFrameReducerCommandFailNode`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowFrameReducerCommand`(frame_id, command, node_id, frame_node_key, node_status, terminal_status)
+- Guards:
+  - `known_frame`
+  - `frame_running`
+  - `fail_node_command`
+  - `no_terminal_status`
+  - `has_node_id`
+  - `failed_node_status`
+  - `node_tracked`
+  - `node_currently_running`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowFrameReducerCommandSkipNode`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowFrameReducerCommand`(frame_id, command, node_id, frame_node_key, node_status, terminal_status)
+- Guards:
+  - `known_frame`
+  - `frame_running`
+  - `skip_node_command`
+  - `no_terminal_status`
+  - `has_node_id`
+  - `skipped_node_status`
+  - `node_tracked`
+  - `node_currently_running`
+- Emits: `EmitRunLifecycleNotice`
+- To: `Running`
+
+### `AuthorizeFlowFrameReducerCommandCancelNode`
+- From: `Running`, `Stopped`, `Completed`
+- On: `AuthorizeFlowFrameReducerCommand`(frame_id, command, node_id, frame_node_key, node_status, terminal_status)
+- Guards:
+  - `known_frame`
+  - `frame_running`
+  - `cancel_node_command`
+  - `no_terminal_status`
+  - `has_node_id`
+  - `canceled_node_status`
+  - `node_tracked`
+  - `node_currently_running`
 - Emits: `EmitRunLifecycleNotice`
 - To: `Running`
 
 ### `AuthorizeFlowFrameReducerCommandSealFrame`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowFrameReducerCommand`(frame_id, command, node_id, node_status, ready_queue, terminal_status)
+- On: `AuthorizeFlowFrameReducerCommand`(frame_id, command, node_id, frame_node_key, node_status, terminal_status)
 - Guards:
   - `known_frame`
   - `frame_running`
   - `seal_frame_command`
   - `terminal_frame_status`
+  - `all_nodes_terminal`
+  - `terminal_class_matches_nodes`
 - Emits: `EmitRunLifecycleNotice`
 - To: `Running`
 

@@ -492,6 +492,21 @@ impl MeerkatMachine {
         Some(dsl_authority::runtime_phase_from_authority(&authority))
     }
 
+    pub(super) async fn existing_session_visible_runtime_state(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<RuntimeState> {
+        let sessions = self.sessions.read().await;
+        let entry = sessions.get(session_id)?;
+        let authority = entry
+            .dsl_authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Some(dsl_authority::visible_runtime_phase_from_authority(
+            &authority,
+        ))
+    }
+
     /// Look up the session entry for a runtime ID, returning a control-plane error
     /// if not found.
     pub(super) async fn lookup_entry(

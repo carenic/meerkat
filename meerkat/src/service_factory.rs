@@ -1147,7 +1147,15 @@ mod tests {
     async fn factory_agent_external_tool_surface_snapshot_forwards_core_state() -> Result<(), String>
     {
         let temp = tempfile::tempdir().map_err(|err| format!("tempdir: {err}"))?;
-        let mut router = meerkat_mcp::McpRouter::new();
+        let runtime_adapter = MeerkatMachine::ephemeral();
+        let session = Session::new();
+        let bindings = runtime_adapter
+            .prepare_bindings(session.id().clone())
+            .await
+            .map_err(|err| format!("prepare bindings: {err}"))?;
+        let mut router = meerkat_mcp::McpRouter::new_with_surface_handle(Arc::clone(
+            &bindings.external_tool_surface,
+        ));
         router
             .stage_add(meerkat_core::McpServerConfig::stdio(
                 "planner",
@@ -1162,6 +1170,8 @@ mod tests {
             &temp,
             AgentBuildConfig {
                 tool_dispatcher_override: Some(dispatcher),
+                resume_session: Some(session),
+                runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
                 ..AgentBuildConfig::new("claude-sonnet-4-5")
             },
         )

@@ -816,20 +816,33 @@ impl AgentToolDispatcher for McpRouterAdapter {
         let Some(slot) = &self.external_surface_handle else {
             return;
         };
-        let mut poisoned_handle = None;
-        if let Some(snapshot) = self.cached_surface_snapshot() {
-            if let Err(error) =
-                Self::transfer_pre_bind_external_surface_state(handle.as_ref(), &snapshot)
-            {
-                let error = error.to_string();
+        let current = match slot.read() {
+            Ok(slot) => Arc::clone(&*slot),
+            Err(poisoned) => {
                 tracing::warn!(
-                    error = %error,
-                    "failed to transfer pre-bind external surface state into session handle; poisoning surface owner"
+                    "McpRouterAdapter external_surface_handle RwLock poisoned during bind read; recovering"
                 );
-                poisoned_handle = Some(Arc::new(PoisonedExternalToolSurfaceHandle::new(
-                    error, snapshot,
-                )) as Arc<dyn ExternalToolSurfaceHandle>);
+                let slot = poisoned.into_inner();
+                Arc::clone(&*slot)
             }
+        };
+        if Arc::ptr_eq(&current, &handle) {
+            return;
+        }
+        let mut poisoned_handle = None;
+        if let Some(snapshot) = self.cached_surface_snapshot()
+            && let Err(error) =
+                Self::transfer_pre_bind_external_surface_state(handle.as_ref(), &snapshot)
+        {
+            let error = error.to_string();
+            tracing::warn!(
+                error = %error,
+                "failed to transfer pre-bind external surface state into session handle; poisoning surface owner"
+            );
+            poisoned_handle = Some(
+                Arc::new(PoisonedExternalToolSurfaceHandle::new(error, snapshot))
+                    as Arc<dyn ExternalToolSurfaceHandle>,
+            );
         }
         let mut guard = match slot.write() {
             Ok(slot) => slot,
@@ -1301,9 +1314,39 @@ mod tests {
 
     #[tokio::test]
     async fn router_lifecycle_handle_none_is_noop() {
-        // Standalone router without a bound handle: every lifecycle seam
-        // must still function (no panic, no fatal error).
-        let mut router = McpRouter::new();
+        // Router without a bound MCP lifecycle mirror: external surface
+        // lifecycle still flows through its owner, while mirror notifications
+        // remain no-ops.
+        let handle: Arc<dyn ExternalToolSurfaceHandle> = Arc::new(
+            CompatExternalToolSurfaceHandle::new(Duration::from_secs(30)),
+        );
+        handle
+            .stage_add("srv-standalone".to_string(), 0)
+            .expect("seed stage add");
+        let staged_sequence = handle
+            .surface_snapshot("srv-standalone")
+            .and_then(|snapshot| snapshot.staged_intent_sequence)
+            .expect("seed staged sequence");
+        handle
+            .apply_boundary(
+                "srv-standalone".to_string(),
+                0,
+                staged_sequence,
+                staged_sequence,
+            )
+            .expect("seed apply boundary");
+        let pending_sequence = handle
+            .surface_snapshot("srv-standalone")
+            .and_then(|snapshot| snapshot.pending_task_sequence)
+            .expect("seed pending sequence");
+        handle
+            .mark_pending_succeeded(
+                "srv-standalone".to_string(),
+                pending_sequence,
+                staged_sequence,
+            )
+            .expect("seed active surface");
+        let mut router = McpRouter::new_with_surface_handle(handle);
         let cfg = meerkat_core::McpServerConfig::stdio(
             "srv-standalone",
             "/bin/echo",
