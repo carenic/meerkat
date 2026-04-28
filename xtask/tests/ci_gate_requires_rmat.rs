@@ -272,6 +272,8 @@ fn machine_authority_changed_detector_classifies_paths() {
         &["meerkat-core/src/generated/terminal_surface_mapping.rs"],
         true,
     );
+    assert_machine_authority_detector(&["meerkat-runtime/src/generated/meerkat_mob_seam.rs"], true);
+    assert_machine_authority_detector(&["meerkat-mob/src/generated/mod.rs"], true);
     assert_machine_authority_detector(&[".github/workflows/cargo.yml"], true);
     assert_machine_authority_detector(&["scripts/machine-authority-changed"], true);
 }

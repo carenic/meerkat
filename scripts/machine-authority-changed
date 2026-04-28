@@ -87,7 +87,7 @@ machine_authority_path() {
     meerkat-runtime/src/meerkat_machine/*|meerkat-runtime/src/auth_machine/*|meerkat-mob/src/machines/*|meerkat-schedule/src/machines/*)
       return 0
       ;;
-    meerkat-machine-kernels/src/generated/*|*/src/generated/protocol_*.rs|meerkat-core/src/generated/terminal_surface_mapping.rs)
+    meerkat-machine-kernels/src/generated/*|meerkat-core/src/generated/*|meerkat-mob/src/generated/*|meerkat-runtime/src/generated/*|meerkat-schedule/src/generated/*|*/src/generated/protocol_*.rs)
       return 0
       ;;
     xtask/Cargo.toml|xtask/BUILD.bazel|xtask/src/lib.rs|xtask/src/main.rs|xtask/src/machines*.rs|xtask/src/protocol_codegen.rs|xtask/src/audit_generated_headers.rs|xtask/src/public_contracts.rs)
