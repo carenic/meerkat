@@ -3707,6 +3707,77 @@ mod tests {
         );
     }
 
+    #[cfg(not(feature = "mini-surface"))]
+    #[tokio::test]
+    async fn session_stream_open_accepts_deferred_session_before_first_turn() {
+        let (router, mut notif_rx) = test_router().await;
+
+        let create_resp = router
+            .dispatch(make_request(
+                "session/create",
+                serde_json::json!({
+                    "prompt": "deferred bootstrap",
+                    "initial_turn": "deferred"
+                }),
+            ))
+            .await
+            .unwrap();
+        let session_id = result_value(&create_resp)["session_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let open_resp = router
+            .dispatch(make_request(
+                "session/stream_open",
+                serde_json::json!({ "session_id": session_id }),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            open_resp.error.is_none(),
+            "session/stream_open should accept pending deferred sessions: {open_resp:?}"
+        );
+        let stream_id = result_value(&open_resp)["stream_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let turn_resp = router
+            .dispatch(make_request(
+                "turn/start",
+                serde_json::json!({
+                    "session_id": session_id,
+                    "prompt": "start first turn"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert!(
+            turn_resp.error.is_none(),
+            "turn/start should materialize deferred session: {turn_resp:?}"
+        );
+
+        let notification = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let notif = notif_rx.recv().await.expect("notification");
+                if notif.method == "session/stream_event"
+                    && notif.params["stream_id"].as_str() == Some(stream_id.as_str())
+                    && notif.params["event"]["payload"]["type"].as_str() == Some("run_started")
+                {
+                    break notif;
+                }
+            }
+        })
+        .await
+        .expect("pending session stream should receive first-turn events");
+
+        assert_eq!(
+            notification.params["session_id"].as_str(),
+            Some(session_id.as_str())
+        );
+    }
+
     #[cfg(feature = "mob")]
     #[tokio::test]
     async fn mob_append_system_context_targets_mob_backing_service() {
