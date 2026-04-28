@@ -12,7 +12,7 @@
 #[path = "session_runtime/schedule_host.rs"]
 mod schedule_host;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 #[cfg(feature = "mcp")]
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +20,7 @@ use std::sync::{Arc, RwLock as StdRwLock};
 #[cfg(feature = "mcp")]
 use std::time::Duration;
 
+use futures::StreamExt;
 use meerkat::{
     AgentBuildConfig, AgentFactory, FactoryAgentBuilder, PersistenceBundle,
     PersistentSessionService, ScheduleService, ScheduleToolDispatcher, StagedPhase,
@@ -55,7 +56,7 @@ use meerkat_runtime::{
     SessionLlmCapabilitySurface, SessionLlmCapabilitySurfaceStatus, SessionLlmReconfigureHost,
     SessionLlmReconfigureRequest, SessionServiceRuntimeExt,
 };
-use tokio::sync::{Mutex, RwLock, mpsc};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
 
 use crate::error;
 use crate::protocol::RpcError;
@@ -107,6 +108,8 @@ fn render_runtime_system_context_message(append: &PendingSystemContextAppend) ->
     content.push_str(&append.text);
     Message::System(SystemMessage { content })
 }
+
+const PENDING_SESSION_EVENT_CHANNEL_CAPACITY: usize = 128;
 
 fn realtime_projection_root_system_message(session: &Session) -> Option<Message> {
     let build_state = session.build_state().unwrap_or_default();
@@ -641,6 +644,11 @@ pub struct SessionRuntime {
     /// in the service. The first `start_turn` call promotes them through
     /// `staged_sessions.begin_promotion()`.
     staged_sessions: Arc<StagedSessionRegistry>,
+    /// Event streams opened while a deferred session is still staged. The
+    /// first materializing turn fans out events here, then bridges the stream
+    /// to the live session service after promotion.
+    pending_session_event_streams:
+        Arc<Mutex<HashMap<SessionId, broadcast::Sender<EventEnvelope<AgentEvent>>>>>,
     max_sessions: usize,
     /// Override LLM client for all sessions (primarily for testing).
     default_llm_client: Arc<StdRwLock<Option<Arc<dyn LlmClient>>>>,
@@ -864,6 +872,7 @@ impl SessionRuntime {
             artifact_store,
             schedule_host: Mutex::new(None),
             staged_sessions: Arc::new(StagedSessionRegistry::new()),
+            pending_session_event_streams: Arc::new(Mutex::new(HashMap::new())),
             max_sessions,
             default_llm_client,
             realm_id: None,
@@ -937,6 +946,7 @@ impl SessionRuntime {
             artifact_store,
             schedule_host: Mutex::new(None),
             staged_sessions: Arc::new(StagedSessionRegistry::new()),
+            pending_session_event_streams: Arc::new(Mutex::new(HashMap::new())),
             max_sessions,
             default_llm_client,
             realm_id: None,
@@ -2591,6 +2601,9 @@ impl SessionRuntime {
                 }
             }
 
+            let event_tx = self
+                .pending_session_event_fanout_tx(session_id, event_tx)
+                .await;
             let output = self
                 .service
                 .apply_runtime_turn(
@@ -2613,8 +2626,9 @@ impl SessionRuntime {
                     },
                     primitive.contributing_input_ids().to_vec(),
                 )
-                .await
-                .map_err(session_error_to_rpc)?;
+                .await;
+            self.bridge_pending_session_event_streams(session_id).await;
+            let output = output.map_err(session_error_to_rpc)?;
             return Ok(output);
         }
 
@@ -2962,6 +2976,9 @@ impl SessionRuntime {
             build.backend = build.backend.or_else(|| self.backend.clone());
             build.config_generation = build.config_generation.or(runtime_generation);
 
+            let event_tx = self
+                .pending_session_event_fanout_tx(session_id, event_tx)
+                .await;
             let req = CreateSessionRequest {
                 model: build_config.model.clone(),
                 prompt: turn_prompt,
@@ -2995,6 +3012,7 @@ impl SessionRuntime {
                             "failed to replay promoted system-context state after create_session; preserving completed turn result"
                         );
                     }
+                    self.bridge_pending_session_event_streams(session_id).await;
                     return Ok(result);
                 }
                 Err(err) => {
@@ -3462,6 +3480,10 @@ impl SessionRuntime {
     pub async fn archive_session(&self, session_id: &SessionId) -> Result<(), RpcError> {
         // Check pending sessions first.
         if self.staged_sessions.abandon(session_id).await {
+            self.pending_session_event_streams
+                .lock()
+                .await
+                .remove(session_id);
             #[cfg(feature = "mcp")]
             if let Some(state) = self.mcp_sessions.write().await.remove(session_id) {
                 state.adapter.shutdown().await;
@@ -3479,6 +3501,11 @@ impl SessionRuntime {
         if let Some(state) = self.mcp_sessions.write().await.remove(session_id) {
             state.adapter.shutdown().await;
         }
+
+        self.pending_session_event_streams
+            .lock()
+            .await
+            .remove(session_id);
 
         #[cfg(feature = "comms")]
         self.runtime_adapter.abort_comms_drain(session_id).await;
@@ -3770,12 +3797,103 @@ impl SessionRuntime {
         self.service.event_injector(session_id).await
     }
 
+    async fn pending_session_event_sender(
+        &self,
+        session_id: &meerkat_core::SessionId,
+    ) -> Option<broadcast::Sender<EventEnvelope<AgentEvent>>> {
+        self.pending_session_event_streams
+            .lock()
+            .await
+            .get(session_id)
+            .cloned()
+    }
+
+    async fn subscribe_pending_session_events(
+        &self,
+        session_id: &meerkat_core::SessionId,
+    ) -> Result<meerkat_core::EventStream, meerkat_core::StreamError> {
+        let sender = {
+            let mut streams = self.pending_session_event_streams.lock().await;
+            streams
+                .entry(session_id.clone())
+                .or_insert_with(|| {
+                    let (tx, _rx) = broadcast::channel(PENDING_SESSION_EVENT_CHANNEL_CAPACITY);
+                    tx
+                })
+                .clone()
+        };
+        let rx = sender.subscribe();
+        Ok(Box::pin(futures::stream::unfold(rx, |mut rx| async move {
+            loop {
+                match rx.recv().await {
+                    Ok(event) => return Some((event, rx)),
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => return None,
+                }
+            }
+        })))
+    }
+
+    async fn pending_session_event_fanout_tx(
+        &self,
+        session_id: &meerkat_core::SessionId,
+        event_tx: mpsc::Sender<EventEnvelope<AgentEvent>>,
+    ) -> mpsc::Sender<EventEnvelope<AgentEvent>> {
+        let Some(pending_tx) = self.pending_session_event_sender(session_id).await else {
+            return event_tx;
+        };
+
+        let (fanout_tx, mut fanout_rx) =
+            mpsc::channel::<EventEnvelope<AgentEvent>>(PENDING_SESSION_EVENT_CHANNEL_CAPACITY);
+        tokio::spawn(async move {
+            while let Some(event) = fanout_rx.recv().await {
+                let _ = pending_tx.send(event.clone());
+                let _ = event_tx.send(event).await;
+            }
+        });
+        fanout_tx
+    }
+
+    async fn bridge_pending_session_event_streams(&self, session_id: &meerkat_core::SessionId) {
+        let Some(pending_tx) = self.pending_session_event_sender(session_id).await else {
+            return;
+        };
+        let Ok(mut live_stream) = self.service.subscribe_session_events(session_id).await else {
+            return;
+        };
+
+        let session_id = session_id.clone();
+        let pending_streams = Arc::clone(&self.pending_session_event_streams);
+        tokio::spawn(async move {
+            while let Some(event) = live_stream.next().await {
+                if pending_tx.receiver_count() == 0 {
+                    break;
+                }
+                let _ = pending_tx.send(event);
+            }
+            pending_streams.lock().await.remove(&session_id);
+        });
+    }
+
     /// Subscribe to session-wide events regardless of triggering interaction.
     pub async fn subscribe_session_events(
         &self,
         session_id: &meerkat_core::SessionId,
     ) -> Result<meerkat_core::EventStream, meerkat_core::StreamError> {
-        self.service.subscribe_session_events(session_id).await
+        match self.service.subscribe_session_events(session_id).await {
+            Ok(stream) => Ok(stream),
+            Err(meerkat_core::StreamError::NotFound(_))
+                if self.staged_sessions.contains(session_id).await =>
+            {
+                self.subscribe_pending_session_events(session_id).await
+            }
+            Err(err @ meerkat_core::StreamError::NotFound(_)) => self
+                .service
+                .subscribe_session_events(session_id)
+                .await
+                .map_err(|_| err),
+            Err(err) => Err(err),
+        }
     }
 
     /// Wait until a live session's authoritative summary timestamp advances.
@@ -3801,6 +3919,7 @@ impl SessionRuntime {
     pub async fn shutdown(&self) {
         // Clear pending sessions.
         self.staged_sessions.clear().await;
+        self.pending_session_event_streams.lock().await.clear();
 
         self.shutdown_schedule_host().await;
 
