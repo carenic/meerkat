@@ -2350,6 +2350,11 @@ fn infer_expr_type(
         }
         Expr::Some(inner) => infer_expr_type(inner, field_types, helper_returns, binding_types)
             .map(|inner_ty| TypeRef::Option(Box::new(inner_ty))),
+        Expr::Call { helper, .. } if helper == "mob_machine_step_status_from_frame_node_status" => {
+            meerkat_machine_schema::identity::EnumTypeId::parse("StepRunStatus")
+                .ok()
+                .map(TypeRef::Enum)
+        }
         Expr::Call { helper, .. } => helper_returns.get(helper).cloned(),
         Expr::SeqLiteral(items) => items.first().and_then(|item| {
             infer_expr_type(item, field_types, helper_returns, binding_types)
@@ -5596,7 +5601,18 @@ impl<'a> MachineTlaCompiler<'a> {
         .expect("write to string");
         writeln!(
             out,
-            "{}(all_statuses, frame_id, node_id) ==",
+            "{}(status) ==",
+            prefix("mob_machine_step_status_from_frame_node_status")
+        )
+        .expect("write to string");
+        pushln!(out, "    IF status = \"Completed\" THEN \"Completed\"");
+        pushln!(out, "    ELSE IF status = \"Skipped\" THEN \"Skipped\"");
+        pushln!(out, "    ELSE IF status = \"Failed\" THEN \"Failed\"");
+        pushln!(out, "    ELSE IF status = \"Canceled\" THEN \"Canceled\"");
+        pushln!(out, "    ELSE \"Dispatched\"");
+        writeln!(
+            out,
+            "{}(all_statuses, frame_branches, ordered_nodes_by_frame, frame_id, node_id) ==",
             prefix("mob_machine_frame_node_status_after_admit")
         )
         .expect("write to string");
@@ -5606,21 +5622,47 @@ impl<'a> MachineTlaCompiler<'a> {
         );
         pushln!(
             out,
-            "    IN MapSet(all_statuses, frame_id, MapSet(current, node_id, \"Running\"))"
+            "        branches == IF frame_id \\in DOMAIN frame_branches THEN frame_branches[frame_id] ELSE [x \\in {{}} |-> None]"
         );
+        pushln!(
+            out,
+            "        admitted_branch == IF node_id \\in DOMAIN branches THEN branches[node_id] ELSE None"
+        );
+        pushln!(
+            out,
+            "        after_branch_reservation == [candidate \\in DOMAIN current |->"
+        );
+        pushln!(out, "            IF admitted_branch # None");
+        pushln!(out, "                /\\ candidate # node_id");
+        pushln!(out, "                /\\ candidate \\in DOMAIN branches");
+        pushln!(
+            out,
+            "                /\\ branches[candidate] = admitted_branch"
+        );
+        pushln!(out, "                /\\ current[candidate] = \"Ready\"");
+        pushln!(out, "            THEN \"Pending\" ELSE current[candidate]]");
+        pushln!(
+            out,
+            "        after_admit == MapSet(after_branch_reservation, node_id, \"Running\")"
+        );
+        pushln!(out, "    IN MapSet(all_statuses, frame_id, after_admit)");
         writeln!(
             out,
-            "{}(all_ready_queues, frame_id, node_id) ==",
+            "{}(all_ready_queues, all_statuses, ordered_nodes_by_frame, frame_id) ==",
             prefix("mob_machine_frame_ready_queue_after_admit")
         )
         .expect("write to string");
         pushln!(
             out,
-            "    LET ready == IF frame_id \\in DOMAIN all_ready_queues THEN all_ready_queues[frame_id] ELSE <<>>"
+            "    LET statuses == IF frame_id \\in DOMAIN all_statuses THEN all_statuses[frame_id] ELSE [x \\in {{}} |-> None]"
         );
         pushln!(
             out,
-            "    IN MapSet(all_ready_queues, frame_id, SelectSeq(ready, LAMBDA candidate: candidate # node_id))"
+            "        ordered == IF frame_id \\in DOMAIN ordered_nodes_by_frame THEN ordered_nodes_by_frame[frame_id] ELSE <<>>"
+        );
+        pushln!(
+            out,
+            "    IN MapSet(all_ready_queues, frame_id, SelectSeq(ordered, LAMBDA candidate: candidate \\in DOMAIN statuses /\\ statuses[candidate] = \"Ready\"))"
         );
         writeln!(
             out,
@@ -5665,6 +5707,7 @@ impl<'a> MachineTlaCompiler<'a> {
             out,
             "                /\\ candidate \\in DOMAIN branches /\\ node_id \\in DOMAIN branches"
         );
+        pushln!(out, "                /\\ branches[node_id] # None");
         pushln!(
             out,
             "                /\\ branches[candidate] = branches[node_id]"
@@ -5699,9 +5742,14 @@ impl<'a> MachineTlaCompiler<'a> {
             out,
             "                     mode == IF candidate \\in DOMAIN dependency_modes THEN dependency_modes[candidate] ELSE \"All\""
         );
+        pushln!(out, "                     failed == Len(deps) # 0");
         pushln!(
             out,
-            "                     failed == \\E dep_index \\in DOMAIN deps: LET dep == deps[dep_index] IN dep \\in DOMAIN after_branch /\\ after_branch[dep] \\in {{\"Failed\", \"Skipped\", \"Canceled\"}}"
+            "                         /\\ ((mode = \"All\" /\\ \\E dep_index \\in DOMAIN deps: LET dep == deps[dep_index] IN dep \\in DOMAIN after_branch /\\ after_branch[dep] \\in {{\"Failed\", \"Skipped\", \"Canceled\"}})"
+        );
+        pushln!(
+            out,
+            "                             \\/ (mode = \"Any\" /\\ \\A dep_index \\in DOMAIN deps: LET dep == deps[dep_index] IN dep \\in DOMAIN after_branch /\\ after_branch[dep] \\in {{\"Failed\", \"Skipped\", \"Canceled\"}}))"
         );
         pushln!(out, "                     satisfied == Len(deps) = 0");
         pushln!(

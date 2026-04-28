@@ -2926,6 +2926,7 @@ impl MobActor {
                         pending_session_ingress_detach_runtime_ids: dsl
                             .pending_session_ingress_detach_runtime_ids
                             .clone(),
+                        topology_epoch: dsl.topology_epoch,
                     });
                 }
                 MobCommand::StartupKickoffSnapshot { reply_tx } => {

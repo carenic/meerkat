@@ -1533,6 +1533,7 @@ pub mod inputs {
         pub step_status: Option<StepRunStatus>,
         pub target_count: Option<u64>,
         pub frame_id: Option<FrameId>,
+        pub node_id: Option<FlowNodeId>,
         pub loop_instance_id: Option<LoopInstanceId>,
         pub retry_key: Option<String>,
     }
@@ -1606,22 +1607,6 @@ pub mod inputs {
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct UnwireExternalPeer {
         pub edge: ExternalPeerEdge,
-    }
-    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub struct BindMemberSession {
-        pub agent_identity: AgentIdentity,
-        pub session_id: SessionId,
-    }
-    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub struct RotateMemberSession {
-        pub agent_identity: AgentIdentity,
-        pub old_session_id: SessionId,
-        pub new_session_id: SessionId,
-    }
-    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub struct ReleaseMemberSession {
-        pub agent_identity: AgentIdentity,
-        pub session_id: SessionId,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct SessionIngressDetachedForMobDestroy {
@@ -1733,10 +1718,6 @@ pub mod inputs {
         pub error: String,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub struct KickoffResolveCancelled {
-        pub member_id: String,
-    }
-    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct KickoffCancelRequested {
         pub member_id: String,
     }
@@ -1770,9 +1751,6 @@ pub enum Input {
     UnwireMembers(inputs::UnwireMembers),
     WireExternalPeer(inputs::WireExternalPeer),
     UnwireExternalPeer(inputs::UnwireExternalPeer),
-    BindMemberSession(inputs::BindMemberSession),
-    RotateMemberSession(inputs::RotateMemberSession),
-    ReleaseMemberSession(inputs::ReleaseMemberSession),
     SessionIngressDetachedForMobDestroy(inputs::SessionIngressDetachedForMobDestroy),
     SessionIngressDetachFailedForMobDestroy(inputs::SessionIngressDetachFailedForMobDestroy),
     SubmitWork(inputs::SubmitWork),
@@ -1809,7 +1787,6 @@ pub enum Input {
     KickoffResolveStarted(inputs::KickoffResolveStarted),
     KickoffResolveCallbackPending(inputs::KickoffResolveCallbackPending),
     KickoffResolveFailed(inputs::KickoffResolveFailed),
-    KickoffResolveCancelled(inputs::KickoffResolveCancelled),
     KickoffCancelRequested(inputs::KickoffCancelRequested),
     KickoffClear(inputs::KickoffClear),
 }
@@ -1842,9 +1819,6 @@ impl Input {
             Self::UnwireMembers(_) => InputKind::UnwireMembers,
             Self::WireExternalPeer(_) => InputKind::WireExternalPeer,
             Self::UnwireExternalPeer(_) => InputKind::UnwireExternalPeer,
-            Self::BindMemberSession(_) => InputKind::BindMemberSession,
-            Self::RotateMemberSession(_) => InputKind::RotateMemberSession,
-            Self::ReleaseMemberSession(_) => InputKind::ReleaseMemberSession,
             Self::SessionIngressDetachedForMobDestroy(_) => {
                 InputKind::SessionIngressDetachedForMobDestroy
             }
@@ -1885,7 +1859,6 @@ impl Input {
             Self::KickoffResolveStarted(_) => InputKind::KickoffResolveStarted,
             Self::KickoffResolveCallbackPending(_) => InputKind::KickoffResolveCallbackPending,
             Self::KickoffResolveFailed(_) => InputKind::KickoffResolveFailed,
-            Self::KickoffResolveCancelled(_) => InputKind::KickoffResolveCancelled,
             Self::KickoffCancelRequested(_) => InputKind::KickoffCancelRequested,
             Self::KickoffClear(_) => InputKind::KickoffClear,
         }
@@ -1915,9 +1888,6 @@ pub enum InputKind {
     UnwireMembers,
     WireExternalPeer,
     UnwireExternalPeer,
-    BindMemberSession,
-    RotateMemberSession,
-    ReleaseMemberSession,
     SessionIngressDetachedForMobDestroy,
     SessionIngressDetachFailedForMobDestroy,
     SubmitWork,
@@ -1954,7 +1924,6 @@ pub enum InputKind {
     KickoffResolveStarted,
     KickoffResolveCallbackPending,
     KickoffResolveFailed,
-    KickoffResolveCancelled,
     KickoffCancelRequested,
     KickoffClear,
 }
@@ -2331,9 +2300,6 @@ pub enum TransitionId {
     KickoffResolveFailedFromStartingRunning,
     KickoffResolveFailedFromStartingStopped,
     KickoffResolveFailedFromStartingCompleted,
-    KickoffResolveCancelledRunning,
-    KickoffResolveCancelledStopped,
-    KickoffResolveCancelledCompleted,
     KickoffCancelRequestedRunning,
     KickoffCancelRequestedStopped,
     KickoffCancelRequestedCompleted,
@@ -2365,9 +2331,6 @@ pub enum TransitionId {
     UnwireMembersRunning,
     WireExternalPeerRunning,
     UnwireExternalPeerRunning,
-    BindMemberSessionRunning,
-    RotateMemberSessionRunning,
-    ReleaseMemberSessionRunning,
     TaskCreateRunning,
     TaskUpdateRunningPending,
     TaskUpdateRunningInProgress,

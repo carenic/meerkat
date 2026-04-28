@@ -228,6 +228,15 @@ pub fn canonical_mob_machine_command_manifest() -> IndexSet<&'static str> {
         .collect()
 }
 
+#[doc(hidden)]
+#[must_use]
+pub fn canonical_mob_machine_runtime_internal_manifest() -> IndexSet<&'static str> {
+    canonical_mob_machine_runtime_internal_classifications()
+        .iter()
+        .map(|record| record.input.as_str())
+        .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MobMachineCommandClassification {
     CatalogInput(MobMachineCatalogInput),
@@ -306,9 +315,6 @@ pub enum MobMachineCatalogInput {
     AuthorizeFlowRunReducerCommand,
     AuthorizeFlowFrameReducerCommand,
     AuthorizeLoopIterationReducerCommand,
-    BindMemberSession,
-    RotateMemberSession,
-    ReleaseMemberSession,
     SessionIngressDetachedForMobDestroy,
     SessionIngressDetachFailedForMobDestroy,
     KickoffMarkPending,
@@ -317,12 +323,74 @@ pub enum MobMachineCatalogInput {
     KickoffResolveStarted,
     KickoffResolveCallbackPending,
     KickoffResolveFailed,
-    KickoffResolveCancelled,
     KickoffCancelRequested,
     KickoffClear,
 }
 
 impl MobMachineCatalogInput {
+    pub const ALL: &'static [Self] = &[
+        Self::RunFlow,
+        Self::CancelFlow,
+        Self::FlowStatus,
+        Self::Spawn,
+        Self::EnsureMember,
+        Self::Reconcile,
+        Self::Retire,
+        Self::Respawn,
+        Self::RetireAll,
+        Self::WireMembers,
+        Self::UnwireMembers,
+        Self::WireExternalPeer,
+        Self::UnwireExternalPeer,
+        Self::SubmitWork,
+        Self::CancelWork,
+        Self::CancelAllWork,
+        Self::Stop,
+        Self::Resume,
+        Self::Complete,
+        Self::Reset,
+        Self::Destroy,
+        Self::TaskCreate,
+        Self::TaskUpdate,
+        Self::TaskList,
+        Self::TaskGet,
+        Self::McpServerStates,
+        Self::RosterSnapshot,
+        Self::ListMembers,
+        Self::ListMembersIncludingRetiring,
+        Self::ListAllMembers,
+        Self::MemberStatus,
+        Self::SubscribeAgentEvents,
+        Self::SubscribeAllAgentEvents,
+        Self::SubscribeMobEvents,
+        Self::PollEvents,
+        Self::ReplayAllEvents,
+        Self::RecordOperatorActionProvenance,
+        Self::GetMember,
+        Self::SetSpawnPolicy,
+        Self::Shutdown,
+        Self::ForceCancel,
+        Self::CreateRunSeed,
+        Self::CreateFrameSeed,
+        Self::CreateLoopSeed,
+        Self::RecordLoopBodyFrameCompleted,
+        Self::RecordLoopUntilConditionMet,
+        Self::RecordLoopUntilConditionFailed,
+        Self::AuthorizeFlowRunReducerCommand,
+        Self::AuthorizeFlowFrameReducerCommand,
+        Self::AuthorizeLoopIterationReducerCommand,
+        session_ingress_detached_for_mob_destroy_catalog_input(),
+        session_ingress_detach_failed_for_mob_destroy_catalog_input(),
+        Self::KickoffMarkPending,
+        Self::KickoffMarkStarting,
+        Self::StartupMarkReady,
+        Self::KickoffResolveStarted,
+        Self::KickoffResolveCallbackPending,
+        Self::KickoffResolveFailed,
+        Self::KickoffCancelRequested,
+        Self::KickoffClear,
+    ];
+
     #[must_use]
     pub const fn as_str(self) -> &'static str {
         match self {
@@ -376,9 +444,6 @@ impl MobMachineCatalogInput {
             Self::AuthorizeFlowRunReducerCommand => "AuthorizeFlowRunReducerCommand",
             Self::AuthorizeFlowFrameReducerCommand => "AuthorizeFlowFrameReducerCommand",
             Self::AuthorizeLoopIterationReducerCommand => "AuthorizeLoopIterationReducerCommand",
-            Self::BindMemberSession => "BindMemberSession",
-            Self::RotateMemberSession => "RotateMemberSession",
-            Self::ReleaseMemberSession => "ReleaseMemberSession",
             Self::SessionIngressDetachedForMobDestroy => "SessionIngressDetachedForMobDestroy",
             Self::SessionIngressDetachFailedForMobDestroy => {
                 "SessionIngressDetachFailedForMobDestroy"
@@ -389,10 +454,23 @@ impl MobMachineCatalogInput {
             Self::KickoffResolveStarted => "KickoffResolveStarted",
             Self::KickoffResolveCallbackPending => "KickoffResolveCallbackPending",
             Self::KickoffResolveFailed => "KickoffResolveFailed",
-            Self::KickoffResolveCancelled => "KickoffResolveCancelled",
             Self::KickoffCancelRequested => "KickoffCancelRequested",
             Self::KickoffClear => "KickoffClear",
         }
+    }
+}
+
+#[allow(clippy::match_single_binding)]
+const fn session_ingress_detached_for_mob_destroy_catalog_input() -> MobMachineCatalogInput {
+    match () {
+        () => MobMachineCatalogInput::SessionIngressDetachedForMobDestroy,
+    }
+}
+
+#[allow(clippy::match_single_binding)]
+const fn session_ingress_detach_failed_for_mob_destroy_catalog_input() -> MobMachineCatalogInput {
+    match () {
+        () => MobMachineCatalogInput::SessionIngressDetachFailedForMobDestroy,
     }
 }
 
@@ -404,10 +482,103 @@ pub enum MobMachineShellMechanicReason {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MobMachineRuntimeInternalReason {
+    FlowProjectionAuthority,
+    SessionIngressDetachFeedback,
+    StartupKickoffLifecycle,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MobMachineCommandClassificationRecord {
     pub command: &'static str,
     pub classification: MobMachineCommandClassification,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MobMachineRuntimeInternalClassificationRecord {
+    pub input: MobMachineCatalogInput,
+    pub reason: MobMachineRuntimeInternalReason,
+}
+
+const MOB_MACHINE_RUNTIME_INTERNAL_CLASSIFICATIONS:
+    &[MobMachineRuntimeInternalClassificationRecord] = &[
+    MobMachineRuntimeInternalClassificationRecord {
+        input: MobMachineCatalogInput::AuthorizeFlowFrameReducerCommand,
+        reason: MobMachineRuntimeInternalReason::FlowProjectionAuthority,
+    },
+    MobMachineRuntimeInternalClassificationRecord {
+        input: MobMachineCatalogInput::AuthorizeFlowRunReducerCommand,
+        reason: MobMachineRuntimeInternalReason::FlowProjectionAuthority,
+    },
+    MobMachineRuntimeInternalClassificationRecord {
+        input: MobMachineCatalogInput::AuthorizeLoopIterationReducerCommand,
+        reason: MobMachineRuntimeInternalReason::FlowProjectionAuthority,
+    },
+    MobMachineRuntimeInternalClassificationRecord {
+        input: MobMachineCatalogInput::CreateFrameSeed,
+        reason: MobMachineRuntimeInternalReason::FlowProjectionAuthority,
+    },
+    MobMachineRuntimeInternalClassificationRecord {
+        input: MobMachineCatalogInput::CreateLoopSeed,
+        reason: MobMachineRuntimeInternalReason::FlowProjectionAuthority,
+    },
+    MobMachineRuntimeInternalClassificationRecord {
+        input: MobMachineCatalogInput::CreateRunSeed,
+        reason: MobMachineRuntimeInternalReason::FlowProjectionAuthority,
+    },
+    MobMachineRuntimeInternalClassificationRecord {
+        input: MobMachineCatalogInput::RecordLoopBodyFrameCompleted,
+        reason: MobMachineRuntimeInternalReason::FlowProjectionAuthority,
+    },
+    MobMachineRuntimeInternalClassificationRecord {
+        input: MobMachineCatalogInput::RecordLoopUntilConditionFailed,
+        reason: MobMachineRuntimeInternalReason::FlowProjectionAuthority,
+    },
+    MobMachineRuntimeInternalClassificationRecord {
+        input: MobMachineCatalogInput::RecordLoopUntilConditionMet,
+        reason: MobMachineRuntimeInternalReason::FlowProjectionAuthority,
+    },
+    MobMachineRuntimeInternalClassificationRecord {
+        input: session_ingress_detached_for_mob_destroy_catalog_input(),
+        reason: MobMachineRuntimeInternalReason::SessionIngressDetachFeedback,
+    },
+    MobMachineRuntimeInternalClassificationRecord {
+        input: session_ingress_detach_failed_for_mob_destroy_catalog_input(),
+        reason: MobMachineRuntimeInternalReason::SessionIngressDetachFeedback,
+    },
+    MobMachineRuntimeInternalClassificationRecord {
+        input: MobMachineCatalogInput::KickoffMarkPending,
+        reason: MobMachineRuntimeInternalReason::StartupKickoffLifecycle,
+    },
+    MobMachineRuntimeInternalClassificationRecord {
+        input: MobMachineCatalogInput::KickoffMarkStarting,
+        reason: MobMachineRuntimeInternalReason::StartupKickoffLifecycle,
+    },
+    MobMachineRuntimeInternalClassificationRecord {
+        input: MobMachineCatalogInput::StartupMarkReady,
+        reason: MobMachineRuntimeInternalReason::StartupKickoffLifecycle,
+    },
+    MobMachineRuntimeInternalClassificationRecord {
+        input: MobMachineCatalogInput::KickoffResolveStarted,
+        reason: MobMachineRuntimeInternalReason::StartupKickoffLifecycle,
+    },
+    MobMachineRuntimeInternalClassificationRecord {
+        input: MobMachineCatalogInput::KickoffResolveCallbackPending,
+        reason: MobMachineRuntimeInternalReason::StartupKickoffLifecycle,
+    },
+    MobMachineRuntimeInternalClassificationRecord {
+        input: MobMachineCatalogInput::KickoffResolveFailed,
+        reason: MobMachineRuntimeInternalReason::StartupKickoffLifecycle,
+    },
+    MobMachineRuntimeInternalClassificationRecord {
+        input: MobMachineCatalogInput::KickoffCancelRequested,
+        reason: MobMachineRuntimeInternalReason::StartupKickoffLifecycle,
+    },
+    MobMachineRuntimeInternalClassificationRecord {
+        input: MobMachineCatalogInput::KickoffClear,
+        reason: MobMachineRuntimeInternalReason::StartupKickoffLifecycle,
+    },
+];
 
 #[doc(hidden)]
 #[must_use]
@@ -421,6 +592,13 @@ pub fn canonical_mob_machine_command_classifications() -> Vec<MobMachineCommandC
             classification: mob_machine_command_classification(variant),
         })
         .collect()
+}
+
+#[doc(hidden)]
+#[must_use]
+pub const fn canonical_mob_machine_runtime_internal_classifications()
+-> &'static [MobMachineRuntimeInternalClassificationRecord] {
+    MOB_MACHINE_RUNTIME_INTERNAL_CLASSIFICATIONS
 }
 
 const fn mob_machine_command_classification(

@@ -281,16 +281,6 @@ fn retire_with_none_releasing_when_bound_takes_preserving_branch() {
 
 #[test]
 fn retire_with_some_releasing_but_wrong_value_is_rejected() {
-    // W3-H: when the caller passes `releasing = Some(wrong_value)`, the
-    // DSL still routes to `RetireRunningReleasing` (the guard only
-    // checks presence/absence of the witness, not value equality), and
-    // the emitted `MemberSessionBindingChanged` carries whatever the
-    // caller passed as the `old_session_id`. Value-level equality is
-    // the caller's contract with its own bookkeeping; the DSL enforces
-    // presence alignment and the shell actor always reads the current
-    // binding before calling, so a mismatched value cannot originate
-    // from the canonical respawn or terminal-retire flows. This test
-    // pins the DSL's presence-based guard semantics.
     let mut authority = MobMachineAuthority::new();
     MobMachineMutator::apply(
         &mut authority,
@@ -298,26 +288,22 @@ fn retire_with_some_releasing_but_wrong_value_is_rejected() {
     )
     .expect("spawn must be accepted");
 
-    // Passing `Some(wrong_session)` matches the Releasing path's guards
-    // and clears the binding with a Changed effect carrying the wrong
-    // value. The shell actor always reads the current binding first, so
-    // this case cannot originate in production.
-    let transition = MobMachineMutator::apply(
+    let error = MobMachineMutator::apply(
         &mut authority,
         retire_input("alpha", 1, Some(session_id("mismatch"))),
     )
-    .expect("Retire with Some(_) + binding present routes to Releasing");
+    .expect_err("Retire with a caller-smuggled releasing witness must be rejected");
     assert!(
-        !authority
+        format!("{error:?}").contains("GuardRejected"),
+        "wrong releasing witness must fail a Retire guard: {error:?}",
+    );
+    assert_eq!(
+        authority
             .state
             .member_session_bindings
-            .contains_key(&identity("alpha")),
-        "Releasing path must clear the binding",
-    );
-    let changed = find_binding_changed(&transition);
-    assert!(
-        matches!(changed, Some((_, _, Some(_), None))),
-        "Releasing path must emit MemberSessionBindingChanged (Some -> None)",
+            .get(&identity("alpha")),
+        Some(&session_id("bridge-a-gen1")),
+        "rejected releasing witness must leave the binding map untouched",
     );
 }
 
@@ -357,13 +343,11 @@ fn bindings_require_known_identity_invariant_holds_through_spawn_retire_cycle() 
 }
 
 // ==========================================================================
-// Track-B (R5): explicit identity-level wiring and session-binding inputs.
+// Track-B (R5): explicit identity-level wiring inputs.
 //
-// These tests exercise the Track-B `WireMembers`, `UnwireMembers`,
-// `BindMemberSession`, `RotateMemberSession`, and `ReleaseMemberSession`
-// inputs plus the `topology_epoch` advancement + `WiringGraphChanged` /
-// `MemberSessionBindingChanged` effects the `RecomputeMobPeerOverlay`
-// composition driver consumes.
+// These tests exercise the Track-B `WireMembers` and `UnwireMembers`
+// inputs plus the `topology_epoch` advancement + `WiringGraphChanged`
+// effects the `RecomputeMobPeerOverlay` composition driver consumes.
 // ==========================================================================
 
 use meerkat_mob::machines::mob_machine::WiringEdge;
@@ -377,28 +361,6 @@ fn wire_input(a: &str, b: &str) -> MobMachineInput {
 fn unwire_input(a: &str, b: &str) -> MobMachineInput {
     MobMachineInput::UnwireMembers {
         edge: WiringEdge::new(identity(a), identity(b)),
-    }
-}
-
-fn bind_session_input(identity_name: &str, sid: &str) -> MobMachineInput {
-    MobMachineInput::BindMemberSession {
-        agent_identity: identity(identity_name),
-        session_id: session_id(sid),
-    }
-}
-
-fn rotate_session_input(identity_name: &str, old_sid: &str, new_sid: &str) -> MobMachineInput {
-    MobMachineInput::RotateMemberSession {
-        agent_identity: identity(identity_name),
-        old_session_id: session_id(old_sid),
-        new_session_id: session_id(new_sid),
-    }
-}
-
-fn release_session_input(identity_name: &str, sid: &str) -> MobMachineInput {
-    MobMachineInput::ReleaseMemberSession {
-        agent_identity: identity(identity_name),
-        session_id: session_id(sid),
     }
 }
 
@@ -488,270 +450,15 @@ fn unwire_members_rejects_absent_edge_without_bumping_epoch() {
     assert_eq!(authority.state.topology_epoch, 0);
 }
 
-/// `BindMemberSession` requires the identity to have a runtime first
-/// (enforced by the `identity_has_runtime` guard). Callers spawn the
-/// member via the regular `Spawn` input before binding. These tests
-/// first drive Spawn (which itself sets a binding via its lifecycle
-/// path), then Release it, then exercise the explicit Bind input
-/// against the now-runtime-present-but-unbound identity.
-fn spawn_then_release(
-    authority: &mut MobMachineAuthority,
-    identity_name: &str,
-    generation: u64,
-    initial_sid: &str,
-) {
-    MobMachineMutator::apply(
-        authority,
-        spawn_input(identity_name, generation, initial_sid, None),
-    )
-    .expect("spawn must be accepted");
-    MobMachineMutator::apply(authority, release_session_input(identity_name, initial_sid))
-        .expect("release must be accepted");
-}
-
 #[test]
-fn bind_member_session_inserts_binding_and_emits_changed_none_to_some() {
+fn topology_epoch_increments_monotonically_across_wire_mutations() {
     let mut authority = MobMachineAuthority::new();
-    spawn_then_release(&mut authority, "alpha", 1, "spawn-sid");
-    let epoch_before_bind = authority.state.topology_epoch;
-
-    let transition =
-        MobMachineMutator::apply(&mut authority, bind_session_input("alpha", "session-1"))
-            .expect("bind_member_session accepted");
-
-    assert_eq!(
-        authority
-            .state
-            .member_session_bindings
-            .get(&identity("alpha")),
-        Some(&session_id("session-1")),
-    );
-    assert_eq!(authority.state.topology_epoch, epoch_before_bind + 1);
-
-    let changed = find_binding_changed(&transition);
-    assert_eq!(
-        changed,
-        Some((
-            authority.state.topology_epoch,
-            identity("alpha"),
-            None,
-            Some(session_id("session-1")),
-        )),
-        "BindMemberSession must emit MemberSessionBindingChanged (None -> Some)",
-    );
-}
-
-#[test]
-fn bind_member_session_rejects_unknown_identity() {
-    let mut authority = MobMachineAuthority::new();
-    let result = MobMachineMutator::apply(&mut authority, bind_session_input("alpha", "session-1"));
-    assert!(
-        result.is_err(),
-        "BindMemberSession on an identity with no runtime must be rejected",
-    );
-    assert_eq!(authority.state.topology_epoch, 0);
-}
-
-#[test]
-fn bind_member_session_rejects_prior_binding() {
-    let mut authority = MobMachineAuthority::new();
-    spawn_then_release(&mut authority, "alpha", 1, "spawn-sid");
-    MobMachineMutator::apply(&mut authority, bind_session_input("alpha", "session-1"))
-        .expect("first bind accepted");
-    let epoch_after_first_bind = authority.state.topology_epoch;
-
-    let result = MobMachineMutator::apply(&mut authority, bind_session_input("alpha", "session-2"));
-    assert!(
-        result.is_err(),
-        "BindMemberSession with prior binding must be rejected",
-    );
-    assert_eq!(authority.state.topology_epoch, epoch_after_first_bind);
-}
-
-#[test]
-fn rotate_member_session_updates_binding_and_emits_changed_some_to_some() {
-    let mut authority = MobMachineAuthority::new();
-    spawn_then_release(&mut authority, "alpha", 1, "spawn-sid");
-    MobMachineMutator::apply(&mut authority, bind_session_input("alpha", "session-1"))
-        .expect("initial bind accepted");
-    let epoch_before_rotate = authority.state.topology_epoch;
-
-    let transition = MobMachineMutator::apply(
-        &mut authority,
-        rotate_session_input("alpha", "session-1", "session-2"),
-    )
-    .expect("rotate accepted");
-
-    assert_eq!(
-        authority
-            .state
-            .member_session_bindings
-            .get(&identity("alpha")),
-        Some(&session_id("session-2")),
-    );
-    assert_eq!(authority.state.topology_epoch, epoch_before_rotate + 1);
-
-    let changed = find_binding_changed(&transition);
-    assert_eq!(
-        changed,
-        Some((
-            authority.state.topology_epoch,
-            identity("alpha"),
-            Some(session_id("session-1")),
-            Some(session_id("session-2")),
-        )),
-        "RotateMemberSession must emit MemberSessionBindingChanged (Some -> Some)",
-    );
-}
-
-#[test]
-fn rotate_member_session_rejects_when_no_prior_binding() {
-    let mut authority = MobMachineAuthority::new();
-    spawn_then_release(&mut authority, "alpha", 1, "spawn-sid");
-    let epoch_after_spawn_release = authority.state.topology_epoch;
-    let result = MobMachineMutator::apply(
-        &mut authority,
-        rotate_session_input("alpha", "session-1", "session-2"),
-    );
-    assert!(result.is_err());
-    assert_eq!(authority.state.topology_epoch, epoch_after_spawn_release);
-}
-
-#[test]
-fn rotate_member_session_rejects_wrong_old_session_id_witness() {
-    // PR #340 review item #5: a caller that supplies the wrong
-    // `old_session_id` must be rejected by the
-    // `old_session_id_matches_current` guard.
-    let mut authority = MobMachineAuthority::new();
-    spawn_then_release(&mut authority, "alpha", 1, "spawn-sid");
-    MobMachineMutator::apply(
-        &mut authority,
-        bind_session_input("alpha", "session-actual"),
-    )
-    .expect("initial bind accepted");
-    let epoch_before_rotate = authority.state.topology_epoch;
-
-    // Caller claims the current binding is "session-stale" but the
-    // actual binding is "session-actual" — rotation must be rejected.
-    let result = MobMachineMutator::apply(
-        &mut authority,
-        rotate_session_input("alpha", "session-stale", "session-new"),
-    );
-    assert!(
-        result.is_err(),
-        "RotateMemberSession with a wrong old_session_id must be rejected",
-    );
-    assert_eq!(authority.state.topology_epoch, epoch_before_rotate);
-    assert_eq!(
-        authority
-            .state
-            .member_session_bindings
-            .get(&identity("alpha")),
-        Some(&session_id("session-actual")),
-        "binding must remain untouched after rejected forgery attempt",
-    );
-}
-
-#[test]
-fn release_member_session_rejects_wrong_session_id_witness() {
-    // PR #340 review item #5: `ReleaseMemberSession` also verifies
-    // the caller's session_id witness matches the current binding.
-    let mut authority = MobMachineAuthority::new();
-    spawn_then_release(&mut authority, "alpha", 1, "spawn-sid");
-    MobMachineMutator::apply(
-        &mut authority,
-        bind_session_input("alpha", "session-actual"),
-    )
-    .expect("initial bind accepted");
-    let epoch_before_release = authority.state.topology_epoch;
-
-    let result = MobMachineMutator::apply(
-        &mut authority,
-        release_session_input("alpha", "session-stale"),
-    );
-    assert!(
-        result.is_err(),
-        "ReleaseMemberSession with a wrong session_id must be rejected",
-    );
-    assert_eq!(authority.state.topology_epoch, epoch_before_release);
-    assert!(
-        authority
-            .state
-            .member_session_bindings
-            .contains_key(&identity("alpha")),
-        "binding must remain present after rejected forgery attempt",
-    );
-}
-
-#[test]
-fn release_member_session_removes_binding_and_emits_changed_some_to_none() {
-    let mut authority = MobMachineAuthority::new();
-    spawn_then_release(&mut authority, "alpha", 1, "spawn-sid");
-    MobMachineMutator::apply(&mut authority, bind_session_input("alpha", "session-1"))
-        .expect("initial bind accepted");
-    let epoch_before_release = authority.state.topology_epoch;
-
-    let transition =
-        MobMachineMutator::apply(&mut authority, release_session_input("alpha", "session-1"))
-            .expect("release accepted");
-
-    assert!(
-        !authority
-            .state
-            .member_session_bindings
-            .contains_key(&identity("alpha")),
-        "release_member_session must remove the binding",
-    );
-    assert_eq!(authority.state.topology_epoch, epoch_before_release + 1);
-
-    let changed = find_binding_changed(&transition);
-    assert_eq!(
-        changed,
-        Some((
-            authority.state.topology_epoch,
-            identity("alpha"),
-            Some(session_id("session-1")),
-            None,
-        )),
-        "ReleaseMemberSession must emit MemberSessionBindingChanged (Some -> None)",
-    );
-}
-
-#[test]
-fn release_member_session_rejects_when_no_prior_binding() {
-    let mut authority = MobMachineAuthority::new();
-    let result =
-        MobMachineMutator::apply(&mut authority, release_session_input("alpha", "session-1"));
-    assert!(result.is_err());
-    assert_eq!(authority.state.topology_epoch, 0);
-}
-
-#[test]
-fn topology_epoch_increments_monotonically_across_mixed_wire_and_bind_mutations() {
-    let mut authority = MobMachineAuthority::new();
-    spawn_then_release(&mut authority, "alpha", 1, "spawn-sid-a");
-    spawn_then_release(&mut authority, "beta", 2, "spawn-sid-b");
     let starting_epoch = authority.state.topology_epoch;
 
     MobMachineMutator::apply(&mut authority, wire_input("alpha", "beta")).expect("wire accepted");
     assert_eq!(authority.state.topology_epoch, starting_epoch + 1);
 
-    MobMachineMutator::apply(&mut authority, bind_session_input("alpha", "session-a"))
-        .expect("bind accepted");
-    assert_eq!(authority.state.topology_epoch, starting_epoch + 2);
-
-    MobMachineMutator::apply(&mut authority, bind_session_input("beta", "session-b"))
-        .expect("bind accepted");
-    assert_eq!(authority.state.topology_epoch, starting_epoch + 3);
-
-    MobMachineMutator::apply(
-        &mut authority,
-        rotate_session_input("alpha", "session-a", "session-a2"),
-    )
-    .expect("rotate accepted");
-    assert_eq!(authority.state.topology_epoch, starting_epoch + 4);
-
     MobMachineMutator::apply(&mut authority, unwire_input("alpha", "beta"))
         .expect("unwire accepted");
-    assert_eq!(authority.state.topology_epoch, starting_epoch + 5);
+    assert_eq!(authority.state.topology_epoch, starting_epoch + 2);
 }

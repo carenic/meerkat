@@ -129,6 +129,7 @@ pub(crate) struct MobDslT2Snapshot {
     >,
     pub pending_session_ingress_detach_runtime_ids:
         std::collections::BTreeSet<crate::machines::mob_machine::AgentRuntimeId>,
+    pub topology_epoch: u64,
 }
 
 #[derive(Debug, Clone, Default)]

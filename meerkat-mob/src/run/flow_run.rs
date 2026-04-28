@@ -13,7 +13,7 @@
 )]
 
 pub use crate::ids::MeerkatId;
-pub use crate::ids::{BranchId, FrameId, LoopInstanceId, StepId};
+pub use crate::ids::{BranchId, FlowNodeId, FrameId, LoopInstanceId, StepId};
 
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -217,7 +217,8 @@ pub(crate) mod inputs {
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct ProjectFrameStepStatus {
         pub step_id: StepId,
-        pub step_status: StepRunStatus,
+        pub frame_id: FrameId,
+        pub node_id: FlowNodeId,
         pub append_failure_ledger: bool,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -636,6 +637,7 @@ fn maybe_add_unique<T: Ord + Clone>(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn transition<C: Context>(
     state: &State,
     input: Input,
@@ -862,46 +864,16 @@ pub(crate) fn transition<C: Context>(
             })
         }
         Input::ProjectFrameStepStatus(payload) => {
-            if state.phase != Phase::Running {
-                return Err(refusal(&state.phase, InputKind::ProjectFrameStepStatus));
-            }
-            ensure_step(
-                state,
+            let _ = (
                 &payload.step_id,
+                &payload.frame_id,
+                &payload.node_id,
+                payload.append_failure_ledger,
+            );
+            Err(guard(
                 TransitionId::ProjectFrameStepStatus,
-            )?;
-            let mut next_state = state.clone();
-            next_state
-                .step_status
-                .insert(payload.step_id.clone(), Some(payload.step_status));
-            let mut effects = vec![emit_step_notice(
-                payload.step_id.clone(),
-                payload.step_status,
-            )];
-            if payload.step_status == StepRunStatus::Failed {
-                next_state.failure_count = next_state.failure_count.saturating_add(1);
-                next_state.consecutive_failure_count =
-                    next_state.consecutive_failure_count.saturating_add(1);
-                if payload.append_failure_ledger {
-                    effects.push(Effect::AppendFailureLedger(effects::AppendFailureLedger {
-                        step_id: payload.step_id.clone(),
-                    }));
-                }
-                if next_state.escalation_threshold > 0
-                    && next_state.consecutive_failure_count >= next_state.escalation_threshold
-                {
-                    effects.push(Effect::EscalateSupervisor(effects::EscalateSupervisor {
-                        step_id: payload.step_id.clone(),
-                    }));
-                }
-            } else if payload.step_status == StepRunStatus::Completed {
-                next_state.consecutive_failure_count = 0;
-            }
-            Ok(Outcome {
-                transition_id: TransitionId::ProjectFrameStepStatus,
-                next_state,
-                effects,
-            })
+                GuardId::StepStatus,
+            ))
         }
         Input::CancelStep(payload) => {
             if state.phase != Phase::Running {

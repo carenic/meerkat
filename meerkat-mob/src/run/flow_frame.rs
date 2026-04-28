@@ -461,6 +461,7 @@ fn guard(transition_id: TransitionId, guard_id: GuardId) -> TransitionError {
     })
 }
 
+#[cfg(test)]
 fn is_terminal(status: NodeRunStatus) -> bool {
     matches!(
         status,
@@ -471,6 +472,7 @@ fn is_terminal(status: NodeRunStatus) -> bool {
     )
 }
 
+#[cfg(test)]
 fn terminal_status_from_node_projection(state: &State) -> Option<FrameTerminalStatus> {
     if !state.ordered_nodes.iter().all(|node_id| {
         state
@@ -500,10 +502,12 @@ fn terminal_status_from_node_projection(state: &State) -> Option<FrameTerminalSt
     }
 }
 
+#[cfg(test)]
 fn dependency_satisfied(status: NodeRunStatus) -> bool {
     matches!(status, NodeRunStatus::Completed)
 }
 
+#[cfg(test)]
 fn dependency_terminal_failure(status: NodeRunStatus) -> bool {
     matches!(
         status,
@@ -511,6 +515,7 @@ fn dependency_terminal_failure(status: NodeRunStatus) -> bool {
     )
 }
 
+#[cfg(test)]
 fn refresh_ready_frontier(state: &mut State) {
     state.ready_queue.clear();
 
@@ -569,6 +574,7 @@ fn refresh_ready_frontier(state: &mut State) {
     }
 }
 
+#[cfg(test)]
 fn propagate_blocked_nodes(state: &mut State) {
     loop {
         let mut changed = false;
@@ -620,6 +626,7 @@ fn propagate_blocked_nodes(state: &mut State) {
     }
 }
 
+#[cfg(test)]
 fn apply_branch_winner(state: &mut State, winner_node: &FlowNodeId) {
     let Some(branch) = state
         .node_branches
@@ -650,6 +657,7 @@ fn apply_branch_winner(state: &mut State, winner_node: &FlowNodeId) {
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn start_frame_state(
     frame_id: FrameId,
@@ -693,6 +701,7 @@ fn start_frame_state(
     state
 }
 
+#[cfg(test)]
 fn admit_next_ready_node(mut state: State) -> Result<Outcome, TransitionError> {
     if state.phase != Phase::Running {
         return Err(refusal(&state.phase, InputKind::AdmitNextReadyNode));
@@ -727,6 +736,7 @@ fn admit_next_ready_node(mut state: State) -> Result<Outcome, TransitionError> {
     })
 }
 
+#[cfg(test)]
 fn apply_node_terminal(
     state: &State,
     node_id: FlowNodeId,
@@ -771,6 +781,7 @@ fn apply_node_terminal(
     })
 }
 
+#[cfg(test)]
 fn seal_frame(state: &State, payload: inputs::SealFrame) -> Result<Outcome, TransitionError> {
     if state.phase != Phase::Running {
         return Err(refusal(&state.phase, InputKind::SealFrame));
@@ -827,6 +838,7 @@ fn seal_frame(state: &State, payload: inputs::SealFrame) -> Result<Outcome, Tran
     })
 }
 
+#[cfg(test)]
 pub(crate) fn transition<C: Context>(
     state: &State,
     input: Input,

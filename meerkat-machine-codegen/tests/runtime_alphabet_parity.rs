@@ -10,15 +10,15 @@ use meerkat_machine_schema::catalog::dsl::{
 };
 use meerkat_machine_schema::identity::{IdentityError, InputVariantId, SignalVariantId};
 use meerkat_mob::{
-    MobMachineCommandClassification, MobMachineCommandClassificationRecord,
-    canonical_mob_machine_command_classifications,
+    MobMachineCatalogInput as MobInput, MobMachineCommandClassification,
+    MobMachineCommandClassificationRecord, canonical_mob_machine_command_classifications,
 };
 use meerkat_runtime::{
-    MeerkatMachineCommandClassification, MeerkatMachineCommandClassificationRecord,
-    canonical_meerkat_machine_command_classifications,
+    MeerkatMachineCatalogInput as MeerkatInput, MeerkatMachineCommandClassification,
+    MeerkatMachineCommandClassificationRecord, canonical_meerkat_machine_command_classifications,
 };
-use std::collections::BTreeSet;
-use std::path::Path;
+use std::collections::{BTreeMap, BTreeSet};
+use std::path::{Path, PathBuf};
 
 fn variant_ids<'a>(
     variants: impl IntoIterator<Item = &'a meerkat_machine_schema::VariantSchema>,
@@ -53,6 +53,170 @@ fn mob_runtime_command_ids(
             .iter()
             .flat_map(|record| record.classification.catalog_input_names()),
     )
+}
+
+fn parse_input_name(input: &'static str) -> InputVariantId {
+    InputVariantId::parse(input).expect("catalog input names must be valid input identifiers")
+}
+
+fn assert_meerkat_command_records_are_identity_checked(
+    schema_inputs: &BTreeSet<InputVariantId>,
+    records: &[MeerkatMachineCommandClassificationRecord],
+) {
+    for record in records {
+        let command_input = InputVariantId::parse(record.command).ok();
+        let command_is_catalog_input = command_input
+            .as_ref()
+            .is_some_and(|input| schema_inputs.contains(input));
+        let catalog_inputs = record.classification.catalog_input_names();
+        let catalog_input_ids = catalog_inputs
+            .iter()
+            .copied()
+            .map(parse_input_name)
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            catalog_input_ids.len(),
+            catalog_inputs.len(),
+            "MeerkatMachine command `{}` must not duplicate catalog input classifications",
+            record.command
+        );
+        assert!(
+            catalog_input_ids.is_subset(schema_inputs),
+            "MeerkatMachine command `{}` classifies to inputs absent from the schema: {:?}",
+            record.command,
+            catalog_input_ids
+                .difference(schema_inputs)
+                .collect::<Vec<_>>()
+        );
+
+        match record.classification {
+            MeerkatMachineCommandClassification::CatalogInput(input) => {
+                if command_is_catalog_input {
+                    assert_eq!(
+                        record.command,
+                        input.as_str(),
+                        "MeerkatMachine command `{}` is itself a catalog input and must classify to that exact typed input",
+                        record.command
+                    );
+                }
+            }
+            MeerkatMachineCommandClassification::CatalogInputs(inputs) => {
+                assert!(
+                    !inputs.is_empty(),
+                    "MeerkatMachine command `{}` must not use an empty typed catalog classification",
+                    record.command
+                );
+                if let Some(command_input) =
+                    command_input.filter(|input| schema_inputs.contains(input))
+                {
+                    assert!(
+                        catalog_input_ids.contains(&command_input),
+                        "MeerkatMachine command `{}` is itself a catalog input and must include that exact typed input",
+                        record.command
+                    );
+                }
+            }
+            MeerkatMachineCommandClassification::ShellMechanic(_) => {
+                assert!(
+                    !command_is_catalog_input,
+                    "MeerkatMachine shell-mechanic command `{}` must not bypass a catalog input",
+                    record.command
+                );
+            }
+        }
+    }
+}
+
+fn assert_mob_command_records_are_identity_checked(
+    schema_inputs: &BTreeSet<InputVariantId>,
+    records: &[MobMachineCommandClassificationRecord],
+) {
+    for record in records {
+        let command_input = InputVariantId::parse(record.command).ok();
+        let command_is_catalog_input = command_input
+            .as_ref()
+            .is_some_and(|input| schema_inputs.contains(input));
+        let catalog_inputs = record.classification.catalog_input_names();
+        let catalog_input_ids = catalog_inputs
+            .iter()
+            .copied()
+            .map(parse_input_name)
+            .collect::<BTreeSet<_>>();
+
+        assert_eq!(
+            catalog_input_ids.len(),
+            catalog_inputs.len(),
+            "MobMachine command `{}` must not duplicate catalog input classifications",
+            record.command
+        );
+        assert!(
+            catalog_input_ids.is_subset(schema_inputs),
+            "MobMachine command `{}` classifies to inputs absent from the schema: {:?}",
+            record.command,
+            catalog_input_ids
+                .difference(schema_inputs)
+                .collect::<Vec<_>>()
+        );
+
+        match record.classification {
+            MobMachineCommandClassification::CatalogInput(input) => {
+                if command_is_catalog_input {
+                    assert_eq!(
+                        record.command,
+                        input.as_str(),
+                        "MobMachine command `{}` is itself a catalog input and must classify to that exact typed input",
+                        record.command
+                    );
+                }
+            }
+            MobMachineCommandClassification::CatalogInputs(inputs) => {
+                assert!(
+                    !inputs.is_empty(),
+                    "MobMachine command `{}` must not use an empty typed catalog classification",
+                    record.command
+                );
+                if let Some(command_input) =
+                    command_input.filter(|input| schema_inputs.contains(input))
+                {
+                    assert!(
+                        catalog_input_ids.contains(&command_input),
+                        "MobMachine command `{}` is itself a catalog input and must include that exact typed input",
+                        record.command
+                    );
+                }
+            }
+            MobMachineCommandClassification::ShellMechanic(_) => {
+                assert!(
+                    !command_is_catalog_input,
+                    "MobMachine shell-mechanic command `{}` must not bypass a catalog input",
+                    record.command
+                );
+            }
+        }
+    }
+}
+
+fn assert_all_mob_catalog_inputs_are_identity_checked(schema_inputs: &BTreeSet<InputVariantId>) {
+    let all_inputs = MobInput::ALL
+        .iter()
+        .copied()
+        .map(MobInput::as_str)
+        .map(parse_input_name)
+        .collect::<BTreeSet<_>>();
+
+    assert_eq!(
+        all_inputs, *schema_inputs,
+        "MobMachineCatalogInput::ALL must exactly mirror the catalog schema input alphabet"
+    );
+
+    for input in MobInput::ALL {
+        let input_id = parse_input_name(input.as_str());
+        assert!(
+            schema_inputs.contains(&input_id),
+            "typed MobMachine catalog input {input:?} must serialize to its exact schema input name"
+        );
+    }
 }
 
 fn assert_runtime_manifest_matches_schema(
@@ -102,158 +266,82 @@ fn assert_runtime_manifest_matches_schema(
     );
 }
 
-fn classifier_function_body(source_path: &Path, function_name: &str) -> String {
-    let source = std::fs::read_to_string(source_path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", source_path.display()));
-    let function_marker = format!("fn {function_name}");
-    let function_start = source
-        .find(&function_marker)
-        .unwrap_or_else(|| panic!("missing classifier function `{function_name}`"));
-    let function_tail = &source[function_start..];
-    let body_start = function_tail
+fn assert_command_mapping_is_identity_or_pinned(
+    machine: &str,
+    records: impl IntoIterator<Item = (&'static str, Vec<InputVariantId>)>,
+    pinned_non_identity: BTreeMap<&'static str, Vec<InputVariantId>>,
+) {
+    for (command, inputs) in records {
+        if inputs.is_empty() {
+            continue;
+        }
+        if let Some(expected) = pinned_non_identity.get(command) {
+            assert_eq!(
+                &inputs, expected,
+                "{machine} command `{command}` changed its typed non-identity catalog mapping"
+            );
+        } else {
+            assert_eq!(
+                inputs,
+                vec![parse_input_name(command)],
+                "{machine} command `{command}` must map to the catalog input with the same name \
+                 unless this semantic exception is explicitly pinned"
+            );
+        }
+    }
+}
+
+fn repo_root() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("repo root")
+        .to_path_buf()
+}
+
+fn function_body(source: &str, start_marker: &str, _end_marker: &str) -> String {
+    let start = source
+        .find(start_marker)
+        .unwrap_or_else(|| panic!("missing start marker `{start_marker}`"));
+    let rest = &source[start..];
+    let body_start = rest
         .find('{')
-        .unwrap_or_else(|| panic!("could not locate body of `{function_name}`"));
+        .unwrap_or_else(|| panic!("missing classifier body for `{start_marker}`"));
     let mut depth = 0usize;
-    let mut body_end = None;
-    for (offset, ch) in function_tail[body_start..].char_indices() {
+    for (offset, ch) in rest[body_start..].char_indices() {
         match ch {
             '{' => depth += 1,
             '}' => {
                 depth = depth
                     .checked_sub(1)
-                    .unwrap_or_else(|| panic!("brace underflow in `{function_name}`"));
+                    .unwrap_or_else(|| panic!("brace underflow in `{start_marker}`"));
                 if depth == 0 {
-                    body_end = Some(body_start + offset + ch.len_utf8());
-                    break;
+                    return rest[body_start..body_start + offset + ch.len_utf8()].to_string();
                 }
             }
             _ => {}
         }
     }
-    let body_end = body_end.unwrap_or_else(|| panic!("could not locate end of `{function_name}`"));
-    function_tail[body_start..body_end].to_owned()
+    panic!("missing classifier body end for `{start_marker}`")
 }
 
-fn catalog_input_enum_variants(source: &str, enum_name: &str) -> BTreeSet<String> {
-    let enum_marker = format!("enum {enum_name}");
-    let enum_start = source
-        .find(&enum_marker)
-        .unwrap_or_else(|| panic!("missing enum `{enum_name}`"));
-    let enum_tail = &source[enum_start..];
-    let body_start = enum_tail
-        .find('{')
-        .unwrap_or_else(|| panic!("could not locate body of enum `{enum_name}`"));
-    let body_end = enum_tail[body_start..]
-        .find('}')
-        .unwrap_or_else(|| panic!("could not locate end of enum `{enum_name}`"));
-    enum_tail[body_start + 1..body_start + body_end]
-        .lines()
-        .filter_map(|line| line.trim().strip_suffix(','))
-        .filter(|line| !line.is_empty() && !line.starts_with("#["))
-        .map(ToOwned::to_owned)
-        .collect()
-}
-
-fn catalog_input_as_str_arms(source: &str, enum_name: &str) -> BTreeSet<(String, String)> {
-    let impl_marker = format!("impl {enum_name}");
-    let impl_start = source
-        .find(&impl_marker)
-        .unwrap_or_else(|| panic!("missing impl `{enum_name}`"));
-    let impl_tail = &source[impl_start..];
-    let function_start = impl_tail
-        .find("fn as_str")
-        .unwrap_or_else(|| panic!("missing `{enum_name}::as_str`"));
-    let mut arms = BTreeSet::new();
-    let mut pending_variant = None::<String>;
-    for line in impl_tail[function_start..].lines() {
-        let trimmed = line.trim();
-        if let Some(arm) = trimmed.strip_prefix("Self::") {
-            if let Some((variant, literal_tail)) = arm.split_once("=>") {
-                pending_variant = Some(variant.trim().to_owned());
-                if let Some(literal) = literal_tail
-                    .trim()
-                    .strip_prefix('"')
-                    .and_then(|tail| tail.split_once('"'))
-                    .map(|(literal, _)| literal.to_owned())
-                {
-                    let variant = pending_variant.take().expect("variant just assigned");
-                    arms.insert((variant, literal));
-                }
-            }
-            continue;
-        }
-        if let Some(variant) = pending_variant.take() {
-            if let Some(literal) = trimmed
-                .strip_prefix('"')
-                .and_then(|tail| tail.split_once('"'))
-                .map(|(literal, _)| literal.to_owned())
-            {
-                arms.insert((variant, literal));
-            } else {
-                pending_variant = Some(variant);
-            }
-        }
-    }
-    arms
-}
-
-fn assert_catalog_input_enum_is_name_identity(source_path: &Path, enum_name: &str) {
-    let source = std::fs::read_to_string(source_path)
-        .unwrap_or_else(|err| panic!("failed to read {}: {err}", source_path.display()));
-    let variants = catalog_input_enum_variants(&source, enum_name);
-    let arms = catalog_input_as_str_arms(&source, enum_name);
-    let arm_variants = arms
-        .iter()
-        .map(|(variant, _)| variant.clone())
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        variants, arm_variants,
-        "{enum_name}::as_str must cover exactly the typed catalog input variants"
-    );
-    let non_identity = arms
-        .into_iter()
-        .filter(|(variant, literal)| variant != literal)
-        .collect::<Vec<_>>();
+fn assert_classifier_body_uses_typed_variants(path: &str, start_marker: &str, end_marker: &str) {
+    let source = std::fs::read_to_string(repo_root().join(path)).expect("read classifier source");
+    let body = function_body(&source, start_marker, end_marker);
     assert!(
-        non_identity.is_empty(),
-        "{enum_name}::as_str must be an identity projection to the catalog variant name, got {non_identity:?}"
-    );
-}
-
-fn assert_classifier_has_no_catalog_input_wildcard(source_path: &Path, function_name: &str) {
-    let function_body = classifier_function_body(source_path, function_name);
-    assert!(
-        !function_body.contains("_ =>") && !function_body.contains(".. =>"),
-        "{function_name} must classify every command variant explicitly; a wildcard/default CatalogInput arm would make new commands bypass the #38 typed parity gate"
-    );
-}
-
-fn assert_classifier_has_no_raw_catalog_input_mapping(source_path: &Path, function_name: &str) {
-    let function_body = classifier_function_body(source_path, function_name);
-    assert!(
-        !function_body.contains("CatalogInput(\"")
-            && !function_body.contains("CatalogInputs(&[\"")
-            && !function_body.contains("variant.as_str()"),
-        "{function_name} must map command variants to typed catalog input variants, not raw strings or command-name stringification"
-    );
-}
-
-fn assert_classifier_uses_typed_catalog_inputs_and_shell_reasons(
-    source_path: &Path,
-    function_name: &str,
-    catalog_input_type: &str,
-    shell_reason_type: &str,
-) {
-    let function_body = classifier_function_body(source_path, function_name);
-    let compact_body = function_body.split_whitespace().collect::<String>();
-    assert!(
-        compact_body.contains(&format!("CatalogInput({catalog_input_type}::"))
-            || compact_body.contains(&format!("CatalogInputs(&[{catalog_input_type}::")),
-        "{function_name} should positively classify semantic commands with typed {catalog_input_type} variants"
+        body.contains("match variant"),
+        "{path} command classifier must dispatch on typed command variants"
     );
     assert!(
-        compact_body.contains(&format!("ShellMechanic({shell_reason_type}::")),
-        "{function_name} should classify shell-only commands with typed {shell_reason_type} variants"
+        !body.contains(".as_str()"),
+        "{path} command classifier must not classify by stringified command names"
+    );
+    assert!(
+        !body.contains("=> _") && !body.contains("_ =>"),
+        "{path} command classifier must enumerate variants without wildcard fallback"
+    );
+    assert!(
+        !body.contains('"'),
+        "{path} command classifier must not contain string-literal command/input whitelists"
     );
 }
 
@@ -264,6 +352,7 @@ fn meerkat_machine_inputs_equal_runtime_manifest_exactly() -> Result<(), Identit
     let dsl_internal_inputs: BTreeSet<InputVariantId> =
         schema.runtime_internal_inputs.iter().cloned().collect();
     let records = canonical_meerkat_machine_command_classifications();
+    assert_meerkat_command_records_are_identity_checked(&schema_inputs, &records);
     let runtime_commands = meerkat_runtime_command_ids(&records)?;
     let shell_mechanics = command_ids(records.iter().filter_map(|record| {
         matches!(
@@ -290,6 +379,8 @@ fn mob_machine_inputs_equal_runtime_manifest_exactly() -> Result<(), IdentityErr
     let dsl_internal_inputs: BTreeSet<InputVariantId> =
         schema.runtime_internal_inputs.iter().cloned().collect();
     let records = canonical_mob_machine_command_classifications();
+    assert_mob_command_records_are_identity_checked(&schema_inputs, &records);
+    assert_all_mob_catalog_inputs_are_identity_checked(&schema_inputs);
     let runtime_commands = mob_runtime_command_ids(&records)?;
     let shell_mechanics = command_ids(records.iter().filter_map(|record| {
         matches!(
@@ -310,76 +401,99 @@ fn mob_machine_inputs_equal_runtime_manifest_exactly() -> Result<(), IdentityErr
 }
 
 #[test]
-fn runtime_command_classifiers_are_exhaustive_not_defaulted() {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crate has workspace parent");
-    assert_classifier_has_no_catalog_input_wildcard(
-        &workspace
-            .join("meerkat-runtime")
-            .join("src")
-            .join("meerkat_machine_types.rs"),
-        "meerkat_machine_command_classification",
-    );
-    assert_classifier_has_no_raw_catalog_input_mapping(
-        &workspace
-            .join("meerkat-runtime")
-            .join("src")
-            .join("meerkat_machine_types.rs"),
-        "meerkat_machine_command_classification",
-    );
-    assert_classifier_uses_typed_catalog_inputs_and_shell_reasons(
-        &workspace
-            .join("meerkat-runtime")
-            .join("src")
-            .join("meerkat_machine_types.rs"),
-        "meerkat_machine_command_classification",
-        "MeerkatMachineCatalogInput",
-        "MeerkatMachineShellMechanicReason",
-    );
-    assert_classifier_has_no_catalog_input_wildcard(
-        &workspace
-            .join("meerkat-mob")
-            .join("src")
-            .join("mob_machine.rs"),
-        "mob_machine_command_classification",
-    );
-    assert_classifier_has_no_raw_catalog_input_mapping(
-        &workspace
-            .join("meerkat-mob")
-            .join("src")
-            .join("mob_machine.rs"),
-        "mob_machine_command_classification",
-    );
-    assert_classifier_uses_typed_catalog_inputs_and_shell_reasons(
-        &workspace
-            .join("meerkat-mob")
-            .join("src")
-            .join("mob_machine.rs"),
-        "mob_machine_command_classification",
-        "MobMachineCatalogInput",
-        "MobMachineShellMechanicReason",
+fn meerkat_machine_command_to_input_mappings_are_typed_and_pinned() {
+    let records = canonical_meerkat_machine_command_classifications();
+    let pinned = BTreeMap::from([
+        (
+            "ConfigureModelRoutingBaseline",
+            vec![parse_input_name(
+                MeerkatInput::SetModelRoutingBaseline.as_str(),
+            )],
+        ),
+        (
+            "RequestSwitchTurn",
+            vec![
+                parse_input_name(MeerkatInput::RequestFiniteSwitchTurn.as_str()),
+                parse_input_name(MeerkatInput::RequestUntilChangedSwitchTurn.as_str()),
+            ],
+        ),
+        (
+            "RuntimeRealtimeChannelStatus",
+            vec![parse_input_name(
+                MeerkatInput::RuntimeRealtimeAttachmentStatus.as_str(),
+            )],
+        ),
+        (
+            "SessionModelRoutingStatus",
+            vec![parse_input_name(MeerkatInput::ModelRoutingStatus.as_str())],
+        ),
+    ]);
+
+    assert_command_mapping_is_identity_or_pinned(
+        "MeerkatMachine",
+        records.iter().map(|record| {
+            (
+                record.command,
+                record
+                    .classification
+                    .catalog_input_names()
+                    .into_iter()
+                    .map(parse_input_name)
+                    .collect::<Vec<_>>(),
+            )
+        }),
+        pinned,
     );
 }
 
 #[test]
-fn typed_catalog_input_enums_cannot_remap_to_other_schema_strings() {
-    let workspace = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .parent()
-        .expect("crate has workspace parent");
-    assert_catalog_input_enum_is_name_identity(
-        &workspace
-            .join("meerkat-runtime")
-            .join("src")
-            .join("meerkat_machine_types.rs"),
-        "MeerkatMachineCatalogInput",
+fn mob_machine_command_to_input_mappings_are_typed_and_pinned() {
+    let records = canonical_mob_machine_command_classifications();
+    let pinned = BTreeMap::from([
+        (
+            "Wire",
+            vec![
+                parse_input_name(MobInput::WireMembers.as_str()),
+                parse_input_name(MobInput::WireExternalPeer.as_str()),
+            ],
+        ),
+        (
+            "Unwire",
+            vec![
+                parse_input_name(MobInput::UnwireMembers.as_str()),
+                parse_input_name(MobInput::UnwireExternalPeer.as_str()),
+            ],
+        ),
+    ]);
+
+    assert_command_mapping_is_identity_or_pinned(
+        "MobMachine",
+        records.iter().map(|record| {
+            (
+                record.command,
+                record
+                    .classification
+                    .catalog_input_names()
+                    .into_iter()
+                    .map(parse_input_name)
+                    .collect::<Vec<_>>(),
+            )
+        }),
+        pinned,
     );
-    assert_catalog_input_enum_is_name_identity(
-        &workspace
-            .join("meerkat-mob")
-            .join("src")
-            .join("mob_machine.rs"),
-        "MobMachineCatalogInput",
+}
+
+#[test]
+fn command_classifiers_do_not_use_string_whitelists_or_wildcards() {
+    assert_classifier_body_uses_typed_variants(
+        "meerkat-runtime/src/meerkat_machine_types.rs",
+        "const fn meerkat_machine_command_classification",
+        "/// Snapshot of completion waiters",
+    );
+    assert_classifier_body_uses_typed_variants(
+        "meerkat-mob/src/mob_machine.rs",
+        "const fn mob_machine_command_classification",
+        "",
     );
 }
 

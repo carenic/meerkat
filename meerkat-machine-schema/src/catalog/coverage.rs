@@ -138,7 +138,7 @@ pub fn canonical_machine_coverage_manifests() -> Vec<MachineCoverageManifest> {
                 anchor(
                     "mob_actor_authority",
                     "meerkat-mob/src/runtime/actor.rs",
-                    "MobMachine actor authority and command execution for wire, unwire, bind, rotate, release, spawn, ensure member, reconcile, observe runtime, submit work, retire, reset, respawn, complete, mark completed, stop/stopped, resume, task, force cancel, subscribe events, shutdown, destroy, terminalized member, record operator action provenance, flow, run, create frame seed, create loop seed, project frame phase, project loop state, orchestrator, coordinator, cleanup, append failure ledger, escalate supervisor, peer, progress, notices, kickoff resolve started/callback pending/failed/cancelled/clear, wiring graph, and session binding",
+                    "MobMachine actor authority and command execution for wire, unwire, spawn, ensure member, reconcile, observe runtime, submit work, retire, reset, respawn, complete, mark completed, stop/stopped, resume, task, force cancel, subscribe events, shutdown, destroy, terminalized member, record operator action provenance, flow, run, create frame seed, create loop seed, project frame phase, project loop state, orchestrator, coordinator, cleanup, append failure ledger, escalate supervisor, peer, progress, notices, kickoff resolve started/callback pending/failed/clear, wiring graph, and session binding",
                 ),
             ],
             &[
@@ -152,7 +152,7 @@ pub fn canonical_machine_coverage_manifests() -> Vec<MachineCoverageManifest> {
                 ),
                 scenario(
                     "wiring-and-session-binding",
-                    "wire and unwire members, bind rotate release member session, enforce known identity for bindings, expose pending spawn, member session binding changed, and wiring lifecycle notices",
+                    "wire and unwire members, enforce known identity for session bindings, expose pending spawn, member session binding changed, and wiring lifecycle notices",
                 ),
                 scenario(
                     "task-flow-and-run-lifecycle",

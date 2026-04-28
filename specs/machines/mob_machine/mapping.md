@@ -9,12 +9,12 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 
 ### Code Anchors
 - `mob_handle_surface`: `meerkat-mob/src/runtime/handle.rs` — identity-first public MobMachine handle surface for ensure member, reconcile, and member command routing
-- `mob_actor_authority`: `meerkat-mob/src/runtime/actor.rs` — MobMachine actor authority and command execution for wire, unwire, bind, rotate, release, spawn, ensure member, reconcile, observe runtime, submit work, retire, reset, respawn, complete, mark completed, stop/stopped, resume, task, force cancel, subscribe events, shutdown, destroy, terminalized member, record operator action provenance, flow, run, create frame seed, create loop seed, project frame phase, project loop state, orchestrator, coordinator, cleanup, append failure ledger, escalate supervisor, peer, progress, notices, kickoff resolve started/callback pending/failed/cancelled/clear, wiring graph, and session binding
+- `mob_actor_authority`: `meerkat-mob/src/runtime/actor.rs` — MobMachine actor authority and command execution for wire, unwire, spawn, ensure member, reconcile, observe runtime, submit work, retire, reset, respawn, complete, mark completed, stop/stopped, resume, task, force cancel, subscribe events, shutdown, destroy, terminalized member, record operator action provenance, flow, run, create frame seed, create loop seed, project frame phase, project loop state, orchestrator, coordinator, cleanup, append failure ledger, escalate supervisor, peer, progress, notices, kickoff resolve started/callback pending/failed/clear, wiring graph, and session binding
 
 ### Scenarios
 - `spawn-work-terminal` — member spawn, ensure member, reconcile, runtime-ready observation, work submission, and terminal work closure
 - `retire-respawn-destroy` — member retires, resets, respawns with a new runtime incarnation, stops/stopped, resumes, shuts down, destroys cleanly, and resets to running when reusable
-- `wiring-and-session-binding` — wire and unwire members, bind rotate release member session, enforce known identity for bindings, expose pending spawn, member session binding changed, and wiring lifecycle notices
+- `wiring-and-session-binding` — wire and unwire members, enforce known identity for session bindings, expose pending spawn, member session binding changed, and wiring lifecycle notices
 - `task-flow-and-run-lifecycle` — task create or update pending/in progress/completed/cancelled, run flow, start flow, create run, create frame seed, create loop seed, project frame phase, project loop state, start run, complete flow, finish run, mark completed, kickoff resolve started or failed, kickoff clear, flow terminalized, and force cancel running work
 - `event-subscriptions-and-notices` — subscribe agent, all agent, and mob events; emit member, run, flow, progress, task, terminal, and wiring notices
 - `orchestrator-coordinator-cleanup` — initialize, stop, resume, and destroy orchestrator; bind or unbind coordinator; begin and finish cleanup; notify coordinator and escalate supervisor
@@ -97,15 +97,6 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: `mob_actor_authority`
   - scenarios: `task-flow-and-run-lifecycle`
 - `KickoffResolveFailedFromStartingCompleted`
-  - anchors: `mob_actor_authority`
-  - scenarios: `task-flow-and-run-lifecycle`
-- `KickoffResolveCancelledRunning`
-  - anchors: `mob_actor_authority`
-  - scenarios: `task-flow-and-run-lifecycle`
-- `KickoffResolveCancelledStopped`
-  - anchors: `mob_actor_authority`
-  - scenarios: `task-flow-and-run-lifecycle`
-- `KickoffResolveCancelledCompleted`
   - anchors: `mob_actor_authority`
   - scenarios: `task-flow-and-run-lifecycle`
 - `KickoffCancelRequestedRunning`
@@ -201,15 +192,6 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `UnwireExternalPeerRunning`
   - anchors: `mob_actor_authority`
   - scenarios: `retire-respawn-destroy`, `wiring-and-session-binding`, `task-flow-and-run-lifecycle`, `operator-provenance-and-peer-input`
-- `BindMemberSessionRunning`
-  - anchors: `mob_actor_authority`
-  - scenarios: `wiring-and-session-binding`
-- `RotateMemberSessionRunning`
-  - anchors: `mob_actor_authority`
-  - scenarios: `wiring-and-session-binding`
-- `ReleaseMemberSessionRunning`
-  - anchors: `mob_actor_authority`
-  - scenarios: `wiring-and-session-binding`
 - `TaskCreateRunning`
   - anchors: `mob_actor_authority`
   - scenarios: `task-flow-and-run-lifecycle`

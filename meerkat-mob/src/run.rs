@@ -77,6 +77,24 @@ pub fn flow_projection_kernel_audit() -> &'static [FlowProjectionKernelAudit] {
     FLOW_PROJECTION_KERNEL_AUDIT
 }
 
+#[must_use]
+pub fn canonical_flow_authority_input_manifest() -> indexmap::IndexSet<&'static str> {
+    [
+        MobMachineCatalogInput::CreateRunSeed,
+        MobMachineCatalogInput::AuthorizeFlowRunReducerCommand,
+        MobMachineCatalogInput::CreateFrameSeed,
+        MobMachineCatalogInput::AuthorizeFlowFrameReducerCommand,
+        MobMachineCatalogInput::CreateLoopSeed,
+        MobMachineCatalogInput::RecordLoopBodyFrameCompleted,
+        MobMachineCatalogInput::RecordLoopUntilConditionMet,
+        MobMachineCatalogInput::RecordLoopUntilConditionFailed,
+        MobMachineCatalogInput::AuthorizeLoopIterationReducerCommand,
+    ]
+    .into_iter()
+    .map(MobMachineCatalogInput::as_str)
+    .collect()
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MobMachineFlowAuthorityKind {
     FlowRun(mob_dsl::FlowRunReducerCommandKind),
@@ -341,6 +359,9 @@ impl MobMachineFlowRunCommand {
             frame_id: self
                 .frame_id()
                 .map(|frame_id| mob_dsl::FrameId::from(frame_id.as_str())),
+            node_id: self
+                .node_id()
+                .map(|node_id| mob_dsl::FlowNodeId::from(node_id.as_str())),
             loop_instance_id: self
                 .loop_instance_id()
                 .map(|loop_id| mob_dsl::LoopInstanceId::from(loop_id.as_str())),
@@ -416,7 +437,6 @@ impl MobMachineFlowRunCommand {
             Self::CompleteStep(_) => flow_run::StepRunStatus::Completed,
             Self::FailStep(_) => flow_run::StepRunStatus::Failed,
             Self::SkipStep(_) => flow_run::StepRunStatus::Skipped,
-            Self::ProjectFrameStepStatus(payload) => payload.step_status,
             Self::CancelStep(_) => flow_run::StepRunStatus::Canceled,
             _ => return None,
         };
@@ -438,10 +458,18 @@ impl MobMachineFlowRunCommand {
 
     fn frame_id(&self) -> Option<&FrameId> {
         match self {
+            Self::ProjectFrameStepStatus(payload) => Some(&payload.frame_id),
             Self::RegisterReadyFrame(payload) => Some(&payload.frame_id),
             Self::PumpNodeScheduler(payload) => Some(&payload.frame_id),
             Self::NodeExecutionReleased(payload) => Some(&payload.frame_id),
             Self::FrameTerminated(payload) => Some(&payload.frame_id),
+            _ => None,
+        }
+    }
+
+    fn node_id(&self) -> Option<&FlowNodeId> {
+        match self {
+            Self::ProjectFrameStepStatus(payload) => Some(&payload.node_id),
             _ => None,
         }
     }
@@ -743,7 +771,8 @@ pub(crate) fn apply_mob_machine_flow_run_command(
                 machine_state,
                 run_id,
                 &payload.step_id,
-                payload.step_status,
+                &payload.frame_id,
+                &payload.node_id,
                 payload.append_failure_ledger,
             )
         }
@@ -1532,15 +1561,6 @@ fn project_flow_run_failed_step_from_machine(
             step_id: step_id.clone(),
         },
     ));
-    if outcome.next_state.escalation_threshold > 0
-        && outcome.next_state.consecutive_failure_count >= outcome.next_state.escalation_threshold
-    {
-        outcome.effects.push(flow_run::Effect::EscalateSupervisor(
-            flow_run::effects::EscalateSupervisor {
-                step_id: step_id.clone(),
-            },
-        ));
-    }
     Ok(outcome)
 }
 
@@ -1549,9 +1569,12 @@ fn project_flow_run_frame_step_status_from_machine(
     machine_state: &mob_dsl::MobMachineState,
     run_id: &RunId,
     step_id: &StepId,
-    expected_status: flow_run::StepRunStatus,
+    frame_id: &FrameId,
+    node_id: &FlowNodeId,
     append_failure_ledger: bool,
 ) -> Result<flow_run::Outcome, MobError> {
+    let expected_status =
+        machine_projected_frame_step_status(machine_state, run_id, step_id, frame_id, node_id)?;
     let mut outcome = project_flow_run_step_status_from_machine(
         state,
         machine_state,
@@ -1597,6 +1620,57 @@ fn project_flow_run_frame_step_status_from_machine(
         _ => {}
     }
     Ok(outcome)
+}
+
+fn machine_projected_frame_step_status(
+    machine_state: &mob_dsl::MobMachineState,
+    run_id: &RunId,
+    step_id: &StepId,
+    frame_id: &FrameId,
+    node_id: &FlowNodeId,
+) -> Result<flow_run::StepRunStatus, MobError> {
+    let run_key = mob_dsl::RunId::from(run_id.to_string());
+    let step_key = mob_dsl::StepId::from(step_id.as_str());
+    let frame_key = mob_dsl::FrameId::from(frame_id.as_str());
+    let node_key = mob_dsl::FlowNodeId::from(node_id.as_str());
+
+    if machine_state.frame_run.get(&frame_key) != Some(&run_key) {
+        return Err(MobError::Internal(format!(
+            "MobMachine ProjectFrameStepStatus accepted frame '{frame_id}' that does not belong \
+             to run '{run_id}'"
+        )));
+    }
+    let Some(step_ids) = machine_state.frame_node_step_ids.get(&frame_key) else {
+        return Err(MobError::Internal(format!(
+            "MobMachine ProjectFrameStepStatus missing step mapping for frame '{frame_id}'"
+        )));
+    };
+    if step_ids.get(&node_key) != Some(&step_key) {
+        return Err(MobError::Internal(format!(
+            "MobMachine ProjectFrameStepStatus mapped frame '{frame_id}' node '{node_id}' to a \
+             different step than '{step_id}'"
+        )));
+    }
+    let Some(node_statuses) = machine_state.frame_node_status.get(&frame_key) else {
+        return Err(MobError::Internal(format!(
+            "MobMachine ProjectFrameStepStatus missing node statuses for frame '{frame_id}'"
+        )));
+    };
+    let Some(node_status) = node_statuses.get(&node_key).copied() else {
+        return Err(MobError::Internal(format!(
+            "MobMachine ProjectFrameStepStatus missing status for frame '{frame_id}' node \
+             '{node_id}'"
+        )));
+    };
+    match node_status {
+        mob_dsl::NodeRunStatus::Completed => Ok(flow_run::StepRunStatus::Completed),
+        mob_dsl::NodeRunStatus::Skipped => Ok(flow_run::StepRunStatus::Skipped),
+        mob_dsl::NodeRunStatus::Failed => Ok(flow_run::StepRunStatus::Failed),
+        other => Err(MobError::Internal(format!(
+            "MobMachine ProjectFrameStepStatus accepted non-projectable frame node status \
+             {other:?} for frame '{frame_id}' node '{node_id}'"
+        ))),
+    }
 }
 
 fn project_flow_run_counters_from_machine(
@@ -3646,7 +3720,9 @@ mod tests {
             assert!(!record.canonical_machine);
             assert!(
                 record.owning_inputs.iter().any(|input| {
-                    input.as_str().starts_with("Authorize") || input.as_str().ends_with("Seed")
+                    input.as_str().starts_with("Authorize")
+                        || input.as_str().ends_with("Seed")
+                        || input.as_str().starts_with("RecordLoop")
                 }),
                 "projection {} must name the MobMachine input that authorizes it",
                 record.module
@@ -3705,6 +3781,7 @@ mod tests {
             step_status: None,
             target_count: None,
             frame_id: None,
+            node_id: None,
             loop_instance_id: None,
             retry_key: None,
         };

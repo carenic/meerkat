@@ -32,8 +32,10 @@ impl LocalMobRuntimeBridge {
     }
 }
 
-fn runtime_state_to_bridge(state: meerkat_runtime::RuntimeState) -> BridgeMemberRuntimeState {
-    match state {
+fn runtime_state_to_bridge(
+    state: meerkat_runtime::RuntimeState,
+) -> Result<BridgeMemberRuntimeState, MobError> {
+    let state = match state {
         meerkat_runtime::RuntimeState::Initializing => BridgeMemberRuntimeState::Initializing,
         meerkat_runtime::RuntimeState::Idle => BridgeMemberRuntimeState::Idle,
         meerkat_runtime::RuntimeState::Attached => BridgeMemberRuntimeState::Attached,
@@ -41,13 +43,11 @@ fn runtime_state_to_bridge(state: meerkat_runtime::RuntimeState) -> BridgeMember
         meerkat_runtime::RuntimeState::Retired => BridgeMemberRuntimeState::Retired,
         meerkat_runtime::RuntimeState::Stopped => BridgeMemberRuntimeState::Stopped,
         meerkat_runtime::RuntimeState::Destroyed => BridgeMemberRuntimeState::Destroyed,
-        _ => {
-            tracing::warn!(
-                "unknown RuntimeState observed over LocalMobRuntimeBridge; failing closed as destroyed"
-            );
-            BridgeMemberRuntimeState::Destroyed
-        }
-    }
+        _ => return Err(MobError::Internal(
+            "unknown RuntimeState observed over LocalMobRuntimeBridge; bridge state mapping must be extended before it can classify terminality".to_string(),
+        )),
+    };
+    Ok(state)
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -176,7 +176,7 @@ impl MobBoundMemberRuntimeBridge for LocalMobRuntimeBridge {
             });
 
         Ok(BridgeObservationResponse::new(
-            runtime_state_to_bridge(state),
+            runtime_state_to_bridge(state)?,
             Some(state.can_accept_input()),
             current_run_id,
             Some(BridgePeerConnectivity::Reachable),

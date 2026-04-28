@@ -70,9 +70,11 @@ migration.
 - No schema/body parity debt remains for Phase 1. The full schema parity gate is
   unignored, the carry-forward production body list is empty, and the drift-count
   ratchet expects zero rows.
-- Runtime command probes still carry a closed-world Mob unprobed-input list; this
-  is command-surface coverage debt, not permission to carry schema/body drift.
-  The Phase 1 parity gate remains full-schema equality plus typed
+- Mob input coverage is closed-world by classification: each non-surface input
+  must either have a real-entrypoint probe or a typed runtime-internal reason.
+  Typed runtime-internal records must exactly match
+  `schema.runtime_internal_inputs`; they are metadata, not fake probe coverage.
+  The Phase 1 parity gate remains full-schema equality plus typed command /
   `ShellMechanic(reason)` classification.
 - `TYPE-001` / `TYPE-002` / `TYPE-003`: retained as historical Phase 0
   inventory, now consumed by the Phase 1 audit and parity gates.
@@ -209,8 +211,8 @@ Commands and outcomes:
 | BuildBuddy machine-authority lane | `scripts/buildbuddy-dev machine-authority` | Passed after taking explicit module-lock ownership and committing only intentional Cargo file hash refreshes. Invocation `5b63b7ad-8f3e-4536-8c6f-6489fa1670ca`: `Executed 3 out of 6 tests: 6 tests pass`. RBE does not currently have `tlc` on `PATH`, so the remote shell target used the hermetic `machine-check-drift --all` fallback; local TLC evidence is recorded separately below. |
 | BuildBuddy wrong-lane controls | `env BUILDBUDDY_BAZEL_COMMAND=fast-test ./scripts/buildbuddy-bazel-poc //xtask:machines_contracts_test --jobs=64` and earlier `scripts/buildbuddy-dev test //xtask:machines_contracts_test` | Rejected as non-evidence because the target is excluded by lane filters: `No test targets were found`. |
 | Supplemental production body audit | `./scripts/repo-cargo test -p xtask --features machine-authority --test machines_contracts phase1_production_body_audit -- --nocapture` | Passed after integration-review macro-bypass fix; `3 passed`. The fixtures reject bare, spaced, and qualified `machine!` forms. |
-| Supplemental Cargo schema parity target | `./scripts/repo-cargo test -p meerkat-machine-codegen --test runtime_schema_parity -- --nocapture` | Passed after the final dogmatic pass; latest full run passed with `11 passed; 2 ignored` and no schema drift rows. The non-input drift negative fixture calls the same schema comparator as the catalog/production parity cases. |
-| Supplemental codegen package tests | `./scripts/repo-cargo test -p meerkat-machine-codegen` | Passed earlier after the Schedule and Occurrence delete batches and Bazel generation changes. The final Phase 1 evidence uses the focused gates below: runtime alphabet parity `6 passed`, render contracts `14 passed`, and runtime schema parity `11 passed; 2 ignored`. |
+| Supplemental Cargo schema parity target | `./scripts/repo-cargo test -p meerkat-machine-codegen --test runtime_schema_parity -- --nocapture` | Passed after the final dogmatic pass; latest full run passed with `18 passed; 2 ignored` and no schema drift rows. The non-input drift negative fixture calls the same schema comparator as the catalog/production parity cases. |
+| Supplemental codegen package tests | `./scripts/repo-cargo test -p meerkat-machine-codegen` | Passed earlier after the Schedule and Occurrence delete batches and Bazel generation changes. The final Phase 1 evidence uses the focused gates below: runtime alphabet parity `7 passed`, render contracts `14 passed`, and runtime schema parity `18 passed; 2 ignored`. |
 | Post-spike back-out schema parity target | `./scripts/repo-cargo test -p meerkat-machine-codegen --test runtime_schema_parity` | Passed after removing the mechanical lift spike; the later convergence work leaves full schema parity unignored and green. |
 | Post-spike back-out production body audit | `./scripts/repo-cargo test -p xtask --features machine-authority --test machines_contracts phase1_production_body_audit -- --nocapture` | Passed after removing the mechanical lift spike; `3 passed`. The audit accepts only declared carry-forward production bodies and rejects new bare/spaced/qualified canonical bodies. |
 | Auth batch classification | `./scripts/repo-cargo test -p meerkat-machine-codegen --test runtime_schema_parity -- --ignored print_phase1_schema_drift_items --nocapture` | Passed; diagnostic no longer reports any `AuthMachine::...` drift after production was changed to invoke the catalog-owned Auth DSL body. Remaining drift is Meerkat, Mob, Schedule, and Occurrence only. |
@@ -235,7 +237,7 @@ Commands and outcomes:
 | Formatting | `make fmt`; `git diff --check` | Passed after the final dogmatic pass and rebase onto `origin/main`. |
 | BuildBuddy setup recheck | `make buildbuddy-generate`; `make buildbuddy-doctor` | Generation passed. Doctor passed: `34 pass, 1 warn, 0 fail`; warning is expected local worktree changes. |
 | Supplemental final drift entrypoint | `./scripts/repo-cargo xtask machine-check-drift --all` | Passed after all current Phase 1 changes; `machine authority artifacts are up to date`. |
-| Typed command classification gate | `./scripts/repo-cargo test -p meerkat-machine-codegen --test runtime_alphabet_parity -- --nocapture` | Passed with typed `CatalogInput` / `ShellMechanic(reason)` records and an identity check proving typed catalog inputs cannot remap to other schema strings; `6 passed`. This closes the #38 string-whitelist/subtraction gap for Phase 1. |
+| Typed command classification gate | `./scripts/repo-cargo test -p meerkat-machine-codegen --test runtime_alphabet_parity -- --nocapture` | Passed with typed `CatalogInput` / `ShellMechanic(reason)` records and an identity check proving typed catalog inputs cannot remap to other schema strings; `7 passed`. This closes the #38 string-whitelist/subtraction gap for Phase 1. |
 | Generated-kernel contract gate | `./scripts/repo-cargo test -p meerkat-machine-codegen --test render_contracts -- --nocapture` | Passed after the contract was corrected to reject legacy generated `transition` / `transition_signal` stubs; `14 passed`. |
 | Xtask authority ratchet gate | `./scripts/repo-cargo test -p xtask --features machine-authority --test machines_contracts -- --nocapture` | Passed with rejected-pattern and accepted-pattern fixtures for production bodies, generated-kernel boundaries, and direct flow reducer/projection writes; `25 passed`. |
 | Mob projection owner checks | `./scripts/repo-cargo check -p meerkat-mob`; `./scripts/repo-cargo test -p meerkat-mob --lib run::tests -- --nocapture`; `./scripts/repo-cargo test -p xtask --features machine-authority --test machines_contracts -- --nocapture` | Passed after flow projections stopped calling `flow_run::transition`, `flow_frame::transition`, and `loop_iteration::transition`. Core seed/terminal/loop projection paths now project from accepted `MobMachine` state; active reducer commands without machine-owned typed payload transitions remain fail-closed. `meerkat-mob` check passed, `run::tests` `19 passed`, and ratchets `25 passed`. |
@@ -267,6 +269,9 @@ Phase 1 closure status:
 - `INV-004` / #38 is closed for Phase 1: runtime command manifests are derived
   from typed classification records, and every non-schema command carries a
   typed `ShellMechanic(reason)` classification that the parity gate checks.
+  Mob runtime-internal inputs are classified by exact typed manifest equality;
+  command manifests and runtime-internal manifests are not counted as real
+  entrypoint probe evidence.
 - The final dogmatic review found that Mob flow reducers were still semantic
   mini-machines behind coarse authorization. Phase 1 now fail-closes
   authorization-only reducer-visible mutations and admits only machine-owned

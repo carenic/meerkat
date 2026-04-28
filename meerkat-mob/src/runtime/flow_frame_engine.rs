@@ -42,7 +42,10 @@ pub enum FrameStepResult {
     Skipped,
     /// Step failed for a step-local reason; the frame should fail this node
     /// but continue admitting unrelated siblings.
-    Failed,
+    Failed {
+        reason: String,
+        failure_ledger_recorded: bool,
+    },
 }
 
 /// Canonical outcome of executing a frame subtree.
@@ -50,7 +53,23 @@ pub enum FrameStepResult {
 pub struct FrameExecutionOutcome {
     pub outputs: IndexMap<StepId, serde_json::Value>,
     pub step_statuses: IndexMap<StepId, StepRunStatus>,
+    pub step_projections: IndexMap<StepId, FrameStepProjection>,
+    pub step_failures: IndexMap<StepId, FrameStepFailureProjection>,
     pub root_phase: FlowFrameTerminalPhase,
+}
+
+#[derive(Debug, Clone)]
+pub struct FrameStepProjection {
+    pub frame_id: FrameId,
+    pub node_id: FlowNodeId,
+    pub step_id: StepId,
+    pub step_status: StepRunStatus,
+}
+
+#[derive(Debug, Clone)]
+pub struct FrameStepFailureProjection {
+    pub reason: String,
+    pub append_failure_ledger: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -511,9 +530,9 @@ impl FlowFrameKernel {
         command: MobMachineFlowFrameCommand,
         max_retries: usize,
     ) -> Result<Vec<flow_frame::Effect>, MobError> {
-        let machine_input = command.authority_input(frame_id);
         for _ in 0..=max_retries {
             let current = self.require_frame(run_id, frame_id).await?;
+            let authority_input = command.authority_input(frame_id);
             let (authority, machine_state) = self
                 .authorize_frame_command(run_id, frame_id, &command)
                 .await?;
@@ -532,7 +551,7 @@ impl FlowFrameKernel {
                 .cas_frame_state(run_id, frame_id, Some(&current), next)
                 .await?;
             if won {
-                self.commit_mob_machine_inputs(std::slice::from_ref(&machine_input))
+                self.commit_mob_machine_inputs(std::slice::from_ref(&authority_input))
                     .await?;
                 return Ok(effects);
             }
@@ -964,6 +983,7 @@ impl FlowFrameEngine {
             .await?;
 
         let mut workers: FrameNodeWorkers = FuturesUnordered::new();
+        let mut step_failures = IndexMap::new();
 
         loop {
             self.executor.check_runtime_guards(run_id).await?;
@@ -979,8 +999,15 @@ impl FlowFrameEngine {
             if !progressed {
                 match workers.next().await {
                     Some(task) => {
-                        self.handle_task_result(run_id, root_frame_id, root_spec, context, task)
-                            .await?;
+                        self.handle_task_result(
+                            run_id,
+                            root_frame_id,
+                            root_spec,
+                            context,
+                            task,
+                            &mut step_failures,
+                        )
+                        .await?;
                         progressed = true;
                     }
                     None => {
@@ -1051,6 +1078,7 @@ impl FlowFrameEngine {
         let run = self.require_run(run_id).await?;
         let outputs = root_outputs_from_run(&run);
         let step_statuses = self.collect_all_step_statuses(&run, root_frame_id, root_spec)?;
+        let step_projections = self.collect_all_step_projections(&run, root_frame_id, root_spec)?;
         let root_frame = run.frames.get(root_frame_id).cloned().ok_or_else(|| {
             MobError::Internal(format!(
                 "root frame '{root_frame_id}' missing at end of run '{run_id}'"
@@ -1066,6 +1094,8 @@ impl FlowFrameEngine {
         Ok(FrameExecutionOutcome {
             outputs,
             step_statuses,
+            step_projections,
+            step_failures,
             root_phase,
         })
     }
@@ -1251,6 +1281,7 @@ impl FlowFrameEngine {
         root_spec: &FrameSpec,
         context: &FlowContext,
         task: FrameNodeTaskResult,
+        step_failures: &mut IndexMap<StepId, FrameStepFailureProjection>,
     ) -> Result<(), MobError> {
         match task {
             FrameNodeTaskResult::Step {
@@ -1284,7 +1315,17 @@ impl FlowFrameEngine {
                             .skip_node(run_id, &frame_id, &node_id)
                             .await?;
                     }
-                    Ok(FrameStepResult::Failed) => {
+                    Ok(FrameStepResult::Failed {
+                        reason,
+                        failure_ledger_recorded,
+                    }) => {
+                        step_failures.insert(
+                            step_id.clone(),
+                            FrameStepFailureProjection {
+                                reason,
+                                append_failure_ledger: !failure_ledger_recorded,
+                            },
+                        );
                         self.frame_kernel
                             .fail_node(run_id, &frame_id, &node_id)
                             .await?;
@@ -2093,6 +2134,23 @@ impl FlowFrameEngine {
         Ok(step_statuses)
     }
 
+    fn collect_all_step_projections(
+        &self,
+        run: &MobRun,
+        root_frame_id: &FrameId,
+        root_spec: &FrameSpec,
+    ) -> Result<IndexMap<StepId, FrameStepProjection>, MobError> {
+        let mut projections = IndexMap::new();
+        for (frame_id, frame) in &run.frames {
+            let spec = self.resolve_frame_spec(run, root_frame_id, root_spec, frame_id)?;
+            merge_step_projections(
+                &mut projections,
+                collect_frame_step_projections(frame_id, &spec, &frame.kernel_state),
+            );
+        }
+        Ok(projections)
+    }
+
     fn build_context_for_frame(
         &self,
         run: &MobRun,
@@ -2403,6 +2461,35 @@ fn collect_frame_step_statuses(
     step_statuses
 }
 
+fn collect_frame_step_projections(
+    frame_id: &FrameId,
+    spec: &FrameSpec,
+    kernel_state: &flow_frame::State,
+) -> IndexMap<StepId, FrameStepProjection> {
+    let mut projections = IndexMap::new();
+    for (node_id, node_spec) in &spec.nodes {
+        let FlowNodeSpec::Step(step_spec) = node_spec else {
+            continue;
+        };
+        let Some(status) = kernel_state.node_status.get(node_id) else {
+            continue;
+        };
+        let Some(step_status) = node_terminal_step_status(*status) else {
+            continue;
+        };
+        merge_step_projection(
+            &mut projections,
+            FrameStepProjection {
+                frame_id: frame_id.clone(),
+                node_id: node_id.clone(),
+                step_id: step_spec.step_id.clone(),
+                step_status,
+            },
+        );
+    }
+    projections
+}
+
 fn node_terminal_step_status(status: flow_frame::NodeRunStatus) -> Option<StepRunStatus> {
     match status {
         flow_frame::NodeRunStatus::Completed => Some(StepRunStatus::Completed),
@@ -2432,6 +2519,30 @@ fn merge_step_status(
         Some(existing) => *existing = status,
         None => {
             into.insert(step_id, status);
+        }
+    }
+}
+
+fn merge_step_projections(
+    into: &mut IndexMap<StepId, FrameStepProjection>,
+    updates: IndexMap<StepId, FrameStepProjection>,
+) {
+    for (_, projection) in updates {
+        merge_step_projection(into, projection);
+    }
+}
+
+fn merge_step_projection(
+    into: &mut IndexMap<StepId, FrameStepProjection>,
+    projection: FrameStepProjection,
+) {
+    let next_rank = step_status_rank(&projection.step_status);
+    let step_id = projection.step_id.clone();
+    match into.get_mut(&step_id) {
+        Some(existing) if step_status_rank(&existing.step_status) >= next_rank => {}
+        Some(existing) => *existing = projection,
+        None => {
+            into.insert(step_id, projection);
         }
     }
 }

@@ -315,6 +315,7 @@ fn guard(transition_id: TransitionId, guard_id: GuardId) -> TransitionError {
     })
 }
 
+#[cfg(test)]
 pub(crate) fn transition<C: Context>(
     state: &State,
     input: Input,

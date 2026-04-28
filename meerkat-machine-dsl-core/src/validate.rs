@@ -10,6 +10,7 @@ const NATIVE_MOB_MACHINE_HELPERS: &[&str] = &[
     "mob_machine_frame_node_status_after_terminal",
     "mob_machine_frame_ready_queue_after_terminal",
     "mob_machine_node_terminal",
+    "mob_machine_step_status_from_frame_node_status",
 ];
 
 /// Validate the parsed machine definition for semantic correctness.

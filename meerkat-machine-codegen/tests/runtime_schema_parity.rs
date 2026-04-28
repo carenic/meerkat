@@ -302,14 +302,20 @@ fn phase1_schema_drift_item_counts() -> BTreeMap<String, usize> {
     counts
 }
 
-const MOB_RUNTIME_PARITY_PROBED_INPUT_VARIANTS: &[MobMachineCatalogInput] = &[
+const MOB_RUNTIME_PARITY_REAL_ENTRYPOINT_PROBED_INPUT_VARIANTS: &[MobMachineCatalogInput] = &[
     MobMachineCatalogInput::Spawn,
+    MobMachineCatalogInput::EnsureMember,
+    MobMachineCatalogInput::Reconcile,
     MobMachineCatalogInput::SubmitWork,
     MobMachineCatalogInput::RunFlow,
     MobMachineCatalogInput::CancelFlow,
     MobMachineCatalogInput::Retire,
     MobMachineCatalogInput::Respawn,
     MobMachineCatalogInput::RetireAll,
+    MobMachineCatalogInput::WireMembers,
+    MobMachineCatalogInput::UnwireMembers,
+    MobMachineCatalogInput::WireExternalPeer,
+    MobMachineCatalogInput::UnwireExternalPeer,
     MobMachineCatalogInput::CancelWork,
     MobMachineCatalogInput::CancelAllWork,
     MobMachineCatalogInput::Stop,
@@ -328,137 +334,18 @@ const MOB_RUNTIME_PARITY_PROBED_INPUT_VARIANTS: &[MobMachineCatalogInput] = &[
     MobMachineCatalogInput::ForceCancel,
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MobRuntimeParityCarryForwardReason {
-    FlowProjectionKernel,
-    MemberRuntimeBinding,
-    SessionIngressDetachHandoff,
-    StartupKickoffLifecycle,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct MobRuntimeParityCarryForwardInput {
-    input: MobMachineCatalogInput,
-    reason: MobRuntimeParityCarryForwardReason,
-}
-
-const fn carry_forward_input(
-    input: MobMachineCatalogInput,
-    reason: MobRuntimeParityCarryForwardReason,
-) -> MobRuntimeParityCarryForwardInput {
-    MobRuntimeParityCarryForwardInput { input, reason }
-}
-
-const FLOW_PROJECTION_MECHANIC: MobRuntimeParityCarryForwardReason =
-    MobRuntimeParityCarryForwardReason::FlowProjectionKernel;
-const MEMBER_RUNTIME_BINDING_MECHANIC: MobRuntimeParityCarryForwardReason =
-    MobRuntimeParityCarryForwardReason::MemberRuntimeBinding;
-const SESSION_INGRESS_DETACH_MECHANIC: MobRuntimeParityCarryForwardReason =
-    MobRuntimeParityCarryForwardReason::SessionIngressDetachHandoff;
-const STARTUP_KICKOFF_LIFECYCLE_MECHANIC: MobRuntimeParityCarryForwardReason =
-    MobRuntimeParityCarryForwardReason::StartupKickoffLifecycle;
-
-const MOB_RUNTIME_PARITY_CARRY_FORWARD_UNPROBED_INPUTS: &[MobRuntimeParityCarryForwardInput] = &[
-    carry_forward_input(
-        MobMachineCatalogInput::CreateRunSeed,
-        FLOW_PROJECTION_MECHANIC,
-    ),
-    carry_forward_input(
-        MobMachineCatalogInput::CreateFrameSeed,
-        FLOW_PROJECTION_MECHANIC,
-    ),
-    carry_forward_input(
-        MobMachineCatalogInput::CreateLoopSeed,
-        FLOW_PROJECTION_MECHANIC,
-    ),
-    carry_forward_input(
-        MobMachineCatalogInput::RecordLoopBodyFrameCompleted,
-        FLOW_PROJECTION_MECHANIC,
-    ),
-    carry_forward_input(
-        MobMachineCatalogInput::RecordLoopUntilConditionMet,
-        FLOW_PROJECTION_MECHANIC,
-    ),
-    carry_forward_input(
-        MobMachineCatalogInput::RecordLoopUntilConditionFailed,
-        FLOW_PROJECTION_MECHANIC,
-    ),
-    carry_forward_input(
-        MobMachineCatalogInput::AuthorizeFlowRunReducerCommand,
-        FLOW_PROJECTION_MECHANIC,
-    ),
-    carry_forward_input(
-        MobMachineCatalogInput::AuthorizeFlowFrameReducerCommand,
-        FLOW_PROJECTION_MECHANIC,
-    ),
-    carry_forward_input(
-        MobMachineCatalogInput::AuthorizeLoopIterationReducerCommand,
-        FLOW_PROJECTION_MECHANIC,
-    ),
-    carry_forward_input(
-        MobMachineCatalogInput::BindMemberSession,
-        MEMBER_RUNTIME_BINDING_MECHANIC,
-    ),
-    carry_forward_input(
-        MobMachineCatalogInput::RotateMemberSession,
-        MEMBER_RUNTIME_BINDING_MECHANIC,
-    ),
-    carry_forward_input(
-        MobMachineCatalogInput::ReleaseMemberSession,
-        MEMBER_RUNTIME_BINDING_MECHANIC,
-    ),
-    carry_forward_input(
-        MobMachineCatalogInput::SessionIngressDetachedForMobDestroy,
-        SESSION_INGRESS_DETACH_MECHANIC,
-    ),
-    carry_forward_input(
-        MobMachineCatalogInput::SessionIngressDetachFailedForMobDestroy,
-        SESSION_INGRESS_DETACH_MECHANIC,
-    ),
-    carry_forward_input(
-        MobMachineCatalogInput::KickoffMarkPending,
-        STARTUP_KICKOFF_LIFECYCLE_MECHANIC,
-    ),
-    carry_forward_input(
-        MobMachineCatalogInput::KickoffMarkStarting,
-        STARTUP_KICKOFF_LIFECYCLE_MECHANIC,
-    ),
-    carry_forward_input(
-        MobMachineCatalogInput::StartupMarkReady,
-        STARTUP_KICKOFF_LIFECYCLE_MECHANIC,
-    ),
-    carry_forward_input(
-        MobMachineCatalogInput::KickoffResolveStarted,
-        STARTUP_KICKOFF_LIFECYCLE_MECHANIC,
-    ),
-    carry_forward_input(
-        MobMachineCatalogInput::KickoffResolveCallbackPending,
-        STARTUP_KICKOFF_LIFECYCLE_MECHANIC,
-    ),
-    carry_forward_input(
-        MobMachineCatalogInput::KickoffResolveFailed,
-        STARTUP_KICKOFF_LIFECYCLE_MECHANIC,
-    ),
-    carry_forward_input(
-        MobMachineCatalogInput::KickoffResolveCancelled,
-        STARTUP_KICKOFF_LIFECYCLE_MECHANIC,
-    ),
-    carry_forward_input(
-        MobMachineCatalogInput::KickoffCancelRequested,
-        STARTUP_KICKOFF_LIFECYCLE_MECHANIC,
-    ),
-    carry_forward_input(
-        MobMachineCatalogInput::KickoffClear,
-        STARTUP_KICKOFF_LIFECYCLE_MECHANIC,
-    ),
-];
-
-fn mob_runtime_parity_probe_inventory_mismatches(schema: &MachineSchema) -> Vec<String> {
+fn mob_runtime_parity_real_entrypoint_probe_manifest_mismatches(
+    schema: &MachineSchema,
+) -> Vec<String> {
     let catalog_inputs = schema
         .inputs
         .variants
         .iter()
         .map(|variant| variant.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let probed = MOB_RUNTIME_PARITY_REAL_ENTRYPOINT_PROBED_INPUT_VARIANTS
+        .iter()
+        .map(|input| input.as_str())
         .collect::<BTreeSet<_>>();
     let surface_only_inputs = schema
         .surface_only_inputs
@@ -470,62 +357,20 @@ fn mob_runtime_parity_probe_inventory_mismatches(schema: &MachineSchema) -> Vec<
         .iter()
         .map(InputVariantId::as_str)
         .collect::<BTreeSet<_>>();
-    let probed = MOB_RUNTIME_PARITY_PROBED_INPUT_VARIANTS
-        .iter()
-        .map(|input| input.as_str())
-        .collect::<BTreeSet<_>>();
-    let production_runtime_path = meerkat_mob::canonical_mob_machine_command_manifest()
-        .into_iter()
-        .collect::<BTreeSet<_>>();
-    let carry_forward = MOB_RUNTIME_PARITY_CARRY_FORWARD_UNPROBED_INPUTS
-        .iter()
-        .map(|record| record.input.as_str())
-        .collect::<BTreeSet<_>>();
     let mut mismatches = Vec::new();
 
     for input in &probed {
         if !catalog_inputs.contains(input) {
-            mismatches.push(format!("runtime_probe_only.{input}"));
-        }
-    }
-    for input in &production_runtime_path {
-        if !catalog_inputs.contains(input) {
-            mismatches.push(format!("production_runtime_path_only.{input}"));
-        }
-    }
-    for input in &carry_forward {
-        if !catalog_inputs.contains(input) {
-            mismatches.push(format!("carry_forward_only.{input}"));
-        }
-        if !runtime_internal_inputs.contains(input) {
-            mismatches.push(format!("carry_forward_not_runtime_internal.{input}"));
-        }
-        if production_runtime_path.contains(input) {
-            mismatches.push(format!("carry_forward_has_production_runtime_path.{input}"));
-        }
-        if probed.contains(input) {
-            mismatches.push(format!("carry_forward_has_runtime_probe.{input}"));
+            mismatches.push(format!("real_entrypoint_probe_only.{input}"));
         }
     }
     for input in catalog_inputs.difference(&surface_only_inputs) {
-        if !probed.contains(input)
-            && !production_runtime_path.contains(input)
-            && !carry_forward.contains(input)
-        {
-            mismatches.push(format!("catalog_input_unprobed.{input}"));
+        if !probed.contains(input) && !runtime_internal_inputs.contains(input) {
+            mismatches.push(format!("catalog_input_unclassified.{input}"));
         }
     }
 
     mismatches
-}
-
-fn mob_runtime_parity_carry_forward_inputs_by_reason(
-    reason: MobRuntimeParityCarryForwardReason,
-) -> BTreeSet<&'static str> {
-    MOB_RUNTIME_PARITY_CARRY_FORWARD_UNPROBED_INPUTS
-        .iter()
-        .filter_map(|record| (record.reason == reason).then_some(record.input.as_str()))
-        .collect()
 }
 
 fn repo_root() -> PathBuf {
@@ -568,7 +413,7 @@ fn phase1_production_machine_schemas_match_catalog_shape() {
 }
 
 #[test]
-fn phase1_schema_parity_inventory_reports_current_carry_forward_drift() {
+fn phase1_schema_parity_inventory_reports_no_current_drift() {
     let failures = phase1_schema_drift_report();
     assert_eq!(
         failures,
@@ -607,7 +452,7 @@ fn phase1_schema_parity_inventory_pins_remaining_drift_counts() {
 
     assert_eq!(
         counts, expected,
-        "Phase 1 carry-forward drift must stay empty; update the parity ledger before reopening it"
+        "Phase 1 drift must stay empty; update the parity ledger before reopening it"
     );
 }
 
@@ -654,15 +499,14 @@ fn mob_flow_projection_kernels_are_audited_as_non_canonical_support() {
             "{} must not be registered as a canonical machine",
             entry.module
         );
-        for owning_input in entry.owning_inputs {
-            let owning_input = owning_input.as_str();
-            assert!(
-                mob_inputs.contains(owning_input),
-                "{} owning input `{owning_input}` must exist on canonical MobMachine",
-                entry.module
-            );
-        }
     }
+    let flow_authority_inputs = meerkat_mob::run::canonical_flow_authority_input_manifest()
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    assert!(
+        flow_authority_inputs.is_subset(&mob_inputs),
+        "flow authority input manifest must name only canonical MobMachine inputs"
+    );
 }
 
 #[test]
@@ -674,12 +518,8 @@ fn mob_runtime_parity_production_command_manifest_closes_command_backed_inputs()
         .iter()
         .map(|variant| variant.name.as_str())
         .collect::<BTreeSet<_>>();
-    let production_runtime_path = meerkat_mob::canonical_mob_machine_command_manifest()
+    let production_command_manifest = meerkat_mob::canonical_mob_machine_command_manifest()
         .into_iter()
-        .collect::<BTreeSet<_>>();
-    let carry_forward = MOB_RUNTIME_PARITY_CARRY_FORWARD_UNPROBED_INPUTS
-        .iter()
-        .map(|record| record.input.as_str())
         .collect::<BTreeSet<_>>();
     let command_backed_runtime_inputs = mob_catalog_input_names([
         MobMachineCatalogInput::RunFlow,
@@ -696,16 +536,12 @@ fn mob_runtime_parity_production_command_manifest_closes_command_backed_inputs()
     ]);
 
     assert!(
-        production_runtime_path.is_subset(&catalog_inputs),
+        production_command_manifest.is_subset(&catalog_inputs),
         "production mob command classifications must name only catalog inputs"
     );
     assert!(
-        command_backed_runtime_inputs.is_subset(&production_runtime_path),
+        command_backed_runtime_inputs.is_subset(&production_command_manifest),
         "command-backed MobMachine inputs must be proved by the production command manifest"
-    );
-    assert!(
-        command_backed_runtime_inputs.is_disjoint(&carry_forward),
-        "command-backed MobMachine inputs must not remain in the carry-forward ledger"
     );
 }
 
@@ -714,110 +550,78 @@ fn mob_runtime_parity_critical_command_inputs_cannot_be_shell_mechanics() {
     let production_runtime_path = meerkat_mob::canonical_mob_machine_command_manifest()
         .into_iter()
         .collect::<BTreeSet<_>>();
-    let carry_forward = MOB_RUNTIME_PARITY_CARRY_FORWARD_UNPROBED_INPUTS
-        .iter()
-        .map(|record| record.input.as_str())
-        .collect::<BTreeSet<_>>();
     let critical = critical_mob_runtime_command_inputs();
 
     assert!(
         critical.is_subset(&production_runtime_path),
-        "critical runtime commands must be catalog-command backed, not hidden behind shell-mechanic carry-forward debt"
-    );
-    assert!(
-        critical.is_disjoint(&carry_forward),
-        "critical runtime commands must never be carried forward as typed shell mechanics"
+        "critical runtime commands must be catalog-command backed, not hidden behind shell-mechanic debt"
     );
 }
 
 #[test]
-fn mob_runtime_parity_carry_forward_inputs_have_typed_shell_mechanic_reasons() {
+fn mob_runtime_parity_runtime_internal_manifest_has_typed_reasons() {
     let schema = dsl_mob_machine();
-    let surface_only_inputs = schema
-        .surface_only_inputs
+    let catalog_inputs = schema
+        .inputs
+        .variants
+        .iter()
+        .map(|variant| variant.name.as_str())
+        .collect::<BTreeSet<_>>();
+    let records = meerkat_mob::canonical_mob_machine_runtime_internal_classifications();
+    let classified = records
+        .iter()
+        .map(|record| record.input.as_str())
+        .collect::<BTreeSet<_>>();
+    let declared = schema
+        .runtime_internal_inputs
         .iter()
         .map(InputVariantId::as_str)
+        .collect::<BTreeSet<_>>();
+
+    assert!(
+        !records.is_empty(),
+        "runtime-internal MobMachine feedback paths must be declared by typed production records"
+    );
+    assert_eq!(
+        classified, declared,
+        "typed runtime-internal records must exactly match schema.runtime_internal_inputs"
+    );
+    for record in records {
+        assert!(
+            catalog_inputs.contains(record.input.as_str()),
+            "runtime-internal record {:?} must name a catalog input",
+            record.input
+        );
+    }
+}
+
+#[test]
+fn mob_runtime_parity_runtime_internal_inputs_are_not_counted_as_real_probes() {
+    let schema = dsl_mob_machine();
+    let catalog_inputs = schema
+        .inputs
+        .variants
+        .iter()
+        .map(|variant| variant.name.as_str())
         .collect::<BTreeSet<_>>();
     let runtime_internal_inputs = schema
         .runtime_internal_inputs
         .iter()
         .map(InputVariantId::as_str)
         .collect::<BTreeSet<_>>();
-    let carry_forward = MOB_RUNTIME_PARITY_CARRY_FORWARD_UNPROBED_INPUTS
+    let probed = MOB_RUNTIME_PARITY_REAL_ENTRYPOINT_PROBED_INPUT_VARIANTS
         .iter()
-        .map(|record| record.input.as_str())
-        .collect::<BTreeSet<_>>();
-    let production_runtime_path = meerkat_mob::canonical_mob_machine_command_manifest()
-        .into_iter()
+        .map(|input| input.as_str())
         .collect::<BTreeSet<_>>();
 
-    assert_eq!(
-        carry_forward.len(),
-        MOB_RUNTIME_PARITY_CARRY_FORWARD_UNPROBED_INPUTS.len(),
-        "carry-forward inputs must be unique"
+    assert!(
+        runtime_internal_inputs.is_subset(&catalog_inputs),
+        "runtime-internal declarations must name only catalog inputs"
     );
     assert!(
-        carry_forward.is_subset(&runtime_internal_inputs),
-        "carry-forward inputs must be runtime-internal shell mechanics, not public runtime paths"
-    );
-    assert!(
-        carry_forward.is_disjoint(&surface_only_inputs),
-        "surface-only inputs do not need carry-forward debt"
-    );
-    assert!(
-        carry_forward.is_disjoint(&production_runtime_path),
-        "inputs with production mob command coverage must not be carried forward"
-    );
-
-    let audited_flow_projection_inputs = meerkat_mob::run::flow_projection_kernel_audit()
-        .iter()
-        .flat_map(|entry| entry.owning_inputs.iter().copied())
-        .map(MobMachineCatalogInput::as_str)
-        .collect::<BTreeSet<_>>();
-    assert_eq!(
-        mob_runtime_parity_carry_forward_inputs_by_reason(
-            MobRuntimeParityCarryForwardReason::FlowProjectionKernel
-        ),
-        audited_flow_projection_inputs,
-        "flow projection carry-forward must match the production flow projection audit"
-    );
-    assert_eq!(
-        mob_runtime_parity_carry_forward_inputs_by_reason(
-            MobRuntimeParityCarryForwardReason::MemberRuntimeBinding
-        ),
-        mob_catalog_input_names([
-            MobMachineCatalogInput::BindMemberSession,
-            MobMachineCatalogInput::RotateMemberSession,
-            MobMachineCatalogInput::ReleaseMemberSession,
-        ]),
-        "member runtime-binding carry-forward must stay explicitly classified"
-    );
-    assert_eq!(
-        mob_runtime_parity_carry_forward_inputs_by_reason(
-            MobRuntimeParityCarryForwardReason::SessionIngressDetachHandoff
-        ),
-        mob_catalog_input_names([
-            MobMachineCatalogInput::SessionIngressDetachedForMobDestroy,
-            MobMachineCatalogInput::SessionIngressDetachFailedForMobDestroy,
-        ]),
-        "session ingress detach carry-forward must stay explicitly classified"
-    );
-    assert_eq!(
-        mob_runtime_parity_carry_forward_inputs_by_reason(
-            MobRuntimeParityCarryForwardReason::StartupKickoffLifecycle
-        ),
-        mob_catalog_input_names([
-            MobMachineCatalogInput::KickoffMarkPending,
-            MobMachineCatalogInput::KickoffMarkStarting,
-            MobMachineCatalogInput::StartupMarkReady,
-            MobMachineCatalogInput::KickoffResolveStarted,
-            MobMachineCatalogInput::KickoffResolveCallbackPending,
-            MobMachineCatalogInput::KickoffResolveFailed,
-            MobMachineCatalogInput::KickoffResolveCancelled,
-            MobMachineCatalogInput::KickoffCancelRequested,
-            MobMachineCatalogInput::KickoffClear,
-        ]),
-        "startup kickoff carry-forward must stay explicitly classified"
+        runtime_internal_inputs.is_disjoint(&probed),
+        "runtime-internal MobMachine inputs must not be counted as real entrypoint probes; \
+         those paths need dedicated production-path evidence before joining the probe manifest"
     );
 }
 
@@ -846,17 +650,32 @@ fn mob_machine_native_reducer_helpers_are_formally_defined() {
 }
 
 #[test]
-fn mob_runtime_parity_probe_inventory_is_closed_world() {
+fn mob_runtime_parity_probe_inventory_does_not_overclaim_real_entrypoints() {
     let schema = dsl_mob_machine();
-    let mismatches = mob_runtime_parity_probe_inventory_mismatches(&schema);
+    let mismatches = mob_runtime_parity_real_entrypoint_probe_manifest_mismatches(&schema);
     assert!(
         mismatches.is_empty(),
-        "Mob runtime parity probes must cover every non-surface MobMachine input or declare explicit carry-forward debt, got {mismatches:#?}"
+        "Mob runtime parity real-entrypoint probe manifest must name only catalog inputs; got {mismatches:#?}"
     );
 }
 
 #[test]
-fn mob_runtime_parity_probe_inventory_rejects_unprobed_catalog_inputs() {
+fn mob_runtime_parity_probe_inventory_rejects_probe_only_inputs() {
+    let mut schema = dsl_mob_machine();
+    schema
+        .inputs
+        .variants
+        .retain(|variant| variant.name.as_str() != "Spawn");
+
+    assert_eq!(
+        mob_runtime_parity_real_entrypoint_probe_manifest_mismatches(&schema),
+        vec!["real_entrypoint_probe_only.Spawn"],
+        "the real-entrypoint probe manifest must fail if it names a non-catalog input"
+    );
+}
+
+#[test]
+fn mob_runtime_parity_probe_inventory_does_not_pretend_to_close_new_runtime_inputs() {
     let mut schema = dsl_mob_machine();
     schema.inputs.variants.push(VariantSchema {
         name: EnumVariantId::parse("NewRuntimeInput").expect("variant id"),
@@ -864,9 +683,10 @@ fn mob_runtime_parity_probe_inventory_rejects_unprobed_catalog_inputs() {
     });
 
     assert_eq!(
-        mob_runtime_parity_probe_inventory_mismatches(&schema),
-        vec!["catalog_input_unprobed.NewRuntimeInput"],
-        "adding a MobMachine input without a runtime probe or explicit carry-forward entry must hard-fail"
+        mob_runtime_parity_real_entrypoint_probe_manifest_mismatches(&schema),
+        vec!["catalog_input_unclassified.NewRuntimeInput"],
+        "adding a non-surface MobMachine input must fail until it has a real entrypoint probe or \
+         a typed runtime-internal classification"
     );
 }
 

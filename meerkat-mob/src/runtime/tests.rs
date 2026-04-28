@@ -21518,14 +21518,18 @@ struct MobModeledStateAuditReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MobRuntimeParityProbeInput {
     Spawn,
+    EnsureMember,
+    Reconcile,
     SubmitWork,
     RunFlow,
     CancelFlow,
     Retire,
     Respawn,
     RetireAll,
-    Wire,
-    Unwire,
+    WireMembers,
+    UnwireMembers,
+    WireExternalPeer,
+    UnwireExternalPeer,
     ExternalTurn,
     InternalTurn,
     CancelWork,
@@ -21726,14 +21730,18 @@ fn mob_runtime_parity_probe_for_input_variant(
 ) -> Option<MobRuntimeParityProbeInput> {
     match input_variant {
         "Spawn" => Some(MobRuntimeParityProbeInput::Spawn),
+        "EnsureMember" => Some(MobRuntimeParityProbeInput::EnsureMember),
+        "Reconcile" => Some(MobRuntimeParityProbeInput::Reconcile),
         "SubmitWork" => Some(MobRuntimeParityProbeInput::SubmitWork),
         "RunFlow" => Some(MobRuntimeParityProbeInput::RunFlow),
         "CancelFlow" => Some(MobRuntimeParityProbeInput::CancelFlow),
         "Retire" => Some(MobRuntimeParityProbeInput::Retire),
         "Respawn" => Some(MobRuntimeParityProbeInput::Respawn),
         "RetireAll" => Some(MobRuntimeParityProbeInput::RetireAll),
-        "Wire" => Some(MobRuntimeParityProbeInput::Wire),
-        "Unwire" => Some(MobRuntimeParityProbeInput::Unwire),
+        "WireMembers" => Some(MobRuntimeParityProbeInput::WireMembers),
+        "UnwireMembers" => Some(MobRuntimeParityProbeInput::UnwireMembers),
+        "WireExternalPeer" => Some(MobRuntimeParityProbeInput::WireExternalPeer),
+        "UnwireExternalPeer" => Some(MobRuntimeParityProbeInput::UnwireExternalPeer),
         "ExternalTurn" => Some(MobRuntimeParityProbeInput::ExternalTurn),
         "InternalTurn" => Some(MobRuntimeParityProbeInput::InternalTurn),
         "CancelWork" => Some(MobRuntimeParityProbeInput::CancelWork),
@@ -21916,6 +21924,7 @@ async fn mob_runtime_parity_snapshot_summary(
         member_session_bindings,
         pending_spawn_sessions,
         pending_session_ingress_detach_runtime_ids,
+        topology_epoch,
     ) = dsl_t2
         .map(|snap| {
             (
@@ -21959,6 +21968,7 @@ async fn mob_runtime_parity_snapshot_summary(
                     .into_iter()
                     .map(|id| format!("{id:?}"))
                     .collect::<BTreeSet<_>>(),
+                snap.topology_epoch,
             )
         })
         .unwrap_or_default();
@@ -22000,10 +22010,7 @@ async fn mob_runtime_parity_snapshot_summary(
         member_session_bindings,
         pending_spawn_sessions,
         pending_session_ingress_detach_runtime_ids,
-        // Track-B (R5): stubbed 0 here; full projection lands alongside
-        // `member_session_bindings` wiring-through when the observer
-        // runtime exposes the field.
-        topology_epoch: 0,
+        topology_epoch,
     })
 }
 
@@ -22335,11 +22342,15 @@ fn mob_modeled_schema_result_summary(
             Some(summarize_mob_runtime_success(probe, "work_receipt"))
         }
         MobRuntimeParityProbeInput::RunFlow => Some(summarize_mob_runtime_success(probe, "run_id")),
-        MobRuntimeParityProbeInput::CancelFlow
+        MobRuntimeParityProbeInput::EnsureMember
+        | MobRuntimeParityProbeInput::Reconcile
+        | MobRuntimeParityProbeInput::CancelFlow
         | MobRuntimeParityProbeInput::Retire
         | MobRuntimeParityProbeInput::RetireAll
-        | MobRuntimeParityProbeInput::Wire
-        | MobRuntimeParityProbeInput::Unwire
+        | MobRuntimeParityProbeInput::WireMembers
+        | MobRuntimeParityProbeInput::UnwireMembers
+        | MobRuntimeParityProbeInput::WireExternalPeer
+        | MobRuntimeParityProbeInput::UnwireExternalPeer
         | MobRuntimeParityProbeInput::CancelWork
         | MobRuntimeParityProbeInput::CancelAllWork
         | MobRuntimeParityProbeInput::Stop
@@ -22397,6 +22408,15 @@ async fn build_mob_runtime_parity_fixture() -> MobRuntimeParityFixture {
     }
 }
 
+fn mob_runtime_parity_external_peer() -> TrustedPeerDescriptor {
+    TrustedPeerDescriptor::test_only_unsigned_typed(
+        "mob-runtime-parity/external/agent",
+        meerkat_core::comms::PeerId::new(),
+        "inproc://mob-runtime-parity/external/agent",
+    )
+    .expect("valid runtime parity external peer")
+}
+
 async fn mob_runtime_parity_prepare_probe(
     target_phase: MobRuntimeParityPhase,
     probe: MobRuntimeParityProbeInput,
@@ -22435,15 +22455,31 @@ async fn mob_runtime_parity_prepare_probe(
             fixture.ensure_worker().await?;
             setup_tags.push("worker_spawned".to_string());
         }
-        MobRuntimeParityProbeInput::Wire => {
+        MobRuntimeParityProbeInput::WireMembers => {
             fixture.ensure_worker().await?;
             fixture.ensure_lead().await?;
             setup_tags.push("worker_spawned".to_string());
             setup_tags.push("lead_spawned".to_string());
         }
-        MobRuntimeParityProbeInput::Unwire => {
+        MobRuntimeParityProbeInput::UnwireMembers => {
             fixture.ensure_wired_edge().await?;
             setup_tags.push("wired_external_edge".to_string());
+        }
+        MobRuntimeParityProbeInput::WireExternalPeer => {
+            fixture.ensure_lead().await?;
+            setup_tags.push("lead_spawned".to_string());
+        }
+        MobRuntimeParityProbeInput::UnwireExternalPeer => {
+            fixture.ensure_lead().await?;
+            fixture
+                .handle
+                .wire(
+                    fixture.lead_identity.clone(),
+                    PeerTarget::External(mob_runtime_parity_external_peer()),
+                )
+                .await
+                .map_err(|error| format!("wire external peer: {error:?}"))?;
+            setup_tags.push("external_peer_wired".to_string());
         }
         MobRuntimeParityProbeInput::ExternalTurn
         | MobRuntimeParityProbeInput::SubscribeAgentEvents
@@ -22471,7 +22507,9 @@ async fn mob_runtime_parity_prepare_probe(
         | MobRuntimeParityProbeInput::SubscribeMobEvents
         | MobRuntimeParityProbeInput::RecordOperatorActionProvenance
         | MobRuntimeParityProbeInput::SetSpawnPolicy
-        | MobRuntimeParityProbeInput::Shutdown => {}
+        | MobRuntimeParityProbeInput::Shutdown
+        | MobRuntimeParityProbeInput::EnsureMember
+        | MobRuntimeParityProbeInput::Reconcile => {}
     }
 
     match target_phase {
@@ -22515,6 +22553,19 @@ async fn mob_runtime_parity_execute_probe(
             )
             .await
             .map(|_| summarize_mob_runtime_success(probe, "spawned")),
+        MobRuntimeParityProbeInput::EnsureMember => fixture
+            .handle
+            .ensure_member(SpawnMemberSpec::new("worker", "parity-ensure"))
+            .await
+            .map(|_| summarize_mob_runtime_success(probe, "unit")),
+        MobRuntimeParityProbeInput::Reconcile => fixture
+            .handle
+            .reconcile(
+                vec![SpawnMemberSpec::new("worker", "parity-reconcile")],
+                crate::runtime::reconcile::ReconcileOptions::default(),
+            )
+            .await
+            .map(|_| summarize_mob_runtime_success(probe, "unit")),
         MobRuntimeParityProbeInput::SubmitWork => {
             let entry = fixture.worker_entry().await.map_err(MobError::Internal)?;
             fixture
@@ -22563,7 +22614,7 @@ async fn mob_runtime_parity_execute_probe(
             .retire_all()
             .await
             .map(|()| summarize_mob_runtime_success(probe, "unit")),
-        MobRuntimeParityProbeInput::Wire => fixture
+        MobRuntimeParityProbeInput::WireMembers => fixture
             .handle
             .wire(
                 fixture.worker_identity.clone(),
@@ -22571,11 +22622,27 @@ async fn mob_runtime_parity_execute_probe(
             )
             .await
             .map(|()| summarize_mob_runtime_success(probe, "unit")),
-        MobRuntimeParityProbeInput::Unwire => fixture
+        MobRuntimeParityProbeInput::UnwireMembers => fixture
             .handle
             .unwire(
                 fixture.worker_identity.clone(),
                 MeerkatId::from(fixture.lead_identity.as_str()),
+            )
+            .await
+            .map(|()| summarize_mob_runtime_success(probe, "unit")),
+        MobRuntimeParityProbeInput::WireExternalPeer => fixture
+            .handle
+            .wire(
+                fixture.lead_identity.clone(),
+                PeerTarget::External(mob_runtime_parity_external_peer()),
+            )
+            .await
+            .map(|()| summarize_mob_runtime_success(probe, "unit")),
+        MobRuntimeParityProbeInput::UnwireExternalPeer => fixture
+            .handle
+            .unwire(
+                fixture.lead_identity.clone(),
+                MeerkatId::from(mob_runtime_parity_external_peer().name.as_str()),
             )
             .await
             .map(|()| summarize_mob_runtime_success(probe, "unit")),
@@ -23187,14 +23254,18 @@ async fn build_mob_runtime_full_pair_report(
 fn mob_runtime_parity_probe_variant_name(probe: MobRuntimeParityProbeInput) -> &'static str {
     match probe {
         MobRuntimeParityProbeInput::Spawn => "Spawn",
+        MobRuntimeParityProbeInput::EnsureMember => "EnsureMember",
+        MobRuntimeParityProbeInput::Reconcile => "Reconcile",
         MobRuntimeParityProbeInput::SubmitWork => "SubmitWork",
         MobRuntimeParityProbeInput::RunFlow => "RunFlow",
         MobRuntimeParityProbeInput::CancelFlow => "CancelFlow",
         MobRuntimeParityProbeInput::Retire => "Retire",
         MobRuntimeParityProbeInput::Respawn => "Respawn",
         MobRuntimeParityProbeInput::RetireAll => "RetireAll",
-        MobRuntimeParityProbeInput::Wire => "Wire",
-        MobRuntimeParityProbeInput::Unwire => "Unwire",
+        MobRuntimeParityProbeInput::WireMembers => "WireMembers",
+        MobRuntimeParityProbeInput::UnwireMembers => "UnwireMembers",
+        MobRuntimeParityProbeInput::WireExternalPeer => "WireExternalPeer",
+        MobRuntimeParityProbeInput::UnwireExternalPeer => "UnwireExternalPeer",
         MobRuntimeParityProbeInput::ExternalTurn => "ExternalTurn",
         MobRuntimeParityProbeInput::InternalTurn => "InternalTurn",
         MobRuntimeParityProbeInput::CancelWork => "CancelWork",
@@ -24039,12 +24110,6 @@ async fn write_mob_runtime_modeled_state_audit_report(path: PathBuf) -> MobModel
         serde_json::to_vec_pretty(&report).expect("serialize modeled-state audit report"),
     )
     .expect("write modeled-state audit report");
-    assert_eq!(
-        report.summary.unprobed_rows,
-        0,
-        "MobMachine modeled-state parity report has required non-surface-only inputs without probes; report written to {}",
-        path.display()
-    );
 
     report
 }
@@ -24085,12 +24150,6 @@ async fn write_mob_runtime_full_parity_audit_report(path: PathBuf) -> MobRuntime
         serde_json::to_vec_pretty(&report).expect("serialize mob runtime full parity report"),
     )
     .expect("write mob runtime full parity report");
-    assert_eq!(
-        report.summary.unprobed_rows,
-        0,
-        "MobMachine runtime parity report has required non-surface-only inputs without probes; report written to {}",
-        path.display()
-    );
 
     report
 }

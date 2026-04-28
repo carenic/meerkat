@@ -112,7 +112,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RecordLoopBodyFrameCompleted`(loop_instance_id: LoopInstanceId, iteration: u64)
 - `RecordLoopUntilConditionMet`(loop_instance_id: LoopInstanceId, iteration: u64)
 - `RecordLoopUntilConditionFailed`(loop_instance_id: LoopInstanceId, iteration: u64)
-- `AuthorizeFlowRunReducerCommand`(run_id: RunId, command: FlowRunReducerCommandKind, step_id: Option<StepId>, run_step_key: Option<RunStepKey>, step_status: Option<StepRunStatus>, target_count: Option<u64>, frame_id: Option<FrameId>, loop_instance_id: Option<LoopInstanceId>, retry_key: Option<String>)
+- `AuthorizeFlowRunReducerCommand`(run_id: RunId, command: FlowRunReducerCommandKind, step_id: Option<StepId>, run_step_key: Option<RunStepKey>, step_status: Option<StepRunStatus>, target_count: Option<u64>, frame_id: Option<FrameId>, node_id: Option<FlowNodeId>, loop_instance_id: Option<LoopInstanceId>, retry_key: Option<String>)
 - `AuthorizeFlowFrameReducerCommand`(frame_id: FrameId, command: FlowFrameReducerCommandKind, node_id: Option<FlowNodeId>, frame_node_key: Option<FrameNodeKey>, node_status: Option<NodeRunStatus>, terminal_status: Option<FrameStatus>)
 - `AuthorizeLoopIterationReducerCommand`(loop_instance_id: LoopInstanceId, command: LoopIterationReducerCommandKind, body_frame_id: Option<FrameId>, body_frame_iteration: Option<u64>)
 - `CancelFlow`(run_id: RunId)
@@ -127,9 +127,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `UnwireMembers`(edge: WiringEdge)
 - `WireExternalPeer`(edge: ExternalPeerEdge)
 - `UnwireExternalPeer`(edge: ExternalPeerEdge)
-- `BindMemberSession`(agent_identity: AgentIdentity, session_id: SessionId)
-- `RotateMemberSession`(agent_identity: AgentIdentity, old_session_id: SessionId, new_session_id: SessionId)
-- `ReleaseMemberSession`(agent_identity: AgentIdentity, session_id: SessionId)
 - `SessionIngressDetachedForMobDestroy`(mob_id: MobId, agent_runtime_id: AgentRuntimeId)
 - `SessionIngressDetachFailedForMobDestroy`(mob_id: MobId, agent_runtime_id: AgentRuntimeId, reason: String)
 - `SubmitWork`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, work_id: WorkId, origin: WorkOrigin)
@@ -166,7 +163,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `KickoffResolveStarted`(member_id: String)
 - `KickoffResolveCallbackPending`(member_id: String)
 - `KickoffResolveFailed`(member_id: String, error: String)
-- `KickoffResolveCancelled`(member_id: String)
 - `KickoffCancelRequested`(member_id: String)
 - `KickoffClear`(member_id: String)
 
@@ -262,6 +258,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `coordinator_bound`
   - `prior_session_binding_present`
   - `replacing_present`
+  - `replacing_matches_current`
 - Emits: `RequestRuntimeBinding`, `MemberSessionBindingChanged`, `EmitMemberLifecycleNotice`
 - To: `Running`
 
@@ -446,30 +443,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `kickoff_active_failed`
 - Emits: `PersistKickoffFailureUpdate`, `EmitKickoffLifecycleNotice`
-- To: `Completed`
-
-### `KickoffResolveCancelledRunning`
-- From: `Running`
-- On: `KickoffResolveCancelled`(member_id)
-- Guards:
-  - `kickoff_cancelled`
-- Emits: `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
-- To: `Running`
-
-### `KickoffResolveCancelledStopped`
-- From: `Stopped`
-- On: `KickoffResolveCancelled`(member_id)
-- Guards:
-  - `kickoff_cancelled`
-- Emits: `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
-- To: `Stopped`
-
-### `KickoffResolveCancelledCompleted`
-- From: `Completed`
-- On: `KickoffResolveCancelled`(member_id)
-- Guards:
-  - `kickoff_cancelled`
-- Emits: `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
 - To: `Completed`
 
 ### `KickoffCancelRequestedRunning`
@@ -683,34 +656,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `external_peer_currently_wired`
 - Emits: `WiringGraphChanged`, `EmitExternalPeerWiringLifecycleNotice`
-- To: `Running`
-
-### `BindMemberSessionRunning`
-- From: `Running`
-- On: `BindMemberSession`(agent_identity, session_id)
-- Guards:
-  - `identity_has_runtime`
-  - `no_prior_session_binding`
-- Emits: `MemberSessionBindingChanged`
-- To: `Running`
-
-### `RotateMemberSessionRunning`
-- From: `Running`
-- On: `RotateMemberSession`(agent_identity, old_session_id, new_session_id)
-- Guards:
-  - `identity_has_runtime`
-  - `prior_session_binding_present`
-  - `old_session_id_matches_current`
-- Emits: `MemberSessionBindingChanged`
-- To: `Running`
-
-### `ReleaseMemberSessionRunning`
-- From: `Running`
-- On: `ReleaseMemberSession`(agent_identity, session_id)
-- Guards:
-  - `prior_session_binding_present`
-  - `session_id_matches_current`
-- Emits: `MemberSessionBindingChanged`
 - To: `Running`
 
 ### `TaskCreateRunning`
@@ -1080,7 +1025,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandStartRun`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `start_run_command`
@@ -1090,7 +1035,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandDispatchStep`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
@@ -1104,7 +1049,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandCompleteStep`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
@@ -1118,7 +1063,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandRecordStepOutput`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
@@ -1131,7 +1076,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandConditionPassed`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
@@ -1144,7 +1089,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandConditionRejected`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
@@ -1157,7 +1102,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandFailStep`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
@@ -1171,7 +1116,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandSkipStep`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
@@ -1185,21 +1130,27 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandProjectFrameStepStatus`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
   - `project_frame_step_status_command`
   - `has_step_id`
   - `has_run_step_key`
-  - `has_step_status`
+  - `has_frame_id`
+  - `has_node_id`
   - `step_tracked`
+  - `frame_belongs_to_run`
+  - `frame_node_tracked`
+  - `frame_node_maps_to_step`
+  - `run_step_not_already_terminal_projected`
+  - `frame_node_completed_skipped_or_failed`
 - Emits: `EmitRunLifecycleNotice`
 - To: `Running`
 
 ### `AuthorizeFlowRunReducerCommandCancelStep`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
@@ -1213,7 +1164,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandRegisterTargets`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
@@ -1227,7 +1178,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandRecordTargetSuccess`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
@@ -1240,7 +1191,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandRecordTargetTerminalFailure`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
@@ -1253,7 +1204,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandRecordTargetCanceled`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
@@ -1266,7 +1217,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandRecordTargetFailure`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
@@ -1280,7 +1231,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandRegisterReadyFrame`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
@@ -1293,7 +1244,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandRegisterReadyFrameAlreadyReady`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
@@ -1306,7 +1257,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandPumpNodeScheduler`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
@@ -1320,7 +1271,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandRegisterPendingBodyFrame`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
@@ -1333,7 +1284,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandPumpFrameScheduler`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
@@ -1347,7 +1298,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandNodeExecutionReleased`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
@@ -1359,7 +1310,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandFrameTerminated`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
@@ -1371,7 +1322,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandFrameTerminatedNoActiveFrame`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
@@ -1383,7 +1334,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandTerminalCompleted`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
@@ -1393,7 +1344,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandTerminalFailed`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
@@ -1403,7 +1354,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `AuthorizeFlowRunReducerCommandTerminalCanceled`
 - From: `Running`, `Stopped`, `Completed`
-- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, loop_instance_id, retry_key)
+- On: `AuthorizeFlowRunReducerCommand`(run_id, command, step_id, run_step_key, step_status, target_count, frame_id, node_id, loop_instance_id, retry_key)
 - Guards:
   - `known_run`
   - `run_running`
@@ -1650,6 +1601,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `runtime_id_present`
   - `prior_session_binding_present`
   - `releasing_present`
+  - `releasing_matches_current`
 - Emits: `RequestRuntimeRetire`, `RequestSessionIngressDetachForMobDestroy`, `MemberSessionBindingChanged`
 - To: `Running`
 
@@ -1683,6 +1635,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `runtime_id_present`
   - `prior_session_binding_present`
   - `releasing_present`
+  - `releasing_matches_current`
 - Emits: `RequestRuntimeRetire`, `RequestSessionIngressDetachForMobDestroy`, `MemberSessionBindingChanged`
 - To: `Stopped`
 
@@ -1786,12 +1739,12 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 ## Coverage
 ### Code Anchors
 - `meerkat-mob/src/runtime/handle.rs` — identity-first public MobMachine handle surface for ensure member, reconcile, and member command routing
-- `meerkat-mob/src/runtime/actor.rs` — MobMachine actor authority and command execution for wire, unwire, bind, rotate, release, spawn, ensure member, reconcile, observe runtime, submit work, retire, reset, respawn, complete, mark completed, stop/stopped, resume, task, force cancel, subscribe events, shutdown, destroy, terminalized member, record operator action provenance, flow, run, create frame seed, create loop seed, project frame phase, project loop state, orchestrator, coordinator, cleanup, append failure ledger, escalate supervisor, peer, progress, notices, kickoff resolve started/callback pending/failed/cancelled/clear, wiring graph, and session binding
+- `meerkat-mob/src/runtime/actor.rs` — MobMachine actor authority and command execution for wire, unwire, spawn, ensure member, reconcile, observe runtime, submit work, retire, reset, respawn, complete, mark completed, stop/stopped, resume, task, force cancel, subscribe events, shutdown, destroy, terminalized member, record operator action provenance, flow, run, create frame seed, create loop seed, project frame phase, project loop state, orchestrator, coordinator, cleanup, append failure ledger, escalate supervisor, peer, progress, notices, kickoff resolve started/callback pending/failed/clear, wiring graph, and session binding
 
 ### Scenarios
 - `spawn-work-terminal` — member spawn, ensure member, reconcile, runtime-ready observation, work submission, and terminal work closure
 - `retire-respawn-destroy` — member retires, resets, respawns with a new runtime incarnation, stops/stopped, resumes, shuts down, destroys cleanly, and resets to running when reusable
-- `wiring-and-session-binding` — wire and unwire members, bind rotate release member session, enforce known identity for bindings, expose pending spawn, member session binding changed, and wiring lifecycle notices
+- `wiring-and-session-binding` — wire and unwire members, enforce known identity for session bindings, expose pending spawn, member session binding changed, and wiring lifecycle notices
 - `task-flow-and-run-lifecycle` — task create or update pending/in progress/completed/cancelled, run flow, start flow, create run, create frame seed, create loop seed, project frame phase, project loop state, start run, complete flow, finish run, mark completed, kickoff resolve started or failed, kickoff clear, flow terminalized, and force cancel running work
 - `event-subscriptions-and-notices` — subscribe agent, all agent, and mob events; emit member, run, flow, progress, task, terminal, and wiring notices
 - `orchestrator-coordinator-cleanup` — initialize, stop, resume, and destroy orchestrator; bind or unbind coordinator; begin and finish cleanup; notify coordinator and escalate supervisor
