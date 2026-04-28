@@ -8,6 +8,16 @@ on:
         required: false
         default: full-fresh
         type: string
+      machine_authority_base_sha:
+        description: Base revision for machine-authority change detection.
+        required: false
+        default: ""
+        type: string
+      machine_authority_head_sha:
+        description: Head revision for machine-authority change detection.
+        required: false
+        default: ""
+        type: string
     secrets:
       BUILDBUDDY_API_KEY:
         required: true
@@ -174,7 +184,36 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      - name: Detect machine-authority changes
+        id: machine-changes
+        shell: bash
+        env:
+          MACHINE_AUTHORITY_BASE_SHA: ${{ inputs.machine_authority_base_sha || '' }}
+          MACHINE_AUTHORITY_HEAD_SHA: ${{ inputs.machine_authority_head_sha || github.sha }}
+        run: |
+          changed=true
+          if [[ -n "${MACHINE_AUTHORITY_BASE_SHA}" && "${MACHINE_AUTHORITY_BASE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
+            set +e
+            scripts/machine-authority-changed --base "${MACHINE_AUTHORITY_BASE_SHA}" --head "${MACHINE_AUTHORITY_HEAD_SHA}"
+            status="$?"
+            set -e
+            case "${status}" in
+              0) changed=true ;;
+              1) changed=false ;;
+              *)
+                echo "Machine-authority diff failed; running conservative check."
+                changed=true
+                ;;
+            esac
+          else
+            echo "No reliable diff base; running machine authority."
+          fi
+          echo "changed=${changed}" >> "${GITHUB_OUTPUT}"
+      - name: Skip machine authority
+        if: ${{ steps.machine-changes.outputs.changed != 'true' }}
+        run: echo "No machine-authority inputs changed; skipping TLA+ machine checks."
       - uses: ./.github/actions/run-buildbuddy-ci-lane
+        if: ${{ steps.machine-changes.outputs.changed == 'true' }}
         with:
           lane: machine-authority
           profile: native

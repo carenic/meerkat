@@ -20,6 +20,7 @@
 //! would let both ends of the contract drift together.
 
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 /// Every governance lane that wave-b requires to block merges. Adding
 /// to this list expands the gate; removing requires a reviewer to
@@ -56,11 +57,33 @@ fn workflow_yml_path(name: &str) -> PathBuf {
     path
 }
 
+fn repo_path(path: &str) -> PathBuf {
+    let mut root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    root.pop();
+    root.push(path);
+    root
+}
+
 fn read_workflow(path: &Path) -> serde_yaml::Value {
     let text = std::fs::read_to_string(path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
     serde_yaml::from_str(&text)
         .unwrap_or_else(|e| panic!("cannot parse {} as YAML: {e}", path.display()))
+}
+
+fn assert_machine_authority_detector(paths: &[&str], should_match: bool) {
+    let script = repo_path("scripts/machine-authority-changed");
+    let output = Command::new(&script)
+        .args(paths)
+        .output()
+        .unwrap_or_else(|e| panic!("run {}: {e}", script.display()));
+    assert_eq!(
+        output.status.success(),
+        should_match,
+        "machine-authority detector mismatch for {paths:?}\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
 }
 
 fn gate_needs(doc: &serde_yaml::Value, path: &Path) -> Vec<String> {
@@ -207,4 +230,48 @@ fn gate_results_loop_enumerates_every_needed_lane() {
             path.display(),
         );
     }
+}
+
+#[test]
+fn machine_authority_jobs_use_changed_path_detector() {
+    let ci = std::fs::read_to_string(ci_yml_path()).expect("read ci.yml");
+    assert!(
+        ci.contains("machine_authority_base_sha")
+            && ci.contains("machine_authority_head_sha")
+            && ci.contains("github.event.pull_request.base.sha")
+            && ci.contains("github.event.before"),
+        "top-level CI workflow must pass a diff range into reusable backends"
+    );
+
+    for workflow in ["cargo.yml", "buildbuddy.yml"] {
+        let path = workflow_yml_path(workflow);
+        let text = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        assert!(
+            text.contains("scripts/machine-authority-changed --base")
+                && text.contains("steps.machine-changes.outputs.changed == 'true'")
+                && text
+                    .contains("No machine-authority inputs changed; skipping TLA+ machine checks."),
+            "{} machine-authority job must gate the expensive TLA+ lane with the changed-path detector",
+            path.display(),
+        );
+    }
+}
+
+#[test]
+fn machine_authority_changed_detector_classifies_paths() {
+    assert_machine_authority_detector(&["README.md"], false);
+    assert_machine_authority_detector(&["specs/machines/auth/model.tla"], true);
+    assert_machine_authority_detector(&["specs/compositions/schedule_bundle/model.tla"], true);
+    assert_machine_authority_detector(
+        &["meerkat-machine-schema/src/catalog/dsl/auth_machine.rs"],
+        true,
+    );
+    assert_machine_authority_detector(&["meerkat-runtime/src/meerkat_machine/dsl.rs"], true);
+    assert_machine_authority_detector(
+        &["meerkat-core/src/generated/terminal_surface_mapping.rs"],
+        true,
+    );
+    assert_machine_authority_detector(&[".github/workflows/cargo.yml"], true);
+    assert_machine_authority_detector(&["scripts/machine-authority-changed"], true);
 }

@@ -21,6 +21,9 @@ jobs:
     name: Cargo CI
     if: ${{ !(vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository) }}
     uses: ./.github/workflows/cargo.yml
+    with:
+      machine_authority_base_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before || '' }}
+      machine_authority_head_sha: ${{ github.sha }}
 
   buildbuddy:
     name: BuildBuddy CI
@@ -28,6 +31,8 @@ jobs:
     uses: ./.github/workflows/buildbuddy.yml
     with:
       mode: ${{ vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}
+      machine_authority_base_sha: ${{ github.event_name == 'pull_request' && github.event.pull_request.base.sha || github.event_name == 'push' && github.event.before || '' }}
+      machine_authority_head_sha: ${{ github.sha }}
     secrets: inherit
 
   gate:
