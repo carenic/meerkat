@@ -2361,44 +2361,48 @@ impl MobActor {
         // provisioner's lazy `runtime_session_state()` init (called during
         // provision_member). stop_autonomous_member preserves registration
         // (only aborts the drain), so resume just needs to re-spawn the drain.
+        self.ensure_mob_comms_drain(agent_identity, member_ref)
+            .await?;
+
+        self.ensure_autonomous_dispatch_capability(agent_identity, member_ref)
+            .await
+    }
+
+    async fn ensure_mob_comms_drain(
+        &self,
+        agent_identity: &MeerkatId,
+        member_ref: &MemberRef,
+    ) -> Result<(), MobError> {
         #[cfg(all(not(target_arch = "wasm32"), feature = "runtime-adapter"))]
         {
-            let bridge_session_id = member_ref.bridge_session_id().ok_or_else(|| {
-                MobError::Internal(format!(
-                    "autonomous member '{agent_identity}' must be session-backed for runtime readiness"
-                ))
-            })?;
+            let Some(bridge_session_id) = member_ref.bridge_session_id() else {
+                return Ok(());
+            };
 
-            if let Some(adapter) = self.runtime_adapter.clone() {
-                let comms_runtime = self.provisioner.comms_runtime(member_ref).await;
-                // W2-G: mob provisioning claims peer-ingress ownership as
-                // `MobOwned { comms_runtime_id, mob_id }`. The DSL transition
-                // permits promotion from `Unattached` or `SessionOwned`, so
-                // an earlier session-standalone drain is absorbed cleanly;
-                // silent downgrades back to `SessionOwned` become impossible.
-                let spawned = match comms_runtime {
-                    Some(comms_runtime) => {
-                        let mob_id = meerkat_runtime::meerkat_machine::dsl::MobId::from(
-                            self.definition.id.as_ref(),
-                        );
-                        adapter
-                            .maybe_spawn_mob_comms_drain(bridge_session_id, comms_runtime, mob_id)
-                            .await
-                    }
-                    None => false,
-                };
+            if let Some(adapter) = self.runtime_adapter.clone()
+                && let Some(comms_runtime) = self.provisioner.comms_runtime(member_ref).await
+            {
+                let mob_id =
+                    meerkat_runtime::meerkat_machine::dsl::MobId::from(self.definition.id.as_ref());
+                let spawned = adapter
+                    .maybe_spawn_mob_comms_drain(bridge_session_id, comms_runtime, mob_id)
+                    .await;
                 if spawned {
                     tracing::debug!(
                         agent_identity = %agent_identity,
-                        bridge_session_id = %bridge_session_id,
-                        "updated peer ingress for autonomous member"
+                        session_id = %bridge_session_id,
+                        "updated peer ingress for mob member"
                     );
                 }
             }
         }
 
-        self.ensure_autonomous_dispatch_capability(agent_identity, member_ref)
-            .await
+        #[cfg(any(target_arch = "wasm32", not(feature = "runtime-adapter")))]
+        {
+            let _ = (agent_identity, member_ref);
+        }
+
+        Ok(())
     }
 
     async fn teardown_autonomous_runtime(&self, member_ref: &MemberRef) {
@@ -2407,6 +2411,23 @@ impl MobActor {
             (&self.runtime_adapter, member_ref.bridge_session_id())
         {
             adapter.unregister_session(bridge_session_id).await;
+        }
+    }
+
+    async fn teardown_session_runtime_bindings_from_roster(&self) {
+        #[cfg(feature = "runtime-adapter")]
+        if let Some(adapter) = &self.runtime_adapter {
+            let session_ids = {
+                let roster = self.roster.read().await;
+                roster
+                    .list()
+                    .filter_map(|entry| entry.member_ref.bridge_session_id().cloned())
+                    .collect::<Vec<_>>()
+            };
+            for session_id in session_ids {
+                adapter.abort_comms_drain(&session_id).await;
+                adapter.unregister_session(&session_id).await;
+            }
         }
     }
 
@@ -2640,15 +2661,69 @@ impl MobActor {
                 .collect::<Vec<_>>()
         };
         if entries.is_empty() {
-            return Ok(());
+            // Turn-driven resumed members still need their mob-owned comms
+            // drain rebound even though they do not need autonomous dispatch.
         }
 
         let mut first_error: Option<MobError> = None;
+        let all_entries = {
+            let roster = self.roster.read().await;
+            roster
+                .list()
+                .filter(|entry| {
+                    entry.runtime_mode != crate::MobRuntimeMode::AutonomousHost
+                        && !broken_members.contains(&entry.agent_identity)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for entry in &all_entries {
+            let ensure_result = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                self.provisioner
+                    .ensure_runtime_session_state(&entry.member_ref)
+                    .await?;
+                self.ensure_mob_comms_drain(&entry.agent_identity, &entry.member_ref)
+                    .await
+            })
+            .await;
+            let result = match ensure_result {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        agent_identity = %entry.agent_identity,
+                        "timed out ensuring mob comms drain ready"
+                    );
+                    continue;
+                }
+            };
+            if let Err(error) = result {
+                tracing::warn!(
+                    agent_identity = %entry.agent_identity,
+                    error = %error,
+                    "failed ensuring mob comms drain ready"
+                );
+                if first_error.is_none() {
+                    first_error = Some(error);
+                }
+            }
+        }
         for entry in &entries {
-            if let Err(error) = self
-                .ensure_autonomous_runtime_ready(&entry.agent_identity, &entry.member_ref)
-                .await
-            {
+            let ensure_result = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.ensure_autonomous_runtime_ready(&entry.agent_identity, &entry.member_ref),
+            )
+            .await;
+            let result = match ensure_result {
+                Ok(result) => result,
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        agent_identity = %entry.agent_identity,
+                        "timed out ensuring autonomous runtime ready"
+                    );
+                    continue;
+                }
+            };
+            if let Err(error) = result {
                 tracing::warn!(
                     agent_identity = %entry.agent_identity,
                     error = %error,
@@ -3408,6 +3483,7 @@ impl MobActor {
                             result = Err(error);
                         }
                     }
+                    self.teardown_session_runtime_bindings_from_roster().await;
                     if let Err(error) = self.stop_mcp_servers().await {
                         tracing::warn!(error = %error, "shutdown mcp stop encountered errors");
                         if result.is_ok() {

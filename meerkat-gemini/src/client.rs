@@ -657,7 +657,7 @@ fn normalize_gemini_function_parameters_schema(schema: &Value) -> Result<Value, 
         });
     }
     lower_gemini_function_parameters_schema(&mut normalized);
-    strip_gemini_function_parameters_unsupported_keywords(&mut normalized, 0);
+    strip_gemini_function_parameters_unsupported_keywords(&mut normalized);
     Ok(normalized)
 }
 
@@ -943,7 +943,7 @@ fn resolve_local_schema_ref<'a>(root: &'a Value, reference: &str) -> Option<&'a 
     Some(cursor)
 }
 
-fn strip_gemini_function_parameters_unsupported_keywords(value: &mut Value, depth: usize) {
+fn strip_gemini_function_parameters_unsupported_keywords(value: &mut Value) {
     match value {
         Value::Object(obj) => {
             obj.remove("$schema");
@@ -970,20 +970,17 @@ fn strip_gemini_function_parameters_unsupported_keywords(value: &mut Value, dept
                     // schema without stripping keys from the map itself.
                     if let Value::Object(props) = child {
                         for prop_schema in props.values_mut() {
-                            strip_gemini_function_parameters_unsupported_keywords(
-                                prop_schema,
-                                depth + 1,
-                            );
+                            strip_gemini_function_parameters_unsupported_keywords(prop_schema);
                         }
                     }
                 } else {
-                    strip_gemini_function_parameters_unsupported_keywords(child, depth + 1);
+                    strip_gemini_function_parameters_unsupported_keywords(child);
                 }
             }
         }
         Value::Array(items) => {
             for item in items {
-                strip_gemini_function_parameters_unsupported_keywords(item, depth + 1);
+                strip_gemini_function_parameters_unsupported_keywords(item);
             }
         }
         _ => {}

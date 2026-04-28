@@ -19,7 +19,7 @@
 //! for the GitHub-side contract; coupling it to a shared constant
 //! would let both ends of the contract drift together.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Every governance lane that wave-b requires to block merges. Adding
 /// to this list expands the gate; removing requires a reviewer to
@@ -48,24 +48,32 @@ fn ci_yml_path() -> PathBuf {
     path
 }
 
-#[test]
-fn gate_job_requires_every_governance_lane() {
-    let ci_yml = ci_yml_path();
-    let text = std::fs::read_to_string(&ci_yml)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", ci_yml.display()));
-    let doc: serde_yaml::Value = serde_yaml::from_str(&text)
-        .unwrap_or_else(|e| panic!("cannot parse {} as YAML: {e}", ci_yml.display()));
+fn workflow_yml_path(name: &str) -> PathBuf {
+    let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    path.pop();
+    path.push(".github/workflows");
+    path.push(name);
+    path
+}
 
+fn read_workflow(path: &Path) -> serde_yaml::Value {
+    let text = std::fs::read_to_string(path)
+        .unwrap_or_else(|e| panic!("cannot read {}: {e}", path.display()));
+    serde_yaml::from_str(&text)
+        .unwrap_or_else(|e| panic!("cannot parse {} as YAML: {e}", path.display()))
+}
+
+fn gate_needs(doc: &serde_yaml::Value, path: &Path) -> Vec<String> {
     let gate = doc
         .get("jobs")
         .and_then(|jobs| jobs.get("gate"))
-        .unwrap_or_else(|| panic!("{} has no jobs.gate", ci_yml.display()));
+        .unwrap_or_else(|| panic!("{} has no jobs.gate", path.display()));
 
     let needs = gate.get("needs").unwrap_or_else(|| {
-        panic!("{} has no jobs.gate.needs", ci_yml.display());
+        panic!("{} has no jobs.gate.needs", path.display());
     });
 
-    let declared: Vec<String> = match needs {
+    match needs {
         serde_yaml::Value::Sequence(seq) => seq
             .iter()
             .filter_map(|v| v.as_str().map(str::to_string))
@@ -73,22 +81,40 @@ fn gate_job_requires_every_governance_lane() {
         serde_yaml::Value::String(single) => vec![single.clone()],
         other => panic!(
             "{} jobs.gate.needs has unexpected shape: {other:?}",
-            ci_yml.display()
+            path.display()
         ),
-    };
-
-    let mut missing: Vec<&str> = Vec::new();
-    for required in REQUIRED_GOVERNANCE_LANES {
-        if !declared.iter().any(|d| d == required) {
-            missing.push(required);
-        }
     }
+}
 
-    assert!(
-        missing.is_empty(),
-        "jobs.gate.needs in {} is missing required governance lane(s): {missing:?}. Declared: {declared:?}. Add them to the gate.needs array in .github/workflows/ci.yml.",
+#[test]
+fn gate_job_requires_every_governance_lane() {
+    let ci_yml = ci_yml_path();
+    let ci_doc = read_workflow(&ci_yml);
+    let wrapper_needs = gate_needs(&ci_doc, &ci_yml);
+    assert_eq!(
+        wrapper_needs,
+        vec!["cargo".to_string(), "buildbuddy".to_string()],
+        "{} jobs.gate.needs must gate both reusable backend workflows",
         ci_yml.display(),
     );
+
+    for workflow in ["cargo.yml", "buildbuddy.yml"] {
+        let workflow_path = workflow_yml_path(workflow);
+        let doc = read_workflow(&workflow_path);
+        let declared = gate_needs(&doc, &workflow_path);
+        let mut missing: Vec<&str> = Vec::new();
+        for required in REQUIRED_GOVERNANCE_LANES {
+            if !declared.iter().any(|d| d == required) {
+                missing.push(required);
+            }
+        }
+
+        assert!(
+            missing.is_empty(),
+            "jobs.gate.needs in {} is missing required governance lane(s): {missing:?}. Declared: {declared:?}. Add them to the gate.needs array in the reusable workflow.",
+            workflow_path.display(),
+        );
+    }
 }
 
 /// Cross-check: every lane named in gate.needs must also correspond to
@@ -97,42 +123,32 @@ fn gate_job_requires_every_governance_lane() {
 /// of silent-regression failure.
 #[test]
 fn gate_needs_only_references_defined_jobs() {
-    let ci_yml = ci_yml_path();
-    let text = std::fs::read_to_string(&ci_yml)
-        .unwrap_or_else(|e| panic!("cannot read {}: {e}", ci_yml.display()));
-    let doc: serde_yaml::Value = serde_yaml::from_str(&text).expect("parse ci.yml");
-    let jobs = doc
-        .get("jobs")
-        .and_then(|j| j.as_mapping())
-        .expect("jobs mapping");
-    let defined: Vec<String> = jobs
-        .keys()
-        .filter_map(|k| k.as_str().map(str::to_string))
-        .collect();
+    for workflow in ["ci.yml", "cargo.yml", "buildbuddy.yml"] {
+        let path = workflow_yml_path(workflow);
+        let doc = read_workflow(&path);
+        let jobs = doc
+            .get("jobs")
+            .and_then(|j| j.as_mapping())
+            .expect("jobs mapping");
+        let defined: Vec<String> = jobs
+            .keys()
+            .filter_map(|k| k.as_str().map(str::to_string))
+            .collect();
+        let declared = gate_needs(&doc, &path);
 
-    let needs = jobs
-        .get("gate")
-        .and_then(|g| g.get("needs"))
-        .expect("gate.needs");
-    let declared: Vec<String> = match needs {
-        serde_yaml::Value::Sequence(seq) => seq
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        _ => panic!("gate.needs must be a sequence"),
-    };
-
-    let mut dangling: Vec<String> = Vec::new();
-    for entry in &declared {
-        if !defined.iter().any(|d| d == entry) {
-            dangling.push(entry.clone());
+        let mut dangling: Vec<String> = Vec::new();
+        for entry in &declared {
+            if !defined.iter().any(|d| d == entry) {
+                dangling.push(entry.clone());
+            }
         }
-    }
 
-    assert!(
-        dangling.is_empty(),
-        "jobs.gate.needs references undefined jobs: {dangling:?}. Defined jobs: {defined:?}.",
-    );
+        assert!(
+            dangling.is_empty(),
+            "{} jobs.gate.needs references undefined jobs: {dangling:?}. Defined jobs: {defined:?}.",
+            path.display(),
+        );
+    }
 }
 
 /// Cross-check: the `gate` job's in-body results loop (the `for job in ...`
@@ -146,44 +162,49 @@ fn gate_needs_only_references_defined_jobs() {
 /// the script body — the shape enforced by the existing gate step.
 #[test]
 fn gate_results_loop_enumerates_every_needed_lane() {
-    let ci_yml = ci_yml_path();
-    let text = std::fs::read_to_string(&ci_yml).expect("read ci.yml");
-    let doc: serde_yaml::Value = serde_yaml::from_str(&text).expect("parse ci.yml");
-    let gate = doc
-        .get("jobs")
-        .and_then(|j| j.get("gate"))
-        .expect("jobs.gate");
-    let needs = gate.get("needs").expect("gate.needs");
-    let declared: Vec<String> = match needs {
-        serde_yaml::Value::Sequence(seq) => seq
-            .iter()
-            .filter_map(|v| v.as_str().map(str::to_string))
-            .collect(),
-        _ => panic!("gate.needs must be a sequence"),
-    };
+    for workflow in ["ci.yml", "cargo.yml", "buildbuddy.yml"] {
+        let path = workflow_yml_path(workflow);
+        let doc = read_workflow(&path);
+        let gate = doc
+            .get("jobs")
+            .and_then(|j| j.get("gate"))
+            .expect("jobs.gate");
+        let declared = gate_needs(&doc, &path);
 
-    // The `run:` step body is one YAML scalar string. Find it by walking
-    // steps and grabbing the first multi-line `run`.
-    let run_body = gate
-        .get("steps")
-        .and_then(|s| s.as_sequence())
-        .and_then(|seq| seq.iter().find_map(|step| step.get("run")?.as_str()))
-        .expect("gate job must have a run step")
-        .to_string();
+        // The `run:` step body is one YAML scalar string. Find it by walking
+        // steps and grabbing the first multi-line `run`.
+        let run_body = gate
+            .get("steps")
+            .and_then(|s| s.as_sequence())
+            .and_then(|seq| seq.iter().find_map(|step| step.get("run")?.as_str()))
+            .expect("gate job must have a run step")
+            .to_string();
 
-    let mut missing_from_loop: Vec<&String> = Vec::new();
-    for lane in &declared {
-        // The canonical shape in the existing gate body is
-        //   <lane>) result="${{ needs.<lane>.result }}" ;;
-        let case_fragment = format!("{lane}) result=\"");
-        let needs_ref = format!("needs.{lane}.result");
-        if !run_body.contains(&case_fragment) || !run_body.contains(&needs_ref) {
-            missing_from_loop.push(lane);
+        if workflow == "buildbuddy.yml" && run_body.contains("needs.*.result") {
+            continue;
         }
-    }
+        if workflow == "ci.yml"
+            && run_body.contains("needs.cargo.result")
+            && run_body.contains("needs.buildbuddy.result")
+        {
+            continue;
+        }
 
-    assert!(
-        missing_from_loop.is_empty(),
-        "jobs.gate.needs lanes not referenced in the gate results loop: {missing_from_loop:?}. Each lane must appear once as a case arm (`<lane>) result=\"${{{{ needs.<lane>.result }}}}\"`) so its result is reported."
-    );
+        let mut missing_from_loop: Vec<&String> = Vec::new();
+        for lane in &declared {
+            // The canonical shape in the explicit gate body is
+            //   <lane>) result="${{ needs.<lane>.result }}" ;;
+            let case_fragment = format!("{lane}) result=\"");
+            let needs_ref = format!("needs.{lane}.result");
+            if !run_body.contains(&case_fragment) || !run_body.contains(&needs_ref) {
+                missing_from_loop.push(lane);
+            }
+        }
+
+        assert!(
+            missing_from_loop.is_empty(),
+            "{} jobs.gate.needs lanes not referenced in the gate results loop: {missing_from_loop:?}. Each lane must appear once as a case arm (`<lane>) result=\"${{{{ needs.<lane>.result }}}}\"`) so its result is reported.",
+            path.display(),
+        );
+    }
 }

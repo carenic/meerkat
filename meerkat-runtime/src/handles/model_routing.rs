@@ -32,6 +32,7 @@ impl ModelRoutingHandle for RuntimeModelRoutingHandle {
         baseline_model: ModelId,
         realtime_capable: bool,
     ) -> Result<(), DslTransitionError> {
+        // intra-machine: no route; dispatcher not applicable (handle targets the meerkat DSL directly, not a CompositionDispatcher seam)
         self.dsl.apply_input(
             mm_dsl::MeerkatMachineInput::SetModelRoutingBaseline {
                 baseline_model: baseline_model.to_string(),

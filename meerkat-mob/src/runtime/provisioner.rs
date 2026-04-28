@@ -89,6 +89,10 @@ pub trait MobProvisioner: Send + Sync {
         bridge_session_id: &SessionId,
     ) -> Option<Arc<dyn SubscribableInjector>>;
     async fn is_member_active(&self, member_ref: &MemberRef) -> Result<Option<bool>, MobError>;
+    async fn ensure_runtime_session_state(&self, member_ref: &MemberRef) -> Result<(), MobError> {
+        let _ = member_ref;
+        Ok(())
+    }
     async fn comms_runtime(&self, member_ref: &MemberRef) -> Option<Arc<dyn CoreCommsRuntime>>;
     async fn trusted_peer_spec(
         &self,
@@ -1178,6 +1182,18 @@ impl MobProvisioner for SessionBackend {
         }
     }
 
+    async fn ensure_runtime_session_state(&self, member_ref: &MemberRef) -> Result<(), MobError> {
+        let bridge_session_id = Self::require_session(member_ref, "ensure runtime session for")?;
+        self.runtime_session_state(&bridge_session_id)
+            .await
+            .ok_or_else(|| {
+                MobError::Internal(format!(
+                    "runtime adapter unavailable while ensuring session state for '{bridge_session_id}'"
+                ))
+            })?;
+        Ok(())
+    }
+
     async fn comms_runtime(&self, member_ref: &MemberRef) -> Option<Arc<dyn CoreCommsRuntime>> {
         let bridge_session_id = member_ref.bridge_session_id()?;
         self.session_service.comms_runtime(bridge_session_id).await
@@ -1921,6 +1937,15 @@ impl MobProvisioner for MultiBackendProvisioner {
                 session_id: None, ..
             } => Ok(None),
             _ => self.session.is_member_active(member_ref).await,
+        }
+    }
+
+    async fn ensure_runtime_session_state(&self, member_ref: &MemberRef) -> Result<(), MobError> {
+        match member_ref {
+            MemberRef::BackendPeer {
+                session_id: None, ..
+            } => Ok(()),
+            _ => self.session.ensure_runtime_session_state(member_ref).await,
         }
     }
 

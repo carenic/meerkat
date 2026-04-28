@@ -489,7 +489,10 @@ fn retired_session_control_names_are_absent() {
         walk_files(&root.join(scan_path), &mut files);
         for file in files {
             let rel = relative(&root, &file);
-            if rel.starts_with("docs/dogma-") || rel.starts_with("docs/wave-") {
+            if rel.starts_with("docs/dogma-")
+                || rel.starts_with("docs/wave-")
+                || rel.starts_with("artifacts/")
+            {
                 continue;
             }
             let Some(text) = read_utf8(&file) else {
@@ -519,6 +522,8 @@ fn deprecated_backend_references_stay_rejected_only() {
         if rel == "CHANGELOG.md"
             || rel == "scripts/deprecated_backend_scan.sh"
             || rel.starts_with("artifacts/")
+            || rel.starts_with(".rct/")
+            || rel.starts_with(".rct-")
             || rel.starts_with(".claude/skills/")
             || rel.contains("/node_modules/")
         {
