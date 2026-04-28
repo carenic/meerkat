@@ -96,6 +96,9 @@ pub enum StagedLifecycleError {
     /// No staged slot exists for the session.
     #[error("staged session not found: {0}")]
     NotFound(SessionId),
+    /// A staged keep-alive override requires a comms participant name.
+    #[error("keep_alive requires a session created with comms_name")]
+    KeepAliveRequiresCommsName,
 }
 
 /// Canonical staged-session registry.
@@ -137,6 +140,33 @@ impl StagedSessionRegistry {
     pub async fn effective_llm_identity(&self, id: &SessionId) -> Option<SessionLlmIdentity> {
         let slots = self.slots.read().await;
         slots.get(id).map(|s| s.effective_llm_identity.clone())
+    }
+
+    /// Apply a keep-alive override to a staged session before its first turn
+    /// materializes it in the session service.
+    pub async fn update_keep_alive(
+        &self,
+        id: &SessionId,
+        keep_alive: bool,
+        updated_at_secs: u64,
+    ) -> Result<bool, StagedLifecycleError> {
+        let mut slots = self.slots.write().await;
+        let Some(slot) = slots.get_mut(id) else {
+            return Ok(false);
+        };
+        match &mut slot.phase {
+            StagedPhase::Staged { build_config } => {
+                if keep_alive && build_config.comms_name.is_none() {
+                    return Err(StagedLifecycleError::KeepAliveRequiresCommsName);
+                }
+                build_config.keep_alive = keep_alive;
+                slot.updated_at_secs = updated_at_secs;
+                Ok(true)
+            }
+            StagedPhase::Promoting { .. } => {
+                Err(StagedLifecycleError::AlreadyPromoting(id.clone()))
+            }
+        }
     }
 
     /// All slots, optionally filtered by labels, as (id, info) pairs.

@@ -2073,6 +2073,13 @@ impl SessionRuntime {
         #[cfg(feature = "comms")]
         {
             let keep_alive_override = overrides.as_ref().and_then(|ov| ov.keep_alive);
+            let pending_keep_alive_override_applied = if let Some(keep_alive) = keep_alive_override
+            {
+                self.apply_pending_keep_alive_override(session_id, keep_alive)
+                    .await?
+            } else {
+                false
+            };
             let keep_alive = match keep_alive_override {
                 Some(val) => val,
                 None => self
@@ -2081,57 +2088,60 @@ impl SessionRuntime {
                     .and_then(|s| s.session_metadata().map(|m| m.keep_alive))
                     .unwrap_or(false),
             };
-            let comms_rt = self.service.comms_runtime(session_id).await;
-            if keep_alive && comms_rt.is_none() {
-                // Check if the runtime adapter already has comms configured
-                // for this session (e.g., via enable_comms_drain). If so,
-                // the session-service comms check is not authoritative.
-                let adapter_has_comms = self.runtime_adapter.session_has_comms(session_id).await;
-                if !adapter_has_comms {
-                    return Err(RpcError {
-                        code: error::INVALID_PARAMS,
-                        message: "keep_alive requires a session created with comms_name"
-                            .to_string(),
-                        data: None,
-                    });
+            if !pending_keep_alive_override_applied {
+                let comms_rt = self.service.comms_runtime(session_id).await;
+                if keep_alive && comms_rt.is_none() {
+                    // Check if the runtime adapter already has comms configured
+                    // for this session (e.g., via enable_comms_drain). If so,
+                    // the session-service comms check is not authoritative.
+                    let adapter_has_comms =
+                        self.runtime_adapter.session_has_comms(session_id).await;
+                    if !adapter_has_comms {
+                        return Err(RpcError {
+                            code: error::INVALID_PARAMS,
+                            message: "keep_alive requires a session created with comms_name"
+                                .to_string(),
+                            data: None,
+                        });
+                    }
                 }
-            }
-            // Persist explicit override so subsequent inheriting calls observe it.
-            if keep_alive_override.is_some() {
-                self.service
-                    .apply_runtime_session_keep_alive(session_id, keep_alive)
-                    .await
-                    .map_err(session_error_to_rpc)?;
-            }
-            // W2-G: never reconfigure a mob-owned drain from the session-runtime
-            // turn-start path. The mob provisioner owns peer-ingress for its
-            // members; the session runtime has no visibility into the mob's
-            // comms context and must not substitute its own (this is the
-            // s71 silent-downgrade class). The DSL's
-            // `AttachSessionIngress` guard would already reject the swap,
-            // but we short-circuit here so the turn-start path doesn't emit
-            // a spurious WARN for every turn on every mob-owned member.
-            let owner = self.runtime_adapter.peer_ingress_owner(session_id).await;
-            if owner.is_mob_owned() {
-                tracing::debug!(
-                    %session_id,
-                    ?owner,
-                    "start_turn_via_runtime: mob-owned peer ingress — skipping drain reconfigure"
-                );
-            } else {
-                let peer_ingress_enabled = self
-                    .preserve_existing_peer_ingress(session_id, keep_alive)
-                    .await;
-                // Preserve an already-active peer ingress channel for
-                // externally-enabled sessions even when the persisted
-                // keep_alive bit is false. Without this, ordinary turn
-                // routing can accidentally tear down the persistent comms
-                // drain that autonomous peers rely on for between-turn
-                // responses.
-                if comms_rt.is_some() || peer_ingress_enabled {
-                    self.runtime_adapter
-                        .update_peer_ingress_context(session_id, peer_ingress_enabled, comms_rt)
+                // Persist explicit override so subsequent inheriting calls observe it.
+                if keep_alive_override.is_some() {
+                    self.service
+                        .apply_runtime_session_keep_alive(session_id, keep_alive)
+                        .await
+                        .map_err(session_error_to_rpc)?;
+                }
+                // W2-G: never reconfigure a mob-owned drain from the session-runtime
+                // turn-start path. The mob provisioner owns peer-ingress for its
+                // members; the session runtime has no visibility into the mob's
+                // comms context and must not substitute its own (this is the
+                // s71 silent-downgrade class). The DSL's
+                // `AttachSessionIngress` guard would already reject the swap,
+                // but we short-circuit here so the turn-start path doesn't emit
+                // a spurious WARN for every turn on every mob-owned member.
+                let owner = self.runtime_adapter.peer_ingress_owner(session_id).await;
+                if owner.is_mob_owned() {
+                    tracing::debug!(
+                        %session_id,
+                        ?owner,
+                        "start_turn_via_runtime: mob-owned peer ingress — skipping drain reconfigure"
+                    );
+                } else {
+                    let peer_ingress_enabled = self
+                        .preserve_existing_peer_ingress(session_id, keep_alive)
                         .await;
+                    // Preserve an already-active peer ingress channel for
+                    // externally-enabled sessions even when the persisted
+                    // keep_alive bit is false. Without this, ordinary turn
+                    // routing can accidentally tear down the persistent comms
+                    // drain that autonomous peers rely on for between-turn
+                    // responses.
+                    if comms_rt.is_some() || peer_ingress_enabled {
+                        self.runtime_adapter
+                            .update_peer_ingress_context(session_id, peer_ingress_enabled, comms_rt)
+                            .await;
+                    }
                 }
             }
         }
@@ -2461,6 +2471,18 @@ impl SessionRuntime {
                 }
             }
 
+            if let Err(err) = Self::validate_keep_alive_has_comms_name(&build_config) {
+                self.restore_pending_from_promoting(
+                    session_id,
+                    build_config,
+                    labels,
+                    saved_deferred_prompt,
+                    created_at_secs,
+                    updated_at_secs,
+                )
+                .await;
+                return Err(err);
+            }
             if build_config.llm_client_override.is_none()
                 && let Some(client) = self.default_llm_client()
             {
@@ -2903,6 +2925,18 @@ impl SessionRuntime {
                 if let Some(keep_alive) = ov.keep_alive {
                     build_config.keep_alive = keep_alive;
                 }
+            }
+            if let Err(err) = Self::validate_keep_alive_has_comms_name(&build_config) {
+                self.restore_pending_from_promoting(
+                    session_id,
+                    build_config,
+                    labels,
+                    saved_deferred_prompt,
+                    saved_created_at_secs,
+                    saved_updated_at_secs,
+                )
+                .await;
+                return Err(err);
             }
             // Inject default LLM client if the caller didn't provide one.
             if build_config.llm_client_override.is_none()
@@ -3360,6 +3394,46 @@ impl SessionRuntime {
 
     pub async fn pending_session_exists(&self, session_id: &SessionId) -> bool {
         self.staged_sessions.contains(session_id).await
+    }
+
+    async fn apply_pending_keep_alive_override(
+        &self,
+        session_id: &SessionId,
+        keep_alive: bool,
+    ) -> Result<bool, RpcError> {
+        match self
+            .staged_sessions
+            .update_keep_alive(session_id, keep_alive, now_unix_secs())
+            .await
+        {
+            Ok(applied) => Ok(applied),
+            Err(meerkat::StagedLifecycleError::AlreadyPromoting(_)) => Err(RpcError {
+                code: error::SESSION_BUSY,
+                message: format!("session {session_id} is already being materialized"),
+                data: None,
+            }),
+            Err(meerkat::StagedLifecycleError::KeepAliveRequiresCommsName) => Err(RpcError {
+                code: error::INVALID_PARAMS,
+                message: "keep_alive requires a session created with comms_name".to_string(),
+                data: None,
+            }),
+            Err(err) => Err(RpcError {
+                code: error::INTERNAL_ERROR,
+                message: format!("staged session lifecycle error: {err}"),
+                data: None,
+            }),
+        }
+    }
+
+    fn validate_keep_alive_has_comms_name(build_config: &AgentBuildConfig) -> Result<(), RpcError> {
+        if build_config.keep_alive && build_config.comms_name.is_none() {
+            return Err(RpcError {
+                code: error::INVALID_PARAMS,
+                message: "keep_alive requires a session created with comms_name".to_string(),
+                data: None,
+            });
+        }
+        Ok(())
     }
 
     /// Read the authoritative session view from the owning session service.
@@ -7891,6 +7965,61 @@ mod tests {
                 err.message
             );
         }
+    }
+
+    #[cfg(feature = "comms")]
+    #[tokio::test]
+    async fn runtime_turn_keep_alive_override_on_pending_requires_comms_name() {
+        use crate::handlers::turn::TurnOverrides;
+
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(make_runtime(temp_factory(&temp), 10));
+
+        let session_id = runtime
+            .create_session(mock_build_config(), None, None)
+            .await
+            .unwrap();
+
+        let (tx, _rx) = mpsc::channel(100);
+        let err = runtime
+            .start_turn_via_runtime(
+                &session_id,
+                "test".into(),
+                tx,
+                None,
+                None,
+                None,
+                Some(TurnOverrides {
+                    keep_alive: Some(true),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect_err("keep_alive=true must require comms_name on pending sessions");
+
+        assert_eq!(err.code, error::INVALID_PARAMS);
+        assert_eq!(
+            err.message,
+            "keep_alive requires a session created with comms_name"
+        );
+        assert!(
+            runtime.pending_session_exists(&session_id).await,
+            "invalid staged keep_alive override must leave the session staged"
+        );
+
+        let (tx, _rx) = mpsc::channel(100);
+        runtime
+            .start_turn(
+                &session_id,
+                "after rejection".into(),
+                tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("staged session should remain promotable after rejected override");
     }
 
     /// W2-G regression: once a mob has claimed peer-ingress ownership on a
