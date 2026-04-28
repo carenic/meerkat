@@ -259,6 +259,10 @@ rust_test(
     data = [
         ":package_runfiles",
         "//:github_workflows",
+        "//meerkat-core:package_runfiles",
+        "//meerkat-machine-schema:package_runfiles",
+        "//meerkat-mob:package_runfiles",
+        "//meerkat-runtime:package_runfiles",
         "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin",
         "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustc_lib",
     ],

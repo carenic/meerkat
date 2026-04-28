@@ -1,0 +1,120 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: machine-authority-changed [--base <rev> --head <rev>] [changed-path ...]
+
+Exits 0 when any changed path can affect the machine-authority CI lane.
+Exits 1 when the supplied or diffed paths are unrelated.
+EOF
+}
+
+base=""
+head=""
+paths=()
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --base)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --base requires a revision" >&2
+        usage >&2
+        exit 2
+      fi
+      base="$2"
+      shift 2
+      ;;
+    --head)
+      if [[ $# -lt 2 ]]; then
+        echo "error: --head requires a revision" >&2
+        usage >&2
+        exit 2
+      fi
+      head="$2"
+      shift 2
+      ;;
+    -h|--help)
+      usage
+      exit 0
+      ;;
+    --)
+      shift
+      while [[ $# -gt 0 ]]; do
+        paths+=("$1")
+        shift
+      done
+      ;;
+    -*)
+      echo "unknown argument: $1" >&2
+      usage >&2
+      exit 2
+      ;;
+    *)
+      paths+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ -n "${base}" || -n "${head}" ]]; then
+  if [[ -z "${base}" || -z "${head}" ]]; then
+    echo "error: --base and --head must be supplied together" >&2
+    usage >&2
+    exit 2
+  fi
+  diff_output="$(git diff --name-only "${base}" "${head}" --)" || {
+    echo "error: cannot diff ${base}..${head}" >&2
+    exit 2
+  }
+  paths=()
+  if [[ -n "${diff_output}" ]]; then
+    while IFS= read -r path; do
+      paths+=("${path}")
+    done <<<"${diff_output}"
+  fi
+fi
+
+machine_authority_path() {
+  local path="${1#./}"
+  case "${path}" in
+    specs/machines/*|specs/compositions/*)
+      return 0
+      ;;
+    meerkat-machine-codegen/*|meerkat-machine-derive/*|meerkat-machine-dsl/*|meerkat-machine-dsl-core/*|meerkat-machine-kernels/*|meerkat-machine-schema/*)
+      return 0
+      ;;
+    meerkat-runtime/src/meerkat_machine/*|meerkat-runtime/src/auth_machine/*|meerkat-mob/src/machines/*|meerkat-schedule/src/machines/*)
+      return 0
+      ;;
+    meerkat-machine-kernels/src/generated/*|meerkat-core/src/generated/*|meerkat-mob/src/generated/*|meerkat-runtime/src/generated/*|meerkat-schedule/src/generated/*|*/src/generated/protocol_*.rs)
+      return 0
+      ;;
+    xtask/Cargo.toml|xtask/BUILD.bazel|xtask/src/lib.rs|xtask/src/main.rs|xtask/src/machines*.rs|xtask/src/protocol_codegen.rs|xtask/src/audit_generated_headers.rs|xtask/src/public_contracts.rs)
+      return 0
+      ;;
+    xtask/tests/machine_verify_all_tlc_test.sh|xtask/tests/machines_contracts.rs|xtask/tests/protocol_codegen_drift.rs)
+      return 0
+      ;;
+    scripts/machine-authority-changed|scripts/pre-push-machines.sh|scripts/pre-push-audit-generated-headers.sh|scripts/buildbuddy-bazel-poc|scripts/buildbuddy-ci-lane|scripts/buildbuddy-doctor|scripts/generate-bazel-rust-builds.mjs|scripts/compare-machine-verify-stats.sh)
+      return 0
+      ;;
+    .github/workflows/ci.yml|.github/workflows/cargo.yml|.github/workflows/buildbuddy.yml|.github/actions/run-buildbuddy-ci-lane/*|.github/actions/setup-buildbuddy-ci/*)
+      return 0
+      ;;
+    Cargo.toml|Cargo.lock|BUILD.bazel|MODULE.bazel|MODULE.bazel.lock|.bazelrc)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+for path in "${paths[@]}"; do
+  if machine_authority_path "${path}"; then
+    echo "machine-authority changed: ${path}"
+    exit 0
+  fi
+done
+
+echo "machine-authority unchanged"
+exit 1
