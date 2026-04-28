@@ -882,6 +882,10 @@ mod tests {
                     .into_iter()
                     .collect(),
                 node_branches: [(node_id.clone(), None)].into_iter().collect(),
+                node_step_ids: Default::default(),
+                node_loop_ids: [(node_id.clone(), LoopId::from("repeat"))]
+                    .into_iter()
+                    .collect(),
                 node_status: [(node_id.clone(), NodeRunStatus::Ready)]
                     .into_iter()
                     .collect(),
@@ -971,6 +975,10 @@ mod tests {
                     .into_iter()
                     .collect(),
                 node_branches: [(node_id.clone(), None)].into_iter().collect(),
+                node_step_ids: [(node_id.clone(), StepId::from("step-a"))]
+                    .into_iter()
+                    .collect(),
+                node_loop_ids: Default::default(),
                 node_status: [(node_id.clone(), NodeRunStatus::Ready)]
                     .into_iter()
                     .collect(),

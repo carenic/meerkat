@@ -2545,6 +2545,15 @@ fn render_named_domain_assignment(
         return "{}".into();
     }
 
+    if let Some(samples) = known_named_domain_samples(name, sample_cardinality) {
+        let rendered = samples
+            .into_iter()
+            .map(tla_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!("{{{rendered}}}");
+    }
+
     if name == "ToolFilter" {
         let target_cardinality = sample_cardinality.max(2);
         let mut values = named_samples
@@ -2634,6 +2643,9 @@ fn sample_values(
         TypeRef::Enum(_) if sample_cardinality == 0 => Vec::new(),
         TypeRef::Enum(name) => {
             let name = name.as_str();
+            if let Some(samples) = known_named_domain_samples(name, sample_cardinality) {
+                return samples.into_iter().map(tla_string).collect();
+            }
             if let Some(samples) = named_samples.get(name) {
                 let limit = sample_cardinality.max(1);
                 let rendered = samples
@@ -2684,6 +2696,20 @@ fn sample_values(
         ),
         TypeRef::Map(_, _) => vec![],
     }
+}
+
+fn known_named_domain_samples(name: &str, sample_cardinality: usize) -> Option<Vec<&'static str>> {
+    let samples = match name {
+        "FlowNodeKind" => &["Loop", "Step"][..],
+        _ => return None,
+    };
+    Some(
+        samples
+            .iter()
+            .copied()
+            .take(sample_cardinality.max(1))
+            .collect(),
+    )
 }
 
 /// Consult the schema's named-type binding table to decide whether a

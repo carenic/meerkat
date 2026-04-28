@@ -3370,6 +3370,8 @@ async fn seed_test_body_frame_in_mob_machine(
                 node_dependencies: Default::default(),
                 node_dependency_modes: Default::default(),
                 node_branches: Default::default(),
+                node_step_ids: Default::default(),
+                node_loop_ids: Default::default(),
                 node_status: Default::default(),
                 ready_queue: Vec::new(),
             },

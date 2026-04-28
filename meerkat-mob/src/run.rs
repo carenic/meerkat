@@ -104,10 +104,8 @@ pub(crate) enum MobMachineFlowAuthorityKind {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum MobMachineFlowAuthoritySource {
-    MachineOwnedInput(&'static str),
-    AuthorizationOnlyInput(&'static str),
-    MachineOwnedSignal(&'static str),
-    MachineOwnedEffect(&'static str),
+    MachineOwnedInput(MobMachineCatalogInput),
+    AuthorizationOnlyInput(MobMachineCatalogInput),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,10 +121,13 @@ impl MobMachineFlowAuthorityToken {
         match input {
             mob_dsl::MobMachineInput::CreateRunSeed { .. } => Ok(Self::new(
                 MobMachineFlowAuthorityKind::FlowRun(mob_dsl::FlowRunReducerCommandKind::CreateRun),
-                MobMachineFlowAuthoritySource::MachineOwnedInput(input_name(input)),
+                MobMachineFlowAuthoritySource::MachineOwnedInput(input_catalog(input)?),
             )),
             mob_dsl::MobMachineInput::AuthorizeFlowRunReducerCommand { command, .. } => {
                 let source = match command {
+                    mob_dsl::FlowRunReducerCommandKind::CreateRun => {
+                        MobMachineFlowAuthoritySource::AuthorizationOnlyInput(input_catalog(input)?)
+                    }
                     mob_dsl::FlowRunReducerCommandKind::StartRun
                     | mob_dsl::FlowRunReducerCommandKind::DispatchStep
                     | mob_dsl::FlowRunReducerCommandKind::CompleteStep
@@ -151,9 +152,8 @@ impl MobMachineFlowAuthorityToken {
                     | mob_dsl::FlowRunReducerCommandKind::TerminalizeCompleted
                     | mob_dsl::FlowRunReducerCommandKind::TerminalizeFailed
                     | mob_dsl::FlowRunReducerCommandKind::TerminalizeCanceled => {
-                        MobMachineFlowAuthoritySource::MachineOwnedInput(input_name(input))
+                        MobMachineFlowAuthoritySource::MachineOwnedInput(input_catalog(input)?)
                     }
-                    _ => MobMachineFlowAuthoritySource::AuthorizationOnlyInput(input_name(input)),
                 };
                 Ok(Self::new(
                     MobMachineFlowAuthorityKind::FlowRun(*command),
@@ -169,10 +169,14 @@ impl MobMachineFlowAuthorityToken {
                         mob_dsl::FlowFrameReducerCommandKind::StartBodyFrame
                     }
                 }),
-                MobMachineFlowAuthoritySource::MachineOwnedInput(input_name(input)),
+                MobMachineFlowAuthoritySource::MachineOwnedInput(input_catalog(input)?),
             )),
             mob_dsl::MobMachineInput::AuthorizeFlowFrameReducerCommand { command, .. } => {
                 let source = match command {
+                    mob_dsl::FlowFrameReducerCommandKind::StartRootFrame
+                    | mob_dsl::FlowFrameReducerCommandKind::StartBodyFrame => {
+                        MobMachineFlowAuthoritySource::AuthorizationOnlyInput(input_catalog(input)?)
+                    }
                     mob_dsl::FlowFrameReducerCommandKind::AdmitNextReadyNode
                     | mob_dsl::FlowFrameReducerCommandKind::CompleteNode
                     | mob_dsl::FlowFrameReducerCommandKind::RecordNodeOutput
@@ -180,9 +184,8 @@ impl MobMachineFlowAuthorityToken {
                     | mob_dsl::FlowFrameReducerCommandKind::SkipNode
                     | mob_dsl::FlowFrameReducerCommandKind::CancelNode
                     | mob_dsl::FlowFrameReducerCommandKind::SealFrame => {
-                        MobMachineFlowAuthoritySource::MachineOwnedInput(input_name(input))
+                        MobMachineFlowAuthoritySource::MachineOwnedInput(input_catalog(input)?)
                     }
-                    _ => MobMachineFlowAuthoritySource::AuthorizationOnlyInput(input_name(input)),
                 };
                 Ok(Self::new(
                     MobMachineFlowAuthorityKind::FlowFrame(*command),
@@ -193,34 +196,40 @@ impl MobMachineFlowAuthorityToken {
                 MobMachineFlowAuthorityKind::LoopIteration(
                     mob_dsl::LoopIterationReducerCommandKind::StartLoop,
                 ),
-                MobMachineFlowAuthoritySource::MachineOwnedInput(input_name(input)),
+                MobMachineFlowAuthoritySource::MachineOwnedInput(input_catalog(input)?),
             )),
             mob_dsl::MobMachineInput::RecordLoopBodyFrameCompleted { .. } => Ok(Self::new(
                 MobMachineFlowAuthorityKind::LoopIteration(
                     mob_dsl::LoopIterationReducerCommandKind::BodyFrameCompleted,
                 ),
-                MobMachineFlowAuthoritySource::MachineOwnedInput(input_name(input)),
+                MobMachineFlowAuthoritySource::MachineOwnedInput(input_catalog(input)?),
             )),
             mob_dsl::MobMachineInput::RecordLoopUntilConditionMet { .. } => Ok(Self::new(
                 MobMachineFlowAuthorityKind::LoopIteration(
                     mob_dsl::LoopIterationReducerCommandKind::UntilConditionMet,
                 ),
-                MobMachineFlowAuthoritySource::MachineOwnedInput(input_name(input)),
+                MobMachineFlowAuthoritySource::MachineOwnedInput(input_catalog(input)?),
             )),
             mob_dsl::MobMachineInput::RecordLoopUntilConditionFailed { .. } => Ok(Self::new(
                 MobMachineFlowAuthorityKind::LoopIteration(
                     mob_dsl::LoopIterationReducerCommandKind::UntilConditionFailed,
                 ),
-                MobMachineFlowAuthoritySource::MachineOwnedInput(input_name(input)),
+                MobMachineFlowAuthoritySource::MachineOwnedInput(input_catalog(input)?),
             )),
             mob_dsl::MobMachineInput::AuthorizeLoopIterationReducerCommand { command, .. } => {
                 let source = match command {
+                    mob_dsl::LoopIterationReducerCommandKind::StartLoop
+                    | mob_dsl::LoopIterationReducerCommandKind::BodyFrameStarted
+                    | mob_dsl::LoopIterationReducerCommandKind::BodyFrameCompleted
+                    | mob_dsl::LoopIterationReducerCommandKind::UntilConditionMet
+                    | mob_dsl::LoopIterationReducerCommandKind::UntilConditionFailed => {
+                        MobMachineFlowAuthoritySource::AuthorizationOnlyInput(input_catalog(input)?)
+                    }
                     mob_dsl::LoopIterationReducerCommandKind::BodyFrameFailed
                     | mob_dsl::LoopIterationReducerCommandKind::BodyFrameCanceled
                     | mob_dsl::LoopIterationReducerCommandKind::CancelLoop => {
-                        MobMachineFlowAuthoritySource::MachineOwnedInput(input_name(input))
+                        MobMachineFlowAuthoritySource::MachineOwnedInput(input_catalog(input)?)
                     }
-                    _ => MobMachineFlowAuthoritySource::AuthorizationOnlyInput(input_name(input)),
                 };
                 Ok(Self::new(
                     MobMachineFlowAuthorityKind::LoopIteration(*command),
@@ -244,45 +253,10 @@ impl MobMachineFlowAuthorityToken {
                 MobMachineFlowAuthorityKind::LoopIteration(
                     mob_dsl::LoopIterationReducerCommandKind::BodyFrameStarted,
                 ),
-                MobMachineFlowAuthoritySource::MachineOwnedInput(input_name(input)),
+                MobMachineFlowAuthoritySource::MachineOwnedInput(input_catalog(input)?),
             )),
             _ => Err(MobError::Internal(format!(
                 "MobMachine input {input:?} is not a body-frame seed authority input"
-            ))),
-        }
-    }
-
-    pub(crate) fn from_accepted_mob_machine_signal(
-        signal: &mob_dsl::MobMachineSignal,
-    ) -> Result<Self, MobError> {
-        match signal {
-            mob_dsl::MobMachineSignal::StartFlow | mob_dsl::MobMachineSignal::StartRun => {
-                Ok(Self::new(
-                    MobMachineFlowAuthorityKind::FlowRun(
-                        mob_dsl::FlowRunReducerCommandKind::StartRun,
-                    ),
-                    MobMachineFlowAuthoritySource::MachineOwnedSignal(signal_name(signal)),
-                ))
-            }
-            _ => Err(MobError::Internal(format!(
-                "MobMachine signal {signal:?} is not a flow reducer authority signal"
-            ))),
-        }
-    }
-
-    pub(crate) fn from_accepted_mob_machine_effect(
-        effect: &mob_dsl::MobMachineEffect,
-    ) -> Result<Self, MobError> {
-        match effect {
-            mob_dsl::MobMachineEffect::EmitFlowRunNotice
-            | mob_dsl::MobMachineEffect::EmitRunLifecycleNotice => Ok(Self::new(
-                MobMachineFlowAuthorityKind::FlowRun(
-                    mob_dsl::FlowRunReducerCommandKind::TerminalizeCompleted,
-                ),
-                MobMachineFlowAuthoritySource::MachineOwnedEffect(effect_name(effect)),
-            )),
-            _ => Err(MobError::Internal(format!(
-                "MobMachine effect {effect:?} is not a flow reducer authority effect"
             ))),
         }
     }
@@ -294,12 +268,10 @@ impl MobMachineFlowAuthorityToken {
     fn require(self, expected: MobMachineFlowAuthorityKind) -> Result<(), MobError> {
         if self.kind == expected {
             match self.source {
-                MobMachineFlowAuthoritySource::MachineOwnedInput(_)
-                | MobMachineFlowAuthoritySource::MachineOwnedSignal(_)
-                | MobMachineFlowAuthoritySource::MachineOwnedEffect(_) => Ok(()),
+                MobMachineFlowAuthoritySource::MachineOwnedInput(_) => Ok(()),
                 MobMachineFlowAuthoritySource::AuthorizationOnlyInput(input) => {
                     Err(MobError::Internal(format!(
-                        "MobMachine input {input} only authorized {:?}; reducer-visible state \
+                        "MobMachine input {input:?} only authorized {:?}; reducer-visible state \
                          changes for {:?} must be machine-owned and are fail-closed",
                         self.kind, expected
                     )))
@@ -2759,46 +2731,36 @@ fn project_node_run_status(status: mob_dsl::NodeRunStatus) -> flow_frame::NodeRu
     }
 }
 
-fn input_name(input: &mob_dsl::MobMachineInput) -> &'static str {
+fn input_catalog(input: &mob_dsl::MobMachineInput) -> Result<MobMachineCatalogInput, MobError> {
     match input {
-        mob_dsl::MobMachineInput::CreateRunSeed { .. } => "CreateRunSeed",
+        mob_dsl::MobMachineInput::CreateRunSeed { .. } => Ok(MobMachineCatalogInput::CreateRunSeed),
         mob_dsl::MobMachineInput::AuthorizeFlowRunReducerCommand { .. } => {
-            "AuthorizeFlowRunReducerCommand"
+            Ok(MobMachineCatalogInput::AuthorizeFlowRunReducerCommand)
         }
-        mob_dsl::MobMachineInput::CreateFrameSeed { .. } => "CreateFrameSeed",
+        mob_dsl::MobMachineInput::CreateFrameSeed { .. } => {
+            Ok(MobMachineCatalogInput::CreateFrameSeed)
+        }
         mob_dsl::MobMachineInput::AuthorizeFlowFrameReducerCommand { .. } => {
-            "AuthorizeFlowFrameReducerCommand"
+            Ok(MobMachineCatalogInput::AuthorizeFlowFrameReducerCommand)
         }
-        mob_dsl::MobMachineInput::CreateLoopSeed { .. } => "CreateLoopSeed",
+        mob_dsl::MobMachineInput::CreateLoopSeed { .. } => {
+            Ok(MobMachineCatalogInput::CreateLoopSeed)
+        }
         mob_dsl::MobMachineInput::RecordLoopBodyFrameCompleted { .. } => {
-            "RecordLoopBodyFrameCompleted"
+            Ok(MobMachineCatalogInput::RecordLoopBodyFrameCompleted)
         }
         mob_dsl::MobMachineInput::RecordLoopUntilConditionMet { .. } => {
-            "RecordLoopUntilConditionMet"
+            Ok(MobMachineCatalogInput::RecordLoopUntilConditionMet)
         }
         mob_dsl::MobMachineInput::RecordLoopUntilConditionFailed { .. } => {
-            "RecordLoopUntilConditionFailed"
+            Ok(MobMachineCatalogInput::RecordLoopUntilConditionFailed)
         }
         mob_dsl::MobMachineInput::AuthorizeLoopIterationReducerCommand { .. } => {
-            "AuthorizeLoopIterationReducerCommand"
+            Ok(MobMachineCatalogInput::AuthorizeLoopIterationReducerCommand)
         }
-        _ => "non_flow_input",
-    }
-}
-
-fn signal_name(signal: &mob_dsl::MobMachineSignal) -> &'static str {
-    match signal {
-        mob_dsl::MobMachineSignal::StartFlow => "StartFlow",
-        mob_dsl::MobMachineSignal::StartRun => "StartRun",
-        _ => "non_flow_signal",
-    }
-}
-
-fn effect_name(effect: &mob_dsl::MobMachineEffect) -> &'static str {
-    match effect {
-        mob_dsl::MobMachineEffect::EmitFlowRunNotice => "EmitFlowRunNotice",
-        mob_dsl::MobMachineEffect::EmitRunLifecycleNotice => "EmitRunLifecycleNotice",
-        _ => "non_flow_effect",
+        _ => Err(MobError::Internal(format!(
+            "MobMachine input {input:?} is not a flow reducer authority input"
+        ))),
     }
 }
 
@@ -3239,6 +3201,8 @@ impl MobRun {
         let mut node_dependencies = BTreeMap::new();
         let mut node_dependency_modes = BTreeMap::new();
         let mut node_branches = BTreeMap::new();
+        let mut node_step_ids = BTreeMap::new();
+        let mut node_loop_ids = BTreeMap::new();
 
         for (node_id, node_spec) in &spec.nodes {
             let key = mob_dsl::FlowNodeId::from(node_id.as_str());
@@ -3257,11 +3221,12 @@ impl MobRun {
                         dependency_mode_seed_value(step.depends_on_mode.clone()),
                     );
                     node_branches.insert(
-                        key,
+                        key.clone(),
                         step.branch
                             .as_ref()
                             .map(|branch| mob_dsl::BranchId::from(branch.as_str())),
                     );
+                    node_step_ids.insert(key, mob_dsl::StepId::from(step.step_id.as_str()));
                 }
                 FlowNodeSpec::RepeatUntil(loop_spec) => {
                     node_kind.insert(key.clone(), mob_dsl::FlowNodeKind::Loop);
@@ -3277,7 +3242,8 @@ impl MobRun {
                         key.clone(),
                         dependency_mode_seed_value(loop_spec.depends_on_mode.clone()),
                     );
-                    node_branches.insert(key, None);
+                    node_branches.insert(key.clone(), None);
+                    node_loop_ids.insert(key, mob_dsl::LoopId::from(loop_spec.loop_id.as_str()));
                 }
             }
         }
@@ -3295,6 +3261,8 @@ impl MobRun {
             node_dependencies,
             node_dependency_modes,
             node_branches,
+            node_step_ids,
+            node_loop_ids,
             node_status,
             ready_queue,
         })
@@ -3718,12 +3686,27 @@ mod tests {
                 FlowProjectionKernelRole::MobMachineOwnedFailClosedProjection
             );
             assert!(!record.canonical_machine);
+            let allowed_inputs = [
+                MobMachineCatalogInput::CreateRunSeed,
+                MobMachineCatalogInput::AuthorizeFlowRunReducerCommand,
+                MobMachineCatalogInput::CreateFrameSeed,
+                MobMachineCatalogInput::AuthorizeFlowFrameReducerCommand,
+                MobMachineCatalogInput::CreateLoopSeed,
+                MobMachineCatalogInput::RecordLoopBodyFrameCompleted,
+                MobMachineCatalogInput::RecordLoopUntilConditionMet,
+                MobMachineCatalogInput::RecordLoopUntilConditionFailed,
+                MobMachineCatalogInput::AuthorizeLoopIterationReducerCommand,
+            ];
             assert!(
-                record.owning_inputs.iter().any(|input| {
-                    input.as_str().starts_with("Authorize")
-                        || input.as_str().ends_with("Seed")
-                        || input.as_str().starts_with("RecordLoop")
-                }),
+                record
+                    .owning_inputs
+                    .iter()
+                    .all(|input| allowed_inputs.contains(input)),
+                "projection {} must name only exact typed MobMachine authority inputs",
+                record.module
+            );
+            assert!(
+                !record.owning_inputs.is_empty(),
                 "projection {} must name the MobMachine input that authorizes it",
                 record.module
             );
@@ -3747,6 +3730,8 @@ mod tests {
             node_dependencies: Default::default(),
             node_dependency_modes: Default::default(),
             node_branches: Default::default(),
+            node_step_ids: Default::default(),
+            node_loop_ids: Default::default(),
             node_status: Default::default(),
             ready_queue: Default::default(),
         };

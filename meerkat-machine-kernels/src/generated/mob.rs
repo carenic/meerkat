@@ -1497,6 +1497,8 @@ pub mod inputs {
         pub node_dependencies: std::collections::BTreeMap<FlowNodeId, Vec<FlowNodeId>>,
         pub node_dependency_modes: std::collections::BTreeMap<FlowNodeId, DependencyMode>,
         pub node_branches: std::collections::BTreeMap<FlowNodeId, Option<BranchId>>,
+        pub node_step_ids: std::collections::BTreeMap<FlowNodeId, StepId>,
+        pub node_loop_ids: std::collections::BTreeMap<FlowNodeId, LoopId>,
         pub node_status: std::collections::BTreeMap<FlowNodeId, NodeRunStatus>,
         pub ready_queue: Vec<FlowNodeId>,
     }

@@ -89,9 +89,10 @@ pub use launch::{BudgetSplitPolicy, ForkContext, MemberLaunchMode};
 #[doc(hidden)]
 pub use mob_machine::{
     MobMachineCatalogInput, MobMachineCommandClassification, MobMachineCommandClassificationRecord,
-    MobMachineRuntimeInternalClassificationRecord, MobMachineRuntimeInternalReason,
-    MobMachineShellMechanicReason, canonical_mob_machine_command_classifications,
-    canonical_mob_machine_command_manifest, canonical_mob_machine_runtime_internal_classifications,
+    MobMachineCommandVariant, MobMachineRuntimeInternalClassificationRecord,
+    MobMachineRuntimeInternalReason, MobMachineShellMechanicReason,
+    canonical_mob_machine_command_classifications, canonical_mob_machine_command_manifest,
+    canonical_mob_machine_runtime_internal_classifications,
     canonical_mob_machine_runtime_internal_manifest,
 };
 

@@ -728,7 +728,7 @@ pub enum MeerkatMachineShellMechanicReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MeerkatMachineCommandClassificationRecord {
-    pub command: &'static str,
+    pub command: MeerkatMachineCommandVariant,
     pub classification: MeerkatMachineCommandClassification,
 }
 
@@ -740,7 +740,7 @@ pub fn canonical_meerkat_machine_command_classifications()
         .iter()
         .copied()
         .map(|variant| MeerkatMachineCommandClassificationRecord {
-            command: variant.as_str(),
+            command: variant,
             classification: meerkat_machine_command_classification(variant),
         })
         .collect()

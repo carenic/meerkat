@@ -490,7 +490,7 @@ pub enum MobMachineRuntimeInternalReason {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MobMachineCommandClassificationRecord {
-    pub command: &'static str,
+    pub command: MobMachineCommandVariant,
     pub classification: MobMachineCommandClassification,
 }
 
@@ -588,7 +588,7 @@ pub fn canonical_mob_machine_command_classifications() -> Vec<MobMachineCommandC
         .iter()
         .copied()
         .map(|variant| MobMachineCommandClassificationRecord {
-            command: variant.as_str(),
+            command: variant,
             classification: mob_machine_command_classification(variant),
         })
         .collect()

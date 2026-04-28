@@ -8923,7 +8923,7 @@ impl MobActor {
         cancel_token.cancel();
 
         let Some(mut handle) = self.run_tasks.remove(&run_id) else {
-            self.flow_engine.cancel_dispatched_steps(&run_id).await?;
+            self.flow_engine.cancel_unfinished_steps(&run_id).await?;
             self.flow_engine
                 .terminalize_canceled(run_id.clone(), flow_id)
                 .await?;
@@ -8965,7 +8965,7 @@ impl MobActor {
                 () = tokio::time::sleep(cancel_grace_timeout) => false,
             };
             if completed {
-                if let Err(error) = flow_engine.cancel_dispatched_steps(&run_id).await {
+                if let Err(error) = flow_engine.cancel_unfinished_steps(&run_id).await {
                     tracing::error!(
                         error = %error,
                         "failed to settle dispatched steps after flow task completion during cancellation"
@@ -8995,7 +8995,7 @@ impl MobActor {
             }
 
             handle.abort();
-            if let Err(error) = flow_engine.cancel_dispatched_steps(&run_id).await {
+            if let Err(error) = flow_engine.cancel_unfinished_steps(&run_id).await {
                 tracing::error!(
                     error = %error,
                     "failed to settle dispatched steps before flow cancellation terminalization"
@@ -9047,24 +9047,28 @@ impl MobActor {
         Ok(())
     }
 
-    async fn cancel_dispatched_steps_in_actor(&mut self, run_id: &RunId) -> Result<(), MobError> {
+    async fn cancel_unfinished_steps_in_actor(&mut self, run_id: &RunId) -> Result<(), MobError> {
         let run = self
             .run_store
             .get_run(run_id)
             .await?
             .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
         for step_id in run.ordered_steps()? {
-            if matches!(
-                run.flow_state.step_status.get(&step_id),
-                Some(Some(flow_run::StepRunStatus::Dispatched))
-            ) {
-                self.apply_flow_run_command_in_actor(
-                    run_id,
-                    MobMachineFlowRunCommand::CancelStep(flow_run::inputs::CancelStep { step_id }),
-                    "actor_cancel_dispatched_step",
-                )
-                .await?;
+            if run
+                .flow_state
+                .step_status
+                .get(&step_id)
+                .and_then(|status| *status)
+                .is_some_and(|status| !matches!(status, flow_run::StepRunStatus::Dispatched))
+            {
+                continue;
             }
+            self.apply_flow_run_command_in_actor(
+                run_id,
+                MobMachineFlowRunCommand::CancelStep(flow_run::inputs::CancelStep { step_id }),
+                "actor_cancel_unfinished_step",
+            )
+            .await?;
         }
         Ok(())
     }
@@ -9105,7 +9109,7 @@ impl MobActor {
             }
             self.flow_streams.lock().await.remove(&run_id);
 
-            self.cancel_dispatched_steps_in_actor(&run_id).await?;
+            self.cancel_unfinished_steps_in_actor(&run_id).await?;
             self.terminalize_canceled_in_actor(
                 run_id.clone(),
                 flow_id.clone(),

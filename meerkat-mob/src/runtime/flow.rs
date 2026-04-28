@@ -55,6 +55,12 @@ pub struct FrameStepProjectionEffects {
 }
 
 #[derive(Debug, Clone)]
+struct FrameStepProjectionOutcome {
+    pub step_status: StepRunStatus,
+    pub effects: Option<FrameStepProjectionEffects>,
+}
+
+#[derive(Debug, Clone)]
 pub struct FrameStepProjectionRequest {
     pub frame_id: FrameId,
     pub node_id: FlowNodeId,
@@ -184,26 +190,56 @@ impl FlowEngine {
 
             match frame_result {
                 Ok(frame_outcome) => {
-                    let projected_run = self
-                        .run_store
-                        .get_run(&run_id)
-                        .await?
-                        .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
-
-                    match frame_outcome.root_phase {
+                    let root_phase = root_frame_terminal_phase_from_machine(
+                        &self.handle.query_machine_state().await?,
+                        &frame_id,
+                    )?;
+                    match root_phase {
                         FlowFrameTerminalPhase::Failed => {
+                            let machine_state = self.handle.query_machine_state().await?;
                             for projection_record in frame_outcome.step_projections.values() {
                                 let step_id = &projection_record.step_id;
-                                let status = projection_record.step_status.clone();
+                                let step_status = frame_step_projection_status_from_machine(
+                                    &machine_state,
+                                    &run_id,
+                                    step_id,
+                                    &projection_record.frame_id,
+                                    &projection_record.node_id,
+                                )?;
                                 if !matches!(
-                                    &status,
+                                    step_status,
                                     StepRunStatus::Failed | StepRunStatus::Skipped
-                                ) || run_step_has_terminal_projection(&projected_run, step_id)
-                                {
+                                ) {
                                     continue;
                                 }
                                 let failure = frame_outcome.step_failures.get(step_id);
-                                let reason = match (&status, failure) {
+                                let request = match (&step_status, failure) {
+                                    (StepRunStatus::Failed, Some(failure)) => {
+                                        FrameStepProjectionRequest::failed(
+                                            projection_record.frame_id.clone(),
+                                            projection_record.node_id.clone(),
+                                            failure.append_failure_ledger,
+                                        )
+                                    }
+                                    (StepRunStatus::Failed, None) => {
+                                        FrameStepProjectionRequest::failed(
+                                            projection_record.frame_id.clone(),
+                                            projection_record.node_id.clone(),
+                                            true,
+                                        )
+                                    }
+                                    (StepRunStatus::Skipped, _) => {
+                                        FrameStepProjectionRequest::skipped(
+                                            projection_record.frame_id.clone(),
+                                            projection_record.node_id.clone(),
+                                        )
+                                    }
+                                    _ => unreachable!("filtered terminal status above"),
+                                };
+                                let projection = self
+                                    .project_frame_step_status(&run_id, step_id, request)
+                                    .await?;
+                                let reason = match (&projection.step_status, failure) {
                                     (StepRunStatus::Failed, Some(failure)) => {
                                         failure.reason.as_str()
                                     }
@@ -213,37 +249,17 @@ impl FlowEngine {
                                     (StepRunStatus::Skipped, _) => {
                                         "auto-skipped by failed frame execution"
                                     }
-                                    _ => unreachable!("filtered terminal status above"),
+                                    _ => {
+                                        return Err(MobError::Internal(format!(
+                                            "failed frame projected non-failed step status {:?} \
+                                             for step '{step_id}' in run '{run_id}'",
+                                            projection.step_status
+                                        )));
+                                    }
                                 };
-                                let projection = self
-                                    .project_frame_step_status(
-                                        &run_id,
-                                        step_id,
-                                        match &status {
-                                            StepRunStatus::Failed => {
-                                                FrameStepProjectionRequest::failed(
-                                                    projection_record.frame_id.clone(),
-                                                    projection_record.node_id.clone(),
-                                                    failure
-                                                        .map(|failure| {
-                                                            failure.append_failure_ledger
-                                                        })
-                                                        .unwrap_or(true),
-                                                )
-                                            }
-                                            StepRunStatus::Skipped => {
-                                                FrameStepProjectionRequest::skipped(
-                                                    projection_record.frame_id.clone(),
-                                                    projection_record.node_id.clone(),
-                                                )
-                                            }
-                                            _ => unreachable!("filtered terminal status above"),
-                                        },
-                                    )
-                                    .await?;
                                 if self
                                     .apply_frame_step_projection(
-                                        projection,
+                                        projection.effects,
                                         &run_id,
                                         step_id,
                                         None,
@@ -271,7 +287,7 @@ impl FlowEngine {
                                 .await;
                         }
                         FlowFrameTerminalPhase::Canceled => {
-                            self.cancel_dispatched_steps(&run_id).await?;
+                            self.cancel_unfinished_steps(&run_id).await?;
                             let _ = self
                                 .terminalize_canceled(run_id.clone(), config.flow_id.clone())
                                 .await?;
@@ -288,7 +304,6 @@ impl FlowEngine {
                             &run_id,
                             config.flow_id.clone(),
                             &frame_outcome.outputs,
-                            &frame_outcome.step_statuses,
                             &frame_outcome.step_projections,
                         )
                         .await?
@@ -303,7 +318,7 @@ impl FlowEngine {
                     // condition, one canonical terminal path). The flat-step path calls
                     // terminalize_canceled when canceled — the frame path must too.
                     if matches!(e, MobError::RunCanceled(_)) {
-                        self.cancel_dispatched_steps(&run_id).await?;
+                        self.cancel_unfinished_steps(&run_id).await?;
                         if let TerminalizationOutcome::Transitioned = self
                             .terminalize_canceled(run_id.clone(), config.flow_id.clone())
                             .await?
@@ -372,9 +387,15 @@ impl FlowEngine {
         }
 
         // ── 2. Prompt rendering ────────────────────────────────────────────
-        let prompt = render_content_input_template(&step.message, context).map_err(|e| {
-            MobError::Internal(format!("template render failed for step '{step_id}': {e}"))
-        })?;
+        let prompt = match render_content_input_template(&step.message, context) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                return Ok(StepGuardOutcome::Failed {
+                    reason: format!("template render failed for step '{step_id}': {error}"),
+                    failure_ledger_recorded: false,
+                });
+            }
+        };
 
         // ── 3. Topology check ──────────────────────────────────────────────
         if let (Some(topology_spec), Some(from_role)) =
@@ -515,9 +536,9 @@ impl FlowEngine {
                     .await?;
                 Ok(StepGuardOutcome::Completed(aggregate))
             }
-            Err(reason) => Ok(StepGuardOutcome::Failed {
-                reason,
-                failure_ledger_recorded: true,
+            Err(failure) => Ok(StepGuardOutcome::Failed {
+                reason: failure.reason,
+                failure_ledger_recorded: failure.failure_ledger_recorded,
             }),
         }
     }
@@ -542,9 +563,15 @@ impl FlowEngine {
         let flow_tool_overlay = step_tool_overlay(step);
         let (step_timeout, flow_deadline_timeout_reason) =
             effective_step_timeout(step_timeout, flow_deadline, run_id)?;
-        let prompt = render_content_input_template(&step.message, context).map_err(|e| {
-            MobError::Internal(format!("template render failed for step '{step_id}': {e}"))
-        })?;
+        let prompt = match render_content_input_template(&step.message, context) {
+            Ok(prompt) => prompt,
+            Err(error) => {
+                return Ok(StepGuardOutcome::Failed {
+                    reason: format!("template render failed for step '{step_id}': {error}"),
+                    failure_ledger_recorded: false,
+                });
+            }
+        };
         let max_retries = config
             .limits
             .as_ref()
@@ -581,7 +608,7 @@ impl FlowEngine {
         }
 
         let mut successes: Vec<(MeerkatId, Value)> = Vec::new();
-        let mut failures: Vec<String> = Vec::new();
+        let mut failures: Vec<StepTargetFailure> = Vec::new();
 
         while let Some((target, result)) = in_flight.next().await {
             match result {
@@ -589,8 +616,8 @@ impl FlowEngine {
                 Ok(Ok(value)) => {
                     successes.push((target, value));
                 }
-                Ok(Err(reason)) => {
-                    failures.push(reason);
+                Ok(Err(failure)) => {
+                    failures.push(failure);
                 }
             }
         }
@@ -611,11 +638,18 @@ impl FlowEngine {
                     failures.len()
                 )
             } else {
-                failures.join("; ")
+                failures
+                    .iter()
+                    .map(|failure| failure.reason.as_str())
+                    .collect::<Vec<_>>()
+                    .join("; ")
             };
             return Ok(StepGuardOutcome::Failed {
                 reason: combined,
-                failure_ledger_recorded: !failures.is_empty(),
+                failure_ledger_recorded: !failures.is_empty()
+                    && failures
+                        .iter()
+                        .all(|failure| failure.failure_ledger_recorded),
             });
         }
 
@@ -642,7 +676,7 @@ impl FlowEngine {
     /// Single-target dispatch with retry loop. Used by both the single-target path
     /// in `execute_step_with_all_guards` and the parallel multi-target path in
     /// `dispatch_multi_target_canonical`. Returns `Ok(Ok(value))` on success,
-    /// `Ok(Err(reason))` on terminal target failure, and `Err(MobError)` on
+    /// `Ok(Err(failure))` on terminal target failure, and `Err(MobError)` on
     /// infrastructure errors that should abort the entire step.
     #[allow(clippy::too_many_arguments)]
     async fn execute_single_target_with_retries(
@@ -657,7 +691,7 @@ impl FlowEngine {
         max_retries: usize,
         cancel: Option<&CancellationToken>,
         flow_deadline_timeout_reason: Option<String>,
-    ) -> Result<Result<Value, String>, MobError> {
+    ) -> Result<Result<Value, StepTargetFailure>, MobError> {
         let mut attempt = 0usize;
         loop {
             self.emitter
@@ -676,7 +710,7 @@ impl FlowEngine {
                 )
                 .await?;
 
-            let ticket = self
+            let ticket = match self
                 .executor
                 .dispatch(
                     run_id,
@@ -685,7 +719,13 @@ impl FlowEngine {
                     prompt.clone(),
                     flow_tool_overlay.clone(),
                 )
-                .await?;
+                .await
+            {
+                Ok(ticket) => ticket,
+                Err(error) => {
+                    return Ok(Err(StepTargetFailure::unrecorded(error.to_string())));
+                }
+            };
 
             let terminal = match cancel {
                 Some(cancel_token) => {
@@ -779,7 +819,7 @@ impl FlowEngine {
                                     },
                                 )
                                 .await?;
-                            return Ok(Err(reason));
+                            return Ok(Err(StepTargetFailure::recorded(reason)));
                         }
                     }
                 }
@@ -826,7 +866,7 @@ impl FlowEngine {
                             },
                         )
                         .await?;
-                    return Ok(Err(reason));
+                    return Ok(Err(StepTargetFailure::recorded(reason)));
                 }
                 Ok(FlowTurnOutcome::Canceled) => {
                     if cancel.is_some_and(CancellationToken::is_cancelled) {
@@ -863,7 +903,7 @@ impl FlowEngine {
                             },
                         )
                         .await?;
-                    return Ok(Err(cancel_reason));
+                    return Ok(Err(StepTargetFailure::recorded(cancel_reason)));
                 }
                 Err(MobError::FlowTurnTimedOut) => {
                     let timeout_reason = match self.executor.on_timeout(ticket).await {
@@ -928,7 +968,7 @@ impl FlowEngine {
                             },
                         )
                         .await?;
-                    return Ok(Err(timeout_reason));
+                    return Ok(Err(StepTargetFailure::recorded(timeout_reason)));
                 }
                 Err(other) => return Err(other),
             }
@@ -943,7 +983,7 @@ impl FlowEngine {
         error: MobError,
     ) -> Result<(), MobError> {
         let reason = error.to_string();
-        self.fail_dispatched_steps(run_id).await?;
+        self.fail_unfinished_steps(run_id).await?;
         let _ = self
             .terminalize_failed(run_id.clone(), flow_id.clone(), reason)
             .await?;
@@ -1271,40 +1311,44 @@ impl FlowEngine {
         .await
     }
 
-    pub(crate) async fn cancel_dispatched_steps(&self, run_id: &RunId) -> Result<(), MobError> {
+    pub(crate) async fn cancel_unfinished_steps(&self, run_id: &RunId) -> Result<(), MobError> {
         for step_id in self.ordered_steps(run_id).await? {
-            if matches!(
-                self.step_status(run_id, &step_id).await?,
-                Some(StepRunStatus::Dispatched)
-            ) {
-                let _ = self
-                    .cas_flow_input_with_effects(
-                        run_id,
-                        MobMachineFlowRunCommand::CancelStep(flow_run::inputs::CancelStep {
-                            step_id: step_id.clone(),
-                        }),
-                    )
-                    .await?;
+            if self
+                .step_status(run_id, &step_id)
+                .await?
+                .is_some_and(|status| status.is_terminal())
+            {
+                continue;
             }
+            let _ = self
+                .cas_flow_input_with_effects(
+                    run_id,
+                    MobMachineFlowRunCommand::CancelStep(flow_run::inputs::CancelStep {
+                        step_id: step_id.clone(),
+                    }),
+                )
+                .await?;
         }
         Ok(())
     }
 
-    pub(crate) async fn fail_dispatched_steps(&self, run_id: &RunId) -> Result<(), MobError> {
+    pub(crate) async fn fail_unfinished_steps(&self, run_id: &RunId) -> Result<(), MobError> {
         for step_id in self.ordered_steps(run_id).await? {
-            if matches!(
-                self.step_status(run_id, &step_id).await?,
-                Some(StepRunStatus::Dispatched)
-            ) {
-                let _ = self
-                    .cas_flow_input_with_effects(
-                        run_id,
-                        MobMachineFlowRunCommand::FailStep(flow_run::inputs::FailStep {
-                            step_id: step_id.clone(),
-                        }),
-                    )
-                    .await?;
+            if self
+                .step_status(run_id, &step_id)
+                .await?
+                .is_some_and(|status| status.is_terminal())
+            {
+                continue;
             }
+            let _ = self
+                .cas_flow_input_with_effects(
+                    run_id,
+                    MobMachineFlowRunCommand::FailStep(flow_run::inputs::FailStep {
+                        step_id: step_id.clone(),
+                    }),
+                )
+                .await?;
         }
         Ok(())
     }
@@ -1370,7 +1414,7 @@ impl FlowEngine {
         run_id: &RunId,
         step_id: &StepId,
         request: FrameStepProjectionRequest,
-    ) -> Result<Option<FrameStepProjectionEffects>, MobError> {
+    ) -> Result<FrameStepProjectionOutcome, MobError> {
         let FrameStepProjectionRequest {
             frame_id,
             node_id,
@@ -1385,9 +1429,21 @@ impl FlowEngine {
             &node_id,
         )?;
 
-        let current_status = self.step_status(run_id, step_id).await?;
-        if current_status == Some(step_status.clone()) {
-            return Ok(None);
+        if let Some(projected_status) =
+            machine_run_step_status_from_machine(&machine_state, run_id, step_id)?
+            && projected_status.is_terminal()
+        {
+            if projected_status != step_status {
+                return Err(MobError::Internal(format!(
+                    "project_frame_step_status: MobMachine run projection has status \
+                     {projected_status:?} for run '{run_id}' step '{step_id}', but frame \
+                     '{frame_id}' node '{node_id}' projects {step_status:?}"
+                )));
+            }
+            return Ok(FrameStepProjectionOutcome {
+                step_status,
+                effects: None,
+            });
         }
 
         let effects = self
@@ -1409,23 +1465,34 @@ impl FlowEngine {
                      step '{step_id}'"
                 ))
             })?;
+        let projected_status = find_step_notice_effect(&effects, step_id)?
+            .map(|notice| notice.status)
+            .ok_or_else(|| {
+                MobError::Internal(format!(
+                    "project_frame_step_status: transition emitted no step notice for run \
+                     '{run_id}' step '{step_id}'"
+                ))
+            })?;
 
-        Ok(Some(FrameStepProjectionEffects {
-            step_status: step_status.clone(),
-            persist_output: matches!(step_status, StepRunStatus::Completed),
-            append_failure_ledger: has_effect(
-                &effects,
-                FlowRunEffectKind::AppendFailureLedger,
-                Some(step_id),
-                None,
-            ),
-            escalate_supervisor: has_effect(
-                &effects,
-                FlowRunEffectKind::EscalateSupervisor,
-                Some(step_id),
-                None,
-            ),
-        }))
+        Ok(FrameStepProjectionOutcome {
+            step_status: projected_status.clone(),
+            effects: Some(FrameStepProjectionEffects {
+                step_status: projected_status.clone(),
+                persist_output: matches!(projected_status, StepRunStatus::Completed),
+                append_failure_ledger: has_effect(
+                    &effects,
+                    FlowRunEffectKind::AppendFailureLedger,
+                    Some(step_id),
+                    None,
+                ),
+                escalate_supervisor: has_effect(
+                    &effects,
+                    FlowRunEffectKind::EscalateSupervisor,
+                    Some(step_id),
+                    None,
+                ),
+            }),
+        })
     }
 
     async fn terminalize_completed_from_frame(
@@ -1433,18 +1500,8 @@ impl FlowEngine {
         run_id: &RunId,
         flow_id: FlowId,
         outputs: &IndexMap<StepId, Value>,
-        step_statuses: &IndexMap<StepId, StepRunStatus>,
         step_projections: &IndexMap<StepId, FrameStepProjection>,
     ) -> Result<TerminalizationOutcome, MobError> {
-        for (step_id, status) in step_statuses {
-            if !matches!(status, StepRunStatus::Completed | StepRunStatus::Skipped) {
-                return Err(MobError::Internal(format!(
-                    "terminalize_completed_from_frame received non-completed terminal status \
-                     {status:?} for step '{step_id}' in run '{run_id}'"
-                )));
-            }
-        }
-
         for step_id in self.ordered_steps(run_id).await? {
             let projection_record = step_projections.get(&step_id).ok_or_else(|| {
                 MobError::Internal(format!(
@@ -1452,22 +1509,21 @@ impl FlowEngine {
                      for step '{step_id}' in run '{run_id}'"
                 ))
             })?;
-            let status = projection_record.step_status.clone();
-            match &status {
+            let projection = self
+                .project_frame_step_status(
+                    run_id,
+                    &step_id,
+                    FrameStepProjectionRequest::completed(
+                        projection_record.frame_id.clone(),
+                        projection_record.node_id.clone(),
+                    ),
+                )
+                .await?;
+            match &projection.step_status {
                 StepRunStatus::Completed => {
-                    let projection = self
-                        .project_frame_step_status(
-                            run_id,
-                            &step_id,
-                            FrameStepProjectionRequest::completed(
-                                projection_record.frame_id.clone(),
-                                projection_record.node_id.clone(),
-                            ),
-                        )
-                        .await?;
                     let _ = self
                         .apply_frame_step_projection(
-                            projection,
+                            projection.effects,
                             run_id,
                             &step_id,
                             outputs.get(&step_id).cloned(),
@@ -1476,19 +1532,9 @@ impl FlowEngine {
                         .await?;
                 }
                 StepRunStatus::Skipped => {
-                    let projection = self
-                        .project_frame_step_status(
-                            run_id,
-                            &step_id,
-                            FrameStepProjectionRequest::skipped(
-                                projection_record.frame_id.clone(),
-                                projection_record.node_id.clone(),
-                            ),
-                        )
-                        .await?;
                     let _ = self
                         .apply_frame_step_projection(
-                            projection,
+                            projection.effects,
                             run_id,
                             &step_id,
                             None,
@@ -1604,6 +1650,7 @@ impl FlowEngine {
         authority: MobMachineFlowAuthorityToken,
     ) -> Result<TerminalizationOutcome, MobError> {
         let next_status = target.status();
+        self.verify_terminal_run_steps(&run_id).await?;
         for attempt in 0..5u32 {
             let run = self.run_snapshot(&run_id).await?;
             if run.status.is_terminal()
@@ -1633,9 +1680,6 @@ impl FlowEngine {
                 )
                 .await?;
             if transitioned {
-                if !matches!(target, TerminalizationTarget::Canceled) {
-                    self.verify_terminal_run_steps(&run_id).await?;
-                }
                 return self
                     .terminalization
                     .record_persisted_terminalization(run_id, flow_id, target)
@@ -1653,13 +1697,20 @@ impl FlowEngine {
     async fn verify_terminal_run_steps(&self, run_id: &RunId) -> Result<(), MobError> {
         let steps = self.ordered_steps(run_id).await?;
         for step_id in &steps {
-            if let Some(status) = self.step_status(run_id, step_id).await?
-                && !status.is_terminal()
-            {
-                return Err(MobError::Internal(format!(
-                    "TerminalRunStepInvariant violated: run '{run_id}' is terminal but \
-                     step '{step_id}' has non-terminal status {status:?}"
-                )));
+            match self.step_status(run_id, step_id).await? {
+                Some(status) if status.is_terminal() => {}
+                Some(status) => {
+                    return Err(MobError::Internal(format!(
+                        "TerminalRunStepInvariant violated: run '{run_id}' is terminal but \
+                         step '{step_id}' has non-terminal status {status:?}"
+                    )));
+                }
+                None => {
+                    return Err(MobError::Internal(format!(
+                        "TerminalRunStepInvariant violated: run '{run_id}' is terminal but \
+                         step '{step_id}' has no MobMachine-owned terminal status"
+                    )));
+                }
             }
         }
         Ok(())
@@ -1698,6 +1749,28 @@ pub(crate) enum StepGuardOutcome {
         reason: String,
         failure_ledger_recorded: bool,
     },
+}
+
+#[derive(Debug)]
+struct StepTargetFailure {
+    reason: String,
+    failure_ledger_recorded: bool,
+}
+
+impl StepTargetFailure {
+    fn recorded(reason: String) -> Self {
+        Self {
+            reason,
+            failure_ledger_recorded: true,
+        }
+    }
+
+    fn unrecorded(reason: String) -> Self {
+        Self {
+            reason,
+            failure_ledger_recorded: false,
+        }
+    }
 }
 
 pub(crate) struct StepExecutionRequest<'a> {
@@ -2279,16 +2352,6 @@ impl super::flow_frame_engine::FrameStepExecutor for FlowTurnExecutorAdapter {
     }
 }
 
-fn run_step_has_terminal_projection(run: &crate::run::MobRun, step_id: &StepId) -> bool {
-    run.step_ledger.iter().any(|entry| {
-        &entry.step_id == step_id
-            && matches!(
-                entry.status,
-                StepRunStatus::Completed | StepRunStatus::Skipped | StepRunStatus::Failed
-            )
-    })
-}
-
 fn frame_step_projection_status_from_machine(
     machine_state: &mob_dsl::MobMachineState,
     run_id: &RunId,
@@ -2344,6 +2407,44 @@ fn frame_step_projection_status_from_machine(
         other => Err(MobError::Internal(format!(
             "project_frame_step_status: frame '{frame_id}' node '{node_id}' has \
              non-projectable status {other:?}"
+        ))),
+    }
+}
+
+fn machine_run_step_status_from_machine(
+    machine_state: &mob_dsl::MobMachineState,
+    run_id: &RunId,
+    step_id: &StepId,
+) -> Result<Option<StepRunStatus>, MobError> {
+    let key = mob_dsl::RunStepKey::from(format!("{run_id}\u{0}{}", step_id.as_str()));
+    machine_state
+        .run_step_status_flat
+        .get(&key)
+        .copied()
+        .map(|status| match status {
+            mob_dsl::StepRunStatus::Dispatched => Ok(StepRunStatus::Dispatched),
+            mob_dsl::StepRunStatus::Completed => Ok(StepRunStatus::Completed),
+            mob_dsl::StepRunStatus::Failed => Ok(StepRunStatus::Failed),
+            mob_dsl::StepRunStatus::Skipped => Ok(StepRunStatus::Skipped),
+            mob_dsl::StepRunStatus::Canceled => Ok(StepRunStatus::Canceled),
+        })
+        .transpose()
+}
+
+fn root_frame_terminal_phase_from_machine(
+    machine_state: &mob_dsl::MobMachineState,
+    frame_id: &FrameId,
+) -> Result<FlowFrameTerminalPhase, MobError> {
+    let frame_key = mob_dsl::FrameId::from(frame_id.as_str());
+    match machine_state.frame_phase.get(&frame_key).copied() {
+        Some(mob_dsl::FrameStatus::Completed) => Ok(FlowFrameTerminalPhase::Completed),
+        Some(mob_dsl::FrameStatus::Failed) => Ok(FlowFrameTerminalPhase::Failed),
+        Some(mob_dsl::FrameStatus::Canceled) => Ok(FlowFrameTerminalPhase::Canceled),
+        Some(mob_dsl::FrameStatus::Running) => Err(MobError::Internal(format!(
+            "root frame '{frame_id}' has non-terminal MobMachine phase Running"
+        ))),
+        None => Err(MobError::Internal(format!(
+            "root frame '{frame_id}' is missing MobMachine frame_phase"
         ))),
     }
 }

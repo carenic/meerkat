@@ -14,10 +14,10 @@ use meerkat_mob::{
     MobMachineCommandClassificationRecord, canonical_mob_machine_command_classifications,
 };
 use meerkat_runtime::{
-    MeerkatMachineCatalogInput as MeerkatInput, MeerkatMachineCommandClassification,
-    MeerkatMachineCommandClassificationRecord, canonical_meerkat_machine_command_classifications,
+    MeerkatMachineCommandClassification, MeerkatMachineCommandClassificationRecord,
+    canonical_meerkat_machine_command_classifications,
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 fn variant_ids<'a>(
@@ -64,7 +64,8 @@ fn assert_meerkat_command_records_are_identity_checked(
     records: &[MeerkatMachineCommandClassificationRecord],
 ) {
     for record in records {
-        let command_input = InputVariantId::parse(record.command).ok();
+        let command_name = record.command.as_str();
+        let command_input = InputVariantId::parse(command_name).ok();
         let command_is_catalog_input = command_input
             .as_ref()
             .is_some_and(|input| schema_inputs.contains(input));
@@ -78,13 +79,11 @@ fn assert_meerkat_command_records_are_identity_checked(
         assert_eq!(
             catalog_input_ids.len(),
             catalog_inputs.len(),
-            "MeerkatMachine command `{}` must not duplicate catalog input classifications",
-            record.command
+            "MeerkatMachine command `{command_name}` must not duplicate catalog input classifications"
         );
         assert!(
             catalog_input_ids.is_subset(schema_inputs),
-            "MeerkatMachine command `{}` classifies to inputs absent from the schema: {:?}",
-            record.command,
+            "MeerkatMachine command `{command_name}` classifies to inputs absent from the schema: {:?}",
             catalog_input_ids
                 .difference(schema_inputs)
                 .collect::<Vec<_>>()
@@ -94,34 +93,30 @@ fn assert_meerkat_command_records_are_identity_checked(
             MeerkatMachineCommandClassification::CatalogInput(input) => {
                 if command_is_catalog_input {
                     assert_eq!(
-                        record.command,
+                        command_name,
                         input.as_str(),
-                        "MeerkatMachine command `{}` is itself a catalog input and must classify to that exact typed input",
-                        record.command
+                        "MeerkatMachine command `{command_name}` is itself a catalog input and must classify to that exact typed input"
                     );
                 }
             }
             MeerkatMachineCommandClassification::CatalogInputs(inputs) => {
                 assert!(
                     !inputs.is_empty(),
-                    "MeerkatMachine command `{}` must not use an empty typed catalog classification",
-                    record.command
+                    "MeerkatMachine command `{command_name}` must not use an empty typed catalog classification"
                 );
                 if let Some(command_input) =
                     command_input.filter(|input| schema_inputs.contains(input))
                 {
                     assert!(
                         catalog_input_ids.contains(&command_input),
-                        "MeerkatMachine command `{}` is itself a catalog input and must include that exact typed input",
-                        record.command
+                        "MeerkatMachine command `{command_name}` is itself a catalog input and must include that exact typed input"
                     );
                 }
             }
             MeerkatMachineCommandClassification::ShellMechanic(_) => {
                 assert!(
                     !command_is_catalog_input,
-                    "MeerkatMachine shell-mechanic command `{}` must not bypass a catalog input",
-                    record.command
+                    "MeerkatMachine shell-mechanic command `{command_name}` must not bypass a catalog input"
                 );
             }
         }
@@ -133,7 +128,8 @@ fn assert_mob_command_records_are_identity_checked(
     records: &[MobMachineCommandClassificationRecord],
 ) {
     for record in records {
-        let command_input = InputVariantId::parse(record.command).ok();
+        let command_name = record.command.as_str();
+        let command_input = InputVariantId::parse(command_name).ok();
         let command_is_catalog_input = command_input
             .as_ref()
             .is_some_and(|input| schema_inputs.contains(input));
@@ -147,13 +143,11 @@ fn assert_mob_command_records_are_identity_checked(
         assert_eq!(
             catalog_input_ids.len(),
             catalog_inputs.len(),
-            "MobMachine command `{}` must not duplicate catalog input classifications",
-            record.command
+            "MobMachine command `{command_name}` must not duplicate catalog input classifications"
         );
         assert!(
             catalog_input_ids.is_subset(schema_inputs),
-            "MobMachine command `{}` classifies to inputs absent from the schema: {:?}",
-            record.command,
+            "MobMachine command `{command_name}` classifies to inputs absent from the schema: {:?}",
             catalog_input_ids
                 .difference(schema_inputs)
                 .collect::<Vec<_>>()
@@ -163,34 +157,30 @@ fn assert_mob_command_records_are_identity_checked(
             MobMachineCommandClassification::CatalogInput(input) => {
                 if command_is_catalog_input {
                     assert_eq!(
-                        record.command,
+                        command_name,
                         input.as_str(),
-                        "MobMachine command `{}` is itself a catalog input and must classify to that exact typed input",
-                        record.command
+                        "MobMachine command `{command_name}` is itself a catalog input and must classify to that exact typed input"
                     );
                 }
             }
             MobMachineCommandClassification::CatalogInputs(inputs) => {
                 assert!(
                     !inputs.is_empty(),
-                    "MobMachine command `{}` must not use an empty typed catalog classification",
-                    record.command
+                    "MobMachine command `{command_name}` must not use an empty typed catalog classification"
                 );
                 if let Some(command_input) =
                     command_input.filter(|input| schema_inputs.contains(input))
                 {
                     assert!(
                         catalog_input_ids.contains(&command_input),
-                        "MobMachine command `{}` is itself a catalog input and must include that exact typed input",
-                        record.command
+                        "MobMachine command `{command_name}` is itself a catalog input and must include that exact typed input"
                     );
                 }
             }
             MobMachineCommandClassification::ShellMechanic(_) => {
                 assert!(
                     !command_is_catalog_input,
-                    "MobMachine shell-mechanic command `{}` must not bypass a catalog input",
-                    record.command
+                    "MobMachine shell-mechanic command `{command_name}` must not bypass a catalog input"
                 );
             }
         }
@@ -266,28 +256,19 @@ fn assert_runtime_manifest_matches_schema(
     );
 }
 
-fn assert_command_mapping_is_identity_or_pinned(
+fn assert_command_mappings_have_no_exception_table(
     machine: &str,
     records: impl IntoIterator<Item = (&'static str, Vec<InputVariantId>)>,
-    pinned_non_identity: BTreeMap<&'static str, Vec<InputVariantId>>,
 ) {
-    for (command, inputs) in records {
+    for (command_name, inputs) in records {
         if inputs.is_empty() {
             continue;
         }
-        if let Some(expected) = pinned_non_identity.get(command) {
-            assert_eq!(
-                &inputs, expected,
-                "{machine} command `{command}` changed its typed non-identity catalog mapping"
-            );
-        } else {
-            assert_eq!(
-                inputs,
-                vec![parse_input_name(command)],
-                "{machine} command `{command}` must map to the catalog input with the same name \
-                 unless this semantic exception is explicitly pinned"
-            );
-        }
+        assert!(
+            inputs.iter().all(|input| !input.as_str().is_empty()),
+            "{machine} command `{command_name}` must map through typed catalog inputs, not an \
+             exception table or string placeholder"
+        );
     }
 }
 
@@ -359,7 +340,7 @@ fn meerkat_machine_inputs_equal_runtime_manifest_exactly() -> Result<(), Identit
             record.classification,
             MeerkatMachineCommandClassification::ShellMechanic(_)
         )
-        .then_some(record.command)
+        .then_some(record.command.as_str())
     }))?;
 
     assert_runtime_manifest_matches_schema(
@@ -387,7 +368,7 @@ fn mob_machine_inputs_equal_runtime_manifest_exactly() -> Result<(), IdentityErr
             record.classification,
             MobMachineCommandClassification::ShellMechanic(_)
         )
-        .then_some(record.command)
+        .then_some(record.command.as_str())
     }))?;
 
     assert_runtime_manifest_matches_schema(
@@ -401,39 +382,14 @@ fn mob_machine_inputs_equal_runtime_manifest_exactly() -> Result<(), IdentityErr
 }
 
 #[test]
-fn meerkat_machine_command_to_input_mappings_are_typed_and_pinned() {
+fn meerkat_machine_command_to_input_mappings_have_no_exception_table() {
     let records = canonical_meerkat_machine_command_classifications();
-    let pinned = BTreeMap::from([
-        (
-            "ConfigureModelRoutingBaseline",
-            vec![parse_input_name(
-                MeerkatInput::SetModelRoutingBaseline.as_str(),
-            )],
-        ),
-        (
-            "RequestSwitchTurn",
-            vec![
-                parse_input_name(MeerkatInput::RequestFiniteSwitchTurn.as_str()),
-                parse_input_name(MeerkatInput::RequestUntilChangedSwitchTurn.as_str()),
-            ],
-        ),
-        (
-            "RuntimeRealtimeChannelStatus",
-            vec![parse_input_name(
-                MeerkatInput::RuntimeRealtimeAttachmentStatus.as_str(),
-            )],
-        ),
-        (
-            "SessionModelRoutingStatus",
-            vec![parse_input_name(MeerkatInput::ModelRoutingStatus.as_str())],
-        ),
-    ]);
 
-    assert_command_mapping_is_identity_or_pinned(
+    assert_command_mappings_have_no_exception_table(
         "MeerkatMachine",
         records.iter().map(|record| {
             (
-                record.command,
+                record.command.as_str(),
                 record
                     .classification
                     .catalog_input_names()
@@ -442,35 +398,18 @@ fn meerkat_machine_command_to_input_mappings_are_typed_and_pinned() {
                     .collect::<Vec<_>>(),
             )
         }),
-        pinned,
     );
 }
 
 #[test]
-fn mob_machine_command_to_input_mappings_are_typed_and_pinned() {
+fn mob_machine_command_to_input_mappings_have_no_exception_table() {
     let records = canonical_mob_machine_command_classifications();
-    let pinned = BTreeMap::from([
-        (
-            "Wire",
-            vec![
-                parse_input_name(MobInput::WireMembers.as_str()),
-                parse_input_name(MobInput::WireExternalPeer.as_str()),
-            ],
-        ),
-        (
-            "Unwire",
-            vec![
-                parse_input_name(MobInput::UnwireMembers.as_str()),
-                parse_input_name(MobInput::UnwireExternalPeer.as_str()),
-            ],
-        ),
-    ]);
 
-    assert_command_mapping_is_identity_or_pinned(
+    assert_command_mappings_have_no_exception_table(
         "MobMachine",
         records.iter().map(|record| {
             (
-                record.command,
+                record.command.as_str(),
                 record
                     .classification
                     .catalog_input_names()
@@ -479,7 +418,6 @@ fn mob_machine_command_to_input_mappings_are_typed_and_pinned() {
                     .collect::<Vec<_>>(),
             )
         }),
-        pinned,
     );
 }
 

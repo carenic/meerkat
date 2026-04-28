@@ -5,7 +5,7 @@ macro_rules! mob_catalog_machine_dsl {
     ($rust_crate:literal, $rust_module:literal) => {
         meerkat_machine_dsl::machine! {
     machine MobMachine {
-        version: 1,
+        version: 2,
         rust: $rust_crate / $rust_module,
 
         state {
@@ -280,6 +280,8 @@ macro_rules! mob_catalog_machine_dsl {
                 node_dependencies: Map<FlowNodeId, Seq<FlowNodeId>>,
                 node_dependency_modes: Map<FlowNodeId, Enum<DependencyMode>>,
                 node_branches: Map<FlowNodeId, Option<BranchId>>,
+                node_step_ids: Map<FlowNodeId, StepId>,
+                node_loop_ids: Map<FlowNodeId, LoopId>,
                 node_status: Map<FlowNodeId, Enum<NodeRunStatus>>,
                 ready_queue: Seq<FlowNodeId>,
             },
@@ -1627,7 +1629,7 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         transition CreateFrameSeedRunning {
-            on input CreateFrameSeed { run_id, frame_id, frame_scope, loop_instance_id, iteration, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, node_status, ready_queue }
+            on input CreateFrameSeed { run_id, frame_id, frame_scope, loop_instance_id, iteration, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches, node_step_ids, node_loop_ids, node_status, ready_queue }
             guard { self.lifecycle_phase == Phase::Running }
             guard "frame_seed_is_new" { self.frame_phase.contains_key(frame_id) == false }
             guard "run_known" { self.run_status.contains_key(run_id) == true }
@@ -1635,6 +1637,14 @@ macro_rules! mob_catalog_machine_dsl {
             guard "frame_seed_status_covers_tracked_nodes" {
                 for_all(candidate in tracked_nodes,
                     node_status.contains_key(candidate))
+            }
+            guard "frame_seed_node_kind_covers_tracked_nodes" {
+                for_all(candidate in tracked_nodes,
+                    node_kind.contains_key(candidate))
+            }
+            guard "frame_seed_node_kind_keys_are_tracked" {
+                for_all(candidate in node_kind.keys(),
+                    tracked_nodes.contains(candidate))
             }
             guard "frame_seed_ready_queue_matches_dependency_roots" {
                 for_all(candidate in tracked_nodes,
@@ -1644,6 +1654,30 @@ macro_rules! mob_catalog_machine_dsl {
                     || (node_dependencies.get_cloned(candidate).get("value") != EmptySeq
                         && node_status.get_cloned(candidate) == Some(NodeRunStatus::Pending)
                         && ready_queue.contains(candidate) == false))
+            }
+            guard "frame_seed_step_nodes_have_exact_step_ids" {
+                for_all(candidate in tracked_nodes,
+                    (node_kind.get_cloned(candidate) == Some(FlowNodeKind::Step)
+                        && node_step_ids.contains_key(candidate)
+                        && node_loop_ids.contains_key(candidate) == false)
+                    || node_kind.get_cloned(candidate) != Some(FlowNodeKind::Step))
+            }
+            guard "frame_seed_loop_nodes_have_exact_loop_ids" {
+                for_all(candidate in tracked_nodes,
+                    (node_kind.get_cloned(candidate) == Some(FlowNodeKind::Loop)
+                        && node_loop_ids.contains_key(candidate)
+                        && node_step_ids.contains_key(candidate) == false)
+                    || node_kind.get_cloned(candidate) != Some(FlowNodeKind::Loop))
+            }
+            guard "frame_seed_step_id_keys_are_tracked_steps" {
+                for_all(candidate in node_step_ids.keys(),
+                    tracked_nodes.contains(candidate)
+                    && node_kind.get_cloned(candidate) == Some(FlowNodeKind::Step))
+            }
+            guard "frame_seed_loop_id_keys_are_tracked_loops" {
+                for_all(candidate in node_loop_ids.keys(),
+                    tracked_nodes.contains(candidate)
+                    && node_kind.get_cloned(candidate) == Some(FlowNodeKind::Loop))
             }
             update {
                 self.frame_scope.insert(frame_id, frame_scope);
@@ -1657,6 +1691,8 @@ macro_rules! mob_catalog_machine_dsl {
                 self.frame_node_dependencies.insert(frame_id, node_dependencies);
                 self.frame_node_dependency_modes.insert(frame_id, node_dependency_modes);
                 self.frame_node_branches.insert(frame_id, node_branches);
+                self.frame_node_step_ids.insert(frame_id, node_step_ids);
+                self.frame_node_loop_ids.insert(frame_id, node_loop_ids);
                 self.frame_node_status.insert(frame_id, node_status);
                 self.frame_ready_queue.insert(frame_id, ready_queue);
                 self.frame_output_recorded.insert(frame_id, EmptyMap);

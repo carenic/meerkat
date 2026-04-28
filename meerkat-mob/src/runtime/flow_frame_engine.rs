@@ -52,10 +52,8 @@ pub enum FrameStepResult {
 #[derive(Debug)]
 pub struct FrameExecutionOutcome {
     pub outputs: IndexMap<StepId, serde_json::Value>,
-    pub step_statuses: IndexMap<StepId, StepRunStatus>,
     pub step_projections: IndexMap<StepId, FrameStepProjection>,
     pub step_failures: IndexMap<StepId, FrameStepFailureProjection>,
-    pub root_phase: FlowFrameTerminalPhase,
 }
 
 #[derive(Debug, Clone)]
@@ -1077,14 +1075,13 @@ impl FlowFrameEngine {
 
         let run = self.require_run(run_id).await?;
         let outputs = root_outputs_from_run(&run);
-        let step_statuses = self.collect_all_step_statuses(&run, root_frame_id, root_spec)?;
         let step_projections = self.collect_all_step_projections(&run, root_frame_id, root_spec)?;
         let root_frame = run.frames.get(root_frame_id).cloned().ok_or_else(|| {
             MobError::Internal(format!(
                 "root frame '{root_frame_id}' missing at end of run '{run_id}'"
             ))
         })?;
-        let root_phase = root_terminal_phase(&root_frame).ok_or_else(|| {
+        root_terminal_phase(&root_frame).ok_or_else(|| {
             MobError::Internal(format!(
                 "root frame '{root_frame_id}' ended in non-terminal phase '{:?}'",
                 root_frame.kernel_state.phase
@@ -1093,10 +1090,8 @@ impl FlowFrameEngine {
 
         Ok(FrameExecutionOutcome {
             outputs,
-            step_statuses,
             step_projections,
             step_failures,
-            root_phase,
         })
     }
 
@@ -2117,23 +2112,6 @@ impl FlowFrameEngine {
         run.frames.get(&parent_frame_id).cloned()
     }
 
-    fn collect_all_step_statuses(
-        &self,
-        run: &MobRun,
-        root_frame_id: &FrameId,
-        root_spec: &FrameSpec,
-    ) -> Result<IndexMap<StepId, StepRunStatus>, MobError> {
-        let mut step_statuses = IndexMap::new();
-        for (frame_id, frame) in &run.frames {
-            let spec = self.resolve_frame_spec(run, root_frame_id, root_spec, frame_id)?;
-            merge_step_statuses(
-                &mut step_statuses,
-                collect_frame_step_statuses(&spec, &frame.kernel_state),
-            );
-        }
-        Ok(step_statuses)
-    }
-
     fn collect_all_step_projections(
         &self,
         run: &MobRun,
@@ -2441,26 +2419,6 @@ fn running_node_ids(kernel_state: &flow_frame::State) -> Vec<FlowNodeId> {
         .collect()
 }
 
-fn collect_frame_step_statuses(
-    spec: &FrameSpec,
-    kernel_state: &flow_frame::State,
-) -> IndexMap<StepId, StepRunStatus> {
-    let mut step_statuses = IndexMap::new();
-    for (node_id, node_spec) in &spec.nodes {
-        let FlowNodeSpec::Step(step_spec) = node_spec else {
-            continue;
-        };
-        let Some(status) = kernel_state.node_status.get(node_id) else {
-            continue;
-        };
-        let Some(step_status) = node_terminal_step_status(*status) else {
-            continue;
-        };
-        merge_step_status(&mut step_statuses, step_spec.step_id.clone(), step_status);
-    }
-    step_statuses
-}
-
 fn collect_frame_step_projections(
     frame_id: &FrameId,
     spec: &FrameSpec,
@@ -2496,30 +2454,6 @@ fn node_terminal_step_status(status: flow_frame::NodeRunStatus) -> Option<StepRu
         flow_frame::NodeRunStatus::Skipped => Some(StepRunStatus::Skipped),
         flow_frame::NodeRunStatus::Failed => Some(StepRunStatus::Failed),
         _ => None,
-    }
-}
-
-fn merge_step_statuses(
-    into: &mut IndexMap<StepId, StepRunStatus>,
-    updates: IndexMap<StepId, StepRunStatus>,
-) {
-    for (step_id, status) in updates {
-        merge_step_status(into, step_id, status);
-    }
-}
-
-fn merge_step_status(
-    into: &mut IndexMap<StepId, StepRunStatus>,
-    step_id: StepId,
-    status: StepRunStatus,
-) {
-    let next_rank = step_status_rank(&status);
-    match into.get_mut(&step_id) {
-        Some(existing) if step_status_rank(existing) >= next_rank => {}
-        Some(existing) => *existing = status,
-        None => {
-            into.insert(step_id, status);
-        }
     }
 }
 
