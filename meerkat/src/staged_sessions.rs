@@ -96,6 +96,9 @@ pub enum StagedLifecycleError {
     /// No staged slot exists for the session.
     #[error("staged session not found: {0}")]
     NotFound(SessionId),
+    /// A staged keep-alive override requires a comms participant name.
+    #[error("keep_alive requires a session created with comms_name")]
+    KeepAliveRequiresCommsName,
 }
 
 /// Canonical staged-session registry.
@@ -153,6 +156,9 @@ impl StagedSessionRegistry {
         };
         match &mut slot.phase {
             StagedPhase::Staged { build_config } => {
+                if keep_alive && build_config.comms_name.is_none() {
+                    return Err(StagedLifecycleError::KeepAliveRequiresCommsName);
+                }
                 build_config.keep_alive = keep_alive;
                 slot.updated_at_secs = updated_at_secs;
                 Ok(true)

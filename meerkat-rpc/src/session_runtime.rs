@@ -2471,6 +2471,18 @@ impl SessionRuntime {
                 }
             }
 
+            if let Err(err) = Self::validate_keep_alive_has_comms_name(&build_config) {
+                self.restore_pending_from_promoting(
+                    session_id,
+                    build_config,
+                    labels,
+                    saved_deferred_prompt,
+                    created_at_secs,
+                    updated_at_secs,
+                )
+                .await;
+                return Err(err);
+            }
             if build_config.llm_client_override.is_none()
                 && let Some(client) = self.default_llm_client()
             {
@@ -2913,6 +2925,18 @@ impl SessionRuntime {
                 if let Some(keep_alive) = ov.keep_alive {
                     build_config.keep_alive = keep_alive;
                 }
+            }
+            if let Err(err) = Self::validate_keep_alive_has_comms_name(&build_config) {
+                self.restore_pending_from_promoting(
+                    session_id,
+                    build_config,
+                    labels,
+                    saved_deferred_prompt,
+                    saved_created_at_secs,
+                    saved_updated_at_secs,
+                )
+                .await;
+                return Err(err);
             }
             // Inject default LLM client if the caller didn't provide one.
             if build_config.llm_client_override.is_none()
@@ -3388,12 +3412,28 @@ impl SessionRuntime {
                 message: format!("session {session_id} is already being materialized"),
                 data: None,
             }),
+            Err(meerkat::StagedLifecycleError::KeepAliveRequiresCommsName) => Err(RpcError {
+                code: error::INVALID_PARAMS,
+                message: "keep_alive requires a session created with comms_name".to_string(),
+                data: None,
+            }),
             Err(err) => Err(RpcError {
                 code: error::INTERNAL_ERROR,
                 message: format!("staged session lifecycle error: {err}"),
                 data: None,
             }),
         }
+    }
+
+    fn validate_keep_alive_has_comms_name(build_config: &AgentBuildConfig) -> Result<(), RpcError> {
+        if build_config.keep_alive && build_config.comms_name.is_none() {
+            return Err(RpcError {
+                code: error::INVALID_PARAMS,
+                message: "keep_alive requires a session created with comms_name".to_string(),
+                data: None,
+            });
+        }
+        Ok(())
     }
 
     /// Read the authoritative session view from the owning session service.
@@ -7925,6 +7965,61 @@ mod tests {
                 err.message
             );
         }
+    }
+
+    #[cfg(feature = "comms")]
+    #[tokio::test]
+    async fn runtime_turn_keep_alive_override_on_pending_requires_comms_name() {
+        use crate::handlers::turn::TurnOverrides;
+
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = Arc::new(make_runtime(temp_factory(&temp), 10));
+
+        let session_id = runtime
+            .create_session(mock_build_config(), None, None)
+            .await
+            .unwrap();
+
+        let (tx, _rx) = mpsc::channel(100);
+        let err = runtime
+            .start_turn_via_runtime(
+                &session_id,
+                "test".into(),
+                tx,
+                None,
+                None,
+                None,
+                Some(TurnOverrides {
+                    keep_alive: Some(true),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .expect_err("keep_alive=true must require comms_name on pending sessions");
+
+        assert_eq!(err.code, error::INVALID_PARAMS);
+        assert_eq!(
+            err.message,
+            "keep_alive requires a session created with comms_name"
+        );
+        assert!(
+            runtime.pending_session_exists(&session_id).await,
+            "invalid staged keep_alive override must leave the session staged"
+        );
+
+        let (tx, _rx) = mpsc::channel(100);
+        runtime
+            .start_turn(
+                &session_id,
+                "after rejection".into(),
+                tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("staged session should remain promotable after rejected override");
     }
 
     /// W2-G regression: once a mob has claimed peer-ingress ownership on a
