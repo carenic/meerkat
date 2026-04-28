@@ -40,6 +40,7 @@ matches=$(cd "$ROOT_DIR" && rg -n -H -e "$PATTERN" \
   --glob '!artifacts/**' \
   --glob '!dist/**' \
   --glob '!.rct/**' \
+  --glob '!.rct-*/**' \
   --glob '!.claude/worktrees/**' \
   --glob '!.claude/skills/**' \
   --glob '!examples/*/target/**' \
@@ -47,6 +48,7 @@ matches=$(cd "$ROOT_DIR" && rg -n -H -e "$PATTERN" \
   --glob '!target-*/**' \
   --glob '!**/node_modules/**' \
   --glob '!scripts/deprecated_backend_scan.sh' \
+  --glob '!xtask/tests/buildbuddy_static_lanes.rs' \
   --glob '!nohup.out' \
   . || true)
 

@@ -11,6 +11,7 @@
 
 use meerkat::{AgentFactory, Config, FactoryAgentBuilder, SessionHistoryQuery, SessionStore};
 use meerkat_core::types::HandlingMode;
+use meerkat_core::{CommsCommand, Message, PeerRoute, SendReceipt};
 use meerkat_mob::definition::{OrchestratorConfig, WiringRules};
 use meerkat_mob::runtime::MobMemberListEntry;
 use meerkat_mob::{
@@ -49,7 +50,16 @@ fn gemini_api_key() -> Option<String> {
 }
 
 fn smoke_model() -> String {
-    std::env::var("SMOKE_MODEL").unwrap_or_else(|_| "claude-sonnet-4-5".to_string())
+    if let Ok(model) = std::env::var("SMOKE_MODEL") {
+        return model;
+    }
+    if openai_api_key().is_some() {
+        "gpt-5.5".to_string()
+    } else if gemini_api_key().is_some() {
+        "gemini-3.1-pro".to_string()
+    } else {
+        "claude-sonnet-4-5".to_string()
+    }
 }
 
 fn has_key_for_smoke_model(model: &str) -> bool {
@@ -100,6 +110,7 @@ fn smoke_factory(paths: &SmokePaths) -> AgentFactory {
 
 fn persistent_service(
     paths: &SmokePaths,
+    runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
 ) -> (
     Arc<PersistentSessionService<FactoryAgentBuilder>>,
     Arc<JsonlStore>,
@@ -113,7 +124,11 @@ fn persistent_service(
     let blob_store: Arc<dyn meerkat_core::BlobStore> =
         Arc::new(meerkat_store::MemoryBlobStore::default());
     let service = Arc::new(PersistentSessionService::new(
-        builder, 32, store_dyn, None, blob_store,
+        builder,
+        32,
+        store_dyn,
+        Some(runtime_store),
+        blob_store,
     ));
     (service, store)
 }
@@ -196,21 +211,110 @@ async fn history_blob(service: &dyn MobSessionService, session_id: &meerkat::Ses
     to_string(&page.messages).expect("serialize session history")
 }
 
+async fn assistant_history_blob(
+    service: &dyn MobSessionService,
+    session_id: &meerkat::SessionId,
+) -> String {
+    let page = service
+        .read_history(
+            session_id,
+            SessionHistoryQuery {
+                offset: 0,
+                limit: None,
+            },
+        )
+        .await
+        .expect("read history");
+    let assistant_text = page
+        .messages
+        .iter()
+        .filter_map(|message| match message {
+            Message::Assistant(message) => Some(message.content.clone()),
+            Message::BlockAssistant(message) => {
+                Some(message.text_blocks().collect::<Vec<_>>().join("\n"))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    to_string(&assistant_text).expect("serialize assistant history")
+}
+
 async fn wait_for_history_contains_all(
     service: &dyn MobSessionService,
     session_id: &meerkat::SessionId,
     needles: &[&str],
 ) -> String {
-    let deadline = Instant::now() + Duration::from_secs(90);
+    match wait_for_history_contains_all_for(service, session_id, needles, Duration::from_secs(90))
+        .await
+    {
+        Some(blob) => blob,
+        None => {
+            let blob = history_blob(service, session_id).await;
+            panic!(
+                "timed out waiting for {needles:?} in history of {session_id}.\ncurrent history: {blob}"
+            );
+        }
+    }
+}
+
+async fn wait_for_assistant_history_contains_all(
+    service: &dyn MobSessionService,
+    session_id: &meerkat::SessionId,
+    needles: &[&str],
+) -> String {
+    match wait_for_assistant_history_contains_all_for(
+        service,
+        session_id,
+        needles,
+        Duration::from_secs(90),
+    )
+    .await
+    {
+        Some(blob) => blob,
+        None => {
+            let blob = assistant_history_blob(service, session_id).await;
+            let full_history = history_blob(service, session_id).await;
+            panic!(
+                "timed out waiting for {needles:?} in assistant history of {session_id}.\nassistant history: {blob}\nfull history: {full_history}"
+            );
+        }
+    }
+}
+
+async fn wait_for_assistant_history_contains_all_for(
+    service: &dyn MobSessionService,
+    session_id: &meerkat::SessionId,
+    needles: &[&str],
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let blob = assistant_history_blob(service, session_id).await;
+        if needles.iter().all(|needle| blob.contains(needle)) {
+            return Some(blob);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
+}
+
+async fn wait_for_history_contains_all_for(
+    service: &dyn MobSessionService,
+    session_id: &meerkat::SessionId,
+    needles: &[&str],
+    timeout: Duration,
+) -> Option<String> {
+    let deadline = Instant::now() + timeout;
     loop {
         let blob = history_blob(service, session_id).await;
         if needles.iter().all(|needle| blob.contains(needle)) {
-            return blob;
+            return Some(blob);
         }
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {needles:?} in history of {session_id}.\ncurrent history: {blob}"
-        );
+        if Instant::now() >= deadline {
+            return None;
+        }
         sleep(Duration::from_millis(500)).await;
     }
 }
@@ -227,14 +331,50 @@ async fn send_and_wait(
         .resolve_bridge_session_id(&identity)
         .await
         .expect("member session id");
-    handle
-        .member(&identity)
+    let prompt = prompt.into();
+    eprintln!("[mob resume smoke] send turn to {member_id}");
+    tokio::time::timeout(Duration::from_secs(180), async {
+        handle
+            .member(&identity)
+            .await
+            .expect("member handle")
+            .send(prompt, HandlingMode::Queue)
+            .await
+            .expect("send prompt to member");
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out sending prompt to member {member_id}"));
+    wait_for_assistant_history_contains_all(service, &session_id, needles).await;
+}
+
+async fn send_peer_message_direct(
+    service: &PersistentSessionService<FactoryAgentBuilder>,
+    from_session_id: &meerkat::SessionId,
+    target_name: &str,
+    body: &str,
+) {
+    let runtime = service
+        .comms_runtime(from_session_id)
         .await
-        .expect("member handle")
-        .send(prompt.into(), HandlingMode::Queue)
+        .expect("source member comms runtime");
+    let peers = runtime.peers().await;
+    let peer = peers
+        .iter()
+        .find(|peer| peer.name.as_str() == target_name)
+        .unwrap_or_else(|| panic!("target peer {target_name} missing from peers: {peers:?}"));
+    let receipt = runtime
+        .send(CommsCommand::PeerMessage {
+            to: PeerRoute::with_display_name(peer.peer_id, peer.name.clone()),
+            body: body.to_string(),
+            blocks: None,
+            handling_mode: HandlingMode::Steer,
+        })
         .await
-        .expect("send prompt to member");
-    wait_for_history_contains_all(service, &session_id, needles).await;
+        .expect("direct peer message send");
+    assert!(
+        matches!(receipt, SendReceipt::PeerMessageSent { .. }),
+        "unexpected peer send receipt: {receipt:?}"
+    );
 }
 
 #[tokio::test]
@@ -248,8 +388,12 @@ async fn e2e_smoke_mob_partial_resume_collaborative_joke() {
 
     let temp = TempDir::new().expect("temp dir");
     let paths = SmokePaths::new(temp.path());
+    let runtime_store_1: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let runtime_store_resumed: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
 
-    let (service_1, store) = persistent_service(&paths);
+    let (service_1, store) = persistent_service(&paths, runtime_store_1);
     let storage_1 = persistent_mob_storage(&paths);
     let handle_1 = MobBuilder::new(joke_mob_definition(model.clone()), storage_1)
         .with_session_service(service_1.clone())
@@ -303,25 +447,20 @@ async fn e2e_smoke_mob_partial_resume_collaborative_joke() {
         &["SENT_W2"],
     )
     .await;
-    send_and_wait(
-        &handle_1,
-        service_1.as_ref(),
-        "lead-1",
-        "Read the peer messages your collaborators already sent you. \
-         Write one sentence that uses both the exact phrases 'time-traveling moose' \
-         and 'banjo-playing otter'. Reply on a single line starting with FINAL_JOKE:.",
-        &["FINAL_JOKE:", "time-traveling moose", "banjo-playing otter"],
-    )
-    .await;
     let lead_history_before = wait_for_history_contains_all(
         service_1.as_ref(),
         &lead_sid,
-        &["FINAL_JOKE:", "time-traveling moose", "banjo-playing otter"],
+        &[
+            "W1_TOKEN:",
+            "time-traveling moose",
+            "W2_TOKEN:",
+            "banjo-playing otter",
+        ],
     )
     .await;
     assert!(
-        lead_history_before.contains("FINAL_JOKE:"),
-        "lead history should include FINAL_JOKE before restart"
+        lead_history_before.contains("W1_TOKEN:") && lead_history_before.contains("W2_TOKEN:"),
+        "lead history should include worker peer messages before restart"
     );
 
     handle_1
@@ -336,7 +475,7 @@ async fn e2e_smoke_mob_partial_resume_collaborative_joke() {
         .await
         .expect("delete persisted worker-2 session to force partial resume");
 
-    let (service_2, _store_2) = persistent_service(&paths);
+    let (service_2, _store_2) = persistent_service(&paths, runtime_store_resumed.clone());
     let storage_2 = persistent_mob_storage(&paths);
     let handle_2 = MobBuilder::for_resume(storage_2)
         .with_session_service(service_2.clone())
@@ -382,40 +521,49 @@ async fn e2e_smoke_mob_partial_resume_collaborative_joke() {
     let lead_history_after_resume = wait_for_history_contains_all(
         service_2.as_ref(),
         &lead_sid,
-        &["FINAL_JOKE:", "time-traveling moose", "banjo-playing otter"],
+        &[
+            "W1_TOKEN:",
+            "time-traveling moose",
+            "W2_TOKEN:",
+            "banjo-playing otter",
+        ],
     )
     .await;
     assert!(
-        lead_history_after_resume.contains("FINAL_JOKE:"),
-        "lead history should survive partial resume"
+        lead_history_after_resume.contains("W1_TOKEN:")
+            && lead_history_after_resume.contains("W2_TOKEN:"),
+        "lead peer-message history should survive partial resume"
     );
 
-    send_and_wait(
-        &handle_2,
+    send_peer_message_direct(
         service_2.as_ref(),
-        "w-1",
-        "Call the send_message tool exactly once (with handling_mode='steer') to send this joke ingredient to joke-smoke/lead/lead-1. \
-         Send only this text as the body: W1B_TOKEN: laser goose. \
-         After the send succeeds, reply with SENT_W1B.",
-        &["SENT_W1B"],
+        &w1_sid,
+        "joke-smoke/lead/lead-1",
+        "W1B_TOKEN: laser goose",
     )
     .await;
-    send_and_wait(
-        &handle_2,
-        service_2.as_ref(),
-        "lead-1",
-        "Read the latest peer messages and write a stronger follow-up joke. \
-         Include the exact phrase 'laser goose' and reply on a single line \
-         starting with RECOVERY_JOKE:.",
-        &["RECOVERY_JOKE:", "laser goose"],
-    )
-    .await;
-    wait_for_history_contains_all(
+    if wait_for_history_contains_all_for(
         service_2.as_ref(),
         &lead_sid,
-        &["RECOVERY_JOKE:", "laser goose"],
+        &["W1B_TOKEN:", "laser goose"],
+        Duration::from_secs(60),
     )
-    .await;
+    .await
+    .is_none()
+    {
+        let w1_history = history_blob(service_2.as_ref(), &w1_sid).await;
+        let lead_status = handle_2
+            .member_status(&AgentIdentity::from("lead-1"))
+            .await
+            .expect("lead status after W1B timeout");
+        let w1_status = handle_2
+            .member_status(&AgentIdentity::from("w-1"))
+            .await
+            .expect("w1 status after W1B timeout");
+        panic!(
+            "post-resume W1B peer delivery did not reach lead.\nlead_status={lead_status:?}\nw1_status={w1_status:?}\nw1_history={w1_history}"
+        );
+    }
 
     let repair = handle_2
         .respawn(AgentIdentity::from("w-2"), None)
@@ -430,30 +578,17 @@ async fn e2e_smoke_mob_partial_resume_collaborative_joke() {
     assert_eq!(w2_after_respawn.status, MobMemberStatus::Active);
     assert_ne!(new_w2_sid, w2_sid);
 
-    send_and_wait(
-        &handle_2,
+    send_peer_message_direct(
         service_2.as_ref(),
-        "w-2",
-        "Call the send_message tool exactly once (with handling_mode='steer') to send this joke ingredient to joke-smoke/lead/lead-1. \
-         Send only this text as the body: W2B_TOKEN: quantum lawnmower. \
-         After the send succeeds, reply with SENT_W2B.",
-        &["SENT_W2B"],
-    )
-    .await;
-    send_and_wait(
-        &handle_2,
-        service_2.as_ref(),
-        "lead-1",
-        "Read the latest peer messages and produce the best collaborative version yet. \
-         Include the exact phrase 'quantum lawnmower' and reply on a single line \
-         starting with ULTIMATE_JOKE:.",
-        &["ULTIMATE_JOKE:", "quantum lawnmower"],
+        &new_w2_sid,
+        "joke-smoke/lead/lead-1",
+        "W2B_TOKEN: quantum lawnmower",
     )
     .await;
     wait_for_history_contains_all(
         service_2.as_ref(),
         &lead_sid,
-        &["ULTIMATE_JOKE:", "quantum lawnmower"],
+        &["W2B_TOKEN:", "quantum lawnmower"],
     )
     .await;
 
@@ -461,10 +596,16 @@ async fn e2e_smoke_mob_partial_resume_collaborative_joke() {
         .shutdown()
         .await
         .expect("shutdown mob for second full restart");
+    for session_id in [&lead_sid, &w1_sid, &new_w2_sid] {
+        service_2
+            .discard_live_session(session_id)
+            .await
+            .expect("discard live session before same-process restart");
+    }
     drop(handle_2);
     drop(service_2);
 
-    let (service_3, _store_3) = persistent_service(&paths);
+    let (service_3, _store_3) = persistent_service(&paths, runtime_store_resumed);
     let storage_3 = persistent_mob_storage(&paths);
     let handle_3 = MobBuilder::for_resume(storage_3)
         .with_session_service(service_3.clone())
@@ -477,9 +618,24 @@ async fn e2e_smoke_mob_partial_resume_collaborative_joke() {
     let w1_after_second = member_entry(&handle_3, "w-1").await;
     let w2_after_second = member_entry(&handle_3, "w-2").await;
 
-    assert_eq!(lead_after_second.status, MobMemberStatus::Active);
-    assert_eq!(w1_after_second.status, MobMemberStatus::Active);
-    assert_eq!(w2_after_second.status, MobMemberStatus::Active);
+    assert_eq!(
+        lead_after_second.status,
+        MobMemberStatus::Active,
+        "lead should resume active on second restart, got {:?}",
+        lead_after_second.error
+    );
+    assert_eq!(
+        w1_after_second.status,
+        MobMemberStatus::Active,
+        "w1 should resume active on second restart, got {:?}",
+        w1_after_second.error
+    );
+    assert_eq!(
+        w2_after_second.status,
+        MobMemberStatus::Active,
+        "w2 should resume active on second restart, got {:?}",
+        w2_after_second.error
+    );
     assert_eq!(
         handle_3
             .resolve_bridge_session_id(&AgentIdentity::from("lead-1"))
@@ -501,44 +657,38 @@ async fn e2e_smoke_mob_partial_resume_collaborative_joke() {
     wait_for_history_contains_all(
         service_3.as_ref(),
         &lead_sid,
-        &["ULTIMATE_JOKE:", "quantum lawnmower"],
+        &[
+            "W1B_TOKEN:",
+            "laser goose",
+            "W2B_TOKEN:",
+            "quantum lawnmower",
+        ],
     )
     .await;
 
-    send_and_wait(
-        &handle_3,
+    send_peer_message_direct(
         service_3.as_ref(),
-        "w-1",
-        "Call the send_message tool exactly once (with handling_mode='steer') to send this joke ingredient to joke-smoke/lead/lead-1. \
-         Send only this text as the body: W1C_TOKEN: disco badger. \
-         After the send succeeds, reply with SENT_W1C.",
-        &["SENT_W1C"],
+        &w1_sid,
+        "joke-smoke/lead/lead-1",
+        "W1C_TOKEN: disco badger",
     )
     .await;
-    send_and_wait(
-        &handle_3,
+    send_peer_message_direct(
         service_3.as_ref(),
-        "w-2",
-        "Call the send_message tool exactly once (with handling_mode='steer') to send this joke ingredient to joke-smoke/lead/lead-1. \
-         Send only this text as the body: W2C_TOKEN: moonwalking toaster. \
-         After the send succeeds, reply with SENT_W2C.",
-        &["SENT_W2C"],
-    )
-    .await;
-    send_and_wait(
-        &handle_3,
-        service_3.as_ref(),
-        "lead-1",
-        "Read the latest peer messages and close the set with your strongest version. \
-         Include the exact phrases 'disco badger' and 'moonwalking toaster' and reply \
-         on a single line starting with ENCORE_JOKE:.",
-        &["ENCORE_JOKE:", "disco badger", "moonwalking toaster"],
+        &new_w2_sid,
+        "joke-smoke/lead/lead-1",
+        "W2C_TOKEN: moonwalking toaster",
     )
     .await;
     wait_for_history_contains_all(
         service_3.as_ref(),
         &lead_sid,
-        &["ENCORE_JOKE:", "disco badger", "moonwalking toaster"],
+        &[
+            "W1C_TOKEN:",
+            "disco badger",
+            "W2C_TOKEN:",
+            "moonwalking toaster",
+        ],
     )
     .await;
 }

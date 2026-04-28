@@ -3158,9 +3158,21 @@ impl MobHandle {
         };
         self.apply_inflight_member_projection(identity, &mut snapshot)
             .await;
-        snapshot.peer_connectivity = self
-            .project_member_peer_connectivity(identity, &snapshot)
-            .await;
+        snapshot.peer_connectivity = match tokio::time::timeout(
+            Duration::from_secs(2),
+            self.project_member_peer_connectivity(identity, &snapshot),
+        )
+        .await
+        {
+            Ok(connectivity) => connectivity,
+            Err(_) => {
+                tracing::warn!(
+                    agent_identity = %identity,
+                    "mob member status peer-connectivity projection timed out"
+                );
+                None
+            }
+        };
         snapshot.realtime_attachment_status =
             self.project_realtime_attachment_status(&snapshot).await;
         snapshot.external_member = self

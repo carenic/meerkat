@@ -77,20 +77,6 @@ for scan_path in "${SCAN_PATHS[@]}"; do
     continue
   fi
 
-  matches=$(rg -n -H -e "$PATTERN" \
-    --hidden \
-    --no-ignore-vcs \
-    --glob '!target/**' \
-    --glob '!.git/**' \
-    --glob '!.rct/**' \
-    --glob '!dist/**' \
-    --glob '!nohup.out' \
-    "$scan_path" || true)
-
-  if [ -z "$matches" ]; then
-    continue
-  fi
-
   while IFS= read -r match; do
     [[ -z "$match" ]] && continue
     file="${match%%:*}"
@@ -101,7 +87,17 @@ for scan_path in "${SCAN_PATHS[@]}"; do
     else
       BLOCKED+=("$match")
     fi
-  done <<<"$matches"
+  done < <(
+    rg -n -H -e "$PATTERN" \
+      --hidden \
+      --no-ignore-vcs \
+      --glob '!target/**' \
+      --glob '!.git/**' \
+      --glob '!.rct/**' \
+      --glob '!dist/**' \
+      --glob '!nohup.out' \
+      "$scan_path" || true
+  )
 done
 
 mkdir -p "$(dirname "$OUTPUT_FILE")"

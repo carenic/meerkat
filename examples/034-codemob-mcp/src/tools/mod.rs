@@ -8,7 +8,7 @@ use meerkat::surface::RequestContext;
 use meerkat::SessionService;
 use meerkat_core::service::{SessionQuery, SessionSummary};
 use meerkat_core::types::SessionId;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 
 use crate::state::ForceState;
 
@@ -44,15 +44,15 @@ impl ToolCallError {
 
 const MODEL_DESCRIPTION: &str = "\
 Available models: \
-claude-opus-4-6 (Anthropic, strongest reasoning), \
+claude-opus-4-7 (Anthropic, strongest reasoning), \
 claude-sonnet-4-6 (Anthropic, fast + capable), \
-gpt-5.4 (OpenAI, strongest general + code), \
+gpt-5.5 (OpenAI, strongest general + code), \
 gpt-5.2-pro (OpenAI, deep reasoning — slow, use sparingly), \
 gemini-3.1-pro-preview (Google, strong general), \
 gemini-3.1-flash-lite-preview (Google, fastest). \
-Default: gpt-5.4. \
+Default: gpt-5.5. \
 Guidance: use opus/gpt-5.2-pro for complex reasoning (architecture, judging). \
-Use sonnet/gpt-5.4 for code tasks. \
+Use sonnet/gpt-5.5 for code tasks. \
 Use gemini-3.1-flash-lite-preview for speed-sensitive roles. \
 Mix providers in multi-agent packs for perspective diversity";
 
@@ -87,7 +87,7 @@ pub fn tools_list() -> Vec<Value> {
                     },
                     "model": {
                         "type": "string",
-                        "description": format!("Model to use (default: gpt-5.4). {MODEL_DESCRIPTION}")
+                        "description": format!("Model to use (default: gpt-5.5). {MODEL_DESCRIPTION}")
                     },
                     "system_prompt": {
                         "type": "string",
@@ -143,7 +143,7 @@ pub fn tools_list() -> Vec<Value> {
                         "type": "object",
                         "additionalProperties": { "type": "string" },
                         "description": format!(
-                            "Override models per role, e.g. {{\"critic\": \"claude-opus-4-6\", \"planner\": \"gpt-5.4\"}}. \
+                            "Override models per role, e.g. {{\"critic\": \"claude-opus-4-7\", \"planner\": \"gpt-5.5\"}}. \
                             Role names depend on the pack. {MODEL_DESCRIPTION}"
                         )
                     },
@@ -323,7 +323,9 @@ pub async fn handle_tool_call(
                 .all()
                 .map(|p| json!({"name": p.name(), "description": p.description(), "agents": p.agent_count(), "flow_steps": p.flow_step_count()}))
                 .collect();
-            Ok(json!({"content": [{"type": "text", "text": serde_json::to_string_pretty(&packs).unwrap_or_default()}]}))
+            Ok(
+                json!({"content": [{"type": "text", "text": serde_json::to_string_pretty(&packs).unwrap_or_default()}]}),
+            )
         }
         "consult" => consult::handle(state, arguments, request_context).await,
         "deliberate" => {
@@ -343,11 +345,16 @@ pub async fn handle_tool_call(
             labels.insert("source".into(), "consult".into());
             let sessions = state
                 .session_service
-                .list(SessionQuery { labels: Some(labels), ..SessionQuery::default() })
+                .list(SessionQuery {
+                    labels: Some(labels),
+                    ..SessionQuery::default()
+                })
                 .await
                 .map_err(|e| ToolCallError::internal(format!("List sessions failed: {e}")))?;
             let summaries: Vec<Value> = sessions.iter().map(format_session_summary).collect();
-            Ok(json!({"content": [{"type": "text", "text": serde_json::to_string_pretty(&summaries).unwrap_or_default()}]}))
+            Ok(
+                json!({"content": [{"type": "text", "text": serde_json::to_string_pretty(&summaries).unwrap_or_default()}]}),
+            )
         }
         "destroy_session" => {
             let sid = arguments
@@ -361,7 +368,9 @@ pub async fn handle_tool_call(
                 .archive(&session_id)
                 .await
                 .map_err(|e| ToolCallError::internal(format!("Destroy failed: {e}")))?;
-            Ok(json!({"content": [{"type": "text", "text": format!("Session {session_id} destroyed.")}]}))
+            Ok(
+                json!({"content": [{"type": "text", "text": format!("Session {session_id} destroyed.")}]}),
+            )
         }
         "create_mob" => {
             let result = mobs::handle_create(arguments).await?;
@@ -382,5 +391,20 @@ pub async fn handle_tool_call(
         _ => Err(ToolCallError::method_not_found(format!(
             "Unknown tool: {name}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advertised_model_defaults_are_current() {
+        let schema = serde_json::to_string(&tools_list()).expect("tools schema serializes");
+
+        assert!(schema.contains("gpt-5.5"));
+        assert!(schema.contains("claude-opus-4-7"));
+        assert!(!schema.contains("gpt-5.4"));
+        assert!(!schema.contains("claude-opus-4-6"));
     }
 }

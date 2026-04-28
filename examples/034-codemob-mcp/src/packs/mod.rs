@@ -24,11 +24,11 @@ pub mod review;
 
 use std::collections::BTreeMap;
 
+use meerkat_core::types::ContentInput;
 use meerkat_mob::definition::*;
 use meerkat_mob::ids::*;
 use meerkat_mob::profile::{Profile, ProfileBinding, ToolConfig};
 use meerkat_mob::MobRuntimeMode;
-use meerkat_core::types::ContentInput;
 use serde_json::Value;
 
 // ── Pack trait ───────────────────────────────────────────────────────────────
@@ -145,7 +145,12 @@ pub fn turn_driven_profile(
 }
 
 /// Build a flow step with text output mode and common defaults.
-pub fn flow_step(role: &str, message: String, depends_on: &[&str], timeout_ms: u64) -> FlowStepSpec {
+pub fn flow_step(
+    role: &str,
+    message: String,
+    depends_on: &[&str],
+    timeout_ms: u64,
+) -> FlowStepSpec {
     FlowStepSpec {
         role: ProfileName::from(role),
         message: ContentInput::from(message),
@@ -180,11 +185,75 @@ pub fn mob_definition(
     flows: BTreeMap<FlowId, FlowSpec>,
     spawn_policy: Option<SpawnPolicyConfig>,
 ) -> MobDefinition {
-    let mut definition =
-        MobDefinition::explicit(MobId::from(format!("codemob-{id_prefix}-{}", uuid::Uuid::new_v4().as_simple())));
+    let mut definition = MobDefinition::explicit(MobId::from(format!(
+        "codemob-{id_prefix}-{}",
+        uuid::Uuid::new_v4().as_simple()
+    )));
     definition.profiles = profiles;
     definition.skills = skills;
     definition.flows = flows;
     definition.spawn_policy = spawn_policy;
     definition
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn built_in_pack_defaults_use_current_generation_models() {
+        let registry = PackRegistry::new();
+        let mut models = Vec::new();
+
+        for pack in registry.all() {
+            let definition = pack.definition("check defaults", "", &BTreeMap::new(), None);
+            for binding in definition.profiles.values() {
+                let profile = binding
+                    .as_inline()
+                    .expect("built-in packs should use inline profiles");
+                models.push(profile.model.clone());
+            }
+        }
+
+        assert!(
+            models.iter().any(|model| model == "gpt-5.5"),
+            "OpenAI default should include gpt-5.5: {models:?}"
+        );
+        assert!(
+            models.iter().any(|model| model == "claude-opus-4-7"),
+            "Anthropic default should include claude-opus-4-7: {models:?}"
+        );
+        assert!(
+            !models.iter().any(|model| model == "gpt-5.4"),
+            "advanced packs should not regress to gpt-5.4: {models:?}"
+        );
+        assert!(
+            !models.iter().any(|model| model == "claude-opus-4-6"),
+            "advanced packs should not regress to claude-opus-4-6: {models:?}"
+        );
+    }
+
+    #[test]
+    fn built_in_pack_defaults_keep_model_diversity_within_each_pack() {
+        let registry = PackRegistry::new();
+
+        for pack in registry.all() {
+            let definition = pack.definition("check diversity", "", &BTreeMap::new(), None);
+            let mut seen = std::collections::BTreeSet::new();
+            let mut models = Vec::new();
+
+            for binding in definition.profiles.values() {
+                let profile = binding
+                    .as_inline()
+                    .expect("built-in packs should use inline profiles");
+                models.push(profile.model.clone());
+                assert!(
+                    seen.insert(profile.model.clone()),
+                    "pack '{}' should not duplicate default model '{}'; models: {models:?}",
+                    pack.name(),
+                    profile.model
+                );
+            }
+        }
+    }
 }
