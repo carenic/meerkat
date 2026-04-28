@@ -95,6 +95,51 @@ fn workspace_member_dirs(root: &Path) -> Vec<PathBuf> {
 }
 
 #[test]
+fn buildbuddy_machine_authority_lane_runs_tlc_machine_verify() {
+    let root = repo_root();
+    let launcher = read(root.join("scripts/buildbuddy-bazel-poc"));
+    let build = read(root.join("xtask/BUILD.bazel"));
+    let wrapper = read(root.join("xtask/tests/machine_verify_all_tlc_test.sh"));
+    let doctor = read(root.join("scripts/buildbuddy-doctor"));
+
+    let lane = find_all_between(&launcher, "machine-authority-rbe)", ";;")
+        .expect("machine-authority-rbe lane block");
+    assert!(
+        lane.contains("default_target=\"//xtask:machine_verify_all_tlc_test "),
+        "machine-authority-rbe must start with explicit machine-verify TLC target; block:\n{lane}"
+    );
+    assert!(
+        build.contains("name = \"machine_verify_all_tlc_test\""),
+        "xtask BUILD must declare machine_verify_all_tlc_test"
+    );
+    assert!(
+        build.contains("args = [\"$(rootpath :xtask_bin)\"]")
+            && build.contains("\":xtask_bin\"")
+            && build.contains("\"//:workspace_runfiles\"")
+            && build.contains(
+                "\"@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin\"",
+            )
+            && build.contains(
+                "\"@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustc_lib\"",
+            )
+            && build.contains(
+                "\"RUSTFMT\": \"$(rootpath @@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin)\"",
+            ),
+        "machine_verify_all_tlc_test must run xtask with workspace runfiles and hermetic rustfmt"
+    );
+    assert!(
+        wrapper.contains("machine-verify --all") && wrapper.contains("export RUSTFMT"),
+        "machine_verify_all_tlc_test wrapper must normalize RUSTFMT and run machine-verify --all"
+    );
+    assert!(
+        doctor.contains("machine_verify_all_tlc_test")
+            && doctor.contains("machine-verify --all")
+            && doctor.contains("hermetic rustfmt"),
+        "buildbuddy-doctor must guard the machine-authority TLC mapping and rustfmt runfiles"
+    );
+}
+
+#[test]
 fn rust_sources_are_formatted() {
     let root = repo_root();
     let rustfmt = std::env::var_os("RUSTFMT")

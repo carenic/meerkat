@@ -314,7 +314,9 @@ async fn lifecycle_contract_remove_emits_draining_then_applied_and_forced_action
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 async fn lifecycle_contract_failed_activation_uses_failed_phase_and_legacy_notice_projection() {
     let mut router = McpRouter::new();
-    router.stage_add(invalid_server_config("lifecycle-fail"));
+    router
+        .stage_add(invalid_server_config("lifecycle-fail"))
+        .expect("stage invalid server");
     let result = router
         .apply_staged()
         .await

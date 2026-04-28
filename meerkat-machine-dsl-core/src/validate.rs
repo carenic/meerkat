@@ -4,6 +4,15 @@ use syn::Error;
 
 use crate::ast::*;
 
+const NATIVE_MOB_MACHINE_HELPERS: &[&str] = &[
+    "mob_machine_frame_node_status_after_admit",
+    "mob_machine_frame_ready_queue_after_admit",
+    "mob_machine_frame_node_status_after_terminal",
+    "mob_machine_frame_ready_queue_after_terminal",
+    "mob_machine_node_terminal",
+    "mob_machine_step_status_from_frame_node_status",
+];
+
 /// Validate the parsed machine definition for semantic correctness.
 ///
 /// Checks all cross-references between blocks, ensuring the DSL definition
@@ -308,7 +317,10 @@ fn validate_expr(
             }
         }
         ExprDef::Call { helper, .. } => {
-            if !helpers.contains(&helper.to_string()) {
+            let helper_name = helper.to_string();
+            if !helpers.contains(&helper_name)
+                && !NATIVE_MOB_MACHINE_HELPERS.contains(&helper_name.as_str())
+            {
                 errors.push(Error::new(
                     helper.span(),
                     format!("unknown helper `{helper}`"),

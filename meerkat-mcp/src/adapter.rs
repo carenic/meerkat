@@ -2,12 +2,19 @@
 
 use async_trait::async_trait;
 use meerkat_core::error::ToolError;
-use meerkat_core::handles::McpServerLifecycleHandle;
+use meerkat_core::handles::{
+    DslTransitionError, ExternalToolSurfaceHandle, ExternalToolSurfaceInput,
+    ExternalToolSurfaceTransition, McpServerLifecycleHandle, SurfaceDiagnosticSnapshot,
+    SurfaceSnapshot,
+};
 use meerkat_core::{
-    ExternalToolDelta, ExternalToolSurfaceSnapshot, ExternalToolUpdate, ToolCallView,
-    ToolCatalogCapabilities, ToolCatalogEntry, ToolDef, ToolResult, agent::AgentToolDispatcher,
+    ExternalToolDelta, ExternalToolSurfaceBaseState, ExternalToolSurfaceDeltaOperation,
+    ExternalToolSurfaceEntrySnapshot, ExternalToolSurfacePendingOp, ExternalToolSurfaceSnapshot,
+    ExternalToolSurfaceStagedOp, ExternalToolUpdate, ToolCallView, ToolCatalogCapabilities,
+    ToolCatalogEntry, ToolDef, ToolResult, agent::AgentToolDispatcher,
 };
 use serde_json::Value;
+use std::collections::BTreeSet;
 use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -35,6 +42,203 @@ pub struct McpRouterAdapter {
     /// trait method can write into it without acquiring the async router
     /// lock.
     mcp_lifecycle_handle: Arc<StdRwLock<Option<Arc<dyn McpServerLifecycleHandle>>>>,
+    /// Shared handle slot for the external-tool surface DSL owner. Standalone
+    /// routers start with a local compatibility handle; runtime-backed session
+    /// builds replace it with the session-owned handle through this slot.
+    external_surface_handle: Option<Arc<StdRwLock<Arc<dyn ExternalToolSurfaceHandle>>>>,
+}
+
+struct PoisonedExternalToolSurfaceHandle {
+    reason: String,
+    snapshot: SurfaceDiagnosticSnapshot,
+}
+
+impl PoisonedExternalToolSurfaceHandle {
+    fn new(reason: String, snapshot: ExternalToolSurfaceSnapshot) -> Self {
+        let entries = snapshot
+            .entries
+            .into_iter()
+            .map(|entry| SurfaceSnapshot {
+                surface_id: entry.surface_id,
+                base_state: Some(entry.base_state),
+                pending_op: entry.pending_op,
+                staged_op: entry.staged_op,
+                staged_intent_sequence: Some(entry.staged_intent_sequence),
+                pending_task_sequence: Some(entry.pending_task_sequence),
+                pending_lineage_sequence: Some(entry.pending_lineage_sequence),
+                inflight_calls: entry.inflight_call_count,
+                last_delta_operation: Some(entry.last_delta_operation),
+                last_delta_phase: Some(entry.last_delta_phase),
+                removal_draining_since_ms: None,
+                removal_timeout_at_ms: None,
+                removal_applied_at_turn: None,
+            })
+            .collect::<Vec<_>>();
+        let known_surfaces = entries
+            .iter()
+            .map(|entry| entry.surface_id.clone())
+            .collect::<BTreeSet<_>>();
+        let visible_surfaces = entries
+            .iter()
+            .filter(|entry| matches!(entry.base_state, Some(ExternalToolSurfaceBaseState::Active)))
+            .map(|entry| entry.surface_id.clone())
+            .collect::<BTreeSet<_>>();
+        let has_pending_or_staged = entries.iter().any(|entry| {
+            entry.pending_op != ExternalToolSurfacePendingOp::None
+                || entry.staged_op != ExternalToolSurfaceStagedOp::None
+        });
+        Self {
+            reason,
+            snapshot: SurfaceDiagnosticSnapshot {
+                surface_phase: snapshot.phase,
+                known_surfaces,
+                visible_surfaces,
+                snapshot_epoch: snapshot.snapshot_epoch,
+                snapshot_aligned_epoch: snapshot.snapshot_aligned_epoch,
+                has_pending_or_staged,
+                entries,
+            },
+        }
+    }
+
+    fn reject(&self, context: &'static str) -> DslTransitionError {
+        DslTransitionError::guard_rejected(
+            context,
+            format!(
+                "external tool surface handle bind failed; surface is poisoned: {}",
+                self.reason
+            ),
+        )
+    }
+}
+
+impl ExternalToolSurfaceHandle for PoisonedExternalToolSurfaceHandle {
+    fn apply_surface_input(
+        &self,
+        _input: ExternalToolSurfaceInput,
+    ) -> Result<ExternalToolSurfaceTransition, DslTransitionError> {
+        Err(self.reject("PoisonedExternalToolSurfaceHandle::apply_surface_input"))
+    }
+
+    fn register(&self, _surface_id: String) -> Result<(), DslTransitionError> {
+        Err(self.reject("PoisonedExternalToolSurfaceHandle::register"))
+    }
+
+    fn stage_add(&self, _surface_id: String, _now_ms: u64) -> Result<(), DslTransitionError> {
+        Err(self.reject("PoisonedExternalToolSurfaceHandle::stage_add"))
+    }
+
+    fn stage_remove(&self, _surface_id: String, _now_ms: u64) -> Result<(), DslTransitionError> {
+        Err(self.reject("PoisonedExternalToolSurfaceHandle::stage_remove"))
+    }
+
+    fn stage_reload(&self, _surface_id: String, _now_ms: u64) -> Result<(), DslTransitionError> {
+        Err(self.reject("PoisonedExternalToolSurfaceHandle::stage_reload"))
+    }
+
+    fn apply_boundary(
+        &self,
+        _surface_id: String,
+        _now_ms: u64,
+        _staged_intent_sequence: u64,
+        _applied_at_turn: u64,
+    ) -> Result<(), DslTransitionError> {
+        Err(self.reject("PoisonedExternalToolSurfaceHandle::apply_boundary"))
+    }
+
+    fn mark_pending_succeeded(
+        &self,
+        _surface_id: String,
+        _pending_task_sequence: u64,
+        _staged_intent_sequence: u64,
+    ) -> Result<(), DslTransitionError> {
+        Err(self.reject("PoisonedExternalToolSurfaceHandle::mark_pending_succeeded"))
+    }
+
+    fn mark_pending_failed(
+        &self,
+        _surface_id: String,
+        _pending_task_sequence: u64,
+        _staged_intent_sequence: u64,
+        _reason: String,
+    ) -> Result<(), DslTransitionError> {
+        Err(self.reject("PoisonedExternalToolSurfaceHandle::mark_pending_failed"))
+    }
+
+    fn call_started(&self, _surface_id: String) -> Result<(), DslTransitionError> {
+        Err(self.reject("PoisonedExternalToolSurfaceHandle::call_started"))
+    }
+
+    fn call_finished(&self, _surface_id: String) -> Result<(), DslTransitionError> {
+        Err(self.reject("PoisonedExternalToolSurfaceHandle::call_finished"))
+    }
+
+    fn finalize_removal_clean(&self, _surface_id: String) -> Result<(), DslTransitionError> {
+        Err(self.reject("PoisonedExternalToolSurfaceHandle::finalize_removal_clean"))
+    }
+
+    fn finalize_removal_forced(&self, _surface_id: String) -> Result<(), DslTransitionError> {
+        Err(self.reject("PoisonedExternalToolSurfaceHandle::finalize_removal_forced"))
+    }
+
+    fn snapshot_aligned(&self, _epoch: u64) -> Result<(), DslTransitionError> {
+        Err(self.reject("PoisonedExternalToolSurfaceHandle::snapshot_aligned"))
+    }
+
+    fn shutdown_surface(&self) -> Result<(), DslTransitionError> {
+        Err(self.reject("PoisonedExternalToolSurfaceHandle::shutdown_surface"))
+    }
+
+    fn surface_snapshot(&self, surface_id: &str) -> Option<SurfaceSnapshot> {
+        self.snapshot
+            .entries
+            .iter()
+            .find(|entry| entry.surface_id == surface_id)
+            .cloned()
+    }
+
+    fn diagnostic_snapshot(&self) -> SurfaceDiagnosticSnapshot {
+        self.snapshot.clone()
+    }
+
+    fn visible_surfaces(&self) -> BTreeSet<String> {
+        self.snapshot.visible_surfaces.clone()
+    }
+
+    fn removing_surfaces(&self) -> BTreeSet<String> {
+        self.snapshot
+            .entries
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.base_state,
+                    Some(ExternalToolSurfaceBaseState::Removing)
+                )
+            })
+            .map(|entry| entry.surface_id.clone())
+            .collect()
+    }
+
+    fn pending_surfaces(&self) -> BTreeSet<String> {
+        self.snapshot
+            .entries
+            .iter()
+            .filter(|entry| entry.pending_op != ExternalToolSurfacePendingOp::None)
+            .map(|entry| entry.surface_id.clone())
+            .collect()
+    }
+
+    fn has_pending_or_staged(&self) -> bool {
+        self.snapshot.has_pending_or_staged
+    }
+
+    fn snapshot_epoch(&self) -> u64 {
+        self.snapshot.snapshot_epoch
+    }
+
+    fn snapshot_aligned_epoch(&self) -> u64 {
+        self.snapshot.snapshot_aligned_epoch
+    }
 }
 
 impl McpRouterAdapter {
@@ -45,6 +249,7 @@ impl McpRouterAdapter {
         let pending_sources: Arc<[String]> = router.pending_sources_snapshot().into();
         let surface_snapshot = McpRouter::external_tool_surface_snapshot(&router);
         let mcp_lifecycle_handle = router.mcp_lifecycle_handle_slot();
+        let external_surface_handle = router.external_surface_handle_slot();
         Self {
             router: AsyncRwLock::new(Some(router)),
             has_pending: AtomicBool::new(has_pending),
@@ -53,6 +258,7 @@ impl McpRouterAdapter {
             pending_sources_cache: StdRwLock::new(pending_sources),
             surface_snapshot_cache: StdRwLock::new(Some(surface_snapshot)),
             mcp_lifecycle_handle,
+            external_surface_handle,
         }
     }
 
@@ -166,7 +372,9 @@ impl McpRouterAdapter {
         let router = router
             .as_mut()
             .ok_or_else(|| "MCP router has been shut down".to_string())?;
-        router.stage_add(config);
+        router
+            .stage_add(config)
+            .map_err(|error| error.to_string())?;
         self.sync_router_projection(router);
         Ok(())
     }
@@ -177,7 +385,9 @@ impl McpRouterAdapter {
         let router = router
             .as_mut()
             .ok_or_else(|| "MCP router has been shut down".to_string())?;
-        router.stage_remove(server_name);
+        router
+            .stage_remove(server_name)
+            .map_err(|error| error.to_string())?;
         self.sync_router_projection(router);
         Ok(())
     }
@@ -197,7 +407,9 @@ impl McpRouterAdapter {
         let router = router
             .as_mut()
             .ok_or_else(|| "MCP router has been shut down".to_string())?;
-        router.stage_reload(target);
+        router
+            .stage_reload(target)
+            .map_err(|error| error.to_string())?;
         self.sync_router_projection(router);
         Ok(())
     }
@@ -273,7 +485,7 @@ impl McpRouterAdapter {
         all_notices
     }
 
-    /// Test helper for cross-crate runtime integration tests.
+    /// Test helper for cross-crate lifecycle integration tests.
     pub async fn set_inflight_calls_for_testing(
         &self,
         server_name: &str,
@@ -300,6 +512,178 @@ impl McpRouterAdapter {
         router.set_removal_timeout(removal_timeout);
         self.sync_router_projection(router);
         Ok(())
+    }
+    fn transfer_pre_bind_external_surface_state(
+        handle: &dyn ExternalToolSurfaceHandle,
+        snapshot: &ExternalToolSurfaceSnapshot,
+    ) -> Result<(), DslTransitionError> {
+        let mut entries = snapshot.entries.clone();
+        entries.sort_by(|left, right| {
+            left.staged_intent_sequence
+                .cmp(&right.staged_intent_sequence)
+                .then_with(|| left.surface_id.cmp(&right.surface_id))
+        });
+        for entry in &entries {
+            Self::transfer_pre_bind_surface_entry(handle, entry)?;
+        }
+        if snapshot.phase == meerkat_core::ExternalToolSurfaceGlobalPhase::Shutdown {
+            handle.shutdown_surface()?;
+        }
+        Ok(())
+    }
+
+    fn transfer_pre_bind_surface_entry(
+        handle: &dyn ExternalToolSurfaceHandle,
+        entry: &ExternalToolSurfaceEntrySnapshot,
+    ) -> Result<(), DslTransitionError> {
+        match entry.pending_op {
+            ExternalToolSurfacePendingOp::Add => {
+                Self::replay_pending_surface_operation(
+                    handle,
+                    entry,
+                    ExternalToolSurfaceDeltaOperation::Add,
+                )?;
+            }
+            ExternalToolSurfacePendingOp::Reload => {
+                Self::ensure_pre_bind_surface_active(handle, entry)?;
+                Self::replay_pending_surface_operation(
+                    handle,
+                    entry,
+                    ExternalToolSurfaceDeltaOperation::Reload,
+                )?;
+            }
+            ExternalToolSurfacePendingOp::None => match entry.base_state {
+                ExternalToolSurfaceBaseState::Active => {
+                    Self::ensure_pre_bind_surface_active(handle, entry)?;
+                }
+                ExternalToolSurfaceBaseState::Removing => {
+                    Self::ensure_pre_bind_surface_removing(handle, entry)?;
+                }
+                ExternalToolSurfaceBaseState::Absent | ExternalToolSurfaceBaseState::Removed => {}
+            },
+        }
+
+        if entry.pending_op == ExternalToolSurfacePendingOp::None {
+            Self::replay_pre_bind_staged_intent(handle, entry)?;
+        }
+
+        for _ in 0..entry.inflight_call_count {
+            handle.call_started(entry.surface_id.clone())?;
+        }
+
+        Ok(())
+    }
+
+    fn ensure_pre_bind_surface_active(
+        handle: &dyn ExternalToolSurfaceHandle,
+        entry: &ExternalToolSurfaceEntrySnapshot,
+    ) -> Result<(), DslTransitionError> {
+        if matches!(
+            handle
+                .surface_snapshot(&entry.surface_id)
+                .and_then(|snapshot| snapshot.base_state),
+            Some(ExternalToolSurfaceBaseState::Active | ExternalToolSurfaceBaseState::Removing)
+        ) {
+            return Ok(());
+        }
+
+        handle.stage_add(entry.surface_id.clone(), 0)?;
+        let staged_intent_sequence = Self::current_staged_sequence(handle, &entry.surface_id);
+        handle.apply_boundary(
+            entry.surface_id.clone(),
+            0,
+            staged_intent_sequence,
+            staged_intent_sequence,
+        )?;
+        let pending_task_sequence = Self::current_pending_task_sequence(handle, &entry.surface_id);
+        handle.mark_pending_succeeded(
+            entry.surface_id.clone(),
+            pending_task_sequence,
+            staged_intent_sequence,
+        )
+    }
+
+    fn ensure_pre_bind_surface_removing(
+        handle: &dyn ExternalToolSurfaceHandle,
+        entry: &ExternalToolSurfaceEntrySnapshot,
+    ) -> Result<(), DslTransitionError> {
+        if matches!(
+            handle
+                .surface_snapshot(&entry.surface_id)
+                .and_then(|snapshot| snapshot.base_state),
+            Some(ExternalToolSurfaceBaseState::Removing)
+        ) {
+            return Ok(());
+        }
+        Self::ensure_pre_bind_surface_active(handle, entry)?;
+        handle.stage_remove(entry.surface_id.clone(), 0)?;
+        let staged_intent_sequence = Self::current_staged_sequence(handle, &entry.surface_id);
+        handle.apply_boundary(
+            entry.surface_id.clone(),
+            0,
+            staged_intent_sequence,
+            staged_intent_sequence,
+        )
+    }
+
+    fn replay_pending_surface_operation(
+        handle: &dyn ExternalToolSurfaceHandle,
+        entry: &ExternalToolSurfaceEntrySnapshot,
+        operation: ExternalToolSurfaceDeltaOperation,
+    ) -> Result<(), DslTransitionError> {
+        match operation {
+            ExternalToolSurfaceDeltaOperation::Add => {
+                handle.stage_add(entry.surface_id.clone(), 0)?;
+            }
+            ExternalToolSurfaceDeltaOperation::Reload => {
+                handle.stage_reload(entry.surface_id.clone(), 0)?;
+            }
+            ExternalToolSurfaceDeltaOperation::Remove | ExternalToolSurfaceDeltaOperation::None => {
+                return Ok(());
+            }
+        }
+        let staged_intent_sequence = Self::current_staged_sequence(handle, &entry.surface_id);
+        handle.apply_boundary(
+            entry.surface_id.clone(),
+            0,
+            staged_intent_sequence,
+            entry.staged_intent_sequence,
+        )
+    }
+
+    fn replay_pre_bind_staged_intent(
+        handle: &dyn ExternalToolSurfaceHandle,
+        entry: &ExternalToolSurfaceEntrySnapshot,
+    ) -> Result<(), DslTransitionError> {
+        match entry.staged_op {
+            ExternalToolSurfaceStagedOp::Add => handle.stage_add(entry.surface_id.clone(), 0),
+            ExternalToolSurfaceStagedOp::Remove => {
+                Self::ensure_pre_bind_surface_active(handle, entry)?;
+                handle.stage_remove(entry.surface_id.clone(), 0)
+            }
+            ExternalToolSurfaceStagedOp::Reload => {
+                Self::ensure_pre_bind_surface_active(handle, entry)?;
+                handle.stage_reload(entry.surface_id.clone(), 0)
+            }
+            ExternalToolSurfaceStagedOp::None => Ok(()),
+        }
+    }
+
+    fn current_staged_sequence(handle: &dyn ExternalToolSurfaceHandle, surface_id: &str) -> u64 {
+        handle
+            .surface_snapshot(surface_id)
+            .and_then(|snapshot| snapshot.staged_intent_sequence)
+            .unwrap_or(0)
+    }
+
+    fn current_pending_task_sequence(
+        handle: &dyn ExternalToolSurfaceHandle,
+        surface_id: &str,
+    ) -> u64 {
+        handle
+            .surface_snapshot(surface_id)
+            .and_then(|snapshot| snapshot.pending_task_sequence)
+            .unwrap_or(0)
     }
 }
 
@@ -427,6 +811,50 @@ impl AgentToolDispatcher for McpRouterAdapter {
         };
         *slot = Some(handle);
     }
+
+    fn bind_external_tool_surface_handle(&self, handle: Arc<dyn ExternalToolSurfaceHandle>) {
+        let Some(slot) = &self.external_surface_handle else {
+            return;
+        };
+        let current = match slot.read() {
+            Ok(slot) => Arc::clone(&*slot),
+            Err(poisoned) => {
+                tracing::warn!(
+                    "McpRouterAdapter external_surface_handle RwLock poisoned during bind read; recovering"
+                );
+                let slot = poisoned.into_inner();
+                Arc::clone(&*slot)
+            }
+        };
+        if Arc::ptr_eq(&current, &handle) {
+            return;
+        }
+        let mut poisoned_handle = None;
+        if let Some(snapshot) = self.cached_surface_snapshot()
+            && let Err(error) =
+                Self::transfer_pre_bind_external_surface_state(handle.as_ref(), &snapshot)
+        {
+            let error = error.to_string();
+            tracing::warn!(
+                error = %error,
+                "failed to transfer pre-bind external surface state into session handle; poisoning surface owner"
+            );
+            poisoned_handle = Some(
+                Arc::new(PoisonedExternalToolSurfaceHandle::new(error, snapshot))
+                    as Arc<dyn ExternalToolSurfaceHandle>,
+            );
+        }
+        let mut guard = match slot.write() {
+            Ok(slot) => slot,
+            Err(poisoned) => {
+                tracing::warn!(
+                    "McpRouterAdapter external_surface_handle RwLock poisoned; recovering"
+                );
+                poisoned.into_inner()
+            }
+        };
+        *guard = poisoned_handle.unwrap_or(handle);
+    }
 }
 
 #[cfg(test)]
@@ -435,6 +863,8 @@ mod tests {
     use super::*;
     use crate::McpRouter;
     use crate::connection::McpConnection;
+    use crate::router::CompatExternalToolSurfaceHandle;
+    use meerkat_core::ExternalToolSurfacePendingOp;
     use std::collections::HashMap;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
@@ -482,6 +912,166 @@ mod tests {
         )
     }
 
+    struct RejectingExternalToolSurfaceHandle;
+
+    impl RejectingExternalToolSurfaceHandle {
+        fn reject(context: &'static str) -> DslTransitionError {
+            DslTransitionError::guard_rejected(context, "injected bind failure")
+        }
+    }
+
+    impl ExternalToolSurfaceHandle for RejectingExternalToolSurfaceHandle {
+        fn apply_surface_input(
+            &self,
+            _input: ExternalToolSurfaceInput,
+        ) -> Result<ExternalToolSurfaceTransition, DslTransitionError> {
+            Err(Self::reject(
+                "RejectingExternalToolSurfaceHandle::apply_surface_input",
+            ))
+        }
+
+        fn register(&self, _surface_id: String) -> Result<(), DslTransitionError> {
+            Err(Self::reject("RejectingExternalToolSurfaceHandle::register"))
+        }
+
+        fn stage_add(&self, _surface_id: String, _now_ms: u64) -> Result<(), DslTransitionError> {
+            Err(Self::reject(
+                "RejectingExternalToolSurfaceHandle::stage_add",
+            ))
+        }
+
+        fn stage_remove(
+            &self,
+            _surface_id: String,
+            _now_ms: u64,
+        ) -> Result<(), DslTransitionError> {
+            Err(Self::reject(
+                "RejectingExternalToolSurfaceHandle::stage_remove",
+            ))
+        }
+
+        fn stage_reload(
+            &self,
+            _surface_id: String,
+            _now_ms: u64,
+        ) -> Result<(), DslTransitionError> {
+            Err(Self::reject(
+                "RejectingExternalToolSurfaceHandle::stage_reload",
+            ))
+        }
+
+        fn apply_boundary(
+            &self,
+            _surface_id: String,
+            _now_ms: u64,
+            _staged_intent_sequence: u64,
+            _applied_at_turn: u64,
+        ) -> Result<(), DslTransitionError> {
+            Err(Self::reject(
+                "RejectingExternalToolSurfaceHandle::apply_boundary",
+            ))
+        }
+
+        fn mark_pending_succeeded(
+            &self,
+            _surface_id: String,
+            _pending_task_sequence: u64,
+            _staged_intent_sequence: u64,
+        ) -> Result<(), DslTransitionError> {
+            Err(Self::reject(
+                "RejectingExternalToolSurfaceHandle::mark_pending_succeeded",
+            ))
+        }
+
+        fn mark_pending_failed(
+            &self,
+            _surface_id: String,
+            _pending_task_sequence: u64,
+            _staged_intent_sequence: u64,
+            _reason: String,
+        ) -> Result<(), DslTransitionError> {
+            Err(Self::reject(
+                "RejectingExternalToolSurfaceHandle::mark_pending_failed",
+            ))
+        }
+
+        fn call_started(&self, _surface_id: String) -> Result<(), DslTransitionError> {
+            Err(Self::reject(
+                "RejectingExternalToolSurfaceHandle::call_started",
+            ))
+        }
+
+        fn call_finished(&self, _surface_id: String) -> Result<(), DslTransitionError> {
+            Err(Self::reject(
+                "RejectingExternalToolSurfaceHandle::call_finished",
+            ))
+        }
+
+        fn finalize_removal_clean(&self, _surface_id: String) -> Result<(), DslTransitionError> {
+            Err(Self::reject(
+                "RejectingExternalToolSurfaceHandle::finalize_removal_clean",
+            ))
+        }
+
+        fn finalize_removal_forced(&self, _surface_id: String) -> Result<(), DslTransitionError> {
+            Err(Self::reject(
+                "RejectingExternalToolSurfaceHandle::finalize_removal_forced",
+            ))
+        }
+
+        fn snapshot_aligned(&self, _epoch: u64) -> Result<(), DslTransitionError> {
+            Err(Self::reject(
+                "RejectingExternalToolSurfaceHandle::snapshot_aligned",
+            ))
+        }
+
+        fn shutdown_surface(&self) -> Result<(), DslTransitionError> {
+            Err(Self::reject(
+                "RejectingExternalToolSurfaceHandle::shutdown_surface",
+            ))
+        }
+
+        fn surface_snapshot(&self, _surface_id: &str) -> Option<SurfaceSnapshot> {
+            None
+        }
+
+        fn diagnostic_snapshot(&self) -> SurfaceDiagnosticSnapshot {
+            SurfaceDiagnosticSnapshot {
+                surface_phase: meerkat_core::ExternalToolSurfaceGlobalPhase::Operating,
+                known_surfaces: BTreeSet::new(),
+                visible_surfaces: BTreeSet::new(),
+                snapshot_epoch: 0,
+                snapshot_aligned_epoch: 0,
+                has_pending_or_staged: false,
+                entries: Vec::new(),
+            }
+        }
+
+        fn visible_surfaces(&self) -> BTreeSet<String> {
+            BTreeSet::new()
+        }
+
+        fn removing_surfaces(&self) -> BTreeSet<String> {
+            BTreeSet::new()
+        }
+
+        fn pending_surfaces(&self) -> BTreeSet<String> {
+            BTreeSet::new()
+        }
+
+        fn has_pending_or_staged(&self) -> bool {
+            false
+        }
+
+        fn snapshot_epoch(&self) -> u64 {
+            0
+        }
+
+        fn snapshot_aligned_epoch(&self) -> u64 {
+            0
+        }
+    }
+
     #[tokio::test]
     async fn empty_adapter_reports_exact_catalog_support() {
         let adapter = McpRouterAdapter::new(McpRouter::new());
@@ -490,6 +1080,107 @@ mod tests {
             "empty MCP adapters should preserve exact deferred catalogs on other tool planes"
         );
         assert!(adapter.tools().is_empty());
+    }
+
+    #[tokio::test]
+    async fn adapter_bind_external_surface_handle_replays_staged_router_state() {
+        let mut router = McpRouter::new();
+        router
+            .stage_add(meerkat_core::McpServerConfig::stdio(
+                "planner",
+                "/bin/echo",
+                Vec::<String>::new(),
+                HashMap::new(),
+            ))
+            .expect("stage planner");
+        let adapter = McpRouterAdapter::new(router);
+        let handle: Arc<dyn ExternalToolSurfaceHandle> = Arc::new(
+            CompatExternalToolSurfaceHandle::new(Duration::from_secs(30)),
+        );
+
+        adapter.bind_external_tool_surface_handle(Arc::clone(&handle));
+        adapter.apply_staged().await.expect("apply staged");
+
+        let snapshot = handle
+            .surface_snapshot("planner")
+            .expect("planner surface snapshot");
+        assert_eq!(snapshot.pending_op, ExternalToolSurfacePendingOp::Add);
+        assert_eq!(snapshot.pending_task_sequence, Some(1));
+        assert_eq!(snapshot.pending_lineage_sequence, Some(1));
+    }
+
+    #[tokio::test]
+    async fn adapter_bind_external_surface_handle_failure_poisons_existing_owner() {
+        let mut router = McpRouter::new();
+        router
+            .stage_add(meerkat_core::McpServerConfig::stdio(
+                "planner",
+                "/bin/echo",
+                Vec::<String>::new(),
+                HashMap::new(),
+            ))
+            .expect("stage planner");
+        let adapter = McpRouterAdapter::new(router);
+        let rejecting_handle: Arc<dyn ExternalToolSurfaceHandle> =
+            Arc::new(RejectingExternalToolSurfaceHandle);
+
+        adapter.bind_external_tool_surface_handle(rejecting_handle);
+
+        let error = adapter
+            .stage_add(meerkat_core::McpServerConfig::stdio(
+                "writer",
+                "/bin/echo",
+                Vec::<String>::new(),
+                HashMap::new(),
+            ))
+            .await
+            .expect_err("poisoned bind should fail future surface mutation");
+        assert!(
+            error.contains("surface is poisoned"),
+            "expected poisoned surface error, got {error}"
+        );
+
+        let snapshot = adapter
+            .external_tool_surface_snapshot()
+            .expect("poisoned adapter preserves diagnostic snapshot");
+        assert_eq!(snapshot.entries.len(), 1);
+        assert_eq!(snapshot.entries[0].surface_id, "planner");
+    }
+
+    #[tokio::test]
+    async fn adapter_bind_external_surface_handle_replays_pending_router_state() {
+        let Some(server_path) = skip_if_no_test_server() else {
+            return;
+        };
+        let mut router = McpRouter::new();
+        router
+            .stage_add(test_server_config("late-bind-pending", &server_path))
+            .expect("stage server");
+        router
+            .apply_staged()
+            .await
+            .expect("apply staged before bind");
+
+        let adapter = McpRouterAdapter::new(router);
+        let handle: Arc<dyn ExternalToolSurfaceHandle> = Arc::new(
+            CompatExternalToolSurfaceHandle::new(Duration::from_secs(30)),
+        );
+
+        adapter.bind_external_tool_surface_handle(Arc::clone(&handle));
+        adapter.wait_until_ready(async_connect_test_timeout()).await;
+
+        let snapshot = handle
+            .surface_snapshot("late-bind-pending")
+            .expect("late-bound surface snapshot");
+        assert_eq!(
+            snapshot.base_state,
+            Some(ExternalToolSurfaceBaseState::Active)
+        );
+        assert_eq!(snapshot.pending_op, ExternalToolSurfacePendingOp::None);
+        assert!(
+            handle.visible_surfaces().contains("late-bind-pending"),
+            "pending completion should land on the late-bound surface owner"
+        );
     }
 
     // Mock handle used to observe Phase 5G / T5g MCP server lifecycle events
@@ -578,7 +1269,7 @@ mod tests {
             Vec::<String>::new(),
             HashMap::new(),
         );
-        router.stage_add(cfg);
+        router.stage_add(cfg).expect("stage add");
 
         let events = handle.events();
         assert_eq!(
@@ -594,7 +1285,9 @@ mod tests {
             return;
         };
         let mut router = McpRouter::new();
-        router.stage_add(test_server_config("srv-beta", &server_path));
+        router
+            .stage_add(test_server_config("srv-beta", &server_path))
+            .expect("stage add");
         // Simulate the CLI flow: stage_add + apply_staged run before the
         // agent-factory bind happens. After apply_staged, pending_sources
         // reflects the in-flight background connect tasks.
@@ -621,17 +1314,47 @@ mod tests {
 
     #[tokio::test]
     async fn router_lifecycle_handle_none_is_noop() {
-        // Standalone router without a bound handle: every lifecycle seam
-        // must still function (no panic, no fatal error).
-        let mut router = McpRouter::new();
+        // Router without a bound MCP lifecycle mirror: external surface
+        // lifecycle still flows through its owner, while mirror notifications
+        // remain no-ops.
+        let handle: Arc<dyn ExternalToolSurfaceHandle> = Arc::new(
+            CompatExternalToolSurfaceHandle::new(Duration::from_secs(30)),
+        );
+        handle
+            .stage_add("srv-standalone".to_string(), 0)
+            .expect("seed stage add");
+        let staged_sequence = handle
+            .surface_snapshot("srv-standalone")
+            .and_then(|snapshot| snapshot.staged_intent_sequence)
+            .expect("seed staged sequence");
+        handle
+            .apply_boundary(
+                "srv-standalone".to_string(),
+                0,
+                staged_sequence,
+                staged_sequence,
+            )
+            .expect("seed apply boundary");
+        let pending_sequence = handle
+            .surface_snapshot("srv-standalone")
+            .and_then(|snapshot| snapshot.pending_task_sequence)
+            .expect("seed pending sequence");
+        handle
+            .mark_pending_succeeded(
+                "srv-standalone".to_string(),
+                pending_sequence,
+                staged_sequence,
+            )
+            .expect("seed active surface");
+        let mut router = McpRouter::new_with_surface_handle(handle);
         let cfg = meerkat_core::McpServerConfig::stdio(
             "srv-standalone",
             "/bin/echo",
             Vec::<String>::new(),
             HashMap::new(),
         );
-        router.stage_add(cfg);
-        router.stage_reload("srv-standalone");
+        router.stage_add(cfg).expect("stage add");
+        router.stage_reload("srv-standalone").expect("stage reload");
         // Nothing panicked; standalone path remains intact.
     }
 
@@ -658,7 +1381,9 @@ mod tests {
         };
 
         let mut router = McpRouter::new();
-        router.stage_add(test_server_config("test-srv", &server_path));
+        router
+            .stage_add(test_server_config("test-srv", &server_path))
+            .expect("stage add");
         router.apply_staged().await.expect("apply staged");
 
         let adapter = McpRouterAdapter::new(router);
@@ -734,7 +1459,9 @@ mod tests {
     #[tokio::test]
     async fn external_tool_surface_snapshot_reflects_staged_surface_state() {
         let mut router = McpRouter::new();
-        router.stage_add(test_server_config("planner", Path::new("/bin/echo")));
+        router
+            .stage_add(test_server_config("planner", Path::new("/bin/echo")))
+            .expect("stage add");
 
         let adapter = McpRouterAdapter::new(router);
         let snapshot = adapter

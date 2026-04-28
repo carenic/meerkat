@@ -11,6 +11,18 @@ fn meerkat_semantic_model_keeps_internal_session_transport_domain() {
     assert!(rendered.contains(
         "PrepareBindingsInitializing(agent_runtime_id, fence_token, generation, arg_session_id) =="
     ));
+    assert!(rendered.contains("MapIncrement(map, key, amount) == [x \\in DOMAIN map \\cup {key}"));
+    assert!(
+        !rendered
+            .contains("IF \"value\" \\in DOMAIN (IF surface_id \\in DOMAIN surface_base_state"),
+        "enum map value projections should not render DOMAIN checks against scalar enum values"
+    );
+    assert!(
+        !rendered.contains(
+            "IF \"value\" \\in DOMAIN (IF surface_id \\in DOMAIN surface_staged_intent_sequence"
+        ),
+        "integer map value projections should not render DOMAIN checks against scalar values"
+    );
     assert!(!rendered.contains("MeerkatIdValues"));
 }
 

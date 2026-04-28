@@ -87,7 +87,6 @@ pub mod path;
 mod pending_spawn_lineage;
 mod provision_guard;
 mod provisioner;
-pub mod pump;
 pub mod reconcile;
 pub mod recovery;
 mod roster_authority;
@@ -133,7 +132,6 @@ pub use handle::{
     WorkDeliveryReceipt,
 };
 use pending_spawn_lineage::{PendingSpawnInsertImpact, PendingSpawnLineage};
-pub use pump::{SchedulerGrant, pump_schedulers_to_exhaustion};
 pub use reconcile::{
     EnsureMemberOutcome, MemberFilter, ReconcileFailure, ReconcileOptions, ReconcileReport,
     ReconcileStage,

@@ -1,5 +1,6 @@
 use super::*;
 use crate::MobRuntimeMode;
+use crate::machines::mob_machine as mob_dsl;
 use crate::mob_machine::{MobMachineCommand, MobMachineCommandResult};
 use crate::roster::MobMemberKickoffSnapshot;
 #[cfg(test)]
@@ -1123,7 +1124,7 @@ impl MobHandle {
                 Ok(MobMachineCommandResult::EnsureMember(outcome))
             }
             MobMachineCommand::Reconcile { desired, options } => {
-                let report = self.handle_reconcile(desired, options).await;
+                let report = self.handle_reconcile(desired, options).await?;
                 Ok(MobMachineCommandResult::Reconcile(Box::new(report)))
             }
             MobMachineCommand::ListMembersMatching { filter } => {
@@ -1418,7 +1419,7 @@ impl MobHandle {
             }
             MobMachineCommand::SetSpawnPolicy { policy } => {
                 self.send_actor_command(|reply_tx| MobCommand::SetSpawnPolicy { policy, reply_tx })
-                    .await?;
+                    .await??;
                 Ok(MobMachineCommandResult::Unit)
             }
             MobMachineCommand::Shutdown => {
@@ -2228,6 +2229,10 @@ impl MobHandle {
         spec: SpawnMemberSpec,
     ) -> Result<EnsureMemberOutcome, MobError> {
         let identity = spec.identity.clone();
+        self.project_machine_input(mob_dsl::MobMachineInput::EnsureMember {
+            agent_identity: mob_dsl::AgentIdentity::from_domain(&identity),
+        })
+        .await?;
         // `Box::pin` breaks the compiler-visible recursion:
         // handle_ensure_member -> spawn_spec -> execute_machine_command ->
         // (MobMachineCommand::Spawn arm, which never re-enters this fn).
@@ -2263,7 +2268,16 @@ impl MobHandle {
         &self,
         desired: Vec<SpawnMemberSpec>,
         options: ReconcileOptions,
-    ) -> ReconcileReport {
+    ) -> Result<ReconcileReport, MobError> {
+        self.project_machine_input(mob_dsl::MobMachineInput::Reconcile {
+            desired: desired
+                .iter()
+                .map(|spec| mob_dsl::AgentIdentity::from_domain(&spec.identity))
+                .collect(),
+            retire_stale: options.retire_stale,
+        })
+        .await?;
+
         let mut report = ReconcileReport {
             desired: desired.iter().map(|spec| spec.identity.clone()).collect(),
             ..ReconcileReport::default()
@@ -2306,7 +2320,7 @@ impl MobHandle {
             }
         }
 
-        report
+        Ok(report)
     }
 
     /// Core `list_members_matching` worker invoked by
@@ -3528,12 +3542,30 @@ impl MobHandle {
     pub(crate) async fn project_machine_input(
         &self,
         input: crate::machines::mob_machine::MobMachineInput,
-    ) -> Result<(), MobError> {
+    ) -> Result<crate::machines::mob_machine::MobMachineState, MobError> {
         self.send_actor_command(|reply_tx| MobCommand::ProjectMachineInput {
             input: Box::new(input),
             reply_tx,
         })
         .await?
+    }
+
+    pub(crate) async fn preview_machine_input(
+        &self,
+        input: crate::machines::mob_machine::MobMachineInput,
+    ) -> Result<crate::machines::mob_machine::MobMachineState, MobError> {
+        self.send_actor_command(|reply_tx| MobCommand::PreviewMachineInput {
+            input: Box::new(input),
+            reply_tx,
+        })
+        .await?
+    }
+
+    pub(crate) async fn query_machine_state(
+        &self,
+    ) -> Result<crate::machines::mob_machine::MobMachineState, MobError> {
+        self.send_actor_command(|reply_tx| MobCommand::QueryMachineState { reply_tx })
+            .await
     }
 }
 

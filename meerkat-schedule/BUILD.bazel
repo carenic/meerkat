@@ -108,6 +108,36 @@ rust_test(
     ),
 )
 
+rust_library(
+    name = "meerkat_schedule_machine_schema_exports",
+    aliases = aliases(package_name = "meerkat-schedule"),
+    crate_name = "meerkat_schedule",
+    crate_root = "src/lib.rs",
+    crate_features = [
+        "machine-schema-exports",
+        "schema",
+    ],
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//meerkat-machine-codegen:__pkg__"],
+    proc_macro_deps = [
+        "//meerkat-machine-dsl:meerkat_machine_dsl",
+    ] + all_crate_deps(
+        package_name = "meerkat-schedule",
+        proc_macro = True,
+    ),
+    deps = [
+        "//meerkat-core:meerkat_core",
+        "//meerkat-machine-schema:meerkat_machine_schema",
+    ] + all_crate_deps(
+        package_name = "meerkat-schedule",
+        normal = True,
+    ),
+)
+
 test_suite(
     name = "fast_tests",
     tests = [

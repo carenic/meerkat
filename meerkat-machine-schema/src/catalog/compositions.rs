@@ -770,7 +770,7 @@ fn mob_bundle_composition() -> CompositionSchema {
                 effect_variant: ev_id("WaitAllSatisfied"),
                 realizing_actor: act_id("ops_lifecycle_owner"),
                 correlation_fields: vec![fld_id("operation_ids")],
-            obligation_fields: vec![fld_id("wait_request_id"), fld_id("operation_ids")],
+            obligation_fields: vec![fld_id("operation_ids")],
                 allowed_feedback_inputs: vec![FeedbackInputRef {
                     machine_instance: mi_id("meerkat"),
                     input_variant: iv_id("OpsBarrierSatisfied"),
@@ -797,9 +797,7 @@ fn mob_bundle_composition() -> CompositionSchema {
                 generation_mode: ProtocolGenerationMode::HandleBridge,
                 required_imports: vec![
                     "use crate::handles::{DslTransitionError, TurnStateHandle};".into(),
-                    "use crate::lifecycle::identifiers::WaitRequestId;".into(),
-                    "use crate::ops::OperationId;".into(),
-                    "use crate::ops_lifecycle::WaitAllSatisfied;".into(),
+                    "use crate::OperationId;".into(),
                 ],
                 authority_type_path: None,
                 mutator_trait_path: None,
@@ -808,7 +806,7 @@ fn mob_bundle_composition() -> CompositionSchema {
                 transition_type_path: None,
                 error_type_path: None,
                 executor_trigger_input_variant: None,
-                bridge_source_type_path: Some("crate::ops_lifecycle::WaitAllSatisfied".into()),
+                bridge_source_type_path: None,
                 helper_return_shape: ProtocolHelperReturnShape::Obligations,
                 handle_trait_path: Some("meerkat_core::handles::TurnStateHandle".into()),
                 handle_feedback_bindings: vec![HandleBridgeFeedbackBinding {
@@ -866,10 +864,6 @@ fn mob_bundle_composition() -> CompositionSchema {
 /// - `surface_snapshot_alignment` — EffectExtractor + HandleBridge
 ///   (`snapshot_aligned`). Same shape, single field.
 fn external_tool_bundle_composition() -> CompositionSchema {
-    // Handle takes `String` surface_id; obligation carries typed SurfaceId.
-    let mut surface_id_accessor = BTreeMap::new();
-    surface_id_accessor.insert(fld_id("surface_id"), ".0".into());
-
     CompositionSchema {
         name: comp_id("external_tool_bundle"),
         machines: vec![MachineInstance {
@@ -900,7 +894,7 @@ fn external_tool_bundle_composition() -> CompositionSchema {
                 allowed_feedback_inputs: vec![
                     FeedbackInputRef {
                         machine_instance: mi_id("meerkat"),
-                        input_variant: iv_id("PendingSucceeded"),
+                        input_variant: iv_id("SurfaceMarkPendingSucceeded"),
                         field_bindings: vec![
                             FeedbackFieldBinding {
                                 input_field: fld_id("surface_id"),
@@ -918,7 +912,7 @@ fn external_tool_bundle_composition() -> CompositionSchema {
                     },
                     FeedbackInputRef {
                         machine_instance: mi_id("meerkat"),
-                        input_variant: iv_id("PendingFailed"),
+                        input_variant: iv_id("SurfaceMarkPendingFailed"),
                         field_bindings: vec![
                             FeedbackFieldBinding {
                                 input_field: fld_id("surface_id"),
@@ -927,6 +921,10 @@ fn external_tool_bundle_composition() -> CompositionSchema {
                             FeedbackFieldBinding {
                                 input_field: fld_id("pending_task_sequence"),
                                 source: FeedbackFieldSource::ObligationField(fld_id("pending_task_sequence")),
+                            },
+                            FeedbackFieldBinding {
+                                input_field: fld_id("staged_intent_sequence"),
+                                source: FeedbackFieldSource::ObligationField(fld_id("staged_intent_sequence")),
                             },
                             FeedbackFieldBinding {
                                 input_field: fld_id("reason"),
@@ -943,8 +941,8 @@ fn external_tool_bundle_composition() -> CompositionSchema {
                     module_path: "meerkat-mcp/src/generated/protocol_surface_completion.rs".into(),
                     generation_mode: ProtocolGenerationMode::EffectExtractor,
                     required_imports: vec![
-                        "use crate::external_tool_surface_authority::{ExternalToolSurfaceEffect, SurfaceDeltaOperation, SurfaceId, TurnNumber};".into(),
-                        "use meerkat_core::handles::{DslTransitionError, ExternalToolSurfaceHandle};".into(),
+                        "use meerkat_core::handles::{DslTransitionError, ExternalToolSurfaceEffect, ExternalToolSurfaceHandle};".into(),
+                        "use meerkat_core::tool_scope::ExternalToolSurfaceDeltaOperation;".into(),
                     ],
                     // No authority submitters; feedback flows through the
                     // handle only. EffectExtractor emits `extract_obligations`
@@ -953,7 +951,7 @@ fn external_tool_bundle_composition() -> CompositionSchema {
                     mutator_trait_path: None,
                     input_enum_path: None,
                     effect_enum_path: Some(
-                        "crate::external_tool_surface_authority::ExternalToolSurfaceEffect".into(),
+                        "meerkat_core::handles::ExternalToolSurfaceEffect".into(),
                     ),
                     transition_type_path: None,
                     error_type_path: None,
@@ -965,9 +963,9 @@ fn external_tool_bundle_composition() -> CompositionSchema {
                     ),
                     handle_feedback_bindings: vec![
                         HandleBridgeFeedbackBinding {
-                            input_variant: iv_id("PendingSucceeded"),
+                            input_variant: iv_id("SurfaceMarkPendingSucceeded"),
                             method_name: "mark_pending_succeeded".into(),
-                            arg_accessors: surface_id_accessor.clone(),
+                            arg_accessors: BTreeMap::new(),
                             forwarded_fields: Some(vec![
                                 fld_id("surface_id"),
                                 fld_id("pending_task_sequence"),
@@ -975,10 +973,15 @@ fn external_tool_bundle_composition() -> CompositionSchema {
                             ]),
                         },
                         HandleBridgeFeedbackBinding {
-                            input_variant: iv_id("PendingFailed"),
+                            input_variant: iv_id("SurfaceMarkPendingFailed"),
                             method_name: "mark_pending_failed".into(),
-                            arg_accessors: surface_id_accessor,
-                            forwarded_fields: Some(vec![fld_id("surface_id"), fld_id("reason")]),
+                            arg_accessors: BTreeMap::new(),
+                            forwarded_fields: Some(vec![
+                                fld_id("surface_id"),
+                                fld_id("pending_task_sequence"),
+                                fld_id("staged_intent_sequence"),
+                                fld_id("reason"),
+                            ]),
                         },
                     ],
                     input_payload_module_path: None,
@@ -995,9 +998,9 @@ fn external_tool_bundle_composition() -> CompositionSchema {
                 obligation_fields: vec![fld_id("snapshot_epoch")],
                 allowed_feedback_inputs: vec![FeedbackInputRef {
                     machine_instance: mi_id("meerkat"),
-                    input_variant: iv_id("SnapshotAligned"),
+                    input_variant: iv_id("SurfaceSnapshotAligned"),
                     field_bindings: vec![FeedbackFieldBinding {
-                        input_field: fld_id("snapshot_epoch"),
+                        input_field: fld_id("epoch"),
                         source: FeedbackFieldSource::ObligationField(fld_id("snapshot_epoch")),
                     }],
                 }],
@@ -1010,14 +1013,13 @@ fn external_tool_bundle_composition() -> CompositionSchema {
                         "meerkat-mcp/src/generated/protocol_surface_snapshot_alignment.rs".into(),
                     generation_mode: ProtocolGenerationMode::EffectExtractor,
                     required_imports: vec![
-                        "use crate::external_tool_surface_authority::ExternalToolSurfaceEffect;".into(),
-                        "use meerkat_core::handles::{DslTransitionError, ExternalToolSurfaceHandle};".into(),
+                        "use meerkat_core::handles::{DslTransitionError, ExternalToolSurfaceEffect, ExternalToolSurfaceHandle};".into(),
                     ],
                     authority_type_path: None,
                     mutator_trait_path: None,
                     input_enum_path: None,
                     effect_enum_path: Some(
-                        "crate::external_tool_surface_authority::ExternalToolSurfaceEffect".into(),
+                        "meerkat_core::handles::ExternalToolSurfaceEffect".into(),
                     ),
                     transition_type_path: None,
                     error_type_path: None,
@@ -1028,7 +1030,7 @@ fn external_tool_bundle_composition() -> CompositionSchema {
                         "meerkat_core::handles::ExternalToolSurfaceHandle".into(),
                     ),
                     handle_feedback_bindings: vec![HandleBridgeFeedbackBinding {
-                        input_variant: iv_id("SnapshotAligned"),
+                        input_variant: iv_id("SurfaceSnapshotAligned"),
                         method_name: "snapshot_aligned".into(),
                         arg_accessors: BTreeMap::new(),
                         forwarded_fields: Some(vec![fld_id("snapshot_epoch")]),
@@ -1422,8 +1424,7 @@ fn mob_destroy_session_ingress_bundle_composition() -> CompositionSchema {
                         .into(),
                 generation_mode: ProtocolGenerationMode::EffectExtractor,
                 required_imports: vec![
-                    "use crate::runtime::actor::MobDestroySessionIngressBridgeEffect;".into(),
-                    "use crate::machines::mob_machine::{AgentRuntimeId, MobId, MobMachineAuthority, MobMachineInput, MobMachineMutator, MobMachineTransition, MobMachineTransitionError};".into(),
+                    "use crate::machines::mob_machine::{AgentRuntimeId, MobId, MobMachineAuthority, MobMachineEffect, MobMachineInput, MobMachineMutator, MobMachineTransition, MobMachineTransitionError};".into(),
                 ],
                 authority_type_path: Some(
                     "crate::machines::mob_machine::dsl::MobMachineAuthority".into(),
@@ -1435,7 +1436,7 @@ fn mob_destroy_session_ingress_bundle_composition() -> CompositionSchema {
                     "crate::machines::mob_machine::dsl::MobMachineInput".into(),
                 ),
                 effect_enum_path: Some(
-                    "crate::runtime::actor::MobDestroySessionIngressBridgeEffect".into(),
+                    "crate::machines::mob_machine::dsl::MobMachineEffect".into(),
                 ),
                 transition_type_path: Some(
                     "crate::machines::mob_machine::dsl::MobMachineTransition".into(),
@@ -1444,9 +1445,7 @@ fn mob_destroy_session_ingress_bundle_composition() -> CompositionSchema {
                     "crate::machines::mob_machine::dsl::MobMachineTransitionError".into(),
                 ),
                 executor_trigger_input_variant: None,
-                bridge_source_type_path: Some(
-                    "crate::runtime::actor::MobDestroySessionIngressBridgeEffect".into(),
-                ),
+                bridge_source_type_path: None,
                 helper_return_shape: ProtocolHelperReturnShape::Obligations,
                 handle_trait_path: None,
                 handle_feedback_bindings: vec![],

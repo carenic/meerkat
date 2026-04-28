@@ -1,233 +1,406 @@
-mod source {
-    #![allow(dead_code, clippy::expect_used, clippy::assign_op_pattern)]
-    use meerkat_machine_dsl::machine;
-
-    machine! {
-        machine ScheduleLifecycleMachine {
-            version: 1,
-            rust: "meerkat-schedule" / "machines::schedule_lifecycle",
-
-            state {
-                lifecycle_phase: ScheduleLifecycleState,
-                revision: u64,
-                trigger_key: String,
-                target_binding_key: String,
-                misfire_policy: Enum<MisfirePolicy>,
-                overlap_policy: Enum<OverlapPolicy>,
-                missing_target_policy: Enum<MissingTargetPolicy>,
-                planning_cursor_utc_ms: Option<u64>,
-                next_occurrence_ordinal: u64,
-            }
-
-            init(Active) {
-                revision = 1,
-                trigger_key = "trigger-0",
-                target_binding_key = "target-0",
-                misfire_policy = MisfirePolicy::Skip,
-                overlap_policy = OverlapPolicy::SkipIfRunning,
-                missing_target_policy = MissingTargetPolicy::MarkMisfired,
-                planning_cursor_utc_ms = None,
-                next_occurrence_ordinal = 0,
-            }
-
-            terminal [Deleted]
-
-            phase ScheduleLifecycleState {
-                Active,
-                Paused,
-                Deleted,
-            }
-
-            input ScheduleLifecycleInput {
-                Create {
-                    trigger_key: String,
-                    target_binding_key: String,
-                    misfire_policy: Enum<MisfirePolicy>,
-                    overlap_policy: Enum<OverlapPolicy>,
-                    missing_target_policy: Enum<MissingTargetPolicy>,
-                },
-                Revise {
-                    trigger_key: String,
-                    target_binding_key: String,
-                    misfire_policy: Enum<MisfirePolicy>,
-                    overlap_policy: Enum<OverlapPolicy>,
-                    missing_target_policy: Enum<MissingTargetPolicy>,
-                },
-                RecordPlanningWindow {
-                    planning_cursor_utc_ms: u64,
-                    next_occurrence_ordinal: u64,
-                },
-                Pause { at_utc_ms: u64 },
-                Resume { at_utc_ms: u64 },
-                Delete { at_utc_ms: u64 },
-            }
-
-            effect ScheduleLifecycleEffect {
-                EmitScheduleNotice { new_state: ScheduleLifecycleState, revision: u64 },
-                SupersedePendingOccurrences { superseding_revision: u64 },
-                PlanningWindowRecorded { planning_cursor_utc_ms: u64, next_occurrence_ordinal: u64 },
-            }
-
-            invariant revision_is_positive {
-                self.revision > 0
-            }
-
-            invariant deleted_has_no_planning_cursor {
-                self.lifecycle_phase != Phase::Deleted || self.planning_cursor_utc_ms == None
-            }
-
-            invariant planning_cursor_requires_occurrence_progress {
-                self.planning_cursor_utc_ms == None || self.next_occurrence_ordinal > 0
-            }
-
-            disposition EmitScheduleNotice => external,
-            disposition SupersedePendingOccurrences => routed [OccurrenceLifecycleMachine],
-            disposition PlanningWindowRecorded => local,
-
-            // --- Create (only from Active, self-loop) ---
-
-            transition CreateSchedule {
-                on input Create { trigger_key, target_binding_key, misfire_policy, overlap_policy, missing_target_policy }
-                guard { self.lifecycle_phase == Phase::Active }
-                update {
-                    self.trigger_key = trigger_key;
-                    self.target_binding_key = target_binding_key;
-                    self.misfire_policy = misfire_policy;
-                    self.overlap_policy = overlap_policy;
-                    self.missing_target_policy = missing_target_policy;
-                }
-                to Active
-                emit EmitScheduleNotice { new_state: self.lifecycle_phase, revision: self.revision }
-            }
-
-            // --- Revise (per-phase, bumps revision) ---
-
-            transition ReviseActive {
-                on input Revise { trigger_key, target_binding_key, misfire_policy, overlap_policy, missing_target_policy }
-                guard { self.lifecycle_phase == Phase::Active }
-                update {
-                    self.trigger_key = trigger_key;
-                    self.target_binding_key = target_binding_key;
-                    self.misfire_policy = misfire_policy;
-                    self.overlap_policy = overlap_policy;
-                    self.missing_target_policy = missing_target_policy;
-                    self.revision += 1;
-                    self.planning_cursor_utc_ms = None;
-                }
-                to Active
-                emit EmitScheduleNotice { new_state: self.lifecycle_phase, revision: self.revision }
-                emit SupersedePendingOccurrences { superseding_revision: self.revision }
-            }
-
-            transition RevisePaused {
-                on input Revise { trigger_key, target_binding_key, misfire_policy, overlap_policy, missing_target_policy }
-                guard { self.lifecycle_phase == Phase::Paused }
-                update {
-                    self.trigger_key = trigger_key;
-                    self.target_binding_key = target_binding_key;
-                    self.misfire_policy = misfire_policy;
-                    self.overlap_policy = overlap_policy;
-                    self.missing_target_policy = missing_target_policy;
-                    self.revision += 1;
-                    self.planning_cursor_utc_ms = None;
-                }
-                to Paused
-                emit EmitScheduleNotice { new_state: self.lifecycle_phase, revision: self.revision }
-                emit SupersedePendingOccurrences { superseding_revision: self.revision }
-            }
-
-            // --- Record planning window (per-phase, with guard) ---
-
-            transition RecordPlanningWindowActive {
-                on input RecordPlanningWindow { planning_cursor_utc_ms, next_occurrence_ordinal }
-                guard "planning_window_advances_ordinal" { self.lifecycle_phase == Phase::Active && next_occurrence_ordinal > 0 }
-                update {
-                    self.planning_cursor_utc_ms = Some(planning_cursor_utc_ms);
-                    self.next_occurrence_ordinal = next_occurrence_ordinal;
-                }
-                to Active
-                emit EmitScheduleNotice { new_state: self.lifecycle_phase, revision: self.revision }
-                emit PlanningWindowRecorded { planning_cursor_utc_ms: planning_cursor_utc_ms, next_occurrence_ordinal: next_occurrence_ordinal }
-            }
-
-            // NB: no `RecordPlanningWindowPaused` — planning only advances while
-            // the schedule is Active. Paused schedules MUST reject
-            // `RecordPlanningWindow` as an invalid transition; this closes the
-            // race where a driver tick could race with `Pause` and silently
-            // advance the planning cursor against a paused schedule.
-
-            // --- Pause / Resume (from Active or Paused) ---
-
-            transition PauseActiveOrPaused {
-                on input Pause { at_utc_ms }
-                guard { self.lifecycle_phase == Phase::Active || self.lifecycle_phase == Phase::Paused }
-                guard "pause_timestamp_present" { at_utc_ms == at_utc_ms }
-                update {}
-                to Paused
-                emit EmitScheduleNotice { new_state: self.lifecycle_phase, revision: self.revision }
-            }
-
-            transition ResumeActiveOrPaused {
-                on input Resume { at_utc_ms }
-                guard { self.lifecycle_phase == Phase::Active || self.lifecycle_phase == Phase::Paused }
-                guard "resume_timestamp_present" { at_utc_ms == at_utc_ms }
-                update {}
-                to Active
-                emit EmitScheduleNotice { new_state: self.lifecycle_phase, revision: self.revision }
-            }
-
-            // --- Delete (per-phase, bumps revision) ---
-
-            transition DeleteActive {
-                on input Delete { at_utc_ms }
-                guard { self.lifecycle_phase == Phase::Active }
-                guard "delete_timestamp_present" { at_utc_ms == at_utc_ms }
-                update {
-                    self.revision += 1;
-                    self.planning_cursor_utc_ms = None;
-                }
-                to Deleted
-                emit EmitScheduleNotice { new_state: self.lifecycle_phase, revision: self.revision }
-                emit SupersedePendingOccurrences { superseding_revision: self.revision }
-            }
-
-            transition DeletePaused {
-                on input Delete { at_utc_ms }
-                guard { self.lifecycle_phase == Phase::Paused }
-                guard "delete_timestamp_present" { at_utc_ms == at_utc_ms }
-                update {
-                    self.revision += 1;
-                    self.planning_cursor_utc_ms = None;
-                }
-                to Deleted
-                emit EmitScheduleNotice { new_state: self.lifecycle_phase, revision: self.revision }
-                emit SupersedePendingOccurrences { superseding_revision: self.revision }
-            }
-        }
-    }
-
-    // DSL proxy types — must match the real policy enums 1:1
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum MisfirePolicy {
-        Skip,
-        CatchUpWithin,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum OverlapPolicy {
-        AllowConcurrent,
-        SkipIfRunning,
-    }
-
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    pub enum MissingTargetPolicy {
-        Skip,
-        MarkMisfired,
-    }
-}
-pub use source::*;
+// @generated — Generated by `cargo xtask machine-codegen --all`.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::implicit_clone,
+    clippy::unnecessary_cast,
+    clippy::redundant_clone
+)]
 
 pub fn schema() -> meerkat_machine_schema::MachineSchema {
     meerkat_machine_schema::catalog::dsl::dsl_schedule_lifecycle_machine()
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct OccurrenceId(pub String);
+impl From<String> for OccurrenceId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for OccurrenceId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for OccurrenceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct ScheduleLifecycleState(pub String);
+impl From<String> for ScheduleLifecycleState {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for ScheduleLifecycleState {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for ScheduleLifecycleState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum MisfirePolicy {
+    #[default]
+    Skip,
+    CatchUpWithin,
+}
+impl MisfirePolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Skip => "Skip",
+            Self::CatchUpWithin => "CatchUpWithin",
+        }
+    }
+}
+impl std::fmt::Display for MisfirePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum MissingTargetPolicy {
+    #[default]
+    MarkMisfired,
+    Skip,
+}
+impl MissingTargetPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::MarkMisfired => "MarkMisfired",
+            Self::Skip => "Skip",
+        }
+    }
+}
+impl std::fmt::Display for MissingTargetPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum OverlapPolicy {
+    #[default]
+    AllowConcurrent,
+    SkipIfRunning,
+}
+impl OverlapPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AllowConcurrent => "AllowConcurrent",
+            Self::SkipIfRunning => "SkipIfRunning",
+        }
+    }
+}
+impl std::fmt::Display for OverlapPolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+pub trait Context {}
+pub struct EmptyContext;
+impl Context for EmptyContext {}
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Phase {
+    Active,
+    Paused,
+    Deleted,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct State {
+    pub phase: Phase,
+    pub revision: u64,
+    pub trigger_key: String,
+    pub target_binding_key: String,
+    pub misfire_policy: MisfirePolicy,
+    pub overlap_policy: OverlapPolicy,
+    pub missing_target_policy: MissingTargetPolicy,
+    pub planning_cursor_utc_ms: Option<u64>,
+    pub next_occurrence_ordinal: u64,
+    pub superseded_ack_ids: std::collections::BTreeSet<OccurrenceId>,
+}
+impl Default for State {
+    fn default() -> Self {
+        initial_state()
+    }
+}
+
+pub mod inputs {
+    #[allow(unused_imports)]
+    use super::*;
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Create {
+        pub trigger_key: String,
+        pub target_binding_key: String,
+        pub misfire_policy: MisfirePolicy,
+        pub overlap_policy: OverlapPolicy,
+        pub missing_target_policy: MissingTargetPolicy,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Revise {
+        pub trigger_key: String,
+        pub target_binding_key: String,
+        pub misfire_policy: MisfirePolicy,
+        pub overlap_policy: OverlapPolicy,
+        pub missing_target_policy: MissingTargetPolicy,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RecordPlanningWindow {
+        pub planning_cursor_utc_ms: u64,
+        pub next_occurrence_ordinal: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Pause {
+        pub at_utc_ms: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Resume {
+        pub at_utc_ms: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Delete {
+        pub at_utc_ms: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ConfirmOccurrencesSuperseded {
+        pub occurrence_id: OccurrenceId,
+        pub superseding_revision: u64,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Input {
+    Create(inputs::Create),
+    Revise(inputs::Revise),
+    RecordPlanningWindow(inputs::RecordPlanningWindow),
+    Pause(inputs::Pause),
+    Resume(inputs::Resume),
+    Delete(inputs::Delete),
+    ConfirmOccurrencesSuperseded(inputs::ConfirmOccurrencesSuperseded),
+}
+impl Input {
+    pub fn kind(&self) -> InputKind {
+        match self {
+            Self::Create(_) => InputKind::Create,
+            Self::Revise(_) => InputKind::Revise,
+            Self::RecordPlanningWindow(_) => InputKind::RecordPlanningWindow,
+            Self::Pause(_) => InputKind::Pause,
+            Self::Resume(_) => InputKind::Resume,
+            Self::Delete(_) => InputKind::Delete,
+            Self::ConfirmOccurrencesSuperseded(_) => InputKind::ConfirmOccurrencesSuperseded,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum InputKind {
+    Create,
+    Revise,
+    RecordPlanningWindow,
+    Pause,
+    Resume,
+    Delete,
+    ConfirmOccurrencesSuperseded,
+}
+
+pub mod effects {
+    #[allow(unused_imports)]
+    use super::*;
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct EmitScheduleNotice {
+        pub new_state: ScheduleLifecycleState,
+        pub revision: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct SupersedePendingOccurrences {
+        pub superseding_revision: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct PlanningWindowRecorded {
+        pub planning_cursor_utc_ms: u64,
+        pub next_occurrence_ordinal: u64,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Effect {
+    EmitScheduleNotice(effects::EmitScheduleNotice),
+    SupersedePendingOccurrences(effects::SupersedePendingOccurrences),
+    PlanningWindowRecorded(effects::PlanningWindowRecorded),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EffectKind {
+    EmitScheduleNotice,
+    SupersedePendingOccurrences,
+    PlanningWindowRecorded,
+}
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TransitionId {
+    CreateSchedule,
+    ReviseActive,
+    RevisePaused,
+    RecordPlanningWindowActive,
+    PauseActiveOrPaused,
+    ResumeActiveOrPaused,
+    DeleteActive,
+    DeletePaused,
+    DeleteDeleted,
+    ConfirmOccurrencesSupersededActive,
+    ConfirmOccurrencesSupersededPaused,
+    ConfirmOccurrencesSupersededDeleted,
+}
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum GuardId {
+    None,
+}
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum HelperId {
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GuardRejection {
+    pub transition_id: TransitionId,
+    pub guard_id: GuardId,
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TriggerDiscriminant {
+    Input(InputKind),
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TransitionRefusal {
+    NoMatchingTransition {
+        phase: Phase,
+        trigger: TriggerDiscriminant,
+    },
+    GuardRejected {
+        rejections: Vec<GuardRejection>,
+    },
+    AmbiguousTransition {
+        transitions: Vec<TransitionId>,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum KernelError {
+    ContextViolation {
+        transition_id: TransitionId,
+        detail: String,
+    },
+    HelperEvaluation {
+        helper_id: HelperId,
+        detail: String,
+    },
+    CodegenInvariant {
+        detail: String,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TransitionError {
+    Refusal(TransitionRefusal),
+    Kernel(KernelError),
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Outcome {
+    pub transition_id: TransitionId,
+    pub next_state: State,
+    pub effects: Vec<Effect>,
+}
+
+pub mod helpers {
+    #[allow(unused_imports)]
+    use super::*;
+    pub fn none<C: Context>(_: &State, context: &C) -> Result<(), KernelError> {
+        let _ = context;
+        Ok(())
+    }
+}
+
+pub fn initial_state() -> State {
+    State {
+        phase: Phase::Active,
+        revision: 0,
+        trigger_key: String::new(),
+        target_binding_key: String::new(),
+        misfire_policy: MisfirePolicy::Skip,
+        overlap_policy: OverlapPolicy::AllowConcurrent,
+        missing_target_policy: MissingTargetPolicy::MarkMisfired,
+        planning_cursor_utc_ms: None,
+        next_occurrence_ordinal: 0,
+        superseded_ack_ids: Default::default(),
+    }
 }

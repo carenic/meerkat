@@ -4,10 +4,9 @@
 // Liveness: eventual feedback: the mob destroy path awaits each session's DetachIngress ack before requesting runtime destroy
 
 use crate::machines::mob_machine::{
-    AgentRuntimeId, MobId, MobMachineAuthority, MobMachineInput, MobMachineMutator,
-    MobMachineTransition, MobMachineTransitionError,
+    AgentRuntimeId, MobId, MobMachineAuthority, MobMachineEffect, MobMachineInput,
+    MobMachineMutator, MobMachineTransition, MobMachineTransitionError,
 };
-use crate::runtime::actor::MobDestroySessionIngressBridgeEffect;
 
 #[derive(Debug, Clone)]
 pub struct MobDestroyingSessionIngressObligation {
@@ -16,12 +15,12 @@ pub struct MobDestroyingSessionIngressObligation {
 }
 
 pub fn extract_obligations(
-    effects: &[MobDestroySessionIngressBridgeEffect],
+    effects: &[MobMachineEffect],
 ) -> Vec<MobDestroyingSessionIngressObligation> {
     effects
         .iter()
         .filter_map(|effect| match effect {
-            MobDestroySessionIngressBridgeEffect::RequestSessionIngressDetachForMobDestroy {
+            MobMachineEffect::RequestSessionIngressDetachForMobDestroy {
                 mob_id,
                 agent_runtime_id,
             } => Some(MobDestroyingSessionIngressObligation {

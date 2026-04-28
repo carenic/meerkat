@@ -36,6 +36,7 @@ sse-stream = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util", "macros"] }
+meerkat-runtime = { workspace = true }
 
 [package.metadata.cargo-machete]
 ignored = ["serde"]  # proc macro (derive)

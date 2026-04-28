@@ -3933,7 +3933,13 @@ impl SessionRuntime {
         session_id: SessionId,
         mut build_config: AgentBuildConfig,
     ) -> Result<AgentBuildConfig, RpcError> {
-        let adapter = Arc::new(McpRouterAdapter::new(McpRouter::new()));
+        let router = match &build_config.runtime_build_mode {
+            meerkat_core::RuntimeBuildMode::SessionOwned(bindings) => {
+                McpRouter::new_with_surface_handle(Arc::clone(&bindings.external_tool_surface))
+            }
+            meerkat_core::RuntimeBuildMode::StandaloneEphemeral => McpRouter::new(),
+        };
+        let adapter = Arc::new(McpRouterAdapter::new(router));
         let adapter_dispatcher: Arc<dyn AgentToolDispatcher> = adapter.clone();
         let combined = match build_config.external_tools.clone() {
             Some(existing) => Arc::new(

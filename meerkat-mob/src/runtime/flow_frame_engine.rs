@@ -1,5 +1,5 @@
-//! FlowFrameEngine: drives a frame-backed flow through the scheduler-owned
-//! admission, execution, and terminalization cycle.
+//! FlowFrameEngine: drives a frame-backed flow through MobMachine-authorized
+//! frame scheduling, execution, and terminalization mechanics.
 //!
 //! This executor handles:
 //! - Step nodes: delegates async work to `FrameStepExecutor` and projects the
@@ -10,8 +10,12 @@
 use crate::definition::{FlowNodeSpec, FrameSpec};
 use crate::error::MobError;
 use crate::ids::{FlowNodeId, FrameId, LoopId, LoopInstanceId, RunId, StepId};
+use crate::machines::mob_machine as mob_dsl;
 use crate::run::{
-    FlowContext, FrameSnapshot, LoopIterationLedgerEntry, LoopSnapshot, MobRun, StepRunStatus,
+    FlowContext, FrameSnapshot, LoopIterationLedgerEntry, LoopSnapshot,
+    MobMachineFlowAuthorityToken, MobMachineFlowFrameCommand, MobMachineFlowRunCommand,
+    MobMachineLoopIterationCommand, MobRun, StepRunStatus, apply_mob_machine_flow_frame_command,
+    apply_mob_machine_flow_run_command, apply_mob_machine_loop_iteration_command,
 };
 use crate::run::{flow_frame, flow_run, loop_iteration};
 use crate::runtime::MobHandle;
@@ -38,27 +42,59 @@ pub enum FrameStepResult {
     Skipped,
     /// Step failed for a step-local reason; the frame should fail this node
     /// but continue admitting unrelated siblings.
-    Failed,
+    Failed {
+        reason: String,
+        failure_ledger_recorded: bool,
+    },
 }
 
 /// Canonical outcome of executing a frame subtree.
 #[derive(Debug)]
 pub struct FrameExecutionOutcome {
     pub outputs: IndexMap<StepId, serde_json::Value>,
-    pub step_statuses: IndexMap<StepId, StepRunStatus>,
-    pub root_phase: FlowFrameTerminalPhase,
+    pub step_projections: IndexMap<StepId, FrameStepProjection>,
+    pub step_failures: IndexMap<StepId, FrameStepFailureProjection>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FrameStepProjection {
+    pub frame_id: FrameId,
+    pub node_id: FlowNodeId,
+    pub step_id: StepId,
+    pub step_status: StepRunStatus,
+}
+
+#[derive(Debug, Clone)]
+pub struct FrameStepFailureProjection {
+    pub reason: String,
+    pub append_failure_ledger: bool,
 }
 
 #[derive(Debug, Clone)]
 struct PreviewedNodeGrant {
     frame_id: FrameId,
     next_run_state: flow_run::State,
+    machine_input: mob_dsl::MobMachineInput,
 }
 
 #[derive(Debug, Clone)]
 struct PreviewedBodyFrameGrant {
     loop_instance_id: LoopInstanceId,
     next_run_state: flow_run::State,
+    machine_input: mob_dsl::MobMachineInput,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FrameDepthLimit {
+    current_depth: u32,
+    max_depth: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct FrameSeedConfirmation<'a> {
+    frame_scope: crate::machines::mob_machine::FrameScope,
+    loop_instance_id: Option<&'a LoopInstanceId>,
+    iteration: u32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,6 +107,7 @@ pub enum FlowFrameTerminalPhase {
 #[derive(Debug, Clone)]
 pub enum FlowFrameLoopStorePlan {
     GrantNodeSlot {
+        machine_inputs: Vec<mob_dsl::MobMachineInput>,
         expected_run_state: flow_run::State,
         next_run_state: flow_run::State,
         frame_id: FrameId,
@@ -78,6 +115,7 @@ pub enum FlowFrameLoopStorePlan {
         next_frame: FrameSnapshot,
     },
     StartLoop {
+        machine_inputs: Vec<mob_dsl::MobMachineInput>,
         loop_instance_id: LoopInstanceId,
         expected_run_state: flow_run::State,
         next_run_state: flow_run::State,
@@ -87,6 +125,7 @@ pub enum FlowFrameLoopStorePlan {
         initial_loop: LoopSnapshot,
     },
     GrantBodyFrameStart {
+        machine_inputs: Vec<mob_dsl::MobMachineInput>,
         loop_instance_id: LoopInstanceId,
         expected_loop: LoopSnapshot,
         next_loop: LoopSnapshot,
@@ -97,15 +136,18 @@ pub enum FlowFrameLoopStorePlan {
         next_run_state: flow_run::State,
     },
     RunStateOnly {
+        machine_inputs: Vec<mob_dsl::MobMachineInput>,
         expected_run_state: flow_run::State,
         next_run_state: flow_run::State,
     },
     SealFrame {
+        machine_inputs: Vec<mob_dsl::MobMachineInput>,
         frame_id: FrameId,
         expected_frame: FrameSnapshot,
         next_frame: FrameSnapshot,
     },
     CompleteBodyFrame {
+        machine_inputs: Vec<mob_dsl::MobMachineInput>,
         loop_instance_id: LoopInstanceId,
         expected_loop: LoopSnapshot,
         next_loop: LoopSnapshot,
@@ -116,6 +158,7 @@ pub enum FlowFrameLoopStorePlan {
         next_run_state: flow_run::State,
     },
     LoopRequestBodyFrame {
+        machine_inputs: Vec<mob_dsl::MobMachineInput>,
         loop_instance_id: LoopInstanceId,
         expected_loop: LoopSnapshot,
         next_loop: LoopSnapshot,
@@ -123,6 +166,7 @@ pub enum FlowFrameLoopStorePlan {
         next_run_state: flow_run::State,
     },
     CompleteLoop {
+        machine_inputs: Vec<mob_dsl::MobMachineInput>,
         loop_instance_id: LoopInstanceId,
         expected_loop: LoopSnapshot,
         next_loop: LoopSnapshot,
@@ -300,11 +344,166 @@ pub trait FlowFrameMutator: sealed::Sealed {
 
 pub struct FlowFrameKernel {
     run_store: Arc<dyn MobRunStore>,
+    projector: MobHandle,
 }
 
 impl FlowFrameKernel {
-    pub fn new(run_store: Arc<dyn MobRunStore>) -> Self {
-        Self { run_store }
+    pub fn new(run_store: Arc<dyn MobRunStore>, projector: MobHandle) -> Self {
+        Self {
+            run_store,
+            projector,
+        }
+    }
+
+    async fn project_mob_machine_input(
+        &self,
+        input: mob_dsl::MobMachineInput,
+    ) -> Result<mob_dsl::MobMachineState, MobError> {
+        self.projector.project_machine_input(input).await
+    }
+
+    async fn preview_mob_machine_input(
+        &self,
+        input: mob_dsl::MobMachineInput,
+    ) -> Result<mob_dsl::MobMachineState, MobError> {
+        self.projector.preview_machine_input(input).await
+    }
+
+    async fn preview_mob_machine_inputs(
+        &self,
+        inputs: &[mob_dsl::MobMachineInput],
+    ) -> Result<mob_dsl::MobMachineState, MobError> {
+        let mut authority =
+            mob_dsl::MobMachineAuthority::from_state(self.current_mob_machine_state().await?);
+        for input in inputs {
+            let transition = mob_dsl::MobMachineMutator::apply(&mut authority, input.clone())
+                .map_err(|error| {
+                    MobError::Internal(format!(
+                        "MobMachine preview rejected staged input {input:?}: {error}"
+                    ))
+                })?;
+            if transition.from_phase != transition.to_phase {
+                authority.state.lifecycle_phase = transition.to_phase;
+            }
+        }
+        Ok(authority.state)
+    }
+
+    async fn commit_mob_machine_inputs(
+        &self,
+        inputs: &[mob_dsl::MobMachineInput],
+    ) -> Result<(), MobError> {
+        for input in inputs {
+            self.project_mob_machine_input(input.clone()).await?;
+        }
+        Ok(())
+    }
+
+    async fn current_mob_machine_state(&self) -> Result<mob_dsl::MobMachineState, MobError> {
+        self.projector.query_machine_state().await
+    }
+
+    async fn authorize_frame_command(
+        &self,
+        run_id: &RunId,
+        frame_id: &FrameId,
+        command: &MobMachineFlowFrameCommand,
+    ) -> Result<(MobMachineFlowAuthorityToken, mob_dsl::MobMachineState), MobError> {
+        let authority_input = self
+            .authority_input_for_frame_command(run_id, frame_id, command)
+            .await?;
+        let machine_state = self
+            .preview_mob_machine_input(authority_input.clone())
+            .await?;
+        validate_accepted_frame_command_witness(&authority_input, &machine_state)?;
+        let authority =
+            MobMachineFlowAuthorityToken::from_accepted_mob_machine_input(&authority_input)?;
+        Ok((authority, machine_state))
+    }
+
+    async fn confirm_frame_seed_from_snapshot(
+        &self,
+        run_id: &RunId,
+        frame_id: &FrameId,
+        snapshot: &FrameSnapshot,
+        spec: &FrameSpec,
+    ) -> Result<(), MobError> {
+        let iteration = u32::try_from(frame_iteration(&snapshot.kernel_state)?).map_err(|_| {
+            MobError::Internal(format!(
+                "frame '{frame_id}' iteration exceeds u32 during seed confirmation"
+            ))
+        })?;
+        let loop_instance_id = frame_loop_instance_id(&snapshot.kernel_state);
+        self.confirm_frame_seed(
+            run_id,
+            frame_id,
+            FrameSeedConfirmation {
+                frame_scope: machine_frame_scope(snapshot.kernel_state.frame_scope),
+                loop_instance_id: loop_instance_id.as_ref(),
+                iteration,
+            },
+            spec,
+            Some(&snapshot.kernel_state),
+        )
+        .await
+    }
+
+    async fn confirm_frame_seed(
+        &self,
+        run_id: &RunId,
+        frame_id: &FrameId,
+        seed: FrameSeedConfirmation<'_>,
+        spec: &FrameSpec,
+        existing: Option<&flow_frame::State>,
+    ) -> Result<(), MobError> {
+        let ordered = topological_order(spec)?;
+        let seed_input = crate::run::MobRun::create_frame_seed_input(
+            run_id,
+            frame_id,
+            seed.loop_instance_id,
+            seed.iteration,
+            seed.frame_scope,
+            spec,
+            &ordered,
+        )?;
+        if let Some(existing) = existing {
+            let current_machine_state = self.current_mob_machine_state().await?;
+            if current_machine_state
+                .frame_phase
+                .contains_key(&mob_dsl::FrameId::from(frame_id.as_str()))
+            {
+                validate_seed_confirmation_matches_snapshot(
+                    frame_id,
+                    existing,
+                    &current_machine_state,
+                )?;
+                return Ok(());
+            }
+        }
+        match self.project_mob_machine_input(seed_input).await {
+            Ok(machine_state) => {
+                if let Some(existing) = existing {
+                    validate_seed_confirmation_matches_snapshot(
+                        frame_id,
+                        existing,
+                        &machine_state,
+                    )?;
+                }
+                Ok(())
+            }
+            Err(error) if mob_machine_seed_already_confirmed(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn authority_input_for_frame_command(
+        &self,
+        run_id: &RunId,
+        frame_id: &FrameId,
+        command: &MobMachineFlowFrameCommand,
+    ) -> Result<mob_dsl::MobMachineInput, MobError> {
+        let _ = run_id;
+        Ok(command.authority_input(frame_id))
     }
 
     async fn require_frame(
@@ -326,17 +525,21 @@ impl FlowFrameKernel {
         &self,
         run_id: &RunId,
         frame_id: &FrameId,
-        input: flow_frame::Input,
+        command: MobMachineFlowFrameCommand,
         max_retries: usize,
     ) -> Result<Vec<flow_frame::Effect>, MobError> {
         for _ in 0..=max_retries {
             let current = self.require_frame(run_id, frame_id).await?;
-            let outcome = flow_frame::transition(
+            let authority_input = command.authority_input(frame_id);
+            let (authority, machine_state) = self
+                .authorize_frame_command(run_id, frame_id, &command)
+                .await?;
+            let outcome = apply_mob_machine_flow_frame_command(
                 &current.kernel_state,
-                input.clone(),
-                &flow_frame::EmptyContext,
-            )
-            .map_err(|e| MobError::Internal(format!("flow_frame transition failed: {e:?}")))?;
+                &machine_state,
+                command.clone(),
+                authority,
+            )?;
             let next = FrameSnapshot {
                 kernel_state: outcome.next_state,
             };
@@ -346,6 +549,8 @@ impl FlowFrameKernel {
                 .cas_frame_state(run_id, frame_id, Some(&current), next)
                 .await?;
             if won {
+                self.commit_mob_machine_inputs(std::slice::from_ref(&authority_input))
+                    .await?;
                 return Ok(effects);
             }
         }
@@ -372,14 +577,29 @@ impl FlowFrameMutator for FlowFrameKernel {
             .await?
             .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
         if let Some(existing) = run.frames.get(frame_id) {
+            self.confirm_frame_seed_from_snapshot(run_id, frame_id, existing, spec)
+                .await?;
             return Ok(existing.clone());
         }
 
         let initial = flow_frame::initial_state();
         let ordered = topological_order(spec)?;
-        let start_input = build_start_root_frame_input(frame_id, spec, &ordered);
-        let outcome = flow_frame::transition(&initial, start_input, &flow_frame::EmptyContext)
-            .map_err(|e| MobError::Internal(format!("flow_frame StartRootFrame failed: {e:?}")))?;
+        let start_input = MobMachineFlowFrameCommand::StartRootFrame(build_start_root_frame_input(
+            frame_id, spec, &ordered,
+        ));
+        let seed_input = crate::run::MobRun::create_frame_seed_input(
+            run_id,
+            frame_id,
+            None,
+            0,
+            crate::machines::mob_machine::FrameScope::Root,
+            spec,
+            &ordered,
+        )?;
+        let machine_state = self.preview_mob_machine_input(seed_input.clone()).await?;
+        let authority = MobMachineFlowAuthorityToken::from_accepted_mob_machine_input(&seed_input)?;
+        let outcome =
+            apply_mob_machine_flow_frame_command(&initial, &machine_state, start_input, authority)?;
         let snapshot = FrameSnapshot {
             kernel_state: outcome.next_state,
         };
@@ -399,6 +619,7 @@ impl FlowFrameMutator for FlowFrameKernel {
                 ))
             });
         }
+        self.commit_mob_machine_inputs(&[seed_input]).await?;
         Ok(snapshot)
     }
 
@@ -407,8 +628,12 @@ impl FlowFrameMutator for FlowFrameKernel {
         run_id: &RunId,
         frame_id: &FrameId,
     ) -> Result<Option<Vec<flow_frame::Effect>>, MobError> {
-        let input =
-            flow_frame::Input::AdmitNextReadyNode(flow_frame::inputs::AdmitNextReadyNode {});
+        let machine_state = self.current_mob_machine_state().await?;
+        let Some(input) =
+            build_admit_next_ready_node_command_from_machine(&machine_state, frame_id)
+        else {
+            return Ok(None);
+        };
         self.transition_frame(run_id, frame_id, input, 5)
             .await
             .map(Some)
@@ -422,14 +647,22 @@ impl FlowFrameMutator for FlowFrameKernel {
     ) -> Result<Option<Vec<flow_frame::Effect>>, MobError> {
         for _ in 0..=max_retries {
             let snap = self.require_frame(run_id, frame_id).await?;
-            if snap.kernel_state.ready_queue.is_empty() {
+            let machine_state = self.current_mob_machine_state().await?;
+            let Some(admit_input) =
+                build_admit_next_ready_node_command_from_machine(&machine_state, frame_id)
+            else {
                 return Ok(None);
-            }
-            let admit_input =
-                flow_frame::Input::AdmitNextReadyNode(flow_frame::inputs::AdmitNextReadyNode {});
-            let outcome =
-                flow_frame::transition(&snap.kernel_state, admit_input, &flow_frame::EmptyContext)
-                    .map_err(|e| MobError::Internal(format!("AdmitNextReadyNode failed: {e:?}")))?;
+            };
+            let machine_input = admit_input.authority_input(frame_id);
+            let (authority, machine_state) = self
+                .authorize_frame_command(run_id, frame_id, &admit_input)
+                .await?;
+            let outcome = apply_mob_machine_flow_frame_command(
+                &snap.kernel_state,
+                &machine_state,
+                admit_input,
+                authority,
+            )?;
             let next_snap = FrameSnapshot {
                 kernel_state: outcome.next_state,
             };
@@ -438,6 +671,7 @@ impl FlowFrameMutator for FlowFrameKernel {
                 .cas_frame_state(run_id, frame_id, Some(&snap), next_snap)
                 .await?;
             if won {
+                self.commit_mob_machine_inputs(&[machine_input]).await?;
                 return Ok(Some(outcome.effects));
             }
         }
@@ -463,15 +697,19 @@ impl FlowFrameMutator for FlowFrameKernel {
         for attempt in 0..=max_retries {
             let snap = self.require_frame(run_id, frame_id).await?;
             let complete_input =
-                flow_frame::Input::CompleteNode(flow_frame::inputs::CompleteNode {
+                MobMachineFlowFrameCommand::CompleteNode(flow_frame::inputs::CompleteNode {
                     node_id: node_id.clone(),
                 });
-            let next_outcome = flow_frame::transition(
+            let machine_input = complete_input.authority_input(frame_id);
+            let (authority, machine_state) = self
+                .authorize_frame_command(run_id, frame_id, &complete_input)
+                .await?;
+            let next_outcome = apply_mob_machine_flow_frame_command(
                 &snap.kernel_state,
+                &machine_state,
                 complete_input,
-                &flow_frame::EmptyContext,
-            )
-            .map_err(|e| MobError::Internal(format!("CompleteNode failed: {e:?}")))?;
+                authority,
+            )?;
             let next_snap = FrameSnapshot {
                 kernel_state: next_outcome.next_state,
             };
@@ -488,6 +726,7 @@ impl FlowFrameMutator for FlowFrameKernel {
                 )
                 .await?;
             if won {
+                self.commit_mob_machine_inputs(&[machine_input]).await?;
                 return Ok(());
             }
             if attempt == max_retries {
@@ -506,7 +745,7 @@ impl FlowFrameMutator for FlowFrameKernel {
         frame_id: &FrameId,
         node_id: &FlowNodeId,
     ) -> Result<bool, MobError> {
-        let input = flow_frame::Input::CompleteNode(flow_frame::inputs::CompleteNode {
+        let input = MobMachineFlowFrameCommand::CompleteNode(flow_frame::inputs::CompleteNode {
             node_id: node_id.clone(),
         });
         self.transition_frame(run_id, frame_id, input, 5)
@@ -520,7 +759,7 @@ impl FlowFrameMutator for FlowFrameKernel {
         frame_id: &FrameId,
         node_id: &FlowNodeId,
     ) -> Result<bool, MobError> {
-        let input = flow_frame::Input::FailNode(flow_frame::inputs::FailNode {
+        let input = MobMachineFlowFrameCommand::FailNode(flow_frame::inputs::FailNode {
             node_id: node_id.clone(),
         });
         self.transition_frame(run_id, frame_id, input, 5)
@@ -534,7 +773,7 @@ impl FlowFrameMutator for FlowFrameKernel {
         frame_id: &FrameId,
         node_id: &FlowNodeId,
     ) -> Result<bool, MobError> {
-        let input = flow_frame::Input::SkipNode(flow_frame::inputs::SkipNode {
+        let input = MobMachineFlowFrameCommand::SkipNode(flow_frame::inputs::SkipNode {
             node_id: node_id.clone(),
         });
         self.transition_frame(run_id, frame_id, input, 5)
@@ -548,7 +787,7 @@ impl FlowFrameMutator for FlowFrameKernel {
         frame_id: &FrameId,
         node_id: &FlowNodeId,
     ) -> Result<bool, MobError> {
-        let input = flow_frame::Input::CancelNode(flow_frame::inputs::CancelNode {
+        let input = MobMachineFlowFrameCommand::CancelNode(flow_frame::inputs::CancelNode {
             node_id: node_id.clone(),
         });
         self.transition_frame(run_id, frame_id, input, 5)
@@ -561,10 +800,43 @@ impl FlowFrameMutator for FlowFrameKernel {
         run_id: &RunId,
         frame_id: &FrameId,
     ) -> Result<bool, MobError> {
-        let input = flow_frame::Input::SealFrame(flow_frame::inputs::SealFrame {});
-        self.transition_frame(run_id, frame_id, input, 5)
-            .await
-            .map(|_| true)
+        for _ in 0..=5 {
+            let current = self.require_frame(run_id, frame_id).await?;
+            let machine_state = self.current_mob_machine_state().await?;
+            let terminal_status =
+                machine_candidate_frame_terminal_status(&machine_state, frame_id).ok_or_else(|| {
+                    MobError::Internal(format!(
+                        "frame '{frame_id}' cannot be sealed because MobMachine does not project a terminal frame class"
+                    ))
+                })?;
+            let input = MobMachineFlowFrameCommand::SealFrame(flow_frame::inputs::SealFrame {
+                terminal_status,
+            });
+            let machine_input = input.authority_input(frame_id);
+            let (authority, machine_state) = self
+                .authorize_frame_command(run_id, frame_id, &input)
+                .await?;
+            let outcome = apply_mob_machine_flow_frame_command(
+                &current.kernel_state,
+                &machine_state,
+                input,
+                authority,
+            )?;
+            let next = FrameSnapshot {
+                kernel_state: outcome.next_state,
+            };
+            let won = self
+                .run_store
+                .cas_frame_state(run_id, frame_id, Some(&current), next)
+                .await?;
+            if won {
+                self.commit_mob_machine_inputs(&[machine_input]).await?;
+                return Ok(true);
+            }
+        }
+        Err(MobError::Internal(format!(
+            "terminalize_frame: CAS exhausted for frame '{frame_id}'"
+        )))
     }
 }
 
@@ -576,7 +848,7 @@ pub struct FlowFrameEngine {
     run_store: Arc<dyn MobRunStore>,
     executor: Arc<dyn FrameStepExecutor>,
     frame_kernel: Arc<FlowFrameKernel>,
-    projector: Option<MobHandle>,
+    projector: MobHandle,
     /// Maximum nesting depth for body frames. 0 means unlimited.
     max_frame_depth: u32,
     /// Maximum number of simultaneously active body frames admitted by the run scheduler.
@@ -589,11 +861,11 @@ impl FlowFrameEngine {
     pub fn new(
         run_store: Arc<dyn MobRunStore>,
         executor: Arc<dyn FrameStepExecutor>,
-        projector: Option<MobHandle>,
+        projector: MobHandle,
         max_frame_depth: u32,
         max_active_frames: u32,
     ) -> Self {
-        let frame_kernel = Arc::new(FlowFrameKernel::new(run_store.clone()));
+        let frame_kernel = Arc::new(FlowFrameKernel::new(run_store.clone(), projector.clone()));
         Self {
             run_store,
             executor,
@@ -632,16 +904,35 @@ impl FlowFrameEngine {
             .await?
             .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
         if let Some(existing) = run.frames.get(frame_id) {
+            self.frame_kernel
+                .confirm_frame_seed_from_snapshot(run_id, frame_id, existing, spec)
+                .await?;
             return Ok(existing.clone());
         }
 
         let initial = flow_frame::initial_state();
         let ordered = crate::runtime::flow_frame_engine::topological_order(spec)?;
-        let start_input = crate::runtime::flow_frame_engine::build_start_root_frame_input(
-            frame_id, spec, &ordered,
+        let start_input = MobMachineFlowFrameCommand::StartRootFrame(
+            crate::runtime::flow_frame_engine::build_start_root_frame_input(
+                frame_id, spec, &ordered,
+            ),
         );
-        let outcome = flow_frame::transition(&initial, start_input, &flow_frame::EmptyContext)
-            .map_err(|e| MobError::Internal(format!("flow_frame StartRootFrame failed: {e:?}")))?;
+        let seed_input = crate::run::MobRun::create_frame_seed_input(
+            run_id,
+            frame_id,
+            None,
+            0,
+            crate::machines::mob_machine::FrameScope::Root,
+            spec,
+            &ordered,
+        )?;
+        let machine_state = self
+            .frame_kernel
+            .preview_mob_machine_input(seed_input.clone())
+            .await?;
+        let authority = MobMachineFlowAuthorityToken::from_accepted_mob_machine_input(&seed_input)?;
+        let outcome =
+            apply_mob_machine_flow_frame_command(&initial, &machine_state, start_input, authority)?;
         let snapshot = FrameSnapshot {
             kernel_state: outcome.next_state,
         };
@@ -661,6 +952,9 @@ impl FlowFrameEngine {
                 ))
             });
         }
+        self.frame_kernel
+            .commit_mob_machine_inputs(&[seed_input])
+            .await?;
         Ok(snapshot)
     }
 
@@ -677,21 +971,17 @@ impl FlowFrameEngine {
         self.frame_kernel
             .start_frame(run_id, root_frame_id, root_spec)
             .await?;
-        self.project_root_frame_seed(run_id, root_frame_id, root_spec)
-            .await?;
-        self.project_frame_phase(
-            root_frame_id,
-            crate::machines::mob_machine::FrameStatus::Running,
-        )
-        .await?;
         self.heal_terminal_body_frames(run_id, root_frame_id, root_spec, context)
             .await?;
         self.heal_orphaned_running_nodes(run_id, root_frame_id, root_spec, context)
             .await?;
         self.revisit_frame(run_id, root_frame_id, root_spec, context, root_frame_id)
             .await?;
+        self.revisit_known_frames(run_id, root_frame_id, root_spec, context)
+            .await?;
 
         let mut workers: FrameNodeWorkers = FuturesUnordered::new();
+        let mut step_failures = IndexMap::new();
 
         loop {
             self.executor.check_runtime_guards(run_id).await?;
@@ -707,19 +997,21 @@ impl FlowFrameEngine {
             if !progressed {
                 match workers.next().await {
                     Some(task) => {
-                        self.handle_task_result(run_id, root_frame_id, root_spec, context, task)
-                            .await?;
-                        progressed = true;
-                    }
-                    None => {
-                        self.revisit_frame(
+                        self.handle_task_result(
                             run_id,
                             root_frame_id,
                             root_spec,
                             context,
-                            root_frame_id,
+                            task,
+                            &mut step_failures,
                         )
                         .await?;
+                        progressed = true;
+                    }
+                    None => {
+                        progressed = self
+                            .revisit_frame(run_id, root_frame_id, root_spec, context, root_frame_id)
+                            .await?;
                     }
                 }
             }
@@ -732,25 +1024,64 @@ impl FlowFrameEngine {
 
             if !progressed && workers.is_empty() {
                 let run = self.require_run(run_id).await?;
+                let machine_state = self.frame_kernel.current_mob_machine_state().await?;
+                let ready_frame_ids =
+                    machine_ready_frame_registration_candidates(&machine_state, run_id);
+                if !ready_frame_ids.is_empty() {
+                    drop(run);
+                    for frame_id in ready_frame_ids {
+                        let run = self.require_run(run_id).await?;
+                        let Some(frame) = run.frames.get(&frame_id) else {
+                            continue;
+                        };
+                        if let Some(plan) = self
+                            .register_ready_frame_if_needed(
+                                run_id,
+                                &run.flow_state,
+                                &frame_id,
+                                &frame.kernel_state,
+                            )
+                            .await?
+                        {
+                            let _ = self.execute_store_plan(run_id, &plan).await?;
+                        }
+                    }
+                    continue;
+                }
                 if run.flow_state.active_node_count > 0 || run.flow_state.active_frame_count > 0 {
                     tokio_time::sleep(std::time::Duration::from_millis(10)).await;
                     continue;
                 }
+                let frame_debug = run
+                    .frames
+                    .iter()
+                    .map(|(frame_id, frame)| {
+                        format!(
+                            "{frame_id}: phase={:?} scope={:?} ready={:?} statuses={:?}",
+                            frame.kernel_state.phase,
+                            frame.kernel_state.frame_scope,
+                            frame.kernel_state.ready_queue,
+                            frame.kernel_state.node_status
+                        )
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ");
                 return Err(MobError::Internal(format!(
-                    "frame runtime stalled for root frame '{root_frame_id}' in run '{run_id}'"
+                    "frame runtime stalled for root frame '{root_frame_id}' in run '{run_id}'; frames=[{frame_debug}]; run_ready={:?}",
+                    run.flow_state.ready_frames
                 )));
             }
         }
 
         let run = self.require_run(run_id).await?;
         let outputs = root_outputs_from_run(&run);
-        let step_statuses = self.collect_all_step_statuses(&run, root_frame_id, root_spec)?;
+        let step_projections = self.collect_all_step_projections(&run, root_frame_id, root_spec)?;
         let root_frame = run.frames.get(root_frame_id).cloned().ok_or_else(|| {
             MobError::Internal(format!(
                 "root frame '{root_frame_id}' missing at end of run '{run_id}'"
             ))
         })?;
-        let root_phase = root_terminal_phase(&root_frame).ok_or_else(|| {
+        root_terminal_phase(&root_frame).ok_or_else(|| {
             MobError::Internal(format!(
                 "root frame '{root_frame_id}' ended in non-terminal phase '{:?}'",
                 root_frame.kernel_state.phase
@@ -759,8 +1090,8 @@ impl FlowFrameEngine {
 
         Ok(FrameExecutionOutcome {
             outputs,
-            step_statuses,
-            root_phase,
+            step_projections,
+            step_failures,
         })
     }
 
@@ -793,7 +1124,23 @@ impl FlowFrameEngine {
     ) -> Result<bool, MobError> {
         for _ in 0..=5usize {
             let run = self.require_run(run_id).await?;
-            let Some(grant) = preview_node_grant(&run.flow_state)? else {
+            let Some(frame_id) = local_node_grant_candidate(&run.flow_state) else {
+                return Ok(false);
+            };
+            let pump_command =
+                MobMachineFlowRunCommand::PumpNodeScheduler(flow_run::inputs::PumpNodeScheduler {
+                    frame_id,
+                });
+            let (pump_authority, machine_state) =
+                self.authorize_run_command(run_id, &pump_command).await?;
+            let Some(grant) = preview_node_grant(
+                &run.flow_state,
+                pump_command,
+                pump_authority,
+                &machine_state,
+                run_id,
+            )?
+            else {
                 return Ok(false);
             };
             let frame_id = grant.frame_id.clone();
@@ -805,14 +1152,19 @@ impl FlowFrameEngine {
             })?;
             let frame_spec = self.resolve_frame_spec(&run, root_frame_id, root_spec, &frame_id)?;
             let frame_depth = self.frame_depth(&run, root_frame_id, &frame_id)?;
-            let decision = acknowledge_node_grant(
-                &run.flow_state,
-                &grant,
-                &current_frame,
-                &frame_spec,
-                frame_depth,
-                self.max_frame_depth,
-            )?;
+            let decision = self
+                .acknowledge_node_grant(
+                    run_id,
+                    &run.flow_state,
+                    &grant,
+                    &current_frame,
+                    &frame_spec,
+                    FrameDepthLimit {
+                        current_depth: frame_depth,
+                        max_depth: self.max_frame_depth,
+                    },
+                )
+                .await?;
             if !self
                 .execute_decision(
                     run_id,
@@ -843,7 +1195,22 @@ impl FlowFrameEngine {
     ) -> Result<bool, MobError> {
         for _ in 0..=5usize {
             let run = self.require_run(run_id).await?;
-            let Some(grant) = preview_body_frame_grant(&run.flow_state)? else {
+            let Some(loop_instance_id) = local_body_frame_grant_candidate(&run.flow_state) else {
+                return Ok(false);
+            };
+            let pump_command = MobMachineFlowRunCommand::PumpFrameScheduler(
+                flow_run::inputs::PumpFrameScheduler { loop_instance_id },
+            );
+            let (pump_authority, machine_state) =
+                self.authorize_run_command(run_id, &pump_command).await?;
+            let Some(grant) = preview_body_frame_grant(
+                &run.flow_state,
+                pump_command,
+                pump_authority,
+                &machine_state,
+                run_id,
+            )?
+            else {
                 return Ok(false);
             };
             let loop_instance_id = grant.loop_instance_id.clone();
@@ -855,8 +1222,15 @@ impl FlowFrameEngine {
             })?;
             let loop_spec =
                 self.resolve_loop_spec(&run, root_frame_id, root_spec, &loop_instance_id)?;
-            let decision =
-                acknowledge_body_frame_start(&run.flow_state, &grant, &loop_snapshot, &loop_spec)?;
+            let decision = self
+                .acknowledge_body_frame_start(
+                    run_id,
+                    &run.flow_state,
+                    &grant,
+                    &loop_snapshot,
+                    &loop_spec,
+                )
+                .await?;
             if !self
                 .execute_decision(run_id, root_frame_id, root_spec, context, None, decision)
                 .await?
@@ -902,6 +1276,7 @@ impl FlowFrameEngine {
         root_spec: &FrameSpec,
         context: &FlowContext,
         task: FrameNodeTaskResult,
+        step_failures: &mut IndexMap<StepId, FrameStepFailureProjection>,
     ) -> Result<(), MobError> {
         match task {
             FrameNodeTaskResult::Step {
@@ -935,7 +1310,17 @@ impl FlowFrameEngine {
                             .skip_node(run_id, &frame_id, &node_id)
                             .await?;
                     }
-                    Ok(FrameStepResult::Failed) => {
+                    Ok(FrameStepResult::Failed {
+                        reason,
+                        failure_ledger_recorded,
+                    }) => {
+                        step_failures.insert(
+                            step_id.clone(),
+                            FrameStepFailureProjection {
+                                reason,
+                                append_failure_ledger: !failure_ledger_recorded,
+                            },
+                        );
                         self.frame_kernel
                             .fail_node(run_id, &frame_id, &node_id)
                             .await?;
@@ -974,29 +1359,39 @@ impl FlowFrameEngine {
         root_spec: &FrameSpec,
         context: &FlowContext,
         frame_id: &FrameId,
-    ) -> Result<(), MobError> {
+    ) -> Result<bool, MobError> {
+        let mut progressed = false;
         loop {
             let run = self.require_run(run_id).await?;
             let Some(frame) = run.frames.get(frame_id).cloned() else {
-                return Ok(());
+                return Ok(progressed);
             };
 
-            if let Some(plan) =
-                register_ready_frame_if_needed(&run.flow_state, frame_id, &frame.kernel_state)?
+            if let Some(plan) = self
+                .register_ready_frame_if_needed(
+                    run_id,
+                    &run.flow_state,
+                    frame_id,
+                    &frame.kernel_state,
+                )
+                .await?
             {
-                let _ = self.execute_store_plan(run_id, &plan).await?;
+                progressed |= self.execute_store_plan(run_id, &plan).await?;
                 continue;
             }
 
             let frame_spec = self.resolve_frame_spec(&run, root_frame_id, root_spec, frame_id)?;
-            if let Some(plan) = seal_frame_if_ready(frame_id, &frame, &frame_spec)? {
-                let _ = self.execute_store_plan(run_id, &plan).await?;
+            if let Some(plan) = self
+                .seal_frame_if_ready(run_id, frame_id, &frame, &frame_spec)
+                .await?
+            {
+                progressed |= self.execute_store_plan(run_id, &plan).await?;
                 continue;
             }
 
             let run = self.require_run(run_id).await?;
             let Some(frame) = run.frames.get(frame_id).cloned() else {
-                return Ok(());
+                return Ok(progressed);
             };
 
             if let Some(loop_instance_id) = frame_loop_instance_id(&frame.kernel_state)
@@ -1011,61 +1406,149 @@ impl FlowFrameEngine {
                         obligation,
                     )
                     .await?;
+                    progressed = true;
                     continue;
                 }
 
                 let parent_frame = self.parent_frame_for_loop(&run, &loop_snapshot);
-                if let Some(decision) = advance_body_frame_after_seal(
-                    &run.flow_state,
-                    frame_id,
-                    &frame,
-                    &loop_snapshot,
-                    parent_frame.as_ref(),
-                )? {
+                if let Some(decision) = self
+                    .advance_body_frame_after_seal(
+                        run_id,
+                        &run.flow_state,
+                        frame_id,
+                        &frame,
+                        &loop_snapshot,
+                        parent_frame.as_ref(),
+                    )
+                    .await?
+                {
                     let _ = self
                         .execute_decision(run_id, root_frame_id, root_spec, context, None, decision)
                         .await?;
+                    progressed = true;
                     continue;
                 }
             }
 
-            return Ok(());
+            return Ok(progressed);
         }
+    }
+
+    async fn revisit_known_frames(
+        &self,
+        run_id: &RunId,
+        root_frame_id: &FrameId,
+        root_spec: &FrameSpec,
+        context: &FlowContext,
+    ) -> Result<(), MobError> {
+        let frame_ids = self
+            .require_run(run_id)
+            .await?
+            .frames
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        for frame_id in frame_ids {
+            let run = self.require_run(run_id).await?;
+            let Some(frame) = run.frames.get(&frame_id).cloned() else {
+                continue;
+            };
+            let frame_spec = self.resolve_frame_spec(&run, root_frame_id, root_spec, &frame_id)?;
+            self.frame_kernel
+                .confirm_frame_seed_from_snapshot(run_id, &frame_id, &frame, &frame_spec)
+                .await?;
+            self.revisit_frame(run_id, root_frame_id, root_spec, context, &frame_id)
+                .await?;
+        }
+        Ok(())
     }
 
     async fn ensure_scheduler_state_initialized(&self, run_id: &RunId) -> Result<(), MobError> {
         for _ in 0..=5usize {
             let run = self.require_run(run_id).await?;
-            let mut reconciled = run.clone();
-            if reconciled.flow_state.phase == flow_run::Phase::Absent {
-                reconciled.flow_state.phase = flow_run::Phase::Running;
+            if run.flow_state.phase == flow_run::Phase::Absent {
+                if run.status != crate::run::MobRunStatus::Pending {
+                    return Err(MobError::Internal(format!(
+                        "run '{run_id}' has no MobMachine-authorized flow state; CreateRunSeed/StartRun must initialize scheduler state before frame execution"
+                    )));
+                }
+                let command = MobMachineFlowRunCommand::StartRun(flow_run::inputs::StartRun {});
+                let machine_input = command.authority_input(run_id);
+                let (authority, machine_state) =
+                    self.authorize_run_command(run_id, &command).await?;
+                let outcome = apply_mob_machine_flow_run_command(
+                    &run.flow_state,
+                    &machine_state,
+                    run_id,
+                    command,
+                    authority,
+                )?;
+                let transitioned = self
+                    .run_store
+                    .cas_run_snapshot(
+                        run_id,
+                        crate::run::MobRunStatus::Pending,
+                        &run.flow_state,
+                        crate::run::MobRunStatus::Running,
+                        &outcome.next_state,
+                    )
+                    .await?;
+                if transitioned {
+                    self.frame_kernel
+                        .commit_mob_machine_inputs(&[machine_input])
+                        .await?;
+                    continue;
+                }
+                continue;
             }
-            if reconciled.flow_state.max_frame_depth == 0 && self.max_frame_depth > 0 {
-                reconciled.flow_state.max_frame_depth = self.max_frame_depth;
+            if run.flow_state.phase == flow_run::Phase::Pending
+                && run.status == crate::run::MobRunStatus::Pending
+            {
+                let command = MobMachineFlowRunCommand::StartRun(flow_run::inputs::StartRun {});
+                let machine_input = command.authority_input(run_id);
+                let (authority, machine_state) =
+                    self.authorize_run_command(run_id, &command).await?;
+                let outcome = apply_mob_machine_flow_run_command(
+                    &run.flow_state,
+                    &machine_state,
+                    run_id,
+                    command,
+                    authority,
+                )?;
+                let transitioned = self
+                    .run_store
+                    .cas_run_snapshot(
+                        run_id,
+                        crate::run::MobRunStatus::Pending,
+                        &run.flow_state,
+                        crate::run::MobRunStatus::Running,
+                        &outcome.next_state,
+                    )
+                    .await?;
+                if transitioned {
+                    self.frame_kernel
+                        .commit_mob_machine_inputs(&[machine_input])
+                        .await?;
+                    continue;
+                }
+                continue;
             }
-            if reconciled.flow_state.max_active_frames == 0 && self.max_active_frames > 0 {
-                reconciled.flow_state.max_active_frames = self.max_active_frames;
+            if self.max_frame_depth > 0 && run.flow_state.max_frame_depth != self.max_frame_depth {
+                return Err(MobError::Internal(format!(
+                    "run '{run_id}' max_frame_depth was not initialized by MobMachine authority"
+                )));
             }
-            crate::runtime::recovery::reconcile_run_state(&mut reconciled).map_err(|error| {
-                MobError::Internal(format!(
-                    "scheduler state reconciliation failed for run '{run_id}': {error}"
-                ))
-            })?;
-            if reconciled.flow_state == run.flow_state {
-                return Ok(());
+            if self.max_active_frames > 0
+                && run.flow_state.max_active_frames != self.max_active_frames
+            {
+                return Err(MobError::Internal(format!(
+                    "run '{run_id}' max_active_frames was not initialized by MobMachine authority"
+                )));
             }
-
-            let won = self
-                .run_store
-                .cas_flow_state(run_id, &run.flow_state, &reconciled.flow_state)
-                .await?;
-            if won {
-                return Ok(());
-            }
+            return Ok(());
         }
-
         Err(MobError::Internal(format!(
-            "scheduler state bootstrap CAS exhausted for run '{run_id}'"
+            "scheduler state initialization CAS exhausted for run '{run_id}'"
         )))
     }
 
@@ -1115,11 +1598,15 @@ impl FlowFrameEngine {
                             let loop_instance_id =
                                 LoopInstanceId::from(format!("{frame_id}::{node_id}").as_str());
                             if let Some(loop_snapshot) = run.loops.get(&loop_instance_id) {
-                                if let Some(decision) = recover_terminal_loop_projection(
-                                    &run.flow_state,
-                                    loop_snapshot,
-                                    &frame,
-                                )? {
+                                if let Some(decision) = self
+                                    .recover_terminal_loop_projection(
+                                        run_id,
+                                        &run.flow_state,
+                                        loop_snapshot,
+                                        &frame,
+                                    )
+                                    .await?
+                                {
                                     healed_any = true;
                                     let _ = self
                                         .execute_decision(
@@ -1133,10 +1620,14 @@ impl FlowFrameEngine {
                                         .await?;
                                     continue;
                                 }
-                                if let Some(decision) = recover_pending_body_frame_request(
-                                    &run.flow_state,
-                                    loop_snapshot,
-                                )? {
+                                if let Some(decision) = self
+                                    .recover_pending_body_frame_request(
+                                        run_id,
+                                        &run.flow_state,
+                                        loop_snapshot,
+                                    )
+                                    .await?
+                                {
                                     healed_any = true;
                                     let _ = self
                                         .execute_decision(
@@ -1242,7 +1733,9 @@ impl FlowFrameEngine {
     ) -> Result<(), MobError> {
         for _ in 0..=5usize {
             let run = self.require_run(run_id).await?;
-            let plan = release_node_execution(&run.flow_state, frame_id)?;
+            let plan = self
+                .release_node_execution(run_id, &run.flow_state, frame_id)
+                .await?;
             let won = self.execute_store_plan(run_id, &plan).await?;
             if won {
                 self.revisit_frame(run_id, root_frame_id, root_spec, context, frame_id)
@@ -1334,26 +1827,30 @@ impl FlowFrameEngine {
         run_id: &RunId,
         plan: &FlowFrameLoopStorePlan,
     ) -> Result<bool, MobError> {
-        match plan {
+        let (won, machine_inputs) = match plan {
             FlowFrameLoopStorePlan::GrantNodeSlot {
+                machine_inputs,
                 expected_run_state,
                 next_run_state,
                 frame_id,
                 expected_frame,
                 next_frame,
-            } => self
-                .run_store
-                .cas_grant_node_slot(
-                    run_id,
-                    expected_run_state,
-                    next_run_state.clone(),
-                    frame_id,
-                    expected_frame,
-                    next_frame.clone(),
-                )
-                .await
-                .map_err(MobError::from),
+            } => (
+                self.run_store
+                    .cas_grant_node_slot(
+                        run_id,
+                        expected_run_state,
+                        next_run_state.clone(),
+                        frame_id,
+                        expected_frame,
+                        next_frame.clone(),
+                    )
+                    .await
+                    .map_err(MobError::from)?,
+                machine_inputs,
+            ),
             FlowFrameLoopStorePlan::StartLoop {
+                machine_inputs,
                 loop_instance_id,
                 expected_run_state,
                 next_run_state,
@@ -1361,21 +1858,24 @@ impl FlowFrameEngine {
                 expected_frame,
                 next_frame,
                 initial_loop,
-            } => self
-                .run_store
-                .cas_start_loop(
-                    run_id,
-                    loop_instance_id,
-                    expected_run_state,
-                    next_run_state.clone(),
-                    frame_id,
-                    expected_frame,
-                    next_frame.clone(),
-                    initial_loop.clone(),
-                )
-                .await
-                .map_err(MobError::from),
+            } => (
+                self.run_store
+                    .cas_start_loop(
+                        run_id,
+                        loop_instance_id,
+                        expected_run_state,
+                        next_run_state.clone(),
+                        frame_id,
+                        expected_frame,
+                        next_frame.clone(),
+                        initial_loop.clone(),
+                    )
+                    .await
+                    .map_err(MobError::from)?,
+                machine_inputs,
+            ),
             FlowFrameLoopStorePlan::GrantBodyFrameStart {
+                machine_inputs,
                 loop_instance_id,
                 expected_loop,
                 next_loop,
@@ -1384,39 +1884,48 @@ impl FlowFrameEngine {
                 ledger_entry,
                 expected_run_state,
                 next_run_state,
-            } => self
-                .run_store
-                .cas_grant_body_frame_start(
-                    run_id,
-                    loop_instance_id,
-                    expected_loop,
-                    next_loop.clone(),
-                    frame_id,
-                    initial_frame.clone(),
-                    ledger_entry.clone(),
-                    expected_run_state,
-                    next_run_state.clone(),
-                )
-                .await
-                .map_err(MobError::from),
+            } => (
+                self.run_store
+                    .cas_grant_body_frame_start(
+                        run_id,
+                        loop_instance_id,
+                        expected_loop,
+                        next_loop.clone(),
+                        frame_id,
+                        initial_frame.clone(),
+                        ledger_entry.clone(),
+                        expected_run_state,
+                        next_run_state.clone(),
+                    )
+                    .await
+                    .map_err(MobError::from)?,
+                machine_inputs,
+            ),
             FlowFrameLoopStorePlan::RunStateOnly {
+                machine_inputs,
                 expected_run_state,
                 next_run_state,
-            } => self
-                .run_store
-                .cas_flow_state(run_id, expected_run_state, next_run_state)
-                .await
-                .map_err(MobError::from),
+            } => (
+                self.run_store
+                    .cas_flow_state(run_id, expected_run_state, next_run_state)
+                    .await
+                    .map_err(MobError::from)?,
+                machine_inputs,
+            ),
             FlowFrameLoopStorePlan::SealFrame {
+                machine_inputs,
                 frame_id,
                 expected_frame,
                 next_frame,
-            } => self
-                .run_store
-                .cas_frame_state(run_id, frame_id, Some(expected_frame), next_frame.clone())
-                .await
-                .map_err(MobError::from),
+            } => (
+                self.run_store
+                    .cas_frame_state(run_id, frame_id, Some(expected_frame), next_frame.clone())
+                    .await
+                    .map_err(MobError::from)?,
+                machine_inputs,
+            ),
             FlowFrameLoopStorePlan::CompleteBodyFrame {
+                machine_inputs,
                 loop_instance_id,
                 expected_loop,
                 next_loop,
@@ -1425,40 +1934,46 @@ impl FlowFrameEngine {
                 next_frame,
                 expected_run_state,
                 next_run_state,
-            } => self
-                .run_store
-                .cas_complete_body_frame(
-                    run_id,
-                    loop_instance_id,
-                    expected_loop,
-                    next_loop.clone(),
-                    frame_id,
-                    expected_frame,
-                    next_frame.clone(),
-                    expected_run_state,
-                    next_run_state.clone(),
-                )
-                .await
-                .map_err(MobError::from),
+            } => (
+                self.run_store
+                    .cas_complete_body_frame(
+                        run_id,
+                        loop_instance_id,
+                        expected_loop,
+                        next_loop.clone(),
+                        frame_id,
+                        expected_frame,
+                        next_frame.clone(),
+                        expected_run_state,
+                        next_run_state.clone(),
+                    )
+                    .await
+                    .map_err(MobError::from)?,
+                machine_inputs,
+            ),
             FlowFrameLoopStorePlan::LoopRequestBodyFrame {
+                machine_inputs,
                 loop_instance_id,
                 expected_loop,
                 next_loop,
                 expected_run_state,
                 next_run_state,
-            } => self
-                .run_store
-                .cas_loop_request_body_frame(
-                    run_id,
-                    loop_instance_id,
-                    expected_loop,
-                    next_loop.clone(),
-                    expected_run_state,
-                    next_run_state.clone(),
-                )
-                .await
-                .map_err(MobError::from),
+            } => (
+                self.run_store
+                    .cas_loop_request_body_frame(
+                        run_id,
+                        loop_instance_id,
+                        expected_loop,
+                        next_loop.clone(),
+                        expected_run_state,
+                        next_run_state.clone(),
+                    )
+                    .await
+                    .map_err(MobError::from)?,
+                machine_inputs,
+            ),
             FlowFrameLoopStorePlan::CompleteLoop {
+                machine_inputs,
                 loop_instance_id,
                 expected_loop,
                 next_loop,
@@ -1467,105 +1982,43 @@ impl FlowFrameEngine {
                 next_frame,
                 expected_run_state,
                 next_run_state,
-            } => self
-                .run_store
-                .cas_complete_loop(
-                    run_id,
-                    loop_instance_id,
-                    expected_loop,
-                    next_loop.clone(),
-                    frame_id,
-                    expected_frame,
-                    next_frame.clone(),
-                    expected_run_state,
-                    next_run_state.clone(),
-                )
-                .await
-                .map_err(MobError::from),
+            } => (
+                self.run_store
+                    .cas_complete_loop(
+                        run_id,
+                        loop_instance_id,
+                        expected_loop,
+                        next_loop.clone(),
+                        frame_id,
+                        expected_frame,
+                        next_frame.clone(),
+                        expected_run_state,
+                        next_run_state.clone(),
+                    )
+                    .await
+                    .map_err(MobError::from)?,
+                machine_inputs,
+            ),
+        };
+        if won {
+            self.frame_kernel
+                .commit_mob_machine_inputs(machine_inputs)
+                .await?;
         }
+        Ok(won)
     }
 
     async fn project_store_plan(
         &self,
-        run_id: &RunId,
-        root_frame_id: &FrameId,
-        root_spec: &FrameSpec,
+        _run_id: &RunId,
+        _root_frame_id: &FrameId,
+        _root_spec: &FrameSpec,
         plan: &FlowFrameLoopStorePlan,
     ) -> Result<(), MobError> {
-        let Some(projector) = &self.projector else {
-            return Ok(());
-        };
         match plan {
-            FlowFrameLoopStorePlan::StartLoop { initial_loop, .. } => {
-                projector
-                    .project_machine_input(crate::run::MobRun::create_loop_seed_input(
-                        initial_loop,
-                    )?)
-                    .await?;
-                let active_body = initial_loop.kernel_state.active_body_frame_id.clone();
-                projector
-                    .project_machine_input(crate::run::MobRun::create_loop_state_input(
-                        &initial_loop.kernel_state.loop_instance_id,
-                        crate::machines::mob_machine::LoopStatus::Running,
-                        crate::machines::mob_machine::LoopIterationStage::AwaitingBodyFrame,
-                        active_body.as_ref(),
-                    ))
-                    .await?;
-            }
-            FlowFrameLoopStorePlan::GrantBodyFrameStart {
-                loop_instance_id,
-                frame_id,
-                ledger_entry,
-                ..
-            } => {
-                let run = self.require_run(run_id).await?;
-                let spec = self.resolve_frame_spec(&run, root_frame_id, root_spec, frame_id)?;
-                let ordered = crate::runtime::flow_frame_engine::topological_order(&spec)?;
-                projector
-                    .project_machine_input(crate::run::MobRun::create_frame_seed_input(
-                        run_id,
-                        frame_id,
-                        Some(loop_instance_id),
-                        u32::try_from(ledger_entry.iteration).map_err(|_| {
-                            MobError::Internal(
-                                "loop iteration ledger entry exceeds u32 during frame projection"
-                                    .to_string(),
-                            )
-                        })?,
-                        crate::machines::mob_machine::FrameScope::Body,
-                        &spec,
-                        &ordered,
-                    )?)
-                    .await?;
-                projector
-                    .project_machine_input(crate::run::MobRun::create_loop_state_input(
-                        loop_instance_id,
-                        crate::machines::mob_machine::LoopStatus::Running,
-                        crate::machines::mob_machine::LoopIterationStage::BodyFrameActive,
-                        Some(frame_id),
-                    ))
-                    .await?;
-                projector
-                    .project_machine_input(crate::run::MobRun::create_frame_phase_input(
-                        frame_id,
-                        crate::machines::mob_machine::FrameStatus::Running,
-                    ))
-                    .await?;
-            }
-            FlowFrameLoopStorePlan::CompleteBodyFrame {
-                loop_instance_id,
-                next_loop,
-                ..
-            } => {
-                projector
-                    .project_machine_input(
-                        crate::run::MobRun::record_loop_body_frame_completed_input(
-                            loop_instance_id,
-                            next_loop.kernel_state.last_completed_iteration,
-                        ),
-                    )
-                    .await?;
-            }
+            FlowFrameLoopStorePlan::StartLoop { .. } => {}
+            FlowFrameLoopStorePlan::GrantBodyFrameStart { .. } => {}
+            FlowFrameLoopStorePlan::CompleteBodyFrame { .. } => {}
             FlowFrameLoopStorePlan::GrantNodeSlot { .. }
             | FlowFrameLoopStorePlan::RunStateOnly { .. }
             | FlowFrameLoopStorePlan::SealFrame { .. }
@@ -1579,18 +2032,10 @@ impl FlowFrameEngine {
         &self,
         feedback: Option<&LoopUntilConditionFeedbackProjection>,
     ) -> Result<(), MobError> {
-        let (Some(projector), Some(feedback)) = (&self.projector, feedback) else {
+        let Some(_feedback) = feedback else {
             return Ok(());
         };
-        projector
-            .project_machine_input(
-                crate::run::MobRun::record_loop_until_condition_feedback_input(
-                    &feedback.loop_instance_id,
-                    feedback.iteration,
-                    feedback.until_met,
-                ),
-            )
-            .await
+        Ok(())
     }
 
     async fn resolve_until_feedback(
@@ -1633,13 +2078,16 @@ impl FlowFrameEngine {
                 context.activation_params.clone(),
             );
             let until_met = evaluate_condition(&loop_spec.until, &eval_context);
-            let (decision, until_feedback) = resolve_until_feedback_decision(
-                &run.flow_state,
-                loop_snapshot,
-                &parent_frame,
-                obligation.clone(),
-                until_met,
-            )?;
+            let (decision, until_feedback) = self
+                .resolve_until_feedback_decision(
+                    run_id,
+                    &run.flow_state,
+                    loop_snapshot,
+                    &parent_frame,
+                    obligation.clone(),
+                    until_met,
+                )
+                .await?;
             if self
                 .execute_decision(run_id, root_frame_id, root_spec, context, None, decision)
                 .await?
@@ -1664,21 +2112,21 @@ impl FlowFrameEngine {
         run.frames.get(&parent_frame_id).cloned()
     }
 
-    fn collect_all_step_statuses(
+    fn collect_all_step_projections(
         &self,
         run: &MobRun,
         root_frame_id: &FrameId,
         root_spec: &FrameSpec,
-    ) -> Result<IndexMap<StepId, StepRunStatus>, MobError> {
-        let mut step_statuses = IndexMap::new();
+    ) -> Result<IndexMap<StepId, FrameStepProjection>, MobError> {
+        let mut projections = IndexMap::new();
         for (frame_id, frame) in &run.frames {
             let spec = self.resolve_frame_spec(run, root_frame_id, root_spec, frame_id)?;
-            merge_step_statuses(
-                &mut step_statuses,
-                collect_frame_step_statuses(&spec, &frame.kernel_state),
+            merge_step_projections(
+                &mut projections,
+                collect_frame_step_projections(frame_id, &spec, &frame.kernel_state),
             );
         }
-        Ok(step_statuses)
+        Ok(projections)
     }
 
     fn build_context_for_frame(
@@ -1837,41 +2285,57 @@ impl FlowFrameEngine {
             .ok_or_else(|| MobError::RunNotFound(run_id.clone()))
     }
 
-    async fn project_root_frame_seed(
+    async fn authorize_run_command(
+        &self,
+        run_id: &RunId,
+        command: &MobMachineFlowRunCommand,
+    ) -> Result<(MobMachineFlowAuthorityToken, mob_dsl::MobMachineState), MobError> {
+        let authority_input = command.authority_input(run_id);
+        let machine_state = self
+            .frame_kernel
+            .preview_mob_machine_input(authority_input.clone())
+            .await
+            .map_err(|error| {
+                MobError::Internal(format!(
+                    "MobMachine rejected run command {:?} for run '{run_id}': {error}",
+                    command.kind()
+                ))
+            })?;
+        let authority =
+            MobMachineFlowAuthorityToken::from_accepted_mob_machine_input(&authority_input)?;
+        Ok((authority, machine_state))
+    }
+
+    async fn authorize_frame_command(
         &self,
         run_id: &RunId,
         frame_id: &FrameId,
-        spec: &FrameSpec,
-    ) -> Result<(), MobError> {
-        let Some(projector) = &self.projector else {
-            return Ok(());
-        };
-        let ordered = crate::runtime::flow_frame_engine::topological_order(spec)?;
-        let input = crate::run::MobRun::create_frame_seed_input(
-            run_id,
-            frame_id,
-            None,
-            0,
-            crate::machines::mob_machine::FrameScope::Root,
-            spec,
-            &ordered,
-        )?;
-        projector.project_machine_input(input).await
+        command: &MobMachineFlowFrameCommand,
+    ) -> Result<(MobMachineFlowAuthorityToken, mob_dsl::MobMachineState), MobError> {
+        let authority_input = command.authority_input(frame_id);
+        let machine_state = self
+            .frame_kernel
+            .preview_mob_machine_input(authority_input.clone())
+            .await?;
+        validate_accepted_frame_command_witness(&authority_input, &machine_state)?;
+        let authority =
+            MobMachineFlowAuthorityToken::from_accepted_mob_machine_input(&authority_input)?;
+        Ok((authority, machine_state))
     }
 
-    async fn project_frame_phase(
+    async fn authorize_loop_command(
         &self,
-        frame_id: &FrameId,
-        phase: crate::machines::mob_machine::FrameStatus,
-    ) -> Result<(), MobError> {
-        let Some(projector) = &self.projector else {
-            return Ok(());
-        };
-        projector
-            .project_machine_input(crate::run::MobRun::create_frame_phase_input(
-                frame_id, phase,
-            ))
-            .await
+        loop_instance_id: &LoopInstanceId,
+        command: &MobMachineLoopIterationCommand,
+    ) -> Result<(MobMachineFlowAuthorityToken, mob_dsl::MobMachineState), MobError> {
+        let authority_input = command.authority_input(loop_instance_id);
+        let machine_state = self
+            .frame_kernel
+            .preview_mob_machine_input(authority_input.clone())
+            .await?;
+        let authority =
+            MobMachineFlowAuthorityToken::from_accepted_mob_machine_input(&authority_input)?;
+        Ok((authority, machine_state))
     }
 
     /// Read the current frame snapshot, propagating errors from the store.
@@ -1955,11 +2419,12 @@ fn running_node_ids(kernel_state: &flow_frame::State) -> Vec<FlowNodeId> {
         .collect()
 }
 
-fn collect_frame_step_statuses(
+fn collect_frame_step_projections(
+    frame_id: &FrameId,
     spec: &FrameSpec,
     kernel_state: &flow_frame::State,
-) -> IndexMap<StepId, StepRunStatus> {
-    let mut step_statuses = IndexMap::new();
+) -> IndexMap<StepId, FrameStepProjection> {
+    let mut projections = IndexMap::new();
     for (node_id, node_spec) in &spec.nodes {
         let FlowNodeSpec::Step(step_spec) = node_spec else {
             continue;
@@ -1970,9 +2435,17 @@ fn collect_frame_step_statuses(
         let Some(step_status) = node_terminal_step_status(*status) else {
             continue;
         };
-        merge_step_status(&mut step_statuses, step_spec.step_id.clone(), step_status);
+        merge_step_projection(
+            &mut projections,
+            FrameStepProjection {
+                frame_id: frame_id.clone(),
+                node_id: node_id.clone(),
+                step_id: step_spec.step_id.clone(),
+                step_status,
+            },
+        );
     }
-    step_statuses
+    projections
 }
 
 fn node_terminal_step_status(status: flow_frame::NodeRunStatus) -> Option<StepRunStatus> {
@@ -1984,26 +2457,26 @@ fn node_terminal_step_status(status: flow_frame::NodeRunStatus) -> Option<StepRu
     }
 }
 
-fn merge_step_statuses(
-    into: &mut IndexMap<StepId, StepRunStatus>,
-    updates: IndexMap<StepId, StepRunStatus>,
+fn merge_step_projections(
+    into: &mut IndexMap<StepId, FrameStepProjection>,
+    updates: IndexMap<StepId, FrameStepProjection>,
 ) {
-    for (step_id, status) in updates {
-        merge_step_status(into, step_id, status);
+    for (_, projection) in updates {
+        merge_step_projection(into, projection);
     }
 }
 
-fn merge_step_status(
-    into: &mut IndexMap<StepId, StepRunStatus>,
-    step_id: StepId,
-    status: StepRunStatus,
+fn merge_step_projection(
+    into: &mut IndexMap<StepId, FrameStepProjection>,
+    projection: FrameStepProjection,
 ) {
-    let next_rank = step_status_rank(&status);
+    let next_rank = step_status_rank(&projection.step_status);
+    let step_id = projection.step_id.clone();
     match into.get_mut(&step_id) {
-        Some(existing) if step_status_rank(existing) >= next_rank => {}
-        Some(existing) => *existing = status,
+        Some(existing) if step_status_rank(&existing.step_status) >= next_rank => {}
+        Some(existing) => *existing = projection,
         None => {
-            into.insert(step_id, status);
+            into.insert(step_id, projection);
         }
     }
 }
@@ -2017,42 +2490,178 @@ fn step_status_rank(status: &StepRunStatus) -> u8 {
     }
 }
 
-fn preview_node_grant(state: &flow_run::State) -> Result<Option<PreviewedNodeGrant>, MobError> {
-    let outcome = flow_run::transition(
-        state,
-        flow_run::Input::PumpNodeScheduler(flow_run::inputs::PumpNodeScheduler {}),
-        &flow_run::EmptyContext,
-    );
-    match outcome {
-        Ok(outcome) => Ok(outcome.effects.iter().find_map(|effect| match effect {
-            flow_run::Effect::GrantNodeSlot(payload) => Some(PreviewedNodeGrant {
-                frame_id: payload.frame_id.clone(),
-                next_run_state: outcome.next_state.clone(),
-            }),
-            _ => None,
-        })),
-        Err(_) => Ok(None),
-    }
+fn preview_node_grant(
+    state: &flow_run::State,
+    command: MobMachineFlowRunCommand,
+    authority: MobMachineFlowAuthorityToken,
+    machine_state: &mob_dsl::MobMachineState,
+    run_id: &RunId,
+) -> Result<Option<PreviewedNodeGrant>, MobError> {
+    let machine_input = command.authority_input(run_id);
+    let outcome = run_transition_outcome(state, machine_state, run_id, command, authority)?;
+    let frame_id = outcome.effects.iter().find_map(|effect| match effect {
+        flow_run::Effect::GrantNodeSlot(payload) => Some(payload.frame_id.clone()),
+        _ => None,
+    });
+    Ok(frame_id.map(|frame_id| PreviewedNodeGrant {
+        frame_id,
+        next_run_state: outcome.next_state,
+        machine_input,
+    }))
 }
 
 fn preview_body_frame_grant(
     state: &flow_run::State,
+    command: MobMachineFlowRunCommand,
+    authority: MobMachineFlowAuthorityToken,
+    machine_state: &mob_dsl::MobMachineState,
+    run_id: &RunId,
 ) -> Result<Option<PreviewedBodyFrameGrant>, MobError> {
-    let outcome = flow_run::transition(
-        state,
-        flow_run::Input::PumpFrameScheduler(flow_run::inputs::PumpFrameScheduler {}),
-        &flow_run::EmptyContext,
-    );
-    match outcome {
-        Ok(outcome) => Ok(outcome.effects.iter().find_map(|effect| match effect {
-            flow_run::Effect::GrantBodyFrameStart(payload) => Some(PreviewedBodyFrameGrant {
-                loop_instance_id: payload.loop_instance_id.clone(),
-                next_run_state: outcome.next_state.clone(),
-            }),
-            _ => None,
-        })),
-        Err(_) => Ok(None),
+    let machine_input = command.authority_input(run_id);
+    let outcome = run_transition_outcome(state, machine_state, run_id, command, authority)?;
+    let loop_instance_id = outcome.effects.iter().find_map(|effect| match effect {
+        flow_run::Effect::GrantBodyFrameStart(payload) => Some(payload.loop_instance_id.clone()),
+        _ => None,
+    });
+    Ok(
+        loop_instance_id.map(|loop_instance_id| PreviewedBodyFrameGrant {
+            loop_instance_id,
+            next_run_state: outcome.next_state,
+            machine_input,
+        }),
+    )
+}
+
+fn local_node_grant_candidate(run_state: &flow_run::State) -> Option<FrameId> {
+    let active = run_state.active_node_count;
+    let max_active = run_state.max_active_nodes;
+    if max_active != 0 && active >= max_active {
+        return None;
     }
+    run_state
+        .ready_frames
+        .first()
+        .cloned()
+        .or_else(|| run_state.ready_frame_membership.iter().next().cloned())
+}
+
+fn local_body_frame_grant_candidate(run_state: &flow_run::State) -> Option<LoopInstanceId> {
+    let active = run_state.active_frame_count;
+    let max_active = run_state.max_active_frames;
+    if max_active != 0 && active >= max_active {
+        return None;
+    }
+    run_state
+        .pending_body_frame_loops
+        .first()
+        .cloned()
+        .or_else(|| {
+            run_state
+                .pending_body_frame_loop_membership
+                .iter()
+                .next()
+                .cloned()
+        })
+}
+
+fn machine_ready_frame_registration_candidates(
+    machine_state: &mob_dsl::MobMachineState,
+    run_id: &RunId,
+) -> Vec<FrameId> {
+    let run_key = mob_dsl::RunId::from(run_id.to_string());
+    machine_state
+        .frame_ready_queue
+        .iter()
+        .filter(|(frame_id, ready_queue)| {
+            !ready_queue.is_empty()
+                && machine_state.frame_run.get(*frame_id) == Some(&run_key)
+                && machine_state.frame_phase.get(*frame_id) == Some(&mob_dsl::FrameStatus::Running)
+                && !machine_state
+                    .run_ready_frame_membership_flat
+                    .contains(*frame_id)
+        })
+        .map(|(frame_id, _)| FrameId::from(frame_id.0.as_str()))
+        .collect()
+}
+
+fn machine_frame_has_ready_nodes(
+    machine_state: &mob_dsl::MobMachineState,
+    frame_id: &FrameId,
+) -> bool {
+    let frame_key = mob_dsl::FrameId::from(frame_id.as_str());
+    machine_state
+        .frame_ready_queue
+        .get(&frame_key)
+        .is_some_and(|ready_queue| !ready_queue.is_empty())
+        && machine_state.frame_phase.get(&frame_key) == Some(&mob_dsl::FrameStatus::Running)
+}
+
+fn machine_run_ready_frame_registered(
+    machine_state: &mob_dsl::MobMachineState,
+    run_id: &RunId,
+    frame_id: &FrameId,
+) -> bool {
+    let run_key = mob_dsl::RunId::from(run_id.to_string());
+    let frame_key = mob_dsl::FrameId::from(frame_id.as_str());
+    machine_state
+        .run_ready_frame_membership_flat
+        .contains(&frame_key)
+        || machine_state
+            .run_ready_frame_membership
+            .get(&run_key)
+            .is_some_and(|frames| frames.contains(&frame_key))
+}
+
+fn machine_loop_pending_body_frame_registered(
+    machine_state: &mob_dsl::MobMachineState,
+    loop_instance_id: &LoopInstanceId,
+) -> bool {
+    machine_state
+        .run_pending_body_frame_loop_membership_flat
+        .contains(&mob_dsl::LoopInstanceId::from(loop_instance_id.as_str()))
+}
+
+fn machine_candidate_frame_terminal_status(
+    machine_state: &mob_dsl::MobMachineState,
+    frame_id: &FrameId,
+) -> Option<flow_frame::FrameTerminalStatus> {
+    let frame_key = mob_dsl::FrameId::from(frame_id.as_str());
+    if machine_state.frame_phase.get(&frame_key) != Some(&mob_dsl::FrameStatus::Running) {
+        return None;
+    }
+    let tracked_nodes = machine_state.frame_tracked_nodes.get(&frame_key)?;
+    let node_status = machine_state.frame_node_status.get(&frame_key)?;
+    if !tracked_nodes.iter().all(|node_id| {
+        node_status
+            .get(node_id)
+            .copied()
+            .is_some_and(machine_node_status_is_terminal)
+    }) {
+        return None;
+    }
+    if tracked_nodes
+        .iter()
+        .any(|node_id| node_status.get(node_id) == Some(&mob_dsl::NodeRunStatus::Failed))
+    {
+        Some(flow_frame::FrameTerminalStatus::Failed)
+    } else if tracked_nodes
+        .iter()
+        .any(|node_id| node_status.get(node_id) == Some(&mob_dsl::NodeRunStatus::Canceled))
+    {
+        Some(flow_frame::FrameTerminalStatus::Canceled)
+    } else {
+        Some(flow_frame::FrameTerminalStatus::Completed)
+    }
+}
+
+fn machine_node_status_is_terminal(status: mob_dsl::NodeRunStatus) -> bool {
+    matches!(
+        status,
+        mob_dsl::NodeRunStatus::Completed
+            | mob_dsl::NodeRunStatus::Failed
+            | mob_dsl::NodeRunStatus::Skipped
+            | mob_dsl::NodeRunStatus::Canceled
+    )
 }
 
 fn root_terminal_phase(frame: &FrameSnapshot) -> Option<FlowFrameTerminalPhase> {
@@ -2066,34 +2675,40 @@ fn root_terminal_phase(frame: &FrameSnapshot) -> Option<FlowFrameTerminalPhase> 
 
 fn run_transition_outcome(
     state: &flow_run::State,
-    input: flow_run::Input,
+    machine_state: &mob_dsl::MobMachineState,
+    run_id: &RunId,
+    command: MobMachineFlowRunCommand,
+    authority: MobMachineFlowAuthorityToken,
 ) -> Result<flow_run::Outcome, MobError> {
-    flow_run::transition(state, input, &flow_run::EmptyContext)
-        .map_err(|error| MobError::Internal(format!("flow_run transition refused: {error:?}")))
+    apply_mob_machine_flow_run_command(state, machine_state, run_id, command, authority)
 }
 
 fn run_transition_state(
     state: &flow_run::State,
-    input: flow_run::Input,
+    machine_state: &mob_dsl::MobMachineState,
+    run_id: &RunId,
+    command: MobMachineFlowRunCommand,
+    authority: MobMachineFlowAuthorityToken,
 ) -> Result<flow_run::State, MobError> {
-    Ok(run_transition_outcome(state, input)?.next_state)
+    Ok(run_transition_outcome(state, machine_state, run_id, command, authority)?.next_state)
 }
 
 fn frame_transition_outcome(
     state: &flow_frame::State,
-    input: flow_frame::Input,
+    machine_state: &mob_dsl::MobMachineState,
+    command: MobMachineFlowFrameCommand,
+    authority: MobMachineFlowAuthorityToken,
 ) -> Result<flow_frame::Outcome, MobError> {
-    flow_frame::transition(state, input, &flow_frame::EmptyContext)
-        .map_err(|error| MobError::Internal(format!("flow_frame transition refused: {error:?}")))
+    apply_mob_machine_flow_frame_command(state, machine_state, command, authority)
 }
 
 fn loop_transition_outcome(
     state: &loop_iteration::State,
-    input: loop_iteration::Input,
+    machine_state: &mob_dsl::MobMachineState,
+    command: MobMachineLoopIterationCommand,
+    authority: MobMachineFlowAuthorityToken,
 ) -> Result<loop_iteration::Outcome, MobError> {
-    loop_iteration::transition(state, input, &loop_iteration::EmptyContext).map_err(|error| {
-        MobError::Internal(format!("loop_iteration transition refused: {error:?}"))
-    })
+    apply_mob_machine_loop_iteration_command(state, machine_state, command, authority)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2134,150 +2749,361 @@ fn loop_current_iteration(state: &loop_iteration::State) -> Result<u64, MobError
     Ok(u64::from(state.current_iteration))
 }
 
-fn initial_loop_snapshot(
-    loop_instance_id: &LoopInstanceId,
-    loop_spec: &crate::definition::RepeatUntilSpec,
-    parent_frame_id: &FrameId,
-    parent_node_id: &FlowNodeId,
-    depth: u32,
-) -> Result<LoopSnapshot, MobError> {
-    let initial = loop_iteration::initial_state();
-    let start = loop_transition_outcome(
-        &initial,
-        loop_iteration::Input::StartLoop(loop_iteration::inputs::StartLoop {
-            loop_instance_id: loop_instance_id.clone(),
-            max_iterations: loop_spec.max_iterations,
-            parent_frame_id: parent_frame_id.clone(),
-            parent_node_id: parent_node_id.clone(),
-            loop_id: loop_spec.loop_id.clone(),
+impl FlowFrameEngine {
+    async fn initial_loop_snapshot(
+        &self,
+        loop_instance_id: &LoopInstanceId,
+        loop_spec: &crate::definition::RepeatUntilSpec,
+        parent_frame_id: &FrameId,
+        parent_node_id: &FlowNodeId,
+        depth: u32,
+    ) -> Result<(LoopSnapshot, mob_dsl::MobMachineInput), MobError> {
+        let initial = loop_iteration::initial_state();
+        let command =
+            MobMachineLoopIterationCommand::StartLoop(loop_iteration::inputs::StartLoop {
+                loop_instance_id: loop_instance_id.clone(),
+                max_iterations: loop_spec.max_iterations,
+                parent_frame_id: parent_frame_id.clone(),
+                parent_node_id: parent_node_id.clone(),
+                loop_id: loop_spec.loop_id.clone(),
+                depth,
+            });
+        let seed_input = crate::run::MobRun::create_loop_seed_input_for_start(
+            loop_instance_id,
+            parent_frame_id,
+            parent_node_id,
+            &loop_spec.loop_id,
             depth,
-        }),
-    )?;
-    Ok(LoopSnapshot {
-        kernel_state: start.next_state,
-    })
-}
-
-fn initial_body_frame_snapshot(
-    frame_id: &FrameId,
-    loop_instance_id: &LoopInstanceId,
-    iteration: u64,
-    spec: &FrameSpec,
-) -> Result<FrameSnapshot, MobError> {
-    let initial = flow_frame::initial_state();
-    let ordered = crate::runtime::flow_frame_engine::topological_order(spec)?;
-    let start_input = crate::runtime::flow_frame_engine::build_start_body_frame_input(
-        frame_id,
-        loop_instance_id,
-        iteration,
-        spec,
-        &ordered,
-    );
-    let outcome = flow_frame::transition(&initial, start_input, &flow_frame::EmptyContext)
-        .map_err(|error| {
-            MobError::Internal(format!("flow_frame StartBodyFrame failed: {error:?}"))
-        })?;
-    Ok(FrameSnapshot {
-        kernel_state: outcome.next_state,
-    })
-}
-
-fn frame_ready(state: &flow_frame::State) -> bool {
-    !state.ready_queue.is_empty()
-}
-
-fn all_nodes_terminal(state: &flow_frame::State, spec: &FrameSpec) -> bool {
-    spec.nodes.keys().all(|node_id| {
-        state
-            .node_status
-            .get(node_id)
-            .is_some_and(|status| node_status_is_terminal(*status))
-    })
-}
-
-fn node_status_is_terminal(status: flow_frame::NodeRunStatus) -> bool {
-    matches!(
-        status,
-        flow_frame::NodeRunStatus::Completed
-            | flow_frame::NodeRunStatus::Failed
-            | flow_frame::NodeRunStatus::Skipped
-            | flow_frame::NodeRunStatus::Canceled
-    )
-}
-
-fn register_ready_frame_if_needed(
-    run_state: &flow_run::State,
-    frame_id: &FrameId,
-    frame_state: &flow_frame::State,
-) -> Result<Option<FlowFrameLoopStorePlan>, MobError> {
-    if frame_state.phase != flow_frame::Phase::Running
-        || !frame_ready(frame_state)
-        || run_state.ready_frame_membership.contains(frame_id)
-    {
-        return Ok(None);
+            loop_spec.max_iterations,
+        );
+        let machine_state = self
+            .frame_kernel
+            .preview_mob_machine_input(seed_input.clone())
+            .await?;
+        let authority = MobMachineFlowAuthorityToken::from_accepted_mob_machine_input(&seed_input)?;
+        let start = loop_transition_outcome(&initial, &machine_state, command, authority)?;
+        Ok((
+            LoopSnapshot {
+                kernel_state: start.next_state,
+            },
+            seed_input,
+        ))
     }
-    Ok(Some(FlowFrameLoopStorePlan::RunStateOnly {
-        expected_run_state: run_state.clone(),
-        next_run_state: flow_run::transition(
-            run_state,
-            flow_run::Input::RegisterReadyFrame(flow_run::inputs::RegisterReadyFrame {
-                frame_id: frame_id.clone(),
-            }),
-            &flow_run::EmptyContext,
-        )
-        .map_err(|error| MobError::Internal(format!("flow_run transition refused: {error:?}")))?
-        .next_state,
-    }))
-}
 
-fn release_node_execution(
-    run_state: &flow_run::State,
-    frame_id: &FrameId,
-) -> Result<FlowFrameLoopStorePlan, MobError> {
-    Ok(FlowFrameLoopStorePlan::RunStateOnly {
-        expected_run_state: run_state.clone(),
-        next_run_state: flow_run::transition(
-            run_state,
-            flow_run::Input::NodeExecutionReleased(flow_run::inputs::NodeExecutionReleased {
-                frame_id: frame_id.clone(),
-            }),
-            &flow_run::EmptyContext,
-        )
-        .map_err(|error| MobError::Internal(format!("flow_run transition refused: {error:?}")))?
-        .next_state,
-    })
-}
-
-fn seal_frame_if_ready(
-    frame_id: &FrameId,
-    current_frame: &FrameSnapshot,
-    frame_spec: &FrameSpec,
-) -> Result<Option<FlowFrameLoopStorePlan>, MobError> {
-    if current_frame.kernel_state.phase != flow_frame::Phase::Running
-        || !all_nodes_terminal(&current_frame.kernel_state, frame_spec)
-    {
-        return Ok(None);
+    async fn initial_body_frame_snapshot(
+        &self,
+        run_id: &RunId,
+        frame_id: &FrameId,
+        loop_instance_id: &LoopInstanceId,
+        iteration: u64,
+        spec: &FrameSpec,
+    ) -> Result<
+        (
+            FrameSnapshot,
+            mob_dsl::MobMachineInput,
+            mob_dsl::MobMachineState,
+        ),
+        MobError,
+    > {
+        let initial = flow_frame::initial_state();
+        let ordered = crate::runtime::flow_frame_engine::topological_order(spec)?;
+        let start_input = crate::runtime::flow_frame_engine::build_start_body_frame_input(
+            frame_id,
+            loop_instance_id,
+            iteration,
+            spec,
+            &ordered,
+        );
+        let command = MobMachineFlowFrameCommand::StartBodyFrame(start_input);
+        let seed_input = crate::run::MobRun::create_frame_seed_input(
+            run_id,
+            frame_id,
+            Some(loop_instance_id),
+            u32::try_from(iteration).map_err(|_| {
+                MobError::Internal("loop iteration exceeds u32 during body frame start".to_string())
+            })?,
+            crate::machines::mob_machine::FrameScope::Body,
+            spec,
+            &ordered,
+        )?;
+        let machine_state = self
+            .frame_kernel
+            .preview_mob_machine_input(seed_input.clone())
+            .await?;
+        let authority = MobMachineFlowAuthorityToken::from_accepted_mob_machine_input(&seed_input)?;
+        let outcome = frame_transition_outcome(&initial, &machine_state, command, authority)?;
+        Ok((
+            FrameSnapshot {
+                kernel_state: outcome.next_state,
+            },
+            seed_input,
+            machine_state,
+        ))
     }
-    let outcome = flow_frame::transition(
-        &current_frame.kernel_state,
-        flow_frame::Input::SealFrame(flow_frame::inputs::SealFrame {}),
-        &flow_frame::EmptyContext,
-    )
-    .map_err(|error| MobError::Internal(format!("flow_frame transition refused: {error:?}")))?;
-    Ok(Some(FlowFrameLoopStorePlan::SealFrame {
-        frame_id: frame_id.clone(),
-        expected_frame: current_frame.clone(),
-        next_frame: FrameSnapshot {
-            kernel_state: outcome.next_state,
+}
+
+fn mob_machine_seed_already_confirmed(error: &MobError) -> bool {
+    error.to_string().contains("frame_seed_is_new")
+}
+
+fn machine_frame_scope(scope: flow_frame::FrameScope) -> crate::machines::mob_machine::FrameScope {
+    match scope {
+        flow_frame::FrameScope::Root => crate::machines::mob_machine::FrameScope::Root,
+        flow_frame::FrameScope::Body => crate::machines::mob_machine::FrameScope::Body,
+    }
+}
+
+fn project_frame_status(status: mob_dsl::FrameStatus) -> flow_frame::Phase {
+    match status {
+        mob_dsl::FrameStatus::Running => flow_frame::Phase::Running,
+        mob_dsl::FrameStatus::Completed => flow_frame::Phase::Completed,
+        mob_dsl::FrameStatus::Failed => flow_frame::Phase::Failed,
+        mob_dsl::FrameStatus::Canceled => flow_frame::Phase::Canceled,
+    }
+}
+
+fn validate_seed_confirmation_matches_snapshot(
+    frame_id: &FrameId,
+    existing: &flow_frame::State,
+    machine_state: &mob_dsl::MobMachineState,
+) -> Result<(), MobError> {
+    let frame_key = mob_dsl::FrameId::from(frame_id.as_str());
+    let Some(accepted_phase) = machine_state.frame_phase.get(&frame_key) else {
+        return Err(MobError::Internal(format!(
+            "MobMachine accepted CreateFrameSeed for existing frame '{frame_id}' without frame_phase projection"
+        )));
+    };
+    if project_frame_status(*accepted_phase) != existing.phase {
+        return Err(MobError::Internal(format!(
+            "MobMachine CreateFrameSeed confirmation for existing frame '{frame_id}' projected phase {:?}, but recovered snapshot has {:?}",
+            project_frame_status(*accepted_phase),
+            existing.phase
+        )));
+    }
+
+    let expected_statuses = existing
+        .node_status
+        .iter()
+        .map(|(id, status)| {
+            (
+                mob_dsl::FlowNodeId::from(id.as_str()),
+                machine_node_status(*status),
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let Some(accepted_statuses) = machine_state.frame_node_status.get(&frame_key) else {
+        return Err(MobError::Internal(format!(
+            "MobMachine accepted CreateFrameSeed for existing frame '{frame_id}' without frame_node_status projection"
+        )));
+    };
+    if accepted_statuses != &expected_statuses {
+        return Err(MobError::Internal(format!(
+            "MobMachine CreateFrameSeed confirmation for existing frame '{frame_id}' projected node statuses that differ from recovered snapshot"
+        )));
+    }
+
+    let expected_ready_queue = existing
+        .ready_queue
+        .iter()
+        .map(|id| mob_dsl::FlowNodeId::from(id.as_str()))
+        .collect::<Vec<_>>();
+    let Some(accepted_ready_queue) = machine_state.frame_ready_queue.get(&frame_key) else {
+        return Err(MobError::Internal(format!(
+            "MobMachine accepted CreateFrameSeed for existing frame '{frame_id}' without frame_ready_queue projection"
+        )));
+    };
+    if accepted_ready_queue != &expected_ready_queue {
+        return Err(MobError::Internal(format!(
+            "MobMachine CreateFrameSeed confirmation for existing frame '{frame_id}' projected ready queue that differs from recovered snapshot"
+        )));
+    }
+
+    Ok(())
+}
+
+fn validate_accepted_frame_command_witness(
+    authority_input: &mob_dsl::MobMachineInput,
+    machine_state: &mob_dsl::MobMachineState,
+) -> Result<(), MobError> {
+    let mob_dsl::MobMachineInput::AuthorizeFlowFrameReducerCommand {
+        frame_id, command, ..
+    } = authority_input
+    else {
+        return Ok(());
+    };
+
+    if matches!(
+        command,
+        mob_dsl::FlowFrameReducerCommandKind::AdmitNextReadyNode
+            | mob_dsl::FlowFrameReducerCommandKind::CompleteNode
+            | mob_dsl::FlowFrameReducerCommandKind::FailNode
+            | mob_dsl::FlowFrameReducerCommandKind::SkipNode
+            | mob_dsl::FlowFrameReducerCommandKind::CancelNode
+    ) && (!machine_state.frame_node_status.contains_key(frame_id)
+        || !machine_state.frame_ready_queue.contains_key(frame_id))
+    {
+        return Err(MobError::Internal(format!(
+            "MobMachine accepted {command:?} for frame '{}' without machine-owned frame projection",
+            frame_id.0
+        )));
+    }
+
+    Ok(())
+}
+
+fn project_machine_node_status(status: mob_dsl::NodeRunStatus) -> flow_frame::NodeRunStatus {
+    match status {
+        mob_dsl::NodeRunStatus::Pending => flow_frame::NodeRunStatus::Pending,
+        mob_dsl::NodeRunStatus::Ready => flow_frame::NodeRunStatus::Ready,
+        mob_dsl::NodeRunStatus::Running => flow_frame::NodeRunStatus::Running,
+        mob_dsl::NodeRunStatus::Completed => flow_frame::NodeRunStatus::Completed,
+        mob_dsl::NodeRunStatus::Failed => flow_frame::NodeRunStatus::Failed,
+        mob_dsl::NodeRunStatus::Skipped => flow_frame::NodeRunStatus::Skipped,
+        mob_dsl::NodeRunStatus::Canceled => flow_frame::NodeRunStatus::Canceled,
+    }
+}
+
+fn machine_node_status(status: flow_frame::NodeRunStatus) -> mob_dsl::NodeRunStatus {
+    match status {
+        flow_frame::NodeRunStatus::Pending => mob_dsl::NodeRunStatus::Pending,
+        flow_frame::NodeRunStatus::Ready => mob_dsl::NodeRunStatus::Ready,
+        flow_frame::NodeRunStatus::Running => mob_dsl::NodeRunStatus::Running,
+        flow_frame::NodeRunStatus::Completed => mob_dsl::NodeRunStatus::Completed,
+        flow_frame::NodeRunStatus::Failed => mob_dsl::NodeRunStatus::Failed,
+        flow_frame::NodeRunStatus::Skipped => mob_dsl::NodeRunStatus::Skipped,
+        flow_frame::NodeRunStatus::Canceled => mob_dsl::NodeRunStatus::Canceled,
+    }
+}
+
+fn build_admit_next_ready_node_command_from_machine(
+    machine_state: &mob_dsl::MobMachineState,
+    frame_id: &FrameId,
+) -> Option<MobMachineFlowFrameCommand> {
+    let frame_key = mob_dsl::FrameId::from(frame_id.as_str());
+    if machine_state.frame_phase.get(&frame_key) != Some(&mob_dsl::FrameStatus::Running) {
+        return None;
+    }
+    let ready_queue = machine_state.frame_ready_queue.get(&frame_key)?;
+    let node_id = ready_queue
+        .first()
+        .map(|candidate| FlowNodeId::from(candidate.0.as_str()))?;
+    let ready_queue = ready_queue
+        .iter()
+        .filter(|candidate| *candidate != &mob_dsl::FlowNodeId::from(node_id.as_str()))
+        .map(|candidate| FlowNodeId::from(candidate.0.as_str()))
+        .collect();
+    Some(MobMachineFlowFrameCommand::AdmitNextReadyNode(
+        flow_frame::inputs::AdmitNextReadyNode {
+            node_id,
+            ready_queue,
         },
-    }))
+    ))
+}
+
+impl FlowFrameEngine {
+    async fn register_ready_frame_if_needed(
+        &self,
+        run_id: &RunId,
+        run_state: &flow_run::State,
+        frame_id: &FrameId,
+        _frame_state: &flow_frame::State,
+    ) -> Result<Option<FlowFrameLoopStorePlan>, MobError> {
+        let current_machine_state = self.frame_kernel.current_mob_machine_state().await?;
+        if !machine_frame_has_ready_nodes(&current_machine_state, frame_id) {
+            return Ok(None);
+        }
+        if machine_run_ready_frame_registered(&current_machine_state, run_id, frame_id) {
+            return Ok(None);
+        }
+        let command =
+            MobMachineFlowRunCommand::RegisterReadyFrame(flow_run::inputs::RegisterReadyFrame {
+                frame_id: frame_id.clone(),
+            });
+        let machine_inputs = vec![command.authority_input(run_id)];
+        let (authority, machine_state) = self.authorize_run_command(run_id, &command).await?;
+        Ok(Some(FlowFrameLoopStorePlan::RunStateOnly {
+            machine_inputs,
+            expected_run_state: run_state.clone(),
+            next_run_state: run_transition_state(
+                run_state,
+                &machine_state,
+                run_id,
+                command,
+                authority,
+            )?,
+        }))
+    }
+
+    async fn release_node_execution(
+        &self,
+        run_id: &RunId,
+        run_state: &flow_run::State,
+        frame_id: &FrameId,
+    ) -> Result<FlowFrameLoopStorePlan, MobError> {
+        let command = MobMachineFlowRunCommand::NodeExecutionReleased(
+            flow_run::inputs::NodeExecutionReleased {
+                frame_id: frame_id.clone(),
+            },
+        );
+        let machine_inputs = vec![command.authority_input(run_id)];
+        let (authority, machine_state) = self.authorize_run_command(run_id, &command).await?;
+        Ok(FlowFrameLoopStorePlan::RunStateOnly {
+            machine_inputs,
+            expected_run_state: run_state.clone(),
+            next_run_state: run_transition_state(
+                run_state,
+                &machine_state,
+                run_id,
+                command,
+                authority,
+            )?,
+        })
+    }
+
+    async fn seal_frame_if_ready(
+        &self,
+        run_id: &RunId,
+        frame_id: &FrameId,
+        current_frame: &FrameSnapshot,
+        frame_spec: &FrameSpec,
+    ) -> Result<Option<FlowFrameLoopStorePlan>, MobError> {
+        let _ = frame_spec;
+        let current_machine_state = self.frame_kernel.current_mob_machine_state().await?;
+        let Some(terminal_status) =
+            machine_candidate_frame_terminal_status(&current_machine_state, frame_id)
+        else {
+            return Ok(None);
+        };
+        let command = MobMachineFlowFrameCommand::SealFrame(flow_frame::inputs::SealFrame {
+            terminal_status,
+        });
+        let machine_inputs = vec![command.authority_input(frame_id)];
+        let (authority, machine_state) = self
+            .authorize_frame_command(run_id, frame_id, &command)
+            .await?;
+        let outcome = frame_transition_outcome(
+            &current_frame.kernel_state,
+            &machine_state,
+            command,
+            authority,
+        )?;
+        Ok(Some(FlowFrameLoopStorePlan::SealFrame {
+            machine_inputs,
+            frame_id: frame_id.clone(),
+            expected_frame: current_frame.clone(),
+            next_frame: FrameSnapshot {
+                kernel_state: outcome.next_state,
+            },
+        }))
+    }
 }
 
 fn pending_until_obligation(
     loop_snapshot: &LoopSnapshot,
 ) -> Result<Option<FlowLoopUntilEvaluationObligation>, MobError> {
     if loop_snapshot.kernel_state.phase != loop_iteration::Phase::Running
-        || loop_snapshot.kernel_state.stage != loop_iteration::LoopIterationStage::AwaitingUntil
+        || loop_snapshot.kernel_state.stage
+            != loop_iteration::LoopIterationStage::AwaitingUntilEvaluation
     {
         return Ok(None);
     }
@@ -2309,187 +3135,262 @@ fn loop_until_evaluation_obligation_from_effect(
     }
 }
 
-fn acknowledge_node_grant(
-    expected_run_state: &flow_run::State,
-    grant: &PreviewedNodeGrant,
-    current_frame: &FrameSnapshot,
-    frame_spec: &FrameSpec,
-    current_depth: u32,
-    max_frame_depth: u32,
-) -> Result<FlowFrameLoopDecision, MobError> {
-    let frame_id = &grant.frame_id;
-    let admit_outcome = frame_transition_outcome(
-        &current_frame.kernel_state,
-        flow_frame::Input::AdmitNextReadyNode(flow_frame::inputs::AdmitNextReadyNode {}),
-    )?;
-    let next_frame = FrameSnapshot {
-        kernel_state: admit_outcome.next_state.clone(),
-    };
-    let mut next_run_state = grant.next_run_state.clone();
-
-    if has_flow_frame_effect(
-        &admit_outcome.effects,
-        FlowFrameEffectKind::NodeExecutionReleased,
-    ) {
-        next_run_state = run_transition_state(
-            &next_run_state,
-            flow_run::Input::NodeExecutionReleased(flow_run::inputs::NodeExecutionReleased {
-                frame_id: frame_id.clone(),
-            }),
-        )?;
-    }
-
-    if frame_ready(&next_frame.kernel_state)
-        && !next_run_state.ready_frame_membership.contains(frame_id)
-    {
-        next_run_state = run_transition_state(
-            &next_run_state,
-            flow_run::Input::RegisterReadyFrame(flow_run::inputs::RegisterReadyFrame {
-                frame_id: frame_id.clone(),
-            }),
-        )?;
-    }
-
-    if let Some(node_id) = effect_node_id(&admit_outcome.effects)? {
-        let loop_spec = match frame_spec.nodes.get(&node_id) {
-            Some(FlowNodeSpec::RepeatUntil(spec)) => spec.clone(),
-            _ => {
-                return Err(MobError::Internal(format!(
-                    "frame '{frame_id}' admitted non-loop node '{node_id}' as loop work"
-                )));
-            }
-        };
-        let body_depth = current_depth + 1;
-        if max_frame_depth > 0 && body_depth > max_frame_depth {
-            return Err(MobError::FrameDepthLimitExceeded {
-                loop_id: loop_spec.loop_id,
-                max_frame_depth,
-                current_depth: body_depth - 1,
+impl FlowFrameEngine {
+    async fn acknowledge_node_grant(
+        &self,
+        run_id: &RunId,
+        expected_run_state: &flow_run::State,
+        grant: &PreviewedNodeGrant,
+        current_frame: &FrameSnapshot,
+        frame_spec: &FrameSpec,
+        depth_limit: FrameDepthLimit,
+    ) -> Result<FlowFrameLoopDecision, MobError> {
+        let frame_id = &grant.frame_id;
+        let machine_state = self.frame_kernel.current_mob_machine_state().await?;
+        let Some(admit_command) =
+            build_admit_next_ready_node_command_from_machine(&machine_state, frame_id)
+        else {
+            return Ok(FlowFrameLoopDecision {
+                store_plan: None,
+                follow_up: Vec::new(),
             });
-        }
-        let loop_instance_id = LoopInstanceId::from(format!("{frame_id}::{node_id}").as_str());
-        let initial_loop = initial_loop_snapshot(
-            &loop_instance_id,
-            &loop_spec,
-            frame_id,
-            &node_id,
-            body_depth,
+        };
+        let (admit_authority, admit_machine_state) = self
+            .authorize_frame_command(run_id, frame_id, &admit_command)
+            .await?;
+        let mut machine_inputs = vec![
+            grant.machine_input.clone(),
+            admit_command.authority_input(frame_id),
+        ];
+        let admit_outcome = frame_transition_outcome(
+            &current_frame.kernel_state,
+            &admit_machine_state,
+            admit_command,
+            admit_authority,
         )?;
-        if state_is_awaiting_body_frame(&initial_loop.kernel_state)
-            && !next_run_state
-                .pending_body_frame_loop_membership
-                .contains(&loop_instance_id)
-        {
-            next_run_state = run_transition_state(
-                &next_run_state,
-                flow_run::Input::RegisterPendingBodyFrame(
+        let next_frame = FrameSnapshot {
+            kernel_state: admit_outcome.next_state.clone(),
+        };
+        let mut next_run_state = grant.next_run_state.clone();
+
+        if has_flow_frame_effect(
+            &admit_outcome.effects,
+            FlowFrameEffectKind::NodeExecutionReleased,
+        ) {
+            let command = MobMachineFlowRunCommand::NodeExecutionReleased(
+                flow_run::inputs::NodeExecutionReleased {
+                    frame_id: frame_id.clone(),
+                },
+            );
+            machine_inputs.push(command.authority_input(run_id));
+            let (authority, machine_state) = self.authorize_run_command(run_id, &command).await?;
+            next_run_state =
+                run_transition_state(&next_run_state, &machine_state, run_id, command, authority)?;
+        }
+
+        if machine_frame_has_ready_nodes(&admit_machine_state, frame_id) {
+            let command = MobMachineFlowRunCommand::RegisterReadyFrame(
+                flow_run::inputs::RegisterReadyFrame {
+                    frame_id: frame_id.clone(),
+                },
+            );
+            let authority_input = command.authority_input(run_id);
+            let mut staged_inputs = machine_inputs.clone();
+            staged_inputs.push(authority_input.clone());
+            let machine_state = self
+                .frame_kernel
+                .preview_mob_machine_inputs(&staged_inputs)
+                .await?;
+            let authority =
+                MobMachineFlowAuthorityToken::from_accepted_mob_machine_input(&authority_input)?;
+            machine_inputs.push(authority_input);
+            next_run_state =
+                run_transition_state(&next_run_state, &machine_state, run_id, command, authority)?;
+        }
+
+        if let Some(node_id) = effect_node_id(&admit_outcome.effects)? {
+            let loop_spec = match frame_spec.nodes.get(&node_id) {
+                Some(FlowNodeSpec::RepeatUntil(spec)) => spec.clone(),
+                _ => {
+                    return Err(MobError::Internal(format!(
+                        "frame '{frame_id}' admitted non-loop node '{node_id}' as loop work"
+                    )));
+                }
+            };
+            let body_depth = depth_limit.current_depth + 1;
+            if depth_limit.max_depth > 0 && body_depth > depth_limit.max_depth {
+                return Err(MobError::FrameDepthLimitExceeded {
+                    loop_id: loop_spec.loop_id,
+                    max_frame_depth: depth_limit.max_depth,
+                    current_depth: body_depth - 1,
+                });
+            }
+            let loop_instance_id = LoopInstanceId::from(format!("{frame_id}::{node_id}").as_str());
+            let (initial_loop, loop_seed_input) = self
+                .initial_loop_snapshot(
+                    &loop_instance_id,
+                    &loop_spec,
+                    frame_id,
+                    &node_id,
+                    body_depth,
+                )
+                .await?;
+            machine_inputs.push(loop_seed_input);
+            if state_is_awaiting_body_frame(&initial_loop.kernel_state) {
+                let command = MobMachineFlowRunCommand::RegisterPendingBodyFrame(
                     flow_run::inputs::RegisterPendingBodyFrame {
                         loop_instance_id: loop_instance_id.clone(),
                         depth: body_depth,
                     },
-                ),
-            )?;
+                );
+                let authority_input = command.authority_input(run_id);
+                let mut staged_inputs = machine_inputs.clone();
+                staged_inputs.push(authority_input.clone());
+                let machine_state = self
+                    .frame_kernel
+                    .preview_mob_machine_inputs(&staged_inputs)
+                    .await?;
+                let authority = MobMachineFlowAuthorityToken::from_accepted_mob_machine_input(
+                    &authority_input,
+                )?;
+                machine_inputs.push(authority_input);
+                next_run_state = run_transition_state(
+                    &next_run_state,
+                    &machine_state,
+                    run_id,
+                    command,
+                    authority,
+                )?;
+            }
+            return Ok(FlowFrameLoopDecision {
+                store_plan: Some(FlowFrameLoopStorePlan::StartLoop {
+                    machine_inputs,
+                    loop_instance_id,
+                    expected_run_state: expected_run_state.clone(),
+                    next_run_state,
+                    frame_id: frame_id.clone(),
+                    expected_frame: current_frame.clone(),
+                    next_frame,
+                    initial_loop,
+                }),
+                follow_up: Vec::new(),
+            });
         }
-        return Ok(FlowFrameLoopDecision {
-            store_plan: Some(FlowFrameLoopStorePlan::StartLoop {
-                loop_instance_id,
+
+        let mut follow_up = Vec::new();
+        if let Some(node_id) = effect_admit_step_node_id(&admit_outcome.effects) {
+            let step_id = match frame_spec.nodes.get(&node_id) {
+                Some(FlowNodeSpec::Step(step)) => step.step_id.clone(),
+                _ => {
+                    return Err(MobError::Internal(format!(
+                        "frame '{frame_id}' admitted non-step node '{node_id}' as step work"
+                    )));
+                }
+            };
+            follow_up.push(FlowFrameLoopWork::SpawnStep {
+                frame_id: frame_id.clone(),
+                node_id,
+                step_id,
+            });
+        } else {
+            follow_up.push(FlowFrameLoopWork::RevisitFrame {
+                frame_id: frame_id.clone(),
+            });
+        }
+        Ok(FlowFrameLoopDecision {
+            store_plan: Some(FlowFrameLoopStorePlan::GrantNodeSlot {
+                machine_inputs,
                 expected_run_state: expected_run_state.clone(),
                 next_run_state,
                 frame_id: frame_id.clone(),
                 expected_frame: current_frame.clone(),
                 next_frame,
-                initial_loop,
             }),
-            follow_up: Vec::new(),
-        });
+            follow_up,
+        })
     }
 
-    let mut follow_up = Vec::new();
-    if let Some(node_id) = effect_admit_step_node_id(&admit_outcome.effects) {
-        let step_id = match frame_spec.nodes.get(&node_id) {
-            Some(FlowNodeSpec::Step(step)) => step.step_id.clone(),
-            _ => {
-                return Err(MobError::Internal(format!(
-                    "frame '{frame_id}' admitted non-step node '{node_id}' as step work"
-                )));
-            }
-        };
-        follow_up.push(FlowFrameLoopWork::SpawnStep {
-            frame_id: frame_id.clone(),
-            node_id,
-            step_id,
-        });
-    } else {
-        follow_up.push(FlowFrameLoopWork::RevisitFrame {
-            frame_id: frame_id.clone(),
-        });
-    }
-    Ok(FlowFrameLoopDecision {
-        store_plan: Some(FlowFrameLoopStorePlan::GrantNodeSlot {
-            expected_run_state: expected_run_state.clone(),
-            next_run_state,
-            frame_id: frame_id.clone(),
-            expected_frame: current_frame.clone(),
-            next_frame,
-        }),
-        follow_up,
-    })
-}
-
-fn acknowledge_body_frame_start(
-    expected_run_state: &flow_run::State,
-    grant: &PreviewedBodyFrameGrant,
-    loop_snapshot: &LoopSnapshot,
-    loop_spec: &crate::definition::RepeatUntilSpec,
-) -> Result<FlowFrameLoopDecision, MobError> {
-    let iteration = loop_current_iteration(&loop_snapshot.kernel_state)?;
-    let frame_id = FrameId::from(format!("{}::iter-{iteration}", grant.loop_instance_id).as_str());
-    let initial_frame = initial_body_frame_snapshot(
-        &frame_id,
-        &grant.loop_instance_id,
-        iteration,
-        &loop_spec.body,
-    )?;
-    let body_frame_outcome = loop_transition_outcome(
-        &loop_snapshot.kernel_state,
-        loop_iteration::Input::BodyFrameStarted(loop_iteration::inputs::BodyFrameStarted {
-            loop_instance_id: grant.loop_instance_id.clone(),
-            frame_id: frame_id.clone(),
-            iteration: iteration as u32,
-        }),
-    )?;
-    let next_loop = LoopSnapshot {
-        kernel_state: body_frame_outcome.next_state,
-    };
-    let ledger_entry = LoopIterationLedgerEntry {
-        loop_instance_id: grant.loop_instance_id.clone(),
-        iteration,
-        frame_id: frame_id.clone(),
-    };
-    let mut next_run_state = grant.next_run_state.clone();
-    if frame_ready(&initial_frame.kernel_state)
-        && !next_run_state.ready_frame_membership.contains(&frame_id)
-    {
-        next_run_state = run_transition_state(
-            &next_run_state,
-            flow_run::Input::RegisterReadyFrame(flow_run::inputs::RegisterReadyFrame {
+    async fn acknowledge_body_frame_start(
+        &self,
+        run_id: &RunId,
+        expected_run_state: &flow_run::State,
+        grant: &PreviewedBodyFrameGrant,
+        loop_snapshot: &LoopSnapshot,
+        loop_spec: &crate::definition::RepeatUntilSpec,
+    ) -> Result<FlowFrameLoopDecision, MobError> {
+        let iteration = loop_current_iteration(&loop_snapshot.kernel_state)?;
+        let frame_id =
+            FrameId::from(format!("{}::iter-{iteration}", grant.loop_instance_id).as_str());
+        let (initial_frame, body_frame_seed_input, body_frame_seed_machine_state) = self
+            .initial_body_frame_snapshot(
+                run_id,
+                &frame_id,
+                &grant.loop_instance_id,
+                iteration,
+                &loop_spec.body,
+            )
+            .await?;
+        let body_frame_started = MobMachineLoopIterationCommand::BodyFrameStarted(
+            loop_iteration::inputs::BodyFrameStarted {
+                loop_instance_id: grant.loop_instance_id.clone(),
                 frame_id: frame_id.clone(),
-            }),
+                iteration: iteration as u32,
+            },
+        );
+        let body_frame_started_authority =
+            MobMachineFlowAuthorityToken::from_accepted_mob_machine_body_frame_seed(
+                &body_frame_seed_input,
+            )?;
+        let body_frame_outcome = loop_transition_outcome(
+            &loop_snapshot.kernel_state,
+            &body_frame_seed_machine_state,
+            body_frame_started,
+            body_frame_started_authority,
         )?;
-    }
-    Ok(FlowFrameLoopDecision {
-        store_plan: Some(FlowFrameLoopStorePlan::GrantBodyFrameStart {
+        let next_loop = LoopSnapshot {
+            kernel_state: body_frame_outcome.next_state,
+        };
+        let ledger_entry = LoopIterationLedgerEntry {
             loop_instance_id: grant.loop_instance_id.clone(),
-            expected_loop: loop_snapshot.clone(),
-            next_loop,
+            iteration,
             frame_id: frame_id.clone(),
-            initial_frame,
-            ledger_entry,
-            expected_run_state: expected_run_state.clone(),
-            next_run_state,
-        }),
-        follow_up: vec![FlowFrameLoopWork::RevisitFrame { frame_id }],
-    })
+        };
+        let mut next_run_state = grant.next_run_state.clone();
+        let mut machine_inputs = vec![grant.machine_input.clone(), body_frame_seed_input];
+        if machine_frame_has_ready_nodes(&body_frame_seed_machine_state, &frame_id) {
+            let command = MobMachineFlowRunCommand::RegisterReadyFrame(
+                flow_run::inputs::RegisterReadyFrame {
+                    frame_id: frame_id.clone(),
+                },
+            );
+            let authority_input = command.authority_input(run_id);
+            let mut staged_inputs = machine_inputs.clone();
+            staged_inputs.push(authority_input.clone());
+            let machine_state = self
+                .frame_kernel
+                .preview_mob_machine_inputs(&staged_inputs)
+                .await?;
+            let authority =
+                MobMachineFlowAuthorityToken::from_accepted_mob_machine_input(&authority_input)?;
+            machine_inputs.push(authority_input);
+            next_run_state =
+                run_transition_state(&next_run_state, &machine_state, run_id, command, authority)?;
+        }
+        Ok(FlowFrameLoopDecision {
+            store_plan: Some(FlowFrameLoopStorePlan::GrantBodyFrameStart {
+                machine_inputs,
+                loop_instance_id: grant.loop_instance_id.clone(),
+                expected_loop: loop_snapshot.clone(),
+                next_loop,
+                frame_id: frame_id.clone(),
+                initial_frame,
+                ledger_entry,
+                expected_run_state: expected_run_state.clone(),
+                next_run_state,
+            }),
+            follow_up: vec![FlowFrameLoopWork::RevisitFrame { frame_id }],
+        })
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2512,21 +3413,21 @@ impl BodyFrameTerminalProjection {
         self,
         loop_instance_id: &LoopInstanceId,
         iteration: u32,
-    ) -> loop_iteration::Input {
+    ) -> MobMachineLoopIterationCommand {
         match self {
-            Self::Completed => loop_iteration::Input::BodyFrameCompleted(
+            Self::Completed => MobMachineLoopIterationCommand::BodyFrameCompleted(
                 loop_iteration::inputs::BodyFrameCompleted {
                     loop_instance_id: loop_instance_id.clone(),
                     iteration,
                 },
             ),
-            Self::Failed => {
-                loop_iteration::Input::BodyFrameFailed(loop_iteration::inputs::BodyFrameFailed {
+            Self::Failed => MobMachineLoopIterationCommand::BodyFrameFailed(
+                loop_iteration::inputs::BodyFrameFailed {
                     loop_instance_id: loop_instance_id.clone(),
                     iteration,
-                })
-            }
-            Self::Canceled => loop_iteration::Input::BodyFrameCanceled(
+                },
+            ),
+            Self::Canceled => MobMachineLoopIterationCommand::BodyFrameCanceled(
                 loop_iteration::inputs::BodyFrameCanceled {
                     loop_instance_id: loop_instance_id.clone(),
                     iteration,
@@ -2536,50 +3437,65 @@ impl BodyFrameTerminalProjection {
     }
 }
 
-fn advance_body_frame_after_seal(
-    run_state: &flow_run::State,
-    body_frame_id: &FrameId,
-    body_frame: &FrameSnapshot,
-    loop_snapshot: &LoopSnapshot,
-    parent_frame: Option<&FrameSnapshot>,
-) -> Result<Option<FlowFrameLoopDecision>, MobError> {
-    if !frame_is_body(&body_frame.kernel_state)
-        || body_frame.kernel_state.phase == flow_frame::Phase::Running
-    {
-        return Ok(None);
-    }
-    let Some(loop_instance_id) = frame_loop_instance_id(&body_frame.kernel_state) else {
-        return Ok(None);
-    };
-    if active_body_frame_id(&loop_snapshot.kernel_state).as_ref() != Some(body_frame_id) {
-        return Ok(None);
-    }
+impl FlowFrameEngine {
+    async fn advance_body_frame_after_seal(
+        &self,
+        run_id: &RunId,
+        run_state: &flow_run::State,
+        body_frame_id: &FrameId,
+        body_frame: &FrameSnapshot,
+        loop_snapshot: &LoopSnapshot,
+        parent_frame: Option<&FrameSnapshot>,
+    ) -> Result<Option<FlowFrameLoopDecision>, MobError> {
+        if !frame_is_body(&body_frame.kernel_state)
+            || body_frame.kernel_state.phase == flow_frame::Phase::Running
+        {
+            return Ok(None);
+        }
+        let Some(loop_instance_id) = frame_loop_instance_id(&body_frame.kernel_state) else {
+            return Ok(None);
+        };
+        if active_body_frame_id(&loop_snapshot.kernel_state).as_ref() != Some(body_frame_id) {
+            return Ok(None);
+        }
 
-    let iteration = frame_iteration(&body_frame.kernel_state)?;
-    let body_terminal =
-        BodyFrameTerminalProjection::from_frame_phase(terminal_phase(&body_frame.kernel_state)?);
-    let next_run_state = flow_run::transition(
-        run_state,
-        flow_run::Input::FrameTerminated(flow_run::inputs::FrameTerminated {
-            frame_id: body_frame_id.clone(),
-        }),
-        &flow_run::EmptyContext,
-    )
-    .map_err(|error| MobError::Internal(format!("flow_run transition refused: {error:?}")))?
-    .next_state;
-    let loop_outcome = loop_iteration::transition(
-        &loop_snapshot.kernel_state,
-        body_terminal.loop_input(&loop_instance_id, iteration as u32),
-        &loop_iteration::EmptyContext,
-    )
-    .map_err(|error| MobError::Internal(format!("loop_iteration transition refused: {error:?}")))?;
-    let next_loop = LoopSnapshot {
-        kernel_state: loop_outcome.next_state.clone(),
-    };
+        let iteration = frame_iteration(&body_frame.kernel_state)?;
+        let body_terminal = BodyFrameTerminalProjection::from_frame_phase(terminal_phase(
+            &body_frame.kernel_state,
+        )?);
+        let frame_terminated =
+            MobMachineFlowRunCommand::FrameTerminated(flow_run::inputs::FrameTerminated {
+                frame_id: body_frame_id.clone(),
+            });
+        let mut machine_inputs = vec![frame_terminated.authority_input(run_id)];
+        let (frame_terminated_authority, frame_terminated_machine_state) = self
+            .authorize_run_command(run_id, &frame_terminated)
+            .await?;
+        let next_run_state = run_transition_state(
+            run_state,
+            &frame_terminated_machine_state,
+            run_id,
+            frame_terminated,
+            frame_terminated_authority,
+        )?;
+        let loop_command = body_terminal.loop_input(&loop_instance_id, iteration as u32);
+        machine_inputs.push(loop_command.authority_input(&loop_instance_id));
+        let (loop_authority, loop_machine_state) = self
+            .authorize_loop_command(&loop_instance_id, &loop_command)
+            .await?;
+        let loop_outcome = loop_transition_outcome(
+            &loop_snapshot.kernel_state,
+            &loop_machine_state,
+            loop_command,
+            loop_authority,
+        )?;
+        let next_loop = LoopSnapshot {
+            kernel_state: loop_outcome.next_state.clone(),
+        };
 
-    match terminal_phase(&body_frame.kernel_state)? {
-        FlowFrameTerminalPhase::Completed => {
-            let request = loop_outcome
+        match terminal_phase(&body_frame.kernel_state)? {
+            FlowFrameTerminalPhase::Completed => {
+                let request = loop_outcome
                 .effects
                 .iter()
                 .find(|effect| matches!(effect, loop_iteration::Effect::EvaluateUntilCondition(_)))
@@ -2588,202 +3504,232 @@ fn advance_body_frame_after_seal(
                         "loop '{loop_instance_id}' did not emit EvaluateUntilCondition after body-frame completion"
                     ))
                 })?;
-            let obligation = loop_until_evaluation_obligation_from_effect(request)?;
-            Ok(Some(FlowFrameLoopDecision {
-                store_plan: Some(FlowFrameLoopStorePlan::CompleteBodyFrame {
-                    loop_instance_id,
-                    expected_loop: loop_snapshot.clone(),
-                    next_loop,
-                    frame_id: body_frame_id.clone(),
-                    expected_frame: body_frame.clone(),
-                    next_frame: body_frame.clone(),
-                    expected_run_state: run_state.clone(),
-                    next_run_state,
-                }),
-                follow_up: vec![FlowFrameLoopWork::EvaluateUntil { obligation }],
-            }))
-        }
-        FlowFrameTerminalPhase::Failed | FlowFrameTerminalPhase::Canceled => {
-            let parent_frame = parent_frame.ok_or_else(|| {
+                let obligation = loop_until_evaluation_obligation_from_effect(request)?;
+                Ok(Some(FlowFrameLoopDecision {
+                    store_plan: Some(FlowFrameLoopStorePlan::CompleteBodyFrame {
+                        machine_inputs,
+                        loop_instance_id,
+                        expected_loop: loop_snapshot.clone(),
+                        next_loop,
+                        frame_id: body_frame_id.clone(),
+                        expected_frame: body_frame.clone(),
+                        next_frame: body_frame.clone(),
+                        expected_run_state: run_state.clone(),
+                        next_run_state,
+                    }),
+                    follow_up: vec![FlowFrameLoopWork::EvaluateUntil { obligation }],
+                }))
+            }
+            FlowFrameTerminalPhase::Failed | FlowFrameTerminalPhase::Canceled => {
+                let parent_frame = parent_frame.ok_or_else(|| {
                 MobError::Internal(format!(
                     "body-frame '{body_frame_id}' terminalization requires parent frame snapshot"
                 ))
             })?;
-            let loop_terminal = first_matching_loop_terminal_effect(&loop_outcome.effects)
+                let loop_terminal = first_matching_loop_terminal_effect(&loop_outcome.effects)
                 .ok_or_else(|| {
                     MobError::Internal(format!(
                         "loop '{loop_instance_id}' did not emit a terminal effect after '{body_terminal:?}'"
                     ))
                 })?;
-            let parent_frame_id = loop_parent_frame_id(&loop_outcome.next_state)?;
-            let parent_node_id = loop_parent_node_id(&loop_outcome.next_state)?;
-            Ok(Some(build_complete_loop_decision(
-                CompleteLoopDecisionRequest {
-                    loop_terminal,
-                    expected_run_state: run_state,
-                    next_run_state,
-                    loop_instance_id: &loop_instance_id,
-                    expected_loop: loop_snapshot,
-                    next_loop,
-                    parent_frame_id: &parent_frame_id,
-                    expected_parent_frame: parent_frame,
-                    parent_node_id: &parent_node_id,
-                },
-            )?))
+                let parent_frame_id = loop_parent_frame_id(&loop_outcome.next_state)?;
+                let parent_node_id = loop_parent_node_id(&loop_outcome.next_state)?;
+                Ok(Some(
+                    self.build_complete_loop_decision(CompleteLoopDecisionRequest {
+                        run_id,
+                        loop_terminal,
+                        machine_inputs,
+                        expected_run_state: run_state,
+                        next_run_state,
+                        loop_instance_id: &loop_instance_id,
+                        expected_loop: loop_snapshot,
+                        next_loop,
+                        parent_frame_id: &parent_frame_id,
+                        expected_parent_frame: parent_frame,
+                        parent_node_id: &parent_node_id,
+                    })
+                    .await?,
+                ))
+            }
         }
     }
-}
 
-fn resolve_until_feedback_decision(
-    run_state: &flow_run::State,
-    loop_snapshot: &LoopSnapshot,
-    parent_frame: &FrameSnapshot,
-    obligation: FlowLoopUntilEvaluationObligation,
-    until_met: bool,
-) -> Result<(FlowFrameLoopDecision, LoopUntilConditionFeedbackProjection), MobError> {
-    let feedback_input = if until_met {
-        loop_iteration::Input::UntilConditionMet(loop_iteration::inputs::UntilConditionMet {
+    async fn resolve_until_feedback_decision(
+        &self,
+        run_id: &RunId,
+        run_state: &flow_run::State,
+        loop_snapshot: &LoopSnapshot,
+        parent_frame: &FrameSnapshot,
+        obligation: FlowLoopUntilEvaluationObligation,
+        until_met: bool,
+    ) -> Result<(FlowFrameLoopDecision, LoopUntilConditionFeedbackProjection), MobError> {
+        let feedback_input = if until_met {
+            MobMachineLoopIterationCommand::UntilConditionMet(
+                loop_iteration::inputs::UntilConditionMet {
+                    loop_instance_id: obligation.loop_instance_id.clone(),
+                    iteration: obligation.iteration,
+                },
+            )
+        } else {
+            MobMachineLoopIterationCommand::UntilConditionFailed(
+                loop_iteration::inputs::UntilConditionFailed {
+                    loop_instance_id: obligation.loop_instance_id.clone(),
+                    iteration: obligation.iteration,
+                },
+            )
+        };
+        let (feedback_authority, feedback_machine_state) = self
+            .authorize_loop_command(&obligation.loop_instance_id, &feedback_input)
+            .await?;
+        let mut machine_inputs = vec![feedback_input.authority_input(&obligation.loop_instance_id)];
+        let feedback = loop_transition_outcome(
+            &loop_snapshot.kernel_state,
+            &feedback_machine_state,
+            feedback_input,
+            feedback_authority,
+        )?;
+        let next_loop = LoopSnapshot {
+            kernel_state: feedback.next_state.clone(),
+        };
+        let until_feedback = LoopUntilConditionFeedbackProjection {
             loop_instance_id: obligation.loop_instance_id.clone(),
             iteration: obligation.iteration,
-        })
-    } else {
-        loop_iteration::Input::UntilConditionFailed(loop_iteration::inputs::UntilConditionFailed {
-            loop_instance_id: obligation.loop_instance_id.clone(),
-            iteration: obligation.iteration,
-        })
-    };
-    let feedback = loop_iteration::transition(
-        &loop_snapshot.kernel_state,
-        feedback_input,
-        &loop_iteration::EmptyContext,
-    )
-    .map_err(|error| MobError::Internal(format!("loop_iteration transition refused: {error:?}")))?;
-    let next_loop = LoopSnapshot {
-        kernel_state: feedback.next_state.clone(),
-    };
-    let until_feedback = LoopUntilConditionFeedbackProjection {
-        loop_instance_id: obligation.loop_instance_id.clone(),
-        iteration: obligation.iteration,
-        until_met,
-    };
+            until_met,
+        };
 
-    if let Some(depth) = maybe_effect_request_body_frame_start_depth(&feedback.effects) {
-        let mut next_run_state = run_state.clone();
-        if !run_state
-            .pending_body_frame_loop_membership
-            .contains(&obligation.loop_instance_id)
-        {
-            next_run_state = flow_run::transition(
-                &next_run_state,
-                flow_run::Input::RegisterPendingBodyFrame(
+        if let Some(depth) = maybe_effect_request_body_frame_start_depth(&feedback.effects) {
+            let mut next_run_state = run_state.clone();
+            if !machine_loop_pending_body_frame_registered(
+                &feedback_machine_state,
+                &obligation.loop_instance_id,
+            ) {
+                let command = MobMachineFlowRunCommand::RegisterPendingBodyFrame(
                     flow_run::inputs::RegisterPendingBodyFrame {
                         loop_instance_id: obligation.loop_instance_id.clone(),
                         depth,
                     },
-                ),
-                &flow_run::EmptyContext,
-            )
-            .map_err(|error| MobError::Internal(format!("flow_run transition refused: {error:?}")))?
-            .next_state;
+                );
+                machine_inputs.push(command.authority_input(run_id));
+                let (authority, machine_state) =
+                    self.authorize_run_command(run_id, &command).await?;
+                next_run_state = run_transition_state(
+                    &next_run_state,
+                    &machine_state,
+                    run_id,
+                    command,
+                    authority,
+                )?;
+            }
+            return Ok((
+                FlowFrameLoopDecision {
+                    store_plan: Some(FlowFrameLoopStorePlan::LoopRequestBodyFrame {
+                        machine_inputs,
+                        loop_instance_id: obligation.loop_instance_id,
+                        expected_loop: loop_snapshot.clone(),
+                        next_loop,
+                        expected_run_state: run_state.clone(),
+                        next_run_state,
+                    }),
+                    follow_up: Vec::new(),
+                },
+                until_feedback,
+            ));
         }
-        return Ok((
-            FlowFrameLoopDecision {
-                store_plan: Some(FlowFrameLoopStorePlan::LoopRequestBodyFrame {
-                    loop_instance_id: obligation.loop_instance_id,
-                    expected_loop: loop_snapshot.clone(),
-                    next_loop,
-                    expected_run_state: run_state.clone(),
-                    next_run_state,
-                }),
-                follow_up: Vec::new(),
-            },
-            until_feedback,
-        ));
-    }
 
-    let loop_terminal = first_matching_loop_terminal_effect(&feedback.effects).ok_or_else(|| {
+        let loop_terminal = first_matching_loop_terminal_effect(&feedback.effects).ok_or_else(|| {
         MobError::Internal(format!(
             "until feedback for loop '{}' produced neither RequestBodyFrameStart nor terminal effect",
             obligation.loop_instance_id
         ))
     })?;
-    let decision = build_complete_loop_decision(CompleteLoopDecisionRequest {
-        loop_terminal,
-        expected_run_state: run_state,
-        next_run_state: run_state.clone(),
-        loop_instance_id: &obligation.loop_instance_id,
-        expected_loop: loop_snapshot,
-        next_loop,
-        parent_frame_id: &obligation.parent_frame_id,
-        expected_parent_frame: parent_frame,
-        parent_node_id: &obligation.parent_node_id,
-    })?;
-    Ok((decision, until_feedback))
-}
-
-fn recover_terminal_loop_projection(
-    run_state: &flow_run::State,
-    loop_snapshot: &LoopSnapshot,
-    parent_frame: &FrameSnapshot,
-) -> Result<Option<FlowFrameLoopDecision>, MobError> {
-    let Some(loop_terminal) = loop_terminal_effect(&loop_snapshot.kernel_state.phase) else {
-        return Ok(None);
-    };
-    let loop_instance_id = loop_snapshot.kernel_state.loop_instance_id.clone();
-    let parent_frame_id = loop_parent_frame_id(&loop_snapshot.kernel_state)?;
-    let parent_node_id = loop_parent_node_id(&loop_snapshot.kernel_state)?;
-    Ok(Some(build_complete_loop_decision(
-        CompleteLoopDecisionRequest {
-            loop_terminal,
-            expected_run_state: run_state,
-            next_run_state: run_state.clone(),
-            loop_instance_id: &loop_instance_id,
-            expected_loop: loop_snapshot,
-            next_loop: loop_snapshot.clone(),
-            parent_frame_id: &parent_frame_id,
-            expected_parent_frame: parent_frame,
-            parent_node_id: &parent_node_id,
-        },
-    )?))
-}
-
-fn recover_pending_body_frame_request(
-    run_state: &flow_run::State,
-    loop_snapshot: &LoopSnapshot,
-) -> Result<Option<FlowFrameLoopDecision>, MobError> {
-    if loop_snapshot.kernel_state.phase != loop_iteration::Phase::Running
-        || !state_is_awaiting_body_frame(&loop_snapshot.kernel_state)
-        || active_body_frame_id(&loop_snapshot.kernel_state).is_some()
-    {
-        return Ok(None);
+        let decision = self
+            .build_complete_loop_decision(CompleteLoopDecisionRequest {
+                run_id,
+                loop_terminal,
+                machine_inputs,
+                expected_run_state: run_state,
+                next_run_state: run_state.clone(),
+                loop_instance_id: &obligation.loop_instance_id,
+                expected_loop: loop_snapshot,
+                next_loop,
+                parent_frame_id: &obligation.parent_frame_id,
+                expected_parent_frame: parent_frame,
+                parent_node_id: &obligation.parent_node_id,
+            })
+            .await?;
+        Ok((decision, until_feedback))
     }
 
-    let loop_instance_id = loop_snapshot.kernel_state.loop_instance_id.clone();
-    if run_state
-        .pending_body_frame_loop_membership
-        .contains(&loop_instance_id)
-    {
-        return Ok(None);
+    async fn recover_terminal_loop_projection(
+        &self,
+        run_id: &RunId,
+        run_state: &flow_run::State,
+        loop_snapshot: &LoopSnapshot,
+        parent_frame: &FrameSnapshot,
+    ) -> Result<Option<FlowFrameLoopDecision>, MobError> {
+        let Some(loop_terminal) = loop_terminal_effect(&loop_snapshot.kernel_state.phase) else {
+            return Ok(None);
+        };
+        let loop_instance_id = loop_snapshot.kernel_state.loop_instance_id.clone();
+        let parent_frame_id = loop_parent_frame_id(&loop_snapshot.kernel_state)?;
+        let parent_node_id = loop_parent_node_id(&loop_snapshot.kernel_state)?;
+        Ok(Some(
+            self.build_complete_loop_decision(CompleteLoopDecisionRequest {
+                run_id,
+                loop_terminal,
+                machine_inputs: Vec::new(),
+                expected_run_state: run_state,
+                next_run_state: run_state.clone(),
+                loop_instance_id: &loop_instance_id,
+                expected_loop: loop_snapshot,
+                next_loop: loop_snapshot.clone(),
+                parent_frame_id: &parent_frame_id,
+                expected_parent_frame: parent_frame,
+                parent_node_id: &parent_node_id,
+            })
+            .await?,
+        ))
     }
 
-    let depth = loop_snapshot.kernel_state.depth;
-    let next_run_state = flow_run::transition(
-        run_state,
-        flow_run::Input::RegisterPendingBodyFrame(flow_run::inputs::RegisterPendingBodyFrame {
-            loop_instance_id,
-            depth,
-        }),
-        &flow_run::EmptyContext,
-    )
-    .map_err(|error| MobError::Internal(format!("flow_run transition refused: {error:?}")))?
-    .next_state;
-    Ok(Some(FlowFrameLoopDecision {
-        store_plan: Some(FlowFrameLoopStorePlan::RunStateOnly {
-            expected_run_state: run_state.clone(),
-            next_run_state,
-        }),
-        follow_up: Vec::new(),
-    }))
+    async fn recover_pending_body_frame_request(
+        &self,
+        run_id: &RunId,
+        run_state: &flow_run::State,
+        loop_snapshot: &LoopSnapshot,
+    ) -> Result<Option<FlowFrameLoopDecision>, MobError> {
+        if loop_snapshot.kernel_state.phase != loop_iteration::Phase::Running
+            || !state_is_awaiting_body_frame(&loop_snapshot.kernel_state)
+            || active_body_frame_id(&loop_snapshot.kernel_state).is_some()
+        {
+            return Ok(None);
+        }
+
+        let loop_instance_id = loop_snapshot.kernel_state.loop_instance_id.clone();
+        let machine_state = self.frame_kernel.current_mob_machine_state().await?;
+        if machine_loop_pending_body_frame_registered(&machine_state, &loop_instance_id) {
+            return Ok(None);
+        }
+
+        let depth = loop_snapshot.kernel_state.depth;
+        let command = MobMachineFlowRunCommand::RegisterPendingBodyFrame(
+            flow_run::inputs::RegisterPendingBodyFrame {
+                loop_instance_id,
+                depth,
+            },
+        );
+        let machine_inputs = vec![command.authority_input(run_id)];
+        let (authority, machine_state) = self.authorize_run_command(run_id, &command).await?;
+        let next_run_state =
+            run_transition_state(run_state, &machine_state, run_id, command, authority)?;
+        Ok(Some(FlowFrameLoopDecision {
+            store_plan: Some(FlowFrameLoopStorePlan::RunStateOnly {
+                machine_inputs,
+                expected_run_state: run_state.clone(),
+                next_run_state,
+            }),
+            follow_up: Vec::new(),
+        }))
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2806,7 +3752,9 @@ impl std::fmt::Display for LoopTerminalEffect {
 }
 
 struct CompleteLoopDecisionRequest<'a> {
+    run_id: &'a RunId,
     loop_terminal: LoopTerminalEffect,
+    machine_inputs: Vec<mob_dsl::MobMachineInput>,
     expected_run_state: &'a flow_run::State,
     next_run_state: flow_run::State,
     loop_instance_id: &'a LoopInstanceId,
@@ -2817,79 +3765,85 @@ struct CompleteLoopDecisionRequest<'a> {
     parent_node_id: &'a FlowNodeId,
 }
 
-fn build_complete_loop_decision(
-    request: CompleteLoopDecisionRequest<'_>,
-) -> Result<FlowFrameLoopDecision, MobError> {
-    let CompleteLoopDecisionRequest {
-        loop_terminal,
-        expected_run_state,
-        mut next_run_state,
-        loop_instance_id,
-        expected_loop,
-        next_loop,
-        parent_frame_id,
-        expected_parent_frame,
-        parent_node_id,
-    } = request;
-    let parent_input = loop_parent_input(loop_terminal, parent_node_id);
-    let parent_outcome = flow_frame::transition(
-        &expected_parent_frame.kernel_state,
-        parent_input,
-        &flow_frame::EmptyContext,
-    )
-    .map_err(|error| MobError::Internal(format!("flow_frame transition refused: {error:?}")))?;
-    let next_parent_frame = FrameSnapshot {
-        kernel_state: parent_outcome.next_state,
-    };
-    if frame_ready(&next_parent_frame.kernel_state)
-        && !next_run_state
-            .ready_frame_membership
-            .contains(parent_frame_id)
-    {
-        next_run_state = flow_run::transition(
-            &next_run_state,
-            flow_run::Input::RegisterReadyFrame(flow_run::inputs::RegisterReadyFrame {
-                frame_id: parent_frame_id.clone(),
-            }),
-            &flow_run::EmptyContext,
-        )
-        .map_err(|error| MobError::Internal(format!("flow_run transition refused: {error:?}")))?
-        .next_state;
-    }
-    Ok(FlowFrameLoopDecision {
-        store_plan: Some(FlowFrameLoopStorePlan::CompleteLoop {
-            loop_instance_id: loop_instance_id.clone(),
-            expected_loop: expected_loop.clone(),
+impl FlowFrameEngine {
+    async fn build_complete_loop_decision(
+        &self,
+        request: CompleteLoopDecisionRequest<'_>,
+    ) -> Result<FlowFrameLoopDecision, MobError> {
+        let CompleteLoopDecisionRequest {
+            run_id,
+            loop_terminal,
+            mut machine_inputs,
+            expected_run_state,
+            mut next_run_state,
+            loop_instance_id,
+            expected_loop,
             next_loop,
-            frame_id: parent_frame_id.clone(),
-            expected_frame: expected_parent_frame.clone(),
-            next_frame: next_parent_frame,
-            expected_run_state: expected_run_state.clone(),
-            next_run_state,
-        }),
-        follow_up: vec![FlowFrameLoopWork::RevisitFrame {
-            frame_id: parent_frame_id.clone(),
-        }],
-    })
+            parent_frame_id,
+            expected_parent_frame,
+            parent_node_id,
+        } = request;
+        let parent_input = loop_parent_input(loop_terminal, parent_node_id);
+        machine_inputs.push(parent_input.authority_input(parent_frame_id));
+        let (parent_authority, parent_machine_state) = self
+            .authorize_frame_command(run_id, parent_frame_id, &parent_input)
+            .await?;
+        let parent_outcome = frame_transition_outcome(
+            &expected_parent_frame.kernel_state,
+            &parent_machine_state,
+            parent_input,
+            parent_authority,
+        )?;
+        let next_parent_frame = FrameSnapshot {
+            kernel_state: parent_outcome.next_state,
+        };
+        if machine_frame_has_ready_nodes(&parent_machine_state, parent_frame_id) {
+            let command = MobMachineFlowRunCommand::RegisterReadyFrame(
+                flow_run::inputs::RegisterReadyFrame {
+                    frame_id: parent_frame_id.clone(),
+                },
+            );
+            machine_inputs.push(command.authority_input(run_id));
+            let (authority, machine_state) = self.authorize_run_command(run_id, &command).await?;
+            next_run_state =
+                run_transition_state(&next_run_state, &machine_state, run_id, command, authority)?;
+        }
+        Ok(FlowFrameLoopDecision {
+            store_plan: Some(FlowFrameLoopStorePlan::CompleteLoop {
+                machine_inputs,
+                loop_instance_id: loop_instance_id.clone(),
+                expected_loop: expected_loop.clone(),
+                next_loop,
+                frame_id: parent_frame_id.clone(),
+                expected_frame: expected_parent_frame.clone(),
+                next_frame: next_parent_frame,
+                expected_run_state: expected_run_state.clone(),
+                next_run_state,
+            }),
+            follow_up: vec![FlowFrameLoopWork::RevisitFrame {
+                frame_id: parent_frame_id.clone(),
+            }],
+        })
+    }
 }
 
 fn loop_parent_input(
     loop_terminal: LoopTerminalEffect,
     parent_node_id: &FlowNodeId,
-) -> flow_frame::Input {
+) -> MobMachineFlowFrameCommand {
     match loop_terminal {
         LoopTerminalEffect::Completed => {
-            flow_frame::Input::CompleteNode(flow_frame::inputs::CompleteNode {
+            MobMachineFlowFrameCommand::CompleteNode(flow_frame::inputs::CompleteNode {
                 node_id: parent_node_id.clone(),
             })
         }
         LoopTerminalEffect::Exhausted | LoopTerminalEffect::Failed => {
-            flow_frame::Input::FailNode(flow_frame::inputs::FailNode {
+            MobMachineFlowFrameCommand::FailNode(flow_frame::inputs::FailNode {
                 node_id: parent_node_id.clone(),
             })
         }
         LoopTerminalEffect::Canceled => {
-            flow_frame::Input::CancelNode(flow_frame::inputs::CancelNode {
+            MobMachineFlowFrameCommand::CancelNode(flow_frame::inputs::CancelNode {
                 node_id: parent_node_id.clone(),
             })
         }
@@ -2948,7 +3902,7 @@ fn build_start_root_frame_input(
     frame_id: &FrameId,
     spec: &FrameSpec,
     ordered: &[FlowNodeId],
-) -> flow_frame::Input {
+) -> flow_frame::inputs::StartRootFrame {
     let (
         tracked_nodes,
         ordered_nodes,
@@ -2957,7 +3911,7 @@ fn build_start_root_frame_input(
         node_dependency_modes,
         node_branches,
     ) = build_frame_start_payload(frame_id, spec, ordered);
-    flow_frame::Input::StartRootFrame(flow_frame::inputs::StartRootFrame {
+    flow_frame::inputs::StartRootFrame {
         frame_id: frame_id.clone(),
         tracked_nodes,
         ordered_nodes,
@@ -2965,7 +3919,7 @@ fn build_start_root_frame_input(
         node_dependencies,
         node_dependency_modes,
         node_branches,
-    })
+    }
 }
 
 fn build_start_body_frame_input(
@@ -2974,7 +3928,7 @@ fn build_start_body_frame_input(
     iteration: u64,
     spec: &FrameSpec,
     ordered: &[FlowNodeId],
-) -> flow_frame::Input {
+) -> flow_frame::inputs::StartBodyFrame {
     let (
         tracked_nodes,
         ordered_nodes,
@@ -2983,7 +3937,7 @@ fn build_start_body_frame_input(
         node_dependency_modes,
         node_branches,
     ) = build_frame_start_payload(frame_id, spec, ordered);
-    flow_frame::Input::StartBodyFrame(flow_frame::inputs::StartBodyFrame {
+    flow_frame::inputs::StartBodyFrame {
         frame_id: frame_id.clone(),
         loop_instance_id: loop_instance_id.clone(),
         iteration: iteration as u32,
@@ -2993,7 +3947,7 @@ fn build_start_body_frame_input(
         node_dependencies,
         node_dependency_modes,
         node_branches,
-    })
+    }
 }
 
 fn dep_mode_kv(mode: &crate::definition::DependencyMode) -> flow_frame::DependencyMode {

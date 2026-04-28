@@ -7,7 +7,7 @@ use crate::meerkat_machine::dsl::{MeerkatMachineEffect, PeerId};
 
 #[derive(Debug, Clone)]
 pub struct SupervisorTrustPublishObligation {
-    pub peer_id: PeerId,
+    pub peer_id: String,
     pub name: String,
     pub address: String,
     pub signing_public_key: Option<String>,

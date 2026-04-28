@@ -51,3 +51,18 @@ pub use types::{
     ScheduledSessionAction, SessionMaterializationSpec, SessionTargetBinding, TargetBinding,
     TriggerSpec, UpdateScheduleRequest,
 };
+
+#[doc(hidden)]
+#[cfg(feature = "machine-schema-exports")]
+pub mod machine_schema_exports {
+    pub fn schedule_lifecycle_schema() -> meerkat_machine_schema::MachineSchema {
+        meerkat_machine_schema::catalog::dsl::schedule_lifecycle_schema_metadata()
+            .attach_to(crate::machines::schedule_lifecycle::ScheduleLifecycleMachineState::schema())
+    }
+
+    pub fn occurrence_lifecycle_schema() -> meerkat_machine_schema::MachineSchema {
+        meerkat_machine_schema::catalog::dsl::occurrence_lifecycle_schema_metadata().attach_to(
+            crate::machines::occurrence_lifecycle::OccurrenceLifecycleMachineState::schema(),
+        )
+    }
+}

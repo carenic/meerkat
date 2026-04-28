@@ -1,3161 +1,2620 @@
-mod source {
-    #![allow(dead_code, clippy::expect_used, clippy::assign_op_pattern)]
-    //! MobMachine — DSL-generated canonical state.
-    //!
-    //! The generated `MobMachineState` is the machine-owned portion of mob state.
-    //! It covers lifecycle phase, roster membership, run tracking, spawn tracking,
-    //! and coordinator binding. Shell infrastructure (channels, stores, services,
-    //! handles, etc.) is NOT modeled here.
-
-    use meerkat_machine_dsl::machine;
-
-    /// Extension trait providing `.get()` on `Option<T>` to support the
-    /// `option_value` schema pattern emitted by the `machine!` DSL
-    /// (`Expr::MapGet { map: Field(...), key: String("value") }`). The DSL's
-    /// `replacing.get("value")` / `releasing.get("value")` expressions lower to
-    /// this trait so conditional emit payloads can extract `T` from an
-    /// `Option<T>` that guards have already constrained to `Some(_)`.
-    trait OptionValueExt<T: Clone> {
-        fn get(&self, _key: &str) -> T;
-    }
-    impl<T: Clone + Default> OptionValueExt<T> for Option<T> {
-        fn get(&self, _key: &str) -> T {
-            self.clone().unwrap_or_default()
-        }
-    }
-
-    // ---------------------------------------------------------------------------
-    // Bridging newtypes
-    // ---------------------------------------------------------------------------
-    //
-    // These types bridge between the DSL's flat representation and the real mob
-    // domain types in `crate::ids`. The DSL needs Ord+Hash+Clone for Set/Map;
-    // these newtypes satisfy that while providing From/Into mappings.
-
-    /// Bridging type for agent identity. Maps to `crate::ids::AgentIdentity`.
-    #[derive(
-        Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-    )]
-    pub struct AgentIdentity(pub String);
-
-    impl<T: Into<String>> From<T> for AgentIdentity {
-        fn from(s: T) -> Self {
-            Self(s.into())
-        }
-    }
-
-    /// Bridging type for agent runtime ID. Maps to `crate::ids::AgentRuntimeId`.
-    ///
-    /// The real `AgentRuntimeId` is a struct `{ identity: AgentIdentity, generation: Generation }`.
-    /// The DSL uses a single string key `"identity:generation"` for Set/Map operations.
-    #[derive(
-        Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-    )]
-    pub struct AgentRuntimeId(pub String);
-
-    impl<T: Into<String>> From<T> for AgentRuntimeId {
-        fn from(s: T) -> Self {
-            Self(s.into())
-        }
-    }
-
-    /// Bridging type for mob id. Maps to `crate::ids::MobId`.
-    #[derive(
-        Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-    )]
-    pub struct MobId(pub String);
-
-    impl<T: Into<String>> From<T> for MobId {
-        fn from(s: T) -> Self {
-            Self(s.into())
-        }
-    }
-
-    impl MobId {
-        pub fn from_domain(id: &crate::ids::MobId) -> Self {
-            Self(id.to_string())
-        }
-    }
-    impl AgentRuntimeId {
-        pub fn as_str(&self) -> &str {
-            &self.0
-        }
-    }
-
-    /// Bridging type for fence token. Maps to `crate::ids::FenceToken`.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct FenceToken(pub u64);
-
-    impl From<u64> for FenceToken {
-        fn from(v: u64) -> Self {
-            Self(v)
-        }
-    }
-
-    /// Bridging type for generation counter. Maps to `crate::ids::Generation`.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct Generation(pub u64);
-
-    impl From<u64> for Generation {
-        fn from(v: u64) -> Self {
-            Self(v)
-        }
-    }
-
-    /// Bridging type for work reference. Maps to `crate::ids::WorkRef`.
-    #[derive(
-        Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-    )]
-    pub struct WorkId(pub String);
-
-    impl<T: Into<String>> From<T> for WorkId {
-        fn from(s: T) -> Self {
-            Self(s.into())
-        }
-    }
-
-    /// Bridging type for flow run identity. Maps to `crate::ids::RunId`.
-    #[derive(
-        Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-    )]
-    pub struct RunId(pub String);
-
-    impl<T: Into<String>> From<T> for RunId {
-        fn from(s: T) -> Self {
-            Self(s.into())
-        }
-    }
-
-    /// Bridging type for frame identity. Maps to `crate::ids::FrameId`.
-    #[derive(
-        Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-    )]
-    pub struct FrameId(pub String);
-
-    impl<T: Into<String>> From<T> for FrameId {
-        fn from(s: T) -> Self {
-            Self(s.into())
-        }
-    }
-    impl FrameId {
-        pub fn as_str(&self) -> &str {
-            &self.0
-        }
-    }
-
-    /// Bridging type for loop instance identity. Maps to `crate::ids::LoopInstanceId`.
-    #[derive(
-        Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-    )]
-    pub struct LoopInstanceId(pub String);
-
-    impl<T: Into<String>> From<T> for LoopInstanceId {
-        fn from(s: T) -> Self {
-            Self(s.into())
-        }
-    }
-    impl LoopInstanceId {
-        pub fn as_str(&self) -> &str {
-            &self.0
-        }
-    }
-
-    /// Bridging type for loop definition identity. Maps to `crate::ids::LoopId`.
-    #[derive(
-        Debug,
-        Clone,
-        PartialEq,
-        Eq,
-        PartialOrd,
-        Ord,
-        Hash,
-        Default,
-        serde::Serialize,
-        serde::Deserialize,
-    )]
-    pub struct LoopId(pub String);
-
-    impl<T: Into<String>> From<T> for LoopId {
-        fn from(s: T) -> Self {
-            Self(s.into())
-        }
-    }
-
-    /// Bridging type for flow-node identity. Maps to `crate::ids::FlowNodeId`.
-    #[derive(
-        Debug,
-        Clone,
-        PartialEq,
-        Eq,
-        PartialOrd,
-        Ord,
-        Hash,
-        Default,
-        serde::Serialize,
-        serde::Deserialize,
-    )]
-    pub struct FlowNodeId(pub String);
-
-    impl<T: Into<String>> From<T> for FlowNodeId {
-        fn from(s: T) -> Self {
-            Self(s.into())
-        }
-    }
-
-    /// Bridging type for branch identity. Maps to `crate::ids::BranchId`.
-    #[derive(
-        Debug,
-        Clone,
-        PartialEq,
-        Eq,
-        PartialOrd,
-        Ord,
-        Hash,
-        Default,
-        serde::Serialize,
-        serde::Deserialize,
-    )]
-    pub struct BranchId(pub String);
-
-    impl<T: Into<String>> From<T> for BranchId {
-        fn from(s: T) -> Self {
-            Self(s.into())
-        }
-    }
-
-    /// Bridging type for step identity. Maps to `crate::ids::StepId`.
-    #[derive(
-        Debug,
-        Clone,
-        PartialEq,
-        Eq,
-        PartialOrd,
-        Ord,
-        Hash,
-        Default,
-        serde::Serialize,
-        serde::Deserialize,
-    )]
-    pub struct StepId(pub String);
-
-    impl<T: Into<String>> From<T> for StepId {
-        fn from(s: T) -> Self {
-            Self(s.into())
-        }
-    }
-    impl StepId {
-        pub fn as_str(&self) -> &str {
-            &self.0
-        }
-    }
-
-    /// Composite key for run-scoped step state projected into MobMachine.
-    #[derive(
-        Debug,
-        Clone,
-        PartialEq,
-        Eq,
-        PartialOrd,
-        Ord,
-        Hash,
-        Default,
-        serde::Serialize,
-        serde::Deserialize,
-    )]
-    pub struct RunStepKey(pub String);
-
-    impl<T: Into<String>> From<T> for RunStepKey {
-        fn from(s: T) -> Self {
-            Self(s.into())
-        }
-    }
-
-    /// Bridging type for bridge session id. Maps to
-    /// `meerkat_core::session::SessionId` — the bridge session a mob member is
-    /// attached to for the current runtime generation. The DSL only needs the
-    /// stringified form for Ord/Hash/Clone/Default; the realtime WS observer
-    /// materializes it back into the typed core id.
-    #[derive(
-        Debug,
-        Clone,
-        Default,
-        PartialEq,
-        Eq,
-        PartialOrd,
-        Ord,
-        Hash,
-        serde::Serialize,
-        serde::Deserialize,
-    )]
-    pub struct SessionId(pub String);
-
-    impl<T: Into<String>> From<T> for SessionId {
-        fn from(s: T) -> Self {
-            Self(s.into())
-        }
-    }
-
-    impl SessionId {
-        /// Project a real `meerkat_core::types::SessionId` into the DSL bridging type.
-        pub fn from_domain(id: &meerkat_core::types::SessionId) -> Self {
-            Self(id.to_string())
-        }
-    }
-
-    /// Per-identity realtime binding state. Lives in MobMachine as the canonical
-    /// join between identity continuity (MobMachine-owned) and the realtime
-    /// attachment's concrete session target (MeerkatMachine-owned).
-    ///
-    /// `Unbound` entries are never actually stored — absence of a key in
-    /// `member_session_bindings` is the Unbound state. The variant exists so
-    /// that the DSL has a tagged type to reason about and shell consumers can
-    /// pattern match on it without relying on map-absence semantics.
-    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-    pub enum RealtimeBindingState {
-        #[default]
-        Unbound,
-        BoundToSession {
-            session_id: SessionId,
-        },
-    }
-
-    // ---------------------------------------------------------------------------
-    // Projection helpers: domain types → bridging types
-    // ---------------------------------------------------------------------------
-
-    impl AgentRuntimeId {
-        /// Project a real `AgentRuntimeId` into the DSL bridging type.
-        pub fn from_domain(rid: &crate::ids::AgentRuntimeId) -> Self {
-            Self(rid.to_string()) // "identity:generation"
-        }
-    }
-
-    impl AgentIdentity {
-        /// Project a real `AgentIdentity` into the DSL bridging type.
-        pub fn from_domain(id: &crate::ids::AgentIdentity) -> Self {
-            Self(id.to_string())
-        }
-    }
-
-    impl FenceToken {
-        /// Project a real `FenceToken` into the DSL bridging type.
-        pub fn from_domain(ft: crate::ids::FenceToken) -> Self {
-            Self(ft.get())
-        }
-    }
-
-    impl Generation {
-        /// Project a real `Generation` into the DSL bridging type.
-        pub fn from_domain(generation: crate::ids::Generation) -> Self {
-            Self(generation.get())
-        }
-    }
-
-    impl WorkId {
-        /// Project a real `WorkRef` into the DSL bridging type.
-        pub fn from_work_ref(wr: &crate::ids::WorkRef) -> Self {
-            Self(wr.to_string())
-        }
-    }
-
-    /// Bridging type for task identifier. Maps to a shell-side task reference.
-    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct TaskId(pub String);
-
-    impl<T: Into<String>> From<T> for TaskId {
-        fn from(s: T) -> Self {
-            Self(s.into())
-        }
-    }
-
-    /// Kickoff lifecycle phase for a member's initial autonomous turn.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub enum KickoffPhase {
-        Pending,
-        Starting,
-        CallbackPending,
-        Started,
-        Failed,
-        Cancelled,
-    }
-
-    /// Task lifecycle status. DSL guards enumerate these directly
-    /// (`TaskStatus::Pending`, `TaskStatus::InProgress`,
-    /// `TaskStatus::Completed`, `TaskStatus::Cancelled`). `Completed` and
-    /// `Cancelled` are the two terminal statuses; neither may be transitioned
-    /// away from.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-    pub enum TaskStatus {
-        #[default]
-        Pending,
-        InProgress,
-        Completed,
-        Cancelled,
-    }
-
-    /// Dependency satisfaction mode for a step or frame node.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-    pub enum DependencyMode {
-        #[default]
-        All,
-        Any,
-    }
-
-    /// Collection policy for a step's fan-out execution.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-    pub enum CollectionPolicyKind {
-        #[default]
-        All,
-        Any,
-        Quorum,
-    }
-
-    /// Canonical flow-run lifecycle state once run-local semantics are absorbed.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-    pub enum FlowRunStatus {
-        #[default]
-        Absent,
-        Pending,
-        Running,
-        Completed,
-        Failed,
-        Canceled,
-    }
-
-    /// Canonical frame lifecycle state once frame-local semantics are absorbed.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-    pub enum FrameStatus {
-        #[default]
-        Running,
-        Completed,
-        Failed,
-        Canceled,
-    }
-
-    /// Canonical loop lifecycle state once loop-local semantics are absorbed.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-    pub enum LoopStatus {
-        #[default]
-        Running,
-        Completed,
-        Exhausted,
-        Failed,
-        Canceled,
-    }
-
-    /// Canonical step execution status once run-local semantics are absorbed.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-    pub enum StepRunStatus {
-        #[default]
-        Dispatched,
-        Completed,
-        Failed,
-        Skipped,
-        Canceled,
-    }
-
-    /// Root-vs-body frame scope for a frame snapshot.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-    pub enum FrameScope {
-        #[default]
-        Root,
-        Body,
-    }
-
-    /// Flow node kind inside a frame DAG.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-    pub enum FlowNodeKind {
-        #[default]
-        Step,
-        Loop,
-    }
-
-    /// Per-node execution status within a frame.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-    pub enum NodeRunStatus {
-        Pending,
-        #[default]
-        Ready,
-        Running,
-        Completed,
-        Failed,
-        Skipped,
-        Canceled,
-    }
-
-    /// Loop-body/evaluate lifecycle stage for an active repeat-until node.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-    pub enum LoopIterationStage {
-        #[default]
-        AwaitingBodyFrame,
-        BodyFrameActive,
-        AwaitingUntilEvaluation,
-    }
-
-    /// Opaque task payload carried through the DSL. The full domain type is
-    /// richer than what the DSL models; only `tasks.contains(id)` is observed in
-    /// guards. Field projection lives in shell code consuming the DSL state.
-    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-    pub struct MobTask {
-        pub subject: String,
-        pub description: String,
-        pub status: TaskStatus,
-        pub owner: Option<AgentIdentity>,
-        pub blocked_by: Vec<TaskId>,
-    }
-
-    /// Per-runtime lifecycle marker tracking whether a member is actively serving
-    /// work or draining toward retirement. Opaque to DSL guards — observed only
-    /// at the shell layer for work-routing decisions.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-    pub enum MobMemberState {
-        #[default]
-        Active,
-        Retiring,
-    }
-
-    /// Typed work-origin classification for
-    /// [`MobMachineInput::SubmitWork`] / [`MobMachineEffect::RequestRuntimeIngress`].
-    /// Closed mirror of [`crate::ids::WorkOrigin`] — the DSL uses this enum as
-    /// guard-visible truth instead of the former `origin == "External"` /
-    /// `origin == "Internal"` string compares. The `Ingest` variant is only
-    /// valid on the receiving side of the admission seam
-    /// (`MeerkatMachine::Ingest` fired by the runtime control plane); mob
-    /// transitions never produce it.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-    pub enum WorkOrigin {
-        #[default]
-        External,
-        Internal,
-        Ingest,
-    }
-
-    impl From<crate::ids::WorkOrigin> for WorkOrigin {
-        fn from(origin: crate::ids::WorkOrigin) -> Self {
-            match origin {
-                crate::ids::WorkOrigin::External => Self::External,
-                crate::ids::WorkOrigin::Internal => Self::Internal,
-            }
-        }
-    }
-
-    /// Fallible reverse mapping: the `Ingest` variant has no counterpart in the
-    /// shell-side [`crate::ids::WorkOrigin`] (which only classifies mob-submitted
-    /// work lanes); callers on the mob-domain side assert it away and surface a
-    /// domain error if the DSL ever produces it back across the seam.
-    impl TryFrom<WorkOrigin> for crate::ids::WorkOrigin {
-        type Error = &'static str;
-
-        fn try_from(origin: WorkOrigin) -> Result<Self, Self::Error> {
-            match origin {
-                WorkOrigin::External => Ok(Self::External),
-                WorkOrigin::Internal => Ok(Self::Internal),
-                WorkOrigin::Ingest => {
-                    Err("WorkOrigin::Ingest has no meerkat-mob domain counterpart")
-                }
-            }
-        }
-    }
-
-    /// Typed member lifecycle notice kind. Replaces the former literal-string
-    /// `kind` field on [`MobMachineEffect::EmitMemberLifecycleNotice`] — closed
-    /// set of observed member-lifecycle transitions the orchestrator emits.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-    pub enum MemberLifecycleKind {
-        #[default]
-        Spawned,
-        Retiring,
-        Retired,
-        Reset,
-        Respawned,
-        Completed,
-        Destroyed,
-    }
-
-    impl MemberLifecycleKind {
-        /// Stable discriminant for logging / wire surfaces.
-        pub const fn as_str(self) -> &'static str {
-            match self {
-                Self::Spawned => "spawned",
-                Self::Retiring => "retiring",
-                Self::Retired => "retired",
-                Self::Reset => "reset",
-                Self::Respawned => "respawned",
-                Self::Completed => "completed",
-                Self::Destroyed => "destroyed",
-            }
-        }
-    }
-
-    impl std::fmt::Display for MemberLifecycleKind {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str(self.as_str())
-        }
-    }
-
-    /// Typed wiring lifecycle notice kind for
-    /// [`MobMachineEffect::EmitWiringLifecycleNotice`]. Pair-valued (edge-keyed)
-    /// counterpart to [`MemberLifecycleKind`] (member-keyed). Emitted alongside
-    /// [`MobMachineEffect::WiringGraphChanged`] by `WireMembers`/`UnwireMembers`
-    /// transitions so external observers can reconstruct which identity pair
-    /// was wired or unwired.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-    pub enum WiringLifecycleKind {
-        #[default]
-        Wired,
-        Unwired,
-    }
-
-    impl WiringLifecycleKind {
-        /// Stable discriminant for logging / wire surfaces.
-        pub const fn as_str(self) -> &'static str {
-            match self {
-                Self::Wired => "wired",
-                Self::Unwired => "unwired",
-            }
-        }
-    }
-
-    impl std::fmt::Display for WiringLifecycleKind {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str(self.as_str())
-        }
-    }
-
-    /// Typed kickoff-notice intent. Replaces the former literal-string `intent`
-    /// field on [`MobMachineEffect::EmitKickoffLifecycleNotice`] — closed mirror
-    /// of [`KickoffPhase`] with an additional `Started` intent variant for the
-    /// `KickoffResolveStarted` input.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
-    pub enum KickoffIntent {
-        #[default]
-        Pending,
-        Starting,
-        Started,
-        CallbackPending,
-        Failed,
-        Cancelled,
-    }
-
-    impl KickoffIntent {
-        /// Stable discriminant for logging / wire surfaces.
-        pub const fn as_str(self) -> &'static str {
-            match self {
-                Self::Pending => "Pending",
-                Self::Starting => "Starting",
-                Self::Started => "Started",
-                Self::CallbackPending => "CallbackPending",
-                Self::Failed => "Failed",
-                Self::Cancelled => "Cancelled",
-            }
-        }
-    }
-
-    impl std::fmt::Display for KickoffIntent {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.write_str(self.as_str())
-        }
-    }
-
-    /// Undirected wiring edge between two identities. Callers MUST normalize
-    /// to `(smaller, larger)` before constructing so that edge equality is
-    /// independent of insertion order.
-    #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
-    pub struct WiringEdge {
-        pub a: AgentIdentity,
-        pub b: AgentIdentity,
-    }
-
-    impl WiringEdge {
-        /// Constructs an edge, normalizing so `a <= b`.
-        pub fn new(lhs: AgentIdentity, rhs: AgentIdentity) -> Self {
-            if lhs <= rhs {
-                Self { a: lhs, b: rhs }
-            } else {
-                Self { a: rhs, b: lhs }
-            }
-        }
-    }
-
-    /// Descriptor-bearing external peer trust endpoint. Unlike `WiringEdge`, this
-    /// preserves the routing id, transport address, and signing key that make an
-    /// external trust edge authoritative.
-    #[derive(
-        Debug,
-        Clone,
-        PartialEq,
-        Eq,
-        PartialOrd,
-        Ord,
-        Hash,
-        Default,
-        serde::Serialize,
-        serde::Deserialize,
-    )]
-    pub struct ExternalPeerEndpoint {
-        pub name: PeerName,
-        pub peer_id: PeerId,
-        pub address: PeerAddress,
-        pub signing_key: PeerSigningKey,
-    }
-
-    impl From<&meerkat_core::comms::TrustedPeerDescriptor> for ExternalPeerEndpoint {
-        fn from(spec: &meerkat_core::comms::TrustedPeerDescriptor) -> Self {
-            Self {
-                name: PeerName(spec.name.as_str().to_owned()),
-                peer_id: PeerId(spec.peer_id.to_string()),
-                address: PeerAddress(spec.address.to_string()),
-                signing_key: PeerSigningKey(spec.pubkey),
-            }
-        }
-    }
-
-    #[derive(
-        Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
-    )]
-    pub struct ExternalPeerEdge {
-        pub local: AgentIdentity,
-        pub endpoint: ExternalPeerEndpoint,
-    }
-
-    impl ExternalPeerEdge {
-        pub fn new(local: AgentIdentity, endpoint: ExternalPeerEndpoint) -> Self {
-            Self { local, endpoint }
-        }
-    }
-
-    #[derive(
-        Debug,
-        Clone,
-        PartialEq,
-        Eq,
-        PartialOrd,
-        Ord,
-        Hash,
-        Default,
-        serde::Serialize,
-        serde::Deserialize,
-    )]
-    pub struct PeerName(pub String);
-    impl<T: Into<String>> From<T> for PeerName {
-        fn from(s: T) -> Self {
-            Self(s.into())
-        }
-    }
-
-    #[derive(
-        Debug,
-        Clone,
-        PartialEq,
-        Eq,
-        PartialOrd,
-        Ord,
-        Hash,
-        Default,
-        serde::Serialize,
-        serde::Deserialize,
-    )]
-    pub struct PeerId(pub String);
-    impl<T: Into<String>> From<T> for PeerId {
-        fn from(s: T) -> Self {
-            Self(s.into())
-        }
-    }
-
-    #[derive(
-        Debug,
-        Clone,
-        PartialEq,
-        Eq,
-        PartialOrd,
-        Ord,
-        Hash,
-        Default,
-        serde::Serialize,
-        serde::Deserialize,
-    )]
-    pub struct PeerAddress(pub String);
-    impl<T: Into<String>> From<T> for PeerAddress {
-        fn from(s: T) -> Self {
-            Self(s.into())
-        }
-    }
-
-    #[derive(
-        Debug,
-        Clone,
-        Copy,
-        PartialEq,
-        Eq,
-        PartialOrd,
-        Ord,
-        Hash,
-        Default,
-        serde::Serialize,
-        serde::Deserialize,
-    )]
-    pub struct PeerSigningKey(pub [u8; 32]);
-    impl From<[u8; 32]> for PeerSigningKey {
-        fn from(key: [u8; 32]) -> Self {
-            Self(key)
-        }
-    }
-
-    // ---------------------------------------------------------------------------
-    // Machine definition
-    // ---------------------------------------------------------------------------
-
-    machine! {
-        machine MobMachine {
-            version: 1,
-            rust: "meerkat-mob" / "machines::mob_machine",
-
-            state {
-                lifecycle_phase: MobPhase,
-                live_runtime_ids: Set<AgentRuntimeId>,
-                externally_addressable_runtime_ids: Set<AgentRuntimeId>,
-                runtime_fence_tokens: Map<AgentRuntimeId, FenceToken>,
-                active_run_count: u64,
-                run_status: Map<RunId, Enum<FlowRunStatus>>,
-                run_ordered_steps: Map<RunId, Seq<StepId>>,
-                run_tracked_steps: Map<RunId, Set<StepId>>,
-                run_step_status: Map<RunId, Map<StepId, Option<Enum<StepRunStatus>>>>,
-                run_step_status_flat: Map<RunStepKey, Enum<StepRunStatus>>,
-                run_output_recorded: Map<RunId, Map<StepId, bool>>,
-                run_step_condition_results: Map<RunId, Map<StepId, Option<bool>>>,
-                run_step_has_conditions: Map<RunId, Map<StepId, bool>>,
-                run_step_dependencies: Map<RunId, Map<StepId, Seq<StepId>>>,
-                run_step_dependency_modes: Map<RunId, Map<StepId, Enum<DependencyMode>>>,
-                run_step_branches: Map<RunId, Map<StepId, Option<BranchId>>>,
-                run_step_collection_policies: Map<RunId, Map<StepId, Enum<CollectionPolicyKind>>>,
-                run_step_quorum_thresholds: Map<RunId, Map<StepId, u32>>,
-                run_step_target_counts: Map<RunId, Map<StepId, u32>>,
-                run_step_target_success_counts: Map<RunId, Map<StepId, u32>>,
-                run_step_target_terminal_failure_counts: Map<RunId, Map<StepId, u32>>,
-                run_output_recorded_flat: Map<RunStepKey, bool>,
-                run_target_retry_counts: Map<RunId, Map<String, u32>>,
-                run_escalation_threshold: Map<RunId, u32>,
-                run_max_step_retries: Map<RunId, u32>,
-                run_ready_frames: Map<RunId, Seq<FrameId>>,
-                run_ready_frame_membership: Map<RunId, Set<FrameId>>,
-                run_pending_body_frame_loops: Map<RunId, Seq<LoopInstanceId>>,
-                run_pending_body_frame_loop_membership: Map<RunId, Set<LoopInstanceId>>,
-                run_max_active_nodes: Map<RunId, u32>,
-                run_max_active_frames: Map<RunId, u32>,
-                run_max_frame_depth: Map<RunId, u32>,
-                frame_scope: Map<FrameId, Enum<FrameScope>>,
-                frame_phase: Map<FrameId, Enum<FrameStatus>>,
-                frame_run: Map<FrameId, RunId>,
-                frame_parent_loop: Map<FrameId, Option<LoopInstanceId>>,
-                frame_iteration: Map<FrameId, u32>,
-                frame_tracked_nodes: Map<FrameId, Set<FlowNodeId>>,
-                frame_ordered_nodes: Map<FrameId, Seq<FlowNodeId>>,
-                frame_node_kind: Map<FrameId, Map<FlowNodeId, Enum<FlowNodeKind>>>,
-                frame_node_dependencies: Map<FrameId, Map<FlowNodeId, Seq<FlowNodeId>>>,
-                frame_node_dependency_modes: Map<FrameId, Map<FlowNodeId, Enum<DependencyMode>>>,
-                frame_node_step_ids: Map<FrameId, Map<FlowNodeId, StepId>>,
-                frame_node_loop_ids: Map<FrameId, Map<FlowNodeId, LoopId>>,
-                frame_node_status: Map<FrameId, Map<FlowNodeId, Enum<NodeRunStatus>>>,
-                frame_ready_queue: Map<FrameId, Seq<FlowNodeId>>,
-                frame_output_recorded: Map<FrameId, Map<FlowNodeId, bool>>,
-                frame_node_condition_results: Map<FrameId, Map<FlowNodeId, Option<bool>>>,
-                frame_node_branches: Map<FrameId, Map<FlowNodeId, Option<BranchId>>>,
-                loop_phase: Map<LoopInstanceId, Enum<LoopStatus>>,
-                loop_parent_frame: Map<LoopInstanceId, FrameId>,
-                loop_parent_node: Map<LoopInstanceId, FlowNodeId>,
-                loop_definition: Map<LoopInstanceId, LoopId>,
-                loop_depth: Map<LoopInstanceId, u32>,
-                loop_stage: Map<LoopInstanceId, Enum<LoopIterationStage>>,
-                loop_current_iteration: Map<LoopInstanceId, u64>,
-                loop_last_completed_iteration: Map<LoopInstanceId, u64>,
-                loop_max_iterations: Map<LoopInstanceId, u64>,
-                loop_active_body_frame: Map<LoopInstanceId, Option<FrameId>>,
-                pending_spawn_count: u64,
-                pending_spawn_sessions: Map<AgentIdentity, SessionId>,
-                coordinator_bound: bool,
-                member_startup_binding_requested: Set<AgentRuntimeId>,
-                member_startup_runtime_ready: Set<AgentRuntimeId>,
-                member_startup_ready: Set<AgentRuntimeId>,
-                member_kickoff_pending: Set<String>,
-                member_kickoff_starting: Set<String>,
-                member_kickoff_callback_pending: Set<String>,
-                member_kickoff_started: Set<String>,
-                member_kickoff_failed: Set<String>,
-                member_kickoff_cancelled: Set<String>,
-                member_kickoff_error: Map<String, String>,
-                // Per-runtime lifecycle marker (Active vs Retiring). Tracks the
-                // draining/retiring sub-state independently of the mob-level
-                // lifecycle phase so the shell can decide whether to route fresh
-                // work to a member while retire-drain is in flight.
-                member_state_markers: Map<AgentRuntimeId, MobMemberState>,
-                // Undirected wiring edges between agent identities. Stored as
-                // ordered pairs (smaller identity first) wrapped in WiringEdge
-                // so the DSL sees a single opaque key type.
-                wiring_edges: Set<WiringEdge>,
-                // Descriptor-bearing external peer trust edges. These are not
-                // member-to-member wiring edges: the endpoint carries the external
-                // peer's routing id, address, and signing key, so it has its own
-                // machine-owned fact instead of being projected into WiringEdge by
-                // peer name.
-                external_peer_edges: Set<ExternalPeerEdge>,
-                // Identity → current runtime binding. Survives within a
-                // generation; respawn replaces the runtime id for the same
-                // identity.
-                identity_to_runtime: Map<AgentIdentity, AgentRuntimeId>,
-                // Task board: the full MobTask payload is opaque at DSL level;
-                // lifecycle fields below provide the guard-visible projection.
-                tasks: Map<TaskId, MobTask>,
-                // Projected status index: guards use these to reject unknown-id
-                // updates and illegal status transitions (e.g. Completed→Pending).
-                in_progress_task_ids: Set<TaskId>,
-                completed_task_ids: Set<TaskId>,
-                member_session_bindings: Map<AgentIdentity, SessionId>,
-                pending_session_ingress_detach_runtime_ids: Set<AgentRuntimeId>,
-                topology_epoch: u64,
-            }
-
-            init(Running) {
-                live_runtime_ids = EmptySet,
-                externally_addressable_runtime_ids = EmptySet,
-                runtime_fence_tokens = EmptyMap,
-                active_run_count = 0,
-                run_status = EmptyMap,
-                run_ordered_steps = EmptyMap,
-                run_tracked_steps = EmptyMap,
-                run_step_status = EmptyMap,
-                run_step_status_flat = EmptyMap,
-                run_output_recorded = EmptyMap,
-                run_step_condition_results = EmptyMap,
-                run_step_has_conditions = EmptyMap,
-                run_step_dependencies = EmptyMap,
-                run_step_dependency_modes = EmptyMap,
-                run_step_branches = EmptyMap,
-                run_step_collection_policies = EmptyMap,
-                run_step_quorum_thresholds = EmptyMap,
-                run_step_target_counts = EmptyMap,
-                run_step_target_success_counts = EmptyMap,
-                run_step_target_terminal_failure_counts = EmptyMap,
-                run_output_recorded_flat = EmptyMap,
-                run_target_retry_counts = EmptyMap,
-                run_escalation_threshold = EmptyMap,
-                run_max_step_retries = EmptyMap,
-                run_ready_frames = EmptyMap,
-                run_ready_frame_membership = EmptyMap,
-                run_pending_body_frame_loops = EmptyMap,
-                run_pending_body_frame_loop_membership = EmptyMap,
-                run_max_active_nodes = EmptyMap,
-                run_max_active_frames = EmptyMap,
-                run_max_frame_depth = EmptyMap,
-                frame_scope = EmptyMap,
-                frame_phase = EmptyMap,
-                frame_run = EmptyMap,
-                frame_parent_loop = EmptyMap,
-                frame_iteration = EmptyMap,
-                frame_tracked_nodes = EmptyMap,
-                frame_ordered_nodes = EmptyMap,
-                frame_node_kind = EmptyMap,
-                frame_node_dependencies = EmptyMap,
-                frame_node_dependency_modes = EmptyMap,
-                frame_node_step_ids = EmptyMap,
-                frame_node_loop_ids = EmptyMap,
-                frame_node_status = EmptyMap,
-                frame_ready_queue = EmptyMap,
-                frame_output_recorded = EmptyMap,
-                frame_node_condition_results = EmptyMap,
-                frame_node_branches = EmptyMap,
-                loop_phase = EmptyMap,
-                loop_parent_frame = EmptyMap,
-                loop_parent_node = EmptyMap,
-                loop_definition = EmptyMap,
-                loop_depth = EmptyMap,
-                loop_stage = EmptyMap,
-                loop_current_iteration = EmptyMap,
-                loop_last_completed_iteration = EmptyMap,
-                loop_max_iterations = EmptyMap,
-                loop_active_body_frame = EmptyMap,
-                pending_spawn_count = 0,
-                pending_spawn_sessions = EmptyMap,
-                coordinator_bound = true,
-                member_startup_binding_requested = EmptySet,
-                member_startup_runtime_ready = EmptySet,
-                member_startup_ready = EmptySet,
-                member_kickoff_pending = EmptySet,
-                member_kickoff_starting = EmptySet,
-                member_kickoff_callback_pending = EmptySet,
-                member_kickoff_started = EmptySet,
-                member_kickoff_failed = EmptySet,
-                member_kickoff_cancelled = EmptySet,
-                member_kickoff_error = EmptyMap,
-                member_state_markers = EmptyMap,
-                wiring_edges = EmptySet,
-                external_peer_edges = EmptySet,
-                identity_to_runtime = EmptyMap,
-                tasks = EmptyMap,
-                in_progress_task_ids = EmptySet,
-                completed_task_ids = EmptySet,
-                member_session_bindings = EmptyMap,
-                pending_session_ingress_detach_runtime_ids = EmptySet,
-                topology_epoch = 0,
-            }
-
-            terminal [Destroyed]
-
-            phase MobPhase {
-                Running,
-                Stopped,
-                Completed,
-                Destroyed,
-            }
-
-            input MobMachineInput {
-                RunFlow,
-                CreateRunSeed {
-                    run_id: RunId,
-                    step_ids: Set<StepId>,
-                    ordered_steps: Seq<StepId>,
-                    step_has_conditions: Map<StepId, bool>,
-                    step_dependencies: Map<StepId, Seq<StepId>>,
-                    step_dependency_modes: Map<StepId, Enum<DependencyMode>>,
-                    step_branches: Map<StepId, Option<BranchId>>,
-                    step_collection_policies: Map<StepId, Enum<CollectionPolicyKind>>,
-                    step_quorum_thresholds: Map<StepId, u32>,
-                    escalation_threshold: u32,
-                    max_step_retries: u32,
-                    max_active_nodes: u32,
-                    max_active_frames: u32,
-                    max_frame_depth: u32,
-                },
-                CreateFrameSeed {
-                    run_id: RunId,
-                    frame_id: FrameId,
-                    frame_scope: Enum<FrameScope>,
-                    loop_instance_id: Option<LoopInstanceId>,
-                    iteration: u32,
-                    tracked_nodes: Set<FlowNodeId>,
-                    ordered_nodes: Seq<FlowNodeId>,
-                    node_kind: Map<FlowNodeId, Enum<FlowNodeKind>>,
-                    node_dependencies: Map<FlowNodeId, Seq<FlowNodeId>>,
-                    node_dependency_modes: Map<FlowNodeId, Enum<DependencyMode>>,
-                    node_branches: Map<FlowNodeId, Option<BranchId>>,
-                },
-                CreateLoopSeed {
-                    loop_instance_id: LoopInstanceId,
-                    parent_frame_id: FrameId,
-                    parent_node_id: FlowNodeId,
-                    loop_id: LoopId,
-                    depth: u32,
-                    max_iterations: u64,
-                },
-                RecordLoopBodyFrameCompleted {
-                    loop_instance_id: LoopInstanceId,
-                    iteration: u64,
-                },
-                RecordLoopUntilConditionMet {
-                    loop_instance_id: LoopInstanceId,
-                    iteration: u64,
-                },
-                RecordLoopUntilConditionFailed {
-                    loop_instance_id: LoopInstanceId,
-                    iteration: u64,
-                },
-                ProjectRunStatus {
-                    run_id: RunId,
-                    status: Enum<FlowRunStatus>,
-                },
-                ProjectRunStepStatus {
-                    run_step: RunStepKey,
-                    status: Enum<StepRunStatus>,
-                    output_recorded: bool,
-                },
-                ProjectFramePhase {
-                    frame_id: FrameId,
-                    phase: Enum<FrameStatus>,
-                },
-                ProjectLoopState {
-                    loop_instance_id: LoopInstanceId,
-                    phase: Enum<LoopStatus>,
-                    stage: Enum<LoopIterationStage>,
-                    active_body_frame_id: Option<FrameId>,
-                },
-                CancelFlow,
-                FlowStatus,
-                Spawn { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: bool, bridge_session_id: SessionId, replacing: Option<SessionId> },
-                Retire { agent_runtime_id: AgentRuntimeId, agent_identity: AgentIdentity, releasing: Option<SessionId>, session_id: SessionId },
-                Respawn { agent_runtime_id: AgentRuntimeId },
-                RetireAll,
-                // Track-B (R5): explicit identity-level wiring and session-binding
-                // mutation inputs. These drive `wiring_edges` and
-                // `member_session_bindings` directly at DSL authority,
-                // independent of the Spawn/Retire lifecycle.
-                //
-                // The `edge` field on `WireMembers`/`UnwireMembers` carries a
-                // pre-normalized `WiringEdge` (a <= b). Callers construct the
-                // edge via `WiringEdge::new(a, b)` before submitting.
-                WireMembers { edge: WiringEdge },
-                UnwireMembers { edge: WiringEdge },
-                WireExternalPeer { edge: ExternalPeerEdge },
-                UnwireExternalPeer { edge: ExternalPeerEdge },
-                BindMemberSession { agent_identity: AgentIdentity, session_id: SessionId },
-                RotateMemberSession { agent_identity: AgentIdentity, old_session_id: SessionId, new_session_id: SessionId },
-                ReleaseMemberSession { agent_identity: AgentIdentity, session_id: SessionId },
-                SessionIngressDetachedForMobDestroy { mob_id: MobId, agent_runtime_id: AgentRuntimeId },
-                SessionIngressDetachFailedForMobDestroy { mob_id: MobId, agent_runtime_id: AgentRuntimeId, reason: String },
-                SubmitWork { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, work_id: WorkId, origin: Enum<WorkOrigin> },
-                CancelWork { work_id: WorkId },
-                CancelAllWork { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken },
-                Stop,
-                Resume,
-                Complete,
-                Reset,
-                Destroy,
-                TaskCreate { task_id: TaskId, task_payload: MobTask },
-                TaskUpdate { task_id: TaskId, new_status: TaskStatus },
-                TaskList,
-                TaskGet,
-                McpServerStates,
-                RosterSnapshot,
-                ListMembers,
-                ListMembersIncludingRetiring,
-                ListAllMembers,
-                MemberStatus,
-                SubscribeAgentEvents,
-                SubscribeAllAgentEvents,
-                SubscribeMobEvents,
-                PollEvents,
-                ReplayAllEvents,
-                RecordOperatorActionProvenance,
-                GetMember,
-                SetSpawnPolicy,
-                Shutdown,
-                ForceCancel,
-                KickoffMarkPending { member_id: String },
-                KickoffMarkStarting { member_id: String },
-                StartupMarkReady { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken },
-                KickoffResolveStarted { member_id: String },
-                KickoffResolveCallbackPending { member_id: String },
-                KickoffResolveFailed { member_id: String, error: String },
-                KickoffResolveCancelled { member_id: String },
-                KickoffCancelRequested { member_id: String },
-                KickoffClear { member_id: String },
-            }
-
-            surface_only [
-                FlowStatus,
-                TaskList,
-                TaskGet,
-                McpServerStates,
-                RosterSnapshot,
-                ListMembers,
-                ListMembersIncludingRetiring,
-                ListAllMembers,
-                MemberStatus,
-                CancelWork,
-                PollEvents,
-                ReplayAllEvents,
-                GetMember
-            ]
-
-            signal MobMachineSignal {
-                ObserveRuntimeReady { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken },
-                RetireMember { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, session_id: SessionId },
-                ObserveRuntimeRetired { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken },
-                ResetMember { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: bool, session_id: SessionId },
-                RespawnMember { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: bool, session_id: SessionId },
-                DestroyMob { session_id: SessionId },
-                ObserveRuntimeDestroyed { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken },
-                MarkCompleted,
-                StartRun,
-                FinishRun,
-                BeginCleanup,
-                FinishCleanup,
-                InitializeOrchestrator,
-                BindCoordinator,
-                UnbindCoordinator,
-                StageSpawn { agent_identity: AgentIdentity, session_id: SessionId },
-                CompleteSpawn { agent_identity: AgentIdentity },
-                StartFlow,
-                CompleteFlow,
-                StopOrchestrator,
-                ResumeOrchestrator,
-                DestroyOrchestrator,
-                ForceCancelMember,
-                MemberPeerExposed,
-                MemberTerminalized,
-                OperationPeerTrusted,
-                PeerInputAdmitted,
-                CreateRun,
-            }
-
-            effect MobMachineEffect {
-                RequestRuntimeBinding { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, session_id: SessionId },
-                RequestRuntimeIngress { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, work_id: WorkId, origin: Enum<WorkOrigin> },
-                RequestRuntimeRetire { session_id: SessionId },
-                RequestRuntimeDestroy { session_id: SessionId },
-                EmitMemberLifecycleNotice { kind: Enum<MemberLifecycleKind> },
-                EmitRunLifecycleNotice,
-                EmitFlowRunNotice,
-                AppendFailureLedger,
-                FlowTerminalized,
-                EscalateSupervisor,
-                NotifyCoordinator,
-                ExposePendingSpawn,
-                EmitMemberTerminalNotice,
-                AdmitPeerInput,
-                EmitProgressNote,
-                EmitTaskNotice,
-                PersistKickoffUpdate { member_id: String, phase: KickoffPhase },
-                PersistKickoffFailureUpdate { member_id: String, phase: KickoffPhase, error: String },
-                EmitKickoffLifecycleNotice { member_id: String, intent: Enum<KickoffIntent> },
-                // Track-B (R5): canonical topology-change signals consumed by
-                // the `RecomputeMobPeerOverlay` composition driver.
-                //
-                // - `WiringGraphChanged` fires when `wiring_edges` mutates.
-                // - `MemberSessionBindingChanged` fires on every binding
-                //   mutation (set, rotated, or released), carrying the
-                //   before/after session ids as `Option<SessionId>`. Absence
-                //   of a value means "no binding on this side of the
-                //   transition": `old=None, new=Some` → set, `Some, Some` →
-                //   rotate, `Some, None` → release.
-                //
-                // Both carry the post-transition `topology_epoch` so the
-                // driver can linearize recomputes against the newest topology
-                // snapshot.
-                WiringGraphChanged { epoch: u64 },
-                MemberSessionBindingChanged { epoch: u64, agent_identity: AgentIdentity, old_session_id: Option<SessionId>, new_session_id: Option<SessionId> },
-                // D-wiring-observability (#27): pair-valued notice emitted from
-                // `WireMembers`/`UnwireMembers` alongside `WiringGraphChanged`.
-                // Unlike `WiringGraphChanged` (opaque epoch bump), this carries
-                // the `WiringEdge` so external observers (event store,
-                // telemetry) can reconstruct which identity pair was wired or
-                // unwired. Separate from `EmitMemberLifecycleNotice` because
-                // wiring is pair-valued, not per-member.
-                EmitWiringLifecycleNotice { kind: Enum<WiringLifecycleKind>, edge: WiringEdge },
-                // Descriptor-bearing external peer trust notice. Carries the
-                // endpoint fields (`peer_id`, `address`, `signing_key`) that
-                // cannot be represented by a member `WiringEdge`.
-                EmitExternalPeerWiringLifecycleNotice { kind: Enum<WiringLifecycleKind>, edge: ExternalPeerEdge },
-            }
-
-            disposition RequestRuntimeBinding => routed [MeerkatMachine],
-            disposition RequestRuntimeIngress => routed [MeerkatMachine],
-            disposition RequestRuntimeRetire => routed [MeerkatMachine],
-            disposition RequestRuntimeDestroy => routed [MeerkatMachine],
-            disposition EmitMemberLifecycleNotice => external,
-            disposition EmitRunLifecycleNotice => external,
-            disposition EmitFlowRunNotice => external,
-            disposition AppendFailureLedger => local,
-            disposition FlowTerminalized => external,
-            disposition EscalateSupervisor => external,
-            disposition NotifyCoordinator => external,
-            disposition ExposePendingSpawn => external,
-            disposition EmitMemberTerminalNotice => external,
-            disposition AdmitPeerInput => external,
-            disposition EmitProgressNote => external,
-            disposition EmitTaskNotice => external,
-            disposition PersistKickoffUpdate => local,
-            disposition PersistKickoffFailureUpdate => local,
-            disposition EmitKickoffLifecycleNotice => external,
-            disposition WiringGraphChanged => external,
-            disposition MemberSessionBindingChanged => external,
-            disposition EmitWiringLifecycleNotice => external,
-            disposition EmitExternalPeerWiringLifecycleNotice => external,
-
-            // =====================================================================
-            // Invariants
-            // =====================================================================
-
-            // W3-H / dogma #4: "no zombie realtime binding" — every identity that
-            // has a bound session must also appear in `identity_to_runtime` (i.e.
-            // must be an identity MobMachine has spawned). Ensures the binding map
-            // cannot reference identities the machine has never admitted. Paired
-            // with the Retire transition's `member_session_bindings.remove` and
-            // Spawn's guard/state consistency: keys(bindings) ⊆ keys(identity_to_runtime).
-            invariant bindings_require_known_identity {
-                for_all(id in self.member_session_bindings.keys(), self.identity_to_runtime.contains_key(id))
-            }
-
-            // =====================================================================
-            // Direct transitions
-            // =====================================================================
-
-            // W3-H: Spawn splits into two guarded variants — Fresh (no prior
-            // realtime binding for the identity) and Replacing (identity already
-            // has a `BoundToSession`, i.e. this Spawn is the second half of a
-            // shell-orchestrated respawn). Guards check BOTH the input's
-            // `replacing` witness AND the state's `member_session_bindings` key
-            // presence so a caller cannot invoke the wrong branch — the DSL
-            // enforces caller/state consistency, and a mismatched caller fails
-            // loudly with "no transition matched" rather than silently picking a
-            // wrong branch.
-            transition SpawnRunningFresh {
-                on input Spawn { agent_identity, agent_runtime_id, fence_token, generation, external_addressable, bridge_session_id, replacing }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "coordinator_bound" { self.coordinator_bound == true }
-                guard "no_prior_session_binding" { self.member_session_bindings.contains_key(agent_identity) == false }
-                guard "replacing_absent" { replacing == None }
-                update {
-                    // Spawn is the "member joined live_runtime_ids" fact. The
-                    // pending_spawn_count lifecycle is owned by StageSpawn (+1)
-                    // and CompleteSpawn (-1) signals; Spawn itself leaves the
-                    // counter untouched. Concurrent spawn batches rely on that
-                    // separation — zeroing or double-decrementing here breaks
-                    // alignment between DSL pending_spawn_count and the actor's
-                    // pending_spawns map
-                    // (test_concurrent_spawns_parallelize_provisioning).
-                    // active_run_count is unrelated to spawn and stays untouched
-                    // (previously zeroed here by mistake).
-                    self.live_runtime_ids.insert(agent_runtime_id);
-                    if external_addressable {
-                        self.externally_addressable_runtime_ids.insert(agent_runtime_id);
-                    } else {
-                        self.externally_addressable_runtime_ids.remove(agent_runtime_id);
-                    }
-                    self.runtime_fence_tokens.insert(agent_runtime_id, fence_token);
-                    self.identity_to_runtime.insert(agent_identity, agent_runtime_id);
-                    self.member_startup_binding_requested.insert(agent_runtime_id);
-                    self.member_startup_runtime_ready.remove(agent_runtime_id);
-                    self.member_startup_ready.remove(agent_runtime_id);
-                    self.member_session_bindings.insert(agent_identity, bridge_session_id);
-                    self.topology_epoch += 1;
-                }
-                to Running
-                emit RequestRuntimeBinding { agent_identity: agent_identity, agent_runtime_id: agent_runtime_id, fence_token: fence_token, generation: generation, session_id: bridge_session_id }
-                emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: None, new_session_id: Some(bridge_session_id) }
-                emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Spawned }
-            }
-
-            transition SpawnRunningReplacing {
-                on input Spawn { agent_identity, agent_runtime_id, fence_token, generation, external_addressable, bridge_session_id, replacing }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "coordinator_bound" { self.coordinator_bound == true }
-                guard "prior_session_binding_present" { self.member_session_bindings.contains_key(agent_identity) == true }
-                guard "replacing_present" { replacing != None }
-                update {
-                    self.live_runtime_ids.insert(agent_runtime_id);
-                    if external_addressable {
-                        self.externally_addressable_runtime_ids.insert(agent_runtime_id);
-                    } else {
-                        self.externally_addressable_runtime_ids.remove(agent_runtime_id);
-                    }
-                    self.runtime_fence_tokens.insert(agent_runtime_id, fence_token);
-                    self.identity_to_runtime.insert(agent_identity, agent_runtime_id);
-                    self.member_startup_binding_requested.insert(agent_runtime_id);
-                    self.member_startup_runtime_ready.remove(agent_runtime_id);
-                    self.member_startup_ready.remove(agent_runtime_id);
-                    self.member_session_bindings.insert(agent_identity, bridge_session_id);
-                    self.topology_epoch += 1;
-                }
-                to Running
-                emit RequestRuntimeBinding { agent_identity: agent_identity, agent_runtime_id: agent_runtime_id, fence_token: fence_token, generation: generation, session_id: bridge_session_id }
-                emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: Some(replacing.get("value")), new_session_id: Some(bridge_session_id) }
-                emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Spawned }
-            }
-
-            transition ObserveRuntimeReady {
-                on signal ObserveRuntimeReady { agent_runtime_id, fence_token }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
-                guard "fence_token_present" { fence_token == fence_token }
-                update {
-                    self.member_startup_binding_requested.remove(agent_runtime_id);
-                    self.member_startup_runtime_ready.insert(agent_runtime_id);
-                    self.member_startup_ready.remove(agent_runtime_id);
-                }
-                to Running
-            }
-
-            transition StartupMarkReady {
-                per_phase [Running, Stopped, Completed]
-                on input StartupMarkReady { agent_runtime_id, fence_token }
-                guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
-                guard "fence_token_present" { fence_token == fence_token }
-                update {
-                    self.member_startup_binding_requested.remove(agent_runtime_id);
-                    self.member_startup_runtime_ready.remove(agent_runtime_id);
-                    self.member_startup_ready.insert(agent_runtime_id);
-                }
-                to Running
-            }
-
-            transition KickoffMarkPending {
-                per_phase [Running, Stopped, Completed]
-                on input KickoffMarkPending { member_id }
-                guard "kickoff_not_started" {
-                    !self.member_kickoff_pending.contains(member_id)
-                    && !self.member_kickoff_starting.contains(member_id)
-                    && !self.member_kickoff_callback_pending.contains(member_id)
-                    && !self.member_kickoff_started.contains(member_id)
-                    && !self.member_kickoff_failed.contains(member_id)
-                    && !self.member_kickoff_cancelled.contains(member_id)
-                }
-                update {
-                    self.member_kickoff_pending.insert(member_id);
-                    self.member_kickoff_starting.remove(member_id);
-                    self.member_kickoff_callback_pending.remove(member_id);
-                    self.member_kickoff_started.remove(member_id);
-                    self.member_kickoff_failed.remove(member_id);
-                    self.member_kickoff_cancelled.remove(member_id);
-                    self.member_kickoff_error.remove(member_id);
-                }
-                to Running
-                emit PersistKickoffUpdate { member_id: member_id, phase: KickoffPhase::Pending }
-                emit EmitKickoffLifecycleNotice { member_id: member_id, intent: KickoffIntent::Pending }
-            }
-
-            transition KickoffMarkStarting {
-                per_phase [Running, Stopped, Completed]
-                on input KickoffMarkStarting { member_id }
-                guard "kickoff_pending" { self.member_kickoff_pending.contains(member_id) }
-                update {
-                    self.member_kickoff_pending.remove(member_id);
-                    self.member_kickoff_starting.insert(member_id);
-                    self.member_kickoff_callback_pending.remove(member_id);
-                    self.member_kickoff_started.remove(member_id);
-                    self.member_kickoff_failed.remove(member_id);
-                    self.member_kickoff_cancelled.remove(member_id);
-                    self.member_kickoff_error.remove(member_id);
-                }
-                to Running
-                emit PersistKickoffUpdate { member_id: member_id, phase: KickoffPhase::Starting }
-                emit EmitKickoffLifecycleNotice { member_id: member_id, intent: KickoffIntent::Starting }
-            }
-
-            transition KickoffResolveStarted {
-                per_phase [Running, Stopped, Completed]
-                on input KickoffResolveStarted { member_id }
-                guard "kickoff_starting" { self.member_kickoff_starting.contains(member_id) }
-                update {
-                    self.member_kickoff_pending.remove(member_id);
-                    self.member_kickoff_starting.remove(member_id);
-                    self.member_kickoff_callback_pending.remove(member_id);
-                    self.member_kickoff_started.insert(member_id);
-                    self.member_kickoff_failed.remove(member_id);
-                    self.member_kickoff_cancelled.remove(member_id);
-                    self.member_kickoff_error.remove(member_id);
-                }
-                to Running
-                emit PersistKickoffUpdate { member_id: member_id, phase: KickoffPhase::Started }
-                emit EmitKickoffLifecycleNotice { member_id: member_id, intent: KickoffIntent::Started }
-            }
-
-            transition KickoffResolveCallbackPending {
-                per_phase [Running, Stopped, Completed]
-                on input KickoffResolveCallbackPending { member_id }
-                guard "kickoff_starting" { self.member_kickoff_starting.contains(member_id) }
-                update {
-                    self.member_kickoff_pending.remove(member_id);
-                    self.member_kickoff_starting.remove(member_id);
-                    self.member_kickoff_callback_pending.insert(member_id);
-                    self.member_kickoff_started.remove(member_id);
-                    self.member_kickoff_failed.remove(member_id);
-                    self.member_kickoff_cancelled.remove(member_id);
-                    self.member_kickoff_error.remove(member_id);
-                }
-                to Running
-                emit PersistKickoffUpdate { member_id: member_id, phase: KickoffPhase::CallbackPending }
-                emit EmitKickoffLifecycleNotice { member_id: member_id, intent: KickoffIntent::CallbackPending }
-            }
-
-            transition KickoffResolveFailedFromStarting {
-                per_phase [Running, Stopped, Completed]
-                on input KickoffResolveFailed { member_id, error }
-                guard "kickoff_active_failed" {
-                    (self.member_kickoff_pending.contains(member_id)
-                        || self.member_kickoff_starting.contains(member_id)
-                        || self.member_kickoff_callback_pending.contains(member_id))
-                }
-                update {
-                    self.member_kickoff_pending.remove(member_id);
-                    self.member_kickoff_starting.remove(member_id);
-                    self.member_kickoff_callback_pending.remove(member_id);
-                    self.member_kickoff_started.remove(member_id);
-                    self.member_kickoff_failed.insert(member_id);
-                    self.member_kickoff_cancelled.remove(member_id);
-                    self.member_kickoff_error.insert(member_id, error);
-                }
-                to Running
-                emit PersistKickoffFailureUpdate { member_id: member_id, phase: KickoffPhase::Failed, error: error }
-                emit EmitKickoffLifecycleNotice { member_id: member_id, intent: KickoffIntent::Failed }
-            }
-
-            transition KickoffResolveCancelled {
-                per_phase [Running, Stopped, Completed]
-                on input KickoffResolveCancelled { member_id }
-                guard "kickoff_cancelled" { !self.member_kickoff_started.contains(member_id) }
-                update {
-                    self.member_kickoff_pending.remove(member_id);
-                    self.member_kickoff_starting.remove(member_id);
-                    self.member_kickoff_callback_pending.remove(member_id);
-                    self.member_kickoff_started.remove(member_id);
-                    self.member_kickoff_failed.remove(member_id);
-                    self.member_kickoff_cancelled.insert(member_id);
-                    self.member_kickoff_error.remove(member_id);
-                }
-                to Running
-                emit PersistKickoffUpdate { member_id: member_id, phase: KickoffPhase::Cancelled }
-                emit EmitKickoffLifecycleNotice { member_id: member_id, intent: KickoffIntent::Cancelled }
-            }
-
-            transition KickoffCancelRequested {
-                per_phase [Running, Stopped, Completed]
-                on input KickoffCancelRequested { member_id }
-                guard "kickoff_cancellable" {
-                    (self.member_kickoff_pending.contains(member_id)
-                        || self.member_kickoff_starting.contains(member_id)
-                        || self.member_kickoff_callback_pending.contains(member_id))
-                }
-                update {
-                    self.member_kickoff_pending.remove(member_id);
-                    self.member_kickoff_starting.remove(member_id);
-                    self.member_kickoff_callback_pending.remove(member_id);
-                    self.member_kickoff_started.remove(member_id);
-                    self.member_kickoff_failed.remove(member_id);
-                    self.member_kickoff_cancelled.insert(member_id);
-                    self.member_kickoff_error.remove(member_id);
-                }
-                to Running
-                emit PersistKickoffUpdate { member_id: member_id, phase: KickoffPhase::Cancelled }
-                emit EmitKickoffLifecycleNotice { member_id: member_id, intent: KickoffIntent::Cancelled }
-            }
-
-            transition KickoffClear {
-                per_phase [Running, Stopped, Completed]
-                on input KickoffClear { member_id }
-                update {
-                    self.member_kickoff_pending.remove(member_id);
-                    self.member_kickoff_starting.remove(member_id);
-                    self.member_kickoff_callback_pending.remove(member_id);
-                    self.member_kickoff_started.remove(member_id);
-                    self.member_kickoff_failed.remove(member_id);
-                    self.member_kickoff_cancelled.remove(member_id);
-                    self.member_kickoff_error.remove(member_id);
-                }
-                to Running
-            }
-
-            transition SubmitWorkRunningExternal {
-                on input SubmitWork { agent_runtime_id, fence_token, work_id, origin }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "active_members_present" { self.live_runtime_ids != EmptySet }
-                guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
-                guard "external_origin" { origin == WorkOrigin::External }
-                guard "runtime_externally_addressable" { self.externally_addressable_runtime_ids.contains(agent_runtime_id) }
-                update {}
-                to Running
-                emit RequestRuntimeIngress { agent_runtime_id: agent_runtime_id, fence_token: fence_token, work_id: work_id, origin: origin }
-            }
-
-            transition SubmitWorkRunningInternal {
-                on input SubmitWork { agent_runtime_id, fence_token, work_id, origin }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "active_members_present" { self.live_runtime_ids != EmptySet }
-                guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
-                guard "internal_origin" { origin == WorkOrigin::Internal }
-                update {}
-                to Running
-                emit RequestRuntimeIngress { agent_runtime_id: agent_runtime_id, fence_token: fence_token, work_id: work_id, origin: origin }
-            }
-
-            transition RetireMember {
-                on signal RetireMember { agent_runtime_id, fence_token, session_id }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
-                guard "fence_token_present" { fence_token == fence_token }
-                update {
-                    self.member_state_markers.insert(agent_runtime_id, MobMemberState::Retiring);
-                }
-                to Running
-                emit RequestRuntimeRetire { session_id: session_id }
-            }
-
-            transition ObserveRuntimeRetired {
-                on signal ObserveRuntimeRetired { agent_runtime_id, fence_token }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
-                guard "fence_token_present" { fence_token == fence_token }
-                update {
-                    self.live_runtime_ids.remove(agent_runtime_id);
-                    self.externally_addressable_runtime_ids.remove(agent_runtime_id);
-                    self.runtime_fence_tokens.remove(agent_runtime_id);
-                    self.member_startup_binding_requested.remove(agent_runtime_id);
-                    self.member_startup_runtime_ready.remove(agent_runtime_id);
-                    self.member_startup_ready.remove(agent_runtime_id);
-                    self.member_state_markers.remove(agent_runtime_id);
-                    self.active_run_count = 0;
-                }
-                to Running
-                emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Retired }
-            }
-
-            transition ResetMember {
-                on signal ResetMember { agent_identity, agent_runtime_id, fence_token, generation, external_addressable, session_id }
-                guard {
-                    self.lifecycle_phase == Phase::Running
-                    || self.lifecycle_phase == Phase::Stopped
-                }
-                update {
-                    self.active_run_count = 0;
-                    self.pending_spawn_count = 0;
-                    self.pending_spawn_sessions = EmptyMap;
-                    self.live_runtime_ids.insert(agent_runtime_id);
-                    if external_addressable {
-                        self.externally_addressable_runtime_ids.insert(agent_runtime_id);
-                    } else {
-                        self.externally_addressable_runtime_ids.remove(agent_runtime_id);
-                    }
-                    self.runtime_fence_tokens.insert(agent_runtime_id, fence_token);
-                    self.identity_to_runtime.insert(agent_identity, agent_runtime_id);
-                    self.member_startup_binding_requested.insert(agent_runtime_id);
-                    self.member_startup_runtime_ready.remove(agent_runtime_id);
-                    self.member_startup_ready.remove(agent_runtime_id);
-                }
-                to Running
-                emit RequestRuntimeBinding { agent_identity: agent_identity, agent_runtime_id: agent_runtime_id, fence_token: fence_token, generation: generation, session_id: session_id }
-                emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Reset }
-            }
-
-            transition RespawnMember {
-                on signal RespawnMember { agent_identity, agent_runtime_id, fence_token, generation, external_addressable, session_id }
-                guard { self.lifecycle_phase == Phase::Running }
-                update {
-                    self.active_run_count = 0;
-                    self.pending_spawn_count = 0;
-                    self.pending_spawn_sessions = EmptyMap;
-                    self.live_runtime_ids.insert(agent_runtime_id);
-                    if external_addressable {
-                        self.externally_addressable_runtime_ids.insert(agent_runtime_id);
-                    } else {
-                        self.externally_addressable_runtime_ids.remove(agent_runtime_id);
-                    }
-                    self.runtime_fence_tokens.insert(agent_runtime_id, fence_token);
-                    self.identity_to_runtime.insert(agent_identity, agent_runtime_id);
-                    self.member_startup_binding_requested.insert(agent_runtime_id);
-                    self.member_startup_runtime_ready.remove(agent_runtime_id);
-                    self.member_startup_ready.remove(agent_runtime_id);
-                }
-                to Running
-                emit RequestRuntimeBinding { agent_identity: agent_identity, agent_runtime_id: agent_runtime_id, fence_token: fence_token, generation: generation, session_id: session_id }
-                emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Respawned }
-            }
-
-            transition MarkCompleted {
-                on signal MarkCompleted
-                guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped }
-                guard "no_active_runs" { self.active_run_count == 0 }
-                update {}
-                to Completed
-                emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Completed }
-            }
-
-            transition DestroyMob {
-                on signal DestroyMob { session_id }
-                guard {
-                    self.lifecycle_phase == Phase::Running
-                    || self.lifecycle_phase == Phase::Stopped
-                    || self.lifecycle_phase == Phase::Completed
-                }
-                guard "session_ingress_detaches_closed" { self.pending_session_ingress_detach_runtime_ids == EmptySet }
-                update {
-                    self.live_runtime_ids = EmptySet;
-                    self.runtime_fence_tokens = EmptyMap;
-                    self.member_startup_binding_requested = EmptySet;
-                    self.member_startup_runtime_ready = EmptySet;
-                    self.member_startup_ready = EmptySet;
-                    self.member_state_markers = EmptyMap;
-                    self.pending_session_ingress_detach_runtime_ids = EmptySet;
-                    self.active_run_count = 0;
-                    self.pending_spawn_count = 0;
-                    self.pending_spawn_sessions = EmptyMap;
-                    self.coordinator_bound = false;
-                }
-                to Destroyed
-                emit RequestRuntimeDestroy { session_id: session_id }
-            }
-
-            transition ObserveRuntimeDestroyed {
-                on signal ObserveRuntimeDestroyed { agent_runtime_id, fence_token }
-                guard {
-                    self.lifecycle_phase == Phase::Running
-                    || self.lifecycle_phase == Phase::Stopped
-                    || self.lifecycle_phase == Phase::Completed
-                    || self.lifecycle_phase == Phase::Destroyed
-                }
-                guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
-                guard "fence_token_present" { fence_token == fence_token }
-                update {
-                    self.live_runtime_ids = EmptySet;
-                    self.runtime_fence_tokens = EmptyMap;
-                    self.member_state_markers = EmptyMap;
-                    self.active_run_count = 0;
-                    self.pending_spawn_count = 0;
-                    self.pending_spawn_sessions = EmptyMap;
-                    self.coordinator_bound = false;
-                }
-                to Destroyed
-                emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Destroyed }
-            }
-
-            // =====================================================================
-            // Absorbed transitions: per-phase self-loops
-            // =====================================================================
-
-            transition RecordOperatorActionProvenanceRunning {
-                on input RecordOperatorActionProvenance
-                guard { self.lifecycle_phase == Phase::Running }
-                update {}
-                to Running
-            }
-            transition RecordOperatorActionProvenanceStopped {
-                on input RecordOperatorActionProvenance
-                guard { self.lifecycle_phase == Phase::Stopped }
-                update {}
-                to Stopped
-            }
-            transition RecordOperatorActionProvenanceCompleted {
-                on input RecordOperatorActionProvenance
-                guard { self.lifecycle_phase == Phase::Completed }
-                update {}
-                to Completed
-            }
-            transition RecordOperatorActionProvenanceDestroyed {
-                on input RecordOperatorActionProvenance
-                guard { self.lifecycle_phase == Phase::Destroyed }
-                update {}
-                to Destroyed
-            }
-
-            transition SetSpawnPolicyRunning {
-                on input SetSpawnPolicy
-                guard { self.lifecycle_phase == Phase::Running }
-                update {}
-                to Running
-            }
-            transition SetSpawnPolicyStopped {
-                on input SetSpawnPolicy
-                guard { self.lifecycle_phase == Phase::Stopped }
-                update {}
-                to Stopped
-            }
-            transition SetSpawnPolicyCompleted {
-                on input SetSpawnPolicy
-                guard { self.lifecycle_phase == Phase::Completed }
-                update {}
-                to Completed
-            }
-            transition SetSpawnPolicyDestroyed {
-                on input SetSpawnPolicy
-                guard { self.lifecycle_phase == Phase::Destroyed }
-                update {}
-                to Destroyed
-            }
-
-            // =====================================================================
-            // Phase-changing transitions
-            // =====================================================================
-
-            transition StopRunning {
-                on input Stop
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "no_active_runs" { self.active_run_count == 0 }
-                update {
-                    self.coordinator_bound = false;
-                    self.active_run_count = 0;
-                }
-                to Stopped
-                emit EmitRunLifecycleNotice
-            }
-
-            transition ResumeStopped {
-                on input Resume
-                guard { self.lifecycle_phase == Phase::Stopped }
-                update {
-                    self.coordinator_bound = true;
-                }
-                to Running
-                emit EmitRunLifecycleNotice
-            }
-
-            transition CompleteRunning {
-                on input Complete
-                guard { self.lifecycle_phase == Phase::Running }
-                update {
-                    self.active_run_count = 0;
-                }
-                to Completed
-                emit EmitRunLifecycleNotice
-            }
-
-            transition ResetToRunning {
-                on input Reset
-                guard {
-                    self.lifecycle_phase == Phase::Running
-                    || self.lifecycle_phase == Phase::Stopped
-                    || self.lifecycle_phase == Phase::Completed
-                }
-                update {
-                    self.active_run_count = 0;
-                    self.pending_spawn_count = 0;
-                    self.pending_spawn_sessions = EmptyMap;
-                    self.coordinator_bound = true;
-                }
-                to Running
-                emit EmitRunLifecycleNotice
-            }
-
-            // =====================================================================
-            // Running self-loops (inputs)
-            // =====================================================================
-
-            // =====================================================================
-            // Track-B (R5): identity-level wiring mutations.
-            //
-            // `WireMembers`/`UnwireMembers` mutate `wiring_edges` at DSL
-            // authority and bump `topology_epoch`. The `WiringGraphChanged`
-            // effect lets the `RecomputeMobPeerOverlay` composition driver
-            // linearize peer-overlay recomputation against graph changes.
-            // =====================================================================
-
-            transition WireMembersRunning {
-                on input WireMembers { edge }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "edge_not_already_wired" { self.wiring_edges.contains(edge) == false }
-                update {
-                    self.wiring_edges.insert(edge);
-                    self.topology_epoch += 1;
-                }
-                to Running
-                emit WiringGraphChanged { epoch: self.topology_epoch }
-                emit EmitWiringLifecycleNotice { kind: WiringLifecycleKind::Wired, edge: edge }
-            }
-
-            transition UnwireMembersRunning {
-                on input UnwireMembers { edge }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "edge_currently_wired" { self.wiring_edges.contains(edge) == true }
-                update {
-                    self.wiring_edges.remove(edge);
-                    self.topology_epoch += 1;
-                }
-                to Running
-                emit WiringGraphChanged { epoch: self.topology_epoch }
-                emit EmitWiringLifecycleNotice { kind: WiringLifecycleKind::Unwired, edge: edge }
-            }
-
-            transition WireExternalPeerRunning {
-                on input WireExternalPeer { edge }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "external_peer_not_already_wired" { self.external_peer_edges.contains(edge) == false }
-                update {
-                    self.external_peer_edges.insert(edge);
-                    self.topology_epoch += 1;
-                }
-                to Running
-                emit WiringGraphChanged { epoch: self.topology_epoch }
-                emit EmitExternalPeerWiringLifecycleNotice { kind: WiringLifecycleKind::Wired, edge: edge }
-            }
-
-            transition UnwireExternalPeerRunning {
-                on input UnwireExternalPeer { edge }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "external_peer_currently_wired" { self.external_peer_edges.contains(edge) == true }
-                update {
-                    self.external_peer_edges.remove(edge);
-                    self.topology_epoch += 1;
-                }
-                to Running
-                emit WiringGraphChanged { epoch: self.topology_epoch }
-                emit EmitExternalPeerWiringLifecycleNotice { kind: WiringLifecycleKind::Unwired, edge: edge }
-            }
-
-            // =====================================================================
-            // Track-B (R5): identity-level session-binding mutations.
-            //
-            // `BindMemberSession`/`RotateMemberSession`/`ReleaseMemberSession`
-            // are the explicit-driven counterparts to the Spawn/Retire-coupled
-            // binding updates. Each bumps `topology_epoch` and emits
-            // `MemberSessionBindingChanged { epoch, agent_identity, old, new }`
-            // so the composition driver can recompute overlay endpoints
-            // keyed on the updated session.
-            // =====================================================================
-
-            transition BindMemberSessionRunning {
-                on input BindMemberSession { agent_identity, session_id }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "identity_has_runtime" { self.identity_to_runtime.contains_key(agent_identity) == true }
-                guard "no_prior_session_binding" { self.member_session_bindings.contains_key(agent_identity) == false }
-                update {
-                    self.member_session_bindings.insert(agent_identity, session_id);
-                    self.topology_epoch += 1;
-                }
-                to Running
-                emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: None, new_session_id: Some(session_id) }
-            }
-
-            transition RotateMemberSessionRunning {
-                on input RotateMemberSession { agent_identity, old_session_id, new_session_id }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "identity_has_runtime" { self.identity_to_runtime.contains_key(agent_identity) == true }
-                guard "prior_session_binding_present" { self.member_session_bindings.contains_key(agent_identity) == true }
-                // PR #340 review item #5: verify the caller's witness of
-                // the prior session matches the current binding.
-                guard "old_session_id_matches_current" {
-                    self.member_session_bindings.get_cloned(agent_identity) == Some(old_session_id)
-                }
-                update {
-                    self.member_session_bindings.insert(agent_identity, new_session_id);
-                    self.topology_epoch += 1;
-                }
-                to Running
-                emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: Some(old_session_id), new_session_id: Some(new_session_id) }
-            }
-
-            transition ReleaseMemberSessionRunning {
-                on input ReleaseMemberSession { agent_identity, session_id }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "prior_session_binding_present" { self.member_session_bindings.contains_key(agent_identity) == true }
-                // PR #340 review item #5: verify the caller's witness of
-                // the session being released matches the current binding.
-                guard "session_id_matches_current" {
-                    self.member_session_bindings.get_cloned(agent_identity) == Some(session_id)
-                }
-                update {
-                    self.member_session_bindings.remove(agent_identity);
-                    self.topology_epoch += 1;
-                }
-                to Running
-                emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: Some(session_id), new_session_id: None }
-            }
-
-            // TaskCreate: real mutator. Rejects duplicate task ids.
-            transition TaskCreateRunning {
-                on input TaskCreate { task_id, task_payload }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "task_id_unused" { self.tasks.contains_key(task_id) == false }
-                update {
-                    self.tasks.insert(task_id, task_payload);
-                }
-                to Running
-                emit EmitTaskNotice
-            }
-
-            // TaskUpdate: status transition authority.
-            //
-            // Split into one transition per target status. Each enforces:
-            //   * task_id must refer to an existing task (unknown ids rejected)
-            //   * the source status is not a terminal one we disallow rolling
-            //     back from (Completed → Pending / InProgress is rejected).
-            //
-            // The status-projection sets (`in_progress_task_ids`,
-            // `completed_task_ids`) are the guard-visible truth; `tasks` carries
-            // the opaque payload for shell-side projection.
-            transition TaskUpdateRunningPending {
-                on input TaskUpdate { task_id, new_status }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "target_pending" { new_status == TaskStatus::Pending }
-                guard "task_known" { self.tasks.contains_key(task_id) == true }
-                guard "not_completed" { self.completed_task_ids.contains(task_id) == false }
-                update {
-                    self.in_progress_task_ids.remove(task_id);
-                }
-                to Running
-                emit EmitTaskNotice
-            }
-
-            transition TaskUpdateRunningInProgress {
-                on input TaskUpdate { task_id, new_status }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "target_in_progress" { new_status == TaskStatus::InProgress }
-                guard "task_known" { self.tasks.contains_key(task_id) == true }
-                guard "not_completed" { self.completed_task_ids.contains(task_id) == false }
-                update {
-                    self.in_progress_task_ids.insert(task_id);
-                }
-                to Running
-                emit EmitTaskNotice
-            }
-
-            transition TaskUpdateRunningCompleted {
-                on input TaskUpdate { task_id, new_status }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "target_completed" { new_status == TaskStatus::Completed }
-                guard "task_known" { self.tasks.contains_key(task_id) == true }
-                update {
-                    self.in_progress_task_ids.remove(task_id);
-                    self.completed_task_ids.insert(task_id);
-                }
-                to Running
-                emit EmitTaskNotice
-            }
-
-            transition TaskUpdateRunningCancelled {
-                on input TaskUpdate { task_id, new_status }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "target_cancelled" { new_status == TaskStatus::Cancelled }
-                guard "task_known" { self.tasks.contains_key(task_id) == true }
-                guard "not_completed" { self.completed_task_ids.contains(task_id) == false }
-                update {
-                    self.in_progress_task_ids.remove(task_id);
-                }
-                to Running
-                emit EmitTaskNotice
-            }
-
-            transition ForceCancelRunning {
-                on input ForceCancel
-                guard { self.lifecycle_phase == Phase::Running }
-                update {
-                    self.active_run_count = 0;
-                }
-                to Running
-                emit FlowTerminalized
-            }
-
-            // =====================================================================
-            // Subscribe commands
-            // =====================================================================
-
-            transition SubscribeAgentEventsRunning {
-                on input SubscribeAgentEvents
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "active_members_present" { self.live_runtime_ids != EmptySet }
-                update {}
-                to Running
-            }
-            transition SubscribeAgentEventsStopped {
-                on input SubscribeAgentEvents
-                guard { self.lifecycle_phase == Phase::Stopped }
-                guard "active_members_present" { self.live_runtime_ids != EmptySet }
-                update {}
-                to Stopped
-            }
-            transition SubscribeAgentEventsCompleted {
-                on input SubscribeAgentEvents
-                guard { self.lifecycle_phase == Phase::Completed }
-                guard "active_members_present" { self.live_runtime_ids != EmptySet }
-                update {}
-                to Completed
-            }
-            transition SubscribeAgentEventsDestroyed {
-                on input SubscribeAgentEvents
-                guard { self.lifecycle_phase == Phase::Destroyed }
-                guard "active_members_present" { self.live_runtime_ids != EmptySet }
-                update {}
-                to Destroyed
-            }
-
-            transition SubscribeAllAgentEventsRunning {
-                on input SubscribeAllAgentEvents
-                guard { self.lifecycle_phase == Phase::Running }
-                update {}
-                to Running
-            }
-            transition SubscribeAllAgentEventsStopped {
-                on input SubscribeAllAgentEvents
-                guard { self.lifecycle_phase == Phase::Stopped }
-                update {}
-                to Stopped
-            }
-            transition SubscribeAllAgentEventsCompleted {
-                on input SubscribeAllAgentEvents
-                guard { self.lifecycle_phase == Phase::Completed }
-                update {}
-                to Completed
-            }
-            transition SubscribeAllAgentEventsDestroyed {
-                on input SubscribeAllAgentEvents
-                guard { self.lifecycle_phase == Phase::Destroyed }
-                update {}
-                to Destroyed
-            }
-
-            transition SubscribeMobEventsRunning {
-                on input SubscribeMobEvents
-                guard { self.lifecycle_phase == Phase::Running }
-                update {}
-                to Running
-            }
-            transition SubscribeMobEventsStopped {
-                on input SubscribeMobEvents
-                guard { self.lifecycle_phase == Phase::Stopped }
-                update {}
-                to Stopped
-            }
-            transition SubscribeMobEventsCompleted {
-                on input SubscribeMobEvents
-                guard { self.lifecycle_phase == Phase::Completed }
-                update {}
-                to Completed
-            }
-            transition SubscribeMobEventsDestroyed {
-                on input SubscribeMobEvents
-                guard { self.lifecycle_phase == Phase::Destroyed }
-                update {}
-                to Destroyed
-            }
-
-            // =====================================================================
-            // Shutdown: from any non-Destroyed state
-            // =====================================================================
-
-            transition ShutdownRunning {
-                on input Shutdown
-                guard { self.lifecycle_phase == Phase::Running }
-                update {
-                    self.coordinator_bound = false;
-                    self.active_run_count = 0;
-                }
-                to Stopped
-                emit EmitRunLifecycleNotice
-            }
-
-            transition ShutdownStopped {
-                on input Shutdown
-                guard { self.lifecycle_phase == Phase::Stopped }
-                update {
-                    self.coordinator_bound = false;
-                    self.active_run_count = 0;
-                }
-                to Stopped
-                emit EmitRunLifecycleNotice
-            }
-
-            transition ShutdownCompleted {
-                on input Shutdown
-                guard { self.lifecycle_phase == Phase::Completed }
-                update {
-                    self.coordinator_bound = false;
-                    self.active_run_count = 0;
-                }
-                to Completed
-                emit EmitRunLifecycleNotice
-            }
-
-            // =====================================================================
-            // Signal-driven Running self-loops
-            // =====================================================================
-
-            transition CancelFlowRunning {
-                on input CancelFlow
-                guard { self.lifecycle_phase == Phase::Running }
-                update {
-                    self.active_run_count = 0;
-                }
-                to Running
-                emit FlowTerminalized
-            }
-
-            transition InitializeOrchestratorRunning {
-                on signal InitializeOrchestrator
-                guard { self.lifecycle_phase == Phase::Running }
-                update {
-                    self.coordinator_bound = true;
-                }
-                to Running
-                emit NotifyCoordinator
-            }
-
-            transition BindCoordinatorRunning {
-                on signal BindCoordinator
-                guard { self.lifecycle_phase == Phase::Running }
-                update {
-                    self.coordinator_bound = true;
-                }
-                to Running
-                emit NotifyCoordinator
-            }
-
-            transition UnbindCoordinatorRunning {
-                on signal UnbindCoordinator
-                guard { self.lifecycle_phase == Phase::Running }
-                update {
-                    self.coordinator_bound = false;
-                }
-                to Running
-                emit NotifyCoordinator
-            }
-
-            transition StageSpawnRunning {
-                on signal StageSpawn { agent_identity, session_id }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "pending_identity_unused" { self.pending_spawn_sessions.contains_key(agent_identity) == false }
-                update {
-                    self.pending_spawn_count += 1;
-                    self.pending_spawn_sessions.insert(agent_identity, session_id);
-                }
-                to Running
-                emit ExposePendingSpawn
-            }
-
-            transition StopOrchestratorRunning {
-                on signal StopOrchestrator
-                guard { self.lifecycle_phase == Phase::Running }
-                update { self.coordinator_bound = false; }
-                to Running
-                emit NotifyCoordinator
-            }
-            transition StopOrchestratorStopped {
-                on signal StopOrchestrator
-                guard { self.lifecycle_phase == Phase::Stopped }
-                update { self.coordinator_bound = false; }
-                to Stopped
-                emit NotifyCoordinator
-            }
-            transition StopOrchestratorCompleted {
-                on signal StopOrchestrator
-                guard { self.lifecycle_phase == Phase::Completed }
-                update { self.coordinator_bound = false; }
-                to Completed
-                emit NotifyCoordinator
-            }
-
-            transition ResumeOrchestratorRunning {
-                on signal ResumeOrchestrator
-                guard { self.lifecycle_phase == Phase::Running }
-                update { self.coordinator_bound = true; }
-                to Running
-                emit NotifyCoordinator
-            }
-            transition ResumeOrchestratorStopped {
-                on signal ResumeOrchestrator
-                guard { self.lifecycle_phase == Phase::Stopped }
-                update { self.coordinator_bound = true; }
-                to Stopped
-                emit NotifyCoordinator
-            }
-            transition ResumeOrchestratorCompleted {
-                on signal ResumeOrchestrator
-                guard { self.lifecycle_phase == Phase::Completed }
-                update { self.coordinator_bound = true; }
-                to Completed
-                emit NotifyCoordinator
-            }
-
-            transition DestroyOrchestratorRunning {
-                on signal DestroyOrchestrator
-                guard { self.lifecycle_phase == Phase::Running }
-                update { self.coordinator_bound = false; }
-                to Running
-                emit NotifyCoordinator
-            }
-            transition DestroyOrchestratorStopped {
-                on signal DestroyOrchestrator
-                guard { self.lifecycle_phase == Phase::Stopped }
-                update { self.coordinator_bound = false; }
-                to Stopped
-                emit NotifyCoordinator
-            }
-            transition DestroyOrchestratorCompleted {
-                on signal DestroyOrchestrator
-                guard { self.lifecycle_phase == Phase::Completed }
-                update { self.coordinator_bound = false; }
-                to Completed
-                emit NotifyCoordinator
-            }
-
-            transition ForceCancelMemberRunning {
-                on signal ForceCancelMember
-                guard { self.lifecycle_phase == Phase::Running }
-                update {}
-                to Running
-                emit EmitMemberTerminalNotice
-            }
-
-            transition MemberPeerExposedRunning {
-                on signal MemberPeerExposed
-                guard { self.lifecycle_phase == Phase::Running }
-                update {}
-                to Running
-                emit AdmitPeerInput
-            }
-
-            transition MemberTerminalizedRunning {
-                on signal MemberTerminalized
-                guard { self.lifecycle_phase == Phase::Running }
-                update {}
-                to Running
-                emit EmitMemberTerminalNotice
-            }
-
-            transition OperationPeerTrustedRunning {
-                on signal OperationPeerTrusted
-                guard { self.lifecycle_phase == Phase::Running }
-                update {}
-                to Running
-                emit AdmitPeerInput
-            }
-
-            transition PeerInputAdmittedRunning {
-                on signal PeerInputAdmitted
-                guard { self.lifecycle_phase == Phase::Running }
-                update {}
-                to Running
-                emit AdmitPeerInput
-            }
-
-            // =====================================================================
-            // BeginCleanup / FinishCleanup
-            // =====================================================================
-
-            transition BeginCleanupStopped {
-                on signal BeginCleanup
-                guard { self.lifecycle_phase == Phase::Stopped }
-                update {}
-                to Stopped
-                emit EmitRunLifecycleNotice
-            }
-
-            transition BeginCleanupCompleted {
-                on signal BeginCleanup
-                guard { self.lifecycle_phase == Phase::Completed }
-                update {}
-                to Stopped
-                emit EmitRunLifecycleNotice
-            }
-
-            transition FinishCleanupStopped {
-                on signal FinishCleanup
-                guard { self.lifecycle_phase == Phase::Stopped }
-                update {}
-                to Stopped
-                emit EmitRunLifecycleNotice
-            }
-
-            transition FinishCleanupCompleted {
-                on signal FinishCleanup
-                guard { self.lifecycle_phase == Phase::Completed }
-                update {}
-                to Stopped
-                emit EmitRunLifecycleNotice
-            }
-
-            // =====================================================================
-            // RunFlow / StartFlow / CreateRun / StartRun
-            // =====================================================================
-
-            transition RunFlowRunning {
-                on input RunFlow
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "coordinator_bound" { self.coordinator_bound == true }
-                update {
-                    self.active_run_count += 1;
-                }
-                to Running
-                emit EmitFlowRunNotice
-            }
-
-            transition CreateRunSeedRunning {
-                on input CreateRunSeed { run_id, step_ids, ordered_steps, step_has_conditions, step_dependencies, step_dependency_modes, step_branches, step_collection_policies, step_quorum_thresholds, escalation_threshold, max_step_retries, max_active_nodes, max_active_frames, max_frame_depth }
-                guard { self.lifecycle_phase == Phase::Running }
-                update {
-                    self.run_status.insert(run_id, FlowRunStatus::Pending);
-                    self.run_tracked_steps.insert(run_id, step_ids);
-                    self.run_ordered_steps.insert(run_id, ordered_steps);
-                    self.run_step_status.insert(run_id, EmptyMap);
-                    self.run_output_recorded.insert(run_id, EmptyMap);
-                    self.run_step_condition_results.insert(run_id, EmptyMap);
-                    self.run_step_has_conditions.insert(run_id, step_has_conditions);
-                    self.run_step_dependencies.insert(run_id, step_dependencies);
-                    self.run_step_dependency_modes.insert(run_id, step_dependency_modes);
-                    self.run_step_branches.insert(run_id, step_branches);
-                    self.run_step_collection_policies.insert(run_id, step_collection_policies);
-                    self.run_step_quorum_thresholds.insert(run_id, step_quorum_thresholds);
-                    self.run_step_target_counts.insert(run_id, EmptyMap);
-                    self.run_step_target_success_counts.insert(run_id, EmptyMap);
-                    self.run_step_target_terminal_failure_counts.insert(run_id, EmptyMap);
-                    self.run_target_retry_counts.insert(run_id, EmptyMap);
-                    self.run_escalation_threshold.insert(run_id, escalation_threshold);
-                    self.run_max_step_retries.insert(run_id, max_step_retries);
-                    self.run_ready_frames.insert(run_id, EmptySeq);
-                    self.run_ready_frame_membership.insert(run_id, EmptySet);
-                    self.run_pending_body_frame_loops.insert(run_id, EmptySeq);
-                    self.run_pending_body_frame_loop_membership.insert(run_id, EmptySet);
-                    self.run_max_active_nodes.insert(run_id, max_active_nodes);
-                    self.run_max_active_frames.insert(run_id, max_active_frames);
-                    self.run_max_frame_depth.insert(run_id, max_frame_depth);
-                }
-                to Running
-                emit EmitRunLifecycleNotice
-            }
-
-            transition CreateFrameSeedRunning {
-                on input CreateFrameSeed { run_id, frame_id, frame_scope, loop_instance_id, iteration, tracked_nodes, ordered_nodes, node_kind, node_dependencies, node_dependency_modes, node_branches }
-                guard { self.lifecycle_phase == Phase::Running }
-                update {
-                    self.frame_scope.insert(frame_id, frame_scope);
-                    self.frame_phase.insert(frame_id, FrameStatus::Running);
-                    self.frame_run.insert(frame_id, run_id);
-                    self.frame_parent_loop.insert(frame_id, loop_instance_id);
-                    self.frame_iteration.insert(frame_id, iteration);
-                    self.frame_tracked_nodes.insert(frame_id, tracked_nodes);
-                    self.frame_ordered_nodes.insert(frame_id, ordered_nodes);
-                    self.frame_node_kind.insert(frame_id, node_kind);
-                    self.frame_node_dependencies.insert(frame_id, node_dependencies);
-                    self.frame_node_dependency_modes.insert(frame_id, node_dependency_modes);
-                    self.frame_node_branches.insert(frame_id, node_branches);
-                    self.frame_node_status.insert(frame_id, EmptyMap);
-                    self.frame_ready_queue.insert(frame_id, EmptySeq);
-                    self.frame_output_recorded.insert(frame_id, EmptyMap);
-                    self.frame_node_condition_results.insert(frame_id, EmptyMap);
-                }
-                to Running
-                emit EmitRunLifecycleNotice
-            }
-
-            transition CreateLoopSeedRunning {
-                on input CreateLoopSeed { loop_instance_id, parent_frame_id, parent_node_id, loop_id, depth, max_iterations }
-                guard { self.lifecycle_phase == Phase::Running }
-                update {
-                    self.loop_phase.insert(loop_instance_id, LoopStatus::Running);
-                    self.loop_parent_frame.insert(loop_instance_id, parent_frame_id);
-                    self.loop_parent_node.insert(loop_instance_id, parent_node_id);
-                    self.loop_definition.insert(loop_instance_id, loop_id);
-                    self.loop_depth.insert(loop_instance_id, depth);
-                    self.loop_stage.insert(loop_instance_id, LoopIterationStage::AwaitingBodyFrame);
-                    self.loop_current_iteration.insert(loop_instance_id, 0u64);
-                    self.loop_last_completed_iteration.insert(loop_instance_id, 0u64);
-                    self.loop_max_iterations.insert(loop_instance_id, max_iterations);
-                    self.loop_active_body_frame.insert(loop_instance_id, None);
-                }
-                to Running
-                emit EmitRunLifecycleNotice
-            }
-
-            transition RecordLoopBodyFrameCompletedRunning {
-                on input RecordLoopBodyFrameCompleted { loop_instance_id, iteration }
-                guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
-                guard "known_loop" { self.loop_phase.contains_key(loop_instance_id) == true }
-                guard "loop_running" { self.loop_phase.get_cloned(loop_instance_id) == Some(LoopStatus::Running) }
-                guard "body_frame_active" { self.loop_stage.get_cloned(loop_instance_id) == Some(LoopIterationStage::BodyFrameActive) }
-                guard "iteration_matches_current" { self.loop_current_iteration.get_cloned(loop_instance_id) == Some(iteration) }
-                update {
-                    self.loop_stage.insert(loop_instance_id, LoopIterationStage::AwaitingUntilEvaluation);
-                    self.loop_last_completed_iteration.insert(loop_instance_id, iteration);
-                    self.loop_current_iteration.insert(loop_instance_id, iteration + 1u64);
-                    self.loop_active_body_frame.insert(loop_instance_id, None);
-                }
-                to Running
-                emit EmitRunLifecycleNotice
-            }
-
-            transition RecordLoopUntilConditionMetRunning {
-                on input RecordLoopUntilConditionMet { loop_instance_id, iteration }
-                guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
-                guard "known_loop" { self.loop_phase.contains_key(loop_instance_id) == true }
-                guard "loop_running" { self.loop_phase.get_cloned(loop_instance_id) == Some(LoopStatus::Running) }
-                guard "awaiting_until_evaluation" { self.loop_stage.get_cloned(loop_instance_id) == Some(LoopIterationStage::AwaitingUntilEvaluation) }
-                guard "iteration_matches_last_completed" { self.loop_last_completed_iteration.get_cloned(loop_instance_id) == Some(iteration) }
-                update {
-                    self.loop_phase.insert(loop_instance_id, LoopStatus::Completed);
-                    self.loop_active_body_frame.insert(loop_instance_id, None);
-                }
-                to Running
-                emit EmitRunLifecycleNotice
-            }
-
-            transition RecordLoopUntilConditionFailedRunning {
-                on input RecordLoopUntilConditionFailed { loop_instance_id, iteration }
-                guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
-                guard "known_loop" { self.loop_phase.contains_key(loop_instance_id) == true }
-                guard "loop_running" { self.loop_phase.get_cloned(loop_instance_id) == Some(LoopStatus::Running) }
-                guard "awaiting_until_evaluation" { self.loop_stage.get_cloned(loop_instance_id) == Some(LoopIterationStage::AwaitingUntilEvaluation) }
-                guard "iteration_matches_last_completed" { self.loop_last_completed_iteration.get_cloned(loop_instance_id) == Some(iteration) }
-                guard "iterations_remaining" {
-                    self.loop_current_iteration.get_cloned(loop_instance_id).get("value")
-                        < self.loop_max_iterations.get_cloned(loop_instance_id).get("value")
-                }
-                update {
-                    self.loop_stage.insert(loop_instance_id, LoopIterationStage::AwaitingBodyFrame);
-                    self.loop_active_body_frame.insert(loop_instance_id, None);
-                }
-                to Running
-                emit EmitRunLifecycleNotice
-            }
-
-            transition RecordLoopUntilConditionFailedExhausted {
-                on input RecordLoopUntilConditionFailed { loop_instance_id, iteration }
-                guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
-                guard "known_loop" { self.loop_phase.contains_key(loop_instance_id) == true }
-                guard "loop_running" { self.loop_phase.get_cloned(loop_instance_id) == Some(LoopStatus::Running) }
-                guard "awaiting_until_evaluation" { self.loop_stage.get_cloned(loop_instance_id) == Some(LoopIterationStage::AwaitingUntilEvaluation) }
-                guard "iteration_matches_last_completed" { self.loop_last_completed_iteration.get_cloned(loop_instance_id) == Some(iteration) }
-                guard "iterations_exhausted" {
-                    self.loop_current_iteration.get_cloned(loop_instance_id).get("value")
-                        >= self.loop_max_iterations.get_cloned(loop_instance_id).get("value")
-                }
-                update {
-                    self.loop_phase.insert(loop_instance_id, LoopStatus::Exhausted);
-                    self.loop_active_body_frame.insert(loop_instance_id, None);
-                }
-                to Running
-                emit EmitRunLifecycleNotice
-            }
-
-            transition ProjectRunStatusRunning {
-                on input ProjectRunStatus { run_id, status }
-                guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
-                update {
-                    self.run_status.insert(run_id, status);
-                }
-                to Running
-                emit EmitRunLifecycleNotice
-            }
-
-            transition ProjectRunStepStatusRunning {
-                on input ProjectRunStepStatus { run_step, status, output_recorded }
-                guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
-                update {
-                    self.run_step_status_flat.insert(run_step, status);
-                    self.run_output_recorded_flat.insert(run_step, output_recorded);
-                }
-                to Running
-                emit EmitRunLifecycleNotice
-            }
-
-            transition ProjectFramePhaseRunning {
-                on input ProjectFramePhase { frame_id, phase }
-                guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
-                update {
-                    self.frame_phase.insert(frame_id, phase);
-                }
-                to Running
-                emit EmitRunLifecycleNotice
-            }
-
-            transition ProjectLoopStateRunning {
-                on input ProjectLoopState { loop_instance_id, phase, stage, active_body_frame_id }
-                guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped || self.lifecycle_phase == Phase::Completed }
-                update {
-                    self.loop_phase.insert(loop_instance_id, phase);
-                    self.loop_stage.insert(loop_instance_id, stage);
-                    self.loop_active_body_frame.insert(loop_instance_id, active_body_frame_id);
-                }
-                to Running
-                emit EmitRunLifecycleNotice
-            }
-
-            transition StartFlowRunning {
-                on signal StartFlow
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "coordinator_bound" { self.coordinator_bound == true }
-                update {
-                    self.active_run_count += 1;
-                }
-                to Running
-                emit EmitFlowRunNotice
-            }
-
-            transition CreateRunRunning {
-                on signal CreateRun
-                guard { self.lifecycle_phase == Phase::Running }
-                update {
-                    self.active_run_count += 1;
-                }
-                to Running
-                emit EmitRunLifecycleNotice
-            }
-
-            transition StartRunRunning {
-                on signal StartRun
-                guard { self.lifecycle_phase == Phase::Running }
-                update {
-                    self.active_run_count += 1;
-                }
-                to Running
-                emit EmitRunLifecycleNotice
-            }
-
-            // =====================================================================
-            // CompleteFlow / FinishRun
-            // =====================================================================
-            //
-            // Two independent flow-terminalization paths drive the authority to
-            // the same state:
-            //   1. Natural completion: a run's task finishes and
-            //      `handle_flow_cleanup` fires `CompleteFlow` + `FinishRun`
-            //      (decrementing `active_run_count`, clearing the run-tracker).
-            //   2. Destroy-driven cancel: `cancel_all_flow_tasks` iterates the
-            //      run-tracker and fires the same signals for any run that has
-            //      not already been cleaned up.
-            // Because actor-command ordering is unordered between these two
-            // paths, they race. Whichever lands first drives
-            // `active_run_count` from 1 → 0; the other arrives with the counter
-            // already at 0. The *Zero transitions below model "CompleteFlow /
-            // FinishRun at count 0" as a legitimate terminal convergence
-            // (no-op update, same target phase) rather than as an error the
-            // caller must paper over — dogma requires that convergence
-            // semantics live in the machine authority.
-
-            transition CompleteFlowRunning {
-                on signal CompleteFlow
-                guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Completed }
-                guard "active_runs_present" { self.active_run_count > 0 }
-                update {
-                    self.active_run_count -= 1;
-                }
-                to Running
-                emit FlowTerminalized
-            }
-
-            transition CompleteFlowRunningZero {
-                on signal CompleteFlow
-                guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Completed }
-                guard "no_active_runs" { self.active_run_count == 0 }
-                update {}
-                to Running
-                emit NotifyCoordinator
-            }
-
-            transition FinishRunRunning {
-                on signal FinishRun
-                guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped }
-                guard "active_runs_present" { self.active_run_count > 0 }
-                update {
-                    self.active_run_count -= 1;
-                }
-                to Running
-                emit EmitRunLifecycleNotice
-            }
-
-            transition FinishRunRunningZero {
-                on signal FinishRun
-                guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped }
-                guard "no_active_runs" { self.active_run_count == 0 }
-                update {}
-                to Running
-                emit NotifyCoordinator
-            }
-
-            // =====================================================================
-            // Retire / RetireAll
-            // =====================================================================
-
-            transition RetireRunningReleasing {
-                on input Retire { agent_runtime_id, agent_identity, releasing, session_id }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "active_members_present" { self.live_runtime_ids != EmptySet }
-                guard "runtime_id_present" { self.live_runtime_ids.contains(agent_runtime_id) }
-                guard "prior_session_binding_present" { self.member_session_bindings.contains_key(agent_identity) == true }
-                guard "releasing_present" { releasing != None }
-                update {
-                    self.member_state_markers.insert(agent_runtime_id, MobMemberState::Retiring);
-                    self.member_session_bindings.remove(agent_identity);
-                    self.pending_session_ingress_detach_runtime_ids.insert(agent_runtime_id);
-                    self.topology_epoch += 1;
-                }
-                to Running
-                emit RequestRuntimeRetire { session_id: session_id }
-                emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: Some(releasing.get("value")), new_session_id: None }
-            }
-
-            transition RetireRunningPreservingBinding {
-                on input Retire { agent_runtime_id, agent_identity, releasing, session_id }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "active_members_present" { self.live_runtime_ids != EmptySet }
-                guard "runtime_id_present" { self.live_runtime_ids.contains(agent_runtime_id) }
-                guard "prior_session_binding_present" { self.member_session_bindings.contains_key(agent_identity) == true }
-                guard "releasing_absent" { releasing == None }
-                update {
-                    self.member_state_markers.insert(agent_runtime_id, MobMemberState::Retiring);
-                }
-                to Running
-                emit RequestRuntimeRetire { session_id: session_id }
-            }
-
-            transition RetireRunningNoBinding {
-                on input Retire { agent_runtime_id, agent_identity, releasing, session_id }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "active_members_present" { self.live_runtime_ids != EmptySet }
-                guard "runtime_id_present" { self.live_runtime_ids.contains(agent_runtime_id) }
-                guard "no_prior_session_binding" { self.member_session_bindings.contains_key(agent_identity) == false }
-                guard "releasing_absent" { releasing == None }
-                update {
-                    self.member_state_markers.insert(agent_runtime_id, MobMemberState::Retiring);
-                }
-                to Running
-                emit RequestRuntimeRetire { session_id: session_id }
-            }
-
-            transition RetireStoppedReleasing {
-                on input Retire { agent_runtime_id, agent_identity, releasing, session_id }
-                guard { self.lifecycle_phase == Phase::Stopped }
-                guard "active_members_present" { self.live_runtime_ids != EmptySet }
-                guard "runtime_id_present" { self.live_runtime_ids.contains(agent_runtime_id) }
-                guard "prior_session_binding_present" { self.member_session_bindings.contains_key(agent_identity) == true }
-                guard "releasing_present" { releasing != None }
-                update {
-                    self.member_state_markers.insert(agent_runtime_id, MobMemberState::Retiring);
-                    self.member_session_bindings.remove(agent_identity);
-                    self.pending_session_ingress_detach_runtime_ids.insert(agent_runtime_id);
-                    self.topology_epoch += 1;
-                }
-                to Stopped
-                emit RequestRuntimeRetire { session_id: session_id }
-                emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: Some(releasing.get("value")), new_session_id: None }
-            }
-
-            transition SessionIngressDetachedForMobDestroyRunning {
-                on input SessionIngressDetachedForMobDestroy { mob_id, agent_runtime_id }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "mob_id_present" { mob_id == mob_id }
-                guard "pending_detach_present" { self.pending_session_ingress_detach_runtime_ids.contains(agent_runtime_id) == true }
-                update {
-                    self.pending_session_ingress_detach_runtime_ids.remove(agent_runtime_id);
-                }
-                to Running
-            }
-
-            transition SessionIngressDetachedForMobDestroyStopped {
-                on input SessionIngressDetachedForMobDestroy { mob_id, agent_runtime_id }
-                guard { self.lifecycle_phase == Phase::Stopped }
-                guard "mob_id_present" { mob_id == mob_id }
-                guard "pending_detach_present" { self.pending_session_ingress_detach_runtime_ids.contains(agent_runtime_id) == true }
-                update {
-                    self.pending_session_ingress_detach_runtime_ids.remove(agent_runtime_id);
-                }
-                to Stopped
-            }
-
-            transition SessionIngressDetachFailedForMobDestroyRunning {
-                on input SessionIngressDetachFailedForMobDestroy { mob_id, agent_runtime_id, reason }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "mob_id_present" { mob_id == mob_id }
-                guard "reason_present" { reason == reason }
-                guard "pending_detach_present" { self.pending_session_ingress_detach_runtime_ids.contains(agent_runtime_id) == true }
-                update {}
-                to Running
-            }
-
-            transition SessionIngressDetachFailedForMobDestroyStopped {
-                on input SessionIngressDetachFailedForMobDestroy { mob_id, agent_runtime_id, reason }
-                guard { self.lifecycle_phase == Phase::Stopped }
-                guard "mob_id_present" { mob_id == mob_id }
-                guard "reason_present" { reason == reason }
-                guard "pending_detach_present" { self.pending_session_ingress_detach_runtime_ids.contains(agent_runtime_id) == true }
-                update {}
-                to Stopped
-            }
-
-            transition RetireStoppedPreservingBinding {
-                on input Retire { agent_runtime_id, agent_identity, releasing, session_id }
-                guard { self.lifecycle_phase == Phase::Stopped }
-                guard "active_members_present" { self.live_runtime_ids != EmptySet }
-                guard "runtime_id_present" { self.live_runtime_ids.contains(agent_runtime_id) }
-                guard "prior_session_binding_present" { self.member_session_bindings.contains_key(agent_identity) == true }
-                guard "releasing_absent" { releasing == None }
-                update {
-                    self.member_state_markers.insert(agent_runtime_id, MobMemberState::Retiring);
-                }
-                to Stopped
-                emit RequestRuntimeRetire { session_id: session_id }
-            }
-
-            transition RetireStoppedNoBinding {
-                on input Retire { agent_runtime_id, agent_identity, releasing, session_id }
-                guard { self.lifecycle_phase == Phase::Stopped }
-                guard "active_members_present" { self.live_runtime_ids != EmptySet }
-                guard "runtime_id_present" { self.live_runtime_ids.contains(agent_runtime_id) }
-                guard "no_prior_session_binding" { self.member_session_bindings.contains_key(agent_identity) == false }
-                guard "releasing_absent" { releasing == None }
-                update {
-                    self.member_state_markers.insert(agent_runtime_id, MobMemberState::Retiring);
-                }
-                to Stopped
-                emit RequestRuntimeRetire { session_id: session_id }
-            }
-
-            transition RetireAllRunning {
-                on input RetireAll
-                guard { self.lifecycle_phase == Phase::Running }
-                update {
-                    self.live_runtime_ids = EmptySet;
-                    self.runtime_fence_tokens = EmptyMap;
-                }
-                to Running
-                emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Retiring }
-            }
-
-            transition RetireAllStopped {
-                on input RetireAll
-                guard { self.lifecycle_phase == Phase::Stopped }
-                update {
-                    self.live_runtime_ids = EmptySet;
-                    self.runtime_fence_tokens = EmptyMap;
-                }
-                to Stopped
-                emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Retiring }
-            }
-
-            // =====================================================================
-            // CompleteSpawn
-            // =====================================================================
-
-            transition CompleteSpawnRunning {
-                on signal CompleteSpawn { agent_identity }
-                guard { self.lifecycle_phase == Phase::Running || self.lifecycle_phase == Phase::Stopped }
-                guard "pending_spawns_present" { self.pending_spawn_count > 0 }
-                guard "pending_identity_present" { self.pending_spawn_sessions.contains_key(agent_identity) == true }
-                update {
-                    self.pending_spawn_count -= 1;
-                    self.pending_spawn_sessions.remove(agent_identity);
-                }
-                to Running
-                emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Spawned }
-            }
-
-            // =====================================================================
-            // Destroy (input)
-            // =====================================================================
-
-            transition DestroyFromAny {
-                on input Destroy
-                guard {
-                    self.lifecycle_phase == Phase::Running
-                    || self.lifecycle_phase == Phase::Stopped
-                    || self.lifecycle_phase == Phase::Completed
-                }
-                guard "session_ingress_detaches_closed" { self.pending_session_ingress_detach_runtime_ids == EmptySet }
-                update {
-                    self.live_runtime_ids = EmptySet;
-                    self.runtime_fence_tokens = EmptyMap;
-                    self.pending_session_ingress_detach_runtime_ids = EmptySet;
-                    self.active_run_count = 0;
-                    self.pending_spawn_count = 0;
-                    self.pending_spawn_sessions = EmptyMap;
-                    self.coordinator_bound = false;
-                }
-                to Destroyed
-            }
-
-            // =====================================================================
-            // Respawn (input, Running self-loop)
-            // =====================================================================
-
-            transition RespawnRunning {
-                on input Respawn { agent_runtime_id }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "runtime_id_present" { self.live_runtime_ids.contains(agent_runtime_id) }
-                guard "coordinator_bound" { self.coordinator_bound == true }
-                update {}
-                to Running
-                emit ExposePendingSpawn
-            }
-
-            // =====================================================================
-            // CancelAllWork
-            // =====================================================================
-
-            transition CancelAllWorkRunning {
-                on input CancelAllWork { agent_runtime_id, fence_token }
-                guard { self.lifecycle_phase == Phase::Running }
-                guard "active_members_present" { self.live_runtime_ids != EmptySet }
-                guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
-                guard "fence_token_present" { fence_token == fence_token }
-                update {
-                    self.active_run_count = 0;
-                }
-                to Running
-                emit FlowTerminalized
-            }
-
-        }
-    }
-
-    #[cfg(any())]
-    mod tests {
-        use super::*;
-
-        #[test]
-        fn create_run_seed_populates_canonical_run_maps() {
-            let mut authority = MobMachineAuthority::new();
-            let run_id = RunId::from("run-1");
-            let step_id = StepId::from("step-a");
-            let transition = MobMachineMutator::apply(
-                &mut authority,
-                MobMachineInput::CreateRunSeed {
-                    run_id: run_id.clone(),
-                    step_ids: [step_id.clone()].into_iter().collect(),
-                    ordered_steps: vec![step_id.clone()],
-                    step_has_conditions: [(step_id.clone(), false)].into_iter().collect(),
-                    step_dependencies: [(step_id.clone(), Vec::new())].into_iter().collect(),
-                    step_dependency_modes: [(step_id.clone(), DependencyMode::All)]
-                        .into_iter()
-                        .collect(),
-                    step_branches: [(step_id.clone(), None)].into_iter().collect(),
-                    step_collection_policies: [(step_id.clone(), CollectionPolicyKind::All)]
-                        .into_iter()
-                        .collect(),
-                    step_quorum_thresholds: [(step_id.clone(), 0)].into_iter().collect(),
-                    escalation_threshold: 0,
-                    max_step_retries: 0,
-                    max_active_nodes: 2,
-                    max_active_frames: 3,
-                    max_frame_depth: 4,
-                },
-            )
-            .expect("CreateRunSeed should be accepted");
-
-            assert_eq!(transition.to_phase, MobPhase::Running);
-            assert_eq!(
-                authority.state.run_status.get(&run_id),
-                Some(&FlowRunStatus::Pending)
-            );
-            assert_eq!(
-                authority.state.run_ordered_steps.get(&run_id),
-                Some(&vec![step_id.clone()])
-            );
-            assert_eq!(
-                authority
-                    .state
-                    .run_step_dependency_modes
-                    .get(&run_id)
-                    .and_then(|map| map.get(&step_id)),
-                Some(&DependencyMode::All)
-            );
-            assert_eq!(authority.state.run_max_active_nodes.get(&run_id), Some(&2));
-            assert_eq!(
-                authority.state.run_ready_frames.get(&run_id),
-                Some(&Vec::new())
-            );
-        }
-
-        #[test]
-        fn create_frame_seed_populates_canonical_frame_maps() {
-            let mut authority = MobMachineAuthority::new();
-            let run_id = RunId::from("run-1");
-            let frame_id = FrameId::from("frame-root");
-            let node_id = FlowNodeId::from("node-a");
-
-            let transition = MobMachineMutator::apply(
-                &mut authority,
-                MobMachineInput::CreateFrameSeed {
-                    run_id: run_id.clone(),
-                    frame_id: frame_id.clone(),
-                    frame_scope: FrameScope::Root,
-                    loop_instance_id: None,
-                    iteration: 0,
-                    tracked_nodes: [node_id.clone()].into_iter().collect(),
-                    ordered_nodes: vec![node_id.clone()],
-                    node_kind: [(node_id.clone(), FlowNodeKind::Step)]
-                        .into_iter()
-                        .collect(),
-                    node_dependencies: [(node_id.clone(), Vec::new())].into_iter().collect(),
-                    node_dependency_modes: [(node_id.clone(), DependencyMode::All)]
-                        .into_iter()
-                        .collect(),
-                    node_branches: [(node_id.clone(), None)].into_iter().collect(),
-                },
-            )
-            .expect("CreateFrameSeed should be accepted");
-
-            assert_eq!(transition.to_phase, MobPhase::Running);
-            assert_eq!(
-                authority.state.frame_scope.get(&frame_id),
-                Some(&FrameScope::Root)
-            );
-            assert_eq!(authority.state.frame_run.get(&frame_id), Some(&run_id));
-            assert_eq!(
-                authority.state.frame_ordered_nodes.get(&frame_id),
-                Some(&vec![node_id.clone()])
-            );
-            assert_eq!(
-                authority
-                    .state
-                    .frame_node_kind
-                    .get(&frame_id)
-                    .and_then(|map| map.get(&node_id)),
-                Some(&FlowNodeKind::Step)
-            );
-        }
-
-        #[test]
-        fn create_loop_seed_populates_canonical_loop_maps() {
-            let mut authority = MobMachineAuthority::new();
-            let loop_instance_id = LoopInstanceId::from("loop-1");
-            let frame_id = FrameId::from("frame-root");
-            let node_id = FlowNodeId::from("loop-node");
-            let loop_id = LoopId::from("repeat");
-
-            let transition = MobMachineMutator::apply(
-                &mut authority,
-                MobMachineInput::CreateLoopSeed {
-                    loop_instance_id: loop_instance_id.clone(),
-                    parent_frame_id: frame_id.clone(),
-                    parent_node_id: node_id.clone(),
-                    loop_id: loop_id.clone(),
-                    depth: 2,
-                    max_iterations: 5,
-                },
-            )
-            .expect("CreateLoopSeed should be accepted");
-
-            assert_eq!(transition.to_phase, MobPhase::Running);
-            assert_eq!(
-                authority.state.loop_parent_frame.get(&loop_instance_id),
-                Some(&frame_id)
-            );
-            assert_eq!(
-                authority.state.loop_parent_node.get(&loop_instance_id),
-                Some(&node_id)
-            );
-            assert_eq!(
-                authority.state.loop_definition.get(&loop_instance_id),
-                Some(&loop_id)
-            );
-            assert_eq!(
-                authority.state.loop_stage.get(&loop_instance_id),
-                Some(&LoopIterationStage::AwaitingBodyFrame)
-            );
-            assert_eq!(
-                authority
-                    .state
-                    .loop_current_iteration
-                    .get(&loop_instance_id),
-                Some(&0)
-            );
-            assert_eq!(
-                authority
-                    .state
-                    .loop_last_completed_iteration
-                    .get(&loop_instance_id),
-                Some(&0)
-            );
-        }
-
-        #[test]
-        fn loop_until_feedback_is_recorded_by_mob_machine() {
-            let mut authority = MobMachineAuthority::new();
-            let loop_instance_id = LoopInstanceId::from("loop-1");
-
-            MobMachineMutator::apply(
-                &mut authority,
-                MobMachineInput::CreateLoopSeed {
-                    loop_instance_id: loop_instance_id.clone(),
-                    parent_frame_id: FrameId::from("frame-root"),
-                    parent_node_id: FlowNodeId::from("loop-node"),
-                    loop_id: LoopId::from("repeat"),
-                    depth: 1,
-                    max_iterations: 2,
-                },
-            )
-            .expect("CreateLoopSeed should be accepted");
-            authority.state.loop_stage.insert(
-                loop_instance_id.clone(),
-                LoopIterationStage::BodyFrameActive,
-            );
-
-            MobMachineMutator::apply(
-                &mut authority,
-                MobMachineInput::RecordLoopBodyFrameCompleted {
-                    loop_instance_id: loop_instance_id.clone(),
-                    iteration: 0,
-                },
-            )
-            .expect("body completion should be accepted");
-            assert_eq!(
-                authority.state.loop_stage.get(&loop_instance_id),
-                Some(&LoopIterationStage::AwaitingUntilEvaluation)
-            );
-            assert_eq!(
-                authority
-                    .state
-                    .loop_current_iteration
-                    .get(&loop_instance_id),
-                Some(&1)
-            );
-
-            MobMachineMutator::apply(
-                &mut authority,
-                MobMachineInput::RecordLoopUntilConditionFailed {
-                    loop_instance_id: loop_instance_id.clone(),
-                    iteration: 0,
-                },
-            )
-            .expect("until=false should request another body frame");
-            assert_eq!(
-                authority.state.loop_stage.get(&loop_instance_id),
-                Some(&LoopIterationStage::AwaitingBodyFrame)
-            );
-
-            authority.state.loop_stage.insert(
-                loop_instance_id.clone(),
-                LoopIterationStage::BodyFrameActive,
-            );
-            MobMachineMutator::apply(
-                &mut authority,
-                MobMachineInput::RecordLoopBodyFrameCompleted {
-                    loop_instance_id: loop_instance_id.clone(),
-                    iteration: 1,
-                },
-            )
-            .expect("second body completion should be accepted");
-            MobMachineMutator::apply(
-                &mut authority,
-                MobMachineInput::RecordLoopUntilConditionMet {
-                    loop_instance_id: loop_instance_id.clone(),
-                    iteration: 1,
-                },
-            )
-            .expect("until=true should complete the loop");
-            assert_eq!(
-                authority.state.loop_phase.get(&loop_instance_id),
-                Some(&LoopStatus::Completed)
-            );
-        }
-
-        #[test]
-        fn observe_runtime_retired_clears_member_binding_without_stopping_mob() {
-            let mut authority = MobMachineAuthority::new();
-            let runtime_id = AgentRuntimeId::from("worker:1");
-            let fence_token = FenceToken(7);
-            authority.state.live_runtime_ids.insert(runtime_id.clone());
-            authority
-                .state
-                .externally_addressable_runtime_ids
-                .insert(runtime_id.clone());
-            authority
-                .state
-                .runtime_fence_tokens
-                .insert(runtime_id.clone(), fence_token);
-            authority
-                .state
-                .member_state_markers
-                .insert(runtime_id.clone(), MobMemberState::Retiring);
-            authority.state.active_run_count = 3;
-
-            let transition = authority
-                .apply_signal(MobMachineSignal::ObserveRuntimeRetired {
-                    agent_runtime_id: runtime_id.clone(),
-                    fence_token,
-                })
-                .expect("runtime retire observation should be accepted");
-
-            assert_eq!(transition.to_phase, MobPhase::Running);
-            assert_eq!(authority.state.lifecycle_phase, MobPhase::Running);
-            assert!(!authority.state.live_runtime_ids.contains(&runtime_id));
-            assert!(
-                !authority
-                    .state
-                    .externally_addressable_runtime_ids
-                    .contains(&runtime_id)
-            );
-            assert!(
-                !authority
-                    .state
-                    .runtime_fence_tokens
-                    .contains_key(&runtime_id)
-            );
-            assert!(
-                !authority
-                    .state
-                    .member_state_markers
-                    .contains_key(&runtime_id)
-            );
-            assert_eq!(authority.state.active_run_count, 0);
-        }
-    }
-}
-pub use source::*;
+// @generated — Generated by `cargo xtask machine-codegen --all`.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::implicit_clone,
+    clippy::unnecessary_cast,
+    clippy::redundant_clone
+)]
 
 pub fn schema() -> meerkat_machine_schema::MachineSchema {
     meerkat_machine_schema::catalog::dsl::dsl_mob_machine()
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct AgentIdentity(pub String);
+impl From<String> for AgentIdentity {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for AgentIdentity {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for AgentIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct AgentRuntimeId(pub String);
+impl From<String> for AgentRuntimeId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for AgentRuntimeId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for AgentRuntimeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct BranchId(pub String);
+impl From<String> for BranchId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for BranchId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for BranchId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+pub type ExternalPeerEdge = meerkat_machine_schema::catalog::dsl::mob_machine::ExternalPeerEdge;
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct FenceToken(pub u64);
+impl From<u64> for FenceToken {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+impl std::fmt::Display for FenceToken {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct FlowNodeId(pub String);
+impl From<String> for FlowNodeId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for FlowNodeId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for FlowNodeId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct FrameId(pub String);
+impl From<String> for FrameId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for FrameId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for FrameId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct FrameNodeKey(pub String);
+impl From<String> for FrameNodeKey {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for FrameNodeKey {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for FrameNodeKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct Generation(pub u64);
+impl From<u64> for Generation {
+    fn from(value: u64) -> Self {
+        Self(value)
+    }
+}
+impl std::fmt::Display for Generation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct KickoffPhase(pub String);
+impl From<String> for KickoffPhase {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for KickoffPhase {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for KickoffPhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct LoopId(pub String);
+impl From<String> for LoopId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for LoopId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for LoopId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct LoopInstanceId(pub String);
+impl From<String> for LoopInstanceId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for LoopInstanceId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for LoopInstanceId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct MobId(pub String);
+impl From<String> for MobId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for MobId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for MobId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct MobMemberState(pub String);
+impl From<String> for MobMemberState {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for MobMemberState {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for MobMemberState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct MobTask(pub String);
+impl From<String> for MobTask {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for MobTask {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for MobTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct RunId(pub String);
+impl From<String> for RunId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for RunId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for RunId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct RunStepKey(pub String);
+impl From<String> for RunStepKey {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for RunStepKey {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for RunStepKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct SessionId(pub String);
+impl From<String> for SessionId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for SessionId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for SessionId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct StepId(pub String);
+impl From<String> for StepId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for StepId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for StepId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct TaskId(pub String);
+impl From<String> for TaskId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for TaskId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for TaskId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct TaskStatus(pub String);
+impl From<String> for TaskStatus {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for TaskStatus {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for TaskStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct WiringEdge(pub String);
+impl From<String> for WiringEdge {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for WiringEdge {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for WiringEdge {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct WorkId(pub String);
+impl From<String> for WorkId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for WorkId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for WorkId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum CollectionPolicyKind {
+    #[default]
+    All,
+    Any,
+    Quorum,
+}
+impl CollectionPolicyKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Any => "Any",
+            Self::Quorum => "Quorum",
+        }
+    }
+}
+impl std::fmt::Display for CollectionPolicyKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum DependencyMode {
+    #[default]
+    All,
+    Any,
+}
+impl DependencyMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::All => "All",
+            Self::Any => "Any",
+        }
+    }
+}
+impl std::fmt::Display for DependencyMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum FlowFrameReducerCommandKind {
+    #[default]
+    StartRootFrame,
+    StartBodyFrame,
+    AdmitNextReadyNode,
+    CompleteNode,
+    RecordNodeOutput,
+    FailNode,
+    SkipNode,
+    CancelNode,
+    SealFrame,
+}
+impl FlowFrameReducerCommandKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::StartRootFrame => "StartRootFrame",
+            Self::StartBodyFrame => "StartBodyFrame",
+            Self::AdmitNextReadyNode => "AdmitNextReadyNode",
+            Self::CompleteNode => "CompleteNode",
+            Self::RecordNodeOutput => "RecordNodeOutput",
+            Self::FailNode => "FailNode",
+            Self::SkipNode => "SkipNode",
+            Self::CancelNode => "CancelNode",
+            Self::SealFrame => "SealFrame",
+        }
+    }
+}
+impl std::fmt::Display for FlowFrameReducerCommandKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum FlowNodeKind {
+    #[default]
+    Step,
+    Loop,
+}
+impl FlowNodeKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Step => "Step",
+            Self::Loop => "Loop",
+        }
+    }
+}
+impl std::fmt::Display for FlowNodeKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum FlowRunReducerCommandKind {
+    #[default]
+    CreateRun,
+    StartRun,
+    DispatchStep,
+    CompleteStep,
+    RecordStepOutput,
+    ConditionPassed,
+    ConditionRejected,
+    FailStep,
+    SkipStep,
+    ProjectFrameStepStatus,
+    CancelStep,
+    RegisterTargets,
+    RecordTargetSuccess,
+    RecordTargetTerminalFailure,
+    RecordTargetCanceled,
+    RecordTargetFailure,
+    RegisterReadyFrame,
+    PumpNodeScheduler,
+    RegisterPendingBodyFrame,
+    PumpFrameScheduler,
+    NodeExecutionReleased,
+    FrameTerminated,
+    TerminalizeCompleted,
+    TerminalizeFailed,
+    TerminalizeCanceled,
+}
+impl FlowRunReducerCommandKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::CreateRun => "CreateRun",
+            Self::StartRun => "StartRun",
+            Self::DispatchStep => "DispatchStep",
+            Self::CompleteStep => "CompleteStep",
+            Self::RecordStepOutput => "RecordStepOutput",
+            Self::ConditionPassed => "ConditionPassed",
+            Self::ConditionRejected => "ConditionRejected",
+            Self::FailStep => "FailStep",
+            Self::SkipStep => "SkipStep",
+            Self::ProjectFrameStepStatus => "ProjectFrameStepStatus",
+            Self::CancelStep => "CancelStep",
+            Self::RegisterTargets => "RegisterTargets",
+            Self::RecordTargetSuccess => "RecordTargetSuccess",
+            Self::RecordTargetTerminalFailure => "RecordTargetTerminalFailure",
+            Self::RecordTargetCanceled => "RecordTargetCanceled",
+            Self::RecordTargetFailure => "RecordTargetFailure",
+            Self::RegisterReadyFrame => "RegisterReadyFrame",
+            Self::PumpNodeScheduler => "PumpNodeScheduler",
+            Self::RegisterPendingBodyFrame => "RegisterPendingBodyFrame",
+            Self::PumpFrameScheduler => "PumpFrameScheduler",
+            Self::NodeExecutionReleased => "NodeExecutionReleased",
+            Self::FrameTerminated => "FrameTerminated",
+            Self::TerminalizeCompleted => "TerminalizeCompleted",
+            Self::TerminalizeFailed => "TerminalizeFailed",
+            Self::TerminalizeCanceled => "TerminalizeCanceled",
+        }
+    }
+}
+impl std::fmt::Display for FlowRunReducerCommandKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum FlowRunStatus {
+    #[default]
+    Absent,
+    Pending,
+    Running,
+    Completed,
+    Failed,
+    Canceled,
+}
+impl FlowRunStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Absent => "Absent",
+            Self::Pending => "Pending",
+            Self::Running => "Running",
+            Self::Completed => "Completed",
+            Self::Failed => "Failed",
+            Self::Canceled => "Canceled",
+        }
+    }
+}
+impl std::fmt::Display for FlowRunStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum FrameScope {
+    #[default]
+    Root,
+    Body,
+}
+impl FrameScope {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Root => "Root",
+            Self::Body => "Body",
+        }
+    }
+}
+impl std::fmt::Display for FrameScope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum FrameStatus {
+    #[default]
+    Running,
+    Completed,
+    Failed,
+    Canceled,
+}
+impl FrameStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Running => "Running",
+            Self::Completed => "Completed",
+            Self::Failed => "Failed",
+            Self::Canceled => "Canceled",
+        }
+    }
+}
+impl std::fmt::Display for FrameStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum KickoffIntent {
+    #[default]
+    Pending,
+    Starting,
+    Started,
+    CallbackPending,
+    Failed,
+    Cancelled,
+}
+impl KickoffIntent {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "Pending",
+            Self::Starting => "Starting",
+            Self::Started => "Started",
+            Self::CallbackPending => "CallbackPending",
+            Self::Failed => "Failed",
+            Self::Cancelled => "Cancelled",
+        }
+    }
+}
+impl std::fmt::Display for KickoffIntent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum LoopIterationReducerCommandKind {
+    #[default]
+    StartLoop,
+    BodyFrameStarted,
+    BodyFrameCompleted,
+    BodyFrameFailed,
+    BodyFrameCanceled,
+    UntilConditionMet,
+    UntilConditionFailed,
+    CancelLoop,
+}
+impl LoopIterationReducerCommandKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::StartLoop => "StartLoop",
+            Self::BodyFrameStarted => "BodyFrameStarted",
+            Self::BodyFrameCompleted => "BodyFrameCompleted",
+            Self::BodyFrameFailed => "BodyFrameFailed",
+            Self::BodyFrameCanceled => "BodyFrameCanceled",
+            Self::UntilConditionMet => "UntilConditionMet",
+            Self::UntilConditionFailed => "UntilConditionFailed",
+            Self::CancelLoop => "CancelLoop",
+        }
+    }
+}
+impl std::fmt::Display for LoopIterationReducerCommandKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum LoopIterationStage {
+    #[default]
+    AwaitingBodyFrame,
+    BodyFrameActive,
+    AwaitingUntilEvaluation,
+}
+impl LoopIterationStage {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::AwaitingBodyFrame => "AwaitingBodyFrame",
+            Self::BodyFrameActive => "BodyFrameActive",
+            Self::AwaitingUntilEvaluation => "AwaitingUntilEvaluation",
+        }
+    }
+}
+impl std::fmt::Display for LoopIterationStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum LoopStatus {
+    #[default]
+    Running,
+    Completed,
+    Exhausted,
+    Failed,
+    Canceled,
+}
+impl LoopStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Running => "Running",
+            Self::Completed => "Completed",
+            Self::Exhausted => "Exhausted",
+            Self::Failed => "Failed",
+            Self::Canceled => "Canceled",
+        }
+    }
+}
+impl std::fmt::Display for LoopStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum MemberLifecycleKind {
+    #[default]
+    Spawned,
+    Retiring,
+    Retired,
+    Reset,
+    Respawned,
+    Completed,
+    Destroyed,
+}
+impl MemberLifecycleKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Spawned => "Spawned",
+            Self::Retiring => "Retiring",
+            Self::Retired => "Retired",
+            Self::Reset => "Reset",
+            Self::Respawned => "Respawned",
+            Self::Completed => "Completed",
+            Self::Destroyed => "Destroyed",
+        }
+    }
+}
+impl std::fmt::Display for MemberLifecycleKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum NodeRunStatus {
+    #[default]
+    Pending,
+    Ready,
+    Running,
+    Completed,
+    Failed,
+    Skipped,
+    Canceled,
+}
+impl NodeRunStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "Pending",
+            Self::Ready => "Ready",
+            Self::Running => "Running",
+            Self::Completed => "Completed",
+            Self::Failed => "Failed",
+            Self::Skipped => "Skipped",
+            Self::Canceled => "Canceled",
+        }
+    }
+}
+impl std::fmt::Display for NodeRunStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum StepRunStatus {
+    #[default]
+    Dispatched,
+    Completed,
+    Failed,
+    Skipped,
+    Canceled,
+}
+impl StepRunStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Dispatched => "Dispatched",
+            Self::Completed => "Completed",
+            Self::Failed => "Failed",
+            Self::Skipped => "Skipped",
+            Self::Canceled => "Canceled",
+        }
+    }
+}
+impl std::fmt::Display for StepRunStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum WiringLifecycleKind {
+    #[default]
+    Wired,
+    Unwired,
+}
+impl WiringLifecycleKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Wired => "Wired",
+            Self::Unwired => "Unwired",
+        }
+    }
+}
+impl std::fmt::Display for WiringLifecycleKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum WorkOrigin {
+    #[default]
+    External,
+    Internal,
+    Ingest,
+}
+impl WorkOrigin {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::External => "External",
+            Self::Internal => "Internal",
+            Self::Ingest => "Ingest",
+        }
+    }
+}
+impl std::fmt::Display for WorkOrigin {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+pub trait Context {}
+pub struct EmptyContext;
+impl Context for EmptyContext {}
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Phase {
+    Running,
+    Stopped,
+    Completed,
+    Destroyed,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct State {
+    pub phase: Phase,
+    pub live_runtime_ids: std::collections::BTreeSet<AgentRuntimeId>,
+    pub externally_addressable_runtime_ids: std::collections::BTreeSet<AgentRuntimeId>,
+    pub runtime_fence_tokens: std::collections::BTreeMap<AgentRuntimeId, FenceToken>,
+    pub active_run_count: u64,
+    pub run_status: std::collections::BTreeMap<RunId, FlowRunStatus>,
+    pub run_ordered_steps: std::collections::BTreeMap<RunId, Vec<StepId>>,
+    pub run_tracked_steps: std::collections::BTreeMap<RunId, std::collections::BTreeSet<StepId>>,
+    pub run_step_status: std::collections::BTreeMap<
+        RunId,
+        std::collections::BTreeMap<StepId, Option<StepRunStatus>>,
+    >,
+    pub run_step_status_flat: std::collections::BTreeMap<RunStepKey, StepRunStatus>,
+    pub run_output_recorded:
+        std::collections::BTreeMap<RunId, std::collections::BTreeMap<StepId, bool>>,
+    pub run_step_condition_results_flat: std::collections::BTreeMap<RunStepKey, Option<bool>>,
+    pub run_step_condition_results:
+        std::collections::BTreeMap<RunId, std::collections::BTreeMap<StepId, Option<bool>>>,
+    pub run_step_has_conditions:
+        std::collections::BTreeMap<RunId, std::collections::BTreeMap<StepId, bool>>,
+    pub run_step_dependencies:
+        std::collections::BTreeMap<RunId, std::collections::BTreeMap<StepId, Vec<StepId>>>,
+    pub run_step_dependency_modes:
+        std::collections::BTreeMap<RunId, std::collections::BTreeMap<StepId, DependencyMode>>,
+    pub run_step_branches:
+        std::collections::BTreeMap<RunId, std::collections::BTreeMap<StepId, Option<BranchId>>>,
+    pub run_step_collection_policies:
+        std::collections::BTreeMap<RunId, std::collections::BTreeMap<StepId, CollectionPolicyKind>>,
+    pub run_step_quorum_thresholds:
+        std::collections::BTreeMap<RunId, std::collections::BTreeMap<StepId, u32>>,
+    pub run_step_target_counts:
+        std::collections::BTreeMap<RunId, std::collections::BTreeMap<StepId, u64>>,
+    pub run_step_target_success_counts:
+        std::collections::BTreeMap<RunId, std::collections::BTreeMap<StepId, u64>>,
+    pub run_step_target_terminal_failure_counts:
+        std::collections::BTreeMap<RunId, std::collections::BTreeMap<StepId, u64>>,
+    pub run_output_recorded_flat: std::collections::BTreeMap<RunStepKey, bool>,
+    pub run_step_target_counts_flat: std::collections::BTreeMap<RunStepKey, u64>,
+    pub run_step_target_success_counts_flat: std::collections::BTreeMap<RunStepKey, u64>,
+    pub run_step_target_terminal_failure_counts_flat: std::collections::BTreeMap<RunStepKey, u64>,
+    pub run_target_retry_counts:
+        std::collections::BTreeMap<RunId, std::collections::BTreeMap<String, u64>>,
+    pub run_target_retry_counts_flat: std::collections::BTreeMap<RunStepKey, u64>,
+    pub run_failure_count: std::collections::BTreeMap<RunId, u64>,
+    pub run_consecutive_failure_count: std::collections::BTreeMap<RunId, u64>,
+    pub run_escalation_threshold: std::collections::BTreeMap<RunId, u32>,
+    pub run_max_step_retries: std::collections::BTreeMap<RunId, u32>,
+    pub run_ready_frames: std::collections::BTreeMap<RunId, Vec<FrameId>>,
+    pub run_ready_frame_membership:
+        std::collections::BTreeMap<RunId, std::collections::BTreeSet<FrameId>>,
+    pub run_ready_frame_membership_flat: std::collections::BTreeSet<FrameId>,
+    pub run_pending_body_frame_loops: std::collections::BTreeMap<RunId, Vec<LoopInstanceId>>,
+    pub run_pending_body_frame_loop_membership:
+        std::collections::BTreeMap<RunId, std::collections::BTreeSet<LoopInstanceId>>,
+    pub run_pending_body_frame_loop_membership_flat: std::collections::BTreeSet<LoopInstanceId>,
+    pub run_active_node_count: std::collections::BTreeMap<RunId, u64>,
+    pub run_active_frame_count: std::collections::BTreeMap<RunId, u64>,
+    pub run_last_granted_frame: std::collections::BTreeMap<RunId, FrameId>,
+    pub run_last_granted_loop: std::collections::BTreeMap<RunId, LoopInstanceId>,
+    pub run_max_active_nodes: std::collections::BTreeMap<RunId, u64>,
+    pub run_max_active_frames: std::collections::BTreeMap<RunId, u64>,
+    pub run_max_frame_depth: std::collections::BTreeMap<RunId, u64>,
+    pub frame_scope: std::collections::BTreeMap<FrameId, FrameScope>,
+    pub frame_phase: std::collections::BTreeMap<FrameId, FrameStatus>,
+    pub frame_run: std::collections::BTreeMap<FrameId, RunId>,
+    pub frame_parent_loop: std::collections::BTreeMap<FrameId, Option<LoopInstanceId>>,
+    pub frame_iteration: std::collections::BTreeMap<FrameId, u32>,
+    pub frame_tracked_nodes:
+        std::collections::BTreeMap<FrameId, std::collections::BTreeSet<FlowNodeId>>,
+    pub frame_ordered_nodes: std::collections::BTreeMap<FrameId, Vec<FlowNodeId>>,
+    pub frame_node_kind:
+        std::collections::BTreeMap<FrameId, std::collections::BTreeMap<FlowNodeId, FlowNodeKind>>,
+    pub frame_node_dependencies: std::collections::BTreeMap<
+        FrameId,
+        std::collections::BTreeMap<FlowNodeId, Vec<FlowNodeId>>,
+    >,
+    pub frame_node_dependency_modes:
+        std::collections::BTreeMap<FrameId, std::collections::BTreeMap<FlowNodeId, DependencyMode>>,
+    pub frame_node_step_ids:
+        std::collections::BTreeMap<FrameId, std::collections::BTreeMap<FlowNodeId, StepId>>,
+    pub frame_node_loop_ids:
+        std::collections::BTreeMap<FrameId, std::collections::BTreeMap<FlowNodeId, LoopId>>,
+    pub frame_node_status:
+        std::collections::BTreeMap<FrameId, std::collections::BTreeMap<FlowNodeId, NodeRunStatus>>,
+    pub frame_ready_queue: std::collections::BTreeMap<FrameId, Vec<FlowNodeId>>,
+    pub frame_output_recorded:
+        std::collections::BTreeMap<FrameId, std::collections::BTreeMap<FlowNodeId, bool>>,
+    pub frame_output_recorded_flat: std::collections::BTreeMap<FrameNodeKey, bool>,
+    pub frame_last_admitted_node: std::collections::BTreeMap<FrameId, FlowNodeId>,
+    pub frame_node_condition_results:
+        std::collections::BTreeMap<FrameId, std::collections::BTreeMap<FlowNodeId, Option<bool>>>,
+    pub frame_node_branches: std::collections::BTreeMap<
+        FrameId,
+        std::collections::BTreeMap<FlowNodeId, Option<BranchId>>,
+    >,
+    pub loop_phase: std::collections::BTreeMap<LoopInstanceId, LoopStatus>,
+    pub loop_parent_frame: std::collections::BTreeMap<LoopInstanceId, FrameId>,
+    pub loop_parent_node: std::collections::BTreeMap<LoopInstanceId, FlowNodeId>,
+    pub loop_definition: std::collections::BTreeMap<LoopInstanceId, LoopId>,
+    pub loop_depth: std::collections::BTreeMap<LoopInstanceId, u32>,
+    pub loop_stage: std::collections::BTreeMap<LoopInstanceId, LoopIterationStage>,
+    pub loop_current_iteration: std::collections::BTreeMap<LoopInstanceId, u64>,
+    pub loop_last_completed_iteration: std::collections::BTreeMap<LoopInstanceId, u64>,
+    pub loop_max_iterations: std::collections::BTreeMap<LoopInstanceId, u64>,
+    pub loop_active_body_frame: std::collections::BTreeMap<LoopInstanceId, Option<FrameId>>,
+    pub pending_spawn_count: u64,
+    pub pending_spawn_sessions: std::collections::BTreeMap<AgentIdentity, SessionId>,
+    pub coordinator_bound: bool,
+    pub member_startup_binding_requested: std::collections::BTreeSet<AgentRuntimeId>,
+    pub member_startup_runtime_ready: std::collections::BTreeSet<AgentRuntimeId>,
+    pub member_startup_ready: std::collections::BTreeSet<AgentRuntimeId>,
+    pub member_kickoff_pending: std::collections::BTreeSet<String>,
+    pub member_kickoff_starting: std::collections::BTreeSet<String>,
+    pub member_kickoff_callback_pending: std::collections::BTreeSet<String>,
+    pub member_kickoff_started: std::collections::BTreeSet<String>,
+    pub member_kickoff_failed: std::collections::BTreeSet<String>,
+    pub member_kickoff_cancelled: std::collections::BTreeSet<String>,
+    pub member_kickoff_error: std::collections::BTreeMap<String, String>,
+    pub member_state_markers: std::collections::BTreeMap<AgentRuntimeId, MobMemberState>,
+    pub wiring_edges: std::collections::BTreeSet<WiringEdge>,
+    pub external_peer_edges: std::collections::BTreeSet<ExternalPeerEdge>,
+    pub identity_to_runtime: std::collections::BTreeMap<AgentIdentity, AgentRuntimeId>,
+    pub tasks: std::collections::BTreeMap<TaskId, MobTask>,
+    pub in_progress_task_ids: std::collections::BTreeSet<TaskId>,
+    pub completed_task_ids: std::collections::BTreeSet<TaskId>,
+    pub member_session_bindings: std::collections::BTreeMap<AgentIdentity, SessionId>,
+    pub pending_session_ingress_detach_runtime_ids: std::collections::BTreeSet<AgentRuntimeId>,
+    pub topology_epoch: u64,
+}
+impl Default for State {
+    fn default() -> Self {
+        initial_state()
+    }
+}
+
+pub mod inputs {
+    #[allow(unused_imports)]
+    use super::*;
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RunFlow {
+        pub run_id: RunId,
+        pub step_ids: std::collections::BTreeSet<StepId>,
+        pub ordered_steps: Vec<StepId>,
+        pub step_has_conditions: std::collections::BTreeMap<StepId, bool>,
+        pub step_dependencies: std::collections::BTreeMap<StepId, Vec<StepId>>,
+        pub step_dependency_modes: std::collections::BTreeMap<StepId, DependencyMode>,
+        pub step_branches: std::collections::BTreeMap<StepId, Option<BranchId>>,
+        pub step_collection_policies: std::collections::BTreeMap<StepId, CollectionPolicyKind>,
+        pub step_quorum_thresholds: std::collections::BTreeMap<StepId, u32>,
+        pub escalation_threshold: u32,
+        pub max_step_retries: u32,
+        pub max_active_nodes: u64,
+        pub max_active_frames: u64,
+        pub max_frame_depth: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct CreateRunSeed {
+        pub run_id: RunId,
+        pub step_ids: std::collections::BTreeSet<StepId>,
+        pub ordered_steps: Vec<StepId>,
+        pub step_has_conditions: std::collections::BTreeMap<StepId, bool>,
+        pub step_dependencies: std::collections::BTreeMap<StepId, Vec<StepId>>,
+        pub step_dependency_modes: std::collections::BTreeMap<StepId, DependencyMode>,
+        pub step_branches: std::collections::BTreeMap<StepId, Option<BranchId>>,
+        pub step_collection_policies: std::collections::BTreeMap<StepId, CollectionPolicyKind>,
+        pub step_quorum_thresholds: std::collections::BTreeMap<StepId, u32>,
+        pub escalation_threshold: u32,
+        pub max_step_retries: u32,
+        pub max_active_nodes: u64,
+        pub max_active_frames: u64,
+        pub max_frame_depth: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct CreateFrameSeed {
+        pub run_id: RunId,
+        pub frame_id: FrameId,
+        pub frame_scope: FrameScope,
+        pub loop_instance_id: Option<LoopInstanceId>,
+        pub iteration: u32,
+        pub tracked_nodes: std::collections::BTreeSet<FlowNodeId>,
+        pub ordered_nodes: Vec<FlowNodeId>,
+        pub node_kind: std::collections::BTreeMap<FlowNodeId, FlowNodeKind>,
+        pub node_dependencies: std::collections::BTreeMap<FlowNodeId, Vec<FlowNodeId>>,
+        pub node_dependency_modes: std::collections::BTreeMap<FlowNodeId, DependencyMode>,
+        pub node_branches: std::collections::BTreeMap<FlowNodeId, Option<BranchId>>,
+        pub node_step_ids: std::collections::BTreeMap<FlowNodeId, StepId>,
+        pub node_loop_ids: std::collections::BTreeMap<FlowNodeId, LoopId>,
+        pub node_status: std::collections::BTreeMap<FlowNodeId, NodeRunStatus>,
+        pub ready_queue: Vec<FlowNodeId>,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct CreateLoopSeed {
+        pub loop_instance_id: LoopInstanceId,
+        pub parent_frame_id: FrameId,
+        pub parent_node_id: FlowNodeId,
+        pub loop_id: LoopId,
+        pub depth: u32,
+        pub max_iterations: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RecordLoopBodyFrameCompleted {
+        pub loop_instance_id: LoopInstanceId,
+        pub iteration: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RecordLoopUntilConditionMet {
+        pub loop_instance_id: LoopInstanceId,
+        pub iteration: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RecordLoopUntilConditionFailed {
+        pub loop_instance_id: LoopInstanceId,
+        pub iteration: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AuthorizeFlowRunReducerCommand {
+        pub run_id: RunId,
+        pub command: FlowRunReducerCommandKind,
+        pub step_id: Option<StepId>,
+        pub run_step_key: Option<RunStepKey>,
+        pub step_status: Option<StepRunStatus>,
+        pub target_count: Option<u64>,
+        pub frame_id: Option<FrameId>,
+        pub node_id: Option<FlowNodeId>,
+        pub loop_instance_id: Option<LoopInstanceId>,
+        pub retry_key: Option<String>,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AuthorizeFlowFrameReducerCommand {
+        pub frame_id: FrameId,
+        pub command: FlowFrameReducerCommandKind,
+        pub node_id: Option<FlowNodeId>,
+        pub frame_node_key: Option<FrameNodeKey>,
+        pub node_status: Option<NodeRunStatus>,
+        pub terminal_status: Option<FrameStatus>,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AuthorizeLoopIterationReducerCommand {
+        pub loop_instance_id: LoopInstanceId,
+        pub command: LoopIterationReducerCommandKind,
+        pub body_frame_id: Option<FrameId>,
+        pub body_frame_iteration: Option<u64>,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct CancelFlow {
+        pub run_id: RunId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct FlowStatus {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Spawn {
+        pub agent_identity: AgentIdentity,
+        pub agent_runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub external_addressable: bool,
+        pub bridge_session_id: SessionId,
+        pub replacing: Option<SessionId>,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct EnsureMember {
+        pub agent_identity: AgentIdentity,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Reconcile {
+        pub desired: std::collections::BTreeSet<AgentIdentity>,
+        pub retire_stale: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Retire {
+        pub mob_id: MobId,
+        pub agent_runtime_id: AgentRuntimeId,
+        pub agent_identity: AgentIdentity,
+        pub releasing: Option<SessionId>,
+        pub session_id: SessionId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Respawn {
+        pub agent_runtime_id: AgentRuntimeId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RetireAll {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct WireMembers {
+        pub edge: WiringEdge,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct UnwireMembers {
+        pub edge: WiringEdge,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct WireExternalPeer {
+        pub edge: ExternalPeerEdge,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct UnwireExternalPeer {
+        pub edge: ExternalPeerEdge,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct SessionIngressDetachedForMobDestroy {
+        pub mob_id: MobId,
+        pub agent_runtime_id: AgentRuntimeId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct SessionIngressDetachFailedForMobDestroy {
+        pub mob_id: MobId,
+        pub agent_runtime_id: AgentRuntimeId,
+        pub reason: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct SubmitWork {
+        pub agent_runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub work_id: WorkId,
+        pub origin: WorkOrigin,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct CancelWork {
+        pub work_id: WorkId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct CancelAllWork {
+        pub agent_runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Stop {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Resume {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Complete {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Reset {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Destroy {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct TaskCreate {
+        pub task_id: TaskId,
+        pub task_payload: MobTask,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct TaskUpdate {
+        pub task_id: TaskId,
+        pub new_status: TaskStatus,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct TaskList {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct TaskGet {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct McpServerStates {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RosterSnapshot {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ListMembers {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ListMembersIncludingRetiring {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ListAllMembers {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct MemberStatus {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct SubscribeAgentEvents {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct SubscribeAllAgentEvents {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct SubscribeMobEvents {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct PollEvents {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ReplayAllEvents {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RecordOperatorActionProvenance {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct GetMember {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct SetSpawnPolicy {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Shutdown {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ForceCancel {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct KickoffMarkPending {
+        pub member_id: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct KickoffMarkStarting {
+        pub member_id: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct StartupMarkReady {
+        pub agent_runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct KickoffResolveStarted {
+        pub member_id: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct KickoffResolveCallbackPending {
+        pub member_id: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct KickoffResolveFailed {
+        pub member_id: String,
+        pub error: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct KickoffCancelRequested {
+        pub member_id: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct KickoffClear {
+        pub member_id: String,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Input {
+    RunFlow(inputs::RunFlow),
+    CreateRunSeed(inputs::CreateRunSeed),
+    CreateFrameSeed(inputs::CreateFrameSeed),
+    CreateLoopSeed(inputs::CreateLoopSeed),
+    RecordLoopBodyFrameCompleted(inputs::RecordLoopBodyFrameCompleted),
+    RecordLoopUntilConditionMet(inputs::RecordLoopUntilConditionMet),
+    RecordLoopUntilConditionFailed(inputs::RecordLoopUntilConditionFailed),
+    AuthorizeFlowRunReducerCommand(inputs::AuthorizeFlowRunReducerCommand),
+    AuthorizeFlowFrameReducerCommand(inputs::AuthorizeFlowFrameReducerCommand),
+    AuthorizeLoopIterationReducerCommand(inputs::AuthorizeLoopIterationReducerCommand),
+    CancelFlow(inputs::CancelFlow),
+    FlowStatus(inputs::FlowStatus),
+    Spawn(inputs::Spawn),
+    EnsureMember(inputs::EnsureMember),
+    Reconcile(inputs::Reconcile),
+    Retire(inputs::Retire),
+    Respawn(inputs::Respawn),
+    RetireAll(inputs::RetireAll),
+    WireMembers(inputs::WireMembers),
+    UnwireMembers(inputs::UnwireMembers),
+    WireExternalPeer(inputs::WireExternalPeer),
+    UnwireExternalPeer(inputs::UnwireExternalPeer),
+    SessionIngressDetachedForMobDestroy(inputs::SessionIngressDetachedForMobDestroy),
+    SessionIngressDetachFailedForMobDestroy(inputs::SessionIngressDetachFailedForMobDestroy),
+    SubmitWork(inputs::SubmitWork),
+    CancelWork(inputs::CancelWork),
+    CancelAllWork(inputs::CancelAllWork),
+    Stop(inputs::Stop),
+    Resume(inputs::Resume),
+    Complete(inputs::Complete),
+    Reset(inputs::Reset),
+    Destroy(inputs::Destroy),
+    TaskCreate(inputs::TaskCreate),
+    TaskUpdate(inputs::TaskUpdate),
+    TaskList(inputs::TaskList),
+    TaskGet(inputs::TaskGet),
+    McpServerStates(inputs::McpServerStates),
+    RosterSnapshot(inputs::RosterSnapshot),
+    ListMembers(inputs::ListMembers),
+    ListMembersIncludingRetiring(inputs::ListMembersIncludingRetiring),
+    ListAllMembers(inputs::ListAllMembers),
+    MemberStatus(inputs::MemberStatus),
+    SubscribeAgentEvents(inputs::SubscribeAgentEvents),
+    SubscribeAllAgentEvents(inputs::SubscribeAllAgentEvents),
+    SubscribeMobEvents(inputs::SubscribeMobEvents),
+    PollEvents(inputs::PollEvents),
+    ReplayAllEvents(inputs::ReplayAllEvents),
+    RecordOperatorActionProvenance(inputs::RecordOperatorActionProvenance),
+    GetMember(inputs::GetMember),
+    SetSpawnPolicy(inputs::SetSpawnPolicy),
+    Shutdown(inputs::Shutdown),
+    ForceCancel(inputs::ForceCancel),
+    KickoffMarkPending(inputs::KickoffMarkPending),
+    KickoffMarkStarting(inputs::KickoffMarkStarting),
+    StartupMarkReady(inputs::StartupMarkReady),
+    KickoffResolveStarted(inputs::KickoffResolveStarted),
+    KickoffResolveCallbackPending(inputs::KickoffResolveCallbackPending),
+    KickoffResolveFailed(inputs::KickoffResolveFailed),
+    KickoffCancelRequested(inputs::KickoffCancelRequested),
+    KickoffClear(inputs::KickoffClear),
+}
+impl Input {
+    pub fn kind(&self) -> InputKind {
+        match self {
+            Self::RunFlow(_) => InputKind::RunFlow,
+            Self::CreateRunSeed(_) => InputKind::CreateRunSeed,
+            Self::CreateFrameSeed(_) => InputKind::CreateFrameSeed,
+            Self::CreateLoopSeed(_) => InputKind::CreateLoopSeed,
+            Self::RecordLoopBodyFrameCompleted(_) => InputKind::RecordLoopBodyFrameCompleted,
+            Self::RecordLoopUntilConditionMet(_) => InputKind::RecordLoopUntilConditionMet,
+            Self::RecordLoopUntilConditionFailed(_) => InputKind::RecordLoopUntilConditionFailed,
+            Self::AuthorizeFlowRunReducerCommand(_) => InputKind::AuthorizeFlowRunReducerCommand,
+            Self::AuthorizeFlowFrameReducerCommand(_) => {
+                InputKind::AuthorizeFlowFrameReducerCommand
+            }
+            Self::AuthorizeLoopIterationReducerCommand(_) => {
+                InputKind::AuthorizeLoopIterationReducerCommand
+            }
+            Self::CancelFlow(_) => InputKind::CancelFlow,
+            Self::FlowStatus(_) => InputKind::FlowStatus,
+            Self::Spawn(_) => InputKind::Spawn,
+            Self::EnsureMember(_) => InputKind::EnsureMember,
+            Self::Reconcile(_) => InputKind::Reconcile,
+            Self::Retire(_) => InputKind::Retire,
+            Self::Respawn(_) => InputKind::Respawn,
+            Self::RetireAll(_) => InputKind::RetireAll,
+            Self::WireMembers(_) => InputKind::WireMembers,
+            Self::UnwireMembers(_) => InputKind::UnwireMembers,
+            Self::WireExternalPeer(_) => InputKind::WireExternalPeer,
+            Self::UnwireExternalPeer(_) => InputKind::UnwireExternalPeer,
+            Self::SessionIngressDetachedForMobDestroy(_) => {
+                InputKind::SessionIngressDetachedForMobDestroy
+            }
+            Self::SessionIngressDetachFailedForMobDestroy(_) => {
+                InputKind::SessionIngressDetachFailedForMobDestroy
+            }
+            Self::SubmitWork(_) => InputKind::SubmitWork,
+            Self::CancelWork(_) => InputKind::CancelWork,
+            Self::CancelAllWork(_) => InputKind::CancelAllWork,
+            Self::Stop(_) => InputKind::Stop,
+            Self::Resume(_) => InputKind::Resume,
+            Self::Complete(_) => InputKind::Complete,
+            Self::Reset(_) => InputKind::Reset,
+            Self::Destroy(_) => InputKind::Destroy,
+            Self::TaskCreate(_) => InputKind::TaskCreate,
+            Self::TaskUpdate(_) => InputKind::TaskUpdate,
+            Self::TaskList(_) => InputKind::TaskList,
+            Self::TaskGet(_) => InputKind::TaskGet,
+            Self::McpServerStates(_) => InputKind::McpServerStates,
+            Self::RosterSnapshot(_) => InputKind::RosterSnapshot,
+            Self::ListMembers(_) => InputKind::ListMembers,
+            Self::ListMembersIncludingRetiring(_) => InputKind::ListMembersIncludingRetiring,
+            Self::ListAllMembers(_) => InputKind::ListAllMembers,
+            Self::MemberStatus(_) => InputKind::MemberStatus,
+            Self::SubscribeAgentEvents(_) => InputKind::SubscribeAgentEvents,
+            Self::SubscribeAllAgentEvents(_) => InputKind::SubscribeAllAgentEvents,
+            Self::SubscribeMobEvents(_) => InputKind::SubscribeMobEvents,
+            Self::PollEvents(_) => InputKind::PollEvents,
+            Self::ReplayAllEvents(_) => InputKind::ReplayAllEvents,
+            Self::RecordOperatorActionProvenance(_) => InputKind::RecordOperatorActionProvenance,
+            Self::GetMember(_) => InputKind::GetMember,
+            Self::SetSpawnPolicy(_) => InputKind::SetSpawnPolicy,
+            Self::Shutdown(_) => InputKind::Shutdown,
+            Self::ForceCancel(_) => InputKind::ForceCancel,
+            Self::KickoffMarkPending(_) => InputKind::KickoffMarkPending,
+            Self::KickoffMarkStarting(_) => InputKind::KickoffMarkStarting,
+            Self::StartupMarkReady(_) => InputKind::StartupMarkReady,
+            Self::KickoffResolveStarted(_) => InputKind::KickoffResolveStarted,
+            Self::KickoffResolveCallbackPending(_) => InputKind::KickoffResolveCallbackPending,
+            Self::KickoffResolveFailed(_) => InputKind::KickoffResolveFailed,
+            Self::KickoffCancelRequested(_) => InputKind::KickoffCancelRequested,
+            Self::KickoffClear(_) => InputKind::KickoffClear,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum InputKind {
+    RunFlow,
+    CreateRunSeed,
+    CreateFrameSeed,
+    CreateLoopSeed,
+    RecordLoopBodyFrameCompleted,
+    RecordLoopUntilConditionMet,
+    RecordLoopUntilConditionFailed,
+    AuthorizeFlowRunReducerCommand,
+    AuthorizeFlowFrameReducerCommand,
+    AuthorizeLoopIterationReducerCommand,
+    CancelFlow,
+    FlowStatus,
+    Spawn,
+    EnsureMember,
+    Reconcile,
+    Retire,
+    Respawn,
+    RetireAll,
+    WireMembers,
+    UnwireMembers,
+    WireExternalPeer,
+    UnwireExternalPeer,
+    SessionIngressDetachedForMobDestroy,
+    SessionIngressDetachFailedForMobDestroy,
+    SubmitWork,
+    CancelWork,
+    CancelAllWork,
+    Stop,
+    Resume,
+    Complete,
+    Reset,
+    Destroy,
+    TaskCreate,
+    TaskUpdate,
+    TaskList,
+    TaskGet,
+    McpServerStates,
+    RosterSnapshot,
+    ListMembers,
+    ListMembersIncludingRetiring,
+    ListAllMembers,
+    MemberStatus,
+    SubscribeAgentEvents,
+    SubscribeAllAgentEvents,
+    SubscribeMobEvents,
+    PollEvents,
+    ReplayAllEvents,
+    RecordOperatorActionProvenance,
+    GetMember,
+    SetSpawnPolicy,
+    Shutdown,
+    ForceCancel,
+    KickoffMarkPending,
+    KickoffMarkStarting,
+    StartupMarkReady,
+    KickoffResolveStarted,
+    KickoffResolveCallbackPending,
+    KickoffResolveFailed,
+    KickoffCancelRequested,
+    KickoffClear,
+}
+
+pub mod signals {
+    #[allow(unused_imports)]
+    use super::*;
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ObserveRuntimeReady {
+        pub agent_runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RetireMember {
+        pub agent_runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub session_id: SessionId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ObserveRuntimeRetired {
+        pub agent_runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ResetMember {
+        pub agent_identity: AgentIdentity,
+        pub agent_runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub external_addressable: bool,
+        pub session_id: SessionId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RespawnMember {
+        pub agent_identity: AgentIdentity,
+        pub agent_runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub external_addressable: bool,
+        pub session_id: SessionId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct DestroyMob {
+        pub session_id: SessionId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ObserveRuntimeDestroyed {
+        pub agent_runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct MarkCompleted {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct StartRun {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct FinishRun {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct BeginCleanup {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct FinishCleanup {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct InitializeOrchestrator {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct BindCoordinator {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct UnbindCoordinator {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct StageSpawn {
+        pub agent_identity: AgentIdentity,
+        pub session_id: SessionId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct CompleteSpawn {
+        pub agent_identity: AgentIdentity,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct StartFlow {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct CompleteFlow {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct StopOrchestrator {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ResumeOrchestrator {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct DestroyOrchestrator {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ForceCancelMember {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct MemberPeerExposed {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct MemberTerminalized {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct OperationPeerTrusted {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct PeerInputAdmitted {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct CreateRun {}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Signal {
+    ObserveRuntimeReady(signals::ObserveRuntimeReady),
+    RetireMember(signals::RetireMember),
+    ObserveRuntimeRetired(signals::ObserveRuntimeRetired),
+    ResetMember(signals::ResetMember),
+    RespawnMember(signals::RespawnMember),
+    DestroyMob(signals::DestroyMob),
+    ObserveRuntimeDestroyed(signals::ObserveRuntimeDestroyed),
+    MarkCompleted(signals::MarkCompleted),
+    StartRun(signals::StartRun),
+    FinishRun(signals::FinishRun),
+    BeginCleanup(signals::BeginCleanup),
+    FinishCleanup(signals::FinishCleanup),
+    InitializeOrchestrator(signals::InitializeOrchestrator),
+    BindCoordinator(signals::BindCoordinator),
+    UnbindCoordinator(signals::UnbindCoordinator),
+    StageSpawn(signals::StageSpawn),
+    CompleteSpawn(signals::CompleteSpawn),
+    StartFlow(signals::StartFlow),
+    CompleteFlow(signals::CompleteFlow),
+    StopOrchestrator(signals::StopOrchestrator),
+    ResumeOrchestrator(signals::ResumeOrchestrator),
+    DestroyOrchestrator(signals::DestroyOrchestrator),
+    ForceCancelMember(signals::ForceCancelMember),
+    MemberPeerExposed(signals::MemberPeerExposed),
+    MemberTerminalized(signals::MemberTerminalized),
+    OperationPeerTrusted(signals::OperationPeerTrusted),
+    PeerInputAdmitted(signals::PeerInputAdmitted),
+    CreateRun(signals::CreateRun),
+}
+impl Signal {
+    pub fn kind(&self) -> SignalKind {
+        match self {
+            Self::ObserveRuntimeReady(_) => SignalKind::ObserveRuntimeReady,
+            Self::RetireMember(_) => SignalKind::RetireMember,
+            Self::ObserveRuntimeRetired(_) => SignalKind::ObserveRuntimeRetired,
+            Self::ResetMember(_) => SignalKind::ResetMember,
+            Self::RespawnMember(_) => SignalKind::RespawnMember,
+            Self::DestroyMob(_) => SignalKind::DestroyMob,
+            Self::ObserveRuntimeDestroyed(_) => SignalKind::ObserveRuntimeDestroyed,
+            Self::MarkCompleted(_) => SignalKind::MarkCompleted,
+            Self::StartRun(_) => SignalKind::StartRun,
+            Self::FinishRun(_) => SignalKind::FinishRun,
+            Self::BeginCleanup(_) => SignalKind::BeginCleanup,
+            Self::FinishCleanup(_) => SignalKind::FinishCleanup,
+            Self::InitializeOrchestrator(_) => SignalKind::InitializeOrchestrator,
+            Self::BindCoordinator(_) => SignalKind::BindCoordinator,
+            Self::UnbindCoordinator(_) => SignalKind::UnbindCoordinator,
+            Self::StageSpawn(_) => SignalKind::StageSpawn,
+            Self::CompleteSpawn(_) => SignalKind::CompleteSpawn,
+            Self::StartFlow(_) => SignalKind::StartFlow,
+            Self::CompleteFlow(_) => SignalKind::CompleteFlow,
+            Self::StopOrchestrator(_) => SignalKind::StopOrchestrator,
+            Self::ResumeOrchestrator(_) => SignalKind::ResumeOrchestrator,
+            Self::DestroyOrchestrator(_) => SignalKind::DestroyOrchestrator,
+            Self::ForceCancelMember(_) => SignalKind::ForceCancelMember,
+            Self::MemberPeerExposed(_) => SignalKind::MemberPeerExposed,
+            Self::MemberTerminalized(_) => SignalKind::MemberTerminalized,
+            Self::OperationPeerTrusted(_) => SignalKind::OperationPeerTrusted,
+            Self::PeerInputAdmitted(_) => SignalKind::PeerInputAdmitted,
+            Self::CreateRun(_) => SignalKind::CreateRun,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum SignalKind {
+    ObserveRuntimeReady,
+    RetireMember,
+    ObserveRuntimeRetired,
+    ResetMember,
+    RespawnMember,
+    DestroyMob,
+    ObserveRuntimeDestroyed,
+    MarkCompleted,
+    StartRun,
+    FinishRun,
+    BeginCleanup,
+    FinishCleanup,
+    InitializeOrchestrator,
+    BindCoordinator,
+    UnbindCoordinator,
+    StageSpawn,
+    CompleteSpawn,
+    StartFlow,
+    CompleteFlow,
+    StopOrchestrator,
+    ResumeOrchestrator,
+    DestroyOrchestrator,
+    ForceCancelMember,
+    MemberPeerExposed,
+    MemberTerminalized,
+    OperationPeerTrusted,
+    PeerInputAdmitted,
+    CreateRun,
+}
+
+pub mod effects {
+    #[allow(unused_imports)]
+    use super::*;
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RequestRuntimeBinding {
+        pub agent_identity: AgentIdentity,
+        pub agent_runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub generation: Generation,
+        pub session_id: SessionId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RequestRuntimeIngress {
+        pub agent_runtime_id: AgentRuntimeId,
+        pub fence_token: FenceToken,
+        pub work_id: WorkId,
+        pub origin: WorkOrigin,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RequestRuntimeRetire {
+        pub session_id: SessionId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RequestRuntimeDestroy {
+        pub session_id: SessionId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RequestSessionIngressDetachForMobDestroy {
+        pub mob_id: MobId,
+        pub agent_runtime_id: AgentRuntimeId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct EmitMemberLifecycleNotice {
+        pub kind: MemberLifecycleKind,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct EmitRunLifecycleNotice {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct EmitFlowRunNotice {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AppendFailureLedger {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct FlowTerminalized {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct EscalateSupervisor {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct NotifyCoordinator {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ExposePendingSpawn {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct EmitMemberTerminalNotice {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AdmitPeerInput {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct EmitProgressNote {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct EmitTaskNotice {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct PersistKickoffUpdate {
+        pub member_id: String,
+        pub phase: KickoffPhase,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct PersistKickoffFailureUpdate {
+        pub member_id: String,
+        pub phase: KickoffPhase,
+        pub error: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct EmitKickoffLifecycleNotice {
+        pub member_id: String,
+        pub intent: KickoffIntent,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct WiringGraphChanged {
+        pub epoch: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct MemberSessionBindingChanged {
+        pub epoch: u64,
+        pub agent_identity: AgentIdentity,
+        pub old_session_id: Option<SessionId>,
+        pub new_session_id: Option<SessionId>,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct EmitWiringLifecycleNotice {
+        pub kind: WiringLifecycleKind,
+        pub edge: WiringEdge,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct EmitExternalPeerWiringLifecycleNotice {
+        pub kind: WiringLifecycleKind,
+        pub edge: ExternalPeerEdge,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Effect {
+    RequestRuntimeBinding(effects::RequestRuntimeBinding),
+    RequestRuntimeIngress(effects::RequestRuntimeIngress),
+    RequestRuntimeRetire(effects::RequestRuntimeRetire),
+    RequestRuntimeDestroy(effects::RequestRuntimeDestroy),
+    RequestSessionIngressDetachForMobDestroy(effects::RequestSessionIngressDetachForMobDestroy),
+    EmitMemberLifecycleNotice(effects::EmitMemberLifecycleNotice),
+    EmitRunLifecycleNotice(effects::EmitRunLifecycleNotice),
+    EmitFlowRunNotice(effects::EmitFlowRunNotice),
+    AppendFailureLedger(effects::AppendFailureLedger),
+    FlowTerminalized(effects::FlowTerminalized),
+    EscalateSupervisor(effects::EscalateSupervisor),
+    NotifyCoordinator(effects::NotifyCoordinator),
+    ExposePendingSpawn(effects::ExposePendingSpawn),
+    EmitMemberTerminalNotice(effects::EmitMemberTerminalNotice),
+    AdmitPeerInput(effects::AdmitPeerInput),
+    EmitProgressNote(effects::EmitProgressNote),
+    EmitTaskNotice(effects::EmitTaskNotice),
+    PersistKickoffUpdate(effects::PersistKickoffUpdate),
+    PersistKickoffFailureUpdate(effects::PersistKickoffFailureUpdate),
+    EmitKickoffLifecycleNotice(effects::EmitKickoffLifecycleNotice),
+    WiringGraphChanged(effects::WiringGraphChanged),
+    MemberSessionBindingChanged(effects::MemberSessionBindingChanged),
+    EmitWiringLifecycleNotice(effects::EmitWiringLifecycleNotice),
+    EmitExternalPeerWiringLifecycleNotice(effects::EmitExternalPeerWiringLifecycleNotice),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EffectKind {
+    RequestRuntimeBinding,
+    RequestRuntimeIngress,
+    RequestRuntimeRetire,
+    RequestRuntimeDestroy,
+    RequestSessionIngressDetachForMobDestroy,
+    EmitMemberLifecycleNotice,
+    EmitRunLifecycleNotice,
+    EmitFlowRunNotice,
+    AppendFailureLedger,
+    FlowTerminalized,
+    EscalateSupervisor,
+    NotifyCoordinator,
+    ExposePendingSpawn,
+    EmitMemberTerminalNotice,
+    AdmitPeerInput,
+    EmitProgressNote,
+    EmitTaskNotice,
+    PersistKickoffUpdate,
+    PersistKickoffFailureUpdate,
+    EmitKickoffLifecycleNotice,
+    WiringGraphChanged,
+    MemberSessionBindingChanged,
+    EmitWiringLifecycleNotice,
+    EmitExternalPeerWiringLifecycleNotice,
+}
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TransitionId {
+    SpawnRunningFresh,
+    SpawnRunningReplacing,
+    EnsureMemberRunningExisting,
+    EnsureMemberRunningMissing,
+    ReconcileRunning,
+    ReconcileStopped,
+    ReconcileCompleted,
+    ObserveRuntimeReady,
+    StartupMarkReadyRunning,
+    StartupMarkReadyStopped,
+    StartupMarkReadyCompleted,
+    KickoffMarkPendingRunning,
+    KickoffMarkPendingStopped,
+    KickoffMarkPendingCompleted,
+    KickoffMarkStartingRunning,
+    KickoffMarkStartingStopped,
+    KickoffMarkStartingCompleted,
+    KickoffResolveStartedRunning,
+    KickoffResolveStartedStopped,
+    KickoffResolveStartedCompleted,
+    KickoffResolveCallbackPendingRunning,
+    KickoffResolveCallbackPendingStopped,
+    KickoffResolveCallbackPendingCompleted,
+    KickoffResolveFailedFromStartingRunning,
+    KickoffResolveFailedFromStartingStopped,
+    KickoffResolveFailedFromStartingCompleted,
+    KickoffCancelRequestedRunning,
+    KickoffCancelRequestedStopped,
+    KickoffCancelRequestedCompleted,
+    KickoffClearRunning,
+    KickoffClearStopped,
+    KickoffClearCompleted,
+    SubmitWorkRunningExternal,
+    SubmitWorkRunningInternal,
+    RetireMember,
+    ObserveRuntimeRetired,
+    ResetMember,
+    RespawnMember,
+    MarkCompleted,
+    DestroyMob,
+    ObserveRuntimeDestroyed,
+    RecordOperatorActionProvenanceRunning,
+    RecordOperatorActionProvenanceStopped,
+    RecordOperatorActionProvenanceCompleted,
+    RecordOperatorActionProvenanceDestroyed,
+    SetSpawnPolicyRunning,
+    SetSpawnPolicyStopped,
+    SetSpawnPolicyCompleted,
+    SetSpawnPolicyDestroyed,
+    StopRunning,
+    ResumeStopped,
+    CompleteRunning,
+    ResetToRunning,
+    WireMembersRunning,
+    UnwireMembersRunning,
+    WireExternalPeerRunning,
+    UnwireExternalPeerRunning,
+    TaskCreateRunning,
+    TaskUpdateRunningPending,
+    TaskUpdateRunningInProgress,
+    TaskUpdateRunningCompleted,
+    TaskUpdateRunningCancelled,
+    ForceCancelRunning,
+    SubscribeAgentEventsRunning,
+    SubscribeAgentEventsStopped,
+    SubscribeAgentEventsCompleted,
+    SubscribeAgentEventsDestroyed,
+    SubscribeAllAgentEventsRunning,
+    SubscribeAllAgentEventsStopped,
+    SubscribeAllAgentEventsCompleted,
+    SubscribeAllAgentEventsDestroyed,
+    SubscribeMobEventsRunning,
+    SubscribeMobEventsStopped,
+    SubscribeMobEventsCompleted,
+    SubscribeMobEventsDestroyed,
+    ShutdownRunning,
+    ShutdownStopped,
+    ShutdownCompleted,
+    CancelFlowRunning,
+    InitializeOrchestratorRunning,
+    BindCoordinatorRunning,
+    UnbindCoordinatorRunning,
+    StageSpawnRunning,
+    StopOrchestratorRunning,
+    StopOrchestratorStopped,
+    StopOrchestratorCompleted,
+    ResumeOrchestratorRunning,
+    ResumeOrchestratorStopped,
+    ResumeOrchestratorCompleted,
+    DestroyOrchestratorRunning,
+    DestroyOrchestratorStopped,
+    DestroyOrchestratorCompleted,
+    ForceCancelMemberRunning,
+    MemberPeerExposedRunning,
+    MemberTerminalizedRunning,
+    OperationPeerTrustedRunning,
+    PeerInputAdmittedRunning,
+    BeginCleanupStopped,
+    BeginCleanupCompleted,
+    FinishCleanupStopped,
+    FinishCleanupCompleted,
+    RunFlowRunning,
+    CreateRunSeedRunning,
+    CreateFrameSeedRunning,
+    CreateLoopSeedRunning,
+    RecordLoopBodyFrameCompletedRunning,
+    RecordLoopUntilConditionMetRunning,
+    RecordLoopUntilConditionFailedRunning,
+    RecordLoopUntilConditionFailedExhausted,
+    AuthorizeFlowRunReducerCommandStartRun,
+    AuthorizeFlowRunReducerCommandDispatchStep,
+    AuthorizeFlowRunReducerCommandCompleteStep,
+    AuthorizeFlowRunReducerCommandRecordStepOutput,
+    AuthorizeFlowRunReducerCommandConditionPassed,
+    AuthorizeFlowRunReducerCommandConditionRejected,
+    AuthorizeFlowRunReducerCommandFailStep,
+    AuthorizeFlowRunReducerCommandSkipStep,
+    AuthorizeFlowRunReducerCommandProjectFrameStepStatus,
+    AuthorizeFlowRunReducerCommandCancelStep,
+    AuthorizeFlowRunReducerCommandRegisterTargets,
+    AuthorizeFlowRunReducerCommandRecordTargetSuccess,
+    AuthorizeFlowRunReducerCommandRecordTargetTerminalFailure,
+    AuthorizeFlowRunReducerCommandRecordTargetCanceled,
+    AuthorizeFlowRunReducerCommandRecordTargetFailure,
+    AuthorizeFlowRunReducerCommandRegisterReadyFrame,
+    AuthorizeFlowRunReducerCommandRegisterReadyFrameAlreadyReady,
+    AuthorizeFlowRunReducerCommandPumpNodeScheduler,
+    AuthorizeFlowRunReducerCommandRegisterPendingBodyFrame,
+    AuthorizeFlowRunReducerCommandPumpFrameScheduler,
+    AuthorizeFlowRunReducerCommandNodeExecutionReleased,
+    AuthorizeFlowRunReducerCommandFrameTerminated,
+    AuthorizeFlowRunReducerCommandFrameTerminatedNoActiveFrame,
+    AuthorizeFlowRunReducerCommandTerminalCompleted,
+    AuthorizeFlowRunReducerCommandTerminalFailed,
+    AuthorizeFlowRunReducerCommandTerminalCanceled,
+    AuthorizeFlowFrameReducerCommandAdmitNextReadyNode,
+    AuthorizeFlowFrameReducerCommandCompleteNode,
+    AuthorizeFlowFrameReducerCommandRecordNodeOutput,
+    AuthorizeFlowFrameReducerCommandFailNode,
+    AuthorizeFlowFrameReducerCommandSkipNode,
+    AuthorizeFlowFrameReducerCommandCancelNode,
+    AuthorizeFlowFrameReducerCommandSealFrame,
+    AuthorizeLoopIterationReducerCommandBodyFrameStarted,
+    AuthorizeLoopIterationReducerCommandBodyFrameCompleted,
+    AuthorizeLoopIterationReducerCommandBodyFrameFailed,
+    AuthorizeLoopIterationReducerCommandBodyFrameCanceled,
+    AuthorizeLoopIterationReducerCommandUntilFeedback,
+    AuthorizeLoopIterationReducerCommandCancelLoop,
+    StartFlowRunning,
+    CreateRunRunning,
+    StartRunRunning,
+    CompleteFlowRunning,
+    CompleteFlowRunningZero,
+    FinishRunRunning,
+    FinishRunRunningZero,
+    RetireRunningReleasing,
+    RetireRunningPreservingBinding,
+    RetireRunningNoBinding,
+    RetireStoppedReleasing,
+    SessionIngressDetachedForMobDestroyRunning,
+    SessionIngressDetachedForMobDestroyStopped,
+    SessionIngressDetachFailedForMobDestroyRunning,
+    SessionIngressDetachFailedForMobDestroyStopped,
+    RetireStoppedPreservingBinding,
+    RetireStoppedNoBinding,
+    RetireAllRunning,
+    RetireAllStopped,
+    CompleteSpawnRunning,
+    DestroyFromAny,
+    RespawnRunning,
+    CancelAllWorkRunning,
+}
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum GuardId {
+    None,
+}
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum HelperId {
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GuardRejection {
+    pub transition_id: TransitionId,
+    pub guard_id: GuardId,
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TriggerDiscriminant {
+    Input(InputKind),
+    Signal(SignalKind),
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TransitionRefusal {
+    NoMatchingTransition {
+        phase: Phase,
+        trigger: TriggerDiscriminant,
+    },
+    GuardRejected {
+        rejections: Vec<GuardRejection>,
+    },
+    AmbiguousTransition {
+        transitions: Vec<TransitionId>,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum KernelError {
+    ContextViolation {
+        transition_id: TransitionId,
+        detail: String,
+    },
+    HelperEvaluation {
+        helper_id: HelperId,
+        detail: String,
+    },
+    CodegenInvariant {
+        detail: String,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TransitionError {
+    Refusal(TransitionRefusal),
+    Kernel(KernelError),
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Outcome {
+    pub transition_id: TransitionId,
+    pub next_state: State,
+    pub effects: Vec<Effect>,
+}
+
+pub mod helpers {
+    #[allow(unused_imports)]
+    use super::*;
+    pub fn none<C: Context>(_: &State, context: &C) -> Result<(), KernelError> {
+        let _ = context;
+        Ok(())
+    }
+}
+
+pub fn initial_state() -> State {
+    State {
+        phase: Phase::Running,
+        live_runtime_ids: Default::default(),
+        externally_addressable_runtime_ids: Default::default(),
+        runtime_fence_tokens: Default::default(),
+        active_run_count: 0,
+        run_status: Default::default(),
+        run_ordered_steps: Default::default(),
+        run_tracked_steps: Default::default(),
+        run_step_status: Default::default(),
+        run_step_status_flat: Default::default(),
+        run_output_recorded: Default::default(),
+        run_step_condition_results_flat: Default::default(),
+        run_step_condition_results: Default::default(),
+        run_step_has_conditions: Default::default(),
+        run_step_dependencies: Default::default(),
+        run_step_dependency_modes: Default::default(),
+        run_step_branches: Default::default(),
+        run_step_collection_policies: Default::default(),
+        run_step_quorum_thresholds: Default::default(),
+        run_step_target_counts: Default::default(),
+        run_step_target_success_counts: Default::default(),
+        run_step_target_terminal_failure_counts: Default::default(),
+        run_output_recorded_flat: Default::default(),
+        run_step_target_counts_flat: Default::default(),
+        run_step_target_success_counts_flat: Default::default(),
+        run_step_target_terminal_failure_counts_flat: Default::default(),
+        run_target_retry_counts: Default::default(),
+        run_target_retry_counts_flat: Default::default(),
+        run_failure_count: Default::default(),
+        run_consecutive_failure_count: Default::default(),
+        run_escalation_threshold: Default::default(),
+        run_max_step_retries: Default::default(),
+        run_ready_frames: Default::default(),
+        run_ready_frame_membership: Default::default(),
+        run_ready_frame_membership_flat: Default::default(),
+        run_pending_body_frame_loops: Default::default(),
+        run_pending_body_frame_loop_membership: Default::default(),
+        run_pending_body_frame_loop_membership_flat: Default::default(),
+        run_active_node_count: Default::default(),
+        run_active_frame_count: Default::default(),
+        run_last_granted_frame: Default::default(),
+        run_last_granted_loop: Default::default(),
+        run_max_active_nodes: Default::default(),
+        run_max_active_frames: Default::default(),
+        run_max_frame_depth: Default::default(),
+        frame_scope: Default::default(),
+        frame_phase: Default::default(),
+        frame_run: Default::default(),
+        frame_parent_loop: Default::default(),
+        frame_iteration: Default::default(),
+        frame_tracked_nodes: Default::default(),
+        frame_ordered_nodes: Default::default(),
+        frame_node_kind: Default::default(),
+        frame_node_dependencies: Default::default(),
+        frame_node_dependency_modes: Default::default(),
+        frame_node_step_ids: Default::default(),
+        frame_node_loop_ids: Default::default(),
+        frame_node_status: Default::default(),
+        frame_ready_queue: Default::default(),
+        frame_output_recorded: Default::default(),
+        frame_output_recorded_flat: Default::default(),
+        frame_last_admitted_node: Default::default(),
+        frame_node_condition_results: Default::default(),
+        frame_node_branches: Default::default(),
+        loop_phase: Default::default(),
+        loop_parent_frame: Default::default(),
+        loop_parent_node: Default::default(),
+        loop_definition: Default::default(),
+        loop_depth: Default::default(),
+        loop_stage: Default::default(),
+        loop_current_iteration: Default::default(),
+        loop_last_completed_iteration: Default::default(),
+        loop_max_iterations: Default::default(),
+        loop_active_body_frame: Default::default(),
+        pending_spawn_count: 0,
+        pending_spawn_sessions: Default::default(),
+        coordinator_bound: false,
+        member_startup_binding_requested: Default::default(),
+        member_startup_runtime_ready: Default::default(),
+        member_startup_ready: Default::default(),
+        member_kickoff_pending: Default::default(),
+        member_kickoff_starting: Default::default(),
+        member_kickoff_callback_pending: Default::default(),
+        member_kickoff_started: Default::default(),
+        member_kickoff_failed: Default::default(),
+        member_kickoff_cancelled: Default::default(),
+        member_kickoff_error: Default::default(),
+        member_state_markers: Default::default(),
+        wiring_edges: Default::default(),
+        external_peer_edges: Default::default(),
+        identity_to_runtime: Default::default(),
+        tasks: Default::default(),
+        in_progress_task_ids: Default::default(),
+        completed_task_ids: Default::default(),
+        member_session_bindings: Default::default(),
+        pending_session_ingress_detach_runtime_ids: Default::default(),
+        topology_epoch: 0,
+    }
 }

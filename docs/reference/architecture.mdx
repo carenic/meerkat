@@ -55,9 +55,11 @@ The current catalog exposes **five** canonical machines from
 | `OccurrenceLifecycleMachine` | Occurrence dispatch, delivery, and terminalization |
 | `AuthMachine` | Auth/session authorization state that must remain machine-owned |
 
-The generated runtime also includes helper kernels such as `flow_frame`,
-`flow_run`, and `loop_iteration`, but those are support artifacts rather than
-additional canonical machines.
+`flow_frame`, `flow_run`, and `loop_iteration` are non-canonical Mob-owned
+reducer/projection support modules, not generated runtime authorities.
+`meerkat_mob::run::flow_projection_kernel_audit()` pins that classification in
+code and records that live reducer transitions are gated behind
+MobMachine-owned command wrappers and tied to the owning `MobMachine` inputs.
 
 ## Canonical compositions
 
@@ -103,6 +105,7 @@ Generated specs for the machine and composition surfaces live under
 - [RMAT](/architecture/RMAT)
 - [Meerkat Runtime Dogma](/architecture/meerkat-runtime-dogma)
 - [Formal Seam Closure](/architecture/formal-seam-closure)
+- [Catalog-Authoritative Machine Generation](/architecture/catalog-authoritative-machine-generation)
 - [Finite Ownership Ledger](/architecture/finite-ownership-ledger)
 - [Identity, Generation, and Hidden Runtime Epoch](/architecture/identity-generation-and-runtime-epoch)
 

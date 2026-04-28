@@ -22,14 +22,29 @@ function cargoManifestFiles() {
   return gitLines(["ls-files", "Cargo.lock", ":(glob)**/Cargo.toml"]);
 }
 
+function cargoAutodiscoveryFiles() {
+  return gitLines([
+    "ls-files",
+    ":(glob)**/tests/*.rs",
+    ":(glob)**/benches/*.rs",
+    ":(glob)**/examples/*.rs",
+    ":(glob)**/src/bin/*.rs",
+  ]);
+}
+
 function metadataFingerprint() {
   const hash = createHash("sha256");
   hash.update(root);
-  for (const file of cargoManifestFiles().sort()) {
-    const stat = statSync(resolve(root, file));
+  for (const file of [...cargoManifestFiles(), ...cargoAutodiscoveryFiles()].sort()) {
+    const path = resolve(root, file);
     hash.update("\0");
     hash.update(file);
     hash.update("\0");
+    if (!existsSync(path)) {
+      hash.update("deleted");
+      continue;
+    }
+    const stat = statSync(path);
     hash.update(String(stat.size));
     hash.update("\0");
     hash.update(String(stat.mtimeMs));

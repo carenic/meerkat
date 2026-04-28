@@ -117,9 +117,10 @@ function targetRule(target) {
   return null;
 }
 
-function localDeps(pkg, procMacroOnly) {
+function localDeps(pkg, procMacroOnly, includeDev = false) {
   const labels = [];
   for (const dep of pkg.dependencies) {
+    if (!includeDev && dep.kind === "dev") continue;
     if (dep.source !== null) continue;
     const local = byName.get(dep.name);
     if (!local) continue;
@@ -130,6 +131,17 @@ function localDeps(pkg, procMacroOnly) {
     if (isProc === procMacroOnly) labels.push(packageLabel(local));
   }
   return [...new Set(labels)].sort();
+}
+
+function crateFeaturesFor(key, pkg, extra = []) {
+  const features = new Set(activeFeatures.get(pkg.id));
+  if (key === "meerkat-schedule") {
+    features.delete("machine-schema-exports");
+  }
+  for (const feature of extra) {
+    features.add(feature);
+  }
+  return [...features].sort();
 }
 
 function externalCrateLabel(dep) {
@@ -602,6 +614,7 @@ for (const pkg of localPackages.values()) {
   const rules = [];
   const packageFastTests = [];
   const loads = new Set(["rust_binary", "rust_library", "rust_proc_macro", "rust_test"]);
+  let needsShellTestLoad = false;
   const libOrMacro = pkg.targets.find((target) =>
     target.kind.includes("proc-macro") || target.kind.includes("lib")
   );
@@ -624,18 +637,27 @@ for (const pkg of localPackages.values()) {
         ? `${crateName(target.name)}_bin`
         : crateName(pkg.name);
     const optionalExternal = optionalExternalDeps(pkg);
-    const deps = isTest && libOrMacro
-      ? [...new Set([packageLabel(pkg), ...localDeps(pkg, false)])].sort()
+    const deps = isTest
+      ? [...new Set([...(libOrMacro ? [packageLabel(pkg)] : []), ...localDeps(pkg, false, true)])].sort()
       : target.kind.includes("bin") && libOrMacro
-      ? [...new Set([packageLabel(pkg), ...localDeps(pkg, false)])].sort()
+      ? [...new Set([packageLabel(pkg), ...localDeps(pkg, false, true)])].sort()
+      : target.kind.includes("bin")
+      ? localDeps(pkg, false, true)
       : localDeps(pkg, false);
-    const procMacroDeps = localDeps(pkg, true);
+    const procMacroDeps = localDeps(pkg, true, isTest);
+    let targetDeps = deps;
+    if (key === "meerkat-machine-codegen" && target.name === "runtime_schema_parity") {
+      targetDeps = deps
+        .filter((dep) => dep !== "//meerkat-schedule:meerkat_schedule")
+        .concat("//meerkat-schedule:meerkat_schedule_machine_schema_exports")
+        .sort();
+    }
     const externalNormal = `all_crate_deps(\n        package_name = ${q(key)},\n        normal = True,\n    )`;
     const externalNormalWithDev = `all_crate_deps(\n        package_name = ${q(key)},\n        normal = True,\n        normal_dev = True,\n    )`;
     const externalProc = `all_crate_deps(\n        package_name = ${q(key)},\n        proc_macro = True,\n    )`;
     const externalProcWithDev = `all_crate_deps(\n        package_name = ${q(key)},\n        proc_macro = True,\n        proc_macro_dev = True,\n    )`;
 
-    const depsWithOptionalExternal = [...new Set([...deps, ...optionalExternal])].sort();
+    const depsWithOptionalExternal = [...new Set([...targetDeps, ...optionalExternal])].sort();
     const depsExpr = depsWithOptionalExternal.length
       ? `${listExpr(depsWithOptionalExternal)} + ${isTest ? externalNormalWithDev : externalNormal}`
       : isTest ? externalNormalWithDev : externalNormal;
@@ -664,7 +686,7 @@ for (const pkg of localPackages.values()) {
       `    aliases = ${aliasesExpr},`,
       `    crate_name = ${q(crateName(target.name))},`,
       `    crate_root = ${q(relative(dir, target.src_path))},`,
-      `    crate_features = ${listExpr([...activeFeatures.get(pkg.id)].sort())},`,
+      `    crate_features = ${listExpr(crateFeaturesFor(key, pkg))},`,
       `    edition = "2024",`,
       `    compile_data = ${compileDataExpr},`,
       `    srcs = ${srcsExpr},`,
@@ -719,6 +741,13 @@ for (const pkg of localPackages.values()) {
       if (scansWorkspaceRustSources) {
         data.push("//:workspace_rust_sources");
       }
+      if (key === "meerkat-machine-codegen" && target.name === "runtime_schema_parity") {
+        data.push("//:workspace_runfiles");
+        env.push(`        "WORKSPACE_ROOT": ".",`);
+      }
+      if (key === "xtask" && target.name === "buildbuddy_static_lanes") {
+        data.push("BUILD.bazel");
+      }
       if (needsLiveWorkspaceRunfiles || isE2eLaneHarness) {
         data.push("//:workspace_runfiles");
         env.push(`        "WORKSPACE_ROOT": ".",`);
@@ -762,11 +791,13 @@ for (const pkg of localPackages.values()) {
       const cargoManifestDir = packageRunfilesDir !== "."
         ? `./${packageRunfilesDir}`
         : packageRunfilesDir;
-      const unitDepsExpr = depsWithOptionalExternal.length
-        ? `${listExpr(depsWithOptionalExternal)} + ${externalNormalWithDev}`
+      const unitDeps = [...new Set([...depsWithOptionalExternal, ...localDeps(pkg, false, true)])].sort();
+      const unitProcDeps = [...new Set([...procMacroDeps, ...localDeps(pkg, true, true)])].sort();
+      const unitDepsExpr = unitDeps.length
+        ? `${listExpr(unitDeps)} + ${externalNormalWithDev}`
         : externalNormalWithDev;
-      const unitProcExpr = procMacroDeps.length
-        ? `${listExpr(procMacroDeps)} + ${externalProcWithDev}`
+      const unitProcExpr = unitProcDeps.length
+        ? `${listExpr(unitProcDeps)} + ${externalProcWithDev}`
         : externalProcWithDev;
       const currentPackageRunfiles = `//${relative(root, dir)}:package_runfiles`;
       const unitData = [
@@ -774,6 +805,7 @@ for (const pkg of localPackages.values()) {
         ...workspaceDataLabels(target).filter((label) => label !== currentPackageRunfiles),
       ];
       const unitEnv = [`        "RUST_MIN_STACK": "16777216",`];
+      const unitSize = key === "meerkat-mob" ? "large" : "small";
       if (key === "xtask") {
         const rustfmt = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin";
         const rustfmtLib = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustc_lib";
@@ -788,14 +820,14 @@ for (const pkg of localPackages.values()) {
         `    aliases = ${aliasesExpr.replace(`aliases(package_name = ${q(key)})`, `aliases(\n        package_name = ${q(key)},\n        normal = True,\n        normal_dev = True,\n        proc_macro = True,\n        proc_macro_dev = True,\n    )`)},`,
         `    crate_name = ${q(crateName(target.name))},`,
         `    crate_root = ${q(relative(dir, target.src_path))},`,
-        `    crate_features = ${listExpr([...activeFeatures.get(pkg.id)].sort())},`,
+        `    crate_features = ${listExpr(crateFeaturesFor(key, pkg))},`,
         `    edition = "2024",`,
         `    compile_data = ${compileDataExpr},`,
         `    srcs = ${srcsExpr},`,
         `    visibility = ["//visibility:public"],`,
         `    rustc_env = {\n        "CARGO_MANIFEST_DIR": ${q(cargoManifestDir)},\n    },`,
         `    tags = ${listExpr(["fast", "unit"])},`,
-        `    size = "small",`,
+        `    size = ${q(unitSize)},`,
         `    data = ${listExpr([...new Set(unitData)].sort())},`,
         `    env = {\n${unitEnv.join("\n")}\n    },`,
         `    proc_macro_deps = ${unitProcExpr},`,
@@ -865,7 +897,9 @@ for (const pkg of localPackages.values()) {
           ? `${crateName(target.name)}_${spec.name}`
           : `${crateName(target.name)}_${spec.name}_bin`;
         const localDependencyLabels = target.kind.includes("bin") && primaryLibVariantName
-          ? [...new Set([`:${primaryLibVariantName}`, ...localDeps(pkg, false)])]
+          ? [...new Set([`:${primaryLibVariantName}`, ...localDeps(pkg, false, true)])]
+          : target.kind.includes("bin")
+          ? localDeps(pkg, false, true)
           : localDeps(pkg, false);
         const depsWithOptionalExternal = [...new Set([...localDependencyLabels, ...optionalExternal])].sort();
         const depsExpr = depsWithOptionalExternal.length
@@ -898,6 +932,61 @@ for (const pkg of localPackages.values()) {
     }
   }
 
+  if (key === "meerkat-schedule" && libOrMacro) {
+    rules.push(`rust_library(
+    name = "meerkat_schedule_machine_schema_exports",
+    aliases = aliases(package_name = "meerkat-schedule"),
+    crate_name = "meerkat_schedule",
+    crate_root = "src/lib.rs",
+    crate_features = ${listExpr(crateFeaturesFor(key, pkg, ["machine-schema-exports"]))},
+    edition = "2024",
+    compile_data = [
+        "Cargo.toml",
+    ],
+    srcs = glob(["src/**/*.rs"]),
+    visibility = ["//meerkat-machine-codegen:__pkg__"],
+    proc_macro_deps = [
+        "//meerkat-machine-dsl:meerkat_machine_dsl",
+    ] + all_crate_deps(
+        package_name = "meerkat-schedule",
+        proc_macro = True,
+    ),
+    deps = [
+        "//meerkat-core:meerkat_core",
+        "//meerkat-machine-schema:meerkat_machine_schema",
+    ] + all_crate_deps(
+        package_name = "meerkat-schedule",
+        normal = True,
+    ),
+)`);
+  }
+
+  if (key === "xtask") {
+    needsShellTestLoad = true;
+    const rustfmt = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin";
+    const rustfmtLib = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustc_lib";
+    rules.push(`sh_test(
+    name = "machine_verify_all_tlc_test",
+    srcs = ["tests/machine_verify_all_tlc_test.sh"],
+    args = ["$(rootpath :xtask_bin)"],
+    data = [
+        ":xtask_bin",
+        "//:workspace_runfiles",
+        "${rustfmtLib}",
+        "${rustfmt}",
+    ],
+    env = {
+        "RUSTFMT": "$(rootpath ${rustfmt})",
+    },
+    size = "enormous",
+    timeout = "eternal",
+    tags = [
+        "buildbuddy",
+        "required-feature",
+    ],
+)`);
+  }
+
   if (rules.length === 0) continue;
   if (packageFastTests.length) {
     rules.push(`test_suite(\n    name = "fast_tests",\n    tests = ${listExpr(packageFastTests.sort())},\n)`);
@@ -908,6 +997,7 @@ for (const pkg of localPackages.values()) {
     [
       `load("@crates//:defs.bzl", "aliases", "all_crate_deps")`,
       `load("@rules_rust//rust:defs.bzl", ${[...loads].sort().map(q).join(", ")})`,
+      ...(needsShellTestLoad ? [`load("@rules_shell//shell:sh_test.bzl", "sh_test")`] : []),
       "",
       `filegroup(`,
       `    name = "cargo_manifest",`,

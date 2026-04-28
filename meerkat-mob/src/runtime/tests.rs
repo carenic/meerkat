@@ -3293,6 +3293,93 @@ async fn create_test_mob_with_run_store(
     (handle, service)
 }
 
+async fn seed_test_run_in_mob_machine(handle: &MobHandle, run_id: &RunId) {
+    handle
+        .project_machine_input(
+            crate::machines::mob_machine::MobMachineInput::CreateRunSeed {
+                run_id: crate::machines::mob_machine::RunId::from(run_id.to_string()),
+                step_ids: Default::default(),
+                ordered_steps: Vec::new(),
+                step_has_conditions: Default::default(),
+                step_dependencies: Default::default(),
+                step_dependency_modes: Default::default(),
+                step_branches: Default::default(),
+                step_collection_policies: Default::default(),
+                step_quorum_thresholds: Default::default(),
+                escalation_threshold: 0,
+                max_step_retries: 0,
+                max_active_nodes: 0,
+                max_active_frames: 0,
+                max_frame_depth: 0,
+            },
+        )
+        .await
+        .expect("seed run in MobMachine");
+}
+
+async fn seed_test_loop_in_mob_machine(
+    handle: &MobHandle,
+    loop_instance_id: &crate::ids::LoopInstanceId,
+    parent_frame_id: &crate::ids::FrameId,
+    parent_node_id: &crate::ids::FlowNodeId,
+    loop_id: &crate::ids::LoopId,
+    depth: u32,
+    max_iterations: u64,
+) {
+    handle
+        .project_machine_input(
+            crate::machines::mob_machine::MobMachineInput::CreateLoopSeed {
+                loop_instance_id: crate::machines::mob_machine::LoopInstanceId::from(
+                    loop_instance_id.as_str(),
+                ),
+                parent_frame_id: crate::machines::mob_machine::FrameId::from(
+                    parent_frame_id.as_str(),
+                ),
+                parent_node_id: crate::machines::mob_machine::FlowNodeId::from(
+                    parent_node_id.as_str(),
+                ),
+                loop_id: crate::machines::mob_machine::LoopId::from(loop_id.as_str()),
+                depth,
+                max_iterations,
+            },
+        )
+        .await
+        .expect("seed loop in MobMachine");
+}
+
+async fn seed_test_body_frame_in_mob_machine(
+    handle: &MobHandle,
+    run_id: &RunId,
+    frame_id: &crate::ids::FrameId,
+    loop_instance_id: &crate::ids::LoopInstanceId,
+    iteration: u32,
+) {
+    handle
+        .project_machine_input(
+            crate::machines::mob_machine::MobMachineInput::CreateFrameSeed {
+                run_id: crate::machines::mob_machine::RunId::from(run_id.to_string()),
+                frame_id: crate::machines::mob_machine::FrameId::from(frame_id.as_str()),
+                frame_scope: crate::machines::mob_machine::FrameScope::Body,
+                loop_instance_id: Some(crate::machines::mob_machine::LoopInstanceId::from(
+                    loop_instance_id.as_str(),
+                )),
+                iteration,
+                tracked_nodes: Default::default(),
+                ordered_nodes: Vec::new(),
+                node_kind: Default::default(),
+                node_dependencies: Default::default(),
+                node_dependency_modes: Default::default(),
+                node_branches: Default::default(),
+                node_step_ids: Default::default(),
+                node_loop_ids: Default::default(),
+                node_status: Default::default(),
+                ready_queue: Vec::new(),
+            },
+        )
+        .await
+        .expect("seed body frame in MobMachine");
+}
+
 fn test_comms_name(profile: &str, agent_identity: &str) -> String {
     format!("test-mob/{profile}/{agent_identity}")
 }
@@ -19558,7 +19645,10 @@ async fn test_flow_with_root_frame_spec_executes_frame_nodes() {
     let executor = Arc::new(ScriptedExecutor {
         outputs: scripted_outputs,
     });
-    let engine = FlowFrameEngine::new(store.clone(), executor, None, 0, 0);
+    let definition = sample_definition();
+    let (handle, _) = create_test_mob_with_run_store(definition, store.clone()).await;
+    seed_test_run_in_mob_machine(&handle, &run_id).await;
+    let engine = FlowFrameEngine::new(store.clone(), executor, handle, 0, 0);
     let context = FlowContext {
         run_id: run_id.clone(),
         activation_params: serde_json::json!({}),
@@ -19983,7 +20073,11 @@ async fn test_resume_running_loop_node_completes_instead_of_failing() {
         FrameSpec { nodes }
     };
 
-    let frame_kernel = crate::runtime::flow_frame_engine::FlowFrameKernel::new(store.clone());
+    let definition = sample_definition();
+    let (handle, _) = create_test_mob_with_run_store(definition, store.clone()).await;
+    seed_test_run_in_mob_machine(&handle, &run_id).await;
+    let frame_kernel =
+        crate::runtime::flow_frame_engine::FlowFrameKernel::new(store.clone(), handle.clone());
     let frame_id = FrameId::from(format!("{run_id}-root").as_str());
     frame_kernel
         .start_frame(&run_id, &frame_id, &root_spec)
@@ -19997,6 +20091,16 @@ async fn test_resume_running_loop_node_completes_instead_of_failing() {
 
     let loop_instance_id =
         crate::ids::LoopInstanceId::from(format!("{frame_id}::loop-node").as_str());
+    seed_test_loop_in_mob_machine(
+        &handle,
+        &loop_instance_id,
+        &frame_id,
+        &crate::ids::FlowNodeId::from("loop-node"),
+        &crate::ids::LoopId::from("retry"),
+        1,
+        3,
+    )
+    .await;
     store
         .upsert_loop_snapshot(
             &run_id,
@@ -20021,7 +20125,13 @@ async fn test_resume_running_loop_node_completes_instead_of_failing() {
         .await
         .expect("seed running loop snapshot");
 
-    let engine = FlowFrameEngine::new(store.clone(), Arc::new(ScriptedExecutor), None, 0, 0);
+    let engine = FlowFrameEngine::new(
+        store.clone(),
+        Arc::new(ScriptedExecutor),
+        handle.clone(),
+        0,
+        0,
+    );
     let context = FlowContext {
         run_id: run_id.clone(),
         activation_params: serde_json::json!({}),
@@ -20120,7 +20230,11 @@ async fn test_resume_running_loop_node_does_not_duplicate_iteration_ledger_entry
         FrameSpec { nodes }
     };
 
-    let frame_kernel = crate::runtime::flow_frame_engine::FlowFrameKernel::new(store.clone());
+    let definition = sample_definition();
+    let (handle, _) = create_test_mob_with_run_store(definition, store.clone()).await;
+    seed_test_run_in_mob_machine(&handle, &run_id).await;
+    let frame_kernel =
+        crate::runtime::flow_frame_engine::FlowFrameKernel::new(store.clone(), handle.clone());
     let frame_id = FrameId::from(format!("{run_id}-root").as_str());
     frame_kernel
         .start_frame(&run_id, &frame_id, &root_spec)
@@ -20135,6 +20249,16 @@ async fn test_resume_running_loop_node_does_not_duplicate_iteration_ledger_entry
     let loop_instance_id =
         crate::ids::LoopInstanceId::from(format!("{frame_id}::loop-node").as_str());
     let body_frame_id = FrameId::from(format!("{loop_instance_id}::iter-0").as_str());
+    seed_test_loop_in_mob_machine(
+        &handle,
+        &loop_instance_id,
+        &frame_id,
+        &crate::ids::FlowNodeId::from("loop-node"),
+        &crate::ids::LoopId::from("retry"),
+        1,
+        3,
+    )
+    .await;
     store
         .upsert_loop_snapshot(
             &run_id,
@@ -20162,23 +20286,73 @@ async fn test_resume_running_loop_node_does_not_duplicate_iteration_ledger_entry
         )
         .await
         .expect("seed running loop snapshot with ledger entry");
-    let root_body_frame = frame_kernel
-        .start_frame(&run_id, &body_frame_id, &body_spec)
+    handle
+        .project_machine_input(
+            MobRun::create_frame_seed_input(
+                &run_id,
+                &body_frame_id,
+                Some(&loop_instance_id),
+                0,
+                crate::machines::mob_machine::FrameScope::Body,
+                &body_spec,
+                &[FlowNodeId::from("body-step")],
+            )
+            .expect("body frame seed input"),
+        )
         .await
-        .expect("seed body frame");
-    let mut body_frame = root_body_frame.clone();
-    body_frame.kernel_state.frame_scope = crate::run::flow_frame::FrameScope::Body;
-    body_frame.kernel_state.loop_instance_id = loop_instance_id.clone();
-    body_frame.kernel_state.iteration = 0;
+        .expect("seed body frame in MobMachine");
+    let body_node_id = FlowNodeId::from("body-step");
+    let body_frame = crate::run::FrameSnapshot {
+        kernel_state: crate::run::flow_frame::State {
+            phase: crate::run::flow_frame::Phase::Running,
+            frame_id: body_frame_id.clone(),
+            frame_scope: crate::run::flow_frame::FrameScope::Body,
+            loop_instance_id: loop_instance_id.clone(),
+            iteration: 0,
+            last_admitted_node: FlowNodeId::from(String::new()),
+            tracked_nodes: [body_node_id.clone()].into_iter().collect(),
+            ordered_nodes: vec![body_node_id.clone()],
+            node_kind: [(
+                body_node_id.clone(),
+                crate::run::flow_frame::FlowNodeKind::Step,
+            )]
+            .into_iter()
+            .collect(),
+            node_dependencies: [(body_node_id.clone(), Vec::new())].into_iter().collect(),
+            node_dependency_modes: [(
+                body_node_id.clone(),
+                crate::run::flow_frame::DependencyMode::All,
+            )]
+            .into_iter()
+            .collect(),
+            node_branches: [(body_node_id.clone(), None)].into_iter().collect(),
+            branch_winners: Default::default(),
+            node_status: [(
+                body_node_id.clone(),
+                crate::run::flow_frame::NodeRunStatus::Ready,
+            )]
+            .into_iter()
+            .collect(),
+            ready_queue: vec![body_node_id.clone()],
+            output_recorded: [(body_node_id.clone(), false)].into_iter().collect(),
+            node_condition_results: [(body_node_id, None)].into_iter().collect(),
+        },
+    };
     assert!(
         store
-            .cas_frame_state(&run_id, &body_frame_id, Some(&root_body_frame), body_frame)
+            .cas_frame_state(&run_id, &body_frame_id, None, body_frame)
             .await
-            .expect("promote body frame scope"),
-        "body frame scope update should succeed"
+            .expect("seed body frame snapshot"),
+        "body frame snapshot insert should succeed"
     );
 
-    let engine = FlowFrameEngine::new(store.clone(), Arc::new(ScriptedExecutor), None, 0, 0);
+    let engine = FlowFrameEngine::new(
+        store.clone(),
+        Arc::new(ScriptedExecutor),
+        handle.clone(),
+        0,
+        0,
+    );
     let context = FlowContext {
         run_id: run_id.clone(),
         activation_params: serde_json::json!({}),
@@ -21241,6 +21415,7 @@ struct MobRuntimeParityProbeReport {
 #[derive(Debug, Serialize)]
 struct MobRuntimeParityRowReport {
     input_variant: String,
+    probe_required: bool,
     schema_classification: MobRuntimeParityClassification,
     schema_left: Vec<MobRuntimeParitySchemaTransitionSummary>,
     schema_right: Vec<MobRuntimeParitySchemaTransitionSummary>,
@@ -21255,6 +21430,7 @@ struct MobRuntimeParityPairSummary {
     aligned_rows: usize,
     mismatched_rows: usize,
     unprobed_rows: usize,
+    surface_only_unprobed_rows: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -21273,6 +21449,7 @@ struct MobRuntimeParityAuditSummary {
     aligned_rows: usize,
     mismatched_rows: usize,
     unprobed_rows: usize,
+    surface_only_unprobed_rows: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -21343,14 +21520,18 @@ struct MobModeledStateAuditReport {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MobRuntimeParityProbeInput {
     Spawn,
+    EnsureMember,
+    Reconcile,
     SubmitWork,
     RunFlow,
     CancelFlow,
     Retire,
     Respawn,
     RetireAll,
-    Wire,
-    Unwire,
+    WireMembers,
+    UnwireMembers,
+    WireExternalPeer,
+    UnwireExternalPeer,
     ExternalTurn,
     InternalTurn,
     CancelWork,
@@ -21551,14 +21732,18 @@ fn mob_runtime_parity_probe_for_input_variant(
 ) -> Option<MobRuntimeParityProbeInput> {
     match input_variant {
         "Spawn" => Some(MobRuntimeParityProbeInput::Spawn),
+        "EnsureMember" => Some(MobRuntimeParityProbeInput::EnsureMember),
+        "Reconcile" => Some(MobRuntimeParityProbeInput::Reconcile),
         "SubmitWork" => Some(MobRuntimeParityProbeInput::SubmitWork),
         "RunFlow" => Some(MobRuntimeParityProbeInput::RunFlow),
         "CancelFlow" => Some(MobRuntimeParityProbeInput::CancelFlow),
         "Retire" => Some(MobRuntimeParityProbeInput::Retire),
         "Respawn" => Some(MobRuntimeParityProbeInput::Respawn),
         "RetireAll" => Some(MobRuntimeParityProbeInput::RetireAll),
-        "Wire" => Some(MobRuntimeParityProbeInput::Wire),
-        "Unwire" => Some(MobRuntimeParityProbeInput::Unwire),
+        "WireMembers" => Some(MobRuntimeParityProbeInput::WireMembers),
+        "UnwireMembers" => Some(MobRuntimeParityProbeInput::UnwireMembers),
+        "WireExternalPeer" => Some(MobRuntimeParityProbeInput::WireExternalPeer),
+        "UnwireExternalPeer" => Some(MobRuntimeParityProbeInput::UnwireExternalPeer),
         "ExternalTurn" => Some(MobRuntimeParityProbeInput::ExternalTurn),
         "InternalTurn" => Some(MobRuntimeParityProbeInput::InternalTurn),
         "CancelWork" => Some(MobRuntimeParityProbeInput::CancelWork),
@@ -21741,6 +21926,7 @@ async fn mob_runtime_parity_snapshot_summary(
         member_session_bindings,
         pending_spawn_sessions,
         pending_session_ingress_detach_runtime_ids,
+        topology_epoch,
     ) = dsl_t2
         .map(|snap| {
             (
@@ -21784,6 +21970,7 @@ async fn mob_runtime_parity_snapshot_summary(
                     .into_iter()
                     .map(|id| format!("{id:?}"))
                     .collect::<BTreeSet<_>>(),
+                snap.topology_epoch,
             )
         })
         .unwrap_or_default();
@@ -21825,10 +22012,7 @@ async fn mob_runtime_parity_snapshot_summary(
         member_session_bindings,
         pending_spawn_sessions,
         pending_session_ingress_detach_runtime_ids,
-        // Track-B (R5): stubbed 0 here; full projection lands alongside
-        // `member_session_bindings` wiring-through when the observer
-        // runtime exposes the field.
-        topology_epoch: 0,
+        topology_epoch,
     })
 }
 
@@ -21918,6 +22102,85 @@ fn mob_runtime_parity_field_value(
         "coordinator_bound" => snapshot
             .coordinator_bound
             .map(MobRuntimeParityExprValue::Bool),
+        "run_ready_frame_membership_flat"
+        | "run_pending_body_frame_loop_membership_flat"
+        | "member_startup_binding_requested"
+        | "member_startup_runtime_ready"
+        | "member_startup_ready"
+        | "member_kickoff_pending"
+        | "member_kickoff_starting"
+        | "member_kickoff_callback_pending"
+        | "member_kickoff_started"
+        | "member_kickoff_failed"
+        | "member_kickoff_cancelled" => Some(MobRuntimeParityExprValue::Set(BTreeSet::new())),
+        "run_status"
+        | "run_ordered_steps"
+        | "run_tracked_steps"
+        | "run_step_status"
+        | "run_step_status_flat"
+        | "run_output_recorded"
+        | "run_step_condition_results_flat"
+        | "run_step_condition_results"
+        | "run_step_has_conditions"
+        | "run_step_dependencies"
+        | "run_step_dependency_modes"
+        | "run_step_branches"
+        | "run_step_collection_policies"
+        | "run_step_quorum_thresholds"
+        | "run_step_target_counts"
+        | "run_step_target_success_counts"
+        | "run_step_target_terminal_failure_counts"
+        | "run_output_recorded_flat"
+        | "run_step_target_counts_flat"
+        | "run_step_target_success_counts_flat"
+        | "run_step_target_terminal_failure_counts_flat"
+        | "run_target_retry_counts"
+        | "run_target_retry_counts_flat"
+        | "run_failure_count"
+        | "run_consecutive_failure_count"
+        | "run_escalation_threshold"
+        | "run_max_step_retries"
+        | "run_ready_frames"
+        | "run_ready_frame_membership"
+        | "run_pending_body_frame_loops"
+        | "run_pending_body_frame_loop_membership"
+        | "run_active_node_count"
+        | "run_active_frame_count"
+        | "run_last_granted_frame"
+        | "run_last_granted_loop"
+        | "run_max_active_nodes"
+        | "run_max_active_frames"
+        | "run_max_frame_depth"
+        | "frame_scope"
+        | "frame_phase"
+        | "frame_run"
+        | "frame_parent_loop"
+        | "frame_iteration"
+        | "frame_tracked_nodes"
+        | "frame_ordered_nodes"
+        | "frame_node_kind"
+        | "frame_node_dependencies"
+        | "frame_node_dependency_modes"
+        | "frame_node_step_ids"
+        | "frame_node_loop_ids"
+        | "frame_node_status"
+        | "frame_ready_queue"
+        | "frame_output_recorded"
+        | "frame_output_recorded_flat"
+        | "frame_last_admitted_node"
+        | "frame_node_condition_results"
+        | "frame_node_branches"
+        | "loop_phase"
+        | "loop_parent_frame"
+        | "loop_parent_node"
+        | "loop_definition"
+        | "loop_depth"
+        | "loop_stage"
+        | "loop_current_iteration"
+        | "loop_last_completed_iteration"
+        | "loop_max_iterations"
+        | "loop_active_body_frame"
+        | "member_kickoff_error" => Some(MobRuntimeParityExprValue::Map(BTreeMap::new())),
         _ => None,
     }
 }
@@ -22081,11 +22344,15 @@ fn mob_modeled_schema_result_summary(
             Some(summarize_mob_runtime_success(probe, "work_receipt"))
         }
         MobRuntimeParityProbeInput::RunFlow => Some(summarize_mob_runtime_success(probe, "run_id")),
-        MobRuntimeParityProbeInput::CancelFlow
+        MobRuntimeParityProbeInput::EnsureMember
+        | MobRuntimeParityProbeInput::Reconcile
+        | MobRuntimeParityProbeInput::CancelFlow
         | MobRuntimeParityProbeInput::Retire
         | MobRuntimeParityProbeInput::RetireAll
-        | MobRuntimeParityProbeInput::Wire
-        | MobRuntimeParityProbeInput::Unwire
+        | MobRuntimeParityProbeInput::WireMembers
+        | MobRuntimeParityProbeInput::UnwireMembers
+        | MobRuntimeParityProbeInput::WireExternalPeer
+        | MobRuntimeParityProbeInput::UnwireExternalPeer
         | MobRuntimeParityProbeInput::CancelWork
         | MobRuntimeParityProbeInput::CancelAllWork
         | MobRuntimeParityProbeInput::Stop
@@ -22143,6 +22410,15 @@ async fn build_mob_runtime_parity_fixture() -> MobRuntimeParityFixture {
     }
 }
 
+fn mob_runtime_parity_external_peer() -> TrustedPeerDescriptor {
+    TrustedPeerDescriptor::test_only_unsigned_typed(
+        "mob-runtime-parity/external/agent",
+        meerkat_core::comms::PeerId::new(),
+        "inproc://mob-runtime-parity/external/agent",
+    )
+    .expect("valid runtime parity external peer")
+}
+
 async fn mob_runtime_parity_prepare_probe(
     target_phase: MobRuntimeParityPhase,
     probe: MobRuntimeParityProbeInput,
@@ -22181,15 +22457,31 @@ async fn mob_runtime_parity_prepare_probe(
             fixture.ensure_worker().await?;
             setup_tags.push("worker_spawned".to_string());
         }
-        MobRuntimeParityProbeInput::Wire => {
+        MobRuntimeParityProbeInput::WireMembers => {
             fixture.ensure_worker().await?;
             fixture.ensure_lead().await?;
             setup_tags.push("worker_spawned".to_string());
             setup_tags.push("lead_spawned".to_string());
         }
-        MobRuntimeParityProbeInput::Unwire => {
+        MobRuntimeParityProbeInput::UnwireMembers => {
             fixture.ensure_wired_edge().await?;
             setup_tags.push("wired_external_edge".to_string());
+        }
+        MobRuntimeParityProbeInput::WireExternalPeer => {
+            fixture.ensure_lead().await?;
+            setup_tags.push("lead_spawned".to_string());
+        }
+        MobRuntimeParityProbeInput::UnwireExternalPeer => {
+            fixture.ensure_lead().await?;
+            fixture
+                .handle
+                .wire(
+                    fixture.lead_identity.clone(),
+                    PeerTarget::External(mob_runtime_parity_external_peer()),
+                )
+                .await
+                .map_err(|error| format!("wire external peer: {error:?}"))?;
+            setup_tags.push("external_peer_wired".to_string());
         }
         MobRuntimeParityProbeInput::ExternalTurn
         | MobRuntimeParityProbeInput::SubscribeAgentEvents
@@ -22217,7 +22509,9 @@ async fn mob_runtime_parity_prepare_probe(
         | MobRuntimeParityProbeInput::SubscribeMobEvents
         | MobRuntimeParityProbeInput::RecordOperatorActionProvenance
         | MobRuntimeParityProbeInput::SetSpawnPolicy
-        | MobRuntimeParityProbeInput::Shutdown => {}
+        | MobRuntimeParityProbeInput::Shutdown
+        | MobRuntimeParityProbeInput::EnsureMember
+        | MobRuntimeParityProbeInput::Reconcile => {}
     }
 
     match target_phase {
@@ -22261,6 +22555,19 @@ async fn mob_runtime_parity_execute_probe(
             )
             .await
             .map(|_| summarize_mob_runtime_success(probe, "spawned")),
+        MobRuntimeParityProbeInput::EnsureMember => fixture
+            .handle
+            .ensure_member(SpawnMemberSpec::new("worker", "parity-ensure"))
+            .await
+            .map(|_| summarize_mob_runtime_success(probe, "unit")),
+        MobRuntimeParityProbeInput::Reconcile => fixture
+            .handle
+            .reconcile(
+                vec![SpawnMemberSpec::new("worker", "parity-reconcile")],
+                crate::runtime::reconcile::ReconcileOptions::default(),
+            )
+            .await
+            .map(|_| summarize_mob_runtime_success(probe, "unit")),
         MobRuntimeParityProbeInput::SubmitWork => {
             let entry = fixture.worker_entry().await.map_err(MobError::Internal)?;
             fixture
@@ -22309,7 +22616,7 @@ async fn mob_runtime_parity_execute_probe(
             .retire_all()
             .await
             .map(|()| summarize_mob_runtime_success(probe, "unit")),
-        MobRuntimeParityProbeInput::Wire => fixture
+        MobRuntimeParityProbeInput::WireMembers => fixture
             .handle
             .wire(
                 fixture.worker_identity.clone(),
@@ -22317,11 +22624,27 @@ async fn mob_runtime_parity_execute_probe(
             )
             .await
             .map(|()| summarize_mob_runtime_success(probe, "unit")),
-        MobRuntimeParityProbeInput::Unwire => fixture
+        MobRuntimeParityProbeInput::UnwireMembers => fixture
             .handle
             .unwire(
                 fixture.worker_identity.clone(),
                 MeerkatId::from(fixture.lead_identity.as_str()),
+            )
+            .await
+            .map(|()| summarize_mob_runtime_success(probe, "unit")),
+        MobRuntimeParityProbeInput::WireExternalPeer => fixture
+            .handle
+            .wire(
+                fixture.lead_identity.clone(),
+                PeerTarget::External(mob_runtime_parity_external_peer()),
+            )
+            .await
+            .map(|()| summarize_mob_runtime_success(probe, "unit")),
+        MobRuntimeParityProbeInput::UnwireExternalPeer => fixture
+            .handle
+            .unwire(
+                fixture.lead_identity.clone(),
+                MeerkatId::from(mob_runtime_parity_external_peer().name.as_str()),
             )
             .await
             .map(|()| summarize_mob_runtime_success(probe, "unit")),
@@ -22717,6 +23040,11 @@ async fn build_mob_runtime_parity_pair_report(
     right_phase: MobRuntimeParityPhase,
 ) -> MobRuntimeParityPairReport {
     let mut rows = Vec::new();
+    let surface_only_inputs = schema
+        .surface_only_inputs
+        .iter()
+        .map(|v| v.as_str())
+        .collect::<BTreeSet<_>>();
 
     for input_variant in &schema.inputs.variants {
         println!(
@@ -22725,6 +23053,7 @@ async fn build_mob_runtime_parity_pair_report(
             right_phase.schema_name(),
             input_variant.name,
         );
+        let probe_required = !surface_only_inputs.contains(input_variant.name.as_str());
         let (mut probe, note) =
             match mob_runtime_parity_probe_for_input_variant(input_variant.name.as_str()) {
                 Some(probe_input) => {
@@ -22740,7 +23069,17 @@ async fn build_mob_runtime_parity_pair_report(
                         Err(error) => (None, Some(format!("probe setup failed: {error}"))),
                     }
                 }
-                None => (None, Some("no runtime probe implemented".to_string())),
+                None if probe_required => (
+                    None,
+                    Some(
+                        "required runtime probe missing; non-surface-only omissions fail closed"
+                            .to_string(),
+                    ),
+                ),
+                None => (
+                    None,
+                    Some("surface-only input: runtime probe not required".to_string()),
+                ),
             };
 
         let Some(schema_row) = mob_runtime_parity_schema_row_for_input(
@@ -22761,6 +23100,7 @@ async fn build_mob_runtime_parity_pair_report(
 
         rows.push(MobRuntimeParityRowReport {
             input_variant: schema_row.input_variant,
+            probe_required,
             schema_classification: schema_row.classification,
             schema_left: schema_row.left,
             schema_right: schema_row.right,
@@ -22784,7 +23124,8 @@ async fn build_mob_runtime_parity_pair_report(
                         summary.mismatched_rows += 1;
                     }
                 }
-                None => summary.unprobed_rows += 1,
+                None if row.probe_required => summary.unprobed_rows += 1,
+                None => summary.surface_only_unprobed_rows += 1,
             }
             summary
         },
@@ -22804,6 +23145,11 @@ async fn build_mob_runtime_full_pair_report(
     right_phase: MobRuntimeParityPhase,
 ) -> MobRuntimeParityPairReport {
     let mut rows = Vec::new();
+    let surface_only_inputs = schema
+        .surface_only_inputs
+        .iter()
+        .map(|v| v.as_str())
+        .collect::<BTreeSet<_>>();
 
     for input_variant in &schema.inputs.variants {
         println!(
@@ -22812,6 +23158,7 @@ async fn build_mob_runtime_full_pair_report(
             right_phase.schema_name(),
             input_variant.name,
         );
+        let probe_required = !surface_only_inputs.contains(input_variant.name.as_str());
         let (probe, note) =
             match mob_runtime_parity_probe_for_input_variant(input_variant.name.as_str()) {
                 Some(probe_input) => {
@@ -22827,7 +23174,17 @@ async fn build_mob_runtime_full_pair_report(
                         Err(error) => (None, Some(format!("probe setup failed: {error}"))),
                     }
                 }
-                None => (None, Some("no runtime probe implemented".to_string())),
+                None if probe_required => (
+                    None,
+                    Some(
+                        "required runtime probe missing; non-surface-only omissions fail closed"
+                            .to_string(),
+                    ),
+                ),
+                None => (
+                    None,
+                    Some("surface-only input: runtime probe not required".to_string()),
+                ),
             };
 
         let Some(schema_row) = mob_runtime_parity_schema_row_for_input(
@@ -22857,6 +23214,7 @@ async fn build_mob_runtime_full_pair_report(
 
         rows.push(MobRuntimeParityRowReport {
             input_variant: schema_row.input_variant,
+            probe_required,
             schema_classification: effective_schema_classification,
             schema_left: schema_row.left,
             schema_right: schema_row.right,
@@ -22880,7 +23238,8 @@ async fn build_mob_runtime_full_pair_report(
                         summary.mismatched_rows += 1;
                     }
                 }
-                None => summary.unprobed_rows += 1,
+                None if row.probe_required => summary.unprobed_rows += 1,
+                None => summary.surface_only_unprobed_rows += 1,
             }
             summary
         },
@@ -22897,14 +23256,18 @@ async fn build_mob_runtime_full_pair_report(
 fn mob_runtime_parity_probe_variant_name(probe: MobRuntimeParityProbeInput) -> &'static str {
     match probe {
         MobRuntimeParityProbeInput::Spawn => "Spawn",
+        MobRuntimeParityProbeInput::EnsureMember => "EnsureMember",
+        MobRuntimeParityProbeInput::Reconcile => "Reconcile",
         MobRuntimeParityProbeInput::SubmitWork => "SubmitWork",
         MobRuntimeParityProbeInput::RunFlow => "RunFlow",
         MobRuntimeParityProbeInput::CancelFlow => "CancelFlow",
         MobRuntimeParityProbeInput::Retire => "Retire",
         MobRuntimeParityProbeInput::Respawn => "Respawn",
         MobRuntimeParityProbeInput::RetireAll => "RetireAll",
-        MobRuntimeParityProbeInput::Wire => "Wire",
-        MobRuntimeParityProbeInput::Unwire => "Unwire",
+        MobRuntimeParityProbeInput::WireMembers => "WireMembers",
+        MobRuntimeParityProbeInput::UnwireMembers => "UnwireMembers",
+        MobRuntimeParityProbeInput::WireExternalPeer => "WireExternalPeer",
+        MobRuntimeParityProbeInput::UnwireExternalPeer => "UnwireExternalPeer",
         MobRuntimeParityProbeInput::ExternalTurn => "ExternalTurn",
         MobRuntimeParityProbeInput::InternalTurn => "InternalTurn",
         MobRuntimeParityProbeInput::CancelWork => "CancelWork",
@@ -23683,12 +24046,16 @@ async fn write_mob_runtime_modeled_state_audit_report(path: PathBuf) -> MobModel
                         outcome_kind: MobModeledStateOutcomeKind::Err,
                         before: None,
                         after: None,
-                        result_summary: "no runtime probe implemented".to_string(),
+                        result_summary:
+                            "required runtime probe missing; non-surface-only omissions fail closed"
+                                .to_string(),
                     },
                     schema: MobModeledStateSchemaReport {
                         outcome_kind: MobModeledStateOutcomeKind::Err,
                         after: None,
-                        detail: "no runtime probe implemented".to_string(),
+                        detail:
+                            "required runtime probe missing; non-surface-only omissions fail closed"
+                                .to_string(),
                         result_summary: None,
                     },
                 });
@@ -23720,7 +24087,9 @@ async fn write_mob_runtime_modeled_state_audit_report(path: PathBuf) -> MobModel
         MobModeledStateAuditSummary::default(),
         |mut summary, row| {
             summary.row_count += 1;
-            if row.runtime.result_summary == "no runtime probe implemented" {
+            if row.runtime.result_summary
+                == "required runtime probe missing; non-surface-only omissions fail closed"
+            {
                 summary.unprobed_rows += 1;
             } else if row.aligned {
                 summary.aligned_rows += 1;
@@ -23766,6 +24135,7 @@ async fn write_mob_runtime_full_parity_audit_report(path: PathBuf) -> MobRuntime
             summary.aligned_rows += pair.summary.aligned_rows;
             summary.mismatched_rows += pair.summary.mismatched_rows;
             summary.unprobed_rows += pair.summary.unprobed_rows;
+            summary.surface_only_unprobed_rows += pair.summary.surface_only_unprobed_rows;
             summary
         },
     );

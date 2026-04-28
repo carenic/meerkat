@@ -19,14 +19,14 @@ pub use crate::ids::{FlowNodeId, FrameId, LoopId, LoopInstanceId};
 pub enum LoopIterationStage {
     AwaitingBodyFrame,
     BodyFrameActive,
-    AwaitingUntil,
+    AwaitingUntilEvaluation,
 }
 impl LoopIterationStage {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::AwaitingBodyFrame => "AwaitingBodyFrame",
             Self::BodyFrameActive => "BodyFrameActive",
-            Self::AwaitingUntil => "AwaitingUntil",
+            Self::AwaitingUntilEvaluation => "AwaitingUntilEvaluation",
         }
     }
 }
@@ -71,7 +71,7 @@ impl Default for State {
     }
 }
 
-pub mod inputs {
+pub(crate) mod inputs {
     use super::*;
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct StartLoop {
@@ -120,7 +120,7 @@ pub mod inputs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum Input {
+pub(crate) enum Input {
     StartLoop(inputs::StartLoop),
     BodyFrameStarted(inputs::BodyFrameStarted),
     BodyFrameCompleted(inputs::BodyFrameCompleted),
@@ -132,7 +132,7 @@ pub enum Input {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum InputKind {
+pub(crate) enum InputKind {
     StartLoop,
     BodyFrameStarted,
     BodyFrameCompleted,
@@ -237,13 +237,13 @@ pub struct Outcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum TransitionError {
+pub(crate) enum TransitionError {
     Refusal(TransitionRefusal),
     Kernel(KernelError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum TransitionRefusal {
+pub(crate) enum TransitionRefusal {
     NoMatchingTransition {
         phase: Phase,
         trigger: TriggerDiscriminant,
@@ -257,7 +257,7 @@ pub enum TransitionRefusal {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum TriggerDiscriminant {
+pub(crate) enum TriggerDiscriminant {
     Input(InputKind),
 }
 
@@ -315,7 +315,8 @@ fn guard(transition_id: TransitionId, guard_id: GuardId) -> TransitionError {
     })
 }
 
-pub fn transition<C: Context>(
+#[cfg(test)]
+pub(crate) fn transition<C: Context>(
     state: &State,
     input: Input,
     context: &C,
@@ -407,7 +408,7 @@ pub fn transition<C: Context>(
                 return Err(guard(TransitionId::BodyFrameCompleted, GuardId::Iteration));
             }
             let mut next_state = state.clone();
-            next_state.stage = LoopIterationStage::AwaitingUntil;
+            next_state.stage = LoopIterationStage::AwaitingUntilEvaluation;
             next_state.last_completed_iteration = payload.iteration;
             next_state.current_iteration = state.current_iteration + 1;
             next_state.active_body_frame_id = None;
@@ -510,7 +511,7 @@ pub fn transition<C: Context>(
                     GuardId::LoopInstanceId,
                 ));
             }
-            if state.stage != LoopIterationStage::AwaitingUntil {
+            if state.stage != LoopIterationStage::AwaitingUntilEvaluation {
                 return Err(guard(TransitionId::UntilConditionMet, GuardId::Stage));
             }
             if state.last_completed_iteration != payload.iteration {
@@ -543,7 +544,7 @@ pub fn transition<C: Context>(
                     GuardId::LoopInstanceId,
                 ));
             }
-            if state.stage != LoopIterationStage::AwaitingUntil {
+            if state.stage != LoopIterationStage::AwaitingUntilEvaluation {
                 return Err(guard(TransitionId::UntilConditionFailed, GuardId::Stage));
             }
             if state.last_completed_iteration != payload.iteration {

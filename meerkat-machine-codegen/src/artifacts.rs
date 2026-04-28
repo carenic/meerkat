@@ -502,6 +502,11 @@ pub fn render_machine_ci_cfg(schema: &MachineSchema, deep: bool) -> String {
     let domains = collect_binding_domains(schema);
     let named_samples = collect_machine_named_type_samples(schema);
     let named_bindings = collect_machine_named_bindings(schema);
+    let sample_cardinality = if !deep && schema.ci_step_limit == Some(1) {
+        0
+    } else {
+        default_sample_cardinality(deep)
+    };
 
     pushln!(&mut out, "SPECIFICATION Spec");
     if !domains.is_empty() {
@@ -519,7 +524,7 @@ pub fn render_machine_ci_cfg(schema: &MachineSchema, deep: bool) -> String {
                 name,
                 render_default_domain_assignment(
                     &ty,
-                    default_sample_cardinality(deep),
+                    sample_cardinality,
                     &named_samples,
                     &named_bindings,
                     false,
@@ -2345,6 +2350,11 @@ fn infer_expr_type(
         }
         Expr::Some(inner) => infer_expr_type(inner, field_types, helper_returns, binding_types)
             .map(|inner_ty| TypeRef::Option(Box::new(inner_ty))),
+        Expr::Call { helper, .. } if helper == "mob_machine_step_status_from_frame_node_status" => {
+            meerkat_machine_schema::identity::EnumTypeId::parse("StepRunStatus")
+                .ok()
+                .map(TypeRef::Enum)
+        }
         Expr::Call { helper, .. } => helper_returns.get(helper).cloned(),
         Expr::SeqLiteral(items) => items.first().and_then(|item| {
             infer_expr_type(item, field_types, helper_returns, binding_types)
@@ -2427,6 +2437,7 @@ fn render_default_domain_assignment(
                 "{1}".into()
             }
         }
+        TypeRef::String if sample_cardinality == 0 => "{}".into(),
         TypeRef::String => format!(
             "{{{}}}",
             collected_string_samples(sample_cardinality, named_samples, include_string_samples)
@@ -2530,6 +2541,19 @@ fn render_named_domain_assignment(
         };
     }
 
+    if sample_cardinality == 0 {
+        return "{}".into();
+    }
+
+    if let Some(samples) = known_named_domain_samples(name, sample_cardinality) {
+        let rendered = samples
+            .into_iter()
+            .map(tla_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        return format!("{{{rendered}}}");
+    }
+
     if name == "ToolFilter" {
         let target_cardinality = sample_cardinality.max(2);
         let mut values = named_samples
@@ -2577,6 +2601,7 @@ fn sample_values(
                 vec!["1".into()]
             }
         }
+        TypeRef::String if sample_cardinality == 0 => Vec::new(),
         TypeRef::String => {
             collected_string_samples(sample_cardinality, named_samples, include_string_samples)
                 .into_iter()
@@ -2597,6 +2622,7 @@ fn sample_values(
                 vec!["1".into()]
             }
         }
+        TypeRef::Named(_) if sample_cardinality == 0 => Vec::new(),
         TypeRef::Named(name) => {
             let name = name.as_str();
             if let Some(samples) = named_samples.get(name) {
@@ -2614,8 +2640,12 @@ fn sample_values(
                 .map(|idx| tla_string(format!("{}_{}", tla_ident(name).to_lowercase(), idx)))
                 .collect()
         }
+        TypeRef::Enum(_) if sample_cardinality == 0 => Vec::new(),
         TypeRef::Enum(name) => {
             let name = name.as_str();
+            if let Some(samples) = known_named_domain_samples(name, sample_cardinality) {
+                return samples.into_iter().map(tla_string).collect();
+            }
             if let Some(samples) = named_samples.get(name) {
                 let limit = sample_cardinality.max(1);
                 let rendered = samples
@@ -2666,6 +2696,20 @@ fn sample_values(
         ),
         TypeRef::Map(_, _) => vec![],
     }
+}
+
+fn known_named_domain_samples(name: &str, sample_cardinality: usize) -> Option<Vec<&'static str>> {
+    let samples = match name {
+        "FlowNodeKind" => &["Loop", "Step"][..],
+        _ => return None,
+    };
+    Some(
+        samples
+            .iter()
+            .copied()
+            .take(sample_cardinality.max(1))
+            .collect(),
+    )
 }
 
 /// Consult the schema's named-type binding table to decide whether a
@@ -2733,6 +2777,39 @@ fn render_map_domain_definition(key: &TypeRef, value: &TypeRef) -> String {
     format!(
         "{{{empty_map}}} \\cup {{ [x \\in {{k}} |-> v] : k \\in {key_domain}, v \\in {value_domain} }}"
     )
+}
+
+fn ordered_composite_domain_definitions(
+    constants: &BTreeMap<String, TypeRef>,
+) -> Vec<(&String, &TypeRef)> {
+    let mut domains = constants
+        .iter()
+        .filter(|(_, ty)| {
+            matches!(
+                ty,
+                TypeRef::Seq(_) | TypeRef::Option(_) | TypeRef::Map(_, _)
+            )
+        })
+        .collect::<Vec<_>>();
+    domains.sort_by_key(|(name, ty)| (domain_dependency_depth(ty), (*name).clone()));
+    domains
+}
+
+fn domain_dependency_depth(ty: &TypeRef) -> usize {
+    match ty {
+        TypeRef::Option(inner) | TypeRef::Seq(inner) | TypeRef::Set(inner) => {
+            1 + domain_dependency_depth(inner)
+        }
+        TypeRef::Map(key, value) => {
+            1 + domain_dependency_depth(key).max(domain_dependency_depth(value))
+        }
+        TypeRef::Bool
+        | TypeRef::U32
+        | TypeRef::U64
+        | TypeRef::String
+        | TypeRef::Named(_)
+        | TypeRef::Enum(_) => 0,
+    }
 }
 
 fn render_type_domain_expr(ty: &TypeRef) -> String {
@@ -2865,38 +2942,14 @@ impl<'a> CompositionTlaCompiler<'a> {
             .expect("write to string");
         writeln!(&mut out, "Some(v) == [tag |-> \"some\", value |-> v]");
         pushln!(&mut out);
-        for (name, ty) in &constants {
-            if let TypeRef::Seq(inner) = ty {
-                writeln!(
-                    &mut out,
-                    "{} == {}",
-                    name,
-                    render_sequence_domain_definition(inner)
-                )
-                .expect("write to string");
-            }
-        }
-        for (name, ty) in &constants {
-            if let TypeRef::Option(inner) = ty {
-                writeln!(
-                    &mut out,
-                    "{} == {}",
-                    name,
-                    render_option_domain_definition(inner)
-                )
-                .expect("write to string");
-            }
-        }
-        for (name, ty) in &constants {
-            if let TypeRef::Map(key, value) = ty {
-                writeln!(
-                    &mut out,
-                    "{} == {}",
-                    name,
-                    render_map_domain_definition(key, value)
-                )
-                .expect("write to string");
-            }
+        for (name, ty) in ordered_composite_domain_definitions(&constants) {
+            let definition = match ty {
+                TypeRef::Seq(inner) => render_sequence_domain_definition(inner),
+                TypeRef::Option(inner) => render_option_domain_definition(inner),
+                TypeRef::Map(key, value) => render_map_domain_definition(key, value),
+                _ => continue,
+            };
+            writeln!(&mut out, "{} == {}", name, definition).expect("write to string");
         }
         if constants.values().any(|ty| {
             matches!(
@@ -2914,6 +2967,16 @@ impl<'a> CompositionTlaCompiler<'a> {
         writeln!(
             &mut out,
             "MapSet(map, key, value) == [x \\in DOMAIN map \\cup {{key}} |-> IF x = key THEN value ELSE map[x]]"
+        )
+        .expect("write to string");
+        writeln!(
+            &mut out,
+            "MapIncrement(map, key, amount) == [x \\in DOMAIN map \\cup {{key}} |-> IF x = key THEN (IF key \\in DOMAIN map THEN map[key] ELSE 0) + amount ELSE map[x]]"
+        )
+        .expect("write to string");
+        writeln!(
+            &mut out,
+            "MapDecrement(map, key, amount) == [x \\in DOMAIN map \\cup {{key}} |-> IF x = key THEN (IF key \\in DOMAIN map THEN map[key] ELSE 0) - amount ELSE map[x]]"
         )
         .expect("write to string");
         writeln!(
@@ -5247,38 +5310,14 @@ impl<'a> MachineTlaCompiler<'a> {
         pushln!(&mut out, "None == [tag |-> \"none\", value |-> \"none\"]");
         writeln!(&mut out, "Some(v) == [tag |-> \"some\", value |-> v]");
         pushln!(&mut out);
-        for (name, ty) in &constants {
-            if let TypeRef::Seq(inner) = ty {
-                writeln!(
-                    &mut out,
-                    "{} == {}",
-                    name,
-                    render_sequence_domain_definition(inner)
-                )
-                .expect("write to string");
-            }
-        }
-        for (name, ty) in &constants {
-            if let TypeRef::Option(inner) = ty {
-                writeln!(
-                    &mut out,
-                    "{} == {}",
-                    name,
-                    render_option_domain_definition(inner)
-                )
-                .expect("write to string");
-            }
-        }
-        for (name, ty) in &constants {
-            if let TypeRef::Map(key, value) = ty {
-                writeln!(
-                    &mut out,
-                    "{} == {}",
-                    name,
-                    render_map_domain_definition(key, value)
-                )
-                .expect("write to string");
-            }
+        for (name, ty) in ordered_composite_domain_definitions(&constants) {
+            let definition = match ty {
+                TypeRef::Seq(inner) => render_sequence_domain_definition(inner),
+                TypeRef::Option(inner) => render_option_domain_definition(inner),
+                TypeRef::Map(key, value) => render_map_domain_definition(key, value),
+                _ => continue,
+            };
+            writeln!(&mut out, "{} == {}", name, definition).expect("write to string");
         }
         if constants.values().any(|ty| {
             matches!(
@@ -5296,6 +5335,16 @@ impl<'a> MachineTlaCompiler<'a> {
         writeln!(
             &mut out,
             "MapSet(map, key, value) == [x \\in DOMAIN map \\cup {{key}} |-> IF x = key THEN value ELSE map[x]]"
+        )
+        .expect("write to string");
+        writeln!(
+            &mut out,
+            "MapIncrement(map, key, amount) == [x \\in DOMAIN map \\cup {{key}} |-> IF x = key THEN (IF key \\in DOMAIN map THEN map[key] ELSE 0) + amount ELSE map[x]]"
+        )
+        .expect("write to string");
+        writeln!(
+            &mut out,
+            "MapDecrement(map, key, amount) == [x \\in DOMAIN map \\cup {{key}} |-> IF x = key THEN (IF key \\in DOMAIN map THEN map[key] ELSE 0) - amount ELSE map[x]]"
         )
         .expect("write to string");
         writeln!(
@@ -5353,6 +5402,9 @@ impl<'a> MachineTlaCompiler<'a> {
 
         for helper in helper_dependency_order(self.schema) {
             self.render_helper(&mut out, helper);
+        }
+        if self.schema.machine.as_str() == "MobMachine" {
+            self.render_mob_machine_native_helpers(&mut out);
         }
         if !self.schema.helpers.is_empty() || !self.schema.derived.is_empty() {
             pushln!(&mut out);
@@ -5563,6 +5615,203 @@ impl<'a> MachineTlaCompiler<'a> {
             )
             .expect("write to string");
         }
+    }
+
+    fn render_mob_machine_native_helpers(&self, out: &mut String) {
+        let prefix = |name: &str| self.scoped_helper_name(name);
+        writeln!(
+            out,
+            "{}(status) == status \\in {{\"Completed\", \"Failed\", \"Skipped\", \"Canceled\"}}",
+            prefix("mob_machine_node_terminal")
+        )
+        .expect("write to string");
+        writeln!(
+            out,
+            "{}(status) ==",
+            prefix("mob_machine_step_status_from_frame_node_status")
+        )
+        .expect("write to string");
+        pushln!(out, "    IF status = \"Completed\" THEN \"Completed\"");
+        pushln!(out, "    ELSE IF status = \"Skipped\" THEN \"Skipped\"");
+        pushln!(out, "    ELSE IF status = \"Failed\" THEN \"Failed\"");
+        pushln!(out, "    ELSE IF status = \"Canceled\" THEN \"Canceled\"");
+        pushln!(out, "    ELSE \"Dispatched\"");
+        writeln!(
+            out,
+            "{}(all_statuses, frame_branches, ordered_nodes_by_frame, frame_id, node_id) ==",
+            prefix("mob_machine_frame_node_status_after_admit")
+        )
+        .expect("write to string");
+        pushln!(
+            out,
+            "    LET current == IF frame_id \\in DOMAIN all_statuses THEN all_statuses[frame_id] ELSE [x \\in {{}} |-> None]"
+        );
+        pushln!(
+            out,
+            "        branches == IF frame_id \\in DOMAIN frame_branches THEN frame_branches[frame_id] ELSE [x \\in {{}} |-> None]"
+        );
+        pushln!(
+            out,
+            "        admitted_branch == IF node_id \\in DOMAIN branches THEN branches[node_id] ELSE None"
+        );
+        pushln!(
+            out,
+            "        after_branch_reservation == [candidate \\in DOMAIN current |->"
+        );
+        pushln!(out, "            IF admitted_branch # None");
+        pushln!(out, "                /\\ candidate # node_id");
+        pushln!(out, "                /\\ candidate \\in DOMAIN branches");
+        pushln!(
+            out,
+            "                /\\ branches[candidate] = admitted_branch"
+        );
+        pushln!(out, "                /\\ current[candidate] = \"Ready\"");
+        pushln!(out, "            THEN \"Pending\" ELSE current[candidate]]");
+        pushln!(
+            out,
+            "        after_admit == MapSet(after_branch_reservation, node_id, \"Running\")"
+        );
+        pushln!(out, "    IN MapSet(all_statuses, frame_id, after_admit)");
+        writeln!(
+            out,
+            "{}(all_ready_queues, all_statuses, ordered_nodes_by_frame, frame_id) ==",
+            prefix("mob_machine_frame_ready_queue_after_admit")
+        )
+        .expect("write to string");
+        pushln!(
+            out,
+            "    LET statuses == IF frame_id \\in DOMAIN all_statuses THEN all_statuses[frame_id] ELSE [x \\in {{}} |-> None]"
+        );
+        pushln!(
+            out,
+            "        ordered == IF frame_id \\in DOMAIN ordered_nodes_by_frame THEN ordered_nodes_by_frame[frame_id] ELSE <<>>"
+        );
+        pushln!(
+            out,
+            "    IN MapSet(all_ready_queues, frame_id, SelectSeq(ordered, LAMBDA candidate: candidate \\in DOMAIN statuses /\\ statuses[candidate] = \"Ready\"))"
+        );
+        writeln!(
+            out,
+            "{}(all_statuses, frame_branches, ordered_nodes_by_frame, dependencies_by_frame, dependency_modes_by_frame, frame_id, node_id, terminal_status) ==",
+            prefix("mob_machine_frame_node_status_after_terminal")
+        )
+        .expect("write to string");
+        pushln!(
+            out,
+            "    LET current == IF frame_id \\in DOMAIN all_statuses THEN all_statuses[frame_id] ELSE [x \\in {{}} |-> None]"
+        );
+        pushln!(
+            out,
+            "        ordered == IF frame_id \\in DOMAIN ordered_nodes_by_frame THEN ordered_nodes_by_frame[frame_id] ELSE <<>>"
+        );
+        pushln!(
+            out,
+            "        branches == IF frame_id \\in DOMAIN frame_branches THEN frame_branches[frame_id] ELSE [x \\in {{}} |-> None]"
+        );
+        pushln!(
+            out,
+            "        dependencies == IF frame_id \\in DOMAIN dependencies_by_frame THEN dependencies_by_frame[frame_id] ELSE [x \\in {{}} |-> <<>>]"
+        );
+        pushln!(
+            out,
+            "        dependency_modes == IF frame_id \\in DOMAIN dependency_modes_by_frame THEN dependency_modes_by_frame[frame_id] ELSE [x \\in {{}} |-> \"All\"]"
+        );
+        pushln!(
+            out,
+            "        after_terminal == MapSet(current, node_id, terminal_status)"
+        );
+        writeln!(
+            out,
+            "        after_branch == [candidate \\in DOMAIN after_terminal |->"
+        )
+        .expect("write to string");
+        pushln!(
+            out,
+            "            IF terminal_status = \"Completed\" /\\ candidate # node_id"
+        );
+        pushln!(
+            out,
+            "                /\\ candidate \\in DOMAIN branches /\\ node_id \\in DOMAIN branches"
+        );
+        pushln!(out, "                /\\ branches[node_id] # None");
+        pushln!(
+            out,
+            "                /\\ branches[candidate] = branches[node_id]"
+        );
+        writeln!(
+            out,
+            "                /\\ ~{}(after_terminal[candidate])",
+            prefix("mob_machine_node_terminal")
+        )
+        .expect("write to string");
+        pushln!(
+            out,
+            "                /\\ after_terminal[candidate] # \"Running\""
+        );
+        pushln!(
+            out,
+            "            THEN \"Skipped\" ELSE after_terminal[candidate]]"
+        );
+        pushln!(
+            out,
+            "        after_dependencies == [candidate \\in DOMAIN after_branch |->"
+        );
+        pushln!(
+            out,
+            "            IF after_branch[candidate] # \"Pending\" THEN after_branch[candidate]"
+        );
+        pushln!(
+            out,
+            "            ELSE LET deps == IF candidate \\in DOMAIN dependencies THEN dependencies[candidate] ELSE <<>>"
+        );
+        pushln!(
+            out,
+            "                     mode == IF candidate \\in DOMAIN dependency_modes THEN dependency_modes[candidate] ELSE \"All\""
+        );
+        pushln!(out, "                     failed == Len(deps) # 0");
+        pushln!(
+            out,
+            "                         /\\ ((mode = \"All\" /\\ \\E dep_index \\in DOMAIN deps: LET dep == deps[dep_index] IN dep \\in DOMAIN after_branch /\\ after_branch[dep] \\in {{\"Failed\", \"Skipped\", \"Canceled\"}})"
+        );
+        pushln!(
+            out,
+            "                             \\/ (mode = \"Any\" /\\ \\A dep_index \\in DOMAIN deps: LET dep == deps[dep_index] IN dep \\in DOMAIN after_branch /\\ after_branch[dep] \\in {{\"Failed\", \"Skipped\", \"Canceled\"}}))"
+        );
+        pushln!(out, "                     satisfied == Len(deps) = 0");
+        pushln!(
+            out,
+            "                         \\/ (mode = \"All\" /\\ \\A dep_index \\in DOMAIN deps: LET dep == deps[dep_index] IN dep \\in DOMAIN after_branch /\\ after_branch[dep] = \"Completed\")"
+        );
+        pushln!(
+            out,
+            "                         \\/ (mode = \"Any\" /\\ \\E dep_index \\in DOMAIN deps: LET dep == deps[dep_index] IN dep \\in DOMAIN after_branch /\\ after_branch[dep] = \"Completed\")"
+        );
+        pushln!(
+            out,
+            "                 IN IF failed THEN \"Skipped\" ELSE IF satisfied THEN \"Ready\" ELSE after_branch[candidate]]"
+        );
+        pushln!(
+            out,
+            "    IN MapSet(all_statuses, frame_id, after_dependencies)"
+        );
+        writeln!(
+            out,
+            "{}(all_ready_queues, all_statuses, ordered_nodes_by_frame, frame_id) ==",
+            prefix("mob_machine_frame_ready_queue_after_terminal")
+        )
+        .expect("write to string");
+        pushln!(
+            out,
+            "    LET statuses == IF frame_id \\in DOMAIN all_statuses THEN all_statuses[frame_id] ELSE [x \\in {{}} |-> None]"
+        );
+        pushln!(
+            out,
+            "        ordered == IF frame_id \\in DOMAIN ordered_nodes_by_frame THEN ordered_nodes_by_frame[frame_id] ELSE <<>>"
+        );
+        pushln!(
+            out,
+            "    IN MapSet(all_ready_queues, frame_id, SelectSeq(ordered, LAMBDA candidate: candidate \\in DOMAIN statuses /\\ statuses[candidate] = \"Ready\"))"
+        );
     }
 
     fn render_transition(&mut self, out: &mut String, transition: &TransitionSchema) {
@@ -6348,12 +6597,19 @@ impl<'a> MachineTlaCompiler<'a> {
                 self.render_expr_with_types(inner, env, binding_env, binding_types)
             ),
             Expr::MapGet { map, key } => format!(
-                "(IF {} \\in DOMAIN {} THEN {}[{}] ELSE {})",
-                self.render_expr_with_types(key, env, binding_env, binding_types),
-                self.render_expr_with_types(map, env, binding_env, binding_types),
-                self.render_expr_with_types(map, env, binding_env, binding_types),
-                self.render_expr_with_types(key, env, binding_env, binding_types),
-                self.map_absent_value_expr(map, binding_types)
+                "{}",
+                if self.is_scalar_value_projection(map, key, binding_types) {
+                    self.render_expr_with_types(map, env, binding_env, binding_types)
+                } else {
+                    format!(
+                        "(IF {} \\in DOMAIN {} THEN {}[{}] ELSE {})",
+                        self.render_expr_with_types(key, env, binding_env, binding_types),
+                        self.render_expr_with_types(map, env, binding_env, binding_types),
+                        self.render_expr_with_types(map, env, binding_env, binding_types),
+                        self.render_expr_with_types(key, env, binding_env, binding_types),
+                        self.map_absent_value_expr(map, binding_types)
+                    )
+                }
             ),
             Expr::Some(inner) => format!(
                 "Some({})",
@@ -6464,6 +6720,7 @@ impl<'a> MachineTlaCompiler<'a> {
             Expr::U64(_) => Some(TypeRef::U64),
             Expr::String(_) | Expr::Phase(_) | Expr::Variant(_) => Some(TypeRef::String),
             Expr::NamedVariant { enum_name, .. } => Some(TypeRef::Enum(enum_name.clone())),
+            Expr::MapGet { map, .. } => self.map_value_type(map, binding_types),
             Expr::Field(name) => self
                 .schema
                 .state
@@ -6475,6 +6732,26 @@ impl<'a> MachineTlaCompiler<'a> {
             Expr::Binding(name) => binding_types.get(name).cloned(),
             _ => None,
         }
+    }
+
+    fn is_scalar_value_projection(
+        &self,
+        map: &Expr,
+        key: &Expr,
+        binding_types: &BTreeMap<String, TypeRef>,
+    ) -> bool {
+        matches!(key, Expr::String(value) if value == "value")
+            && matches!(
+                self.scalar_expr_type(map, binding_types),
+                Some(
+                    TypeRef::Bool
+                        | TypeRef::U32
+                        | TypeRef::U64
+                        | TypeRef::String
+                        | TypeRef::Enum(_)
+                        | TypeRef::Named(_)
+                )
+            )
     }
 
     fn map_value_type(

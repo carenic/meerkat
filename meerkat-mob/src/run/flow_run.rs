@@ -13,7 +13,7 @@
 )]
 
 pub use crate::ids::MeerkatId;
-pub use crate::ids::{BranchId, FrameId, LoopInstanceId, StepId};
+pub use crate::ids::{BranchId, FlowNodeId, FrameId, LoopInstanceId, StepId};
 
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -166,7 +166,7 @@ impl Default for State {
     }
 }
 
-pub mod inputs {
+pub(crate) mod inputs {
     use super::*;
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct CreateRun {
@@ -217,7 +217,8 @@ pub mod inputs {
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct ProjectFrameStepStatus {
         pub step_id: StepId,
-        pub step_status: StepRunStatus,
+        pub frame_id: FrameId,
+        pub node_id: FlowNodeId,
         pub append_failure_ledger: bool,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -254,14 +255,18 @@ pub mod inputs {
         pub frame_id: FrameId,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub struct PumpNodeScheduler {}
+    pub struct PumpNodeScheduler {
+        pub frame_id: FrameId,
+    }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct RegisterPendingBodyFrame {
         pub loop_instance_id: LoopInstanceId,
         pub depth: u32,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub struct PumpFrameScheduler {}
+    pub struct PumpFrameScheduler {
+        pub loop_instance_id: LoopInstanceId,
+    }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct NodeExecutionReleased {
         pub frame_id: FrameId,
@@ -279,7 +284,7 @@ pub mod inputs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum Input {
+pub(crate) enum Input {
     CreateRun(inputs::CreateRun),
     StartRun(inputs::StartRun),
     DispatchStep(inputs::DispatchStep),
@@ -308,7 +313,7 @@ pub enum Input {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum InputKind {
+pub(crate) enum InputKind {
     CreateRun,
     StartRun,
     DispatchStep,
@@ -473,13 +478,13 @@ pub struct Outcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum TransitionError {
+pub(crate) enum TransitionError {
     Refusal(TransitionRefusal),
     Kernel(KernelError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum TransitionRefusal {
+pub(crate) enum TransitionRefusal {
     NoMatchingTransition {
         phase: Phase,
         trigger: TriggerDiscriminant,
@@ -493,7 +498,7 @@ pub enum TransitionRefusal {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum TriggerDiscriminant {
+pub(crate) enum TriggerDiscriminant {
     Input(InputKind),
 }
 
@@ -632,7 +637,8 @@ fn maybe_add_unique<T: Ord + Clone>(
     }
 }
 
-pub fn transition<C: Context>(
+#[cfg(test)]
+pub(crate) fn transition<C: Context>(
     state: &State,
     input: Input,
     context: &C,
@@ -858,46 +864,16 @@ pub fn transition<C: Context>(
             })
         }
         Input::ProjectFrameStepStatus(payload) => {
-            if state.phase != Phase::Running {
-                return Err(refusal(&state.phase, InputKind::ProjectFrameStepStatus));
-            }
-            ensure_step(
-                state,
+            let _ = (
                 &payload.step_id,
+                &payload.frame_id,
+                &payload.node_id,
+                payload.append_failure_ledger,
+            );
+            Err(guard(
                 TransitionId::ProjectFrameStepStatus,
-            )?;
-            let mut next_state = state.clone();
-            next_state
-                .step_status
-                .insert(payload.step_id.clone(), Some(payload.step_status));
-            let mut effects = vec![emit_step_notice(
-                payload.step_id.clone(),
-                payload.step_status,
-            )];
-            if payload.step_status == StepRunStatus::Failed {
-                next_state.failure_count = next_state.failure_count.saturating_add(1);
-                next_state.consecutive_failure_count =
-                    next_state.consecutive_failure_count.saturating_add(1);
-                if payload.append_failure_ledger {
-                    effects.push(Effect::AppendFailureLedger(effects::AppendFailureLedger {
-                        step_id: payload.step_id.clone(),
-                    }));
-                }
-                if next_state.escalation_threshold > 0
-                    && next_state.consecutive_failure_count >= next_state.escalation_threshold
-                {
-                    effects.push(Effect::EscalateSupervisor(effects::EscalateSupervisor {
-                        step_id: payload.step_id.clone(),
-                    }));
-                }
-            } else if payload.step_status == StepRunStatus::Completed {
-                next_state.consecutive_failure_count = 0;
-            }
-            Ok(Outcome {
-                transition_id: TransitionId::ProjectFrameStepStatus,
-                next_state,
-                effects,
-            })
+                GuardId::StepStatus,
+            ))
         }
         Input::CancelStep(payload) => {
             if state.phase != Phase::Running {

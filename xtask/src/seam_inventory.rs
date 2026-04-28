@@ -104,6 +104,42 @@ fn known_classifications() -> Vec<(&'static str, &'static str, SeamClassificatio
         ),
         (
             "MeerkatMachine",
+            "TurnRunStarted",
+            SeamClassification::NoOwnerRealization,
+            "Local turn-run start marker retained inside the agent loop boundary tracker",
+        ),
+        (
+            "MeerkatMachine",
+            "TurnBoundaryApplied",
+            SeamClassification::NoOwnerRealization,
+            "Local turn-boundary marker retained inside the agent loop boundary tracker",
+        ),
+        (
+            "MeerkatMachine",
+            "TurnRunCompleted",
+            SeamClassification::NoOwnerRealization,
+            "Local turn-run completion marker retained inside the agent loop boundary tracker",
+        ),
+        (
+            "MeerkatMachine",
+            "TurnRunFailed",
+            SeamClassification::NoOwnerRealization,
+            "Local turn-run failure marker retained inside the agent loop boundary tracker",
+        ),
+        (
+            "MeerkatMachine",
+            "TurnRunCancelled",
+            SeamClassification::NoOwnerRealization,
+            "Local turn-run cancellation marker retained inside the agent loop boundary tracker",
+        ),
+        (
+            "MeerkatMachine",
+            "TurnCheckCompaction",
+            SeamClassification::NoOwnerRealization,
+            "Local turn compaction check retained inside the agent loop boundary tracker",
+        ),
+        (
+            "MeerkatMachine",
             "WakeInterrupt",
             SeamClassification::NoOwnerRealization,
             "Local wake signal consumed by the in-process runtime loop",
@@ -599,6 +635,24 @@ fn known_classifications() -> Vec<(&'static str, &'static str, SeamClassificatio
             "EmitTaskNotice",
             SeamClassification::OwnerRealizationOnly,
             "External task-notice emission realized by the task-board surface",
+        ),
+        (
+            "MobMachine",
+            "PersistKickoffUpdate",
+            SeamClassification::NoOwnerRealization,
+            "Local kickoff lifecycle state persistence consumed inside the mob startup tracker",
+        ),
+        (
+            "MobMachine",
+            "PersistKickoffFailureUpdate",
+            SeamClassification::NoOwnerRealization,
+            "Local kickoff failure persistence consumed inside the mob startup tracker",
+        ),
+        (
+            "MobMachine",
+            "EmitKickoffLifecycleNotice",
+            SeamClassification::OwnerRealizationOnly,
+            "External kickoff lifecycle notice realized by the mob event stream",
         ),
         //
         // =========================================================================

@@ -5,6 +5,15 @@ use crate::identity::{
 use indexmap::{IndexMap, IndexSet};
 use std::fmt;
 
+const NATIVE_MOB_MACHINE_HELPERS: &[&str] = &[
+    "mob_machine_frame_node_status_after_admit",
+    "mob_machine_frame_ready_queue_after_admit",
+    "mob_machine_frame_node_status_after_terminal",
+    "mob_machine_frame_ready_queue_after_terminal",
+    "mob_machine_node_terminal",
+    "mob_machine_step_status_from_frame_node_status",
+];
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineSchema {
     pub machine: MachineId,
@@ -1097,7 +1106,9 @@ impl Expr {
                 )?;
             }
             Self::Call { helper, args } => {
-                if !helper_names.contains(helper.as_str()) {
+                if !helper_names.contains(helper.as_str())
+                    && !NATIVE_MOB_MACHINE_HELPERS.contains(&helper.as_str())
+                {
                     return Err(MachineSchemaError::UnknownHelper {
                         helper: helper.clone(),
                     });

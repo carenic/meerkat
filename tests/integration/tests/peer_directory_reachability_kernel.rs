@@ -1,19 +1,35 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::collections::BTreeMap;
+
 use meerkat_machine_kernels::generated::meerkat;
+use meerkat_machine_kernels::test_oracle::{GeneratedMachineKernel, KernelSignal};
+use meerkat_machine_schema::identity::{PhaseId, SignalVariantId};
+
+fn signal(slug: &str) -> SignalVariantId {
+    SignalVariantId::parse(slug).expect("signal id")
+}
+
+fn phase(slug: &str) -> PhaseId {
+    PhaseId::parse(slug).expect("phase id")
+}
 
 #[test]
 fn peer_directory_reachability_kernel_initializes_with_typed_signal() {
-    let state = meerkat::initial_state();
-    let initialized = meerkat::transition_signal(
-        &state,
-        meerkat::Signal::Initialize(meerkat::signals::Initialize {}),
-        &meerkat::EmptyContext,
-    )
-    .expect("initialize")
-    .next_state;
+    let kernel = GeneratedMachineKernel::new(meerkat::schema());
+    let state = kernel.initial_state().expect("initial state");
+    let initialized = kernel
+        .transition_signal(
+            &state,
+            &KernelSignal {
+                variant: signal("Initialize"),
+                fields: BTreeMap::new(),
+            },
+        )
+        .expect("initialize")
+        .next_state;
 
-    assert_ne!(initialized.phase, meerkat::Phase::Initializing);
+    assert_ne!(initialized.phase, phase("Initializing"));
 }
 
 #[test]

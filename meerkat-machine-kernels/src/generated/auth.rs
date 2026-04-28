@@ -1,172 +1,246 @@
-mod source {
-    #![allow(dead_code, clippy::expect_used, clippy::assign_op_pattern)]
-    use meerkat_machine_dsl::machine;
-
-    // AuthMachine — per-binding auth lease lifecycle (Phase 1.5-rev,
-    // refactored from the original "absorbed into MeerkatMachine"
-    // design after review).
-    //
-    // Each typed LeaseKey (realm, binding, optional profile) has its own
-    // AuthMachine instance, tracked by the runtime-level registry in
-    // `meerkat-runtime/src/handles/auth_lease.rs`. The machine owns the
-    // semantics of:
-    //
-    //   * whether a lease is currently fresh / expiring / refreshing /
-    //     requires reauth / released
-    //   * the legal transitions between those states (e.g. refresh only
-    //     from Valid or Expiring; complete only from Refreshing)
-    //   * the expiry timestamp, last refresh timestamp, and consecutive
-    //     refresh-failure count associated with the lease
-    //
-    // Per-binding (rather than one machine with multi-binding state) keeps
-    // the TLC state space small, aligns the machine with dogma §1 "one
-    // semantic fact, one owner" (each lease IS a distinct fact), and lets
-    // auth be orthogonal to MeerkatMachine — which is what Luka flagged
-    // when reviewing the absorbed design.
-    machine! {
-        machine AuthMachine {
-            version: 1,
-            rust: "meerkat-runtime" / "auth_machine::dsl",
-
-            state {
-                lifecycle_phase: AuthLifecyclePhase,
-                expires_at: Option<u64>,
-                last_refresh: Option<u64>,
-                refresh_attempt: u64,
-            }
-
-            init(Valid) {
-                expires_at = None,
-                last_refresh = None,
-                refresh_attempt = 0,
-            }
-
-            terminal [Released]
-
-            phase AuthLifecyclePhase {
-                Valid,
-                Expiring,
-                Refreshing,
-                ReauthRequired,
-                Released,
-            }
-
-            input AuthMachineInput {
-                Acquire { expires_at_ts: Option<u64> },
-                MarkExpiring,
-                BeginRefresh,
-                CompleteRefresh { new_expires_at: Option<u64>, now_ts: u64 },
-                RefreshFailedTransient,
-                RefreshFailedPermanent,
-                MarkReauthRequired,
-                Release,
-            }
-
-            effect AuthMachineEffect {
-                EmitLifecycleEvent { new_state: AuthLifecyclePhase },
-                WakeRefreshLoop,
-            }
-
-            disposition EmitLifecycleEvent => external,
-            disposition WakeRefreshLoop => local,
-
-            // --- Transitions ---
-
-            transition Acquire {
-                on input Acquire { expires_at_ts }
-                update {
-                    self.expires_at = expires_at_ts;
-                    self.refresh_attempt = 0;
-                }
-                to Valid
-                emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
-            }
-
-            transition MarkExpiring {
-                on input MarkExpiring
-                guard { self.lifecycle_phase == Phase::Valid }
-                to Expiring
-                emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
-            }
-
-            transition BeginRefreshFromValid {
-                on input BeginRefresh
-                guard { self.lifecycle_phase == Phase::Valid }
-                to Refreshing
-                emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
-                emit WakeRefreshLoop
-            }
-
-            transition BeginRefreshFromExpiring {
-                on input BeginRefresh
-                guard { self.lifecycle_phase == Phase::Expiring }
-                to Refreshing
-                emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
-                emit WakeRefreshLoop
-            }
-
-            transition CompleteRefresh {
-                on input CompleteRefresh { new_expires_at, now_ts }
-                guard { self.lifecycle_phase == Phase::Refreshing }
-                update {
-                    self.expires_at = new_expires_at;
-                    self.last_refresh = Some(now_ts);
-                    self.refresh_attempt = 0;
-                }
-                to Valid
-                emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
-            }
-
-            transition RefreshFailedTransient {
-                on input RefreshFailedTransient
-                guard { self.lifecycle_phase == Phase::Refreshing }
-                update {
-                    self.refresh_attempt = self.refresh_attempt + 1;
-                }
-                to Expiring
-                emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
-            }
-
-            transition RefreshFailedPermanent {
-                on input RefreshFailedPermanent
-                guard { self.lifecycle_phase == Phase::Refreshing }
-                update {
-                    self.refresh_attempt = self.refresh_attempt + 1;
-                }
-                to ReauthRequired
-                emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
-            }
-
-            transition MarkReauthRequiredFromValid {
-                on input MarkReauthRequired
-                guard { self.lifecycle_phase == Phase::Valid }
-                to ReauthRequired
-                emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
-            }
-
-            transition MarkReauthRequiredFromExpiring {
-                on input MarkReauthRequired
-                guard { self.lifecycle_phase == Phase::Expiring }
-                to ReauthRequired
-                emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
-            }
-
-            transition MarkReauthRequiredFromRefreshing {
-                on input MarkReauthRequired
-                guard { self.lifecycle_phase == Phase::Refreshing }
-                to ReauthRequired
-                emit EmitLifecycleEvent { new_state: self.lifecycle_phase }
-            }
-
-            transition Release {
-                on input Release
-                to Released
-            }
-        }
-    }
-}
-pub use source::*;
+// @generated — Generated by `cargo xtask machine-codegen --all`.
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::panic,
+    clippy::implicit_clone,
+    clippy::unnecessary_cast,
+    clippy::redundant_clone
+)]
 
 pub fn schema() -> meerkat_machine_schema::MachineSchema {
     meerkat_machine_schema::catalog::dsl::dsl_auth_machine()
+}
+
+#[derive(
+    Debug,
+    Clone,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct AuthLifecyclePhase(pub String);
+impl From<String> for AuthLifecyclePhase {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+impl From<&str> for AuthLifecyclePhase {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+impl std::fmt::Display for AuthLifecyclePhase {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+pub trait Context {}
+pub struct EmptyContext;
+impl Context for EmptyContext {}
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Phase {
+    Valid,
+    Expiring,
+    Refreshing,
+    ReauthRequired,
+    Released,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct State {
+    pub phase: Phase,
+    pub expires_at: Option<u64>,
+    pub last_refresh: Option<u64>,
+    pub refresh_attempt: u64,
+}
+impl Default for State {
+    fn default() -> Self {
+        initial_state()
+    }
+}
+
+pub mod inputs {
+    #[allow(unused_imports)]
+    use super::*;
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Acquire {
+        pub expires_at_ts: Option<u64>,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct MarkExpiring {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct BeginRefresh {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct CompleteRefresh {
+        pub new_expires_at: Option<u64>,
+        pub now_ts: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RefreshFailedTransient {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RefreshFailedPermanent {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct MarkReauthRequired {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct Release {}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Input {
+    Acquire(inputs::Acquire),
+    MarkExpiring(inputs::MarkExpiring),
+    BeginRefresh(inputs::BeginRefresh),
+    CompleteRefresh(inputs::CompleteRefresh),
+    RefreshFailedTransient(inputs::RefreshFailedTransient),
+    RefreshFailedPermanent(inputs::RefreshFailedPermanent),
+    MarkReauthRequired(inputs::MarkReauthRequired),
+    Release(inputs::Release),
+}
+impl Input {
+    pub fn kind(&self) -> InputKind {
+        match self {
+            Self::Acquire(_) => InputKind::Acquire,
+            Self::MarkExpiring(_) => InputKind::MarkExpiring,
+            Self::BeginRefresh(_) => InputKind::BeginRefresh,
+            Self::CompleteRefresh(_) => InputKind::CompleteRefresh,
+            Self::RefreshFailedTransient(_) => InputKind::RefreshFailedTransient,
+            Self::RefreshFailedPermanent(_) => InputKind::RefreshFailedPermanent,
+            Self::MarkReauthRequired(_) => InputKind::MarkReauthRequired,
+            Self::Release(_) => InputKind::Release,
+        }
+    }
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum InputKind {
+    Acquire,
+    MarkExpiring,
+    BeginRefresh,
+    CompleteRefresh,
+    RefreshFailedTransient,
+    RefreshFailedPermanent,
+    MarkReauthRequired,
+    Release,
+}
+
+pub mod effects {
+    #[allow(unused_imports)]
+    use super::*;
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct EmitLifecycleEvent {
+        pub new_state: AuthLifecyclePhase,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct WakeRefreshLoop {}
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Effect {
+    EmitLifecycleEvent(effects::EmitLifecycleEvent),
+    WakeRefreshLoop(effects::WakeRefreshLoop),
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum EffectKind {
+    EmitLifecycleEvent,
+    WakeRefreshLoop,
+}
+
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TransitionId {
+    Acquire,
+    MarkExpiring,
+    BeginRefreshFromValid,
+    BeginRefreshFromExpiring,
+    CompleteRefresh,
+    RefreshFailedTransient,
+    RefreshFailedPermanent,
+    MarkReauthRequiredFromValid,
+    MarkReauthRequiredFromExpiring,
+    MarkReauthRequiredFromRefreshing,
+    Release,
+}
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum GuardId {
+    None,
+}
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum HelperId {
+    None,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct GuardRejection {
+    pub transition_id: TransitionId,
+    pub guard_id: GuardId,
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TriggerDiscriminant {
+    Input(InputKind),
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TransitionRefusal {
+    NoMatchingTransition {
+        phase: Phase,
+        trigger: TriggerDiscriminant,
+    },
+    GuardRejected {
+        rejections: Vec<GuardRejection>,
+    },
+    AmbiguousTransition {
+        transitions: Vec<TransitionId>,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum KernelError {
+    ContextViolation {
+        transition_id: TransitionId,
+        detail: String,
+    },
+    HelperEvaluation {
+        helper_id: HelperId,
+        detail: String,
+    },
+    CodegenInvariant {
+        detail: String,
+    },
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum TransitionError {
+    Refusal(TransitionRefusal),
+    Kernel(KernelError),
+}
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct Outcome {
+    pub transition_id: TransitionId,
+    pub next_state: State,
+    pub effects: Vec<Effect>,
+}
+
+pub mod helpers {
+    #[allow(unused_imports)]
+    use super::*;
+    pub fn none<C: Context>(_: &State, context: &C) -> Result<(), KernelError> {
+        let _ = context;
+        Ok(())
+    }
+}
+
+pub fn initial_state() -> State {
+    State {
+        phase: Phase::Valid,
+        expires_at: None,
+        last_refresh: None,
+        refresh_attempt: 0,
+    }
 }

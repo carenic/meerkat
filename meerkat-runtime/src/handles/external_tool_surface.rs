@@ -4,7 +4,9 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use meerkat_core::handles::{
-    DslTransitionError, ExternalToolSurfaceHandle, SurfaceDiagnosticSnapshot, SurfaceSnapshot,
+    DslTransitionError, ExternalToolSurfaceEffect, ExternalToolSurfaceHandle,
+    ExternalToolSurfaceInput, ExternalToolSurfaceTransition, SurfaceDiagnosticSnapshot,
+    SurfaceSnapshot,
 };
 use meerkat_core::tool_scope::{
     ExternalToolSurfaceBaseState, ExternalToolSurfaceDeltaOperation, ExternalToolSurfaceDeltaPhase,
@@ -28,7 +30,14 @@ impl RuntimeExternalToolSurfaceHandle {
 
     /// Construct a handle backed by an ephemeral DSL authority.
     pub fn ephemeral() -> Self {
-        Self::new(Arc::new(HandleDslAuthority::ephemeral()))
+        let state = mm_dsl::MeerkatMachineState {
+            lifecycle_phase: mm_dsl::MeerkatPhase::Attached,
+            ..Default::default()
+        };
+        let shared = Arc::new(std::sync::Mutex::new(
+            mm_dsl::MeerkatMachineAuthority::from_state(state),
+        ));
+        Self::new(Arc::new(HandleDslAuthority::from_shared(shared)))
     }
 }
 
@@ -83,9 +92,114 @@ impl RuntimeExternalToolSurfaceHandle {
             removal_applied_at_turn: state.surface_removal_applied_at_turn.get(&key).copied(),
         })
     }
+
+    fn apply_input_with_effects(
+        &self,
+        input: mm_dsl::MeerkatMachineInput,
+        context: &'static str,
+    ) -> Result<ExternalToolSurfaceTransition, DslTransitionError> {
+        let effects = self.dsl.apply_input_with_effects(input, context)?;
+        let state = self.dsl.snapshot_state();
+        Ok(ExternalToolSurfaceTransition {
+            phase: map_surface_phase(state.surface_phase),
+            effects: effects
+                .into_iter()
+                .filter_map(|effect| map_surface_effect(effect, state.snapshot_epoch))
+                .collect(),
+        })
+    }
 }
 
 impl ExternalToolSurfaceHandle for RuntimeExternalToolSurfaceHandle {
+    fn apply_surface_input(
+        &self,
+        input: ExternalToolSurfaceInput,
+    ) -> Result<ExternalToolSurfaceTransition, DslTransitionError> {
+        match input {
+            ExternalToolSurfaceInput::StageAdd { surface_id, now_ms } => self
+                .apply_input_with_effects(
+                    mm_dsl::MeerkatMachineInput::SurfaceStageAdd { surface_id, now_ms },
+                    "ExternalToolSurfaceHandle::stage_add",
+                ),
+            ExternalToolSurfaceInput::StageRemove { surface_id, now_ms } => self
+                .apply_input_with_effects(
+                    mm_dsl::MeerkatMachineInput::SurfaceStageRemove { surface_id, now_ms },
+                    "ExternalToolSurfaceHandle::stage_remove",
+                ),
+            ExternalToolSurfaceInput::StageReload { surface_id, now_ms } => self
+                .apply_input_with_effects(
+                    mm_dsl::MeerkatMachineInput::SurfaceStageReload { surface_id, now_ms },
+                    "ExternalToolSurfaceHandle::stage_reload",
+                ),
+            ExternalToolSurfaceInput::ApplyBoundary {
+                surface_id,
+                now_ms,
+                staged_intent_sequence,
+                applied_at_turn,
+            } => self.apply_input_with_effects(
+                mm_dsl::MeerkatMachineInput::SurfaceApplyBoundary {
+                    surface_id,
+                    now_ms,
+                    staged_intent_sequence,
+                    applied_at_turn,
+                },
+                "ExternalToolSurfaceHandle::apply_boundary",
+            ),
+            ExternalToolSurfaceInput::MarkPendingSucceeded {
+                surface_id,
+                pending_task_sequence,
+                staged_intent_sequence,
+            } => self.apply_input_with_effects(
+                mm_dsl::MeerkatMachineInput::SurfaceMarkPendingSucceeded {
+                    surface_id,
+                    pending_task_sequence,
+                    staged_intent_sequence,
+                },
+                "ExternalToolSurfaceHandle::mark_pending_succeeded",
+            ),
+            ExternalToolSurfaceInput::MarkPendingFailed {
+                surface_id,
+                pending_task_sequence,
+                staged_intent_sequence,
+                reason,
+            } => self.apply_input_with_effects(
+                mm_dsl::MeerkatMachineInput::SurfaceMarkPendingFailed {
+                    surface_id,
+                    pending_task_sequence,
+                    staged_intent_sequence,
+                    reason,
+                },
+                "ExternalToolSurfaceHandle::mark_pending_failed",
+            ),
+            ExternalToolSurfaceInput::CallStarted { surface_id } => self.apply_input_with_effects(
+                mm_dsl::MeerkatMachineInput::SurfaceCallStarted { surface_id },
+                "ExternalToolSurfaceHandle::call_started",
+            ),
+            ExternalToolSurfaceInput::CallFinished { surface_id } => self.apply_input_with_effects(
+                mm_dsl::MeerkatMachineInput::SurfaceCallFinished { surface_id },
+                "ExternalToolSurfaceHandle::call_finished",
+            ),
+            ExternalToolSurfaceInput::FinalizeRemovalClean { surface_id } => self
+                .apply_input_with_effects(
+                    mm_dsl::MeerkatMachineInput::SurfaceFinalizeRemovalClean { surface_id },
+                    "ExternalToolSurfaceHandle::finalize_removal_clean",
+                ),
+            ExternalToolSurfaceInput::FinalizeRemovalForced { surface_id } => self
+                .apply_input_with_effects(
+                    mm_dsl::MeerkatMachineInput::SurfaceFinalizeRemovalForced { surface_id },
+                    "ExternalToolSurfaceHandle::finalize_removal_forced",
+                ),
+            ExternalToolSurfaceInput::SnapshotAligned { epoch } => self.apply_input_with_effects(
+                mm_dsl::MeerkatMachineInput::SurfaceSnapshotAligned { epoch },
+                "ExternalToolSurfaceHandle::snapshot_aligned",
+            ),
+            ExternalToolSurfaceInput::Shutdown => self.apply_input_with_effects(
+                mm_dsl::MeerkatMachineInput::SurfaceShutdown,
+                "ExternalToolSurfaceHandle::shutdown_surface",
+            ),
+        }
+    }
+
     fn register(&self, surface_id: String) -> Result<(), DslTransitionError> {
         // intra-machine: no route; dispatcher not applicable (handle targets the meerkat DSL directly, not a CompositionDispatcher seam)
         self.dsl.apply_input(
@@ -122,14 +236,16 @@ impl ExternalToolSurfaceHandle for RuntimeExternalToolSurfaceHandle {
         &self,
         surface_id: String,
         now_ms: u64,
-        current_turn: u64,
+        staged_intent_sequence: u64,
+        applied_at_turn: u64,
     ) -> Result<(), DslTransitionError> {
         // intra-machine: no route; dispatcher not applicable (handle targets the meerkat DSL directly, not a CompositionDispatcher seam)
         self.dsl.apply_input(
             mm_dsl::MeerkatMachineInput::SurfaceApplyBoundary {
                 surface_id,
                 now_ms,
-                current_turn,
+                staged_intent_sequence,
+                applied_at_turn,
             },
             "ExternalToolSurfaceHandle::apply_boundary",
         )
@@ -155,11 +271,18 @@ impl ExternalToolSurfaceHandle for RuntimeExternalToolSurfaceHandle {
     fn mark_pending_failed(
         &self,
         surface_id: String,
+        pending_task_sequence: u64,
+        staged_intent_sequence: u64,
         reason: String,
     ) -> Result<(), DslTransitionError> {
         // intra-machine: no route; dispatcher not applicable (handle targets the meerkat DSL directly, not a CompositionDispatcher seam)
         self.dsl.apply_input(
-            mm_dsl::MeerkatMachineInput::SurfaceMarkPendingFailed { surface_id, reason },
+            mm_dsl::MeerkatMachineInput::SurfaceMarkPendingFailed {
+                surface_id,
+                pending_task_sequence,
+                staged_intent_sequence,
+                reason,
+            },
             "ExternalToolSurfaceHandle::mark_pending_failed",
         )
     }
@@ -317,5 +440,233 @@ fn map_staged_op(op: mm_dsl::SurfaceStagedOp) -> ExternalToolSurfaceStagedOp {
         mm_dsl::SurfaceStagedOp::Add => ExternalToolSurfaceStagedOp::Add,
         mm_dsl::SurfaceStagedOp::Remove => ExternalToolSurfaceStagedOp::Remove,
         mm_dsl::SurfaceStagedOp::Reload => ExternalToolSurfaceStagedOp::Reload,
+    }
+}
+
+fn map_surface_effect(
+    effect: mm_dsl::MeerkatMachineEffect,
+    _snapshot_epoch: u64,
+) -> Option<ExternalToolSurfaceEffect> {
+    match effect {
+        mm_dsl::MeerkatMachineEffect::ScheduleSurfaceCompletion {
+            surface_id,
+            operation,
+            pending_task_sequence,
+            staged_intent_sequence,
+            applied_at_turn,
+        } => Some(ExternalToolSurfaceEffect::ScheduleSurfaceCompletion {
+            surface_id,
+            operation: ExternalToolSurfaceDeltaOperation::from(operation),
+            pending_task_sequence,
+            staged_intent_sequence,
+            applied_at_turn,
+        }),
+        mm_dsl::MeerkatMachineEffect::RefreshVisibleSurfaceSet { snapshot_epoch } => {
+            Some(ExternalToolSurfaceEffect::RefreshVisibleSurfaceSet { snapshot_epoch })
+        }
+        mm_dsl::MeerkatMachineEffect::EmitExternalToolDelta {
+            surface_id,
+            operation,
+            phase,
+        } => Some(ExternalToolSurfaceEffect::EmitExternalToolDelta {
+            surface_id,
+            operation: ExternalToolSurfaceDeltaOperation::from(operation),
+            phase: ExternalToolSurfaceDeltaPhase::from(phase),
+        }),
+        mm_dsl::MeerkatMachineEffect::CloseSurfaceConnection { surface_id } => {
+            Some(ExternalToolSurfaceEffect::CloseSurfaceConnection { surface_id })
+        }
+        mm_dsl::MeerkatMachineEffect::RejectSurfaceCall { surface_id, reason } => {
+            Some(ExternalToolSurfaceEffect::RejectSurfaceCall { surface_id, reason })
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use super::*;
+
+    fn handle_in_phase(phase: mm_dsl::MeerkatPhase) -> RuntimeExternalToolSurfaceHandle {
+        let state = mm_dsl::MeerkatMachineState {
+            lifecycle_phase: phase,
+            ..Default::default()
+        };
+        let authority = mm_dsl::MeerkatMachineAuthority::from_state(state);
+        let shared = Arc::new(Mutex::new(authority));
+        RuntimeExternalToolSurfaceHandle::new(Arc::new(HandleDslAuthority::from_shared(shared)))
+    }
+
+    fn handle_with_active_surface(surface_id: &str) -> RuntimeExternalToolSurfaceHandle {
+        let mut state = mm_dsl::MeerkatMachineState {
+            lifecycle_phase: mm_dsl::MeerkatPhase::Attached,
+            ..Default::default()
+        };
+        state.known_surfaces.insert(surface_id.to_owned());
+        state.active_surfaces.insert(surface_id.to_owned());
+        state.surface_base_state.insert(
+            surface_id.to_owned(),
+            mm_dsl::ExternalToolSurfaceBaseState::Active,
+        );
+        let authority = mm_dsl::MeerkatMachineAuthority::from_state(state);
+        let shared = Arc::new(Mutex::new(authority));
+        RuntimeExternalToolSurfaceHandle::new(Arc::new(HandleDslAuthority::from_shared(shared)))
+    }
+
+    #[test]
+    fn staging_inputs_mint_sequences_and_project_snapshot() {
+        let handle = handle_in_phase(mm_dsl::MeerkatPhase::Attached);
+
+        handle.stage_add("alpha".to_owned(), 10).expect("stage add");
+        let add = handle.surface_snapshot("alpha").expect("add snapshot");
+        assert_eq!(add.staged_op, ExternalToolSurfaceStagedOp::Add);
+        assert_eq!(add.staged_intent_sequence, Some(1));
+        assert!(
+            handle
+                .diagnostic_snapshot()
+                .known_surfaces
+                .contains("alpha")
+        );
+
+        handle
+            .stage_remove("alpha".to_owned(), 20)
+            .expect("stage remove");
+        let remove = handle.surface_snapshot("alpha").expect("remove snapshot");
+        assert_eq!(remove.staged_op, ExternalToolSurfaceStagedOp::Remove);
+        assert_eq!(remove.staged_intent_sequence, Some(2));
+
+        handle.stage_add("beta".to_owned(), 30).expect("stage add");
+        let beta = handle.surface_snapshot("beta").expect("beta snapshot");
+        assert_eq!(beta.staged_op, ExternalToolSurfaceStagedOp::Add);
+        assert_eq!(beta.staged_intent_sequence, Some(3));
+    }
+
+    #[test]
+    fn staging_inputs_reject_after_surface_shutdown() {
+        let handle = handle_in_phase(mm_dsl::MeerkatPhase::Attached);
+
+        handle.shutdown_surface().expect("shutdown surface");
+
+        assert!(handle.stage_add("alpha".to_owned(), 10).is_err());
+        assert_eq!(
+            handle.diagnostic_snapshot().surface_phase,
+            ExternalToolSurfaceGlobalPhase::Shutdown
+        );
+    }
+
+    #[test]
+    fn stage_reload_requires_active_base_state() {
+        let handle = handle_in_phase(mm_dsl::MeerkatPhase::Attached);
+
+        assert!(handle.stage_reload("alpha".to_owned(), 10).is_err());
+        assert!(handle.surface_snapshot("alpha").is_none());
+    }
+
+    #[test]
+    fn stage_reload_mints_sequence_for_active_surface() {
+        let handle = handle_with_active_surface("alpha");
+
+        handle
+            .stage_reload("alpha".to_owned(), 10)
+            .expect("stage reload");
+
+        let snapshot = handle.surface_snapshot("alpha").expect("reload snapshot");
+        assert_eq!(
+            snapshot.base_state,
+            Some(ExternalToolSurfaceBaseState::Active)
+        );
+        assert_eq!(snapshot.staged_op, ExternalToolSurfaceStagedOp::Reload);
+        assert_eq!(snapshot.staged_intent_sequence, Some(1));
+    }
+
+    #[test]
+    fn runtime_surface_lifecycle_keeps_pending_lineage_on_staged_sequence() {
+        let handle = handle_in_phase(mm_dsl::MeerkatPhase::Attached);
+
+        assert!(handle.stage_reload("alpha".to_owned(), 10).is_err());
+
+        handle.stage_add("alpha".to_owned(), 10).expect("stage add");
+        let staged_add = handle.surface_snapshot("alpha").expect("staged add");
+        let add_lineage = staged_add
+            .staged_intent_sequence
+            .expect("staged add sequence");
+
+        assert!(
+            handle
+                .apply_boundary("alpha".to_owned(), 20, add_lineage + 1, 99)
+                .is_err(),
+            "apply boundary must reject a lineage that is not the staged intent"
+        );
+
+        handle
+            .apply_boundary("alpha".to_owned(), 20, add_lineage, 99)
+            .expect("apply add boundary");
+        let pending_add = handle.surface_snapshot("alpha").expect("pending add");
+        assert_eq!(pending_add.pending_op, ExternalToolSurfacePendingOp::Add);
+        assert_eq!(pending_add.pending_task_sequence, Some(1));
+        assert_eq!(pending_add.pending_lineage_sequence, Some(add_lineage));
+        assert_eq!(pending_add.staged_op, ExternalToolSurfaceStagedOp::None);
+
+        handle
+            .mark_pending_succeeded("alpha".to_owned(), 1, add_lineage)
+            .expect("add success");
+        let active = handle.surface_snapshot("alpha").expect("active alpha");
+        assert_eq!(
+            active.base_state,
+            Some(ExternalToolSurfaceBaseState::Active)
+        );
+        assert!(handle.visible_surfaces().contains("alpha"));
+
+        handle
+            .stage_reload("alpha".to_owned(), 30)
+            .expect("stage reload after active");
+        let staged_reload = handle.surface_snapshot("alpha").expect("staged reload");
+        let reload_lineage = staged_reload
+            .staged_intent_sequence
+            .expect("staged reload sequence");
+        handle
+            .apply_boundary("alpha".to_owned(), 40, reload_lineage, 100)
+            .expect("apply reload boundary");
+        let pending_reload = handle.surface_snapshot("alpha").expect("pending reload");
+        assert_eq!(
+            pending_reload.pending_op,
+            ExternalToolSurfacePendingOp::Reload
+        );
+        assert_eq!(
+            pending_reload.pending_lineage_sequence,
+            Some(reload_lineage)
+        );
+        handle
+            .mark_pending_succeeded("alpha".to_owned(), 2, reload_lineage)
+            .expect("reload success");
+
+        handle
+            .stage_remove("alpha".to_owned(), 50)
+            .expect("stage remove");
+        let remove_lineage = handle
+            .surface_snapshot("alpha")
+            .and_then(|entry| entry.staged_intent_sequence)
+            .expect("staged remove sequence");
+        handle
+            .apply_boundary("alpha".to_owned(), 60, remove_lineage, 101)
+            .expect("apply remove boundary");
+        let removing = handle.surface_snapshot("alpha").expect("removing alpha");
+        assert_eq!(
+            removing.base_state,
+            Some(ExternalToolSurfaceBaseState::Removing)
+        );
+        assert!(!handle.visible_surfaces().contains("alpha"));
+
+        handle
+            .finalize_removal_clean("alpha".to_owned())
+            .expect("finalize removal");
+        let removed = handle.surface_snapshot("alpha").expect("removed alpha");
+        assert_eq!(
+            removed.base_state,
+            Some(ExternalToolSurfaceBaseState::Removed)
+        );
+        assert!(!handle.visible_surfaces().contains("alpha"));
     }
 }

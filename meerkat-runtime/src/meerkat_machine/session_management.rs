@@ -1,6 +1,54 @@
 use super::*;
 
 impl MeerkatMachine {
+    fn replay_recovered_runtime_phase_through_dsl_authority(
+        session_id: &SessionId,
+        dsl_authority: &Arc<std::sync::Mutex<super::dsl::MeerkatMachineAuthority>>,
+        recovered_phase: RuntimeState,
+    ) {
+        // Cold-restart: when `recover()` realizes a stored terminal runtime
+        // state on the driver, replay that fact through the DSL authority
+        // before publishing or attaching the session entry. The shell
+        // projection remains a persistence witness; it never directly seeds
+        // `authority.state`.
+        let authority_phase = {
+            let authority = dsl_authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            super::dsl_authority::runtime_phase_from_authority(&authority)
+        };
+        if recovered_phase == RuntimeState::Idle || recovered_phase == authority_phase {
+            return;
+        }
+
+        let input = match recovered_phase {
+            RuntimeState::Retired => Some(super::dsl::MeerkatMachineInput::Retire {
+                session_id: super::dsl::SessionId::from_domain(session_id),
+            }),
+            RuntimeState::Stopped => Some(super::dsl::MeerkatMachineInput::StopRuntimeExecutor),
+            RuntimeState::Destroyed => Some(super::dsl::MeerkatMachineInput::Destroy {
+                session_id: super::dsl::SessionId::from_domain(session_id),
+            }),
+            RuntimeState::Attached | RuntimeState::Running | RuntimeState::Initializing => None,
+            RuntimeState::Idle => None,
+        };
+        let Some(input) = input else {
+            return;
+        };
+
+        let mut authority = dsl_authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Err(err) = super::dsl::MeerkatMachineMutator::apply(&mut *authority, input) {
+            tracing::error!(
+                %session_id,
+                ?recovered_phase,
+                error = ?err,
+                "failed to replay recovered runtime phase through DSL authority"
+            );
+        }
+    }
+
     pub(super) async fn register_session_inner(&self, session_id: SessionId) {
         {
             let mut sessions = self.sessions.write().await;
@@ -26,43 +74,11 @@ impl MeerkatMachine {
             tracing::error!(%session_id, error = %err, "failed to recover runtime driver during registration");
             return;
         }
-        // Cold-restart: when `recover()` realizes a stored terminal runtime
-        // state on the driver, replay that fact through the DSL authority
-        // before publishing the session entry. The shell projection remains a
-        // persistence witness; it never directly seeds `authority.state`.
-        let recovered_phase = entry.as_driver().runtime_state();
-        let authority_phase = {
-            let authority = dsl_authority
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            super::dsl_authority::runtime_phase_from_authority(&authority)
-        };
-        if recovered_phase != RuntimeState::Idle && recovered_phase != authority_phase {
-            let mut authority = dsl_authority
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let input = match recovered_phase {
-                RuntimeState::Retired => Some(super::dsl::MeerkatMachineInput::Retire {
-                    session_id: super::dsl::SessionId::from_domain(&session_id),
-                }),
-                RuntimeState::Stopped => Some(super::dsl::MeerkatMachineInput::StopRuntimeExecutor),
-                RuntimeState::Destroyed => Some(super::dsl::MeerkatMachineInput::Destroy {
-                    session_id: super::dsl::SessionId::from_domain(&session_id),
-                }),
-                RuntimeState::Attached | RuntimeState::Running | RuntimeState::Initializing => None,
-                RuntimeState::Idle => None,
-            };
-            if let Some(input) = input
-                && let Err(err) = super::dsl::MeerkatMachineMutator::apply(&mut *authority, input)
-            {
-                tracing::error!(
-                    %session_id,
-                    ?recovered_phase,
-                    error = ?err,
-                    "failed to replay recovered runtime phase through DSL authority"
-                );
-            }
-        }
+        Self::replay_recovered_runtime_phase_through_dsl_authority(
+            &session_id,
+            &dsl_authority,
+            entry.as_driver().runtime_state(),
+        );
         let control_projection = entry.control_projection_handle();
 
         let (ops_lifecycle, epoch_id, cursor_state) =
@@ -221,6 +237,11 @@ impl MeerkatMachine {
                     );
                     return;
                 }
+                Self::replay_recovered_runtime_phase_through_dsl_authority(
+                    &session_id,
+                    &dsl_authority,
+                    recovered_entry.as_driver().runtime_state(),
+                );
 
                 // Recover ops state OUTSIDE the sessions lock to avoid blocking
                 // other adapter operations behind potentially slow disk I/O.

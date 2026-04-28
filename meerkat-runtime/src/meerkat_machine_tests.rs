@@ -12871,6 +12871,7 @@ struct RuntimeParityProbeReport {
 #[derive(Debug, Serialize)]
 struct RuntimeParityRowReport {
     input_variant: String,
+    probe_required: bool,
     static_schema_classification: RuntimeParityClassification,
     static_schema_left: Vec<RuntimeParitySchemaTransitionSummary>,
     static_schema_right: Vec<RuntimeParitySchemaTransitionSummary>,
@@ -12885,6 +12886,7 @@ struct RuntimeParityPairSummary {
     aligned_rows: usize,
     mismatched_rows: usize,
     unprobed_rows: usize,
+    surface_only_unprobed_rows: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -12903,6 +12905,7 @@ struct RuntimeParityAuditSummary {
     aligned_rows: usize,
     mismatched_rows: usize,
     unprobed_rows: usize,
+    surface_only_unprobed_rows: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -14129,10 +14132,37 @@ async fn modeled_meerkat_accept_with_completion_attached_steer_matches_runtime()
             ("request_immediate_processing", KernelValue::Bool(true)),
             ("interrupt_yielding", KernelValue::Bool(false)),
             ("wake_if_idle", KernelValue::Bool(false)),
+        ],
+    );
+    let accept_outcome = GeneratedMachineKernel::new(modeled_meerkat_kernel::schema())
+        .transition(&runtime_modeled_kernel_state(&schema, &before), &input)
+        .expect("modeled AcceptWithCompletion should succeed");
+    let prepare_input = modeled_kernel_input(
+        "Prepare",
+        [
+            (
+                "session_id",
+                runtime_modeled_named_string(runtime_modeled_session_value(&before)),
+            ),
             ("run_id", runtime_modeled_run_id_value()),
         ],
     );
-    assert_modeled_meerkat_transition_matches_runtime_after(&schema, &before, &input, &after);
+    let prepare_outcome = GeneratedMachineKernel::new(modeled_meerkat_kernel::schema())
+        .transition(&accept_outcome.next_state, &prepare_input)
+        .expect("modeled Prepare should succeed after attached AcceptWithCompletion");
+    let schema_after =
+        runtime_modeled_summary_from_kernel_state(&schema, &prepare_outcome.next_state, &before)
+            .expect("modeled AcceptWithCompletion+Prepare should produce a schema summary");
+    let runtime_after = runtime_modeled_summary_from_runtime_snapshot(Some(&after))
+        .expect("runtime attached steer should produce a runtime summary");
+    assert_eq!(
+        runtime_after.phase, schema_after.phase,
+        "modeled phase should match runtime phase after AcceptWithCompletion+Prepare"
+    );
+    assert_eq!(
+        runtime_after.formal_fields, schema_after.formal_fields,
+        "modeled formal fields should match runtime fields after AcceptWithCompletion+Prepare"
+    );
     assert_modeled_meerkat_post_admission_signal_matches_runtime(
         &schema,
         &before,
@@ -14188,7 +14218,6 @@ async fn modeled_meerkat_accept_with_completion_idle_queue_signal_matches_runtim
             ("request_immediate_processing", KernelValue::Bool(false)),
             ("interrupt_yielding", KernelValue::Bool(false)),
             ("wake_if_idle", KernelValue::Bool(false)),
-            ("run_id", runtime_modeled_run_id_value()),
         ],
     );
     assert_modeled_meerkat_transition_matches_runtime_after(&schema, &before, &input, &after);
@@ -14394,7 +14423,6 @@ async fn modeled_meerkat_accept_with_completion_running_steer_signal_matches_run
             ("request_immediate_processing", KernelValue::Bool(true)),
             ("interrupt_yielding", KernelValue::Bool(false)),
             ("wake_if_idle", KernelValue::Bool(false)),
-            ("run_id", runtime_modeled_run_id_value()),
         ],
     );
     assert_modeled_meerkat_transition_matches_runtime_after(&schema, &before, &input, &after);
@@ -14506,7 +14534,6 @@ async fn modeled_meerkat_accept_with_completion_running_interrupt_signal_matches
             ("request_immediate_processing", KernelValue::Bool(false)),
             ("interrupt_yielding", KernelValue::Bool(true)),
             ("wake_if_idle", KernelValue::Bool(false)),
-            ("run_id", runtime_modeled_run_id_value()),
         ],
     );
     assert_modeled_meerkat_transition_matches_runtime_after(&schema, &before, &input, &after);
@@ -15560,8 +15587,14 @@ async fn build_runtime_parity_pair_report(
     include_same_surface_rows: bool,
 ) -> RuntimeParityPairReport {
     let mut rows = Vec::new();
+    let surface_only_inputs = static_schema
+        .surface_only_inputs
+        .iter()
+        .map(|v| v.as_str())
+        .collect::<BTreeSet<_>>();
 
     for schema_row in runtime_parity_schema_rows_for_pair(static_schema, left_phase, right_phase) {
+        let probe_required = !surface_only_inputs.contains(schema_row.input_variant.as_str());
         let probe =
             runtime_parity_probe_for_input_variant(&schema_row.input_variant).map(|probe_input| {
                 Box::pin(probe_runtime_parity_row(
@@ -15592,11 +15625,16 @@ async fn build_runtime_parity_pair_report(
                 ))
             }
             Some(_) => None,
-            None => Some("no runtime probe implemented".to_string()),
+            None if probe_required => Some(
+                "required runtime probe missing; non-surface-only omissions fail closed"
+                    .to_string(),
+            ),
+            None => Some("surface-only input: runtime probe not required".to_string()),
         };
 
         rows.push(RuntimeParityRowReport {
             input_variant: schema_row.input_variant,
+            probe_required,
             static_schema_classification: schema_row.classification,
             static_schema_left: schema_row.left,
             static_schema_right: schema_row.right,
@@ -15620,7 +15658,8 @@ async fn build_runtime_parity_pair_report(
                         summary.mismatched_rows += 1;
                     }
                 }
-                None => summary.unprobed_rows += 1,
+                None if row.probe_required => summary.unprobed_rows += 1,
+                None => summary.surface_only_unprobed_rows += 1,
             }
             summary
         },
@@ -15666,6 +15705,7 @@ async fn write_runtime_parity_audit_report(
             summary.aligned_rows += pair.summary.aligned_rows;
             summary.mismatched_rows += pair.summary.mismatched_rows;
             summary.unprobed_rows += pair.summary.unprobed_rows;
+            summary.surface_only_unprobed_rows += pair.summary.surface_only_unprobed_rows;
             summary
         },
     );
@@ -15682,6 +15722,12 @@ async fn write_runtime_parity_audit_report(
         serde_json::to_vec_pretty(&report).expect("serialize runtime parity report"),
     )
     .expect("write runtime parity report");
+    assert_eq!(
+        report.summary.unprobed_rows,
+        0,
+        "MeerkatMachine runtime parity report has required non-surface-only inputs without probes; report written to {}",
+        path.display()
+    );
 
     report
 }
@@ -15718,13 +15764,17 @@ async fn write_runtime_modeled_state_audit_report(path: PathBuf) -> RuntimeModel
                         outcome_kind: RuntimeModeledStateOutcomeKind::Err,
                         before: None,
                         after: None,
-                        result_summary: "no runtime probe implemented".to_string(),
+                        result_summary:
+                            "required runtime probe missing; non-surface-only omissions fail closed"
+                                .to_string(),
                         surface_summary: None,
                     },
                     schema: RuntimeModeledStateSchemaReport {
                         outcome_kind: RuntimeModeledStateOutcomeKind::Err,
                         after: None,
-                        detail: "no runtime probe implemented".to_string(),
+                        detail:
+                            "required runtime probe missing; non-surface-only omissions fail closed"
+                                .to_string(),
                         result_summary: None,
                     },
                 });
@@ -15755,7 +15805,9 @@ async fn write_runtime_modeled_state_audit_report(path: PathBuf) -> RuntimeModel
         RuntimeModeledStateAuditSummary::default(),
         |mut summary, row| {
             summary.row_count += 1;
-            if row.runtime.result_summary == "no runtime probe implemented" {
+            if row.runtime.result_summary
+                == "required runtime probe missing; non-surface-only omissions fail closed"
+            {
                 summary.unprobed_rows += 1;
             } else if row.aligned {
                 summary.aligned_rows += 1;
@@ -15778,6 +15830,12 @@ async fn write_runtime_modeled_state_audit_report(path: PathBuf) -> RuntimeModel
         serde_json::to_vec_pretty(&report).expect("serialize modeled-state audit report"),
     )
     .expect("write modeled-state audit report");
+    assert_eq!(
+        report.summary.unprobed_rows,
+        0,
+        "MeerkatMachine modeled-state parity report has required non-surface-only inputs without probes; report written to {}",
+        path.display()
+    );
 
     report
 }
@@ -15787,9 +15845,8 @@ async fn write_runtime_modeled_state_audit_report(path: PathBuf) -> RuntimeModel
 // ---------------------------------------------------------------------------
 
 /// Two concurrent Retire commands on the same session must serialize: the
-/// first succeeds, and the second fails because the session is already
-/// Retired. Without the mutation gate they could both read Idle and both
-/// attempt the transition.
+/// first stages the DSL transition, and the second observes the
+/// DSL-authoritative Retired phase and completes idempotently.
 #[tokio::test]
 async fn concurrent_retire_serializes_via_mutation_gate() {
     let adapter = Arc::new(MeerkatMachine::ephemeral());
@@ -15822,18 +15879,18 @@ async fn concurrent_retire_serializes_via_mutation_gate() {
     let result_a = result_a.expect("task a should not panic");
     let result_b = result_b.expect("task b should not panic");
 
-    // Exactly one should succeed and one should fail (the order is
-    // non-deterministic due to task scheduling).
+    // Both command calls should succeed. The mutation gate still matters:
+    // it ensures only one call stages the non-self-looping Retire DSL input.
     let successes = [&result_a, &result_b].iter().filter(|r| r.is_ok()).count();
     let failures = [&result_a, &result_b].iter().filter(|r| r.is_err()).count();
 
     assert_eq!(
-        successes, 1,
-        "exactly one concurrent Retire should succeed, got: a={result_a:?}, b={result_b:?}"
+        successes, 2,
+        "both concurrent Retire commands should succeed idempotently, got: a={result_a:?}, b={result_b:?}"
     );
     assert_eq!(
-        failures, 1,
-        "exactly one concurrent Retire should fail, got: a={result_a:?}, b={result_b:?}"
+        failures, 0,
+        "no concurrent Retire command should fail idempotence, got: a={result_a:?}, b={result_b:?}"
     );
 
     // Verify the session is in Retired state after both commands complete.
@@ -15847,12 +15904,11 @@ async fn concurrent_retire_serializes_via_mutation_gate() {
     );
 }
 
-/// After a failed realization step (driver mutation), restore_session_dsl_state
-/// must roll back the DSL authority to the exact pre-command state. Verify
-/// that a Destroy command on a session that is already Destroyed fails and
-/// leaves the DSL phase unchanged.
+/// Once the DSL-authoritative session phase is Retired, another command-level
+/// retire should succeed idempotently without restaging the raw DSL Retire
+/// transition.
 #[tokio::test]
-async fn rollback_restores_dsl_state_on_realization_failure() {
+async fn retire_runtime_is_idempotent_from_retired() {
     let adapter = Arc::new(MeerkatMachine::ephemeral());
     let session_id = SessionId::new();
     adapter.register_session(session_id.clone()).await;
@@ -15889,26 +15945,24 @@ async fn rollback_restores_dsl_state_on_realization_failure() {
         .expect("runtime state");
     assert_eq!(state, RuntimeState::Retired);
 
-    // Attempt a second Retire from Retired → should fail because Retire is
-    // not a valid transition from Retired. The DSL authority should reject
-    // it and the state should remain Retired (not corrupted).
-    let result =
-        <MeerkatMachine as SessionServiceRuntimeExt>::retire_runtime(&adapter, &session_id).await;
-    assert!(
-        result.is_err(),
-        "Retire from Retired should fail, got: {result:?}"
-    );
+    // Attempt a second Retire from Retired. The command path should be
+    // idempotent without staging the non-self-looping DSL Retire input again.
+    let report =
+        <MeerkatMachine as SessionServiceRuntimeExt>::retire_runtime(&adapter, &session_id)
+            .await
+            .expect("retire from Retired should succeed idempotently");
+    assert_eq!(report.inputs_abandoned, 0);
+    assert_eq!(report.inputs_pending_drain, 0);
 
-    // Verify state is still Retired — the failed command did not corrupt the
-    // DSL authority.
-    let state_after_failed =
+    // Verify state is still Retired.
+    let state_after_idempotent =
         <MeerkatMachine as SessionServiceRuntimeExt>::runtime_state(&adapter, &session_id)
             .await
-            .expect("runtime state after failed retire");
+            .expect("runtime state after idempotent retire");
     assert_eq!(
-        state_after_failed,
+        state_after_idempotent,
         RuntimeState::Retired,
-        "DSL state should be unchanged after a failed Retire command"
+        "DSL state should be unchanged after an idempotent Retire command"
     );
 }
 

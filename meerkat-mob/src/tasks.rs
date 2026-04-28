@@ -93,13 +93,24 @@ impl MobTaskBoardService {
         description: String,
         blocked_by: Vec<TaskId>,
     ) -> Result<TaskId, MobError> {
+        let task_id = TaskId::from(uuid::Uuid::new_v4().to_string());
+        self.create_task_with_id(task_id, subject, description, blocked_by)
+            .await
+    }
+
+    pub async fn create_task_with_id(
+        &self,
+        task_id: TaskId,
+        subject: String,
+        description: String,
+        blocked_by: Vec<TaskId>,
+    ) -> Result<TaskId, MobError> {
         if subject.trim().is_empty() {
             return Err(MobError::Internal(
                 "task subject cannot be empty".to_string(),
             ));
         }
 
-        let task_id = TaskId::from(uuid::Uuid::new_v4().to_string());
         let appended = self
             .events
             .append(NewMobEvent {

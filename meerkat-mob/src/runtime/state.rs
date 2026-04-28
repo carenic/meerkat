@@ -129,6 +129,7 @@ pub(crate) struct MobDslT2Snapshot {
     >,
     pub pending_session_ingress_detach_runtime_ids:
         std::collections::BTreeSet<crate::machines::mob_machine::AgentRuntimeId>,
+    pub topology_epoch: u64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -232,7 +233,14 @@ pub(super) enum MobCommand {
     },
     ProjectMachineInput {
         input: Box<mob_dsl::MobMachineInput>,
-        reply_tx: oneshot::Sender<Result<(), MobError>>,
+        reply_tx: oneshot::Sender<Result<mob_dsl::MobMachineState, MobError>>,
+    },
+    PreviewMachineInput {
+        input: Box<mob_dsl::MobMachineInput>,
+        reply_tx: oneshot::Sender<Result<mob_dsl::MobMachineState, MobError>>,
+    },
+    QueryMachineState {
+        reply_tx: oneshot::Sender<mob_dsl::MobMachineState>,
     },
     ProjectMachineSignal {
         signal: mob_dsl::MobMachineSignal,
@@ -376,7 +384,7 @@ pub(super) enum MobCommand {
     },
     SetSpawnPolicy {
         policy: Option<Arc<dyn super::spawn_policy::SpawnPolicy>>,
-        reply_tx: oneshot::Sender<()>,
+        reply_tx: oneshot::Sender<Result<(), MobError>>,
     },
     Shutdown {
         reply_tx: oneshot::Sender<Result<(), MobError>>,

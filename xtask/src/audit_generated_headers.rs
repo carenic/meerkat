@@ -21,7 +21,8 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use meerkat_machine_schema::{
-    CompositionSchema, canonical_composition_schemas, compat_composition_schemas,
+    CompositionSchema, canonical_composition_schemas, canonical_machine_schemas,
+    compat_composition_schemas,
 };
 
 use crate::public_contracts::repo_root;
@@ -216,6 +217,16 @@ pub fn live_emit_paths() -> BTreeSet<PathBuf> {
         "meerkat-core/src/generated/terminal_surface_mapping.rs",
     ));
 
+    set.insert(PathBuf::from(
+        "meerkat-machine-kernels/src/generated/mod.rs",
+    ));
+    for machine in canonical_machine_schemas() {
+        set.insert(PathBuf::from(format!(
+            "meerkat-machine-kernels/src/generated/{}.rs",
+            machine_slug(machine.machine.as_str())
+        )));
+    }
+
     set
 }
 
@@ -225,6 +236,7 @@ fn default_scan_roots() -> Vec<&'static str> {
     // etc. Add more as new emit roots appear.
     vec![
         "meerkat-core/src/generated",
+        "meerkat-machine-kernels/src/generated",
         "meerkat-mob/src/generated",
         "meerkat-mcp/src/generated",
         "meerkat-runtime/src/generated",
@@ -277,6 +289,35 @@ pub fn render_findings(findings: &[AuditFinding]) -> String {
         "\nEvery `@generated` file must be written by xtask codegen; every codegen-emitted file must carry `@generated`.\n",
     );
     buf
+}
+
+fn machine_slug(machine_name: &str) -> String {
+    let trimmed = machine_name.strip_suffix("Machine").unwrap_or(machine_name);
+    to_snake_case(trimmed)
+}
+
+fn to_snake_case(value: &str) -> String {
+    let mut out = String::new();
+    let mut previous_is_sep = true;
+
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() {
+            if ch.is_ascii_uppercase() {
+                if !previous_is_sep {
+                    out.push('_');
+                }
+                out.push(ch.to_ascii_lowercase());
+            } else {
+                out.push(ch);
+            }
+            previous_is_sep = false;
+        } else if !previous_is_sep {
+            out.push('_');
+            previous_is_sep = true;
+        }
+    }
+
+    out.trim_matches('_').to_string()
 }
 
 #[cfg(test)]

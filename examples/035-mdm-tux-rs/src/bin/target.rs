@@ -1206,7 +1206,9 @@ async fn load_mcp_tools(data_dir: Option<&Path>) -> anyhow::Result<Option<McpRou
     let mut router = McpRouter::new();
     for s in &servers {
         eprintln!("[target]   - {}", s.server.name);
-        router.stage_add(s.server.clone());
+        router
+            .stage_add(s.server.clone())
+            .map_err(|e| anyhow::anyhow!("MCP stage: {e}"))?;
     }
     router
         .apply_staged()

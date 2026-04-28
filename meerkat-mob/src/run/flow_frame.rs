@@ -104,6 +104,28 @@ impl std::fmt::Display for NodeRunStatus {
     }
 }
 
+#[allow(non_camel_case_types)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum FrameTerminalStatus {
+    Completed,
+    Failed,
+    Canceled,
+}
+impl FrameTerminalStatus {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Completed => "Completed",
+            Self::Failed => "Failed",
+            Self::Canceled => "Canceled",
+        }
+    }
+}
+impl std::fmt::Display for FrameTerminalStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 pub trait Context {}
 pub struct EmptyContext;
 impl Context for EmptyContext {}
@@ -144,7 +166,7 @@ impl Default for State {
     }
 }
 
-pub mod inputs {
+pub(crate) mod inputs {
     use super::*;
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct StartRootFrame {
@@ -169,7 +191,10 @@ pub mod inputs {
         pub node_branches: std::collections::BTreeMap<FlowNodeId, Option<BranchId>>,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub struct AdmitNextReadyNode {}
+    pub struct AdmitNextReadyNode {
+        pub node_id: FlowNodeId,
+        pub ready_queue: Vec<FlowNodeId>,
+    }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct CompleteNode {
         pub node_id: FlowNodeId,
@@ -191,11 +216,13 @@ pub mod inputs {
         pub node_id: FlowNodeId,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-    pub struct SealFrame {}
+    pub struct SealFrame {
+        pub terminal_status: FrameTerminalStatus,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum Input {
+pub(crate) enum Input {
     StartRootFrame(inputs::StartRootFrame),
     StartBodyFrame(inputs::StartBodyFrame),
     AdmitNextReadyNode(inputs::AdmitNextReadyNode),
@@ -208,7 +235,7 @@ pub enum Input {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum InputKind {
+pub(crate) enum InputKind {
     StartRootFrame,
     StartBodyFrame,
     AdmitNextReadyNode,
@@ -343,13 +370,13 @@ pub struct Outcome {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum TransitionError {
+pub(crate) enum TransitionError {
     Refusal(TransitionRefusal),
     Kernel(KernelError),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum TransitionRefusal {
+pub(crate) enum TransitionRefusal {
     NoMatchingTransition {
         phase: Phase,
         trigger: TriggerDiscriminant,
@@ -363,7 +390,7 @@ pub enum TransitionRefusal {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub enum TriggerDiscriminant {
+pub(crate) enum TriggerDiscriminant {
     Input(InputKind),
 }
 
@@ -434,6 +461,7 @@ fn guard(transition_id: TransitionId, guard_id: GuardId) -> TransitionError {
     })
 }
 
+#[cfg(test)]
 fn is_terminal(status: NodeRunStatus) -> bool {
     matches!(
         status,
@@ -444,10 +472,42 @@ fn is_terminal(status: NodeRunStatus) -> bool {
     )
 }
 
+#[cfg(test)]
+fn terminal_status_from_node_projection(state: &State) -> Option<FrameTerminalStatus> {
+    if !state.ordered_nodes.iter().all(|node_id| {
+        state
+            .node_status
+            .get(node_id)
+            .copied()
+            .is_some_and(is_terminal)
+    }) {
+        return None;
+    }
+    if state
+        .node_status
+        .values()
+        .copied()
+        .any(|status| status == NodeRunStatus::Failed)
+    {
+        Some(FrameTerminalStatus::Failed)
+    } else if state
+        .node_status
+        .values()
+        .copied()
+        .any(|status| status == NodeRunStatus::Canceled)
+    {
+        Some(FrameTerminalStatus::Canceled)
+    } else {
+        Some(FrameTerminalStatus::Completed)
+    }
+}
+
+#[cfg(test)]
 fn dependency_satisfied(status: NodeRunStatus) -> bool {
     matches!(status, NodeRunStatus::Completed)
 }
 
+#[cfg(test)]
 fn dependency_terminal_failure(status: NodeRunStatus) -> bool {
     matches!(
         status,
@@ -455,6 +515,7 @@ fn dependency_terminal_failure(status: NodeRunStatus) -> bool {
     )
 }
 
+#[cfg(test)]
 fn refresh_ready_frontier(state: &mut State) {
     state.ready_queue.clear();
 
@@ -513,6 +574,7 @@ fn refresh_ready_frontier(state: &mut State) {
     }
 }
 
+#[cfg(test)]
 fn propagate_blocked_nodes(state: &mut State) {
     loop {
         let mut changed = false;
@@ -564,6 +626,7 @@ fn propagate_blocked_nodes(state: &mut State) {
     }
 }
 
+#[cfg(test)]
 fn apply_branch_winner(state: &mut State, winner_node: &FlowNodeId) {
     let Some(branch) = state
         .node_branches
@@ -594,6 +657,7 @@ fn apply_branch_winner(state: &mut State, winner_node: &FlowNodeId) {
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn start_frame_state(
     frame_id: FrameId,
@@ -637,6 +701,7 @@ fn start_frame_state(
     state
 }
 
+#[cfg(test)]
 fn admit_next_ready_node(mut state: State) -> Result<Outcome, TransitionError> {
     if state.phase != Phase::Running {
         return Err(refusal(&state.phase, InputKind::AdmitNextReadyNode));
@@ -671,6 +736,7 @@ fn admit_next_ready_node(mut state: State) -> Result<Outcome, TransitionError> {
     })
 }
 
+#[cfg(test)]
 fn apply_node_terminal(
     state: &State,
     node_id: FlowNodeId,
@@ -715,65 +781,54 @@ fn apply_node_terminal(
     })
 }
 
-fn seal_frame(state: &State) -> Result<Outcome, TransitionError> {
+#[cfg(test)]
+fn seal_frame(state: &State, payload: inputs::SealFrame) -> Result<Outcome, TransitionError> {
     if state.phase != Phase::Running {
         return Err(refusal(&state.phase, InputKind::SealFrame));
     }
-    if !state.ordered_nodes.iter().all(|node_id| {
-        state
-            .node_status
-            .get(node_id)
-            .copied()
-            .is_some_and(is_terminal)
-    }) {
+    if terminal_status_from_node_projection(state) != Some(payload.terminal_status) {
         return Err(guard(TransitionId::SealFrame, GuardId::Sealable));
     }
     let mut next_state = state.clone();
-    let has_failed = state
-        .node_status
-        .values()
-        .copied()
-        .any(|status| status == NodeRunStatus::Failed);
-    let has_canceled = state
-        .node_status
-        .values()
-        .copied()
-        .any(|status| status == NodeRunStatus::Canceled);
-    let effect = if has_failed {
-        next_state.phase = Phase::Failed;
-        match state.frame_scope {
-            FrameScope::Root => Effect::RootFrameFailed(effects::RootFrameFailed {
-                frame_id: state.frame_id.clone(),
-            }),
-            FrameScope::Body => Effect::BodyFrameFailed(effects::BodyFrameFailed {
-                frame_id: state.frame_id.clone(),
-                loop_instance_id: state.loop_instance_id.clone(),
-                iteration: state.iteration,
-            }),
+    let effect = match payload.terminal_status {
+        FrameTerminalStatus::Failed => {
+            next_state.phase = Phase::Failed;
+            match state.frame_scope {
+                FrameScope::Root => Effect::RootFrameFailed(effects::RootFrameFailed {
+                    frame_id: state.frame_id.clone(),
+                }),
+                FrameScope::Body => Effect::BodyFrameFailed(effects::BodyFrameFailed {
+                    frame_id: state.frame_id.clone(),
+                    loop_instance_id: state.loop_instance_id.clone(),
+                    iteration: state.iteration,
+                }),
+            }
         }
-    } else if has_canceled {
-        next_state.phase = Phase::Canceled;
-        match state.frame_scope {
-            FrameScope::Root => Effect::RootFrameCanceled(effects::RootFrameCanceled {
-                frame_id: state.frame_id.clone(),
-            }),
-            FrameScope::Body => Effect::BodyFrameCanceled(effects::BodyFrameCanceled {
-                frame_id: state.frame_id.clone(),
-                loop_instance_id: state.loop_instance_id.clone(),
-                iteration: state.iteration,
-            }),
+        FrameTerminalStatus::Canceled => {
+            next_state.phase = Phase::Canceled;
+            match state.frame_scope {
+                FrameScope::Root => Effect::RootFrameCanceled(effects::RootFrameCanceled {
+                    frame_id: state.frame_id.clone(),
+                }),
+                FrameScope::Body => Effect::BodyFrameCanceled(effects::BodyFrameCanceled {
+                    frame_id: state.frame_id.clone(),
+                    loop_instance_id: state.loop_instance_id.clone(),
+                    iteration: state.iteration,
+                }),
+            }
         }
-    } else {
-        next_state.phase = Phase::Completed;
-        match state.frame_scope {
-            FrameScope::Root => Effect::RootFrameCompleted(effects::RootFrameCompleted {
-                frame_id: state.frame_id.clone(),
-            }),
-            FrameScope::Body => Effect::BodyFrameCompleted(effects::BodyFrameCompleted {
-                frame_id: state.frame_id.clone(),
-                loop_instance_id: state.loop_instance_id.clone(),
-                iteration: state.iteration,
-            }),
+        FrameTerminalStatus::Completed => {
+            next_state.phase = Phase::Completed;
+            match state.frame_scope {
+                FrameScope::Root => Effect::RootFrameCompleted(effects::RootFrameCompleted {
+                    frame_id: state.frame_id.clone(),
+                }),
+                FrameScope::Body => Effect::BodyFrameCompleted(effects::BodyFrameCompleted {
+                    frame_id: state.frame_id.clone(),
+                    loop_instance_id: state.loop_instance_id.clone(),
+                    iteration: state.iteration,
+                }),
+            }
         }
     };
     Ok(Outcome {
@@ -783,7 +838,8 @@ fn seal_frame(state: &State) -> Result<Outcome, TransitionError> {
     })
 }
 
-pub fn transition<C: Context>(
+#[cfg(test)]
+pub(crate) fn transition<C: Context>(
     state: &State,
     input: Input,
     context: &C,
@@ -877,6 +933,6 @@ pub fn transition<C: Context>(
             NodeRunStatus::Canceled,
             TransitionId::CancelNode,
         ),
-        Input::SealFrame(_) => seal_frame(state),
+        Input::SealFrame(payload) => seal_frame(state, payload),
     }
 }

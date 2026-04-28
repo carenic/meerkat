@@ -506,8 +506,94 @@ pub struct SurfaceDiagnosticSnapshot {
     pub entries: Vec<SurfaceSnapshot>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalToolSurfaceInput {
+    StageAdd {
+        surface_id: String,
+        now_ms: u64,
+    },
+    StageRemove {
+        surface_id: String,
+        now_ms: u64,
+    },
+    StageReload {
+        surface_id: String,
+        now_ms: u64,
+    },
+    ApplyBoundary {
+        surface_id: String,
+        now_ms: u64,
+        staged_intent_sequence: u64,
+        applied_at_turn: u64,
+    },
+    MarkPendingSucceeded {
+        surface_id: String,
+        pending_task_sequence: u64,
+        staged_intent_sequence: u64,
+    },
+    MarkPendingFailed {
+        surface_id: String,
+        pending_task_sequence: u64,
+        staged_intent_sequence: u64,
+        reason: String,
+    },
+    CallStarted {
+        surface_id: String,
+    },
+    CallFinished {
+        surface_id: String,
+    },
+    FinalizeRemovalClean {
+        surface_id: String,
+    },
+    FinalizeRemovalForced {
+        surface_id: String,
+    },
+    SnapshotAligned {
+        epoch: u64,
+    },
+    Shutdown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExternalToolSurfaceEffect {
+    ScheduleSurfaceCompletion {
+        surface_id: String,
+        operation: ExternalToolSurfaceDeltaOperation,
+        pending_task_sequence: u64,
+        staged_intent_sequence: u64,
+        applied_at_turn: u64,
+    },
+    RefreshVisibleSurfaceSet {
+        snapshot_epoch: u64,
+    },
+    EmitExternalToolDelta {
+        surface_id: String,
+        operation: ExternalToolSurfaceDeltaOperation,
+        phase: ExternalToolSurfaceDeltaPhase,
+    },
+    CloseSurfaceConnection {
+        surface_id: String,
+    },
+    RejectSurfaceCall {
+        surface_id: String,
+        reason: String,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalToolSurfaceTransition {
+    pub phase: ExternalToolSurfaceGlobalPhase,
+    pub effects: Vec<ExternalToolSurfaceEffect>,
+}
+
 /// External tool surface lifecycle DSL handle.
 pub trait ExternalToolSurfaceHandle: Send + Sync {
+    fn apply_surface_input(
+        &self,
+        input: ExternalToolSurfaceInput,
+    ) -> Result<ExternalToolSurfaceTransition, DslTransitionError>;
+
     fn register(&self, surface_id: String) -> Result<(), DslTransitionError>;
 
     fn stage_add(&self, surface_id: String, now_ms: u64) -> Result<(), DslTransitionError>;
@@ -520,7 +606,8 @@ pub trait ExternalToolSurfaceHandle: Send + Sync {
         &self,
         surface_id: String,
         now_ms: u64,
-        current_turn: u64,
+        staged_intent_sequence: u64,
+        applied_at_turn: u64,
     ) -> Result<(), DslTransitionError>;
 
     fn mark_pending_succeeded(
@@ -533,6 +620,8 @@ pub trait ExternalToolSurfaceHandle: Send + Sync {
     fn mark_pending_failed(
         &self,
         surface_id: String,
+        pending_task_sequence: u64,
+        staged_intent_sequence: u64,
         reason: String,
     ) -> Result<(), DslTransitionError>;
 

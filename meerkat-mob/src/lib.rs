@@ -87,7 +87,22 @@ pub use ids::{
 };
 pub use launch::{BudgetSplitPolicy, ForkContext, MemberLaunchMode};
 #[doc(hidden)]
-pub use mob_machine::canonical_mob_machine_command_manifest;
+pub use mob_machine::{
+    MobMachineCatalogInput, MobMachineCommandClassification, MobMachineCommandClassificationRecord,
+    MobMachineCommandVariant, MobMachineRuntimeInternalClassificationRecord,
+    MobMachineRuntimeInternalReason, MobMachineShellMechanicReason,
+    canonical_mob_machine_command_classifications, canonical_mob_machine_command_manifest,
+    canonical_mob_machine_runtime_internal_classifications,
+    canonical_mob_machine_runtime_internal_manifest,
+};
+
+#[doc(hidden)]
+pub mod machine_schema_exports {
+    pub fn mob_machine_schema() -> meerkat_machine_schema::MachineSchema {
+        meerkat_machine_schema::catalog::dsl::mob_machine_schema_metadata()
+            .attach_to(crate::machines::mob_machine::MobMachineState::schema())
+    }
+}
 
 pub use profile::{Profile, ProfileBinding, ProfileSource, SpawnTooling, ToolConfig};
 pub use roster::{MemberState, MobMemberKickoffPhase, MobMemberKickoffSnapshot};
@@ -117,7 +132,6 @@ pub use runtime::{
     SpawnMemberSpec, SpawnPolicy, SpawnResult, SpawnSpec, SupervisorRotationReport,
     WorkDeliveryReceipt,
 };
-pub use runtime::{SchedulerGrant, pump_schedulers_to_exhaustion};
 pub use runtime_mode::MobRuntimeMode;
 pub use snapshot::ParentToolScopeSnapshot;
 pub use spec::SpecValidator;

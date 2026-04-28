@@ -2577,6 +2577,7 @@ dependencies = [
  "meerkat-comms",
  "meerkat-core",
  "meerkat-machine-kernels",
+ "meerkat-machine-schema",
  "meerkat-mob",
  "meerkat-mob-mcp",
  "meerkat-models",
@@ -2626,6 +2627,7 @@ dependencies = [
  "meerkat-machine-schema",
  "meerkat-mob",
  "meerkat-runtime",
+ "meerkat-schedule",
 ]
 
 [[package]]
@@ -2687,6 +2689,7 @@ dependencies = [
  "inventory",
  "meerkat-contracts",
  "meerkat-core",
+ "meerkat-runtime",
  "meerkat-skills",
  "reqwest",
  "rmcp",

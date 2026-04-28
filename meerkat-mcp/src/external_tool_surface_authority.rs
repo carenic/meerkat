@@ -1,15 +1,15 @@
-//! MTAS authority for the ExternalToolSurface machine.
+//! Compatibility projection for the retired standalone ExternalToolSurface path.
 //!
 //! This module provides typed enums and a sealed mutator trait that enforces
-//! all ExternalToolSurface state mutations flow through the machine authority.
-//! Handwritten shell code calls [`ExternalToolSurfaceAuthority::apply`] and
-//! executes returned effects; it cannot mutate canonical state directly.
-//! In `meerkat-mcp`, this remains the standalone/local owner path; runtime-
-//! backed router instances now use the shared surface handle as production
-//! owner and only preserve this authority for standalone behavior.
+//! all mutations of this projection flow through one encoded transition table.
+//! Production MCP router construction no longer uses this table for surface
+//! legality; normal flows route through the catalog-backed
+//! `RuntimeExternalToolSurfaceHandle` and generated MeerkatMachine DSL. This
+//! module remains as a compatibility/test fixture while old shell projections
+//! are unwound.
 //!
-//! The transition table encoded here is the single source of truth, matching
-//! the machine schema in `meerkat-machine-schema/src/catalog/external_tool_surface.rs`:
+//! The transition table encoded here mirrors the surface lifecycle shape that
+//! used to be standalone-owned:
 //!
 //! - 2 global phases: Operating, Shutdown
 //! - 12 inputs: StageAdd, StageRemove, StageReload, ApplyBoundary,
@@ -185,6 +185,7 @@ pub enum ExternalToolSurfaceInput {
     },
     ApplyBoundary {
         surface_id: SurfaceId,
+        staged_intent_sequence: u64,
         applied_at_turn: TurnNumber,
     },
     PendingSucceeded {
@@ -411,11 +412,11 @@ mod sealed {
     pub trait Sealed {}
 }
 
-/// Sealed trait for ExternalToolSurface state mutation.
+/// Sealed trait for compatibility ExternalToolSurface projection mutation.
 ///
-/// Only [`ExternalToolSurfaceAuthority`] implements this. Handwritten code
-/// cannot create alternative implementations, ensuring single-source-of-truth
-/// semantics for lifecycle state.
+/// Only [`ExternalToolSurfaceAuthority`] implements this. Production semantic
+/// decisions live in the generated MeerkatMachine runtime handle; this trait is
+/// intentionally kept local to the compatibility projection.
 pub trait ExternalToolSurfaceMutator: sealed::Sealed {
     /// Apply a typed input to the current machine state.
     ///
@@ -431,10 +432,11 @@ pub trait ExternalToolSurfaceMutator: sealed::Sealed {
 // Authority implementation
 // ---------------------------------------------------------------------------
 
-/// The canonical authority for ExternalToolSurface state.
+/// Compatibility authority for the retired standalone ExternalToolSurface path.
 ///
-/// Holds the canonical global phase + per-surface field maps and delegates
-/// all transitions through the encoded transition table.
+/// Holds projection global phase + per-surface field maps and delegates
+/// mutations through the encoded transition table. Do not use this as a
+/// production surface legality owner.
 pub struct ExternalToolSurfaceAuthority {
     phase: ExternalToolSurfacePhase,
     fields: ExternalToolSurfaceFields,
@@ -763,18 +765,31 @@ impl ExternalToolSurfaceAuthority {
             // ----------------------------------------------------------
             ExternalToolSurfaceInput::ApplyBoundary {
                 surface_id,
+                staged_intent_sequence,
                 applied_at_turn,
             } => {
                 self.require_operating("ApplyBoundary")?;
                 let staged = self.fields.staged_op(surface_id);
                 let base = self.fields.surface_base(surface_id);
                 let pending = self.fields.pending_op(surface_id);
+                let expected_staged_intent_sequence =
+                    self.fields.staged_intent_sequence(surface_id);
 
                 if pending != PendingSurfaceOp::None {
                     return Err(ExternalToolSurfaceError {
                         input_name: "ApplyBoundary".into(),
                         reason: format!(
                             "cannot apply staged boundary for surface '{surface_id}' while pending operation {pending:?} is unresolved"
+                        ),
+                    });
+                }
+                if staged != StagedSurfaceOp::None
+                    && expected_staged_intent_sequence != *staged_intent_sequence
+                {
+                    return Err(ExternalToolSurfaceError {
+                        input_name: "ApplyBoundary".into(),
+                        reason: format!(
+                            "staged lineage mismatch for surface '{surface_id}': expected {expected_staged_intent_sequence}, got {staged_intent_sequence}"
                         ),
                     });
                 }
@@ -796,7 +811,7 @@ impl ExternalToolSurfaceAuthority {
                             });
                         }
                         fields.known_surfaces.insert(surface_id.clone());
-                        let staged_intent_sequence = self.fields.staged_intent_sequence(surface_id);
+                        let staged_intent_sequence = *staged_intent_sequence;
                         let pending_task_sequence = fields.next_pending_task_sequence;
                         fields.next_pending_task_sequence =
                             fields.next_pending_task_sequence.saturating_add(1);
@@ -852,7 +867,7 @@ impl ExternalToolSurfaceAuthority {
                             });
                         }
                         fields.known_surfaces.insert(surface_id.clone());
-                        let staged_intent_sequence = self.fields.staged_intent_sequence(surface_id);
+                        let staged_intent_sequence = *staged_intent_sequence;
                         let pending_task_sequence = fields.next_pending_task_sequence;
                         fields.next_pending_task_sequence =
                             fields.next_pending_task_sequence.saturating_add(1);
@@ -1889,6 +1904,27 @@ mod tests {
         }
     }
 
+    fn apply_boundary_input(
+        auth: &ExternalToolSurfaceAuthority,
+        surface_id: &SurfaceId,
+        applied_at_turn: u64,
+    ) -> ExternalToolSurfaceInput {
+        ExternalToolSurfaceInput::ApplyBoundary {
+            surface_id: surface_id.clone(),
+            staged_intent_sequence: auth.staged_intent_sequence(surface_id),
+            applied_at_turn: turn(applied_at_turn),
+        }
+    }
+
+    fn apply_boundary(
+        auth: &mut ExternalToolSurfaceAuthority,
+        surface_id: &SurfaceId,
+        applied_at_turn: u64,
+    ) -> Result<ExternalToolSurfaceTransition, ExternalToolSurfaceError> {
+        let input = apply_boundary_input(auth, surface_id, applied_at_turn);
+        auth.apply(input)
+    }
+
     /// Helper: stage add + apply boundary + pending succeeded -> Active.
     fn add_surface_active(auth: &mut ExternalToolSurfaceAuthority, id: &str, t: u64) {
         let sid = SurfaceId::from(id);
@@ -1896,11 +1932,7 @@ mod tests {
             surface_id: sid.clone(),
         })
         .expect("stage add");
-        auth.apply(ExternalToolSurfaceInput::ApplyBoundary {
-            surface_id: sid.clone(),
-            applied_at_turn: turn(t),
-        })
-        .expect("apply boundary add");
+        apply_boundary(auth, &sid, t).expect("apply boundary add");
         auth.apply(pending_succeeded_input(auth, id, t))
             .expect("pending succeeded");
     }
@@ -1964,12 +1996,7 @@ mod tests {
             surface_id: sid.clone(),
         })
         .expect("stage add");
-        let t = auth
-            .apply(ExternalToolSurfaceInput::ApplyBoundary {
-                surface_id: sid.clone(),
-                applied_at_turn: turn(5),
-            })
-            .expect("apply add");
+        let t = apply_boundary(&mut auth, &sid, 5).expect("apply add");
         assert_eq!(t.transition_name, "ApplyBoundaryAdd");
         assert!(t.effects.iter().any(|e| matches!(
             e,
@@ -1995,12 +2022,7 @@ mod tests {
             surface_id: sid.clone(),
         })
         .expect("stage remove");
-        let t = auth
-            .apply(ExternalToolSurfaceInput::ApplyBoundary {
-                surface_id: sid.clone(),
-                applied_at_turn: turn(2),
-            })
-            .expect("apply remove");
+        let t = apply_boundary(&mut auth, &sid, 2).expect("apply remove");
         assert_eq!(t.transition_name, "ApplyBoundaryRemoveDraining");
         assert!(!auth.is_visible(&sid));
         assert_eq!(auth.surface_base(&sid), SurfaceBaseState::Removing);
@@ -2018,12 +2040,7 @@ mod tests {
             surface_id: sid.clone(),
         })
         .expect("stage remove");
-        let t = auth
-            .apply(ExternalToolSurfaceInput::ApplyBoundary {
-                surface_id: sid.clone(),
-                applied_at_turn: turn(1),
-            })
-            .expect("apply remove noop");
+        let t = apply_boundary(&mut auth, &sid, 1).expect("apply remove noop");
         assert_eq!(t.transition_name, "ApplyBoundaryRemoveNoop");
         assert!(t.effects.is_empty());
     }
@@ -2037,12 +2054,7 @@ mod tests {
             surface_id: sid.clone(),
         })
         .expect("stage reload");
-        let t = auth
-            .apply(ExternalToolSurfaceInput::ApplyBoundary {
-                surface_id: sid.clone(),
-                applied_at_turn: turn(2),
-            })
-            .expect("apply reload");
+        let t = apply_boundary(&mut auth, &sid, 2).expect("apply reload");
         assert_eq!(t.transition_name, "ApplyBoundaryReload");
         assert_eq!(auth.pending_op(&sid), PendingSurfaceOp::Reload);
     }
@@ -2053,6 +2065,7 @@ mod tests {
         let sid = SurfaceId::from("alpha");
         let result = auth.apply(ExternalToolSurfaceInput::ApplyBoundary {
             surface_id: sid,
+            staged_intent_sequence: 0,
             applied_at_turn: turn(1),
         });
         assert!(result.is_err());
@@ -2068,11 +2081,7 @@ mod tests {
             surface_id: sid.clone(),
         })
         .expect("stage add");
-        auth.apply(ExternalToolSurfaceInput::ApplyBoundary {
-            surface_id: sid.clone(),
-            applied_at_turn: turn(5),
-        })
-        .expect("apply add");
+        apply_boundary(&mut auth, &sid, 5).expect("apply add");
         assert!(!auth.is_visible(&sid));
 
         let input = pending_succeeded_input(&auth, "alpha", 5);
@@ -2096,11 +2105,7 @@ mod tests {
             surface_id: sid.clone(),
         })
         .expect("stage reload");
-        auth.apply(ExternalToolSurfaceInput::ApplyBoundary {
-            surface_id: sid.clone(),
-            applied_at_turn: turn(2),
-        })
-        .expect("apply reload");
+        apply_boundary(&mut auth, &sid, 2).expect("apply reload");
         let input = pending_succeeded_input(&auth, "alpha", 2);
         let t = auth.apply(input).expect("reload succeeded");
         assert_eq!(t.transition_name, "PendingSucceededReload");
@@ -2115,11 +2120,7 @@ mod tests {
             surface_id: sid.clone(),
         })
         .expect("stage add");
-        auth.apply(ExternalToolSurfaceInput::ApplyBoundary {
-            surface_id: sid.clone(),
-            applied_at_turn: turn(5),
-        })
-        .expect("apply add");
+        apply_boundary(&mut auth, &sid, 5).expect("apply add");
         let input = pending_failed_input(&auth, "alpha", 5);
         let t = auth.apply(input).expect("pending failed");
         assert_eq!(t.transition_name, "PendingFailedAdd");
@@ -2140,11 +2141,7 @@ mod tests {
             surface_id: sid.clone(),
         })
         .expect("stage reload");
-        auth.apply(ExternalToolSurfaceInput::ApplyBoundary {
-            surface_id: sid.clone(),
-            applied_at_turn: turn(2),
-        })
-        .expect("apply reload");
+        apply_boundary(&mut auth, &sid, 2).expect("apply reload");
         let input = pending_failed_input(&auth, "alpha", 2);
         let t = auth.apply(input).expect("reload failed");
         assert_eq!(t.transition_name, "PendingFailedReload");
@@ -2175,18 +2172,15 @@ mod tests {
             surface_id: sid.clone(),
         })
         .expect("stage add");
-        auth.apply(ExternalToolSurfaceInput::ApplyBoundary {
-            surface_id: sid.clone(),
-            applied_at_turn: turn(1),
-        })
-        .expect("apply add");
+        apply_boundary(&mut auth, &sid, 1).expect("apply add");
         auth.apply(ExternalToolSurfaceInput::StageRemove {
             surface_id: sid.clone(),
         })
         .expect("stage remove");
 
         let result = auth.apply(ExternalToolSurfaceInput::ApplyBoundary {
-            surface_id: sid,
+            surface_id: sid.clone(),
+            staged_intent_sequence: auth.staged_intent_sequence(&sid),
             applied_at_turn: turn(2),
         });
         assert!(
@@ -2223,11 +2217,7 @@ mod tests {
             surface_id: sid.clone(),
         })
         .expect("stage remove");
-        auth.apply(ExternalToolSurfaceInput::ApplyBoundary {
-            surface_id: sid.clone(),
-            applied_at_turn: turn(2),
-        })
-        .expect("apply remove");
+        apply_boundary(&mut auth, &sid, 2).expect("apply remove");
         let t = auth
             .apply(ExternalToolSurfaceInput::CallStarted {
                 surface_id: sid.clone(),
@@ -2301,11 +2291,7 @@ mod tests {
             surface_id: sid.clone(),
         })
         .expect("stage remove");
-        auth.apply(ExternalToolSurfaceInput::ApplyBoundary {
-            surface_id: sid.clone(),
-            applied_at_turn: turn(2),
-        })
-        .expect("apply remove");
+        apply_boundary(&mut auth, &sid, 2).expect("apply remove");
         assert_eq!(auth.surface_base(&sid), SurfaceBaseState::Removing);
         let t = auth
             .apply(ExternalToolSurfaceInput::CallFinished {
@@ -2327,11 +2313,7 @@ mod tests {
             surface_id: sid.clone(),
         })
         .expect("stage remove");
-        auth.apply(ExternalToolSurfaceInput::ApplyBoundary {
-            surface_id: sid.clone(),
-            applied_at_turn: turn(2),
-        })
-        .expect("apply remove");
+        apply_boundary(&mut auth, &sid, 2).expect("apply remove");
         let t = auth
             .apply(ExternalToolSurfaceInput::FinalizeRemovalClean {
                 surface_id: sid.clone(),
@@ -2365,11 +2347,7 @@ mod tests {
             surface_id: sid.clone(),
         })
         .expect("stage remove");
-        auth.apply(ExternalToolSurfaceInput::ApplyBoundary {
-            surface_id: sid.clone(),
-            applied_at_turn: turn(2),
-        })
-        .expect("apply remove");
+        apply_boundary(&mut auth, &sid, 2).expect("apply remove");
         let result = auth.apply(ExternalToolSurfaceInput::FinalizeRemovalClean {
             surface_id: sid,
             applied_at_turn: turn(2),
@@ -2390,11 +2368,7 @@ mod tests {
             surface_id: sid.clone(),
         })
         .expect("stage remove");
-        auth.apply(ExternalToolSurfaceInput::ApplyBoundary {
-            surface_id: sid.clone(),
-            applied_at_turn: turn(2),
-        })
-        .expect("apply remove");
+        apply_boundary(&mut auth, &sid, 2).expect("apply remove");
         let t = auth
             .apply(ExternalToolSurfaceInput::FinalizeRemovalForced {
                 surface_id: sid.clone(),
@@ -2480,12 +2454,7 @@ mod tests {
         .expect("stage add");
 
         // 2. Apply boundary -> pending
-        let t = auth
-            .apply(ExternalToolSurfaceInput::ApplyBoundary {
-                surface_id: sid.clone(),
-                applied_at_turn: turn(1),
-            })
-            .expect("apply add");
+        let t = apply_boundary(&mut auth, &sid, 1).expect("apply add");
         assert_eq!(t.transition_name, "ApplyBoundaryAdd");
 
         // 3. Pending succeeds -> active
@@ -2512,11 +2481,7 @@ mod tests {
         .expect("stage remove");
 
         // 6. Apply boundary -> draining
-        auth.apply(ExternalToolSurfaceInput::ApplyBoundary {
-            surface_id: sid.clone(),
-            applied_at_turn: turn(2),
-        })
-        .expect("apply remove");
+        apply_boundary(&mut auth, &sid, 2).expect("apply remove");
         assert_eq!(auth.surface_base(&sid), SurfaceBaseState::Removing);
         assert!(!auth.is_visible(&sid));
 
@@ -2569,11 +2534,7 @@ mod tests {
             surface_id: sid.clone(),
         })
         .expect("stage remove");
-        auth.apply(ExternalToolSurfaceInput::ApplyBoundary {
-            surface_id: sid.clone(),
-            applied_at_turn: turn(2),
-        })
-        .expect("apply remove");
+        apply_boundary(&mut auth, &sid, 2).expect("apply remove");
         auth.apply(ExternalToolSurfaceInput::FinalizeRemovalClean {
             surface_id: sid.clone(),
             applied_at_turn: turn(2),
@@ -2586,11 +2547,7 @@ mod tests {
             surface_id: sid.clone(),
         })
         .expect("re-stage add");
-        auth.apply(ExternalToolSurfaceInput::ApplyBoundary {
-            surface_id: sid.clone(),
-            applied_at_turn: turn(3),
-        })
-        .expect("re-apply add");
+        apply_boundary(&mut auth, &sid, 3).expect("re-apply add");
         let input = pending_succeeded_input(&auth, "alpha", 3);
         auth.apply(input).expect("re-pending succeeded");
         assert!(auth.is_visible(&sid));
@@ -2607,11 +2564,7 @@ mod tests {
             surface_id: sid.clone(),
         })
         .expect("stage add");
-        auth.apply(ExternalToolSurfaceInput::ApplyBoundary {
-            surface_id: sid.clone(),
-            applied_at_turn: turn(1),
-        })
-        .expect("apply add");
+        apply_boundary(&mut auth, &sid, 1).expect("apply add");
         assert_eq!(auth.pending_count(), 1);
 
         let input = pending_succeeded_input(&auth, "alpha", 1);

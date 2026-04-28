@@ -8,7 +8,7 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `MeerkatMachine`
 
 ### Code Anchors
-- `meerkat_machine`: `meerkat-runtime/src/meerkat_machine/mod.rs` — authoritative MeerkatMachine command dispatch and state ownership for initialize, register, unregister, reconfigure, stage filters and tools, prepare bindings, drain, interrupt, cancel boundary, cancellation, abort, wait, ingest, publish event, accept input, classify envelope, append/context starts, run preparation, commit, fail, pending/call/finalize tool surface, retire/retired, reset, stop/stopped executor, destroy/destroyed, ensure executor, runtime notice, silent intents, recycle, realtime binding, MCP server, interaction stream, product turn, live topology, ingress, supervisor, trust reconcile, ops barrier, local endpoint, admission, completion, compaction, submit op event, notify op watcher, collect/enqueue, terminal records, model routing status, set model routing baseline, finite switch turn, until changed switch turn, assistant turn admission, image operation begin activate complete restore, routing approval, routing denial, scoped override, and persistent reconfigure
+- `meerkat_machine`: `meerkat-runtime/src/meerkat_machine/mod.rs` — authoritative MeerkatMachine command dispatch and state ownership for initialize, recover initializing, register, unregister, reconfigure, stage filters and tools, prepare bindings, drain, interrupt, cancel boundary, cancellation, abort, wait, ingest, publish event, accept input, recover input lifecycle, classify envelope, append/context starts, run preparation, primitive applied conversation/immediate, enter extraction, extraction validation passed/failed retry/exhausted, recoverable/fatal failure, retry requested, budget exhausted, steer accepted, increment attempt count, rollback staged, consume on accept, commit, fail, pending/call/finalize tool surface, retire/retired, reset, stop/stopped executor, destroy/destroyed, ensure executor, runtime notice, silent intents, recycle, realtime binding, MCP server, interaction stream, product turn, live topology, ingress, supervisor, trust reconcile, ops barrier, local endpoint, admission, completion, compaction, submit op event, progress reported op, terminate op, notify op watcher, collect/enqueue, terminal records, model routing status, set model routing baseline, finite switch turn, until changed switch turn, assistant turn admission, image operation begin activate complete restore, routing approval, routing denial, scoped override, sync visibility revisions, and persistent reconfigure
 - `meerkat_public_surface`: `meerkat/src/meerkat_machine.rs` — MeerkatMachine snapshot/diagnostic facade
 - `peer_directory_reachability_authority`: `meerkat-comms/src/peer_directory_reachability_authority.rs` — peer directory reachability state now owned as a MeerkatMachine-internal region
 
@@ -18,8 +18,8 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `staged_visibility_apply` — tool visibility staged state promotes into the committed visible revision at a boundary
 - `turn_interrupt_and_shutdown` — running work records interrupt and shutdown intent without escaping the Meerkat authority boundary
 - `peer_reachability_probe` — resolved peer directory updates and send outcomes mutate Meerkat-owned peer reachability state
-- `session_registration_and_binding` — initialize, register, unregister, reconfigure session identity, prepare bindings, ensure executor, attach session ingress, detach ingress, drain exit, and runtime bound/retired/destroyed notices
-- `input_admission_and_queueing` — ingest and publish event, accept input with or without completion, classify external envelope or plain event, prepare run work, enqueue classified entry, resolve admission, submit admitted ingress effect, post admission signal, and input or ingress notices
+- `session_registration_and_binding` — initialize, recover initializing, register, unregister, reconfigure session identity, prepare bindings, ensure executor, attach session ingress, detach ingress, drain exit, and runtime bound/retired/destroyed notices
+- `input_admission_and_queueing` — ingest and publish event, accept input with or without completion, classify external envelope or plain event, prepare run work, primitive applied conversation or immediate, enter extraction, extraction validation passed, recoverable or fatal failure, budget exhausted, steer accepted, increment attempt count, consume on accept, enqueue classified entry, resolve admission, submit admitted ingress effect, post admission signal, and input or ingress notices
 - `ops_completion_and_waiters` — abort, wait, abort all, request cancellation at boundary, completion produced/resolved, wait all satisfied, collect completed result, submit op event, notify op watcher, reject surface call, retain or evict completed terminal records
 - `realtime_connection_projection` — project realtime intent, begin replace detach binding, require reattach, publish signal, reconnect progress, MCP server connect/connected/failed/disconnected/reload, advance session context, interaction stream reserved/attached/completed/expired/closed early, freshness, policy, and binding rotation
 - `product_turn_streaming` — product turn in flight, committed, output started, interrupted, terminal, realtime projection advance/refreshed/reset, client input submitted, mid turn activity, and turn terminated classification
@@ -372,7 +372,7 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - scenarios: `ops_completion_and_waiters`
 - `BoundaryAppliedPublish`
   - anchors: `meerkat_machine`
-  - scenarios: `bind-run-boundary-terminal`, `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `input_admission_and_queueing`, `ops_completion_and_waiters`, `realtime_connection_projection`, `live_topology_and_supervision`
+  - scenarios: `input_admission_and_queueing`
 - `PublishCommittedVisibleSetIdle`
   - anchors: `meerkat_machine`
   - scenarios: `staged_visibility_apply`, `product_turn_streaming`
@@ -403,24 +403,39 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `StopRuntimeExecutorRunning`
   - anchors: `meerkat_machine`
   - scenarios: `retire-reset-destroy`, `session_registration_and_binding`
+- `RuntimeExecutorExitedFromAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`, `recycle_and_compaction`
+- `RuntimeExecutorExitedFromRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`, `recycle_and_compaction`
+- `RuntimeExecutorExitedFromIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `recycle_and_compaction`
+- `RuntimeExecutorExitedFromRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`, `recycle_and_compaction`
+- `RuntimeExecutorExitedFromStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`, `recycle_and_compaction`
 - `Destroy`
   - anchors: `meerkat_machine`
   - scenarios: `retire-reset-destroy`, `session_registration_and_binding`
-- `RecoverInputLifecycleIdle`
+- `RecoverInitializing`
   - anchors: `meerkat_machine`
-  - scenarios: `input_admission_and_queueing`, `product_turn_streaming`, `recycle_and_compaction`
-- `RecoverInputLifecycleAttached`
+  - scenarios: `session_registration_and_binding`
+- `RecoverIdle`
   - anchors: `meerkat_machine`
-  - scenarios: `input_admission_and_queueing`, `realtime_connection_projection`, `product_turn_streaming`
-- `RecoverInputLifecycleRunning`
+  - scenarios: `session_registration_and_binding`, `input_admission_and_queueing`, `recycle_and_compaction`
+- `RecoverAttached`
   - anchors: `meerkat_machine`
-  - scenarios: `turn_interrupt_and_shutdown`, `input_admission_and_queueing`, `product_turn_streaming`
-- `RecoverInputLifecycleRetired`
+  - scenarios: `session_registration_and_binding`, `input_admission_and_queueing`, `realtime_connection_projection`
+- `RecoverRetired`
   - anchors: `meerkat_machine`
-  - scenarios: `session_registration_and_binding`, `input_admission_and_queueing`, `product_turn_streaming`, `recycle_and_compaction`
-- `RecoverInputLifecycleStopped`
+  - scenarios: `session_registration_and_binding`
+- `RecoverStopped`
   - anchors: `meerkat_machine`
-  - scenarios: `input_admission_and_queueing`, `product_turn_streaming`
+  - scenarios: `session_registration_and_binding`, `input_admission_and_queueing`
 - `EnsureSessionWithExecutorIdle`
   - anchors: `meerkat_machine`
   - scenarios: `session_registration_and_binding`
@@ -580,15 +595,237 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `DrainQueuedRunRetired`
   - anchors: `meerkat_machine`
   - scenarios: `session_registration_and_binding`
+- `StartConversationRunInitializing`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`, `input_admission_and_queueing`
 - `StartConversationRunAttached`
   - anchors: `meerkat_machine`
-  - scenarios: `bind-run-boundary-terminal`, `retire-reset-destroy`, `turn_interrupt_and_shutdown`, `session_registration_and_binding`, `input_admission_and_queueing`, `realtime_connection_projection`, `product_turn_streaming`, `recycle_and_compaction`
+  - scenarios: `input_admission_and_queueing`
+- `StartConversationRunRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `input_admission_and_queueing`
+- `StartImmediateAppendInitializing`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`, `input_admission_and_queueing`, `product_turn_streaming`
 - `StartImmediateAppendAttached`
   - anchors: `meerkat_machine`
-  - scenarios: `realtime_connection_projection`, `product_turn_streaming`
+  - scenarios: `input_admission_and_queueing`, `realtime_connection_projection`, `product_turn_streaming`
+- `StartImmediateAppendRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `input_admission_and_queueing`, `product_turn_streaming`
+- `StartImmediateContextInitializing`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`, `input_admission_and_queueing`, `realtime_connection_projection`, `product_turn_streaming`
 - `StartImmediateContextAttached`
   - anchors: `meerkat_machine`
   - scenarios: `realtime_connection_projection`
+- `StartImmediateContextRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `input_admission_and_queueing`, `realtime_connection_projection`, `product_turn_streaming`
+- `PrimitiveAppliedConversation`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `PrimitiveAppliedImmediate`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `LlmReturnedToolCallsPositive`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`
+- `LlmReturnedToolCallsZero`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`
+- `LlmReturnedTerminal`
+  - anchors: `meerkat_machine`
+  - scenarios: `bind-run-boundary-terminal`, `ops_completion_and_waiters`, `product_turn_streaming`, `model_routing_and_image_operation`
+- `RegisterPendingOps`
+  - anchors: `meerkat_machine`
+  - scenarios: `retire-reset-destroy`, `session_registration_and_binding`, `ops_completion_and_waiters`
+- `ToolCallsResolvedToCalling`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `peer_reachability_probe`, `ops_completion_and_waiters`
+- `ToolCallsResolvedToBoundary`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `peer_reachability_probe`, `ops_completion_and_waiters`
+- `OpsBarrierSatisfied`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `BoundaryContinue`
+  - anchors: `meerkat_machine`
+  - scenarios: `bind-run-boundary-terminal`, `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`
+- `BoundaryComplete`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `EnterExtraction`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `ExtractionStart`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`, `product_turn_streaming`
+- `ExtractionValidationPassed`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `ExtractionValidationFailedRetry`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `ExtractionValidationFailedExhausted`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `RecoverableFailure`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `FatalFailure`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `RetryRequested`
+  - anchors: `meerkat_machine`
+  - scenarios: `model_routing_and_image_operation`
+- `CancelNow`
+  - anchors: `meerkat_machine`, `peer_directory_reachability_authority`
+  - scenarios: `ops_completion_and_waiters`
+- `RequestCancelAfterBoundary`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `CancellationObserved`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `AcknowledgeTerminal`
+  - anchors: `meerkat_machine`
+  - scenarios: `bind-run-boundary-terminal`, `ops_completion_and_waiters`, `product_turn_streaming`, `model_routing_and_image_operation`
+- `TurnLimitReached`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `product_turn_streaming`, `model_routing_and_image_operation`
+- `BudgetExhausted`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `TimeBudgetExceeded`
+  - anchors: `meerkat_machine`
+  - scenarios: `bind-run-boundary-terminal`, `retire-reset-destroy`, `session_registration_and_binding`, `input_admission_and_queueing`, `realtime_connection_projection`, `product_turn_streaming`, `recycle_and_compaction`
+- `ForceCancelNoRun`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `RunCompleted`
+  - anchors: `meerkat_machine`
+  - scenarios: `recycle_and_compaction`
+- `RunFailed`
+  - anchors: `meerkat_machine`
+  - scenarios: `bind-run-boundary-terminal`, `retire-reset-destroy`, `turn_interrupt_and_shutdown`, `session_registration_and_binding`, `input_admission_and_queueing`, `realtime_connection_projection`, `recycle_and_compaction`
+- `RunCancelled`
+  - anchors: `meerkat_machine`
+  - scenarios: `bind-run-boundary-terminal`, `retire-reset-destroy`, `turn_interrupt_and_shutdown`, `session_registration_and_binding`, `input_admission_and_queueing`, `recycle_and_compaction`
+- `SurfaceRegisterAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`, `ops_completion_and_waiters`, `realtime_connection_projection`
+- `SurfaceRegisterRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `session_registration_and_binding`, `ops_completion_and_waiters`
+- `SurfaceStageAddAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `ops_completion_and_waiters`, `realtime_connection_projection`
+- `SurfaceStageAddRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`
+- `SurfaceStageRemoveAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `ops_completion_and_waiters`, `realtime_connection_projection`
+- `SurfaceStageRemoveRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`
+- `SurfaceStageReloadAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `realtime_connection_projection`
+- `SurfaceStageReloadRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`, `realtime_connection_projection`
+- `SurfaceApplyBoundaryAddAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `ops_completion_and_waiters`
+- `SurfaceApplyBoundaryAddRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`
+- `SurfaceApplyBoundaryReloadAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `ops_completion_and_waiters`, `realtime_connection_projection`
+- `SurfaceApplyBoundaryReloadRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`
+- `SurfaceApplyBoundaryRemoveDrainingAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `ops_completion_and_waiters`
+- `SurfaceApplyBoundaryRemoveDrainingRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`
+- `SurfaceApplyBoundaryRemoveNoopAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `ops_completion_and_waiters`
+- `SurfaceApplyBoundaryRemoveNoopRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`
+- `SurfaceMarkPendingSucceededAddAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`, `realtime_connection_projection`, `live_topology_and_supervision`
+- `SurfaceMarkPendingSucceededAddRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`, `live_topology_and_supervision`
+- `SurfaceMarkPendingSucceededReloadAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `realtime_connection_projection`
+- `SurfaceMarkPendingSucceededReloadRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`, `realtime_connection_projection`, `live_topology_and_supervision`
+- `SurfaceMarkPendingFailedAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `realtime_connection_projection`
+- `SurfaceMarkPendingFailedRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`, `realtime_connection_projection`, `live_topology_and_supervision`
+- `SurfaceCallStartedActiveAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `SurfaceCallStartedActiveRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `SurfaceCallStartedRejectRemovingAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `SurfaceCallStartedRejectRemovingRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `SurfaceCallStartedRejectUnavailableAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `SurfaceCallStartedRejectUnavailableRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `SurfaceCallFinishedAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `SurfaceCallFinishedRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `SurfaceFinalizeRemovalCleanAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`, `realtime_connection_projection`
+- `SurfaceFinalizeRemovalCleanRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`
+- `SurfaceFinalizeRemovalForcedAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`, `realtime_connection_projection`
+- `SurfaceFinalizeRemovalForcedRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`
+- `SurfaceSnapshotAlignedAttached`
+  - anchors: `meerkat_public_surface`
+  - scenarios: `ops_completion_and_waiters`, `realtime_connection_projection`
+- `SurfaceSnapshotAlignedRunning`
+  - anchors: `meerkat_public_surface`
+  - scenarios: `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`
+- `SurfaceShutdownAttached`
+  - anchors: `meerkat_machine`, `meerkat_public_surface`
+  - scenarios: `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`, `realtime_connection_projection`
+- `SurfaceShutdownRunning`
+  - anchors: `meerkat_machine`, `meerkat_public_surface`
+  - scenarios: `turn_interrupt_and_shutdown`
 - `CommitRunningToIdle`
   - anchors: `meerkat_machine`
   - scenarios: `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `product_turn_streaming`
@@ -600,91 +837,589 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - scenarios: `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `product_turn_streaming`
 - `FailRunningToIdle`
   - anchors: `meerkat_machine`
-  - scenarios: `turn_interrupt_and_shutdown`, `realtime_connection_projection`, `live_topology_and_supervision`
+  - scenarios: `turn_interrupt_and_shutdown`, `input_admission_and_queueing`, `realtime_connection_projection`, `live_topology_and_supervision`
 - `FailRunningToAttached`
   - anchors: `meerkat_machine`
-  - scenarios: `turn_interrupt_and_shutdown`, `realtime_connection_projection`, `live_topology_and_supervision`
+  - scenarios: `turn_interrupt_and_shutdown`, `input_admission_and_queueing`, `realtime_connection_projection`, `live_topology_and_supervision`
 - `FailRunningToRetired`
   - anchors: `meerkat_machine`
-  - scenarios: `turn_interrupt_and_shutdown`, `realtime_connection_projection`, `live_topology_and_supervision`
-- `StageAddAttached`
-  - anchors: `meerkat_machine`
-  - scenarios: `staged_visibility_apply`, `realtime_connection_projection`
-- `StageAddRunning`
-  - anchors: `meerkat_machine`
-  - scenarios: `staged_visibility_apply`, `turn_interrupt_and_shutdown`
-- `StageRemoveAttached`
-  - anchors: `meerkat_machine`
-  - scenarios: `staged_visibility_apply`, `realtime_connection_projection`
-- `StageRemoveRunning`
-  - anchors: `meerkat_machine`
-  - scenarios: `staged_visibility_apply`, `turn_interrupt_and_shutdown`
-- `StageReloadAttached`
-  - anchors: `meerkat_machine`
-  - scenarios: `realtime_connection_projection`
-- `StageReloadRunning`
-  - anchors: `meerkat_machine`
-  - scenarios: `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `realtime_connection_projection`
-- `ApplySurfaceBoundaryAttached`
-  - anchors: `meerkat_machine`
-  - scenarios: `staged_visibility_apply`, `ops_completion_and_waiters`
-- `ApplySurfaceBoundaryRunning`
-  - anchors: `meerkat_machine`
-  - scenarios: `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`
-- `PendingSucceededAttached`
-  - anchors: `meerkat_machine`
-  - scenarios: `realtime_connection_projection`
-- `PendingSucceededRunning`
-  - anchors: `meerkat_machine`
-  - scenarios: `turn_interrupt_and_shutdown`
-- `PendingFailedAttached`
-  - anchors: `meerkat_machine`
-  - scenarios: `realtime_connection_projection`
-- `PendingFailedRunning`
-  - anchors: `meerkat_machine`
-  - scenarios: `turn_interrupt_and_shutdown`, `realtime_connection_projection`
-- `CallStartedAttached`
-  - anchors: `meerkat_machine`
-  - scenarios: `ops_completion_and_waiters`, `realtime_connection_projection`, `product_turn_streaming`
-- `CallStartedRunning`
-  - anchors: `meerkat_machine`
-  - scenarios: `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`, `product_turn_streaming`
-- `CallFinishedAttached`
-  - anchors: `meerkat_machine`
-  - scenarios: `ops_completion_and_waiters`, `realtime_connection_projection`
-- `CallFinishedRunning`
-  - anchors: `meerkat_machine`
-  - scenarios: `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`
-- `FinalizeRemovalCleanAttached`
-  - anchors: `meerkat_machine`
-  - scenarios: `realtime_connection_projection`
-- `FinalizeRemovalCleanRunning`
-  - anchors: `meerkat_machine`
-  - scenarios: `turn_interrupt_and_shutdown`
-- `FinalizeRemovalForcedAttached`
-  - anchors: `meerkat_machine`
-  - scenarios: `realtime_connection_projection`
-- `FinalizeRemovalForcedRunning`
-  - anchors: `meerkat_machine`
-  - scenarios: `turn_interrupt_and_shutdown`
-- `SnapshotAlignedAttached`
-  - anchors: `meerkat_public_surface`
-  - scenarios: `realtime_connection_projection`
-- `SnapshotAlignedRunning`
-  - anchors: `meerkat_public_surface`
-  - scenarios: `turn_interrupt_and_shutdown`
-- `ShutdownSurfaceAttached`
-  - anchors: `meerkat_machine`, `meerkat_public_surface`
-  - scenarios: `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`, `realtime_connection_projection`
-- `ShutdownSurfaceRunning`
-  - anchors: `meerkat_machine`, `meerkat_public_surface`
-  - scenarios: `turn_interrupt_and_shutdown`
+  - scenarios: `turn_interrupt_and_shutdown`, `input_admission_and_queueing`, `realtime_connection_projection`, `live_topology_and_supervision`
 - `RecycleFromIdleOrRetired`
   - anchors: `meerkat_machine`
   - scenarios: `recycle_and_compaction`
 - `RecycleFromAttached`
   - anchors: `meerkat_machine`
   - scenarios: `recycle_and_compaction`
+- `RecoverInputLifecycleIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `RecoverInputLifecycleAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `RecoverInputLifecycleRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `RecoverInputLifecycleRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`, `input_admission_and_queueing`
+- `RecoverInputLifecycleStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `QueueAcceptedIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `QueueAcceptedAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `QueueAcceptedRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `QueueAcceptedRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `QueueAcceptedStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `SteerAcceptedIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `SteerAcceptedAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `SteerAcceptedRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `SteerAcceptedRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `SteerAcceptedStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `ChangeLaneIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `recycle_and_compaction`, `model_routing_and_image_operation`
+- `ChangeLaneAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `realtime_connection_projection`, `model_routing_and_image_operation`
+- `ChangeLaneRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `model_routing_and_image_operation`
+- `ChangeLaneRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`, `recycle_and_compaction`, `model_routing_and_image_operation`
+- `ChangeLaneStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `model_routing_and_image_operation`
+- `StageForRunIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `recycle_and_compaction`
+- `StageForRunAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `bind-run-boundary-terminal`, `retire-reset-destroy`, `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `session_registration_and_binding`, `input_admission_and_queueing`, `realtime_connection_projection`, `recycle_and_compaction`
+- `StageForRunRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`
+- `StageForRunRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`, `recycle_and_compaction`
+- `StageForRunStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `bind-run-boundary-terminal`, `retire-reset-destroy`, `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `session_registration_and_binding`, `input_admission_and_queueing`, `recycle_and_compaction`
+- `IncrementAttemptCountIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `IncrementAttemptCountAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `IncrementAttemptCountRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `IncrementAttemptCountRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `IncrementAttemptCountStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `RollbackStagedIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `recycle_and_compaction`
+- `RollbackStagedAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `realtime_connection_projection`
+- `RollbackStagedRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `turn_interrupt_and_shutdown`
+- `RollbackStagedRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `session_registration_and_binding`, `recycle_and_compaction`
+- `RollbackStagedStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`
+- `MarkAppliedIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`, `recycle_and_compaction`, `live_topology_and_supervision`
+- `MarkAppliedAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`, `realtime_connection_projection`, `live_topology_and_supervision`
+- `MarkAppliedRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `input_admission_and_queueing`, `live_topology_and_supervision`
+- `MarkAppliedRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`, `input_admission_and_queueing`, `recycle_and_compaction`, `live_topology_and_supervision`
+- `MarkAppliedStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`, `live_topology_and_supervision`
+- `MarkAppliedPendingConsumptionIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`, `recycle_and_compaction`, `live_topology_and_supervision`
+- `MarkAppliedPendingConsumptionAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`, `realtime_connection_projection`, `live_topology_and_supervision`
+- `MarkAppliedPendingConsumptionRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `input_admission_and_queueing`, `live_topology_and_supervision`
+- `MarkAppliedPendingConsumptionRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`, `input_admission_and_queueing`, `recycle_and_compaction`, `live_topology_and_supervision`
+- `MarkAppliedPendingConsumptionStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`, `live_topology_and_supervision`
+- `ConsumeOnAcceptIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`, `recycle_and_compaction`
+- `ConsumeOnAcceptAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`, `realtime_connection_projection`
+- `ConsumeOnAcceptRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `input_admission_and_queueing`
+- `ConsumeOnAcceptRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`, `input_admission_and_queueing`, `recycle_and_compaction`
+- `ConsumeOnAcceptStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `RecordBoundarySeqIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`, `recycle_and_compaction`
+- `RecordBoundarySeqAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`
+- `RecordBoundarySeqRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`
+- `RecordBoundarySeqRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`, `recycle_and_compaction`
+- `RecordBoundarySeqStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`
+- `ConsumeInputIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `ConsumeInputAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `ConsumeInputRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `ConsumeInputRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `ConsumeInputStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `SupersedeInputIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `retire-reset-destroy`, `input_admission_and_queueing`, `product_turn_streaming`, `recycle_and_compaction`
+- `SupersedeInputAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `retire-reset-destroy`, `input_admission_and_queueing`, `realtime_connection_projection`, `product_turn_streaming`
+- `SupersedeInputRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `retire-reset-destroy`, `turn_interrupt_and_shutdown`, `input_admission_and_queueing`, `product_turn_streaming`
+- `SupersedeInputRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `retire-reset-destroy`, `session_registration_and_binding`, `input_admission_and_queueing`, `product_turn_streaming`, `recycle_and_compaction`
+- `SupersedeInputStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `retire-reset-destroy`, `input_admission_and_queueing`, `product_turn_streaming`
+- `CoalesceInputIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`, `product_turn_streaming`, `recycle_and_compaction`
+- `CoalesceInputAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`, `realtime_connection_projection`, `product_turn_streaming`
+- `CoalesceInputRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `input_admission_and_queueing`, `product_turn_streaming`
+- `CoalesceInputRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`, `input_admission_and_queueing`, `product_turn_streaming`, `recycle_and_compaction`
+- `CoalesceInputStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`, `product_turn_streaming`
+- `AbandonInputIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`, `product_turn_streaming`, `recycle_and_compaction`
+- `AbandonInputAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`, `realtime_connection_projection`, `product_turn_streaming`
+- `AbandonInputRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `input_admission_and_queueing`, `product_turn_streaming`
+- `AbandonInputRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`, `input_admission_and_queueing`, `product_turn_streaming`, `recycle_and_compaction`
+- `AbandonInputStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`, `product_turn_streaming`
+- `RegisterOpIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`
+- `RegisterOpAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`
+- `RegisterOpRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`
+- `RegisterOpRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`
+- `RegisterOpStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`
+- `StartOpIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `product_turn_streaming`
+- `StartOpAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `product_turn_streaming`
+- `StartOpRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `product_turn_streaming`
+- `StartOpRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `product_turn_streaming`
+- `StartOpStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `product_turn_streaming`
+- `CompleteOpIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`, `realtime_connection_projection`, `recycle_and_compaction`, `model_routing_and_image_operation`, `live_topology_and_supervision`
+- `CompleteOpAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`, `realtime_connection_projection`, `recycle_and_compaction`, `model_routing_and_image_operation`, `live_topology_and_supervision`
+- `CompleteOpRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`, `realtime_connection_projection`, `recycle_and_compaction`, `model_routing_and_image_operation`, `live_topology_and_supervision`
+- `CompleteOpRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`, `realtime_connection_projection`, `recycle_and_compaction`, `model_routing_and_image_operation`, `live_topology_and_supervision`
+- `CompleteOpStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`, `realtime_connection_projection`, `recycle_and_compaction`, `model_routing_and_image_operation`, `live_topology_and_supervision`
+- `FailOpIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`, `realtime_connection_projection`, `live_topology_and_supervision`
+- `FailOpAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`, `realtime_connection_projection`, `live_topology_and_supervision`
+- `FailOpRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`, `realtime_connection_projection`, `live_topology_and_supervision`
+- `FailOpRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`, `realtime_connection_projection`, `live_topology_and_supervision`
+- `FailOpStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`, `realtime_connection_projection`, `live_topology_and_supervision`
+- `CancelOpIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `CancelOpAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `CancelOpRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `CancelOpRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `CancelOpStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `AbortOpIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`, `live_topology_and_supervision`
+- `AbortOpAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`, `live_topology_and_supervision`
+- `AbortOpRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`, `live_topology_and_supervision`
+- `AbortOpRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`, `live_topology_and_supervision`
+- `AbortOpStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`, `live_topology_and_supervision`
+- `PeerReadyOpIdle`
+  - anchors: `peer_directory_reachability_authority`
+  - scenarios: `peer_reachability_probe`, `recycle_and_compaction`
+- `PeerReadyOpAttached`
+  - anchors: `peer_directory_reachability_authority`
+  - scenarios: `peer_reachability_probe`, `recycle_and_compaction`
+- `PeerReadyOpRunning`
+  - anchors: `peer_directory_reachability_authority`
+  - scenarios: `peer_reachability_probe`, `recycle_and_compaction`
+- `PeerReadyOpRetired`
+  - anchors: `peer_directory_reachability_authority`
+  - scenarios: `peer_reachability_probe`, `recycle_and_compaction`
+- `PeerReadyOpStopped`
+  - anchors: `peer_directory_reachability_authority`
+  - scenarios: `peer_reachability_probe`, `recycle_and_compaction`
+- `ProgressReportedOpIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `realtime_connection_projection`
+- `ProgressReportedOpAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `realtime_connection_projection`
+- `ProgressReportedOpRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `realtime_connection_projection`
+- `ProgressReportedOpRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `realtime_connection_projection`
+- `ProgressReportedOpStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `realtime_connection_projection`
+- `RetireRequestedOpIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `retire-reset-destroy`, `session_registration_and_binding`, `recycle_and_compaction`, `model_routing_and_image_operation`
+- `RetireRequestedOpAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `retire-reset-destroy`, `session_registration_and_binding`, `recycle_and_compaction`, `model_routing_and_image_operation`
+- `RetireRequestedOpRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `retire-reset-destroy`, `session_registration_and_binding`, `recycle_and_compaction`, `model_routing_and_image_operation`
+- `RetireRequestedOpRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `retire-reset-destroy`, `session_registration_and_binding`, `recycle_and_compaction`, `model_routing_and_image_operation`
+- `RetireRequestedOpStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `retire-reset-destroy`, `session_registration_and_binding`, `recycle_and_compaction`, `model_routing_and_image_operation`
+- `RetireCompletedOpIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `recycle_and_compaction`
+- `RetireCompletedOpAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `recycle_and_compaction`
+- `RetireCompletedOpRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `recycle_and_compaction`
+- `RetireCompletedOpRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `recycle_and_compaction`
+- `RetireCompletedOpStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `recycle_and_compaction`
+- `TerminateOpIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `product_turn_streaming`
+- `TerminateOpAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `product_turn_streaming`
+- `TerminateOpRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `product_turn_streaming`
+- `TerminateOpRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `product_turn_streaming`
+- `TerminateOpStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `product_turn_streaming`
+- `RequestWaitAllIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `RequestWaitAllAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `RequestWaitAllRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `RequestWaitAllRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `RequestWaitAllStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `SatisfyWaitAllIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `SatisfyWaitAllAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `SatisfyWaitAllRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `SatisfyWaitAllRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `SatisfyWaitAllStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `CancelWaitAllIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `CancelWaitAllAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `CancelWaitAllRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `CancelWaitAllRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `CancelWaitAllStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `SpawnDrainIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`, `recycle_and_compaction`
+- `SpawnDrainAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`, `realtime_connection_projection`
+- `SpawnDrainRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `session_registration_and_binding`
+- `SpawnDrainRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`
+- `SpawnDrainStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`
+- `StopDrainIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `retire-reset-destroy`, `session_registration_and_binding`, `recycle_and_compaction`
+- `StopDrainAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `retire-reset-destroy`, `session_registration_and_binding`, `realtime_connection_projection`
+- `StopDrainRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `retire-reset-destroy`, `turn_interrupt_and_shutdown`, `session_registration_and_binding`
+- `StopDrainRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`
+- `StopDrainStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `retire-reset-destroy`, `session_registration_and_binding`
+- `DrainExitedCleanIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`, `recycle_and_compaction`
+- `DrainExitedCleanAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`, `realtime_connection_projection`
+- `DrainExitedCleanRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `session_registration_and_binding`
+- `DrainExitedCleanRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`
+- `DrainExitedCleanStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`
+- `DrainExitedRespawnableIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`, `recycle_and_compaction`
+- `DrainExitedRespawnableAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`, `realtime_connection_projection`
+- `DrainExitedRespawnableRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `session_registration_and_binding`
+- `DrainExitedRespawnableRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`
+- `DrainExitedRespawnableStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`
+- `StageVisibilityFilterIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`
+- `StageVisibilityFilterAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`
+- `StageVisibilityFilterRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`
+- `StageVisibilityFilterRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`
+- `StageVisibilityFilterStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`
+- `CommitVisibilityFilterIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`
+- `CommitVisibilityFilterAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`
+- `CommitVisibilityFilterRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`
+- `CommitVisibilityFilterRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`
+- `CommitVisibilityFilterStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`
+- `StageDeferredNamesIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `recycle_and_compaction`
+- `StageDeferredNamesAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `realtime_connection_projection`
+- `StageDeferredNamesRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `turn_interrupt_and_shutdown`
+- `StageDeferredNamesRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `session_registration_and_binding`, `recycle_and_compaction`
+- `StageDeferredNamesStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`
+- `CommitDeferredNamesIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `product_turn_streaming`, `recycle_and_compaction`
+- `CommitDeferredNamesAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `realtime_connection_projection`, `product_turn_streaming`
+- `CommitDeferredNamesRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `product_turn_streaming`
+- `CommitDeferredNamesRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `session_registration_and_binding`, `product_turn_streaming`, `recycle_and_compaction`
+- `CommitDeferredNamesStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `product_turn_streaming`
+- `SyncVisibilityRevisionsIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `recycle_and_compaction`, `live_topology_and_supervision`
+- `SyncVisibilityRevisionsAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `realtime_connection_projection`, `live_topology_and_supervision`
+- `SyncVisibilityRevisionsRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `turn_interrupt_and_shutdown`, `live_topology_and_supervision`
+- `SyncVisibilityRevisionsRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `session_registration_and_binding`, `recycle_and_compaction`, `live_topology_and_supervision`
+- `SyncVisibilityRevisionsStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `live_topology_and_supervision`
 - `ProjectRealtimeIntentIdle`
   - anchors: `meerkat_machine`
   - scenarios: `realtime_connection_projection`
@@ -820,6 +1555,111 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `ClearRealtimeReconnectProgressStopped`
   - anchors: `meerkat_machine`
   - scenarios: `realtime_connection_projection`
+- `BeginLiveTopologyReconfigureIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `BeginLiveTopologyReconfigureAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `BeginLiveTopologyReconfigureRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `BeginLiveTopologyReconfigureRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `BeginLiveTopologyReconfigureStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `MarkLiveTopologyDetachedIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `MarkLiveTopologyDetachedAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `MarkLiveTopologyDetachedRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `MarkLiveTopologyDetachedRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `MarkLiveTopologyDetachedStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `ApplyLiveTopologyIdentityIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `ApplyLiveTopologyIdentityAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `ApplyLiveTopologyIdentityRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `ApplyLiveTopologyIdentityRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `ApplyLiveTopologyIdentityStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `ApplyLiveTopologyVisibilityIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `ApplyLiveTopologyVisibilityAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `ApplyLiveTopologyVisibilityRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `ApplyLiveTopologyVisibilityRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `ApplyLiveTopologyVisibilityStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `CompleteLiveTopologyIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `CompleteLiveTopologyAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `CompleteLiveTopologyRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `CompleteLiveTopologyRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `CompleteLiveTopologyStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `AbortLiveTopologyBeforeDetachIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `AbortLiveTopologyBeforeDetachAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `AbortLiveTopologyBeforeDetachRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `AbortLiveTopologyBeforeDetachRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `AbortLiveTopologyBeforeDetachStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `FailLiveTopologyAfterDetachIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `FailLiveTopologyAfterDetachAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `FailLiveTopologyAfterDetachRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `FailLiveTopologyAfterDetachRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `FailLiveTopologyAfterDetachStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
 - `McpServerConnectPendingIdle`
   - anchors: `meerkat_machine`
   - scenarios: `realtime_connection_projection`
@@ -896,34 +1736,34 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: `meerkat_machine`
   - scenarios: `realtime_connection_projection`
 - `PeerRequestSentIdle`
-  - anchors: `peer_directory_reachability_authority`
+  - anchors: `meerkat_machine`, `peer_directory_reachability_authority`
   - scenarios: `peer_reachability_probe`, `ops_completion_and_waiters`, `recycle_and_compaction`, `model_routing_and_image_operation`
 - `PeerRequestSentAttached`
-  - anchors: `peer_directory_reachability_authority`
+  - anchors: `meerkat_machine`, `peer_directory_reachability_authority`
   - scenarios: `peer_reachability_probe`, `ops_completion_and_waiters`, `realtime_connection_projection`, `model_routing_and_image_operation`
 - `PeerRequestSentRunning`
-  - anchors: `peer_directory_reachability_authority`
+  - anchors: `meerkat_machine`, `peer_directory_reachability_authority`
   - scenarios: `turn_interrupt_and_shutdown`, `peer_reachability_probe`, `ops_completion_and_waiters`, `model_routing_and_image_operation`
 - `PeerRequestSentRetired`
-  - anchors: `meerkat_machine`, `peer_directory_reachability_authority`
+  - anchors: `meerkat_machine`
   - scenarios: `peer_reachability_probe`, `session_registration_and_binding`, `ops_completion_and_waiters`, `recycle_and_compaction`, `model_routing_and_image_operation`
 - `PeerRequestSentStopped`
-  - anchors: `meerkat_machine`, `peer_directory_reachability_authority`
+  - anchors: `meerkat_machine`
   - scenarios: `peer_reachability_probe`, `ops_completion_and_waiters`, `model_routing_and_image_operation`
 - `PeerResponseProgressArrivedIdle`
-  - anchors: `peer_directory_reachability_authority`
+  - anchors: `meerkat_machine`, `peer_directory_reachability_authority`
   - scenarios: `peer_reachability_probe`, `realtime_connection_projection`, `recycle_and_compaction`
 - `PeerResponseProgressArrivedAttached`
-  - anchors: `peer_directory_reachability_authority`
+  - anchors: `meerkat_machine`, `peer_directory_reachability_authority`
   - scenarios: `realtime_connection_projection`
 - `PeerResponseProgressArrivedRunning`
-  - anchors: `peer_directory_reachability_authority`
+  - anchors: `meerkat_machine`, `peer_directory_reachability_authority`
   - scenarios: `turn_interrupt_and_shutdown`, `peer_reachability_probe`, `realtime_connection_projection`
 - `PeerResponseProgressArrivedRetired`
-  - anchors: `meerkat_machine`, `peer_directory_reachability_authority`
+  - anchors: `meerkat_machine`
   - scenarios: `peer_reachability_probe`, `session_registration_and_binding`, `realtime_connection_projection`, `recycle_and_compaction`
 - `PeerResponseProgressArrivedStopped`
-  - anchors: `meerkat_machine`, `peer_directory_reachability_authority`
+  - anchors: `meerkat_machine`
   - scenarios: `peer_reachability_probe`, `realtime_connection_projection`
 - `PeerResponseTerminalArrivedCompletedIdle`
   - anchors: `meerkat_machine`, `peer_directory_reachability_authority`
@@ -941,13 +1781,13 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: `meerkat_machine`
   - scenarios: `ops_completion_and_waiters`
 - `PeerResponseTerminalArrivedFailedIdle`
-  - anchors: `meerkat_machine`, `peer_directory_reachability_authority`
+  - anchors: `meerkat_machine`
   - scenarios: `bind-run-boundary-terminal`, `peer_reachability_probe`, `ops_completion_and_waiters`, `realtime_connection_projection`, `product_turn_streaming`, `recycle_and_compaction`, `model_routing_and_image_operation`
 - `PeerResponseTerminalArrivedFailedAttached`
-  - anchors: `meerkat_machine`, `peer_directory_reachability_authority`
+  - anchors: `meerkat_machine`
   - scenarios: `realtime_connection_projection`
 - `PeerResponseTerminalArrivedFailedRunning`
-  - anchors: `meerkat_machine`, `peer_directory_reachability_authority`
+  - anchors: `meerkat_machine`
   - scenarios: `bind-run-boundary-terminal`, `turn_interrupt_and_shutdown`, `peer_reachability_probe`, `ops_completion_and_waiters`, `realtime_connection_projection`, `product_turn_streaming`, `model_routing_and_image_operation`
 - `PeerResponseTerminalArrivedFailedRetired`
   - anchors: `meerkat_machine`
@@ -956,13 +1796,13 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: `meerkat_machine`
   - scenarios: `bind-run-boundary-terminal`, `peer_reachability_probe`, `ops_completion_and_waiters`, `realtime_connection_projection`, `product_turn_streaming`, `model_routing_and_image_operation`
 - `PeerRequestTimedOutIdle`
-  - anchors: `meerkat_machine`, `peer_directory_reachability_authority`
+  - anchors: `meerkat_machine`
   - scenarios: `peer_reachability_probe`, `recycle_and_compaction`, `model_routing_and_image_operation`
 - `PeerRequestTimedOutAttached`
-  - anchors: `meerkat_machine`, `peer_directory_reachability_authority`
+  - anchors: `meerkat_machine`
   - scenarios: `peer_reachability_probe`, `model_routing_and_image_operation`
 - `PeerRequestTimedOutRunning`
-  - anchors: `meerkat_machine`, `peer_directory_reachability_authority`
+  - anchors: `meerkat_machine`
   - scenarios: `turn_interrupt_and_shutdown`, `peer_reachability_probe`, `model_routing_and_image_operation`
 - `PeerRequestTimedOutRetired`
   - anchors: `meerkat_machine`
@@ -971,19 +1811,19 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: `meerkat_machine`
   - scenarios: `peer_reachability_probe`, `model_routing_and_image_operation`
 - `PeerRequestReceivedIdle`
-  - anchors: `peer_directory_reachability_authority`
+  - anchors: `meerkat_machine`, `peer_directory_reachability_authority`
   - scenarios: `peer_reachability_probe`, `ops_completion_and_waiters`, `recycle_and_compaction`, `model_routing_and_image_operation`
 - `PeerRequestReceivedAttached`
-  - anchors: `peer_directory_reachability_authority`
+  - anchors: `meerkat_machine`, `peer_directory_reachability_authority`
   - scenarios: `peer_reachability_probe`, `ops_completion_and_waiters`, `realtime_connection_projection`, `model_routing_and_image_operation`
 - `PeerRequestReceivedRunning`
-  - anchors: `peer_directory_reachability_authority`
+  - anchors: `meerkat_machine`, `peer_directory_reachability_authority`
   - scenarios: `turn_interrupt_and_shutdown`, `peer_reachability_probe`, `ops_completion_and_waiters`, `model_routing_and_image_operation`
 - `PeerRequestReceivedRetired`
-  - anchors: `meerkat_machine`, `peer_directory_reachability_authority`
+  - anchors: `meerkat_machine`
   - scenarios: `peer_reachability_probe`, `session_registration_and_binding`, `ops_completion_and_waiters`, `recycle_and_compaction`, `model_routing_and_image_operation`
 - `PeerRequestReceivedStopped`
-  - anchors: `meerkat_machine`, `peer_directory_reachability_authority`
+  - anchors: `meerkat_machine`
   - scenarios: `peer_reachability_probe`, `ops_completion_and_waiters`, `model_routing_and_image_operation`
 - `PeerResponseRepliedIdle`
   - anchors: `peer_directory_reachability_authority`
@@ -1360,111 +2200,6 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `ClassifyRealtimeTurnTerminatedStopped`
   - anchors: `meerkat_machine`
   - scenarios: `product_turn_streaming`
-- `BeginLiveTopologyReconfigureIdle`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `BeginLiveTopologyReconfigureAttached`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `BeginLiveTopologyReconfigureRunning`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `BeginLiveTopologyReconfigureRetired`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `BeginLiveTopologyReconfigureStopped`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `MarkLiveTopologyDetachedIdle`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `MarkLiveTopologyDetachedAttached`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `MarkLiveTopologyDetachedRunning`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `MarkLiveTopologyDetachedRetired`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `MarkLiveTopologyDetachedStopped`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `ApplyLiveTopologyIdentityIdle`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `ApplyLiveTopologyIdentityAttached`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `ApplyLiveTopologyIdentityRunning`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `ApplyLiveTopologyIdentityRetired`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `ApplyLiveTopologyIdentityStopped`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `ApplyLiveTopologyVisibilityIdle`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `ApplyLiveTopologyVisibilityAttached`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `ApplyLiveTopologyVisibilityRunning`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `ApplyLiveTopologyVisibilityRetired`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `ApplyLiveTopologyVisibilityStopped`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `CompleteLiveTopologyIdle`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `CompleteLiveTopologyAttached`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `CompleteLiveTopologyRunning`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `CompleteLiveTopologyRetired`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `CompleteLiveTopologyStopped`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `AbortLiveTopologyBeforeDetachIdle`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `AbortLiveTopologyBeforeDetachAttached`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `AbortLiveTopologyBeforeDetachRunning`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `AbortLiveTopologyBeforeDetachRetired`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `AbortLiveTopologyBeforeDetachStopped`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `FailLiveTopologyAfterDetachIdle`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `FailLiveTopologyAfterDetachAttached`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `FailLiveTopologyAfterDetachRunning`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `FailLiveTopologyAfterDetachRetired`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `FailLiveTopologyAfterDetachStopped`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
 - `AttachSessionIngressIdle`
   - anchors: `meerkat_machine`
   - scenarios: `session_registration_and_binding`
@@ -1615,12 +2350,6 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `SupervisorTrustEdgeRevokeFailedStopped`
   - anchors: `meerkat_machine`
   - scenarios: `live_topology_and_supervision`
-- `OpsBarrierSatisfiedAttached`
-  - anchors: `meerkat_machine`
-  - scenarios: `ops_completion_and_waiters`
-- `OpsBarrierSatisfiedRunning`
-  - anchors: `meerkat_machine`
-  - scenarios: `ops_completion_and_waiters`
 - `PublishLocalEndpointIdle`
   - anchors: `meerkat_machine`
   - scenarios: `live_topology_and_supervision`
@@ -1677,6 +2406,24 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RuntimeDestroyed`
   - anchors: `meerkat_machine`
   - scenarios: `session_registration_and_binding`
+- `TurnRunStarted`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `product_turn_streaming`
+- `TurnBoundaryApplied`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`
+- `TurnRunCompleted`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `recycle_and_compaction`
+- `TurnRunFailed`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`
+- `TurnRunCancelled`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`
+- `TurnCheckCompaction`
+  - anchors: `meerkat_machine`
+  - scenarios: `recycle_and_compaction`
 - `RequestCancellationAtBoundary`
   - anchors: `meerkat_machine`
   - scenarios: `ops_completion_and_waiters`
@@ -1733,7 +2480,7 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - scenarios: `recycle_and_compaction`
 - `IngressAccepted`
   - anchors: `meerkat_machine`
-  - scenarios: `session_registration_and_binding`, `input_admission_and_queueing`
+  - scenarios: `input_admission_and_queueing`
 - `PostAdmissionSignal`
   - anchors: `meerkat_machine`
   - scenarios: `input_admission_and_queueing`
@@ -1751,7 +2498,7 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - scenarios: `session_registration_and_binding`, `input_admission_and_queueing`
 - `SilentIntentApplied`
   - anchors: `meerkat_machine`
-  - scenarios: `turn_interrupt_and_shutdown`, `realtime_connection_projection`
+  - scenarios: `turn_interrupt_and_shutdown`, `input_admission_and_queueing`, `realtime_connection_projection`
 - `CheckCompaction`
   - anchors: `meerkat_machine`
   - scenarios: `recycle_and_compaction`
@@ -1809,6 +2556,12 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RejectSurfaceCall`
   - anchors: `meerkat_machine`
   - scenarios: `ops_completion_and_waiters`
+- `PublishSupervisorTrustEdge`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
+- `RevokeSupervisorTrustEdge`
+  - anchors: `meerkat_machine`
+  - scenarios: `live_topology_and_supervision`
 - `RealtimeIntentProjected`
   - anchors: `meerkat_machine`
   - scenarios: `realtime_connection_projection`
@@ -1818,6 +2571,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RealtimeReconnectProgressProjected`
   - anchors: `meerkat_machine`
   - scenarios: `realtime_connection_projection`
+- `LiveTopologyPhaseChanged`
+  - anchors: `meerkat_machine`
+  - scenarios: `model_routing_and_image_operation`, `live_topology_and_supervision`
 - `McpServerStateChanged`
   - anchors: `meerkat_machine`
   - scenarios: `realtime_connection_projection`
@@ -1851,9 +2607,6 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RealtimeReconnectPolicyChanged`
   - anchors: `meerkat_machine`
   - scenarios: `realtime_connection_projection`
-- `LiveTopologyPhaseChanged`
-  - anchors: `meerkat_machine`
-  - scenarios: `model_routing_and_image_operation`, `live_topology_and_supervision`
 - `LocalEndpointChanged`
   - anchors: `meerkat_machine`
   - scenarios: `live_topology_and_supervision`
@@ -1861,12 +2614,6 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: `meerkat_machine`, `peer_directory_reachability_authority`
   - scenarios: `peer_reachability_probe`, `realtime_connection_projection`, `product_turn_streaming`, `model_routing_and_image_operation`
 - `CommsTrustReconcileRequested`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `PublishSupervisorTrustEdge`
-  - anchors: `meerkat_machine`
-  - scenarios: `live_topology_and_supervision`
-- `RevokeSupervisorTrustEdge`
   - anchors: `meerkat_machine`
   - scenarios: `live_topology_and_supervision`
 
@@ -1880,6 +2627,12 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `current_run_only_while_running_or_retired`
   - anchors: `meerkat_machine`
   - scenarios: `turn_interrupt_and_shutdown`, `session_registration_and_binding`, `recycle_and_compaction`
+- `staged_surface_ops_are_known_and_sequenced`
+  - anchors: `meerkat_machine`
+  - scenarios: `ops_completion_and_waiters`
+- `staged_reload_surfaces_are_active`
+  - anchors: `meerkat_machine`
+  - scenarios: `staged_visibility_apply`, `session_registration_and_binding`, `input_admission_and_queueing`, `realtime_connection_projection`
 - `realtime_binding_epoch_consistency`
   - anchors: `meerkat_machine`
   - scenarios: `realtime_connection_projection`

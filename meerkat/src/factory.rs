@@ -2638,6 +2638,7 @@ impl AgentFactory {
         // connection state into MeerkatMachine's `mcp_server_states`. Others
         // are no-ops.
         if let RuntimeBuildMode::SessionOwned(bindings) = resolved_mode {
+            tools.bind_external_tool_surface_handle(Arc::clone(&bindings.external_tool_surface));
             tools.bind_mcp_server_lifecycle_handle(Arc::clone(&bindings.mcp_server_lifecycle));
             // W1-A: install the peer-interaction DSL handle on the session's
             // comms runtime so outbound PeerRequest sends record into
