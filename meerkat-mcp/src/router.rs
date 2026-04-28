@@ -129,169 +129,6 @@ pub(crate) struct CompatExternalToolSurfaceHandle {
     authority: Mutex<ExternalToolSurfaceAuthority>,
 }
 
-#[cfg(not(test))]
-struct UnboundExternalToolSurfaceHandle {
-    removal_timeout: Duration,
-}
-
-#[cfg(not(test))]
-impl UnboundExternalToolSurfaceHandle {
-    fn new(removal_timeout: Duration) -> Self {
-        Self { removal_timeout }
-    }
-
-    fn reject(context: &'static str) -> DslTransitionError {
-        DslTransitionError::no_matching(
-            context,
-            "external tool surface lifecycle requires a runtime-owned MeerkatMachine handle",
-        )
-    }
-}
-
-#[cfg(not(test))]
-impl ExternalToolSurfaceHandle for UnboundExternalToolSurfaceHandle {
-    fn apply_surface_input(
-        &self,
-        _input: CoreSurfaceInput,
-    ) -> Result<CoreSurfaceTransition, DslTransitionError> {
-        Err(Self::reject(
-            "UnboundExternalToolSurfaceHandle::apply_surface_input",
-        ))
-    }
-
-    fn register(&self, _surface_id: String) -> Result<(), DslTransitionError> {
-        Err(Self::reject("UnboundExternalToolSurfaceHandle::register"))
-    }
-
-    fn stage_add(&self, _surface_id: String, _now_ms: u64) -> Result<(), DslTransitionError> {
-        Err(Self::reject("UnboundExternalToolSurfaceHandle::stage_add"))
-    }
-
-    fn stage_remove(&self, _surface_id: String, _now_ms: u64) -> Result<(), DslTransitionError> {
-        Err(Self::reject(
-            "UnboundExternalToolSurfaceHandle::stage_remove",
-        ))
-    }
-
-    fn stage_reload(&self, _surface_id: String, _now_ms: u64) -> Result<(), DslTransitionError> {
-        Err(Self::reject(
-            "UnboundExternalToolSurfaceHandle::stage_reload",
-        ))
-    }
-
-    fn apply_boundary(
-        &self,
-        _surface_id: String,
-        _now_ms: u64,
-        _staged_intent_sequence: u64,
-        _applied_at_turn: u64,
-    ) -> Result<(), DslTransitionError> {
-        Err(Self::reject(
-            "UnboundExternalToolSurfaceHandle::apply_boundary",
-        ))
-    }
-
-    fn mark_pending_succeeded(
-        &self,
-        _surface_id: String,
-        _pending_task_sequence: u64,
-        _staged_intent_sequence: u64,
-    ) -> Result<(), DslTransitionError> {
-        Err(Self::reject(
-            "UnboundExternalToolSurfaceHandle::mark_pending_succeeded",
-        ))
-    }
-
-    fn mark_pending_failed(
-        &self,
-        _surface_id: String,
-        _pending_task_sequence: u64,
-        _staged_intent_sequence: u64,
-        _reason: String,
-    ) -> Result<(), DslTransitionError> {
-        Err(Self::reject(
-            "UnboundExternalToolSurfaceHandle::mark_pending_failed",
-        ))
-    }
-
-    fn call_started(&self, _surface_id: String) -> Result<(), DslTransitionError> {
-        Err(Self::reject(
-            "UnboundExternalToolSurfaceHandle::call_started",
-        ))
-    }
-
-    fn call_finished(&self, _surface_id: String) -> Result<(), DslTransitionError> {
-        Err(Self::reject(
-            "UnboundExternalToolSurfaceHandle::call_finished",
-        ))
-    }
-
-    fn finalize_removal_clean(&self, _surface_id: String) -> Result<(), DslTransitionError> {
-        Err(Self::reject(
-            "UnboundExternalToolSurfaceHandle::finalize_removal_clean",
-        ))
-    }
-
-    fn finalize_removal_forced(&self, _surface_id: String) -> Result<(), DslTransitionError> {
-        Err(Self::reject(
-            "UnboundExternalToolSurfaceHandle::finalize_removal_forced",
-        ))
-    }
-
-    fn snapshot_aligned(&self, _epoch: u64) -> Result<(), DslTransitionError> {
-        Err(Self::reject(
-            "UnboundExternalToolSurfaceHandle::snapshot_aligned",
-        ))
-    }
-
-    fn shutdown_surface(&self) -> Result<(), DslTransitionError> {
-        Err(Self::reject(
-            "UnboundExternalToolSurfaceHandle::shutdown_surface",
-        ))
-    }
-
-    fn surface_snapshot(&self, _surface_id: &str) -> Option<SurfaceSnapshot> {
-        None
-    }
-
-    fn diagnostic_snapshot(&self) -> SurfaceDiagnosticSnapshot {
-        let _ = self.removal_timeout;
-        SurfaceDiagnosticSnapshot {
-            surface_phase: ExternalToolSurfaceGlobalPhase::Operating,
-            known_surfaces: BTreeSet::new(),
-            visible_surfaces: BTreeSet::new(),
-            snapshot_epoch: 0,
-            snapshot_aligned_epoch: 0,
-            has_pending_or_staged: false,
-            entries: Vec::new(),
-        }
-    }
-
-    fn visible_surfaces(&self) -> BTreeSet<String> {
-        BTreeSet::new()
-    }
-
-    fn removing_surfaces(&self) -> BTreeSet<String> {
-        BTreeSet::new()
-    }
-
-    fn pending_surfaces(&self) -> BTreeSet<String> {
-        BTreeSet::new()
-    }
-
-    fn has_pending_or_staged(&self) -> bool {
-        false
-    }
-
-    fn snapshot_epoch(&self) -> u64 {
-        0
-    }
-
-    fn snapshot_aligned_epoch(&self) -> u64 {
-        0
-    }
-}
-
 #[allow(dead_code)]
 impl CompatExternalToolSurfaceHandle {
     pub(crate) fn new(removal_timeout: Duration) -> Self {
@@ -1533,20 +1370,16 @@ impl McpRouter {
         self.with_lifecycle_handle(|handle| handle.apply_reload(server_name));
     }
 
-    /// Create a new empty router without a surface authority.
+    /// Create a new empty standalone router with a local surface authority.
     ///
     /// Production/session construction must bind a runtime-owned
     /// [`ExternalToolSurfaceHandle`] through [`Self::new_with_surface_handle`] or
-    /// late adapter binding before staging external-tool lifecycle operations.
-    /// Unit tests keep the retired compatibility handle behind `cfg(test)`.
+    /// late adapter binding when lifecycle state must be session-owned.
+    /// Standalone callers keep a local compatibility handle so lifecycle
+    /// operations work outside a `MeerkatMachine`.
     pub fn new() -> Self {
-        #[cfg(test)]
         let surface_handle: Arc<dyn ExternalToolSurfaceHandle> = Arc::new(
             CompatExternalToolSurfaceHandle::new(DEFAULT_REMOVAL_TIMEOUT),
-        );
-        #[cfg(not(test))]
-        let surface_handle: Arc<dyn ExternalToolSurfaceHandle> = Arc::new(
-            UnboundExternalToolSurfaceHandle::new(DEFAULT_REMOVAL_TIMEOUT),
         );
         Self::with_surface_owner(SurfaceOwner::runtime(
             surface_handle,
@@ -1564,12 +1397,8 @@ impl McpRouter {
 
     /// Create a new router with a custom remove-drain timeout.
     pub fn new_with_removal_timeout(removal_timeout: Duration) -> Self {
-        #[cfg(test)]
         let surface_handle: Arc<dyn ExternalToolSurfaceHandle> =
             Arc::new(CompatExternalToolSurfaceHandle::new(removal_timeout));
-        #[cfg(not(test))]
-        let surface_handle: Arc<dyn ExternalToolSurfaceHandle> =
-            Arc::new(UnboundExternalToolSurfaceHandle::new(removal_timeout));
         Self::with_surface_owner(SurfaceOwner::runtime(surface_handle, removal_timeout))
     }
 

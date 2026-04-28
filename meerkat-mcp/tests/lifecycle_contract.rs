@@ -67,6 +67,26 @@ fn has_action(
     })
 }
 
+#[test]
+#[allow(clippy::expect_used)]
+fn standalone_default_router_accepts_surface_stage_add() {
+    let mut router = McpRouter::new();
+
+    router
+        .stage_add(invalid_server_config("standalone-stage-add"))
+        .expect("standalone router should accept staged MCP lifecycle input");
+
+    let snapshot = router.external_tool_surface_snapshot();
+    assert_eq!(snapshot.entries.len(), 1);
+
+    let entry = &snapshot.entries[0];
+    assert_eq!(entry.surface_id, "standalone-stage-add");
+    assert_eq!(
+        entry.staged_op,
+        meerkat_core::ExternalToolSurfaceStagedOp::Add
+    );
+}
+
 #[allow(clippy::expect_used, clippy::unwrap_used)]
 async fn wait_for_adapter_action(
     adapter: &McpRouterAdapter,
