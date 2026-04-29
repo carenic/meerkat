@@ -8,7 +8,7 @@
 //! - Creates a `SimpleMemoryStore` (in-memory keyword-matching implementation)
 //! - Wraps it in a `MemorySearchDispatcher` to expose the `memory_search` tool
 //! - Composes the memory tool into the agent's tool dispatcher via `ToolGatewayBuilder`
-//! - Wires the memory store into the `AgentBuilder` so compaction can index into it
+//! - Wires the memory store into the `CoreAgentBuilder` so compaction can index into it
 //! - Pre-seeds the memory store with facts (simulating prior compaction indexing)
 //! - Asks the agent to recall those facts using the `memory_search` tool
 //!
@@ -25,7 +25,7 @@
 
 use std::sync::Arc;
 
-use meerkat::{AgentBuilder, AgentFactory, AnthropicClient, ToolGatewayBuilder};
+use meerkat::{AgentFactory, AnthropicClient, CoreAgentBuilder, ToolGatewayBuilder};
 use meerkat_core::memory::{
     MemoryIndexRequest, MemoryIndexScope, MemoryMetadata, MemoryStore as _,
 };
@@ -120,12 +120,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Step 5: Build the agent with memory wired in ─────────────────────────
     //
     // Two things are wired:
-    //   1. `.memory_store()` on AgentBuilder -- so the agent loop can index
+    //   1. `.memory_store()` on CoreAgentBuilder -- so the agent loop can index
     //      discarded messages during compaction
     //   2. The ToolGateway containing MemorySearchDispatcher -- so the agent
     //      can call `memory_search` to retrieve indexed content
 
-    let mut agent = AgentBuilder::new()
+    let mut agent = CoreAgentBuilder::new()
         .model("claude-sonnet-4-6")
         .system_prompt(
             "You are a helpful assistant with access to a semantic memory store.\n\n\
@@ -139,6 +139,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_tokens_per_turn(1024)
         .resume_session(memory_session)
         .memory_store(Arc::clone(&memory_store) as Arc<dyn meerkat_core::memory::MemoryStore>)
+        .with_turn_state_handle(Arc::new(
+            meerkat_runtime::RuntimeTurnStateHandle::ephemeral(),
+        ))
         .build(Arc::new(llm), Arc::new(gateway), store)
         .await;
 
@@ -181,7 +184,7 @@ Two implementations:
 
 Wiring in the factory (AgentFactory::build_agent):
   1. Creates HnswMemoryStore from .rkat/memory/ directory
-  2. Passes it to AgentBuilder::memory_store() for compaction indexing
+  2. Passes it to CoreAgentBuilder::memory_store() for compaction indexing
   3. Wraps it in MemorySearchDispatcher for the memory_search tool
   4. Composes into ToolGateway alongside other dispatchers
 

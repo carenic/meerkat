@@ -243,7 +243,7 @@ You are a security auditor reviewing code for vulnerabilities.
         .max_tokens_per_turn(2048)
         .with_skill_engine(skill_runtime)
         .build(Arc::new(llm), Arc::new(EmptyToolDispatcher), store)
-        .await;
+        .await?;
 
     // ── Step 7: Run the agent with skills ────────────────────────────────────
 

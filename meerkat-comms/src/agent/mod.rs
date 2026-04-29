@@ -30,9 +30,9 @@ use tokio::sync::watch;
 /// Agent wrapper that integrates comms inbox.
 pub struct CommsAgent<C, T, S>
 where
-    C: AgentLlmClient + 'static,
-    T: AgentToolDispatcher + 'static,
-    S: AgentSessionStore + 'static,
+    C: AgentLlmClient + ?Sized + 'static,
+    T: AgentToolDispatcher + ?Sized + 'static,
+    S: AgentSessionStore + ?Sized + 'static,
 {
     agent: Agent<C, T, S>,
     comms_manager: CommsManager,
@@ -40,9 +40,9 @@ where
 
 impl<C, T, S> CommsAgent<C, T, S>
 where
-    C: AgentLlmClient + 'static,
-    T: AgentToolDispatcher + 'static,
-    S: AgentSessionStore + 'static,
+    C: AgentLlmClient + ?Sized + 'static,
+    T: AgentToolDispatcher + ?Sized + 'static,
+    S: AgentSessionStore + ?Sized + 'static,
 {
     pub fn new(agent: Agent<C, T, S>, comms_manager: CommsManager) -> Self {
         Self {

@@ -235,7 +235,11 @@ async fn sdk_structured_output_extraction_succeeds() -> Result<(), Box<dyn std::
     let llm_client = Arc::new(MockLlmClientWithStructuredOutput {
         calls: calls.clone(),
     });
-    let llm_adapter = Arc::new(factory.build_llm_adapter(llm_client, "mock-model").await);
+    let llm_adapter = Arc::new(
+        factory
+            .build_llm_adapter(llm_client, "claude-sonnet-4-6")
+            .await,
+    );
 
     let store = Arc::new(TestSessionStore::new());
     let store_adapter = Arc::new(factory.build_store_adapter(store).await);
@@ -243,14 +247,14 @@ async fn sdk_structured_output_extraction_succeeds() -> Result<(), Box<dyn std::
     let tools: Arc<dyn AgentToolDispatcher> = Arc::new(EmptyDispatcher);
 
     let mut agent = AgentBuilder::new()
-        .model("mock-model")
+        .model("claude-sonnet-4-6")
         .max_tokens_per_turn(64)
         .output_schema(OutputSchema::new(person_schema())?)
         .with_turn_state_handle(std::sync::Arc::new(
             meerkat_runtime::RuntimeTurnStateHandle::ephemeral(),
         ))
         .build(llm_adapter, tools, store_adapter)
-        .await;
+        .await?;
 
     let result = agent
         .run("Tell me about a person.".to_string().into())
@@ -283,7 +287,11 @@ async fn sdk_structured_output_retry_on_invalid_json() -> Result<(), Box<dyn std
     let llm_client = Arc::new(MockLlmClientWithRetry {
         calls: calls.clone(),
     });
-    let llm_adapter = Arc::new(factory.build_llm_adapter(llm_client, "mock-model").await);
+    let llm_adapter = Arc::new(
+        factory
+            .build_llm_adapter(llm_client, "claude-sonnet-4-6")
+            .await,
+    );
 
     let store = Arc::new(TestSessionStore::new());
     let store_adapter = Arc::new(factory.build_store_adapter(store).await);
@@ -291,7 +299,7 @@ async fn sdk_structured_output_retry_on_invalid_json() -> Result<(), Box<dyn std
     let tools: Arc<dyn AgentToolDispatcher> = Arc::new(EmptyDispatcher);
 
     let mut agent = AgentBuilder::new()
-        .model("mock-model")
+        .model("claude-sonnet-4-6")
         .max_tokens_per_turn(64)
         .output_schema(OutputSchema::new(person_schema())?)
         .structured_output_retries(2) // Allow retries
@@ -299,7 +307,7 @@ async fn sdk_structured_output_retry_on_invalid_json() -> Result<(), Box<dyn std
             meerkat_runtime::RuntimeTurnStateHandle::ephemeral(),
         ))
         .build(llm_adapter, tools, store_adapter)
-        .await;
+        .await?;
 
     let result = agent
         .run("Tell me about a person.".to_string().into())
@@ -324,7 +332,11 @@ async fn sdk_no_structured_output_without_schema() {
 
     let factory = AgentFactory::new(".rkat/sessions");
     let llm_client = Arc::new(MockLlmClientWithStructuredOutput { calls });
-    let llm_adapter = Arc::new(factory.build_llm_adapter(llm_client, "mock-model").await);
+    let llm_adapter = Arc::new(
+        factory
+            .build_llm_adapter(llm_client, "claude-sonnet-4-6")
+            .await,
+    );
 
     let store = Arc::new(TestSessionStore::new());
     let store_adapter = Arc::new(factory.build_store_adapter(store).await);
@@ -333,13 +345,14 @@ async fn sdk_no_structured_output_without_schema() {
 
     // NO output_schema configured
     let mut agent = AgentBuilder::new()
-        .model("mock-model")
+        .model("claude-sonnet-4-6")
         .max_tokens_per_turn(64)
         .with_turn_state_handle(std::sync::Arc::new(
             meerkat_runtime::RuntimeTurnStateHandle::ephemeral(),
         ))
         .build(llm_adapter, tools, store_adapter)
-        .await;
+        .await
+        .expect("public builder build");
 
     let result = agent
         .run("Hello".to_string().into())
@@ -376,7 +389,11 @@ async fn sdk_structured_output_unwraps_named_envelope() -> Result<(), Box<dyn st
     let llm_client = Arc::new(MockLlmClientWithNamedWrapper {
         calls: calls.clone(),
     });
-    let llm_adapter = Arc::new(factory.build_llm_adapter(llm_client, "mock-model").await);
+    let llm_adapter = Arc::new(
+        factory
+            .build_llm_adapter(llm_client, "claude-sonnet-4-6")
+            .await,
+    );
 
     let store = Arc::new(TestSessionStore::new());
     let store_adapter = Arc::new(factory.build_store_adapter(store).await);
@@ -384,14 +401,14 @@ async fn sdk_structured_output_unwraps_named_envelope() -> Result<(), Box<dyn st
     let tools: Arc<dyn AgentToolDispatcher> = Arc::new(EmptyDispatcher);
 
     let mut agent = AgentBuilder::new()
-        .model("mock-model")
+        .model("claude-sonnet-4-6")
         .max_tokens_per_turn(64)
         .output_schema(OutputSchema::new(person_schema())?.with_name("advisor"))
         .with_turn_state_handle(std::sync::Arc::new(
             meerkat_runtime::RuntimeTurnStateHandle::ephemeral(),
         ))
         .build(llm_adapter, tools, store_adapter)
-        .await;
+        .await?;
 
     let result = agent
         .run("Tell me about a person.".to_string().into())

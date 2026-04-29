@@ -17,7 +17,7 @@
 
 use std::sync::Arc;
 
-use meerkat::{AgentBuilder, AgentEvent, AgentFactory, AnthropicClient, DefaultCompactor};
+use meerkat::{AgentEvent, AgentFactory, AnthropicClient, CoreAgentBuilder, DefaultCompactor};
 use meerkat_core::compact::CompactionConfig;
 use meerkat_store::{JsonlStore, StoreAdapter};
 use meerkat_tools::EmptyToolDispatcher;
@@ -56,8 +56,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("Compaction threshold: 2000 tokens (low for demo purposes)");
     println!("Recent turns preserved: 2\n");
 
-    // Build agent with the compactor wired in.
-    let mut agent = AgentBuilder::new()
+    // Build a low-level core agent with the compactor wired in directly.
+    let mut agent = CoreAgentBuilder::new()
         .model("claude-sonnet-4-6")
         .system_prompt(
             "You are a patient tutor. Build on previous conversation context. \
@@ -66,6 +66,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .max_tokens_per_turn(1024)
         .compactor(compactor)
+        .with_turn_state_handle(Arc::new(
+            meerkat_runtime::RuntimeTurnStateHandle::ephemeral(),
+        ))
         .build(Arc::new(llm), Arc::new(EmptyToolDispatcher), store)
         .await;
 

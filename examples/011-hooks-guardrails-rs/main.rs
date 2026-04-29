@@ -202,7 +202,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_tokens_per_turn(1024)
         .with_hook_engine(hook_engine)
         .build(Arc::new(llm), Arc::new(WeatherDispatcher), store)
-        .await;
+        .await?;
 
     // ── Run the agent with event monitoring ────────────────────────────────
 

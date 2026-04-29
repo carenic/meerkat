@@ -571,7 +571,7 @@ let comms_manager = CommsManager::new(config)?;
 let agent = AgentBuilder::new()
     .model("claude-sonnet-4-6")
     .build(llm_client, tools, store)
-    .await;
+    .await?;
 
 let mut comms_agent = CommsAgent::new(agent, comms_manager);
 

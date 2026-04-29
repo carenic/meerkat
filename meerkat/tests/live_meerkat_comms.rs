@@ -25,6 +25,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
 
+type DynCommsAgent = CommsAgent<dyn AgentLlmClient, dyn AgentToolDispatcher, dyn AgentSessionStore>;
+
 // ============================================================================
 // ADAPTERS - Bridge LlmClient/SessionStore to Agent traits
 // ============================================================================
@@ -257,16 +259,8 @@ async fn create_temp_store() -> (
 async fn create_agent_pair(
     api_key: &str,
 ) -> (
-    CommsAgent<
-        LlmClientAdapter<AnthropicClient>,
-        CommsToolDispatcher,
-        SessionStoreAdapter<JsonlStore>,
-    >,
-    CommsAgent<
-        LlmClientAdapter<AnthropicClient>,
-        CommsToolDispatcher,
-        SessionStoreAdapter<JsonlStore>,
-    >,
+    DynCommsAgent,
+    DynCommsAgent,
     meerkat_comms::agent::ListenerHandle,
     meerkat_comms::agent::ListenerHandle,
     TempDir,
@@ -375,7 +369,8 @@ async fn create_agent_pair(
              Use the peers tool to see available peers.",
         )
         .build(llm_adapter_a, tools_a, store_adapter_a)
-        .await;
+        .await
+            .expect("public builder build");
 
     let agent_b_inner = AgentBuilder::new()
         .model(anthropic_model())
@@ -386,7 +381,8 @@ async fn create_agent_pair(
              Use the peers tool to see available peers.",
         )
         .build(llm_adapter_b, tools_b, store_adapter_b)
-        .await;
+        .await
+            .expect("public builder build");
 
     let agent_a = CommsAgent::new(agent_a_inner, comms_manager_a);
     let agent_b = CommsAgent::new(agent_b_inner, comms_manager_b);
@@ -736,7 +732,8 @@ mod three_agent_coordination {
                  Use peers to see available peers and send to communicate.",
             )
             .build(llm_adapter_a, tools_a, store_adapter_a)
-            .await;
+            .await
+            .expect("public builder build");
 
         let agent_b_inner = AgentBuilder::new()
             .model(anthropic_model())
@@ -745,7 +742,8 @@ mod three_agent_coordination {
                 "You are Agent B, a worker. You can communicate with Agent A and Agent C.",
             )
             .build(llm_adapter_b, tools_b, store_adapter_b)
-            .await;
+            .await
+            .expect("public builder build");
 
         let agent_c_inner = AgentBuilder::new()
             .model(anthropic_model())
@@ -754,7 +752,8 @@ mod three_agent_coordination {
                 "You are Agent C, a worker. You can communicate with Agent A and Agent B.",
             )
             .build(llm_adapter_c, tools_c, store_adapter_c)
-            .await;
+            .await
+            .expect("public builder build");
 
         let mut agent_a = CommsAgent::new(agent_a_inner, comms_manager_a);
         let mut agent_b = CommsAgent::new(agent_b_inner, comms_manager_b);

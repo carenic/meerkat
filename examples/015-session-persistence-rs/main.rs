@@ -45,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .system_prompt("You are a persistent assistant. You remember across restarts.")
         .max_tokens_per_turn(512)
         .build(Arc::new(llm), Arc::new(EmptyToolDispatcher), adapted_store)
-        .await;
+        .await?;
 
     // Turn 1: Create session
     let result = agent

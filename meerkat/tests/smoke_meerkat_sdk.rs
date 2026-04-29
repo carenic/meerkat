@@ -9,7 +9,7 @@
 //! E2E smoke tests for the Meerkat native Rust SDK.
 //!
 //! These tests verify compound, realistic scenario-based workflows through
-//! the AgentFactory path (and AgentBuilder where injection is needed).
+//! the AgentFactory path (and CoreAgentBuilder where low-level injection is needed).
 //!
 //! Each test requires API keys and makes real API calls. When keys are missing,
 //! tests skip gracefully with an informational message.
@@ -25,6 +25,13 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tempfile::TempDir;
+
+#[cfg(feature = "comms")]
+type DynCommsAgent = meerkat_comms::agent::CommsAgent<
+    dyn AgentLlmClient,
+    dyn AgentToolDispatcher,
+    dyn AgentSessionStore,
+>;
 
 // ============================================================================
 // ADAPTERS - Bridge LlmClient/SessionStore to Agent traits
@@ -821,7 +828,8 @@ mod scenario_06_hooks {
             .system_prompt("You are a helpful assistant. Keep responses brief.")
             .with_hook_engine(hook_engine)
             .build(llm_adapter, tools, store_adapter)
-            .await;
+            .await
+            .expect("public builder build");
 
         let result = agent
             .run("Say hello.".into())
@@ -956,16 +964,8 @@ mod scenario_08_comms {
     async fn create_agent_pair(
         api_key: &str,
     ) -> (
-        CommsAgent<
-            LlmClientAdapter<AnthropicClient>,
-            CommsToolDispatcher,
-            SessionStoreAdapter<JsonlStore>,
-        >,
-        CommsAgent<
-            LlmClientAdapter<AnthropicClient>,
-            CommsToolDispatcher,
-            SessionStoreAdapter<JsonlStore>,
-        >,
+        DynCommsAgent,
+        DynCommsAgent,
         meerkat_comms::agent::ListenerHandle,
         meerkat_comms::agent::ListenerHandle,
         TempDir,
@@ -1062,7 +1062,8 @@ mod scenario_08_comms {
                  To message agent-b, call `send` with kind `peer_message`.",
             )
             .build(llm_adapter_a, tools_a, store_adapter_a)
-            .await;
+            .await
+            .expect("public builder build");
 
         let agent_b_inner = AgentBuilder::new()
             .model(smoke_model())
@@ -1072,7 +1073,8 @@ mod scenario_08_comms {
                  Acknowledge any messages you receive.",
             )
             .build(llm_adapter_b, tools_b, store_adapter_b)
-            .await;
+            .await
+            .expect("public builder build");
 
         let agent_a = CommsAgent::new(agent_a_inner, comms_manager_a);
         let agent_b = CommsAgent::new(agent_b_inner, comms_manager_b);
@@ -1311,12 +1313,12 @@ mod scenario_10_memory {
         );
         let memory_tools: Arc<dyn AgentToolDispatcher> = Arc::new(memory_dispatcher);
 
-        // Build agent with memory store + compactor + memory_search tool
+        // Build a low-level core agent with memory store + compactor + memory_search tool
         let llm_client = Arc::new(AnthropicClient::new(api_key_val).unwrap());
         let llm_adapter = Arc::new(self::LlmClientAdapter::new(llm_client, smoke_model()));
         let (_store, store_adapter, _temp_dir) = create_temp_store().await;
 
-        let mut agent = AgentBuilder::new()
+        let mut agent = CoreAgentBuilder::new()
             .model(smoke_model())
             .max_tokens_per_turn(512)
             .system_prompt(
@@ -1327,6 +1329,9 @@ mod scenario_10_memory {
             .resume_session(memory_session)
             .memory_store(Arc::clone(&memory_store))
             .compactor(compactor)
+            .with_turn_state_handle(Arc::new(
+                meerkat_runtime::RuntimeTurnStateHandle::ephemeral(),
+            ))
             .build(llm_adapter, memory_tools, store_adapter)
             .await;
 
