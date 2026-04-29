@@ -4203,10 +4203,6 @@ impl<'a> CompositionTlaCompiler<'a> {
                 compiler.render_helper(out, derived);
                 pushln!(out);
             }
-            if machine.machine.as_str() == "MobMachine" {
-                compiler.render_mob_machine_native_helpers(out);
-                pushln!(out);
-            }
 
             let branches = machine
                 .transitions
@@ -5683,128 +5679,6 @@ impl<'a> MachineTlaCompiler<'a> {
         writeln!(
             out,
             "{}(all_ready_queues, all_statuses, ordered_nodes_by_frame, frame_id) ==",
-            prefix("mob_machine_frame_ready_queue_after_admit")
-        )
-        .expect("write to string");
-        pushln!(
-            out,
-            "    LET statuses == IF frame_id \\in DOMAIN all_statuses THEN all_statuses[frame_id] ELSE [x \\in {{}} |-> None]"
-        );
-        pushln!(
-            out,
-            "        ordered == IF frame_id \\in DOMAIN ordered_nodes_by_frame THEN ordered_nodes_by_frame[frame_id] ELSE <<>>"
-        );
-        pushln!(
-            out,
-            "    IN MapSet(all_ready_queues, frame_id, SelectSeq(ordered, LAMBDA candidate: candidate \\in DOMAIN statuses /\\ statuses[candidate] = \"Ready\"))"
-        );
-        writeln!(
-            out,
-            "{}(all_statuses, frame_branches, ordered_nodes_by_frame, dependencies_by_frame, dependency_modes_by_frame, frame_id, node_id, terminal_status) ==",
-            prefix("mob_machine_frame_node_status_after_terminal")
-        )
-        .expect("write to string");
-        pushln!(
-            out,
-            "    LET current == IF frame_id \\in DOMAIN all_statuses THEN all_statuses[frame_id] ELSE [x \\in {{}} |-> None]"
-        );
-        pushln!(
-            out,
-            "        ordered == IF frame_id \\in DOMAIN ordered_nodes_by_frame THEN ordered_nodes_by_frame[frame_id] ELSE <<>>"
-        );
-        pushln!(
-            out,
-            "        branches == IF frame_id \\in DOMAIN frame_branches THEN frame_branches[frame_id] ELSE [x \\in {{}} |-> None]"
-        );
-        pushln!(
-            out,
-            "        dependencies == IF frame_id \\in DOMAIN dependencies_by_frame THEN dependencies_by_frame[frame_id] ELSE [x \\in {{}} |-> <<>>]"
-        );
-        pushln!(
-            out,
-            "        dependency_modes == IF frame_id \\in DOMAIN dependency_modes_by_frame THEN dependency_modes_by_frame[frame_id] ELSE [x \\in {{}} |-> \"All\"]"
-        );
-        pushln!(
-            out,
-            "        after_terminal == MapSet(current, node_id, terminal_status)"
-        );
-        writeln!(
-            out,
-            "        after_branch == [candidate \\in DOMAIN after_terminal |->"
-        )
-        .expect("write to string");
-        pushln!(
-            out,
-            "            IF terminal_status = \"Completed\" /\\ candidate # node_id"
-        );
-        pushln!(
-            out,
-            "                /\\ candidate \\in DOMAIN branches /\\ node_id \\in DOMAIN branches"
-        );
-        pushln!(out, "                /\\ branches[node_id] # None");
-        pushln!(
-            out,
-            "                /\\ branches[candidate] = branches[node_id]"
-        );
-        writeln!(
-            out,
-            "                /\\ ~{}(after_terminal[candidate])",
-            prefix("mob_machine_node_terminal")
-        )
-        .expect("write to string");
-        pushln!(
-            out,
-            "                /\\ after_terminal[candidate] # \"Running\""
-        );
-        pushln!(
-            out,
-            "            THEN \"Skipped\" ELSE after_terminal[candidate]]"
-        );
-        pushln!(
-            out,
-            "        after_dependencies == [candidate \\in DOMAIN after_branch |->"
-        );
-        pushln!(
-            out,
-            "            IF after_branch[candidate] # \"Pending\" THEN after_branch[candidate]"
-        );
-        pushln!(
-            out,
-            "            ELSE LET deps == IF candidate \\in DOMAIN dependencies THEN dependencies[candidate] ELSE <<>>"
-        );
-        pushln!(
-            out,
-            "                     mode == IF candidate \\in DOMAIN dependency_modes THEN dependency_modes[candidate] ELSE \"All\""
-        );
-        pushln!(out, "                     failed == Len(deps) # 0");
-        pushln!(
-            out,
-            "                         /\\ ((mode = \"All\" /\\ \\E dep_index \\in DOMAIN deps: LET dep == deps[dep_index] IN dep \\in DOMAIN after_branch /\\ after_branch[dep] \\in {{\"Failed\", \"Skipped\", \"Canceled\"}})"
-        );
-        pushln!(
-            out,
-            "                             \\/ (mode = \"Any\" /\\ \\A dep_index \\in DOMAIN deps: LET dep == deps[dep_index] IN dep \\in DOMAIN after_branch /\\ after_branch[dep] \\in {{\"Failed\", \"Skipped\", \"Canceled\"}}))"
-        );
-        pushln!(out, "                     satisfied == Len(deps) = 0");
-        pushln!(
-            out,
-            "                         \\/ (mode = \"All\" /\\ \\A dep_index \\in DOMAIN deps: LET dep == deps[dep_index] IN dep \\in DOMAIN after_branch /\\ after_branch[dep] = \"Completed\")"
-        );
-        pushln!(
-            out,
-            "                         \\/ (mode = \"Any\" /\\ \\E dep_index \\in DOMAIN deps: LET dep == deps[dep_index] IN dep \\in DOMAIN after_branch /\\ after_branch[dep] = \"Completed\")"
-        );
-        pushln!(
-            out,
-            "                 IN IF failed THEN \"Skipped\" ELSE IF satisfied THEN \"Ready\" ELSE after_branch[candidate]]"
-        );
-        pushln!(
-            out,
-            "    IN MapSet(all_statuses, frame_id, after_dependencies)"
-        );
-        writeln!(
-            out,
-            "{}(all_ready_queues, all_statuses, ordered_nodes_by_frame, frame_id) ==",
             prefix("mob_machine_frame_ready_queue_after_terminal")
         )
         .expect("write to string");
@@ -5819,6 +5693,135 @@ impl<'a> MachineTlaCompiler<'a> {
         pushln!(
             out,
             "    IN MapSet(all_ready_queues, frame_id, SelectSeq(ordered, LAMBDA candidate: candidate \\in DOMAIN statuses /\\ statuses[candidate] = \"Ready\"))"
+        );
+        writeln!(
+            out,
+            "{}(all_ready_queues, all_statuses, ordered_nodes_by_frame, frame_id) ==",
+            prefix("mob_machine_frame_ready_queue_after_admit")
+        )
+        .expect("write to string");
+        writeln!(
+            out,
+            "    {}(all_ready_queues, all_statuses, ordered_nodes_by_frame, frame_id)",
+            prefix("mob_machine_frame_ready_queue_after_terminal")
+        )
+        .expect("write to string");
+        writeln!(
+            out,
+            "{}(current, branches, node_id, terminal_status) ==",
+            prefix("mob_machine_frame_node_status_after_terminal_branch")
+        )
+        .expect("write to string");
+        pushln!(
+            out,
+            "    LET after_terminal == MapSet(current, node_id, terminal_status)"
+        );
+        pushln!(out, "    IN [candidate \\in DOMAIN after_terminal |->");
+        pushln!(
+            out,
+            "        IF terminal_status = \"Completed\" /\\ candidate # node_id"
+        );
+        pushln!(
+            out,
+            "            /\\ candidate \\in DOMAIN branches /\\ node_id \\in DOMAIN branches"
+        );
+        pushln!(out, "            /\\ branches[node_id] # None");
+        pushln!(
+            out,
+            "            /\\ branches[candidate] = branches[node_id]"
+        );
+        writeln!(
+            out,
+            "            /\\ ~{}(after_terminal[candidate])",
+            prefix("mob_machine_node_terminal")
+        )
+        .expect("write to string");
+        pushln!(
+            out,
+            "            /\\ after_terminal[candidate] # \"Running\""
+        );
+        pushln!(
+            out,
+            "        THEN \"Skipped\" ELSE after_terminal[candidate]]"
+        );
+        writeln!(
+            out,
+            "{}(after_branch, dependencies, dependency_modes) ==",
+            prefix("mob_machine_frame_node_status_after_terminal_dependencies")
+        )
+        .expect("write to string");
+        pushln!(out, "    [candidate \\in DOMAIN after_branch |->");
+        pushln!(
+            out,
+            "        IF after_branch[candidate] # \"Pending\" THEN after_branch[candidate]"
+        );
+        pushln!(
+            out,
+            "        ELSE LET deps == IF candidate \\in DOMAIN dependencies THEN dependencies[candidate] ELSE <<>>"
+        );
+        pushln!(
+            out,
+            "                 mode == IF candidate \\in DOMAIN dependency_modes THEN dependency_modes[candidate] ELSE \"All\""
+        );
+        pushln!(out, "                 failed == Len(deps) # 0");
+        pushln!(
+            out,
+            "                     /\\ ((mode = \"All\" /\\ \\E dep_index \\in DOMAIN deps: LET dep == deps[dep_index] IN dep \\in DOMAIN after_branch /\\ after_branch[dep] \\in {{\"Failed\", \"Skipped\", \"Canceled\"}})"
+        );
+        pushln!(
+            out,
+            "                         \\/ (mode = \"Any\" /\\ \\A dep_index \\in DOMAIN deps: LET dep == deps[dep_index] IN dep \\in DOMAIN after_branch /\\ after_branch[dep] \\in {{\"Failed\", \"Skipped\", \"Canceled\"}}))"
+        );
+        pushln!(out, "                 satisfied == Len(deps) = 0");
+        pushln!(
+            out,
+            "                     \\/ (mode = \"All\" /\\ \\A dep_index \\in DOMAIN deps: LET dep == deps[dep_index] IN dep \\in DOMAIN after_branch /\\ after_branch[dep] = \"Completed\")"
+        );
+        pushln!(
+            out,
+            "                     \\/ (mode = \"Any\" /\\ \\E dep_index \\in DOMAIN deps: LET dep == deps[dep_index] IN dep \\in DOMAIN after_branch /\\ after_branch[dep] = \"Completed\")"
+        );
+        pushln!(
+            out,
+            "             IN IF failed THEN \"Skipped\" ELSE IF satisfied THEN \"Ready\" ELSE after_branch[candidate]]"
+        );
+        writeln!(
+            out,
+            "{}(all_statuses, frame_branches, ordered_nodes_by_frame, dependencies_by_frame, dependency_modes_by_frame, frame_id, node_id, terminal_status) ==",
+            prefix("mob_machine_frame_node_status_after_terminal")
+        )
+        .expect("write to string");
+        pushln!(
+            out,
+            "    LET current == IF frame_id \\in DOMAIN all_statuses THEN all_statuses[frame_id] ELSE [x \\in {{}} |-> None]"
+        );
+        pushln!(
+            out,
+            "        branches == IF frame_id \\in DOMAIN frame_branches THEN frame_branches[frame_id] ELSE [x \\in {{}} |-> None]"
+        );
+        pushln!(
+            out,
+            "        dependencies == IF frame_id \\in DOMAIN dependencies_by_frame THEN dependencies_by_frame[frame_id] ELSE [x \\in {{}} |-> <<>>]"
+        );
+        pushln!(
+            out,
+            "        dependency_modes == IF frame_id \\in DOMAIN dependency_modes_by_frame THEN dependency_modes_by_frame[frame_id] ELSE [x \\in {{}} |-> \"All\"]"
+        );
+        writeln!(
+            out,
+            "        after_branch == {}(current, branches, node_id, terminal_status)",
+            prefix("mob_machine_frame_node_status_after_terminal_branch")
+        )
+        .expect("write to string");
+        writeln!(
+            out,
+            "        after_dependencies == {}(after_branch, dependencies, dependency_modes)",
+            prefix("mob_machine_frame_node_status_after_terminal_dependencies")
+        )
+        .expect("write to string");
+        pushln!(
+            out,
+            "    IN MapSet(all_statuses, frame_id, after_dependencies)"
         );
     }
 

@@ -108,6 +108,8 @@ fn renders_kernel_seam_composition_with_namespaced_mob_native_helpers() {
         "mob__mob_machine_step_status_from_frame_node_status(status) ==",
         "mob__mob_machine_frame_node_status_after_admit(",
         "mob__mob_machine_frame_ready_queue_after_admit(",
+        "mob__mob_machine_frame_node_status_after_terminal_branch(",
+        "mob__mob_machine_frame_node_status_after_terminal_dependencies(",
         "mob__mob_machine_frame_node_status_after_terminal(",
         "mob__mob_machine_frame_ready_queue_after_terminal(",
     ] {

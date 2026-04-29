@@ -140,41 +140,42 @@ mob_machine_frame_node_status_after_admit(all_statuses, frame_branches, ordered_
             THEN "Pending" ELSE current[candidate]]
         after_admit == MapSet(after_branch_reservation, node_id, "Running")
     IN MapSet(all_statuses, frame_id, after_admit)
-mob_machine_frame_ready_queue_after_admit(all_ready_queues, all_statuses, ordered_nodes_by_frame, frame_id) ==
-    LET statuses == IF frame_id \in DOMAIN all_statuses THEN all_statuses[frame_id] ELSE [x \in {} |-> None]
-        ordered == IF frame_id \in DOMAIN ordered_nodes_by_frame THEN ordered_nodes_by_frame[frame_id] ELSE <<>>
-    IN MapSet(all_ready_queues, frame_id, SelectSeq(ordered, LAMBDA candidate: candidate \in DOMAIN statuses /\ statuses[candidate] = "Ready"))
-mob_machine_frame_node_status_after_terminal(all_statuses, frame_branches, ordered_nodes_by_frame, dependencies_by_frame, dependency_modes_by_frame, frame_id, node_id, terminal_status) ==
-    LET current == IF frame_id \in DOMAIN all_statuses THEN all_statuses[frame_id] ELSE [x \in {} |-> None]
-        ordered == IF frame_id \in DOMAIN ordered_nodes_by_frame THEN ordered_nodes_by_frame[frame_id] ELSE <<>>
-        branches == IF frame_id \in DOMAIN frame_branches THEN frame_branches[frame_id] ELSE [x \in {} |-> None]
-        dependencies == IF frame_id \in DOMAIN dependencies_by_frame THEN dependencies_by_frame[frame_id] ELSE [x \in {} |-> <<>>]
-        dependency_modes == IF frame_id \in DOMAIN dependency_modes_by_frame THEN dependency_modes_by_frame[frame_id] ELSE [x \in {} |-> "All"]
-        after_terminal == MapSet(current, node_id, terminal_status)
-        after_branch == [candidate \in DOMAIN after_terminal |->
-            IF terminal_status = "Completed" /\ candidate # node_id
-                /\ candidate \in DOMAIN branches /\ node_id \in DOMAIN branches
-                /\ branches[node_id] # None
-                /\ branches[candidate] = branches[node_id]
-                /\ ~mob_machine_node_terminal(after_terminal[candidate])
-                /\ after_terminal[candidate] # "Running"
-            THEN "Skipped" ELSE after_terminal[candidate]]
-        after_dependencies == [candidate \in DOMAIN after_branch |->
-            IF after_branch[candidate] # "Pending" THEN after_branch[candidate]
-            ELSE LET deps == IF candidate \in DOMAIN dependencies THEN dependencies[candidate] ELSE <<>>
-                     mode == IF candidate \in DOMAIN dependency_modes THEN dependency_modes[candidate] ELSE "All"
-                     failed == Len(deps) # 0
-                         /\ ((mode = "All" /\ \E dep_index \in DOMAIN deps: LET dep == deps[dep_index] IN dep \in DOMAIN after_branch /\ after_branch[dep] \in {"Failed", "Skipped", "Canceled"})
-                             \/ (mode = "Any" /\ \A dep_index \in DOMAIN deps: LET dep == deps[dep_index] IN dep \in DOMAIN after_branch /\ after_branch[dep] \in {"Failed", "Skipped", "Canceled"}))
-                     satisfied == Len(deps) = 0
-                         \/ (mode = "All" /\ \A dep_index \in DOMAIN deps: LET dep == deps[dep_index] IN dep \in DOMAIN after_branch /\ after_branch[dep] = "Completed")
-                         \/ (mode = "Any" /\ \E dep_index \in DOMAIN deps: LET dep == deps[dep_index] IN dep \in DOMAIN after_branch /\ after_branch[dep] = "Completed")
-                 IN IF failed THEN "Skipped" ELSE IF satisfied THEN "Ready" ELSE after_branch[candidate]]
-    IN MapSet(all_statuses, frame_id, after_dependencies)
 mob_machine_frame_ready_queue_after_terminal(all_ready_queues, all_statuses, ordered_nodes_by_frame, frame_id) ==
     LET statuses == IF frame_id \in DOMAIN all_statuses THEN all_statuses[frame_id] ELSE [x \in {} |-> None]
         ordered == IF frame_id \in DOMAIN ordered_nodes_by_frame THEN ordered_nodes_by_frame[frame_id] ELSE <<>>
     IN MapSet(all_ready_queues, frame_id, SelectSeq(ordered, LAMBDA candidate: candidate \in DOMAIN statuses /\ statuses[candidate] = "Ready"))
+mob_machine_frame_ready_queue_after_admit(all_ready_queues, all_statuses, ordered_nodes_by_frame, frame_id) ==
+    mob_machine_frame_ready_queue_after_terminal(all_ready_queues, all_statuses, ordered_nodes_by_frame, frame_id)
+mob_machine_frame_node_status_after_terminal_branch(current, branches, node_id, terminal_status) ==
+    LET after_terminal == MapSet(current, node_id, terminal_status)
+    IN [candidate \in DOMAIN after_terminal |->
+        IF terminal_status = "Completed" /\ candidate # node_id
+            /\ candidate \in DOMAIN branches /\ node_id \in DOMAIN branches
+            /\ branches[node_id] # None
+            /\ branches[candidate] = branches[node_id]
+            /\ ~mob_machine_node_terminal(after_terminal[candidate])
+            /\ after_terminal[candidate] # "Running"
+        THEN "Skipped" ELSE after_terminal[candidate]]
+mob_machine_frame_node_status_after_terminal_dependencies(after_branch, dependencies, dependency_modes) ==
+    [candidate \in DOMAIN after_branch |->
+        IF after_branch[candidate] # "Pending" THEN after_branch[candidate]
+        ELSE LET deps == IF candidate \in DOMAIN dependencies THEN dependencies[candidate] ELSE <<>>
+                 mode == IF candidate \in DOMAIN dependency_modes THEN dependency_modes[candidate] ELSE "All"
+                 failed == Len(deps) # 0
+                     /\ ((mode = "All" /\ \E dep_index \in DOMAIN deps: LET dep == deps[dep_index] IN dep \in DOMAIN after_branch /\ after_branch[dep] \in {"Failed", "Skipped", "Canceled"})
+                         \/ (mode = "Any" /\ \A dep_index \in DOMAIN deps: LET dep == deps[dep_index] IN dep \in DOMAIN after_branch /\ after_branch[dep] \in {"Failed", "Skipped", "Canceled"}))
+                 satisfied == Len(deps) = 0
+                     \/ (mode = "All" /\ \A dep_index \in DOMAIN deps: LET dep == deps[dep_index] IN dep \in DOMAIN after_branch /\ after_branch[dep] = "Completed")
+                     \/ (mode = "Any" /\ \E dep_index \in DOMAIN deps: LET dep == deps[dep_index] IN dep \in DOMAIN after_branch /\ after_branch[dep] = "Completed")
+             IN IF failed THEN "Skipped" ELSE IF satisfied THEN "Ready" ELSE after_branch[candidate]]
+mob_machine_frame_node_status_after_terminal(all_statuses, frame_branches, ordered_nodes_by_frame, dependencies_by_frame, dependency_modes_by_frame, frame_id, node_id, terminal_status) ==
+    LET current == IF frame_id \in DOMAIN all_statuses THEN all_statuses[frame_id] ELSE [x \in {} |-> None]
+        branches == IF frame_id \in DOMAIN frame_branches THEN frame_branches[frame_id] ELSE [x \in {} |-> None]
+        dependencies == IF frame_id \in DOMAIN dependencies_by_frame THEN dependencies_by_frame[frame_id] ELSE [x \in {} |-> <<>>]
+        dependency_modes == IF frame_id \in DOMAIN dependency_modes_by_frame THEN dependency_modes_by_frame[frame_id] ELSE [x \in {} |-> "All"]
+        after_branch == mob_machine_frame_node_status_after_terminal_branch(current, branches, node_id, terminal_status)
+        after_dependencies == mob_machine_frame_node_status_after_terminal_dependencies(after_branch, dependencies, dependency_modes)
+    IN MapSet(all_statuses, frame_id, after_dependencies)
 Init ==
     /\ phase = "Running"
     /\ model_step_count = 0
