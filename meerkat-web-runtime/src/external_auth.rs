@@ -9,7 +9,8 @@
 //! This module defines:
 //!
 //! - JS callback slot — wasm_bindgen-exposed registration that stores a
-//!   host callback returning a Promise<string> of a bearer token. The
+//!   host callback returning a Promise of either a legacy bearer string
+//!   or a typed auth envelope. The
 //!   callback survives across WASM calls (registered once, consulted
 //!   per-session).
 //! - [`register_external_auth_resolver`] — wasm_bindgen entry point
@@ -18,7 +19,7 @@
 //!   session-request builder that routes through the provider-runtime
 //!   registry. When the resolved binding uses an `ExternalResolver`
 //!   credential source, the registry looks up this resolver id's callback,
-//!   awaits it, and wires the returned token into the LLM client's
+//!   awaits it, and wires the returned typed lease into the LLM client's
 //!   Authorization header.
 //!
 //! The callback shape matches plan §Phase 4d.wasm:
@@ -26,11 +27,23 @@
 //! ```js
 //! // Host-page registration:
 //! meerkat.register_external_auth_resolver(async (connectionRef) => {
-//!   // host-owned OAuth flow; returns a bearer string
+//!   // host-owned OAuth flow; returns a typed lease envelope
 //!   const token = await my_oauth_client.fresh_token_for(connectionRef);
-//!   return token; // plain string; meerkat wraps as envelope internally
+//!   return {
+//!     kind: "inline_secret",
+//!     secret: token.accessToken,
+//!     metadata: { account_id: token.accountId },
+//!     expires_at: token.expiresAt,
+//!   };
 //! });
 //! ```
+//!
+//! For compatibility, resolving the Promise to a plain bearer string is
+//! still accepted and wrapped as `ResolvedAuthEnvelope::InlineSecret`
+//! with empty metadata and no expiration. To preserve typed failures,
+//! reject the Promise with a wire auth error object such as
+//! `{ kind: "interactive_login_required" }` or
+//! `{ kind: "refresh_failed", detail: "token endpoint returned 401" }`.
 
 #[cfg(target_arch = "wasm32")]
 use js_sys::{Function, Promise};
@@ -58,7 +71,16 @@ pub const WASM_EXTERNAL_AUTH_RESOLVER_HANDLE: &str = WASM_EXTERNAL_AUTH_RESOLVER
 
 /// Register a JS-side external-auth resolver. The callback receives a
 /// structural connection reference argument (`{ realm, binding, profile? }`)
-/// and must return a Promise that resolves to a bearer-token string.
+/// and must return a Promise that resolves to either a bearer-token string
+/// or a JSON-serializable `ResolvedAuthEnvelope` object.
+///
+/// For compatibility, a plain string is still accepted as
+/// `ResolvedAuthEnvelope::InlineSecret` with empty metadata and no expiry.
+/// Hosts that know lease truth should prefer the typed object form:
+/// `{ kind: "inline_secret", secret, metadata, expires_at? }`.
+/// Structured failures should reject the Promise with a wire auth error
+/// object, e.g. `{ kind: "interactive_login_required" }` or
+/// `{ kind: "refresh_failed", detail }`.
 ///
 /// Subsequent registrations overwrite the previous one. Passing
 /// `undefined` clears the registration.
@@ -92,25 +114,30 @@ pub fn has_external_auth_resolver() -> bool {
 /// resolver is registered.
 ///
 /// Caller awaits the Promise via wasm-bindgen-futures to obtain the
-/// bearer token string.
+/// typed auth envelope.
 #[cfg(target_arch = "wasm32")]
 #[allow(dead_code)] // wired in when the provider-runtime-registry WASM path consumes it
 pub(crate) fn invoke_external_auth_resolver(
     connection_ref: &meerkat_core::ConnectionRef,
-) -> Result<Promise, JsValue> {
+) -> Result<Promise, ExternalAuthInvokeError> {
     EXTERNAL_AUTH_RESOLVER.with(|slot| {
         let slot = slot.borrow();
-        let callback = slot.as_ref().ok_or_else(|| {
-            JsValue::from_str(
-                "external_auth: no resolver registered; call register_external_auth_resolver first",
-            )
-        })?;
+        let callback = slot.as_ref().ok_or(ExternalAuthInvokeError::NoResolver)?;
         let this = JsValue::NULL;
-        let result = callback.call1(&this, &connection_ref_js_value(connection_ref))?;
+        let result = callback
+            .call1(&this, &connection_ref_js_value(connection_ref))
+            .map_err(ExternalAuthInvokeError::Callback)?;
         result
             .dyn_into::<Promise>()
-            .map_err(|_| JsValue::from_str("external_auth: callback must return a Promise"))
+            .map_err(|_| ExternalAuthInvokeError::NonPromise)
     })
+}
+
+#[cfg(target_arch = "wasm32")]
+pub(crate) enum ExternalAuthInvokeError {
+    NoResolver,
+    Callback(JsValue),
+    NonPromise,
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -157,34 +184,12 @@ impl meerkat_providers::ExternalAuthResolverHandle for WasmExternalAuthResolver 
         &self,
         binding: &meerkat_providers::ValidatedBinding,
     ) -> Result<meerkat_core::ResolvedAuthEnvelope, meerkat_core::AuthError> {
-        let promise = invoke_external_auth_resolver(&binding.connection_ref).map_err(|e| {
-            meerkat_core::AuthError::Other(format!(
-                "{} resolver: {}",
-                WASM_EXTERNAL_AUTH_RESOLVER_ID,
-                js_value_display(&e),
-            ))
-        })?;
+        let promise = invoke_external_auth_resolver(&binding.connection_ref)
+            .map_err(auth_error_from_invoke_error)?;
         let js_value = wasm_bindgen_futures::JsFuture::from(promise)
             .await
-            .map_err(|e| {
-                meerkat_core::AuthError::Other(format!(
-                    "{WASM_EXTERNAL_AUTH_RESOLVER_ID} resolver rejected: {}",
-                    js_value_display(&e)
-                ))
-            })?;
-        let token = js_value.as_string().ok_or_else(|| {
-            meerkat_core::AuthError::Other(format!(
-                "{WASM_EXTERNAL_AUTH_RESOLVER_ID} resolver must resolve its Promise to a string bearer token",
-            ))
-        })?;
-        if token.trim().is_empty() {
-            return Err(meerkat_core::AuthError::MissingSecret);
-        }
-        Ok(meerkat_core::ResolvedAuthEnvelope::InlineSecret {
-            secret: token,
-            metadata: meerkat_core::AuthMetadata::default(),
-            expires_at: None,
-        })
+            .map_err(auth_error_from_rejection)?;
+        auth_envelope_from_js_value(js_value)
     }
 }
 
@@ -193,6 +198,148 @@ fn js_value_display(v: &JsValue) -> String {
     v.as_string()
         .or_else(|| v.dyn_ref::<js_sys::Error>().map(|e| e.message().into()))
         .unwrap_or_else(|| format!("{v:?}"))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn auth_error_from_invoke_error(error: ExternalAuthInvokeError) -> meerkat_core::AuthError {
+    match error {
+        ExternalAuthInvokeError::NoResolver => meerkat_core::AuthError::MissingSecret,
+        ExternalAuthInvokeError::Callback(e) => meerkat_core::AuthError::Other(format!(
+            "{WASM_EXTERNAL_AUTH_RESOLVER_ID} resolver callback failed: {}",
+            js_value_display(&e),
+        )),
+        ExternalAuthInvokeError::NonPromise => meerkat_core::AuthError::Other(format!(
+            "{WASM_EXTERNAL_AUTH_RESOLVER_ID} resolver callback must return a Promise",
+        )),
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn auth_error_from_rejection(value: JsValue) -> meerkat_core::AuthError {
+    if let Some(error) = wire_auth_error_from_js_value(&value) {
+        return auth_error_from_wire(error);
+    }
+
+    meerkat_core::AuthError::Other(format!(
+        "{WASM_EXTERNAL_AUTH_RESOLVER_ID} resolver rejected: {}",
+        js_value_display(&value),
+    ))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn auth_envelope_from_js_value(
+    value: JsValue,
+) -> Result<meerkat_core::ResolvedAuthEnvelope, meerkat_core::AuthError> {
+    if let Some(token) = value.as_string() {
+        return legacy_bearer_envelope(token);
+    }
+
+    if value.is_null() || value.is_undefined() {
+        return Err(meerkat_core::AuthError::MissingSecret);
+    }
+
+    let raw = json_string_from_js_value(&value).map_err(|detail| {
+        meerkat_core::AuthError::Other(format!(
+            "{WASM_EXTERNAL_AUTH_RESOLVER_ID} resolver returned unsupported credential envelope: {detail}",
+        ))
+    })?;
+    let envelope =
+        serde_json::from_str::<meerkat_core::ResolvedAuthEnvelope>(&raw).map_err(|e| {
+            meerkat_core::AuthError::Other(format!(
+                "{WASM_EXTERNAL_AUTH_RESOLVER_ID} resolver returned unsupported credential envelope: {e}",
+            ))
+        })?;
+    validate_auth_envelope(envelope)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn legacy_bearer_envelope(
+    token: String,
+) -> Result<meerkat_core::ResolvedAuthEnvelope, meerkat_core::AuthError> {
+    if token.trim().is_empty() {
+        return Err(meerkat_core::AuthError::MissingSecret);
+    }
+
+    Ok(meerkat_core::ResolvedAuthEnvelope::InlineSecret {
+        secret: token,
+        metadata: meerkat_core::AuthMetadata::default(),
+        expires_at: None,
+    })
+}
+
+#[cfg(target_arch = "wasm32")]
+fn validate_auth_envelope(
+    envelope: meerkat_core::ResolvedAuthEnvelope,
+) -> Result<meerkat_core::ResolvedAuthEnvelope, meerkat_core::AuthError> {
+    match &envelope {
+        meerkat_core::ResolvedAuthEnvelope::InlineSecret { secret, .. } => {
+            if secret.trim().is_empty() {
+                return Err(meerkat_core::AuthError::MissingSecret);
+            }
+        }
+        meerkat_core::ResolvedAuthEnvelope::StaticHeaders { headers, .. } => {
+            if headers.is_empty()
+                || headers
+                    .iter()
+                    .any(|(name, value)| name.trim().is_empty() || value.trim().is_empty())
+            {
+                return Err(meerkat_core::AuthError::MissingSecret);
+            }
+        }
+        meerkat_core::ResolvedAuthEnvelope::DynamicAuthorizer { .. }
+        | meerkat_core::ResolvedAuthEnvelope::None { .. } => {}
+    }
+
+    Ok(envelope)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn wire_auth_error_from_js_value(value: &JsValue) -> Option<meerkat_contracts::WireAuthError> {
+    let raw = json_string_from_js_value(value).ok()?;
+    serde_json::from_str::<meerkat_contracts::WireAuthError>(&raw).ok()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn json_string_from_js_value(value: &JsValue) -> Result<String, String> {
+    if let Some(raw) = value.as_string() {
+        return Ok(raw);
+    }
+
+    let stringified = js_sys::JSON::stringify(value)
+        .map_err(|e| format!("JSON.stringify failed: {}", js_value_display(&e)))?;
+    stringified
+        .as_string()
+        .ok_or_else(|| "JSON.stringify returned undefined".to_string())
+}
+
+#[cfg(target_arch = "wasm32")]
+fn auth_error_from_wire(error: meerkat_contracts::WireAuthError) -> meerkat_core::AuthError {
+    match error {
+        meerkat_contracts::WireAuthError::MissingSecret => meerkat_core::AuthError::MissingSecret,
+        meerkat_contracts::WireAuthError::UnsupportedCombination { backend, auth } => {
+            meerkat_core::AuthError::UnsupportedCombination { backend, auth }
+        }
+        meerkat_contracts::WireAuthError::MissingRequiredMetadata { field } => {
+            meerkat_core::AuthError::MissingRequiredMetadata(field)
+        }
+        meerkat_contracts::WireAuthError::WorkspaceMismatch => {
+            meerkat_core::AuthError::WorkspaceMismatch
+        }
+        meerkat_contracts::WireAuthError::Expired => meerkat_core::AuthError::Expired,
+        meerkat_contracts::WireAuthError::RefreshFailed { detail } => {
+            meerkat_core::AuthError::RefreshFailed(detail)
+        }
+        meerkat_contracts::WireAuthError::InteractiveLoginRequired => {
+            meerkat_core::AuthError::InteractiveLoginRequired
+        }
+        meerkat_contracts::WireAuthError::HostOwnedUnavailable => {
+            meerkat_core::AuthError::HostOwnedUnavailable
+        }
+        meerkat_contracts::WireAuthError::Io { detail } => meerkat_core::AuthError::Io(detail),
+        meerkat_contracts::WireAuthError::Other { detail } => {
+            meerkat_core::AuthError::Other(detail)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

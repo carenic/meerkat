@@ -15,12 +15,66 @@
 
 #![cfg(target_arch = "wasm32")]
 
+use std::sync::Arc;
+
 use js_sys::Function;
+use meerkat_core::{
+    AuthError, AuthMetadata, AuthProfile, BackendProfile, BindingPolicy, ConnectionRef,
+    CredentialSourceSpec, Provider, ResolvedAuthEnvelope,
+    connection::{BindingId, ProfileId, RealmId},
+    provider_matrix::openai::{OpenAiAuthMethod, OpenAiBackendKind},
+};
+use meerkat_providers::{
+    ExternalAuthResolverHandle, NormalizedAuthMethod, NormalizedBackendKind, ValidatedBinding,
+};
 use meerkat_web_runtime::external_auth::{
-    has_external_auth_resolver, register_external_auth_resolver,
+    WasmExternalAuthResolver, has_external_auth_resolver, register_external_auth_resolver,
 };
 use wasm_bindgen::{JsCast, JsValue};
 use wasm_bindgen_test::wasm_bindgen_test;
+
+fn test_binding() -> ValidatedBinding {
+    ValidatedBinding {
+        connection_ref: ConnectionRef {
+            realm: RealmId::parse("browser").expect("realm"),
+            binding: BindingId::parse("chatgpt").expect("binding"),
+            profile: Some(ProfileId::parse("primary").expect("profile")),
+        },
+        provider: Provider::OpenAI,
+        backend: NormalizedBackendKind::OpenAi(OpenAiBackendKind::ChatGptBackend),
+        auth: NormalizedAuthMethod::OpenAi(OpenAiAuthMethod::ExternalAuthorizer),
+        backend_profile: Arc::new(BackendProfile {
+            id: "chatgpt-backend".into(),
+            provider: Provider::OpenAI,
+            backend_kind: "chatgpt_backend".into(),
+            base_url: None,
+            options: serde_json::Value::Null,
+        }),
+        auth_profile: Arc::new(AuthProfile {
+            id: "host-oauth".into(),
+            provider: Provider::OpenAI,
+            auth_method: "external_authorizer".into(),
+            source: CredentialSourceSpec::ExternalResolver {
+                handle: "wasm_host".into(),
+            },
+            constraints: Default::default(),
+            metadata_defaults: Default::default(),
+        }),
+        policy: BindingPolicy::default(),
+    }
+}
+
+fn register_eval_callback(source: &str) {
+    let cb = js_sys::eval(source)
+        .expect("eval callback")
+        .dyn_into::<Function>()
+        .expect("cast to Function");
+    register_external_auth_resolver(JsValue::from(cb)).expect("register callback");
+}
+
+async fn resolve_with_registered_callback() -> Result<ResolvedAuthEnvelope, AuthError> {
+    WasmExternalAuthResolver.resolve(&test_binding()).await
+}
 
 /// Before registration: `has_external_auth_resolver()` returns false.
 #[wasm_bindgen_test]
@@ -72,5 +126,166 @@ fn register_non_function_returns_error() {
     assert!(
         s.contains("must be a function"),
         "error must mention callback must be a function: {s}"
+    );
+}
+
+/// Back-compat: host pages that still resolve the Promise to a plain bearer
+/// string keep working, but the runtime wraps it in the typed envelope shape.
+#[wasm_bindgen_test(async)]
+async fn resolver_preserves_legacy_bearer_string_as_inline_secret() {
+    register_eval_callback(
+        r#"
+            (function (connectionRef) {
+                return Promise.resolve("bearer-" + connectionRef.realm + "-" + connectionRef.binding);
+            })
+        "#,
+    );
+
+    let envelope = resolve_with_registered_callback()
+        .await
+        .expect("resolve bearer string");
+
+    match envelope {
+        ResolvedAuthEnvelope::InlineSecret {
+            secret,
+            metadata,
+            expires_at,
+        } => {
+            assert_eq!(secret, "bearer-browser-chatgpt");
+            assert_eq!(metadata, AuthMetadata::default());
+            assert_eq!(expires_at, None);
+        }
+        other => panic!("unexpected envelope: {other:?}"),
+    }
+}
+
+/// Typed JS resolver objects must cross the WASM boundary without losing lease
+/// expiration or non-secret provenance metadata.
+#[wasm_bindgen_test(async)]
+async fn resolver_preserves_typed_inline_secret_expiration_and_metadata() {
+    register_eval_callback(
+        r#"
+            (function (connectionRef) {
+                if (
+                    connectionRef.realm !== "browser" ||
+                    connectionRef.binding !== "chatgpt" ||
+                    connectionRef.profile !== "primary"
+                ) {
+                    return Promise.reject({
+                        kind: "other",
+                        detail: "connectionRef projection changed: " + JSON.stringify(connectionRef)
+                    });
+                }
+                return Promise.resolve({
+                    kind: "inline_secret",
+                    secret: "typed-access-token",
+                    metadata: {
+                        account_id: "acct_browser",
+                        workspace_id: "workspace_browser",
+                        user_id: "user_browser"
+                    },
+                    expires_at: "2030-01-02T03:04:05Z"
+                });
+            })
+        "#,
+    );
+
+    let envelope = resolve_with_registered_callback()
+        .await
+        .expect("resolve typed envelope");
+
+    match envelope {
+        ResolvedAuthEnvelope::InlineSecret {
+            secret,
+            metadata,
+            expires_at,
+        } => {
+            assert_eq!(secret, "typed-access-token");
+            assert_eq!(metadata.account_id.as_deref(), Some("acct_browser"));
+            assert_eq!(metadata.workspace_id.as_deref(), Some("workspace_browser"));
+            assert_eq!(metadata.user_id.as_deref(), Some("user_browser"));
+            assert_eq!(
+                expires_at.expect("expiration").to_rfc3339(),
+                "2030-01-02T03:04:05+00:00"
+            );
+        }
+        other => panic!("unexpected envelope: {other:?}"),
+    }
+}
+
+/// Structured JS rejections preserve stable auth-failure truth instead of
+/// collapsing every rejection into `AuthError::Other`.
+#[wasm_bindgen_test(async)]
+async fn resolver_preserves_structured_refresh_and_denial_failures() {
+    register_eval_callback(
+        r#"
+            (function (_) {
+                return Promise.reject({
+                    kind: "refresh_failed",
+                    detail: "browser refresh token revoked"
+                });
+            })
+        "#,
+    );
+    let err = resolve_with_registered_callback()
+        .await
+        .expect_err("refresh failure should remain typed");
+    match err {
+        AuthError::RefreshFailed(detail) => {
+            assert_eq!(detail, "browser refresh token revoked");
+        }
+        other => panic!("unexpected refresh error: {other:?}"),
+    }
+
+    register_eval_callback(
+        r#"
+            (function (_) {
+                return Promise.reject({ kind: "interactive_login_required" });
+            })
+        "#,
+    );
+    let err = resolve_with_registered_callback()
+        .await
+        .expect_err("denial should remain typed");
+    assert!(matches!(err, AuthError::InteractiveLoginRequired));
+}
+
+/// Missing credentials fail closed whether the host forgot to register a
+/// resolver, produced an empty token, or resolved to JS null.
+#[wasm_bindgen_test(async)]
+async fn resolver_fails_closed_for_missing_credentials() {
+    register_external_auth_resolver(JsValue::NULL).expect("clear");
+    let err = resolve_with_registered_callback()
+        .await
+        .expect_err("missing resolver should fail closed");
+    assert!(matches!(err, AuthError::MissingSecret));
+
+    register_eval_callback("(function (_) { return Promise.resolve('   '); })");
+    let err = resolve_with_registered_callback()
+        .await
+        .expect_err("blank token should fail closed");
+    assert!(matches!(err, AuthError::MissingSecret));
+
+    register_eval_callback("(function (_) { return Promise.resolve(null); })");
+    let err = resolve_with_registered_callback()
+        .await
+        .expect_err("null token should fail closed");
+    assert!(matches!(err, AuthError::MissingSecret));
+}
+
+/// Raw wasm-bindgen registration intentionally requires a Promise. The
+/// TypeScript SDK adapter provides the JS-facing convenience for callbacks
+/// that return a string synchronously.
+#[wasm_bindgen_test(async)]
+async fn resolver_rejects_non_promise_js_results() {
+    register_eval_callback("(function (_) { return 'bearer-without-promise'; })");
+
+    let err = resolve_with_registered_callback()
+        .await
+        .expect_err("raw WASM callback must return Promise");
+    let message = err.to_string();
+    assert!(
+        message.contains("must return a Promise"),
+        "unexpected error: {message}"
     );
 }

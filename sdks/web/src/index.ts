@@ -13,7 +13,11 @@ export {
   withConnectionRef,
 } from './auth.js';
 export type {
+  ExternalAuthFailure,
+  ExternalAuthLease,
+  ExternalAuthMetadata,
   ExternalAuthResolver,
+  ExternalAuthResolverResult,
   AuthTransport,
   AuthProfile,
   AuthBindingIdentity,
