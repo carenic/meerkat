@@ -685,8 +685,9 @@ Admit a correlated terminal peer response through the typed runtime ingress.
   "method": "session/peer_response_terminal",
   "params": {
     "session_id": "01936f8a-...",
-    "peer_name": "analyst",
-    "request_id": "req-123",
+    "peer_id": "00000000-0000-4000-8000-000000000161",
+    "display_name": "analyst",
+    "request_id": "00000000-0000-4000-8000-000000000162",
     "status": "completed",
     "result": {"token": "silver harbor"}
   }
@@ -706,15 +707,27 @@ Admit a correlated terminal peer response through the typed runtime ingress.
 </CodeGroup>
 
 <ParamField body="session_id" type="string" required>
-  Session ID to admit the external event to.
+  Session ID to admit the peer response to.
 </ParamField>
 
-<ParamField body="payload" type="any JSON" required>
-  Any JSON value. Stored as the runtime external-event payload.
+<ParamField body="peer_id" type="string" required>
+  Canonical peer routing ID.
 </ParamField>
 
-<ParamField body="source" type="string">
-  Optional source label. Defaults to `"rpc"` and becomes the runtime external-event source.
+<ParamField body="display_name" type="string">
+  Optional presentation label. It is not used as routing identity.
+</ParamField>
+
+<ParamField body="request_id" type="string" required>
+  Peer correlation ID for the request this terminal response completes.
+</ParamField>
+
+<ParamField body="status" type="string" required>
+  Terminal response status: `"completed"`, `"failed"`, or `"cancelled"`.
+</ParamField>
+
+<ParamField body="result" type="any JSON" required>
+  Peer-returned terminal payload.
 </ParamField>
 
 Error `-32603` if runtime admission fails, `-32602` if the session locator is invalid.

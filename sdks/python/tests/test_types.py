@@ -780,6 +780,44 @@ async def test_create_deferred_session_returns_runtime_backed_deferred_wrapper()
     ]
 
 
+@pytest.mark.asyncio
+async def test_peer_response_terminal_uses_canonical_peer_id_and_correlation() -> None:
+    from meerkat import PeerCorrelationId, PeerId
+
+    client = MeerkatClient()
+    seen: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_request(method: str, params: dict[str, object]) -> dict[str, object]:
+        seen.append((method, params))
+        return {"status": "accepted"}
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    await client.send_peer_response_terminal(
+        "sess-1",
+        PeerId("00000000-0000-4000-8000-000000000161"),
+        PeerCorrelationId("00000000-0000-4000-8000-000000000162"),
+        "completed",
+        {"ok": True},
+        display_name="analyst",
+    )
+
+    assert seen == [
+        (
+            "session/peer_response_terminal",
+            {
+                "session_id": "sess-1",
+                "peer_id": "00000000-0000-4000-8000-000000000161",
+                "request_id": "00000000-0000-4000-8000-000000000162",
+                "status": "completed",
+                "result": {"ok": True},
+                "display_name": "analyst",
+            },
+        )
+    ]
+    assert "peer_name" not in seen[0][1]
+
+
 def test_live_mcp_contract_types_exported():
     add = McpAddParams(
         session_id="s1",

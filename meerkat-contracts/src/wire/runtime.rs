@@ -3,7 +3,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::wire::session::WireContentBlock;
-use meerkat_core::comms::PeerName;
+use meerkat_core::PeerCorrelationId;
+use meerkat_core::comms::{PeerId, PeerName};
 
 fn deserialize_raw_json_box<'de, D>(
     deserializer: D,
@@ -89,13 +90,13 @@ pub enum PeerResponseTerminalStatusWire {
 /// `dogma-blind-spots` §7 alongside tool-call args.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct SessionPeerResponseTerminalParams {
     pub session_id: String,
+    pub peer_id: PeerId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub transport_identity: Option<String>,
-    pub route_identity: String,
-    pub display_identity: String,
-    pub request_id: String,
+    pub display_name: Option<PeerName>,
+    pub request_id: PeerCorrelationId,
     pub status: PeerResponseTerminalStatusWire,
     #[cfg_attr(feature = "schema", schemars(with = "serde_json::Value"))]
     pub result: Box<serde_json::value::RawValue>,
@@ -126,11 +127,10 @@ pub enum SessionExternalEventEnvelope {
     /// instead of routing terminal peer responses through the generic event
     /// ingress.
     PeerResponseTerminal {
+        peer_id: PeerId,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        transport_identity: Option<String>,
-        route_identity: String,
-        display_identity: String,
-        request_id: String,
+        display_name: Option<PeerName>,
+        request_id: PeerCorrelationId,
         status: PeerResponseTerminalStatusWire,
         #[serde(deserialize_with = "deserialize_raw_json_box")]
         #[cfg_attr(feature = "schema", schemars(with = "serde_json::Value"))]

@@ -101,6 +101,9 @@ import type {
   MobStatus,
   MobSummary,
   MobTurnStartOptions,
+  PeerCorrelationId,
+  PeerId,
+  PeerResponseTerminalOptions,
   RunResult,
   Schedule,
   ScheduleListOptions,
@@ -570,23 +573,21 @@ export class MeerkatClient {
 
   async sendPeerResponseTerminal(
     sessionId: string,
-    routeIdentity: string,
-    displayIdentity: string,
-    requestId: string,
+    peerId: PeerId,
+    requestId: PeerCorrelationId,
     status: "completed" | "failed" | "cancelled",
     result: unknown,
-    options?: { transportIdentity?: string },
+    options?: PeerResponseTerminalOptions,
   ): Promise<Record<string, unknown>> {
     const params: Record<string, unknown> = {
       session_id: sessionId,
-      route_identity: routeIdentity,
-      display_identity: displayIdentity,
+      peer_id: peerId,
       request_id: requestId,
       status,
       result,
     };
-    if (options?.transportIdentity !== undefined) {
-      params.transport_identity = options.transportIdentity;
+    if (options?.displayName !== undefined) {
+      params.display_name = options.displayName;
     }
     return this.request("session/peer_response_terminal", params);
   }

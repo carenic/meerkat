@@ -2322,8 +2322,9 @@ impl SessionRuntime {
     pub async fn accept_peer_response_terminal_via_runtime(
         self: &Arc<Self>,
         session_id: &SessionId,
-        source: meerkat_core::PeerResponseTerminalSource,
-        request_id: String,
+        peer_id: meerkat_core::comms::PeerId,
+        display_name: Option<meerkat_core::comms::PeerName>,
+        request_id: meerkat_core::PeerCorrelationId,
         status: meerkat_contracts::PeerResponseTerminalStatusWire,
         result: serde_json::Value,
     ) -> Result<meerkat_runtime::AcceptOutcome, RpcError> {
@@ -2334,13 +2335,13 @@ impl SessionRuntime {
 
         self.ensure_runtime_executor(session_id).await?;
 
-        let input =
-            meerkat_runtime::peer_response_terminal_input(source, request_id, status, result)
-                .map_err(|err| RpcError {
-                    code: error::INVALID_PARAMS,
-                    message: err.to_string(),
-                    data: None,
-                })?;
+        let input = meerkat_runtime::peer_response_terminal_input(
+            peer_id,
+            display_name,
+            request_id,
+            status,
+            result,
+        );
 
         self.runtime_adapter
             .accept_input(session_id, input)

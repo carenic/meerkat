@@ -94,6 +94,8 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "MobUnwireResult": schema_for!(crate::wire::MobUnwireResult),
         "WireRuntimeState": schema_for!(crate::wire::WireRuntimeState),
         "RuntimeStateResult": schema_for!(crate::wire::RuntimeStateResult),
+        "PeerResponseTerminalStatusWire": schema_for!(crate::wire::PeerResponseTerminalStatusWire),
+        "SessionExternalEventEnvelope": schema_for!(crate::wire::SessionExternalEventEnvelope),
         "WireRealtimeAttachmentStatus": schema_for!(crate::wire::WireRealtimeAttachmentStatus),
         "RuntimeRealtimeAttachmentStatusResult": schema_for!(crate::wire::RuntimeRealtimeAttachmentStatusResult),
         "RealtimeChannelTarget": schema_for!(crate::wire::RealtimeChannelTarget),
@@ -252,6 +254,7 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "RuntimeAcceptParams": schema_for!(crate::wire::RuntimeAcceptParams),
         "RuntimeRetireParams": schema_for!(crate::wire::RuntimeRetireParams),
         "RuntimeResetParams": schema_for!(crate::wire::RuntimeResetParams),
+        "SessionPeerResponseTerminalParams": schema_for!(crate::wire::SessionPeerResponseTerminalParams),
         "InputStateParams": schema_for!(crate::wire::InputStateParams),
         "InputListParams": schema_for!(crate::wire::InputListParams),
         "RuntimeRealtimeAttachmentStatusParams": schema_for!(crate::wire::RuntimeRealtimeAttachmentStatusParams),
@@ -627,9 +630,8 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
             "RestPeerResponseTerminalRequest".to_string(),
             object_schema(
                 vec![
-                    ("transport_identity", string_schema()),
-                    ("route_identity", string_schema()),
-                    ("display_identity", string_schema()),
+                    ("peer_id", string_schema()),
+                    ("display_name", string_schema()),
                     ("request_id", string_schema()),
                     (
                         "status",
@@ -640,13 +642,7 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
                     ),
                     ("result", json_value.clone()),
                 ],
-                vec![
-                    "route_identity",
-                    "display_identity",
-                    "request_id",
-                    "status",
-                    "result",
-                ],
+                vec!["peer_id", "request_id", "status", "result"],
             ),
         );
         components.insert(

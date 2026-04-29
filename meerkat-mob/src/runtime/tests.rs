@@ -20232,20 +20232,19 @@ async fn test_peer_response_reaches_requester_in_runtime_backed_real_comms() {
         "terminal peer response reaction should be system-triggered, not a new user prompt"
     );
 
-    let duplicate_source = meerkat_core::PeerResponseTerminalSource::new(
-        None,
-        meerkat_core::PeerResponseTerminalRouteIdentity::parse(responder_route_identity)
-            .expect("responder route identity"),
-        meerkat_core::PeerResponseTerminalDisplayIdentity::parse(responder_display_identity)
-            .expect("responder display identity"),
-    );
+    let duplicate_peer_id = meerkat_core::comms::PeerId::parse(&responder_route_identity)
+        .expect("responder peer id");
+    let duplicate_display_name =
+        meerkat_core::comms::PeerName::new(responder_display_identity.clone())
+            .expect("responder display name");
+    let duplicate_request_id = meerkat_core::PeerCorrelationId::from_uuid(request_id.0);
     let duplicate = meerkat_runtime::peer_response_terminal_input(
-        duplicate_source,
-        request_id.to_string(),
+        duplicate_peer_id,
+        Some(duplicate_display_name),
+        duplicate_request_id,
         meerkat_contracts::PeerResponseTerminalStatusWire::Completed,
         serde_json::json!({"interpretation":"lighthouse"}),
-    )
-    .expect("duplicate terminal response input");
+    );
     service
         .runtime_adapter
         .accept_input_with_completion(&sid_requester, duplicate)

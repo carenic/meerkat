@@ -26,7 +26,15 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Any
 
-from .types import ContentBlock, RunResult, SessionHistory, SkillKey, SkillRef
+from .types import (
+    ContentBlock,
+    PeerCorrelationId,
+    PeerId,
+    RunResult,
+    SessionHistory,
+    SkillKey,
+    SkillRef,
+)
 
 if TYPE_CHECKING:
     from .client import MeerkatClient
@@ -236,23 +244,21 @@ class Session:
 
     async def send_peer_response_terminal(
         self,
-        route_identity: str,
-        display_identity: str,
-        request_id: str,
+        peer_id: PeerId,
+        request_id: PeerCorrelationId,
         status: str,
         result: Any,
         *,
-        transport_identity: str | None = None,
+        display_name: str | None = None,
     ) -> dict[str, Any]:
         """Admit a correlated terminal peer response into this session runtime."""
         return await self._client.send_peer_response_terminal(
             self._id,
-            route_identity,
-            display_identity,
+            peer_id,
             request_id,
             status,
             result,
-            transport_identity=transport_identity,
+            display_name=display_name,
         )
 
     async def history(
@@ -425,23 +431,21 @@ class DeferredSession:
 
     async def send_peer_response_terminal(
         self,
-        route_identity: str,
-        display_identity: str,
-        request_id: str,
+        peer_id: PeerId,
+        request_id: PeerCorrelationId,
         status: str,
         result: Any,
         *,
-        transport_identity: str | None = None,
+        display_name: str | None = None,
     ) -> dict[str, Any]:
         """Admit a correlated terminal peer response into this deferred session."""
         return await self._client.send_peer_response_terminal(
             self._id,
-            route_identity,
-            display_identity,
+            peer_id,
             request_id,
             status,
             result,
-            transport_identity=transport_identity,
+            display_name=display_name,
         )
 
     async def history(

@@ -24,6 +24,9 @@ import type {
   CommsCommand,
   CommsSendReceipt,
   ContentBlock,
+  PeerCorrelationId,
+  PeerId,
+  PeerResponseTerminalOptions,
   RunResult,
   SessionHistory,
   SessionIngressOptions,
@@ -128,17 +131,15 @@ export class Session {
   }
 
   async sendPeerResponseTerminal(
-    routeIdentity: string,
-    displayIdentity: string,
-    requestId: string,
+    peerId: PeerId,
+    requestId: PeerCorrelationId,
     status: "completed" | "failed" | "cancelled",
     result: unknown,
-    options?: { transportIdentity?: string },
+    options?: PeerResponseTerminalOptions,
   ): Promise<Record<string, unknown>> {
     return this._client.sendPeerResponseTerminal(
       this._id,
-      routeIdentity,
-      displayIdentity,
+      peerId,
       requestId,
       status,
       result,
@@ -273,17 +274,15 @@ export class DeferredSession {
   }
 
   async sendPeerResponseTerminal(
-    routeIdentity: string,
-    displayIdentity: string,
-    requestId: string,
+    peerId: PeerId,
+    requestId: PeerCorrelationId,
     status: "completed" | "failed" | "cancelled",
     result: unknown,
-    options?: { transportIdentity?: string },
+    options?: PeerResponseTerminalOptions,
   ): Promise<Record<string, unknown>> {
     return this._client.sendPeerResponseTerminal(
       this._id,
-      routeIdentity,
-      displayIdentity,
+      peerId,
       requestId,
       status,
       result,
