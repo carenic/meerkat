@@ -26,6 +26,7 @@ pub struct AgentBuilder {
     config: Config,
     build_config: AgentBuildConfig,
     model_explicit: bool,
+    unsupported_core_injections: Vec<&'static str>,
 }
 
 impl Default for AgentBuilder {
@@ -45,6 +46,7 @@ impl AgentBuilder {
             config,
             build_config: AgentBuildConfig::new(model),
             model_explicit: false,
+            unsupported_core_injections: Vec::new(),
         }
     }
 
@@ -111,8 +113,12 @@ impl AgentBuilder {
     ///
     /// Public facade builds intentionally derive these defaults from
     /// `Config.provider_tools` and the model profile. Use `provider_params` for
-    /// explicit per-build provider overrides.
-    pub fn provider_tool_defaults(self, _defaults: serde_json::Value) -> Self {
+    /// explicit per-build provider overrides. Calling this standalone-only
+    /// injection method makes `try_build` return a configuration error instead
+    /// of silently dropping the supplied defaults.
+    pub fn provider_tool_defaults(mut self, _defaults: serde_json::Value) -> Self {
+        self.unsupported_core_injections
+            .push("provider_tool_defaults");
         self
     }
 
@@ -200,8 +206,10 @@ impl AgentBuilder {
     /// This is intentionally a builder-only core escape hatch. Facade builds
     /// route compaction through the factory/config pipeline; use
     /// [`crate::CoreAgentBuilder`] when a test or embedding must inject a
-    /// bespoke compactor directly into the core agent loop.
-    pub fn compactor(self, _compactor: Arc<dyn meerkat_core::compact::Compactor>) -> Self {
+    /// bespoke compactor directly into the core agent loop. Calling this on the
+    /// facade builder makes `try_build` return a configuration error.
+    pub fn compactor(mut self, _compactor: Arc<dyn meerkat_core::compact::Compactor>) -> Self {
+        self.unsupported_core_injections.push("compactor");
         self
     }
 
@@ -209,17 +217,24 @@ impl AgentBuilder {
     ///
     /// This direct core-loop injection is intentionally not a facade authority;
     /// the factory owns memory tool/session composition. Use
-    /// [`crate::CoreAgentBuilder`] for low-level standalone tests.
-    pub fn memory_store(self, _store: Arc<dyn meerkat_core::memory::MemoryStore>) -> Self {
+    /// [`crate::CoreAgentBuilder`] for low-level standalone tests. Calling this
+    /// on the facade builder makes `try_build` return a configuration error.
+    pub fn memory_store(mut self, _store: Arc<dyn meerkat_core::memory::MemoryStore>) -> Self {
+        self.unsupported_core_injections.push("memory_store");
         self
     }
 
     /// Runtime-backed turn-state handles are owned by the factory runtime mode.
     ///
-    /// The facade builder keeps this method as a compatibility no-op for older
-    /// direct-builder tests. Use `runtime_build_mode` to supply session-owned
-    /// runtime bindings.
-    pub fn with_turn_state_handle(self, _handle: Arc<dyn meerkat_core::TurnStateHandle>) -> Self {
+    /// Use `runtime_build_mode` to supply session-owned runtime bindings.
+    /// Calling this standalone-only injection method makes `try_build` return a
+    /// configuration error instead of silently dropping the supplied handle.
+    pub fn with_turn_state_handle(
+        mut self,
+        _handle: Arc<dyn meerkat_core::TurnStateHandle>,
+    ) -> Self {
+        self.unsupported_core_injections
+            .push("with_turn_state_handle");
         self
     }
 
@@ -234,6 +249,9 @@ impl AgentBuilder {
         tools: Arc<dyn AgentToolDispatcher>,
         store: Arc<dyn AgentSessionStore>,
     ) -> Result<DynAgent, BuildAgentError> {
+        if !self.model_explicit {
+            self.build_config.model = client.model().to_string();
+        }
         self.build_config.agent_llm_client_override = Some(client);
         self.build_config.tool_dispatcher_override = Some(tools);
         self.build_config.session_store_override = Some(store);
@@ -242,6 +260,16 @@ impl AgentBuilder {
 
     /// Build an agent using the factory resources already set on this builder.
     pub async fn try_build(self) -> Result<DynAgent, BuildAgentError> {
+        if !self.unsupported_core_injections.is_empty() {
+            return Err(BuildAgentError::Config(format!(
+                "public AgentBuilder cannot accept standalone core injection method(s): {}. \
+                 Facade builds route through AgentFactory-owned provider/session/runtime \
+                 composition; use AgentFactory/AgentBuildConfig for facade-owned settings or \
+                 CoreAgentBuilder for explicit standalone construction.",
+                self.unsupported_core_injections.join(", ")
+            )));
+        }
+
         self.factory
             .build_agent(self.build_config, &self.config)
             .await

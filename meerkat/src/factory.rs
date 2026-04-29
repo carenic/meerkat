@@ -1910,6 +1910,9 @@ impl AgentFactory {
         if let Some(client) = build_config.llm_client_override.as_ref() {
             return Ok((Provider::from_name(client.provider()), None));
         }
+        if let Some(client) = build_config.agent_llm_client_override.as_ref() {
+            return Ok((Provider::from_name(client.provider()), None));
+        }
 
         Err(BuildAgentError::UnknownProvider {
             model: build_config.model.clone(),

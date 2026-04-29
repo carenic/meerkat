@@ -7,13 +7,14 @@ use std::sync::{
 use async_trait::async_trait;
 use futures::stream;
 use meerkat::{
-    AgentBuildConfig, AgentBuilder, AgentFactory, AgentLlmClient, AgentToolDispatcher, Config,
-    CoreAgentBuilder, LlmDoneOutcome, LlmEvent, LlmRequest, ToolDef, ToolError, ToolResult,
+    AgentBuildConfig, AgentBuilder, AgentFactory, AgentLlmClient, AgentToolDispatcher,
+    BuildAgentError, Config, CoreAgentBuilder, LlmDoneOutcome, LlmEvent, LlmRequest, ToolDef,
+    ToolError, ToolResult,
 };
 use meerkat_client::LlmClient;
 use meerkat_core::ToolDispatchOutcome;
 use meerkat_core::{
-    AssistantBlock, BlobId, BlobRef, LlmStreamResult, Message, ProviderImageMetadata,
+    AssistantBlock, BlobId, BlobRef, LlmStreamResult, Message, Provider, ProviderImageMetadata,
     RevisedPromptDisposition, StopReason, ToolCallView, Usage,
 };
 use meerkat_core::{HookEngine, HookEngineError, HookExecutionReport, HookId, HookInvocation};
@@ -151,6 +152,90 @@ impl AgentLlmClient for ImageAgentLlmClient {
     }
 }
 
+struct CustomAgentLlmClient;
+
+#[async_trait]
+impl AgentLlmClient for CustomAgentLlmClient {
+    async fn stream_response(
+        &self,
+        _messages: &[Message],
+        _tools: &[Arc<ToolDef>],
+        _max_tokens: u32,
+        _temperature: Option<f32>,
+        _provider_params: Option<&meerkat_core::lifecycle::run_primitive::ProviderParamsOverride>,
+    ) -> Result<LlmStreamResult, meerkat::AgentError> {
+        Ok(LlmStreamResult::new(
+            vec![AssistantBlock::Text {
+                text: "custom ok".to_string(),
+                meta: None,
+            }],
+            StopReason::EndTurn,
+            Usage::default(),
+        ))
+    }
+
+    fn provider(&self) -> &'static str {
+        "custom-provider"
+    }
+
+    fn model(&self) -> &str {
+        "custom-agent-model"
+    }
+}
+
+struct NoopCompactor;
+
+impl meerkat_core::compact::Compactor for NoopCompactor {
+    fn should_compact(&self, _ctx: &meerkat_core::compact::CompactionContext) -> bool {
+        false
+    }
+
+    fn compaction_prompt(&self) -> &str {
+        ""
+    }
+
+    fn max_summary_tokens(&self) -> u32 {
+        1
+    }
+
+    fn rebuild_history(
+        &self,
+        messages: &[Message],
+        _summary: &str,
+    ) -> meerkat_core::compact::CompactionResult {
+        meerkat_core::compact::CompactionResult {
+            messages: messages.to_vec(),
+            discarded: Vec::new(),
+        }
+    }
+}
+
+struct NoopMemoryStore;
+
+#[async_trait]
+impl meerkat_core::memory::MemoryStore for NoopMemoryStore {
+    async fn index_scoped_batch(
+        &self,
+        batch: meerkat_core::memory::MemoryIndexBatch,
+    ) -> Result<meerkat_core::memory::MemoryIndexReceipt, meerkat_core::memory::MemoryStoreError>
+    {
+        Ok(meerkat_core::memory::MemoryIndexReceipt {
+            scope: batch.scope().clone(),
+            indexed_entries: batch.len(),
+        })
+    }
+
+    async fn search(
+        &self,
+        _scope: &meerkat_core::memory::MemorySearchScope,
+        _query: &str,
+        _limit: usize,
+    ) -> Result<Vec<meerkat_core::memory::MemoryResult>, meerkat_core::memory::MemoryStoreError>
+    {
+        Ok(Vec::new())
+    }
+}
+
 struct ParamsCaptureClient {
     captured: Mutex<serde_json::Value>,
 }
@@ -250,9 +335,6 @@ async fn test_sdk_agentfactory_tool_dispatch() {
     let mut agent = AgentBuilder::new()
         .model("claude-sonnet-4-6")
         .max_tokens_per_turn(64)
-        .with_turn_state_handle(std::sync::Arc::new(
-            meerkat_runtime::RuntimeTurnStateHandle::ephemeral(),
-        ))
         .build(llm_adapter, tools, store_adapter)
         .await
         .expect("public builder build");
@@ -485,6 +567,143 @@ async fn public_agentbuilder_preserves_agent_llm_image_blocks() {
         BlobId::new("image-blob-124"),
         "public builder compatibility path must preserve AgentLlmClient image blocks"
     );
+}
+
+#[tokio::test]
+async fn public_agentbuilder_build_uses_agent_llm_provider_for_uncatalogued_model() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let factory = AgentFactory::new(temp.path().join("sessions"));
+    let custom_client: Arc<dyn AgentLlmClient> = Arc::new(CustomAgentLlmClient);
+    let tools: Arc<dyn AgentToolDispatcher> = Arc::new(RecordingDispatcher {
+        called: Arc::new(AtomicBool::new(false)),
+    });
+    let store = Arc::new(TestSessionStore::new());
+    let store = Arc::new(factory.build_store_adapter(store).await);
+
+    let agent = AgentBuilder::new()
+        .with_factory(factory)
+        .model("custom-agent-model")
+        .build(custom_client, tools, store)
+        .await
+        .expect("public builder should accept AgentLlmClient provider identity");
+
+    let metadata = agent
+        .session()
+        .session_metadata()
+        .expect("factory metadata");
+    assert_eq!(metadata.provider, Provider::Other);
+    assert_eq!(metadata.model, "custom-agent-model");
+}
+
+#[tokio::test]
+async fn public_agentbuilder_build_defaults_to_agent_llm_identity_when_model_is_not_explicit() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let factory = AgentFactory::new(temp.path().join("sessions"));
+    let custom_client: Arc<dyn AgentLlmClient> = Arc::new(CustomAgentLlmClient);
+    let tools: Arc<dyn AgentToolDispatcher> = Arc::new(RecordingDispatcher {
+        called: Arc::new(AtomicBool::new(false)),
+    });
+    let store = Arc::new(TestSessionStore::new());
+    let store = Arc::new(factory.build_store_adapter(store).await);
+
+    let agent = AgentBuilder::new()
+        .with_factory(factory)
+        .build(custom_client, tools, store)
+        .await
+        .expect("public builder should derive default identity from AgentLlmClient");
+
+    let metadata = agent
+        .session()
+        .session_metadata()
+        .expect("factory metadata");
+    assert_eq!(metadata.provider, Provider::Other);
+    assert_eq!(
+        metadata.model, "custom-agent-model",
+        "implicit public builder model should not fall back to Config::default() when an AgentLlmClient override supplies identity"
+    );
+}
+
+fn assert_unsupported_builder_injection(error: BuildAgentError, method: &str) {
+    let BuildAgentError::Config(message) = error else {
+        panic!("expected Config error for {method}, got {error:?}");
+    };
+    assert!(
+        message.contains(method),
+        "error should name unsupported method {method}: {message}"
+    );
+    assert!(
+        message.contains("CoreAgentBuilder"),
+        "error should point callers to the standalone builder: {message}"
+    );
+}
+
+fn unwrap_build_error(
+    result: Result<meerkat::DynAgent, BuildAgentError>,
+    context: &str,
+) -> BuildAgentError {
+    match result {
+        Ok(_) => panic!("{context}"),
+        Err(error) => error,
+    }
+}
+
+#[tokio::test]
+async fn public_agentbuilder_rejects_standalone_core_injections_loudly() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let factory = AgentFactory::new(temp.path().join("sessions"));
+    let client: Arc<dyn LlmClient> = Arc::new(MockLlmClient {
+        calls: Arc::new(AtomicUsize::new(1)),
+    });
+
+    let provider_defaults_error = AgentBuilder::new()
+        .with_factory(factory.clone())
+        .model("claude-sonnet-4-6")
+        .llm_client(Arc::clone(&client))
+        .provider_tool_defaults(json!({"web_search": {"type": "custom"}}))
+        .try_build()
+        .await;
+    let provider_defaults_error = unwrap_build_error(
+        provider_defaults_error,
+        "provider_tool_defaults should not be silently ignored",
+    );
+    assert_unsupported_builder_injection(provider_defaults_error, "provider_tool_defaults");
+
+    let compactor_error = AgentBuilder::new()
+        .with_factory(factory.clone())
+        .model("claude-sonnet-4-6")
+        .llm_client(Arc::clone(&client))
+        .compactor(Arc::new(NoopCompactor))
+        .try_build()
+        .await;
+    let compactor_error =
+        unwrap_build_error(compactor_error, "compactor should not be silently ignored");
+    assert_unsupported_builder_injection(compactor_error, "compactor");
+
+    let memory_error = AgentBuilder::new()
+        .with_factory(factory.clone())
+        .model("claude-sonnet-4-6")
+        .llm_client(Arc::clone(&client))
+        .memory_store(Arc::new(NoopMemoryStore))
+        .try_build()
+        .await;
+    let memory_error =
+        unwrap_build_error(memory_error, "memory_store should not be silently ignored");
+    assert_unsupported_builder_injection(memory_error, "memory_store");
+
+    let turn_state_error = AgentBuilder::new()
+        .with_factory(factory)
+        .model("claude-sonnet-4-6")
+        .llm_client(client)
+        .with_turn_state_handle(Arc::new(
+            meerkat_runtime::RuntimeTurnStateHandle::ephemeral(),
+        ))
+        .try_build()
+        .await;
+    let turn_state_error = unwrap_build_error(
+        turn_state_error,
+        "with_turn_state_handle should not be silently ignored",
+    );
+    assert_unsupported_builder_injection(turn_state_error, "with_turn_state_handle");
 }
 
 #[tokio::test]

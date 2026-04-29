@@ -26,6 +26,8 @@ recovery-safe background completion handling.
 
 `meerkat::CoreAgentBuilder` is the lower-level `meerkat-core` builder. It is the intentional builder-only escape hatch for tests or embeddings that own every primitive directly and do not want facade-owned provider/auth/session/runtime composition.
 
+`meerkat::StandaloneAgentBuilder` is an alias for `CoreAgentBuilder` for code migrating from the older concrete `Agent<C, T, S>` builder contract. The facade `AgentBuilder::build(...)` now returns `Result<DynAgent, BuildAgentError>` because the factory pipeline may wrap or compose the supplied resources before the agent is runnable.
+
 **Use `AgentFactory` via `build_persistent_service()` (main path), `build_ephemeral_service()` (substrate/testing path), or the public `meerkat::AgentBuilder` facade unless you explicitly need to bypass session lifecycle orchestration.** Direct `CoreAgentBuilder` usage means you own composition, persistence, event handling, and any drift from the standard runtime-backed path.
 
 If you are building a runtime-backed surface around `SessionService`, avoid the
@@ -42,7 +44,7 @@ facade composition entirely.
 </Note>
 
 <Warning>
-If you are embedding Meerkat into an application, start with `SessionService`. Reach for `CoreAgentBuilder` only when you deliberately want an expert-only execution API with no runtime-managed session identity.
+If you are embedding Meerkat into an application, start with `SessionService`. Reach for `CoreAgentBuilder` or `StandaloneAgentBuilder` only when you deliberately want an expert-only execution API with no runtime-managed session identity. Facade `AgentBuilder` rejects direct `provider_tool_defaults`, `compactor`, `memory_store`, and `with_turn_state_handle` injection so those standalone-only behaviors cannot be silently dropped.
 </Warning>
 
 ```rust
