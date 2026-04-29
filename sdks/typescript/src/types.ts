@@ -352,6 +352,23 @@ export interface MobSpawnManyResultEntry {
   readonly error?: string;
 }
 
+export interface MobTurnStartOptions {
+  readonly skillRefs?: SkillRef[];
+  readonly flowToolOverlay?: TurnToolOverlay;
+  readonly additionalInstructions?: string[];
+  readonly keepAlive?: boolean;
+  readonly model?: string;
+  readonly provider?: string;
+  readonly maxTokens?: number;
+  readonly systemPrompt?: string;
+  readonly outputSchema?: unknown;
+  readonly structuredOutputRetries?: number;
+  readonly providerParams?: unknown;
+  readonly clearProviderParams?: boolean;
+  readonly connectionRef?: WireConnectionRef;
+  readonly clearConnectionRef?: boolean;
+}
+
 export interface MobEventsOptions {
   readonly afterCursor?: number;
   readonly limit?: number;

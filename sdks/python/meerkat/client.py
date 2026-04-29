@@ -38,6 +38,7 @@ from .events import Usage, parse_event
 from .generated.types import CONTRACT_VERSION
 from .generated.types import (
     MobDefinitionInput,
+    MobTurnStartParams,
     RealtimeCapabilitiesResult,
     RealtimeOpenInfo,
     RealtimeOpenRequest,
@@ -1429,13 +1430,43 @@ class MeerkatClient:
         self,
         mob_id: str,
         agent_identity: str,
-        prompt: str,
-        **overrides: Any,
-    ) -> dict:
-        return await self._request(
-            "mob/turn_start",
-            {"mob_id": mob_id, "agent_identity": agent_identity, "prompt": prompt, **overrides},
+        prompt: WireContentInput,
+        *,
+        skill_refs: list[SkillRef] | None = None,
+        flow_tool_overlay: dict[str, Any] | None = None,
+        additional_instructions: list[str] | None = None,
+        keep_alive: bool | None = None,
+        model: str | None = None,
+        provider: str | None = None,
+        max_tokens: int | None = None,
+        system_prompt: str | None = None,
+        output_schema: Any | None = None,
+        structured_output_retries: int | None = None,
+        provider_params: Any | None = None,
+        clear_provider_params: bool | None = None,
+        connection_ref: WireConnectionRef | dict[str, str] | None = None,
+        clear_connection_ref: bool | None = None,
+    ) -> dict[str, Any]:
+        params = MobTurnStartParams(
+            mob_id=mob_id,
+            agent_identity=agent_identity,
+            prompt=prompt,
+            skill_refs=_skill_refs_to_wire(skill_refs),
+            flow_tool_overlay=flow_tool_overlay,
+            additional_instructions=additional_instructions,
+            keep_alive=keep_alive,
+            model=model,
+            provider=provider,
+            max_tokens=max_tokens,
+            system_prompt=system_prompt,
+            output_schema=output_schema,
+            structured_output_retries=structured_output_retries,
+            provider_params=provider_params,
+            clear_provider_params=clear_provider_params,
+            connection_ref=connection_ref,
+            clear_connection_ref=clear_connection_ref,
         )
+        return await self._request("mob/turn_start", _wire_value(params))
 
     async def mob_member_status(
         self, mob_id: str, agent_identity: str

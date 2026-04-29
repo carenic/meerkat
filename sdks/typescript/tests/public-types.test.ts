@@ -1,4 +1,11 @@
-import type { MobCreateOptions, MobDefinition, SpawnManySpec, SpawnSpec } from "../src/index.js";
+import { MeerkatClient } from "../src/index.js";
+import type {
+  MobCreateOptions,
+  MobDefinition,
+  MobTurnStartOptions,
+  SpawnManySpec,
+  SpawnSpec,
+} from "../src/index.js";
 import type {
   MobSpawnParams as PublicMobSpawnParams,
   MobSpawnSpecParams as PublicMobSpawnSpecParams,
@@ -152,6 +159,39 @@ const publicSpawnManySpecWithSingleSpawnOnlyField: SpawnManySpec = {
 };
 
 void publicSpawnManySpecWithSingleSpawnOnlyField;
+
+const publicMobTurnStartOptions: MobTurnStartOptions = {
+  skillRefs: [{ sourceUuid: "00000000-0000-4000-8000-000000000001", skillName: "read" }],
+  flowToolOverlay: { allowedTools: ["read"], blockedTools: [] },
+  additionalInstructions: ["stay concise"],
+  keepAlive: true,
+  model: "gpt-test",
+  provider: "openai",
+  maxTokens: 128,
+  systemPrompt: "system",
+  outputSchema: { type: "object" },
+  structuredOutputRetries: 2,
+  providerParams: { temperature: 0.2 },
+  clearProviderParams: true,
+  connectionRef: { realm: "dev", binding: "default_openai" },
+  clearConnectionRef: true,
+};
+
+const publicMobTurnStartOptionsWithUnknown: MobTurnStartOptions = {
+  model: "gpt-test",
+  // @ts-expect-error turn_start overrides are explicit and must fail closed.
+  unexpectedOverride: true,
+};
+
+const publicMobTurnStartClient = new MeerkatClient();
+void publicMobTurnStartClient.mobTurnStart(
+  "mob-1",
+  "worker-1",
+  [{ type: "text", text: "continue" }],
+  publicMobTurnStartOptions,
+);
+void publicMobTurnStartOptions;
+void publicMobTurnStartOptionsWithUnknown;
 
 const generatedMobSpawn: MobSpawnParams = {
   mob_id: "mob-1",

@@ -1432,6 +1432,9 @@ describe("Parity wrappers", () => {
           }],
         };
       }
+      if (method === "mob/turn_start") {
+        return { status: "started" };
+      }
       if (method === "mob/events") {
         return { events: [{ cursor: 1 }] };
       }
@@ -1486,6 +1489,27 @@ describe("Parity wrappers", () => {
       agentIdentity: "worker-1",
       connectionRef: { realm: "dev", binding: "default_anthropic" },
     }]);
+    await client.mobTurnStart(
+      "mob-1",
+      "worker-1",
+      [{ type: "text", text: "continue" }],
+      {
+        skillRefs: [{ sourceUuid: "00000000-0000-4000-8000-000000000001", skillName: "read" }],
+        flowToolOverlay: { allowedTools: ["read"], blockedTools: [] },
+        additionalInstructions: ["stay concise"],
+        keepAlive: true,
+        model: "gpt-test",
+        provider: "openai",
+        maxTokens: 128,
+        systemPrompt: "system",
+        outputSchema: { type: "object" },
+        structuredOutputRetries: 2,
+        providerParams: { temperature: 0.2 },
+        clearProviderParams: true,
+        connectionRef: { realm: "dev", binding: "default_openai" },
+        clearConnectionRef: true,
+      },
+    );
     const append = await client.appendMobSystemContext("mob-1", "worker-1", "remember this");
     const events = await client.readMobEvents("mob-1", { afterCursor: 10, limit: 5 });
     const created = await client.createMobProfile("worker", { model: "claude-sonnet-4-6" });
@@ -1513,6 +1537,7 @@ describe("Parity wrappers", () => {
     assert.deepEqual(calls.map((c) => c.method), [
       "mob/spawn",
       "mob/spawn_many",
+      "mob/turn_start",
       "mob/append_system_context",
       "mob/events",
       "mob/profile/create",
@@ -1548,8 +1573,32 @@ describe("Parity wrappers", () => {
       realm: "dev",
       binding: "default_anthropic",
     });
-    assert.equal(calls[3].params.after_cursor, 10);
-    assert.equal(calls[3].params.limit, 5);
+    assert.deepEqual(calls[2].params, {
+      mob_id: "mob-1",
+      agent_identity: "worker-1",
+      prompt: [{ type: "text", text: "continue" }],
+      skill_refs: [
+        {
+          source_uuid: "00000000-0000-4000-8000-000000000001",
+          skill_name: "read",
+        },
+      ],
+      flow_tool_overlay: { allowed_tools: ["read"], blocked_tools: [] },
+      additional_instructions: ["stay concise"],
+      keep_alive: true,
+      model: "gpt-test",
+      provider: "openai",
+      max_tokens: 128,
+      system_prompt: "system",
+      output_schema: { type: "object" },
+      structured_output_retries: 2,
+      provider_params: { temperature: 0.2 },
+      clear_provider_params: true,
+      connection_ref: { realm: "dev", binding: "default_openai" },
+      clear_connection_ref: true,
+    });
+    assert.equal(calls[4].params.after_cursor, 10);
+    assert.equal(calls[4].params.limit, 5);
   });
 
   it("returns identity-native mob member listings", async () => {

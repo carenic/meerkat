@@ -74,6 +74,7 @@ export type {
   MobSpawnManyResultEntry,
   MobStatus,
   MobSummary,
+  MobTurnStartOptions,
   ModelTier,
   ProviderModelCatalog,
   RunResult,

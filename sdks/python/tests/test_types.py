@@ -1504,6 +1504,84 @@ async def test_client_mcp_methods_reject_malformed_response():
         await client.mcp_add("s1", "filesystem", {"cmd": "npx"})
 
 
+@pytest.mark.asyncio
+async def test_mob_turn_start_wrapper_uses_typed_prompt_and_overrides():
+    client = MeerkatClient()
+    calls = []
+
+    async def fake_request(method: str, params: dict[str, object]) -> dict[str, object]:
+        calls.append((method, params))
+        return {"status": "started"}
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    await client.mob_turn_start(
+        "mob-1",
+        "worker-1",
+        [{"type": "text", "text": "continue"}],
+        skill_refs=[
+            SkillKey(
+                source_uuid="00000000-0000-4000-8000-000000000001",
+                skill_name="read",
+            )
+        ],
+        flow_tool_overlay={"allowed_tools": ["read"], "blocked_tools": []},
+        additional_instructions=["stay concise"],
+        keep_alive=True,
+        model="gpt-test",
+        provider="openai",
+        max_tokens=128,
+        system_prompt="system",
+        output_schema={"type": "object"},
+        structured_output_retries=2,
+        provider_params={"temperature": 0.2},
+        clear_provider_params=True,
+        connection_ref={"realm": "dev", "binding": "default_openai"},
+        clear_connection_ref=True,
+    )
+
+    assert calls == [
+        (
+            "mob/turn_start",
+            {
+                "mob_id": "mob-1",
+                "agent_identity": "worker-1",
+                "prompt": [{"type": "text", "text": "continue"}],
+                "skill_refs": [
+                    {
+                        "source_uuid": "00000000-0000-4000-8000-000000000001",
+                        "skill_name": "read",
+                    }
+                ],
+                "flow_tool_overlay": {
+                    "allowed_tools": ["read"],
+                    "blocked_tools": [],
+                },
+                "additional_instructions": ["stay concise"],
+                "keep_alive": True,
+                "model": "gpt-test",
+                "provider": "openai",
+                "max_tokens": 128,
+                "system_prompt": "system",
+                "output_schema": {"type": "object"},
+                "structured_output_retries": 2,
+                "provider_params": {"temperature": 0.2},
+                "clear_provider_params": True,
+                "connection_ref": {"realm": "dev", "binding": "default_openai"},
+                "clear_connection_ref": True,
+            },
+        )
+    ]
+
+    with pytest.raises(TypeError):
+        await client.mob_turn_start(
+            "mob-1",
+            "worker-1",
+            "continue",
+            unexpected_override=True,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Pattern matching
 # ---------------------------------------------------------------------------

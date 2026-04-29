@@ -99,6 +99,7 @@ import type {
   MobSpawnManyResultEntry,
   MobStatus,
   MobSummary,
+  MobTurnStartOptions,
   RunResult,
   Schedule,
   ScheduleListOptions,
@@ -220,6 +221,42 @@ function mobSpawnManySpecPayload(spec: SpawnManySpec): Record<string, unknown> {
   setIfDefined(payload, "context", spec.context);
   setIfDefined(payload, "additional_instructions", spec.additionalInstructions);
   setIfDefined(payload, "connection_ref", spec.connectionRef);
+  return payload;
+}
+
+function mobTurnStartPayload(
+  mobId: string,
+  agentIdentity: string,
+  prompt: ContentInput,
+  options?: MobTurnStartOptions,
+): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    mob_id: mobId,
+    agent_identity: agentIdentity,
+    prompt,
+  };
+  const wireRefs = skillRefsToWire(options?.skillRefs);
+  if (wireRefs) {
+    payload.skill_refs = wireRefs;
+  }
+  if (options?.flowToolOverlay) {
+    payload.flow_tool_overlay = {
+      allowed_tools: options.flowToolOverlay.allowedTools,
+      blocked_tools: options.flowToolOverlay.blockedTools,
+    };
+  }
+  setIfDefined(payload, "additional_instructions", options?.additionalInstructions);
+  setIfDefined(payload, "keep_alive", options?.keepAlive);
+  setIfDefined(payload, "model", options?.model);
+  setIfDefined(payload, "provider", options?.provider);
+  setIfDefined(payload, "max_tokens", options?.maxTokens);
+  setIfDefined(payload, "system_prompt", options?.systemPrompt);
+  setIfDefined(payload, "output_schema", options?.outputSchema);
+  setIfDefined(payload, "structured_output_retries", options?.structuredOutputRetries);
+  setIfDefined(payload, "provider_params", options?.providerParams);
+  setIfDefined(payload, "clear_provider_params", options?.clearProviderParams);
+  setIfDefined(payload, "connection_ref", options?.connectionRef);
+  setIfDefined(payload, "clear_connection_ref", options?.clearConnectionRef);
   return payload;
 }
 
@@ -1083,15 +1120,15 @@ export class MeerkatClient {
   async mobTurnStart(
     mobId: string,
     agentIdentity: string,
-    prompt: string,
-    overrides?: Record<string, unknown>,
+    prompt: ContentInput,
+    options?: MobTurnStartOptions,
   ): Promise<Record<string, unknown>> {
-    return await this.request("mob/turn_start", {
-      mob_id: mobId,
-      agent_identity: agentIdentity,
+    return await this.request("mob/turn_start", mobTurnStartPayload(
+      mobId,
+      agentIdentity,
       prompt,
-      ...overrides,
-    });
+      options,
+    ));
   }
 
   async mobMemberStatus(

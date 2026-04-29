@@ -421,6 +421,7 @@ pub async fn handle_spawn(
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MobSpawnManyParams {
     pub mob_id: String,
     pub specs: Vec<MobSpawnSpecParams>,
@@ -428,6 +429,7 @@ pub struct MobSpawnManyParams {
 
 /// Per-member spec within a `mob/spawn_many` batch.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MobSpawnSpecParams {
     pub profile: String,
     pub agent_identity: String,
@@ -2333,6 +2335,36 @@ mod tests {
             .expect_err("internal rust bundle fields must be rejected");
         assert!(
             err.to_string().contains("unknown field `rust_bundles`"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn mob_spawn_many_params_reject_unknown_fields() {
+        let top_level = serde_json::json!({
+            "mob_id": "m1",
+            "specs": [],
+            "unexpected": true
+        });
+        let err = serde_json::from_value::<MobSpawnManyParams>(top_level)
+            .expect_err("spawn_many top-level contract must fail closed");
+        assert!(
+            err.to_string().contains("unknown field `unexpected`"),
+            "unexpected error: {err}"
+        );
+
+        let nested = serde_json::json!({
+            "mob_id": "m1",
+            "specs": [{
+                "profile": "worker",
+                "agent_identity": "w1",
+                "launch_mode": { "mode": "fresh" }
+            }]
+        });
+        let err = serde_json::from_value::<MobSpawnManyParams>(nested)
+            .expect_err("spawn_many nested specs must fail closed");
+        assert!(
+            err.to_string().contains("unknown field `launch_mode`"),
             "unexpected error: {err}"
         );
     }
