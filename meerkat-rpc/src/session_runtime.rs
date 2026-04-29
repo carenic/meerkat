@@ -218,6 +218,23 @@ fn runtime_driver_error_to_rpc(err: RuntimeDriverError) -> RpcError {
     }
 }
 
+fn registered_model_provider_mismatch_reason(
+    registry: &meerkat_core::ModelRegistry,
+    provider: meerkat_core::Provider,
+    model: &str,
+) -> Option<String> {
+    let registered_provider = registry.entry(model)?.provider;
+    if registered_provider == provider {
+        return None;
+    }
+
+    Some(format!(
+        "model '{model}' is registered for provider '{}', not provider '{}'; specify a matching provider with the model override",
+        registered_provider.as_str(),
+        provider.as_str()
+    ))
+}
+
 fn profile_to_capability_surface(
     profile: &meerkat_models::profile::ModelProfile,
 ) -> SessionLlmCapabilitySurface {
@@ -384,6 +401,12 @@ impl SessionRuntimeLlmReconfigureHost {
         } else {
             current.provider
         };
+        if (request.model.is_some() || request.provider.is_some())
+            && let Some(reason) =
+                registered_model_provider_mismatch_reason(&registry, provider, &model)
+        {
+            return Err(RuntimeDriverError::ValidationFailed { reason });
+        }
         let provider_params = if request.clear_provider_params {
             None
         } else {
@@ -1383,6 +1406,16 @@ impl SessionRuntime {
         } else {
             current.provider
         };
+        if (ov.model.is_some() || ov.provider.is_some())
+            && let Some(reason) =
+                registered_model_provider_mismatch_reason(&registry, provider, &model)
+        {
+            return Err(RpcError {
+                code: error::INVALID_PARAMS,
+                message: reason,
+                data: None,
+            });
+        }
         let provider_params = if ov.clear_provider_params {
             None
         } else {
@@ -5973,7 +6006,36 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turn_model_override_without_provider_preserves_current_provider() {
+    async fn turn_model_override_without_provider_preserves_current_provider_for_owned_model() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = make_runtime(temp_factory(&temp), 10);
+        let current = SessionLlmIdentity {
+            model: "claude-sonnet-4-5".to_string(),
+            provider: meerkat_core::Provider::Anthropic,
+            self_hosted_server_id: None,
+            provider_params: None,
+            connection_ref: None,
+        };
+        let overrides = crate::handlers::turn::TurnOverrides {
+            model: Some("claude-opus-4-6".to_string()),
+            ..Default::default()
+        };
+
+        let resolved = runtime
+            .resolve_target_llm_identity(&current, &overrides)
+            .await
+            .expect("model-only override should resolve against the current provider");
+
+        assert_eq!(
+            resolved.provider,
+            meerkat_core::Provider::Anthropic,
+            "model-only turn overrides must not infer a new provider from model id alone"
+        );
+        assert_eq!(resolved.model, "claude-opus-4-6");
+    }
+
+    #[tokio::test]
+    async fn turn_model_override_without_provider_rejects_other_provider_catalog_model() {
         let temp = tempfile::tempdir().unwrap();
         let runtime = make_runtime(temp_factory(&temp), 10);
         let current = SessionLlmIdentity {
@@ -5988,15 +6050,18 @@ mod tests {
             ..Default::default()
         };
 
-        let resolved = runtime
+        let err = runtime
             .resolve_target_llm_identity(&current, &overrides)
             .await
-            .expect("model-only override should resolve against the current provider");
+            .expect_err("model owned by another provider must fail closed");
 
-        assert_eq!(
-            resolved.provider,
-            meerkat_core::Provider::Anthropic,
-            "model-only turn overrides must not infer a new provider from model id alone"
+        assert_eq!(err.code, error::INVALID_PARAMS);
+        assert!(
+            err.message.contains("openai")
+                && err.message.contains("anthropic")
+                && err.message.contains("gpt-5.4"),
+            "error should identify the rejected provider/model pair: {}",
+            err.message
         );
     }
 
