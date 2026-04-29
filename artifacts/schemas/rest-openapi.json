@@ -5459,7 +5459,7 @@
         "type": "object"
       },
       "MobTurnStartParams": {
-        "additionalProperties": false,
+        "additionalProperties": true,
         "description": "Request payload for `mob/turn_start`.",
         "properties": {
           "agent_identity": {

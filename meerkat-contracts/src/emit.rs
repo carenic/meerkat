@@ -1219,6 +1219,25 @@ mod tests {
     }
 
     #[test]
+    fn emitted_mob_turn_start_params_allow_override_fields() {
+        let output_dir = temp_output_dir("mob-turn-start-overrides");
+        emit_all_schemas(&output_dir).expect("emit schemas");
+
+        let params: serde_json::Value =
+            serde_json::from_slice(&fs::read(output_dir.join("params.json")).unwrap()).unwrap();
+        let turn_start = params
+            .get("MobTurnStartParams")
+            .expect("MobTurnStartParams schema must be emitted");
+        assert_ne!(
+            turn_start.get("additionalProperties"),
+            Some(&serde_json::Value::Bool(false)),
+            "mob/turn_start params must permit flattened turn override fields"
+        );
+
+        fs::remove_dir_all(&output_dir).unwrap();
+    }
+
+    #[test]
     fn emitted_rest_openapi_contains_wire_contracts_not_only_paths() {
         let output_dir = temp_output_dir("rest-openapi-contracts");
         emit_all_schemas(&output_dir).expect("emit schemas");

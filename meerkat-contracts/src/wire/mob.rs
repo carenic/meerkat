@@ -1382,7 +1382,6 @@ pub struct MobForceCancelResult {
 /// Request payload for `mob/turn_start`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(deny_unknown_fields)]
 pub struct MobTurnStartParams {
     pub mob_id: String,
     pub agent_identity: String,
@@ -1782,6 +1781,30 @@ mod tests {
         assert!(
             msg.contains("unknown field `local`") || msg.contains("missing field `member`"),
             "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn mob_turn_start_params_capture_turn_override_fields() {
+        let params = serde_json::from_value::<MobTurnStartParams>(serde_json::json!({
+            "mob_id": "mob-1",
+            "agent_identity": "worker",
+            "prompt": "continue",
+            "output_schema": { "type": "object" },
+            "structured_output_retries": 2
+        }))
+        .expect("turn_start should accept flattened turn override fields");
+
+        assert_eq!(params.mob_id, "mob-1");
+        assert_eq!(params.agent_identity, "worker");
+        assert_eq!(params.prompt, serde_json::json!("continue"));
+        assert_eq!(
+            params.turn_overrides.get("output_schema"),
+            Some(&serde_json::json!({ "type": "object" }))
+        );
+        assert_eq!(
+            params.turn_overrides.get("structured_output_retries"),
+            Some(&serde_json::json!(2))
         );
     }
 
