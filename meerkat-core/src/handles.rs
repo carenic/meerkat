@@ -29,6 +29,7 @@ use crate::LoopState;
 use crate::comms::InputSource;
 use crate::lifecycle::run_primitive::ModelId;
 use crate::lifecycle::{InputId, RunId};
+use crate::ops::{AsyncOpRef, OperationId};
 use crate::peer_correlation::{
     InboundPeerRequestState, InteractionStreamState, OutboundPeerRequestState, PeerCorrelationId,
 };
@@ -336,8 +337,8 @@ pub struct TurnStateSnapshot {
     pub vision_enabled: bool,
     pub image_tool_results_enabled: bool,
     pub tool_calls_pending: u64,
-    pub pending_op_refs: BTreeSet<String>,
-    pub barrier_operation_ids: BTreeSet<String>,
+    pub pending_op_refs: BTreeSet<AsyncOpRef>,
+    pub barrier_operation_ids: BTreeSet<OperationId>,
     pub has_barrier_ops: bool,
     pub barrier_satisfied: bool,
     pub boundary_count: u64,
@@ -384,15 +385,15 @@ pub trait TurnStateHandle: Send + Sync {
 
     fn register_pending_ops(
         &self,
-        op_refs: BTreeSet<String>,
-        barrier_operation_ids: BTreeSet<String>,
+        op_refs: BTreeSet<AsyncOpRef>,
+        barrier_operation_ids: BTreeSet<OperationId>,
     ) -> Result<(), DslTransitionError>;
 
     fn tool_calls_resolved(&self) -> Result<(), DslTransitionError>;
 
     fn ops_barrier_satisfied(
         &self,
-        operation_ids: BTreeSet<String>,
+        operation_ids: BTreeSet<OperationId>,
     ) -> Result<(), DslTransitionError>;
 
     fn boundary_continue(&self) -> Result<(), DslTransitionError>;

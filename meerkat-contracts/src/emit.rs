@@ -360,4 +360,50 @@ mod tests {
 
         fs::remove_dir_all(&output_dir).unwrap();
     }
+
+    #[test]
+    fn emitted_rpc_catalog_carries_typed_auth_and_mob_contracts() {
+        let output_dir = temp_output_dir("typed-rpc-catalog");
+        emit_all_schemas(&output_dir).expect("emit schemas");
+
+        let rpc_methods: serde_json::Value =
+            serde_json::from_slice(&fs::read(output_dir.join("rpc-methods.json")).unwrap())
+                .unwrap();
+        let methods = rpc_methods["methods"].as_array().expect("methods array");
+
+        for (name, params_type, result_type) in [
+            (
+                "auth/login/device_complete",
+                "DeviceCompleteParams",
+                "WireDeviceCompleteResult",
+            ),
+            (
+                "auth/profile/create",
+                "CreateProfileParams",
+                "WireAuthProfileCreated",
+            ),
+            ("mob/spawn", "MobSpawnParams", "MobSpawnResult"),
+            (
+                "mob/cancel_all_work",
+                "MobCancelAllWorkParams",
+                "MobCancelAllWorkResult",
+            ),
+            ("mob/wait_ready", "MobWaitReadyParams", "MobWaitReadyResult"),
+        ] {
+            let method = methods
+                .iter()
+                .find(|method| method["name"] == name)
+                .unwrap_or_else(|| panic!("missing emitted RPC catalog entry for {name}"));
+            assert_eq!(
+                method["params_type"], params_type,
+                "{name} emitted params_type drifted"
+            );
+            assert_eq!(
+                method["result_type"], result_type,
+                "{name} emitted result_type drifted"
+            );
+        }
+
+        fs::remove_dir_all(&output_dir).unwrap();
+    }
 }

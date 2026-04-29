@@ -49,7 +49,7 @@ impl<C: LlmClient + 'static> AgentLlmClient for LlmClientAdapter<C> {
         tools: &[Arc<ToolDef>],
         max_tokens: u32,
         temperature: Option<f32>,
-        _provider_params: Option<&serde_json::Value>,
+        _provider_params: Option<&meerkat_core::lifecycle::run_primitive::ProviderParamsOverride>,
     ) -> Result<LlmStreamResult, AgentError> {
         let request = LlmRequest {
             model: self.model.clone(),
@@ -1410,7 +1410,9 @@ mod sanity {
             _tools: &[Arc<ToolDef>],
             _max_tokens: u32,
             _temperature: Option<f32>,
-            _provider_params: Option<&serde_json::Value>,
+            _provider_params: Option<
+                &meerkat_core::lifecycle::run_primitive::ProviderParamsOverride,
+            >,
         ) -> Result<LlmStreamResult, AgentError> {
             Ok(LlmStreamResult::new(
                 vec![meerkat_core::AssistantBlock::Text {

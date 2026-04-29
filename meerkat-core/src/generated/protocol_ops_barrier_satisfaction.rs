@@ -15,11 +15,5 @@ pub fn submit_ops_barrier_satisfied(
     handle: &(impl TurnStateHandle + ?Sized),
     obligation: OpsBarrierSatisfactionObligation,
 ) -> Result<(), DslTransitionError> {
-    handle.ops_barrier_satisfied(
-        obligation
-            .operation_ids
-            .iter()
-            .map(ToString::to_string)
-            .collect(),
-    )
+    handle.ops_barrier_satisfied(obligation.operation_ids.into_iter().collect())
 }

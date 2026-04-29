@@ -56,7 +56,14 @@ fn bridge_delivery_rejection_cause(
     match reason {
         meerkat_runtime::RejectReason::NotReady { state } => {
             BridgeDeliveryRejectionCause::NotReady {
-                state: state.clone(),
+                state: match runtime_state_to_bridge(*state) {
+                    Ok(state) => state,
+                    Err(err) => {
+                        return BridgeDeliveryRejectionCause::Internal {
+                            detail: err.to_string(),
+                        };
+                    }
+                },
             }
         }
         meerkat_runtime::RejectReason::DurabilityViolation { detail } => {

@@ -876,6 +876,106 @@ impl ProviderParamsOverride {
             && self.thinking_budget_tokens.is_none()
             && self.provider_tag.is_none()
     }
+
+    pub fn from_legacy_provider_value(provider: &str, value: &serde_json::Value) -> Self {
+        let Some(obj) = value.as_object() else {
+            if value.is_null() {
+                return Self::default();
+            }
+            return Self {
+                provider_tag: Some(unknown_provider_tag(provider, value)),
+                ..Default::default()
+            };
+        };
+
+        let mut remaining = serde_json::Map::new();
+        let mut override_params = Self::default();
+
+        for (key, item) in obj {
+            match key.as_str() {
+                "temperature" => {
+                    if let Some(value) = item.as_f64() {
+                        override_params.temperature = Some(value as f32);
+                    } else {
+                        remaining.insert(key.clone(), item.clone());
+                    }
+                }
+                "top_p" => {
+                    if let Some(value) = item.as_f64() {
+                        override_params.top_p = Some(value as f32);
+                    } else {
+                        remaining.insert(key.clone(), item.clone());
+                    }
+                }
+                "max_output_tokens" => {
+                    if let Some(value) = item.as_u64().and_then(|value| u32::try_from(value).ok()) {
+                        override_params.max_output_tokens = Some(value);
+                    } else {
+                        remaining.insert(key.clone(), item.clone());
+                    }
+                }
+                "reasoning" => {
+                    if let Some(value) = item.as_str().and_then(parse_reasoning_mode) {
+                        override_params.reasoning = Some(value);
+                    } else {
+                        remaining.insert(key.clone(), item.clone());
+                    }
+                }
+                "thinking_budget_tokens" => {
+                    if let Some(value) = item.as_u64().and_then(|value| u32::try_from(value).ok()) {
+                        override_params.thinking_budget_tokens = Some(value);
+                    } else {
+                        remaining.insert(key.clone(), item.clone());
+                    }
+                }
+                _ => {
+                    remaining.insert(key.clone(), item.clone());
+                }
+            }
+        }
+
+        if !remaining.is_empty() {
+            let provider_value = serde_json::Value::Object(remaining);
+            override_params.provider_tag =
+                Some(project_legacy_provider_tag(provider, &provider_value));
+        }
+
+        override_params
+    }
+}
+
+fn parse_reasoning_mode(value: &str) -> Option<ReasoningMode> {
+    match value {
+        "emit" => Some(ReasoningMode::Emit),
+        "silent" => Some(ReasoningMode::Silent),
+        "off" => Some(ReasoningMode::Off),
+        _ => None,
+    }
+}
+
+fn project_legacy_provider_tag(provider: &str, value: &serde_json::Value) -> ProviderTag {
+    match provider {
+        "anthropic" => AnthropicProviderTag::from_legacy_value(value)
+            .map(ProviderTag::Anthropic)
+            .unwrap_or_else(|_| unknown_provider_tag("anthropic", value)),
+        "openai" => OpenAiProviderTag::from_legacy_value(value)
+            .map(ProviderTag::OpenAi)
+            .unwrap_or_else(|_| unknown_provider_tag("openai", value)),
+        "gemini" | "google" => GeminiProviderTag::from_legacy_value(value)
+            .map(ProviderTag::Gemini)
+            .unwrap_or_else(|_| unknown_provider_tag("gemini", value)),
+        other => unknown_provider_tag(other, value),
+    }
+}
+
+fn unknown_provider_tag(provider: &str, value: &serde_json::Value) -> ProviderTag {
+    ProviderTag::Unknown {
+        bag: StructuredProviderExtension {
+            namespace: provider.to_string(),
+            key: "provider_params".to_string(),
+            body: value.to_string(),
+        },
+    }
 }
 
 /// Error returned when [`merge_batch_turn_metadata`] sees two distinct scalar

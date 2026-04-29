@@ -24,13 +24,8 @@ use serde_json::value::to_raw_value;
 use std::collections::HashSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use uuid::Uuid;
 
 use super::{Agent, AgentBuilder, AgentLlmClient, AgentSessionStore, AgentToolDispatcher};
-
-fn parse_operation_id(value: &str) -> Option<crate::ops::OperationId> {
-    Uuid::parse_str(value).ok().map(crate::ops::OperationId)
-}
 
 fn dispatcher_knows_tool<T>(dispatcher: &T, name: &str) -> bool
 where
@@ -85,15 +80,11 @@ fn runtime_execution_snapshot(
             snapshot
                 .pending_op_refs
                 .iter()
-                .map(|id| parse_operation_id(id))
-                .collect::<Option<Vec<_>>>()?,
+                .map(|op_ref| op_ref.operation_id.clone())
+                .collect(),
         )
     };
-    let barrier_operation_ids = snapshot
-        .barrier_operation_ids
-        .iter()
-        .map(|id| parse_operation_id(id))
-        .collect::<Option<Vec<_>>>()?;
+    let barrier_operation_ids = snapshot.barrier_operation_ids.iter().cloned().collect();
 
     Some(crate::AgentExecutionSnapshot {
         loop_state: snapshot.loop_state,

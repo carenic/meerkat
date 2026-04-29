@@ -22,11 +22,11 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::RwLock as StdRwLock;
 
-use meerkat_core::BlobStore;
 use meerkat_core::lifecycle::core_executor::CoreApplyOutput;
 use meerkat_core::lifecycle::run_control::RunControlCommand;
 use meerkat_core::lifecycle::{InputId, RunId};
 use meerkat_core::types::SessionId;
+use meerkat_core::{BlobId, BlobPayload, BlobRef, BlobStore, BlobStoreError};
 use meerkat_core::{
     SessionToolVisibilityState, ToolFilter, ToolScopeApplyError, ToolScopeRevision,
     ToolScopeStageError, ToolVisibilityOwner, ToolVisibilityWitness,
@@ -66,6 +66,42 @@ pub enum RuntimeBindingsError {
     /// Session was not found after registration (should not happen in practice).
     #[error("session {0} not found in runtime adapter after registration")]
     SessionNotFound(SessionId),
+}
+
+#[derive(Debug, Default)]
+struct UnavailableBlobStore;
+
+impl UnavailableBlobStore {
+    fn error() -> BlobStoreError {
+        BlobStoreError::Unsupported(
+            "persistent runtime constructed without blob store; blob-backed inputs require a BlobStore"
+                .to_string(),
+        )
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl BlobStore for UnavailableBlobStore {
+    async fn put_image(&self, _media_type: &str, _data: &str) -> Result<BlobRef, BlobStoreError> {
+        Err(Self::error())
+    }
+
+    async fn get(&self, _blob_id: &BlobId) -> Result<BlobPayload, BlobStoreError> {
+        Err(Self::error())
+    }
+
+    async fn delete(&self, _blob_id: &BlobId) -> Result<(), BlobStoreError> {
+        Err(Self::error())
+    }
+
+    async fn exists(&self, _blob_id: &BlobId) -> Result<bool, BlobStoreError> {
+        Err(Self::error())
+    }
+
+    fn is_persistent(&self) -> bool {
+        false
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -529,16 +565,15 @@ impl MeerkatMachine {
 
     /// Create a persistent adapter with a RuntimeStore but no blob store.
     ///
-    /// The driver will fall back to ephemeral mode for sessions (no durable
-    /// boundary commits), but ops lifecycle recovery from the store still works.
-    /// Primarily useful for tests that need to verify recovery without needing
-    /// a full blob store.
+    /// The driver remains persistent for session state. Blob-backed inputs fail
+    /// explicitly at the blob-store boundary until a real [`BlobStore`] is
+    /// supplied.
     pub fn persistent_without_blobs(store: Arc<dyn RuntimeStore>) -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
             mode: RuntimeMode::V9Compliant,
             store: Some(store),
-            blob_store: None,
+            blob_store: Some(Arc::new(UnavailableBlobStore)),
             llm_reconfigure_host: StdRwLock::new(None),
             session_claims: Arc::new(crate::handles::RuntimeSessionClaimRegistry::new()),
             composition_signal_dispatcher: StdRwLock::new(None),
@@ -633,18 +668,6 @@ impl MeerkatMachine {
                     runtime_id,
                     store.clone(),
                     blob_store.clone(),
-                    control_projection,
-                    dsl_authority,
-                ))
-            }
-            (Some(_store), None) => {
-                tracing::warn!(
-                    %session_id,
-                    "persistent runtime store present but blob store missing; \
-                     falling back to ephemeral driver"
-                );
-                DriverEntry::Ephemeral(EphemeralRuntimeDriver::new_with_control_and_dsl(
-                    runtime_id,
                     control_projection,
                     dsl_authority,
                 ))

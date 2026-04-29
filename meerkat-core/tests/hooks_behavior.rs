@@ -48,7 +48,7 @@ impl AgentLlmClient for ScenarioClient {
         _tools: &[Arc<ToolDef>],
         max_tokens: u32,
         _temperature: Option<f32>,
-        _provider_params: Option<&Value>,
+        _provider_params: Option<&meerkat_core::lifecycle::run_primitive::ProviderParamsOverride>,
     ) -> Result<LlmStreamResult, AgentError> {
         self.observed_max_tokens.lock().await.push(max_tokens);
 

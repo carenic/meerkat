@@ -10,6 +10,7 @@ use crate::input::Input;
 use crate::input_state::InputState;
 use crate::policy::PolicyDecision;
 use crate::policy_table::DefaultPolicyTable;
+use crate::runtime_state::RuntimeState;
 
 // `AcceptOutcome` is a domain envelope. The wire shape lives in
 // `meerkat-contracts::wire::runtime::RuntimeAcceptResult` and is materialized
@@ -72,7 +73,7 @@ pub enum RejectReason {
     /// Runtime is not in a state that accepts input (e.g. stopped, destroyed).
     NotReady {
         /// The runtime state that caused the rejection.
-        state: String,
+        state: RuntimeState,
     },
     /// Input failed durability validation.
     DurabilityViolation {
@@ -372,11 +373,11 @@ mod tests {
     #[test]
     fn reject_reason_display() {
         let not_ready = RejectReason::NotReady {
-            state: "Stopped".into(),
+            state: RuntimeState::Stopped,
         };
         assert_eq!(
             not_ready.to_string(),
-            "runtime not accepting input while in state: Stopped"
+            "runtime not accepting input while in state: stopped"
         );
 
         let durability = RejectReason::DurabilityViolation {
@@ -400,7 +401,7 @@ mod tests {
     fn reject_reason_serde_round_trip() {
         let reasons = vec![
             RejectReason::NotReady {
-                state: "Destroyed".into(),
+                state: RuntimeState::Destroyed,
             },
             RejectReason::DurabilityViolation {
                 detail: "external derived".into(),

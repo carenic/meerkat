@@ -4,16 +4,12 @@
 use crate::tokio;
 use async_trait::async_trait;
 use futures::StreamExt;
-use meerkat_core::lifecycle::run_primitive::{
-    AnthropicProviderTag, GeminiProviderTag, OpenAiProviderTag, ProviderTag,
-    StructuredProviderExtension,
-};
+use meerkat_core::lifecycle::run_primitive::{ProviderParamsOverride, ProviderTag};
 use meerkat_core::schema::{CompiledSchema, SchemaError};
 use meerkat_core::{
     AgentError, AgentEvent, AgentLlmClient, LlmStreamResult, Message, OutputSchema, StopReason,
     ToolDef, Usage,
 };
-use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 
@@ -62,7 +58,7 @@ impl LlmClientAdapter {
     }
 
     /// Set default typed provider-specific parameters to apply on every
-    /// request. Per-call `Option<&Value>` overrides from
+    /// request. Per-call typed overrides from
     /// [`AgentLlmClient::stream_response`] take precedence when present.
     pub fn with_provider_params(mut self, params: Option<ProviderTag>) -> Self {
         self.provider_params = params;
@@ -75,34 +71,53 @@ impl LlmClientAdapter {
         self
     }
 
-    /// Project the untyped `Option<&Value>` coming from
-    /// [`AgentLlmClient::stream_response`] into a typed
-    /// [`ProviderTag`] rooted in the adapter's provider. Unknown keys
-    /// fall through to `ProviderTag::Unknown { bag }` rather than
-    /// silently dropping (see `StructuredProviderExtension`).
-    fn project_value_to_provider_tag(&self, value: &Value) -> ProviderTag {
-        let provider = self.client.provider();
-        let fallback_unknown = |ns: &str| ProviderTag::Unknown {
-            bag: StructuredProviderExtension {
-                namespace: ns.to_string(),
-                key: "provider_params".to_string(),
-                body: value.to_string(),
-            },
+    fn apply_generic_provider_overrides(
+        &self,
+        tag: Option<ProviderTag>,
+        params: Option<&ProviderParamsOverride>,
+    ) -> Option<ProviderTag> {
+        let Some(params) = params else {
+            return tag;
         };
-        match provider {
-            "anthropic" => match AnthropicProviderTag::from_legacy_value(value) {
-                Ok(t) => ProviderTag::Anthropic(t),
-                Err(_) => fallback_unknown("anthropic"),
+
+        match self.client.provider() {
+            "anthropic" if params.thinking_budget_tokens.is_some() => match tag {
+                Some(ProviderTag::Anthropic(mut tag)) => {
+                    tag.thinking_budget_tokens = params.thinking_budget_tokens;
+                    Some(ProviderTag::Anthropic(tag))
+                }
+                None => Some(ProviderTag::Anthropic(
+                    meerkat_core::lifecycle::run_primitive::AnthropicProviderTag {
+                        thinking_budget_tokens: params.thinking_budget_tokens,
+                        ..Default::default()
+                    },
+                )),
+                other => other,
             },
-            "openai" => match OpenAiProviderTag::from_legacy_value(value) {
-                Ok(t) => ProviderTag::OpenAi(t),
-                Err(_) => fallback_unknown("openai"),
-            },
-            "gemini" | "google" => match GeminiProviderTag::from_legacy_value(value) {
-                Ok(t) => ProviderTag::Gemini(t),
-                Err(_) => fallback_unknown("gemini"),
-            },
-            other => fallback_unknown(other),
+            "gemini" | "google"
+                if params.top_p.is_some() || params.thinking_budget_tokens.is_some() =>
+            {
+                match tag {
+                    Some(ProviderTag::Gemini(mut tag)) => {
+                        if let Some(top_p) = params.top_p {
+                            tag.top_p = Some(top_p);
+                        }
+                        if let Some(budget) = params.thinking_budget_tokens {
+                            tag.thinking_budget = Some(budget);
+                        }
+                        Some(ProviderTag::Gemini(tag))
+                    }
+                    None => Some(ProviderTag::Gemini(
+                        meerkat_core::lifecycle::run_primitive::GeminiProviderTag {
+                            top_p: params.top_p,
+                            thinking_budget: params.thinking_budget_tokens,
+                            ..Default::default()
+                        },
+                    )),
+                    other => other,
+                }
+            }
+            _ => tag,
         }
     }
 }
@@ -121,19 +136,26 @@ impl AgentLlmClient for LlmClientAdapter {
         tools: &[Arc<ToolDef>],
         max_tokens: u32,
         temperature: Option<f32>,
-        provider_params: Option<&Value>,
+        provider_params: Option<&ProviderParamsOverride>,
     ) -> Result<LlmStreamResult, AgentError> {
-        let effective_params = match provider_params {
-            Some(value) => Some(self.project_value_to_provider_tag(value)),
-            None => self.provider_params.clone(),
-        };
+        let effective_params = provider_params
+            .and_then(|params| params.provider_tag.clone())
+            .or_else(|| self.provider_params.clone());
+        let effective_params =
+            self.apply_generic_provider_overrides(effective_params, provider_params);
+        let effective_max_tokens = provider_params
+            .and_then(|params| params.max_output_tokens)
+            .unwrap_or(max_tokens);
+        let effective_temperature = provider_params
+            .and_then(|params| params.temperature)
+            .or(temperature);
 
         let request = LlmRequest {
             model: self.model.clone(),
             messages: messages.to_vec(),
             tools: tools.to_vec(),
-            max_tokens,
-            temperature,
+            max_tokens: effective_max_tokens,
+            temperature: effective_temperature,
             stop_sequences: None,
             provider_params: effective_params,
         };

@@ -13,6 +13,7 @@ use crate::hooks::{
 };
 use crate::image_content::{MissingBlobBehavior, hydrate_messages_for_execution};
 use crate::lifecycle::RunId;
+use crate::lifecycle::run_primitive::ProviderParamsOverride;
 #[cfg(target_arch = "wasm32")]
 use crate::tokio;
 use crate::tool_catalog::{ToolCatalogDeferredEligibility, ToolCatalogMode, ToolPlaneClass};
@@ -30,7 +31,6 @@ use serde_json::value::RawValue;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 use tokio::sync::mpsc;
-use uuid::Uuid;
 
 use super::{
     Agent, AgentLlmClient, AgentSessionStore, AgentToolDispatcher, LlmStreamResult,
@@ -56,7 +56,7 @@ struct LlmRetryRequest<'a> {
     tools: &'a [Arc<ToolDef>],
     max_tokens: u32,
     temperature: Option<f32>,
-    provider_params: Option<&'a Value>,
+    provider_params: Option<&'a ProviderParamsOverride>,
 }
 
 fn turn_input_run_id(input: &TurnExecutionInput) -> Option<RunId> {
@@ -228,10 +228,6 @@ fn tool_error_result(tool_use_id: String, error: ToolError) -> ToolResult {
     ToolResult::new(tool_use_id, serialized, true)
 }
 
-fn parse_runtime_operation_id(value: &str) -> Option<crate::ops::OperationId> {
-    Uuid::parse_str(value).ok().map(crate::ops::OperationId)
-}
-
 impl<C, T, S> Agent<C, T, S>
 where
     C: AgentLlmClient + ?Sized + 'static,
@@ -292,11 +288,7 @@ where
 
     fn turn_barrier_operation_ids(&self) -> Result<Vec<crate::ops::OperationId>, AgentError> {
         let snapshot = self.runtime_turn_authority_snapshot()?;
-        Ok(snapshot
-            .barrier_operation_ids
-            .iter()
-            .filter_map(|id| parse_runtime_operation_id(id))
-            .collect())
+        Ok(snapshot.barrier_operation_ids.iter().cloned().collect())
     }
 
     fn turn_pending_ops_registered(&self) -> Result<bool, AgentError> {
@@ -638,18 +630,13 @@ where
                 barrier_operation_ids,
                 ..
             } => handle.register_pending_ops(
-                op_refs
-                    .iter()
-                    .map(|op| op.operation_id.to_string())
-                    .collect(),
-                barrier_operation_ids
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect(),
+                op_refs.iter().cloned().collect(),
+                barrier_operation_ids.iter().cloned().collect(),
             ),
             TurnExecutionInput::ToolCallsResolved { .. } => handle.tool_calls_resolved(),
-            TurnExecutionInput::OpsBarrierSatisfied { operation_ids, .. } => handle
-                .ops_barrier_satisfied(operation_ids.iter().map(ToString::to_string).collect()),
+            TurnExecutionInput::OpsBarrierSatisfied { operation_ids, .. } => {
+                handle.ops_barrier_satisfied(operation_ids.iter().cloned().collect())
+            }
             TurnExecutionInput::BoundaryContinue { .. } => handle.boundary_continue(),
             TurnExecutionInput::BoundaryComplete { .. } => handle.boundary_complete(),
             TurnExecutionInput::RecoverableFailure { retry, .. } => {
@@ -1564,6 +1551,15 @@ where
                     } else {
                         &tool_defs
                     };
+                    let typed_provider_params = effective_provider_params
+                        .as_ref()
+                        .map(|params| {
+                            ProviderParamsOverride::from_legacy_provider_value(
+                                self.client.provider(),
+                                params,
+                            )
+                        })
+                        .filter(|params| !params.is_empty());
 
                     // Call LLM with retry — route errors through machine authority
                     let boundary_system_context = self.take_pending_system_context_boundary();
@@ -1578,7 +1574,7 @@ where
                             tools: call_tool_defs,
                             max_tokens: effective_max_tokens,
                             temperature: effective_temperature,
-                            provider_params: effective_provider_params.as_ref(),
+                            provider_params: typed_provider_params.as_ref(),
                         })
                         .await
                     {
@@ -2573,7 +2569,7 @@ mod tests {
             _tools: &[Arc<ToolDef>],
             _max_tokens: u32,
             _temperature: Option<f32>,
-            _provider_params: Option<&Value>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
         ) -> Result<super::LlmStreamResult, AgentError> {
             Ok(super::LlmStreamResult::new(
                 vec![AssistantBlock::Text {
@@ -2596,7 +2592,8 @@ mod tests {
 
     struct RecordingLlmClient {
         seen_user_messages: Mutex<Vec<String>>,
-        seen_provider_params: Mutex<Vec<Option<Value>>>,
+        seen_provider_params:
+            Mutex<Vec<Option<crate::lifecycle::run_primitive::ProviderParamsOverride>>>,
     }
 
     impl RecordingLlmClient {
@@ -2611,7 +2608,9 @@ mod tests {
             self.seen_user_messages.lock().unwrap().clone()
         }
 
-        fn seen_params(&self) -> Vec<Option<Value>> {
+        fn seen_params(
+            &self,
+        ) -> Vec<Option<crate::lifecycle::run_primitive::ProviderParamsOverride>> {
             self.seen_provider_params.lock().unwrap().clone()
         }
     }
@@ -2745,7 +2744,7 @@ mod tests {
             _tools: &[Arc<ToolDef>],
             _max_tokens: u32,
             _temperature: Option<f32>,
-            provider_params: Option<&Value>,
+            provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
         ) -> Result<super::LlmStreamResult, AgentError> {
             let mut seen = self.seen_user_messages.lock().unwrap();
             for msg in messages {
@@ -2770,7 +2769,7 @@ mod tests {
         }
 
         fn provider(&self) -> &'static str {
-            "mock"
+            "openai"
         }
 
         fn model(&self) -> &'static str {
@@ -2803,7 +2802,7 @@ mod tests {
             _tools: &[Arc<ToolDef>],
             _max_tokens: u32,
             _temperature: Option<f32>,
-            _provider_params: Option<&Value>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
         ) -> Result<super::LlmStreamResult, AgentError> {
             let mut seen = self.seen_user_blocks.lock().unwrap();
             for message in messages {
@@ -2910,7 +2909,7 @@ mod tests {
             _tools: &[Arc<ToolDef>],
             _max_tokens: u32,
             _temperature: Option<f32>,
-            _provider_params: Option<&Value>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
         ) -> Result<super::LlmStreamResult, AgentError> {
             let last_user = messages
                 .iter()
@@ -3507,7 +3506,7 @@ mod tests {
             tools: &[Arc<ToolDef>],
             _max_tokens: u32,
             _temperature: Option<f32>,
-            _provider_params: Option<&Value>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
         ) -> Result<super::LlmStreamResult, AgentError> {
             self.seen_tools.lock().unwrap().push(
                 tools
@@ -3542,7 +3541,7 @@ mod tests {
             tools: &[Arc<ToolDef>],
             _max_tokens: u32,
             _temperature: Option<f32>,
-            _provider_params: Option<&Value>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
         ) -> Result<super::LlmStreamResult, AgentError> {
             self.seen_tools.lock().unwrap().push(
                 tools
@@ -3612,7 +3611,7 @@ mod tests {
             tools: &[Arc<ToolDef>],
             _max_tokens: u32,
             _temperature: Option<f32>,
-            _provider_params: Option<&Value>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
         ) -> Result<super::LlmStreamResult, AgentError> {
             self.seen_tools.lock().unwrap().push(
                 tools
@@ -3694,7 +3693,7 @@ mod tests {
             tools: &[Arc<ToolDef>],
             _max_tokens: u32,
             _temperature: Option<f32>,
-            _provider_params: Option<&Value>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
         ) -> Result<super::LlmStreamResult, AgentError> {
             self.seen_tools.lock().unwrap().push(
                 tools
@@ -4215,11 +4214,23 @@ mod tests {
         let seen_params = client.seen_params();
         assert_eq!(
             seen_params.last(),
-            Some(&Some(serde_json::json!({
-                "web_search": {"type": "web_search"},
-                "temperature": 0.2
-            }))),
-            "next LLM request must use the hot-swapped provider params/defaults, not the build-time policy",
+            Some(&Some(
+                crate::lifecycle::run_primitive::ProviderParamsOverride {
+                    temperature: Some(0.2),
+                    provider_tag: Some(crate::lifecycle::run_primitive::ProviderTag::OpenAi(
+                        crate::lifecycle::run_primitive::OpenAiProviderTag {
+                            web_search: Some(
+                                crate::lifecycle::run_primitive::OpaqueProviderBody::from_value(
+                                    &serde_json::json!({"type": "web_search"}),
+                                ),
+                            ),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                }
+            )),
+            "next LLM request must use typed hot-swapped provider params/defaults, not the build-time JSON bag",
         );
     }
 
@@ -4449,7 +4460,7 @@ mod tests {
             _tools: &[Arc<ToolDef>],
             _max_tokens: u32,
             _temperature: Option<f32>,
-            _provider_params: Option<&Value>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
         ) -> Result<super::LlmStreamResult, AgentError> {
             let mut calls = self.call_count.lock().unwrap();
             let response = if *calls == 0 {
@@ -5017,7 +5028,7 @@ mod tests {
             _tools: &[Arc<ToolDef>],
             _max_tokens: u32,
             _temperature: Option<f32>,
-            _provider_params: Option<&Value>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
         ) -> Result<super::LlmStreamResult, AgentError> {
             Ok(super::LlmStreamResult::new(
                 vec![AssistantBlock::Text {
@@ -5176,7 +5187,7 @@ mod tests {
             _tools: &[Arc<ToolDef>],
             _max_tokens: u32,
             _temperature: Option<f32>,
-            _provider_params: Option<&Value>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
         ) -> Result<super::LlmStreamResult, AgentError> {
             let mut times = self.call_times.lock().unwrap();
             times.push(std::time::Instant::now());
@@ -5337,7 +5348,7 @@ mod tests {
             _tools: &[Arc<ToolDef>],
             _max_tokens: u32,
             _temperature: Option<f32>,
-            _provider_params: Option<&Value>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
         ) -> Result<super::LlmStreamResult, AgentError> {
             *self.call_count.lock().unwrap() += 1;
             let mut responses = self.responses.lock().unwrap();
