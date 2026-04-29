@@ -148,6 +148,42 @@ fn seed_mob_authority_sync_from_roster(
     }
 }
 
+async fn seed_mob_authority_sync_from_flow_runs(
+    authority: &mut crate::machines::mob_machine::MobMachineAuthority,
+    run_store: Arc<dyn crate::store::MobRunStore>,
+    mob_id: &MobId,
+) -> Result<(), MobError> {
+    use crate::machines::mob_machine as mob_dsl;
+    use crate::run::MobRun;
+
+    let mut runs = run_store.list_runs(mob_id, None).await?;
+    runs.sort_by(|left, right| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left.run_id.to_string().cmp(&right.run_id.to_string()))
+    });
+
+    let resumed_phase = authority.state.lifecycle_phase;
+    for mut run in runs {
+        super::recovery::reconcile_run_state(&mut run).map_err(|error| {
+            MobError::Internal(format!("cannot resume flow run '{}': {error}", run.run_id))
+        })?;
+        if run.status.is_terminal() || run.flow_authority_inputs.is_empty() {
+            continue;
+        }
+
+        authority.state.lifecycle_phase = mob_dsl::MobPhase::Running;
+        MobRun::replay_flow_authority_inputs_into(
+            authority,
+            &run.flow_authority_inputs,
+            &format!("resume_flow_run_{}", run.run_id),
+        )?;
+        authority.state.lifecycle_phase = resumed_phase;
+    }
+    authority.state.lifecycle_phase = resumed_phase;
+    Ok(())
+}
+
 struct RuntimeWiring {
     roster: Arc<RwLock<RosterAuthority>>,
     task_board: Arc<RwLock<TaskBoard>>,
@@ -664,6 +700,12 @@ impl MobBuilder {
         // lets MobMachine guards (SubmitWork legality, Retire membership,
         // etc.) see resumed members on the first command.
         seed_mob_authority_sync_from_roster(&mut wiring.dsl_authority, &roster, &definition);
+        seed_mob_authority_sync_from_flow_runs(
+            &mut wiring.dsl_authority,
+            storage.runs.clone(),
+            &definition.id,
+        )
+        .await?;
         *wiring.roster.write().await = RosterAuthority::from_roster(roster);
         *wiring.task_board.write().await = task_board;
 
