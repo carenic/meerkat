@@ -846,6 +846,7 @@ async fn build_agent_with_resume_preserves_explicit_override_masked_fields() {
         peer_meta: Some(meerkat_core::PeerMeta::default().with_label("role", "explicit")),
         ..AgentBuildConfig::new("gpt-5.4")
     };
+    build_config.resume_override_mask.model = true;
     build_config.resume_override_mask.provider = true;
     build_config.resume_override_mask.max_tokens = true;
     build_config.resume_override_mask.provider_params = true;
@@ -859,7 +860,7 @@ async fn build_agent_with_resume_preserves_explicit_override_masked_fields() {
         .session_metadata()
         .expect("session should have metadata");
 
-    assert_eq!(metadata.model, "claude-sonnet-4-5");
+    assert_eq!(metadata.model, "gpt-5.4");
     assert_eq!(metadata.provider, Provider::OpenAI);
     assert_eq!(metadata.max_tokens, 1024);
     assert_eq!(

@@ -9580,6 +9580,11 @@ fn resolve_cli_provider(
     explicit: Option<Provider>,
 ) -> anyhow::Result<Provider> {
     if let Some(provider) = explicit {
+        if let Some(reason) = config.model_registry().ok().and_then(|registry| {
+            registry.provider_override_mismatch_reason(provider.as_core(), model)
+        }) {
+            anyhow::bail!(reason);
+        }
         return Ok(provider);
     }
 
@@ -13672,6 +13677,21 @@ supports_reasoning = true
         assert!(error.to_string().contains("Cannot infer provider"));
     }
 
+    #[test]
+    fn test_resolve_cli_provider_rejects_explicit_provider_contradicting_catalog_owner() {
+        let config = Config::default();
+        let error = resolve_cli_provider(&config, "gpt-5.4", Some(Provider::Anthropic))
+            .expect_err("explicit provider must match catalog ownership");
+        assert!(
+            error
+                .to_string()
+                .contains("registered for provider 'openai'")
+                && error.to_string().contains("not provider 'anthropic'")
+                && error.to_string().contains("gpt-5.4"),
+            "error should identify the rejected provider/model pair: {error}"
+        );
+    }
+
     #[cfg(feature = "comms")]
     #[test]
     fn test_comms_tool_dispatcher_provides_comms_tools() {
@@ -13934,6 +13954,7 @@ supports_reasoning = true
             step_ledger: Vec::new(),
             failure_ledger: Vec::new(),
             flow_state: Default::default(),
+            flow_authority_inputs: Vec::new(),
             frames: std::collections::BTreeMap::new(),
             loops: std::collections::BTreeMap::new(),
             loop_iteration_ledger: Vec::new(),
@@ -13978,6 +13999,7 @@ supports_reasoning = true
                             step_ledger: Vec::new(),
                             failure_ledger: Vec::new(),
                             flow_state: Default::default(),
+                            flow_authority_inputs: Vec::new(),
                             frames: std::collections::BTreeMap::new(),
                             loops: std::collections::BTreeMap::new(),
                             loop_iteration_ledger: Vec::new(),
@@ -13999,6 +14021,7 @@ supports_reasoning = true
                             step_ledger: Vec::new(),
                             failure_ledger: Vec::new(),
                             flow_state: Default::default(),
+                            flow_authority_inputs: Vec::new(),
                             frames: std::collections::BTreeMap::new(),
                             loops: std::collections::BTreeMap::new(),
                             loop_iteration_ledger: Vec::new(),

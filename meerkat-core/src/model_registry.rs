@@ -108,6 +108,23 @@ impl ModelRegistry {
             .filter(|entry| entry.provider == provider)
     }
 
+    pub fn provider_override_mismatch_reason(
+        &self,
+        provider: Provider,
+        model_id: &str,
+    ) -> Option<String> {
+        let registered_provider = self.entry(model_id)?.provider;
+        if registered_provider == provider {
+            return None;
+        }
+
+        Some(format!(
+            "model '{model_id}' is registered for provider '{}', not provider '{}'; explicit provider overrides must match catalog ownership",
+            registered_provider.as_str(),
+            provider.as_str()
+        ))
+    }
+
     pub fn profile_for(&self, model_id: &str) -> Option<ModelProfile> {
         self.entry(model_id).map(|entry| entry.profile.clone())
     }
@@ -415,6 +432,35 @@ mod tests {
         assert!(
             registry.profile_for("gpt-5.4").is_some(),
             "legacy unambiguous model-id lookup remains available"
+        );
+    }
+
+    #[test]
+    fn provider_override_mismatch_reason_reports_catalog_owner_contradictions() {
+        let registry = match ModelRegistry::from_config(&Config::default()) {
+            Ok(registry) => registry,
+            Err(err) => panic!("registry construction failed: {err}"),
+        };
+
+        let reason = registry
+            .provider_override_mismatch_reason(Provider::Anthropic, "gpt-5.4")
+            .expect("wrong-provider override for a catalog model should be rejected");
+        assert!(reason.contains("model 'gpt-5.4'"));
+        assert!(reason.contains("registered for provider 'openai'"));
+        assert!(reason.contains("not provider 'anthropic'"));
+        assert!(reason.contains("explicit provider overrides"));
+
+        assert!(
+            registry
+                .provider_override_mismatch_reason(Provider::OpenAI, "gpt-5.4")
+                .is_none(),
+            "matching provider override should remain valid"
+        );
+        assert!(
+            registry
+                .provider_override_mismatch_reason(Provider::OpenAI, "uncatalogued-gpt-compatible")
+                .is_none(),
+            "uncatalogued models have no catalog owner to contradict"
         );
     }
 }
