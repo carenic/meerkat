@@ -662,9 +662,12 @@ pub trait ExternalToolSurfaceHandle: Send + Sync {
 /// Peer comms ingress classification DSL handle.
 ///
 /// Covers the peer-envelope classification signals on the MeerkatMachine DSL.
-/// Envelope state (raw_item_id, peer_id, request_id, etc.) is staged via
-/// other DSL inputs before these signals fire; the signals themselves are
-/// parameterless — they advance the classification lifecycle phase.
+/// Runtime-backed comms ingress must fire one of these signals before the
+/// comms shell computes its stored compatibility projection (`PeerInputClass`,
+/// auth exemption, lifecycle subject, rendered text). A rejection is
+/// authoritative and callers fail closed. Standalone comms runtimes may have
+/// no session DSL handle; those retain the historical in-process projection
+/// path for wire compatibility.
 pub trait PeerCommsHandle: Send + Sync {
     /// Fire the `ClassifyExternalEnvelope` signal.
     fn classify_external_envelope(&self) -> Result<(), DslTransitionError>;

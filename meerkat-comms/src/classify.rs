@@ -8,9 +8,12 @@ use crate::trust::TrustedPeers;
 use crate::types::{InboxItem, MessageKind};
 use meerkat_core::{
     PeerIngressAuthDecision, PeerIngressKind, PeerIngressMachinePolicy, PeerInputClass,
+    handles::PeerCommsHandle,
 };
 use std::sync::Arc;
 use uuid::Uuid;
+
+pub(crate) type PeerCommsHandleSlot = Arc<parking_lot::RwLock<Option<Arc<dyn PeerCommsHandle>>>>;
 
 /// Receiver-owned context for synchronous ingress classification.
 ///
@@ -20,6 +23,7 @@ pub(crate) struct IngressClassificationContext {
     pub(crate) require_peer_auth: bool,
     pub(crate) trusted_peers: Arc<parking_lot::RwLock<TrustedPeers>>,
     pub(crate) ingress_policy: Arc<PeerIngressMachinePolicy>,
+    pub(crate) peer_comms_handle: PeerCommsHandleSlot,
 }
 
 /// Result of classifying an inbox item.
@@ -71,13 +75,56 @@ fn content_shape_for_text_and_blocks(
 }
 
 impl IngressClassificationContext {
+    fn machine_classify_external_envelope(&self) -> bool {
+        let handle = self.peer_comms_handle.read().clone();
+        let Some(handle) = handle else {
+            return true;
+        };
+
+        match handle.classify_external_envelope() {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "classified ingress rejected external envelope before shell auth/routing classification"
+                );
+                false
+            }
+        }
+    }
+
+    fn machine_classify_plain_event(&self) -> bool {
+        let handle = self.peer_comms_handle.read().clone();
+        let Some(handle) = handle else {
+            return true;
+        };
+
+        match handle.classify_plain_event() {
+            Ok(()) => true,
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    "classified ingress rejected plain event before shell routing classification"
+                );
+                false
+            }
+        }
+    }
+
     /// Prepare an inbox item for classified ingress.
     ///
-    /// This normalizes plain-event identities and computes the same
-    /// high-level ingress facts that the peer machine will need later.
+    /// Runtime-backed inboxes first hand the raw ingress shape to the
+    /// MeerkatMachine DSL. Only after that machine classification accepts do
+    /// we compute the compatibility projection stored on the queue. Standalone
+    /// comms runtimes leave `peer_comms_handle` unset and keep the historical
+    /// in-process behavior.
     pub(crate) fn prepare(&self, item: InboxItem) -> Option<PreparedIngressItem> {
         match item {
             InboxItem::External { envelope } => {
+                if !self.machine_classify_external_envelope() {
+                    return None;
+                }
+
                 let trusted = self.trusted_peers.read();
                 let from_peer = trusted.get_peer(&envelope.from).map(|p| p.name.clone());
                 let trusted_sender = from_peer.is_some();
@@ -185,6 +232,10 @@ impl IngressClassificationContext {
                 blocks,
                 render_metadata,
             } => {
+                if !self.machine_classify_plain_event() {
+                    return None;
+                }
+
                 let interaction_id = interaction_id.unwrap_or_else(Uuid::new_v4);
                 let text_projection = meerkat_core::interaction::format_external_event_projection(
                     &source.to_string(),
@@ -245,7 +296,87 @@ mod tests {
     use crate::identity::{Keypair, PubKey, Signature};
     use crate::trust::TrustedPeer;
     use crate::types::Envelope;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use uuid::Uuid;
+
+    struct RecordingPeerCommsHandle {
+        external_calls: AtomicUsize,
+        plain_calls: AtomicUsize,
+        reject_external: bool,
+        reject_plain: bool,
+    }
+
+    impl RecordingPeerCommsHandle {
+        fn accepting() -> Arc<Self> {
+            Arc::new(Self {
+                external_calls: AtomicUsize::new(0),
+                plain_calls: AtomicUsize::new(0),
+                reject_external: false,
+                reject_plain: false,
+            })
+        }
+
+        fn rejecting_external() -> Arc<Self> {
+            Arc::new(Self {
+                external_calls: AtomicUsize::new(0),
+                plain_calls: AtomicUsize::new(0),
+                reject_external: true,
+                reject_plain: false,
+            })
+        }
+
+        fn rejecting_plain() -> Arc<Self> {
+            Arc::new(Self {
+                external_calls: AtomicUsize::new(0),
+                plain_calls: AtomicUsize::new(0),
+                reject_external: false,
+                reject_plain: true,
+            })
+        }
+
+        fn external_calls(&self) -> usize {
+            self.external_calls.load(Ordering::SeqCst)
+        }
+
+        fn plain_calls(&self) -> usize {
+            self.plain_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl meerkat_core::handles::PeerCommsHandle for RecordingPeerCommsHandle {
+        fn classify_external_envelope(
+            &self,
+        ) -> Result<(), meerkat_core::handles::DslTransitionError> {
+            self.external_calls.fetch_add(1, Ordering::SeqCst);
+            if self.reject_external {
+                Err(meerkat_core::handles::DslTransitionError::guard_rejected(
+                    "test_peer_comms::classify_external_envelope",
+                    "machine rejected external ingress",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn classify_plain_event(&self) -> Result<(), meerkat_core::handles::DslTransitionError> {
+            self.plain_calls.fetch_add(1, Ordering::SeqCst);
+            if self.reject_plain {
+                Err(meerkat_core::handles::DslTransitionError::guard_rejected(
+                    "test_peer_comms::classify_plain_event",
+                    "machine rejected plain ingress",
+                ))
+            } else {
+                Ok(())
+            }
+        }
+
+        fn set_peer_ingress_context(
+            &self,
+            _keep_alive: bool,
+        ) -> Result<(), meerkat_core::handles::DslTransitionError> {
+            Ok(())
+        }
+    }
 
     fn make_keypair() -> Keypair {
         Keypair::generate()
@@ -256,12 +387,22 @@ mod tests {
         trusted_peers: TrustedPeers,
         silent_intents: Vec<&str>,
     ) -> IngressClassificationContext {
+        make_context_with_machine(require_peer_auth, trusted_peers, silent_intents, None)
+    }
+
+    fn make_context_with_machine(
+        require_peer_auth: bool,
+        trusted_peers: TrustedPeers,
+        silent_intents: Vec<&str>,
+        peer_comms_handle: Option<Arc<dyn meerkat_core::handles::PeerCommsHandle>>,
+    ) -> IngressClassificationContext {
         IngressClassificationContext {
             require_peer_auth,
             trusted_peers: Arc::new(parking_lot::RwLock::new(trusted_peers)),
             ingress_policy: Arc::new(PeerIngressMachinePolicy::from_silent_intents(
                 silent_intents,
             )),
+            peer_comms_handle: Arc::new(parking_lot::RwLock::new(peer_comms_handle)),
         }
     }
 
@@ -499,6 +640,34 @@ mod tests {
     }
 
     #[test]
+    fn auth_exempt_supervisor_intent_cannot_bypass_machine_rejection() {
+        let sender = make_keypair();
+        let machine = RecordingPeerCommsHandle::rejecting_external();
+        let ctx = make_context_with_machine(
+            true,
+            TrustedPeers::new(),
+            vec![],
+            Some(machine.clone() as Arc<dyn meerkat_core::handles::PeerCommsHandle>),
+        );
+        let envelope = make_envelope(
+            &sender,
+            MessageKind::Request {
+                intent: meerkat_core::SUPERVISOR_BRIDGE_INTENT.to_string(),
+                params: serde_json::json!({}),
+                handling_mode: None,
+            },
+        );
+
+        let result = ctx.classify(&InboxItem::External { envelope });
+
+        assert!(
+            result.is_none(),
+            "machine rejection must fail closed before auth exemptions apply"
+        );
+        assert_eq!(machine.external_calls(), 1);
+    }
+
+    #[test]
     fn classify_untrusted_legacy_bridge_intent_drops_at_ingress() {
         let sender = make_keypair();
         let trusted = TrustedPeers::new(); // sender NOT trusted yet
@@ -520,6 +689,82 @@ mod tests {
     }
 
     #[test]
+    fn machine_handoff_precedes_silent_routing_and_lifecycle_extraction() {
+        let sender = make_keypair();
+        let trusted = make_trusted_peers("orchestrator", &sender.public_key());
+        let machine = RecordingPeerCommsHandle::accepting();
+        let ctx = make_context_with_machine(
+            true,
+            trusted,
+            vec!["review"],
+            Some(machine.clone() as Arc<dyn meerkat_core::handles::PeerCommsHandle>),
+        );
+
+        let silent = ctx
+            .classify(&InboxItem::External {
+                envelope: make_envelope(
+                    &sender,
+                    MessageKind::Request {
+                        intent: "review".to_string(),
+                        params: serde_json::json!({}),
+                        handling_mode: None,
+                    },
+                ),
+            })
+            .expect("machine-accepted silent request should classify");
+        assert_eq!(silent.class, PeerInputClass::SilentRequest);
+
+        let lifecycle = ctx
+            .classify(&InboxItem::External {
+                envelope: make_envelope(
+                    &sender,
+                    MessageKind::Request {
+                        intent: "mob.peer_added".to_string(),
+                        params: serde_json::json!({"peer": "new-agent"}),
+                        handling_mode: None,
+                    },
+                ),
+            })
+            .expect("machine-accepted lifecycle request should classify");
+        assert_eq!(lifecycle.class, PeerInputClass::PeerLifecycleAdded);
+        assert_eq!(lifecycle.lifecycle_peer.as_deref(), Some("new-agent"));
+        assert_eq!(machine.external_calls(), 2);
+    }
+
+    #[test]
+    fn rendered_request_projection_is_created_only_after_machine_accepts() {
+        let sender = make_keypair();
+        let trusted = make_trusted_peers("sender-agent", &sender.public_key());
+        let machine = RecordingPeerCommsHandle::accepting();
+        let ctx = make_context_with_machine(
+            true,
+            trusted,
+            vec![],
+            Some(machine.clone() as Arc<dyn meerkat_core::handles::PeerCommsHandle>),
+        );
+        let envelope = make_envelope(
+            &sender,
+            MessageKind::Request {
+                intent: "review".to_string(),
+                params: serde_json::json!({"pr": 42}),
+                handling_mode: None,
+            },
+        );
+        let request_id = envelope.id.to_string();
+
+        let prepared = ctx
+            .prepare(InboxItem::External { envelope })
+            .expect("machine accepted request should prepare");
+
+        assert_eq!(prepared.class, PeerInputClass::ActionableRequest);
+        assert_eq!(prepared.request_id.as_deref(), Some(request_id.as_str()));
+        assert!(prepared.text_projection.starts_with(&format!(
+            "[COMMS REQUEST from sender-agent (id: {request_id})]\nIntent: review"
+        )));
+        assert_eq!(machine.external_calls(), 1);
+    }
+
+    #[test]
     fn classify_plain_event() {
         let ctx = make_context(false, TrustedPeers::new(), vec![]);
         let item = InboxItem::PlainEvent {
@@ -533,6 +778,58 @@ mod tests {
         let result = ctx.classify(&item).expect("should classify");
         assert_eq!(result.class, PeerInputClass::PlainEvent);
         assert!(result.from_peer.is_none());
+    }
+
+    #[test]
+    fn plain_event_projection_requires_machine_classification() {
+        let machine = RecordingPeerCommsHandle::accepting();
+        let ctx = make_context_with_machine(
+            false,
+            TrustedPeers::new(),
+            vec![],
+            Some(machine.clone() as Arc<dyn meerkat_core::handles::PeerCommsHandle>),
+        );
+
+        let prepared = ctx
+            .prepare(InboxItem::PlainEvent {
+                blocks: None,
+                body: "event body".to_string(),
+                source: meerkat_core::PlainEventSource::Tcp,
+                handling_mode: meerkat_core::types::HandlingMode::Queue,
+                interaction_id: None,
+                render_metadata: None,
+            })
+            .expect("machine accepted plain event should prepare");
+
+        assert_eq!(prepared.class, PeerInputClass::PlainEvent);
+        assert_eq!(prepared.text_projection, "[EVENT via tcp] event body");
+        assert_eq!(machine.plain_calls(), 1);
+    }
+
+    #[test]
+    fn plain_event_machine_rejection_fails_closed() {
+        let machine = RecordingPeerCommsHandle::rejecting_plain();
+        let ctx = make_context_with_machine(
+            false,
+            TrustedPeers::new(),
+            vec![],
+            Some(machine.clone() as Arc<dyn meerkat_core::handles::PeerCommsHandle>),
+        );
+
+        let prepared = ctx.prepare(InboxItem::PlainEvent {
+            blocks: None,
+            body: "event body".to_string(),
+            source: meerkat_core::PlainEventSource::Tcp,
+            handling_mode: meerkat_core::types::HandlingMode::Queue,
+            interaction_id: None,
+            render_metadata: None,
+        });
+
+        assert!(
+            prepared.is_none(),
+            "machine rejection must fail closed before plain-event routing"
+        );
+        assert_eq!(machine.plain_calls(), 1);
     }
 
     #[test]

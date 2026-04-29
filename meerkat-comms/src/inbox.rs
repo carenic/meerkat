@@ -1050,15 +1050,25 @@ mod tests {
 
     use crate::classify::IngressClassificationContext;
     use crate::trust::{TrustedPeer, TrustedPeers};
+    use std::sync::atomic::AtomicUsize;
 
     fn make_classification_context(
         trusted: TrustedPeers,
         require_auth: bool,
     ) -> Arc<IngressClassificationContext> {
+        make_classification_context_with_machine(trusted, require_auth, None)
+    }
+
+    fn make_classification_context_with_machine(
+        trusted: TrustedPeers,
+        require_auth: bool,
+        peer_comms_handle: Option<Arc<dyn meerkat_core::handles::PeerCommsHandle>>,
+    ) -> Arc<IngressClassificationContext> {
         Arc::new(IngressClassificationContext {
             require_peer_auth: require_auth,
             trusted_peers: Arc::new(parking_lot::RwLock::new(trusted)),
             ingress_policy: Arc::new(PeerIngressMachinePolicy::default()),
+            peer_comms_handle: Arc::new(parking_lot::RwLock::new(peer_comms_handle)),
         })
     }
 
@@ -1070,6 +1080,45 @@ mod tests {
                 addr: "inproc://test".to_string(),
                 meta: crate::PeerMeta::default(),
             }],
+        }
+    }
+
+    struct RejectingPeerCommsHandle {
+        external_calls: AtomicUsize,
+    }
+
+    impl RejectingPeerCommsHandle {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                external_calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn external_calls(&self) -> usize {
+            self.external_calls.load(Ordering::SeqCst)
+        }
+    }
+
+    impl meerkat_core::handles::PeerCommsHandle for RejectingPeerCommsHandle {
+        fn classify_external_envelope(
+            &self,
+        ) -> Result<(), meerkat_core::handles::DslTransitionError> {
+            self.external_calls.fetch_add(1, Ordering::SeqCst);
+            Err(meerkat_core::handles::DslTransitionError::guard_rejected(
+                "test_peer_comms::classify_external_envelope",
+                "machine rejected external ingress",
+            ))
+        }
+
+        fn classify_plain_event(&self) -> Result<(), meerkat_core::handles::DslTransitionError> {
+            Ok(())
+        }
+
+        fn set_peer_ingress_context(
+            &self,
+            _keep_alive: bool,
+        ) -> Result<(), meerkat_core::handles::DslTransitionError> {
+            Ok(())
         }
     }
 
@@ -1394,6 +1443,32 @@ mod tests {
             }
         );
         assert_eq!(inbox.dropped_count(), Some(1));
+    }
+
+    #[tokio::test]
+    async fn test_machine_rejection_returns_classification_rejected_drop_reason() {
+        let sender_pubkey = PubKey::new([1u8; 32]);
+        let machine = RejectingPeerCommsHandle::new();
+        let ctx = make_classification_context_with_machine(
+            make_trusted("peer", &sender_pubkey),
+            true,
+            Some(machine.clone() as Arc<dyn meerkat_core::handles::PeerCommsHandle>),
+        );
+        let (mut inbox, sender) = Inbox::new_classified(ctx);
+
+        let outcome = sender.send_classified(InboxItem::External {
+            envelope: make_test_envelope(),
+        });
+
+        assert_eq!(
+            outcome,
+            AdmissionOutcome::Dropped {
+                reason: DropReason::ClassificationRejected
+            }
+        );
+        assert_eq!(inbox.dropped_count(), Some(1));
+        assert_eq!(inbox.try_drain_classified().len(), 0);
+        assert_eq!(machine.external_calls(), 1);
     }
 
     #[tokio::test]
