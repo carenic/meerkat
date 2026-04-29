@@ -8680,27 +8680,21 @@ impl MobActor {
         description: String,
         blocked_by: Vec<TaskId>,
     ) -> Result<TaskId, MobError> {
-        if subject.trim().is_empty() {
-            return Err(MobError::Internal(
-                "task subject cannot be empty".to_string(),
-            ));
-        }
         let task_id = TaskId::from(uuid::Uuid::new_v4().to_string());
         let dsl_input = mob_dsl::MobMachineInput::TaskCreate {
             task_id: mob_dsl::TaskId::from(task_id.as_str()),
             task_payload: Self::task_payload_to_dsl(&subject, &description, &blocked_by),
         };
         // MobMachine is the admission authority. Allocate the id in the
-        // actor, fail closed through the DSL, then append/project the
-        // shell task-board event using the same id. This prevents the
-        // prior event-sourced-board/DSL split-brain where DSL rejection
-        // was only logged after the shell write.
+        // actor, prepare through the DSL, append/project the shell
+        // task-board event using the same id, then commit the prepared DSL
+        // state only after the board write succeeds.
         let prepared =
             self.prepare_command_admission(dsl_input, MobState::Running, "handle_task_create")?;
-        self.commit_prepared_dsl_input(prepared);
         self.task_board_service
             .create_task_with_id(task_id.clone(), subject, description, blocked_by)
             .await?;
+        self.commit_prepared_dsl_input(prepared);
         Ok(task_id)
     }
 
@@ -8729,14 +8723,15 @@ impl MobActor {
                 )));
             }
         }
-        // Gate the status transition through the DSL guard set before
-        // applying the shell-side event-sourced update. Rolling back from
-        // a terminal status (Completed / Cancelled) is rejected here
-        // rather than by the event projection.
-        self.commit_prepared_dsl_input(prepared);
+        // Gate the status transition through the DSL guard set before the
+        // shell-side event-sourced update, but commit only after the board
+        // write succeeds. Rolling back from a terminal status (Completed /
+        // Cancelled) is rejected here rather than by the event projection.
         self.task_board_service
             .update_task(task_id, status, owner)
-            .await
+            .await?;
+        self.commit_prepared_dsl_input(prepared);
+        Ok(())
     }
 
     /// Unified work-lane entry.
@@ -8936,6 +8931,10 @@ impl MobActor {
         fence_token: FenceToken,
     ) -> Result<(), MobError> {
         let agent_identity = MeerkatId::from(&runtime_id.identity);
+        let entry = {
+            let roster = self.roster.read().await;
+            roster.get(&agent_identity).cloned()
+        };
         let dsl_runtime_id = mob_dsl::AgentRuntimeId::from_domain(&runtime_id);
         let dsl_fence_token = mob_dsl::FenceToken::from_domain(fence_token);
         let prepared = self
@@ -8950,6 +8949,15 @@ impl MobActor {
                 if self.state() != MobState::Running {
                     return self.invalid_transition_to(MobState::Running);
                 }
+                if let Some(entry) = &entry
+                    && entry.fence_token != fence_token
+                {
+                    return MobError::StaleFenceToken {
+                        runtime_id: runtime_id.clone(),
+                        expected: entry.fence_token,
+                        actual: fence_token,
+                    };
+                }
                 if !self
                     .dsl_authority
                     .state
@@ -8961,13 +8969,7 @@ impl MobActor {
                 self.invalid_transition_to(MobState::Running)
             })?;
 
-        let entry = {
-            let roster = self.roster.read().await;
-            roster
-                .get(&agent_identity)
-                .cloned()
-                .ok_or_else(|| MobError::MemberNotFound(agent_identity.clone()))?
-        };
+        let entry = entry.ok_or_else(|| MobError::MemberNotFound(agent_identity.clone()))?;
         if entry.fence_token != fence_token {
             return Err(MobError::StaleFenceToken {
                 runtime_id,
