@@ -31,9 +31,13 @@ fn phase(slug: &str) -> PhaseId {
 }
 
 fn named_string(type_name: &str, value: &str) -> KernelValue {
+    named_value(type_name, KernelValue::String(value.into()))
+}
+
+fn named_value(type_name: &str, value: KernelValue) -> KernelValue {
     KernelValue::Named {
         type_name: NamedTypeId::parse(type_name).expect("type id"),
-        value: Box::new(KernelValue::String(value.into())),
+        value: Box::new(value),
     }
 }
 
@@ -52,8 +56,80 @@ fn tool_filter_all() -> KernelValue {
     )
 }
 
-fn witness(value: &str) -> KernelValue {
+fn string_key(value: &str) -> KernelValue {
+    KernelValue::String(value.to_string())
+}
+
+fn witness_string(value: &str) -> KernelValue {
     named_string("ToolVisibilityWitness", value)
+}
+
+fn empty_witness() -> KernelValue {
+    named_value("ToolVisibilityWitness", KernelValue::Map(BTreeMap::new()))
+}
+
+fn owner_witness(owner_key: &str) -> KernelValue {
+    named_value(
+        "ToolVisibilityWitness",
+        KernelValue::Map(BTreeMap::from([(
+            string_key("stable_owner_key"),
+            KernelValue::String(owner_key.to_string()),
+        )])),
+    )
+}
+
+fn provenance_witness(source_id: &str) -> KernelValue {
+    named_value(
+        "ToolVisibilityWitness",
+        KernelValue::Map(BTreeMap::from([(
+            string_key("last_seen_provenance"),
+            named_value(
+                "ToolProvenance",
+                KernelValue::Map(BTreeMap::from([
+                    (
+                        string_key("kind"),
+                        named_string("ToolSourceKind", "Callback"),
+                    ),
+                    (
+                        string_key("source_id"),
+                        KernelValue::String(source_id.to_string()),
+                    ),
+                ])),
+            ),
+        )])),
+    )
+}
+
+fn string_set(values: &[&str]) -> KernelValue {
+    KernelValue::Set(
+        values
+            .iter()
+            .map(|value| KernelValue::String((*value).to_string()))
+            .collect(),
+    )
+}
+
+fn witness_map(entries: &[(&str, KernelValue)]) -> KernelValue {
+    KernelValue::Map(
+        entries
+            .iter()
+            .map(|(name, value)| (KernelValue::String((*name).to_string()), value.clone()))
+            .collect(),
+    )
+}
+
+fn witness_string_map(entries: &[(&str, &str)]) -> KernelValue {
+    KernelValue::Map(
+        entries
+            .iter()
+            .map(|(name, value)| {
+                (
+                    KernelValue::String((*name).to_string()),
+                    witness_string(value),
+                )
+            })
+            .collect(),
+    )
 }
 
 fn prepared_meerkat_state(kernel: &GeneratedMachineKernel) -> KernelState {
@@ -121,6 +197,14 @@ fn session_tool_visibility_kernel_publishes_committed_set_from_attached() {
                         field("staged_requested_deferred_names"),
                         KernelValue::Set(BTreeSet::new()),
                     ),
+                    (
+                        field("active_deferred_authorities"),
+                        KernelValue::Map(BTreeMap::new()),
+                    ),
+                    (
+                        field("staged_deferred_authorities"),
+                        KernelValue::Map(BTreeMap::new()),
+                    ),
                     (field("active_visibility_revision"), KernelValue::U64(0)),
                     (field("staged_visibility_revision"), KernelValue::U64(0)),
                 ]),
@@ -137,6 +221,71 @@ fn session_tool_visibility_kernel_publishes_committed_set_from_attached() {
 }
 
 #[test]
+fn session_tool_visibility_kernel_publishes_committed_deferred_set_with_structural_authority() {
+    let kernel = GeneratedMachineKernel::new(meerkat::schema());
+    let attached = prepared_meerkat_state(&kernel);
+    let names = string_set(&["search"]);
+    let authorities = witness_map(&[("search", owner_witness("callback:search"))]);
+
+    let published = kernel
+        .transition(
+            &attached,
+            &KernelInput {
+                variant: input("PublishCommittedVisibleSet"),
+                fields: BTreeMap::from([
+                    (field("active_filter"), tool_filter_all()),
+                    (field("staged_filter"), tool_filter_all()),
+                    (field("active_requested_deferred_names"), names.clone()),
+                    (field("staged_requested_deferred_names"), names),
+                    (field("active_deferred_authorities"), authorities.clone()),
+                    (field("staged_deferred_authorities"), authorities),
+                    (field("active_visibility_revision"), KernelValue::U64(1)),
+                    (field("staged_visibility_revision"), KernelValue::U64(1)),
+                ]),
+            },
+        )
+        .expect("publish committed visible set with structural deferred authority");
+
+    assert_eq!(published.next_state.phase, phase("Attached"));
+    assert_eq!(
+        published.effects[0].variant,
+        effect("CommittedVisibleSetPublished")
+    );
+}
+
+#[test]
+fn session_tool_visibility_kernel_rejects_committed_deferred_set_with_string_authority() {
+    let kernel = GeneratedMachineKernel::new(meerkat::schema());
+    let attached = prepared_meerkat_state(&kernel);
+    let names = string_set(&["search"]);
+    let authorities = witness_string_map(&[("search", "{}")]);
+
+    let err = kernel
+        .transition(
+            &attached,
+            &KernelInput {
+                variant: input("PublishCommittedVisibleSet"),
+                fields: BTreeMap::from([
+                    (field("active_filter"), tool_filter_all()),
+                    (field("staged_filter"), tool_filter_all()),
+                    (field("active_requested_deferred_names"), names.clone()),
+                    (field("staged_requested_deferred_names"), names),
+                    (field("active_deferred_authorities"), authorities.clone()),
+                    (field("staged_deferred_authorities"), authorities),
+                    (field("active_visibility_revision"), KernelValue::U64(1)),
+                    (field("staged_visibility_revision"), KernelValue::U64(1)),
+                ]),
+            },
+        )
+        .expect_err("string authority must not pass visibility admission");
+
+    assert!(
+        format!("{err:?}").contains("InvalidInputPayload"),
+        "string authority must be rejected before visibility admission: {err:?}"
+    );
+}
+
+#[test]
 fn session_tool_visibility_kernel_accepts_deferred_request_without_phase_change() {
     let kernel = GeneratedMachineKernel::new(meerkat::schema());
     let attached = prepared_meerkat_state(&kernel);
@@ -146,25 +295,13 @@ fn session_tool_visibility_kernel_accepts_deferred_request_without_phase_change(
             &KernelInput {
                 variant: input("RequestDeferredTools"),
                 fields: BTreeMap::from([
-                    (
-                        field("names"),
-                        KernelValue::Set(BTreeSet::from([
-                            KernelValue::String("search".to_string()),
-                            KernelValue::String("view_image".to_string()),
-                        ])),
-                    ),
+                    (field("names"), string_set(&["search", "view_image"])),
                     (
                         field("witnesses"),
-                        KernelValue::Map(BTreeMap::from([
-                            (
-                                KernelValue::String("search".to_string()),
-                                witness("verified"),
-                            ),
-                            (
-                                KernelValue::String("view_image".to_string()),
-                                witness("verified"),
-                            ),
-                        ])),
+                        witness_map(&[
+                            ("search", owner_witness("callback:search")),
+                            ("view_image", provenance_witness("view-image")),
+                        ]),
                     ),
                 ]),
             },
@@ -173,4 +310,130 @@ fn session_tool_visibility_kernel_accepts_deferred_request_without_phase_change(
         .next_state;
 
     assert_eq!(requested.phase, phase("Attached"));
+}
+
+#[test]
+fn session_tool_visibility_kernel_materializes_deferred_authority_in_state() {
+    let kernel = GeneratedMachineKernel::new(meerkat::schema());
+    let attached = prepared_meerkat_state(&kernel);
+    let witness = owner_witness("callback:search");
+    let requested = kernel
+        .transition(
+            &attached,
+            &KernelInput {
+                variant: input("RequestDeferredTools"),
+                fields: BTreeMap::from([
+                    (field("names"), string_set(&["search"])),
+                    (
+                        field("witnesses"),
+                        witness_map(&[("search", witness.clone())]),
+                    ),
+                ]),
+            },
+        )
+        .expect("request deferred tools")
+        .next_state;
+
+    assert_eq!(
+        requested.fields.get(&field("staged_deferred_authorities")),
+        Some(&witness_map(&[("search", witness)])),
+        "deferred admission authority must be machine-owned, not a shell-side witness"
+    );
+    assert_eq!(
+        requested.fields.get(&field("staged_deferred_names")),
+        Some(&string_set(&["search"])),
+        "names remain only the routing projection of the typed authority"
+    );
+}
+
+#[test]
+fn session_tool_visibility_kernel_rejects_deferred_names_without_witnesses() {
+    let kernel = GeneratedMachineKernel::new(meerkat::schema());
+    let attached = prepared_meerkat_state(&kernel);
+    let err = kernel
+        .transition(
+            &attached,
+            &KernelInput {
+                variant: input("RequestDeferredTools"),
+                fields: BTreeMap::from([
+                    (field("names"), string_set(&["search"])),
+                    (field("witnesses"), KernelValue::Map(BTreeMap::new())),
+                ]),
+            },
+        )
+        .expect_err("missing witness must be rejected before staging names");
+
+    assert!(
+        format!("{err:?}").contains("NoMatchingTransition"),
+        "missing authority must leave no admissible transition: {err:?}"
+    );
+}
+
+#[test]
+fn session_tool_visibility_kernel_rejects_deferred_names_with_empty_witness() {
+    let kernel = GeneratedMachineKernel::new(meerkat::schema());
+    let attached = prepared_meerkat_state(&kernel);
+    let err = kernel
+        .transition(
+            &attached,
+            &KernelInput {
+                variant: input("RequestDeferredTools"),
+                fields: BTreeMap::from([
+                    (field("names"), string_set(&["search"])),
+                    (
+                        field("witnesses"),
+                        witness_map(&[("search", empty_witness())]),
+                    ),
+                ]),
+            },
+        )
+        .expect_err("empty witness must be rejected before staging names");
+
+    assert!(
+        format!("{err:?}").contains("NoMatchingTransition"),
+        "empty authority must leave no admissible transition: {err:?}"
+    );
+}
+
+#[test]
+fn session_tool_visibility_kernel_rejects_deferred_names_with_serialized_default_witness() {
+    let kernel = GeneratedMachineKernel::new(meerkat::schema());
+    let attached = prepared_meerkat_state(&kernel);
+    let err = kernel
+        .transition(
+            &attached,
+            &KernelInput {
+                variant: input("RequestDeferredTools"),
+                fields: BTreeMap::from([
+                    (field("names"), string_set(&["search"])),
+                    (field("witnesses"), witness_string_map(&[("search", "{}")])),
+                ]),
+            },
+        )
+        .expect_err("serialized default witness must not be accepted as typed authority");
+
+    assert!(
+        format!("{err:?}").contains("InvalidInputPayload"),
+        "serialized default authority must be rejected before transition matching: {err:?}"
+    );
+}
+
+#[test]
+fn session_tool_visibility_kernel_rejects_legacy_stage_deferred_names_input() {
+    let kernel = GeneratedMachineKernel::new(meerkat::schema());
+    let attached = prepared_meerkat_state(&kernel);
+    let err = kernel
+        .transition(
+            &attached,
+            &KernelInput {
+                variant: input("StageDeferredNames"),
+                fields: BTreeMap::from([(field("names"), string_set(&["search"]))]),
+            },
+        )
+        .expect_err("legacy staged names must not load deferred tools");
+
+    assert!(
+        format!("{err:?}").contains("NoMatchingTransition"),
+        "legacy staged names must leave no admissible transition: {err:?}"
+    );
 }
