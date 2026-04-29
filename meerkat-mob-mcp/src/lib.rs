@@ -2064,6 +2064,7 @@ impl MobMcpDispatcher {
                                     "agent_identity":{"type":"string"},
                                     "initial_message": content_input_schema(),
                                     "backend":{"type":"string","enum":["session","external"]},
+                                    "binding": runtime_binding_schema(),
                                     "runtime_mode":{"type":"string","enum":["autonomous_host","turn_driven"]},
                                     "labels":{"type":"object","additionalProperties":{"type":"string"}},
                                     "context":{"type":"object"}
@@ -2232,6 +2233,40 @@ fn content_input_schema() -> serde_json::Value {
     })
 }
 
+fn runtime_binding_schema() -> serde_json::Value {
+    json!({
+        "oneOf": [
+            {
+                "type": "object",
+                "properties": {
+                    "kind": { "const": "session" }
+                },
+                "required": ["kind"],
+                "additionalProperties": false
+            },
+            {
+                "type": "object",
+                "properties": {
+                    "kind": { "const": "external" },
+                    "address": { "type": "string" },
+                    "bootstrap_token": { "type": "string" },
+                    "identity": {
+                        "type": "object",
+                        "properties": {
+                            "kind": { "const": "ed25519_public_key" },
+                            "public_key": { "type": "string" }
+                        },
+                        "required": ["kind", "public_key"],
+                        "additionalProperties": false
+                    }
+                },
+                "required": ["kind", "address", "identity"],
+                "additionalProperties": false
+            }
+        ]
+    })
+}
+
 fn encode(call: ToolCallView<'_>, payload: serde_json::Value) -> Result<ToolResult, ToolError> {
     let content = serde_json::to_string(&payload)
         .map_err(|e| ToolError::execution_failed(format!("encode result: {e}")))?;
@@ -2260,7 +2295,7 @@ struct LifecycleArgs {
 struct MobIdArgs {
     mob_id: String,
 }
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct MobSpawnMeerkatArgs {
     profile: String,
     agent_identity: String,
@@ -2269,7 +2304,7 @@ struct MobSpawnMeerkatArgs {
     #[serde(default)]
     backend: Option<MobBackendKind>,
     #[serde(default)]
-    binding: Option<meerkat_mob::RuntimeBinding>,
+    binding: Option<meerkat_contracts::WireRuntimeBinding>,
     #[serde(default)]
     runtime_mode: Option<MobRuntimeMode>,
     #[serde(default)]
@@ -2279,7 +2314,7 @@ struct MobSpawnMeerkatArgs {
     #[serde(default)]
     additional_instructions: Option<Vec<String>>,
 }
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 struct SpawnManyMeerkatsArgs {
     mob_id: String,
     specs: Vec<MobSpawnMeerkatArgs>,
@@ -2318,6 +2353,27 @@ fn trusted_peer_descriptor_from_wire_parts(
         address,
         pubkey: resolved.pubkey,
     })
+}
+
+fn runtime_binding_from_wire(
+    binding: meerkat_contracts::WireRuntimeBinding,
+) -> Result<meerkat_mob::RuntimeBinding, String> {
+    match binding {
+        meerkat_contracts::WireRuntimeBinding::Session => Ok(meerkat_mob::RuntimeBinding::Session),
+        meerkat_contracts::WireRuntimeBinding::External {
+            address,
+            bootstrap_token,
+            identity,
+        } => {
+            let resolved = identity.resolve().map_err(|err| err.to_string())?;
+            Ok(meerkat_mob::RuntimeBinding::External {
+                peer_id: resolved.peer_id.to_string(),
+                address,
+                bootstrap_token,
+                pubkey: Some(resolved.pubkey),
+            })
+        }
+    }
 }
 
 impl WireActionArgs {
@@ -2569,7 +2625,11 @@ impl AgentToolDispatcher for MobMcpDispatcher {
                         s.initial_message = spec.initial_message;
                         s.runtime_mode = spec.runtime_mode;
                         s.backend = spec.backend;
-                        s.binding = spec.binding;
+                        s.binding = spec
+                            .binding
+                            .map(runtime_binding_from_wire)
+                            .transpose()
+                            .map_err(|e| ToolError::invalid_arguments(call.name, e))?;
                         s.context = spec.context;
                         s.labels = spec.labels;
                         s.additional_instructions = spec.additional_instructions;
@@ -2930,6 +2990,71 @@ mod tests {
                 public_key: public_key.to_string(),
             },
         })
+    }
+
+    #[test]
+    fn mob_spawn_member_args_accept_canonical_external_runtime_binding() {
+        let args = serde_json::from_value::<SpawnManyMeerkatsArgs>(json!({
+            "mob_id": "mob",
+            "specs": [{
+                "profile": "worker",
+                "agent_identity": "w-ext",
+                "binding": {
+                    "kind": "external",
+                    "address": "inproc://external-worker",
+                    "identity": {
+                        "kind": "ed25519_public_key",
+                        "public_key": ED25519_PUBLIC_KEY_7
+                    }
+                }
+            }]
+        }))
+        .expect("canonical external runtime binding should deserialize");
+
+        let binding = args
+            .specs
+            .into_iter()
+            .next()
+            .and_then(|spec| spec.binding)
+            .expect("binding present");
+        let resolved = runtime_binding_from_wire(binding)
+            .expect("canonical external runtime binding resolves");
+        let meerkat_mob::RuntimeBinding::External {
+            peer_id, pubkey, ..
+        } = resolved
+        else {
+            panic!("expected external runtime binding");
+        };
+        let expected_pubkey = [7u8; 32];
+        assert_eq!(
+            peer_id,
+            meerkat_core::comms::PeerId::from_ed25519_pubkey(&expected_pubkey).to_string()
+        );
+        assert_eq!(pubkey, Some(expected_pubkey));
+    }
+
+    #[test]
+    fn mob_spawn_member_args_reject_raw_external_runtime_binding_atoms() {
+        let err = serde_json::from_value::<SpawnManyMeerkatsArgs>(json!({
+            "mob_id": "mob",
+            "specs": [{
+                "profile": "worker",
+                "agent_identity": "w-ext",
+                "binding": {
+                    "kind": "external",
+                    "peer_id": meerkat_core::comms::PeerId::from_ed25519_pubkey(&[7u8; 32]).to_string(),
+                    "address": "inproc://external-worker",
+                    "pubkey": vec![7u8; 32]
+                }
+            }]
+        }))
+        .expect_err("raw peer_id/pubkey external runtime binding shape must be rejected");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("peer_id") || msg.contains("identity"),
+            "unexpected error: {msg}"
+        );
     }
 
     #[test]
@@ -4266,7 +4391,18 @@ mod tests {
             "mob_spawn_member",
             json!({
                 "mob_id": mob_id,
-                "specs": [{"profile": "worker", "agent_identity": "w-ext", "binding": {"kind": "external", "peer_id": "ed25519:QUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUE=", "address": "inproc://test-w-ext"}}]
+                "specs": [{
+                    "profile": "worker",
+                    "agent_identity": "w-ext",
+                    "binding": {
+                        "kind": "external",
+                        "address": "inproc://test-w-ext",
+                        "identity": {
+                            "kind": "ed25519_public_key",
+                            "public_key": ED25519_PUBLIC_KEY_7
+                        }
+                    }
+                }]
             }),
         )
         .await;

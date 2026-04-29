@@ -27,23 +27,21 @@ pub enum WireMobBackendKind {
 /// Runtime binding for spawn requests.
 ///
 /// First step toward identity-first mobs. Carries backend-specific binding
-/// details at spawn time. `External` requires real process identity.
+/// details at spawn time. `External` requires typed process identity; callers
+/// do not supply raw comms peer IDs.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum WireRuntimeBinding {
     Session,
     External {
-        peer_id: String,
         address: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         bootstrap_token: Option<BridgeBootstrapToken>,
-        /// Ed25519 signing pubkey (32 bytes) of the external peer. Required
-        /// for the supervisor to install a non-zero-pubkey trust entry so
-        /// real-comms signed-envelope replies admit past ingress trust
-        /// check. Absent on legacy bindings that pre-date pubkey plumbing.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        pubkey: Option<[u8; 32]>,
+        /// Typed Ed25519 signing identity for the external process. The
+        /// canonical comms `PeerId` is derived from this key after the wire
+        /// boundary, so callers cannot spoof an unrelated raw peer id.
+        identity: WireTrustedPeerIdentity,
     },
 }
 
@@ -1904,6 +1902,66 @@ mod tests {
             }
         }))
         .expect_err("missing external peer pubkey material must fail closed");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("public_key") || msg.contains("identity"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn runtime_binding_accepts_canonical_external_peer_identity() {
+        let binding = serde_json::from_value::<WireRuntimeBinding>(serde_json::json!({
+            "kind": "external",
+            "address": "inproc://external-worker",
+            "identity": {
+                "kind": "ed25519_public_key",
+                "public_key": "ed25519:BwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwcHBwc="
+            }
+        }))
+        .expect("canonical external runtime binding identity should deserialize");
+
+        let WireRuntimeBinding::External {
+            identity, address, ..
+        } = binding
+        else {
+            panic!("expected external runtime binding");
+        };
+        assert_eq!(address, "inproc://external-worker");
+        assert_eq!(
+            identity.resolve().expect("identity resolves").pubkey,
+            [7u8; 32]
+        );
+    }
+
+    #[test]
+    fn runtime_binding_rejects_raw_external_peer_id_shape() {
+        let err = serde_json::from_value::<WireRuntimeBinding>(serde_json::json!({
+            "kind": "external",
+            "peer_id": meerkat_core::comms::PeerId::from_ed25519_pubkey(&[7u8; 32]).to_string(),
+            "address": "inproc://external-worker",
+            "pubkey": vec![7u8; 32]
+        }))
+        .expect_err("raw peer_id/pubkey external runtime binding shape must be rejected");
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("peer_id") || msg.contains("identity"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn runtime_binding_rejects_missing_external_peer_pubkey_material() {
+        let err = serde_json::from_value::<WireRuntimeBinding>(serde_json::json!({
+            "kind": "external",
+            "address": "inproc://external-worker",
+            "identity": {
+                "kind": "ed25519_public_key"
+            }
+        }))
+        .expect_err("missing external runtime binding pubkey material must fail closed");
 
         let msg = err.to_string();
         assert!(

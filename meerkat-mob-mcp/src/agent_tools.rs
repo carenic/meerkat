@@ -1762,6 +1762,7 @@ enum WirePeerArg {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ExternalPeerArg {
     name: String,
     address: String,

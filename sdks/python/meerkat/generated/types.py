@@ -290,14 +290,12 @@ class WireRenderMetadata:
     salience: Optional[Literal['background', 'normal', 'important', 'urgent']] = None
 
 
+# Typed external peer identity for public mob wiring surfaces.
 class WireTrustedPeerIdentityEd25519PublicKey(TypedDict, total=False):
-    """Recoverable Ed25519 public key string in `ed25519:<base64>` form."""
     kind: Required[Literal['ed25519_public_key']]
     public_key: Required[str]
 
-
 WireTrustedPeerIdentity = WireTrustedPeerIdentityEd25519PublicKey
-
 
 @dataclass
 class WireTrustedPeerSpec:
