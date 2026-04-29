@@ -339,8 +339,6 @@ macro_rules! mob_catalog_machine_dsl {
             CancelFlow { run_id: RunId },
             FlowStatus,
             Spawn { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: bool, bridge_session_id: SessionId, replacing: Option<SessionId> },
-            MarkMemberRestoreFailed { agent_identity: AgentIdentity, reason: String },
-            ClearMemberRestoreFailure { agent_identity: AgentIdentity },
             EnsureMember { agent_identity: AgentIdentity },
             Reconcile { desired: Set<AgentIdentity>, retire_stale: bool },
             Retire { mob_id: MobId, agent_runtime_id: AgentRuntimeId, agent_identity: AgentIdentity, releasing: Option<SessionId>, session_id: SessionId },
@@ -613,56 +611,6 @@ macro_rules! mob_catalog_machine_dsl {
             emit RequestRuntimeBinding { agent_identity: agent_identity, agent_runtime_id: agent_runtime_id, fence_token: fence_token, generation: generation, session_id: bridge_session_id }
             emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: Some(replacing.get("value")), new_session_id: Some(bridge_session_id) }
             emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Spawned }
-        }
-
-        transition MarkMemberRestoreFailedRunning {
-            on input MarkMemberRestoreFailed { agent_identity, reason }
-            guard { self.lifecycle_phase == Phase::Running }
-            update {
-                self.member_restore_failures.insert(agent_identity, reason);
-            }
-            to Running
-        }
-        transition MarkMemberRestoreFailedStopped {
-            on input MarkMemberRestoreFailed { agent_identity, reason }
-            guard { self.lifecycle_phase == Phase::Stopped }
-            update {
-                self.member_restore_failures.insert(agent_identity, reason);
-            }
-            to Stopped
-        }
-        transition MarkMemberRestoreFailedCompleted {
-            on input MarkMemberRestoreFailed { agent_identity, reason }
-            guard { self.lifecycle_phase == Phase::Completed }
-            update {
-                self.member_restore_failures.insert(agent_identity, reason);
-            }
-            to Completed
-        }
-
-        transition ClearMemberRestoreFailureRunning {
-            on input ClearMemberRestoreFailure { agent_identity }
-            guard { self.lifecycle_phase == Phase::Running }
-            update {
-                self.member_restore_failures.remove(agent_identity);
-            }
-            to Running
-        }
-        transition ClearMemberRestoreFailureStopped {
-            on input ClearMemberRestoreFailure { agent_identity }
-            guard { self.lifecycle_phase == Phase::Stopped }
-            update {
-                self.member_restore_failures.remove(agent_identity);
-            }
-            to Stopped
-        }
-        transition ClearMemberRestoreFailureCompleted {
-            on input ClearMemberRestoreFailure { agent_identity }
-            guard { self.lifecycle_phase == Phase::Completed }
-            update {
-                self.member_restore_failures.remove(agent_identity);
-            }
-            to Completed
         }
 
         transition EnsureMemberRunningExisting {

@@ -3147,6 +3147,10 @@ impl<'a> CompositionTlaCompiler<'a> {
                 compiler.render_helper(&mut out, derived);
                 pushln!(&mut out);
             }
+            if machine.machine.as_str() == "MobMachine" {
+                compiler.render_mob_machine_native_helpers(&mut out);
+                pushln!(&mut out);
+            }
 
             let mut rendered_actions = Vec::new();
             for transition in &machine.transitions {
@@ -4197,6 +4201,10 @@ impl<'a> CompositionTlaCompiler<'a> {
 
             for derived in helper_dependency_order(machine) {
                 compiler.render_helper(out, derived);
+                pushln!(out);
+            }
+            if machine.machine.as_str() == "MobMachine" {
+                compiler.render_mob_machine_native_helpers(out);
                 pushln!(out);
             }
 

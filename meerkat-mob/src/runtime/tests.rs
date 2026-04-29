@@ -23477,6 +23477,7 @@ struct MobRuntimeParitySnapshotSummary {
     tasks: BTreeMap<String, String>,
     in_progress_task_ids: BTreeSet<String>,
     completed_task_ids: BTreeSet<String>,
+    member_restore_failures: BTreeMap<String, String>,
     // W3-H-1: canonical identity→bridge-session binding map. Stubbed as an
     // empty BTreeMap for the parity evaluator; full projection through the
     // runtime-parity snapshot is a follow-up to the observer wiring PR.
@@ -24167,6 +24168,7 @@ async fn mob_runtime_parity_snapshot_summary(
         tasks_map,
         in_progress_task_ids,
         completed_task_ids,
+        member_restore_failures,
         member_session_bindings,
         pending_spawn_sessions,
         pending_session_ingress_detach_runtime_ids,
@@ -24202,6 +24204,10 @@ async fn mob_runtime_parity_snapshot_summary(
                     .into_iter()
                     .map(|id| format!("{id:?}"))
                     .collect::<BTreeSet<_>>(),
+                snap.member_restore_failures
+                    .into_iter()
+                    .map(|(k, v)| (format!("{k:?}"), v))
+                    .collect::<BTreeMap<_, _>>(),
                 snap.member_session_bindings
                     .into_iter()
                     .map(|(k, v)| (format!("{k:?}"), format!("{v:?}")))
@@ -24253,6 +24259,7 @@ async fn mob_runtime_parity_snapshot_summary(
         tasks: tasks_map,
         in_progress_task_ids,
         completed_task_ids,
+        member_restore_failures,
         member_session_bindings,
         pending_spawn_sessions,
         pending_session_ingress_detach_runtime_ids,
@@ -24309,6 +24316,13 @@ fn mob_runtime_parity_field_value(
         )),
         "completed_task_ids" => Some(MobRuntimeParityExprValue::Set(
             snapshot.completed_task_ids.clone(),
+        )),
+        "member_restore_failures" => Some(MobRuntimeParityExprValue::Map(
+            snapshot
+                .member_restore_failures
+                .keys()
+                .map(|k| (k.clone(), 0u64))
+                .collect(),
         )),
         "member_session_bindings" => Some(MobRuntimeParityExprValue::Map(
             snapshot

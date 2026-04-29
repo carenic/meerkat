@@ -3191,6 +3191,7 @@ impl MobActor {
                         tasks: dsl.tasks.clone(),
                         in_progress_task_ids: dsl.in_progress_task_ids.clone(),
                         completed_task_ids: dsl.completed_task_ids.clone(),
+                        member_restore_failures: dsl.member_restore_failures.clone(),
                         member_session_bindings: dsl.member_session_bindings.clone(),
                         pending_spawn_sessions: dsl.pending_spawn_sessions.clone(),
                         pending_session_ingress_detach_runtime_ids: dsl
