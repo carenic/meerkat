@@ -7914,6 +7914,7 @@ mod tests {
         // Hot-swap to an OpenAI model (does NOT support image_tool_results).
         let overrides = crate::handlers::turn::TurnOverrides {
             model: Some("gpt-5.4".to_string()),
+            provider: Some("openai".to_string()),
             ..Default::default()
         };
         let (event_tx2, _event_rx2) = mpsc::channel(100);
@@ -7981,6 +7982,7 @@ mod tests {
         // Hot-swap to OpenAI (deny view_image).
         let overrides = crate::handlers::turn::TurnOverrides {
             model: Some("gpt-5.4".to_string()),
+            provider: Some("openai".to_string()),
             ..Default::default()
         };
         let (event_tx2, _event_rx2) = mpsc::channel(100);
@@ -8000,6 +8002,7 @@ mod tests {
         // Hot-swap back to Anthropic (should clear the deny).
         let overrides = crate::handlers::turn::TurnOverrides {
             model: Some("claude-sonnet-4-5".to_string()),
+            provider: Some("anthropic".to_string()),
             ..Default::default()
         };
         let (event_tx3, _event_rx3) = mpsc::channel(100);
@@ -8076,6 +8079,7 @@ mod tests {
         // Hot-swap to OpenAI — should add view_image to the deny set, not replace it.
         let overrides = crate::handlers::turn::TurnOverrides {
             model: Some("gpt-5.4".to_string()),
+            provider: Some("openai".to_string()),
             ..Default::default()
         };
         let (event_tx2, _event_rx2) = mpsc::channel(100);
@@ -8344,6 +8348,7 @@ mod tests {
         });
         let overrides = crate::handlers::turn::TurnOverrides {
             model: Some("gpt-5.4".to_string()),
+            provider: Some("openai".to_string()),
             provider_params: Some(provider_params.clone()),
             ..Default::default()
         };
