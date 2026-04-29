@@ -1058,7 +1058,22 @@ impl MobActor {
     }
 
     async fn ensure_member_not_broken(&self, agent_identity: &MeerkatId) -> Result<(), MobError> {
-        if let Some(diag) = self.restore_failure_for(agent_identity).await {
+        let dsl_identity = mob_dsl::AgentIdentity::from_domain(&crate::ids::AgentIdentity::from(
+            agent_identity.as_str(),
+        ));
+        let lifecycle = self
+            .dsl_authority
+            .state
+            .member_lifecycle_for_identity(&dsl_identity, true);
+        if lifecycle.status == mob_dsl::MobMemberLifecycleStatus::Broken {
+            let diag = self.restore_failure_for(agent_identity).await.unwrap_or(
+                super::handle::RestoreFailureDiagnostic {
+                    bridge_session_id: None,
+                    reason: lifecycle
+                        .error
+                        .unwrap_or_else(|| "member restore failed".to_string()),
+                },
+            );
             return Err(MobError::MemberRestoreFailed {
                 member_id: agent_identity.clone(),
                 session_id: diag.bridge_session_id,
@@ -1415,40 +1430,6 @@ impl MobActor {
             .state
             .member_lifecycle_for_identity(&dsl_identity, member_present);
 
-        let restore_failure = {
-            self.restore_diagnostics
-                .read()
-                .await
-                .get(agent_identity)
-                .cloned()
-        };
-        if let Some(diag) = restore_failure {
-            return MobMemberLifecycleProjection::materialize(MobMemberLifecycleInput {
-                member_present,
-                machine_lifecycle,
-                restore_failure: Some(diag.reason),
-                output_preview: None,
-                tokens_used: 0,
-                agent_runtime_id: roster_entry
-                    .as_ref()
-                    .map(|entry| entry.agent_runtime_id.clone())
-                    .unwrap_or_else(|| {
-                        crate::ids::AgentRuntimeId::initial(crate::ids::AgentIdentity::from(
-                            agent_identity.as_str(),
-                        ))
-                    }),
-                fence_token: roster_entry
-                    .as_ref()
-                    .map(|entry| entry.fence_token)
-                    .unwrap_or(crate::ids::FenceToken::new(0)),
-                current_bridge_session_id: diag.bridge_session_id,
-                peer_connectivity: None,
-                kickoff: roster_entry
-                    .as_ref()
-                    .and_then(|entry| entry.kickoff.clone()),
-            });
-        }
-
         let (output_preview, tokens_used) = match current_bridge_session_id.as_ref() {
             None => (None, 0),
             Some(bridge_session_id) if include_session_details => {
@@ -1467,7 +1448,6 @@ impl MobActor {
         MobMemberLifecycleProjection::materialize(MobMemberLifecycleInput {
             member_present,
             machine_lifecycle,
-            restore_failure: None,
             output_preview,
             tokens_used,
             agent_runtime_id: roster_entry
@@ -2848,11 +2828,11 @@ impl MobActor {
     /// member's session already has its conversation history.
     async fn ensure_autonomous_runtimes_from_roster(&self) -> Result<(), MobError> {
         let broken_members = self
-            .restore_diagnostics
-            .read()
-            .await
+            .dsl_authority
+            .state
+            .member_restore_failures
             .keys()
-            .cloned()
+            .map(|identity| MeerkatId::from(identity.0.as_str()))
             .collect::<HashSet<_>>();
         let entries = {
             let roster = self.roster.read().await;
@@ -5345,11 +5325,11 @@ impl MobActor {
     ) -> Vec<MeerkatId> {
         let mut targets = Vec::new();
         let broken_members = self
-            .restore_diagnostics
-            .read()
-            .await
+            .dsl_authority
+            .state
+            .member_restore_failures
             .keys()
-            .cloned()
+            .map(|identity| MeerkatId::from(identity.0.as_str()))
             .collect::<HashSet<_>>();
 
         if self.definition.wiring.auto_wire_orchestrator
@@ -5413,11 +5393,11 @@ impl MobActor {
     ) -> Option<MeerkatId> {
         let owner_bridge_session_id = owner_bridge_session_id?;
         let broken_members = self
-            .restore_diagnostics
-            .read()
-            .await
+            .dsl_authority
+            .state
+            .member_restore_failures
             .keys()
-            .cloned()
+            .map(|identity| MeerkatId::from(identity.0.as_str()))
             .collect::<HashSet<_>>();
         let roster = self.roster.read().await;
         roster

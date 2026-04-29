@@ -1883,37 +1883,17 @@ impl MobHandle {
     /// live peer-connectivity fanout. Use [`member_status`](Self::member_status)
     /// for deep per-member inspection including live comms reachability.
     pub async fn list_members_including_retiring(&self) -> Vec<MobMemberListEntry> {
-        self.roster
-            .read()
+        match self
+            .execute_machine_command(MobMachineCommand::ListMembersIncludingRetiring)
             .await
-            .list_all()
-            .map(|entry| {
-                let status = match entry.state {
-                    crate::roster::MemberState::Active => MobMemberStatus::Active,
-                    crate::roster::MemberState::Retiring => MobMemberStatus::Retiring,
-                };
-                MobMemberListEntry {
-                    agent_identity: entry.agent_identity.clone(),
-                    agent_runtime_id: entry.agent_runtime_id.clone(),
-                    fence_token: entry.fence_token,
-                    role: entry.role.clone(),
-                    runtime_mode: entry.runtime_mode,
-                    peer_id: entry.peer_id,
-                    transport_public_key: entry.transport_public_key.clone(),
-                    state: entry.state,
-                    wired_to: entry.wired_to.clone(),
-                    external_peer_specs: entry.external_peer_specs.clone(),
-                    labels: entry.labels.clone(),
-                    status,
-                    error: None,
-                    is_final: false,
-                    current_session_id: None,
-                    current_bridge_session_id: None,
-                    kickoff: entry.kickoff.clone(),
-                }
-                .with_current_bridge_session_id(entry.member_ref.bridge_session_id().cloned())
-            })
-            .collect()
+        {
+            Ok(MobMachineCommandResult::ListMembersIncludingRetiring(entries)) => entries,
+            Ok(_) => {
+                tracing::error!("unexpected command result variant");
+                Default::default()
+            }
+            Err(_) => Vec::new(),
+        }
     }
 
     /// List members currently eligible for runtime work dispatch.
@@ -4051,7 +4031,7 @@ mod tests {
         let snapshot = CanonicalMemberSnapshotMaterial {
             member_present: true,
             status: CanonicalMemberStatus::Active,
-            terminal_class: mob_dsl::MobMemberTerminalClass::Running,
+            is_terminal: false,
             error: None,
             output_preview: None,
             tokens_used: 0,

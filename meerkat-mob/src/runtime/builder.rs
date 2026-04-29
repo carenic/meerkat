@@ -421,6 +421,21 @@ fn apply_recovered_flow_signal(
     Ok(())
 }
 
+fn seed_mob_authority_restore_failures(
+    authority: &mut crate::machines::mob_machine::MobMachineAuthority,
+    restore_diagnostics: &HashMap<MeerkatId, super::handle::RestoreFailureDiagnostic>,
+) {
+    use crate::machines::mob_machine as mob_dsl;
+    for (identity, diagnostic) in restore_diagnostics {
+        authority.state.member_restore_failures.insert(
+            mob_dsl::AgentIdentity::from_domain(&crate::ids::AgentIdentity::from(
+                identity.as_str(),
+            )),
+            diagnostic.reason.clone(),
+        );
+    }
+}
+
 struct RuntimeWiring {
     roster: Arc<RwLock<RosterAuthority>>,
     task_board: Arc<RwLock<TaskBoard>>,
@@ -944,6 +959,11 @@ impl MobBuilder {
             &definition.id,
         )
         .await?;
+        let restore_diagnostics_snapshot = preview_handle.restore_diagnostics.read().await.clone();
+        seed_mob_authority_restore_failures(
+            &mut wiring.dsl_authority,
+            &restore_diagnostics_snapshot,
+        );
         *wiring.roster.write().await = RosterAuthority::from_roster(roster);
         *wiring.task_board.write().await = task_board;
 

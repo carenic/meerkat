@@ -7844,6 +7844,22 @@ async fn test_resume_marks_missing_persisted_session_as_broken() {
         "broken member should surface restore failure reason"
     );
 
+    let machine_state = resumed
+        .query_machine_state()
+        .await
+        .expect("query MobMachine state after restore failure");
+    let machine_identity =
+        crate::machines::mob_machine::AgentIdentity::from_domain(&AgentIdentity::from("w-1"));
+    assert_eq!(
+        machine_state.member_lifecycle_for_identity(&machine_identity, true),
+        crate::machines::mob_machine::MobMemberLifecycleMaterial {
+            status: crate::machines::mob_machine::MobMemberLifecycleStatus::Broken,
+            terminal_class: crate::machines::mob_machine::MobMemberTerminalClass::TerminalFailure,
+            error: Some(format!("missing durable session snapshot for '{old_sid}'")),
+        },
+        "restore-failure member status must be owned by MobMachine, not reconstructed by projection code"
+    );
+
     let members = resumed.list_members().await;
     let broken = members
         .into_iter()
@@ -7862,6 +7878,17 @@ async fn test_resume_marks_missing_persisted_session_as_broken() {
             .is_some_and(|message| message.contains("missing durable session")),
         "projected member listing should carry the restore failure"
     );
+
+    let including_retiring = resumed.list_members_including_retiring().await;
+    let broken_including_retiring = including_retiring
+        .into_iter()
+        .find(|entry| entry.agent_identity == "w-1")
+        .expect("broken member should remain visible in list_members_including_retiring");
+    assert_eq!(
+        broken_including_retiring.status,
+        crate::runtime::handle::MobMemberStatus::Broken
+    );
+    assert!(broken_including_retiring.is_final);
 }
 
 #[tokio::test]
