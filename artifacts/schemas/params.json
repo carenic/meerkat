@@ -5190,7 +5190,7 @@
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "additionalProperties": false,
-    "description": "Request payload for `mob/spawn`.\n\nThe public catalog uses wire-owned projections for stable fields and JSON\nextension slots for advanced Rust-native spawn options whose schemas are\nnot yet owned by `meerkat-contracts`.",
+    "description": "Request payload for `mob/spawn`.\n\nThe public catalog uses wire-owned projections only. Advanced Rust-native\nspawn options such as launch mode, tool access policy, budget splitting,\ninherited tool filtering, and override profiles are intentionally not\nadvertised here until `meerkat-contracts` owns stable wire schemas for them.",
     "properties": {
       "additional_instructions": {
         "items": {
@@ -5230,7 +5230,6 @@
           }
         ]
       },
-      "budget_split_policy": true,
       "connection_ref": {
         "anyOf": [
           {
@@ -5242,7 +5241,6 @@
         ]
       },
       "context": true,
-      "inherited_tool_filter": true,
       "initial_message": {
         "anyOf": [
           {
@@ -5262,11 +5260,9 @@
           "null"
         ]
       },
-      "launch_mode": true,
       "mob_id": {
         "type": "string"
       },
-      "override_profile": true,
       "profile": {
         "type": "string"
       },
@@ -5288,8 +5284,7 @@
           "object",
           "null"
         ]
-      },
-      "tool_access_policy": true
+      }
     },
     "required": [
       "mob_id",
@@ -5518,17 +5513,355 @@
     "type": "object"
   },
   "MobTurnStartParams": {
+    "$defs": {
+      "BindingId": {
+        "description": "Opaque slug identifying a binding inside a realm.",
+        "type": "string"
+      },
+      "ProfileId": {
+        "description": "Opaque slug identifying an auth profile override on a connection.",
+        "type": "string"
+      },
+      "RealmId": {
+        "description": "Opaque slug identifying a realm.",
+        "type": "string"
+      },
+      "SkillKey": {
+        "description": "Canonical runtime identity for a skill.\n\nThis is the single identity carried across every surface — the wire parses\ndirectly into this struct, tools receive this struct, the registry stores\nthis struct. There is no slash-delimited string path form.",
+        "properties": {
+          "skill_name": {
+            "$ref": "#/$defs/SkillName"
+          },
+          "source_uuid": {
+            "$ref": "#/$defs/SourceUuid"
+          }
+        },
+        "required": [
+          "source_uuid",
+          "skill_name"
+        ],
+        "type": "object"
+      },
+      "SkillName": {
+        "description": "Canonical skill slug (lowercase, dash-separated).",
+        "type": "string"
+      },
+      "SkillRef": {
+        "description": "Structured skill reference for wire/surface input.\n\nPost-V4 this has exactly one variant — `Structured` — and is kept only as a\ntyped enum to leave room for future source-scoped variants (e.g. alias or\ncapability-scoped forms) without changing the trait surface. No legacy\nstring form, no slash-delimited path, no untagged fallback.",
+        "oneOf": [
+          {
+            "$ref": "#/$defs/SkillKey",
+            "properties": {
+              "kind": {
+                "const": "structured",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SourceUuid": {
+        "description": "Canonical source identifier.",
+        "type": "string"
+      },
+      "TurnToolOverlay": {
+        "description": "Ephemeral per-turn tool overlay for flow-dispatched turns.",
+        "properties": {
+          "allowed_tools": {
+            "default": null,
+            "description": "Optional allow-list for this turn.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "blocked_tools": {
+            "default": null,
+            "description": "Optional deny-list for this turn.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "WireConnectionRef": {
+        "description": "Wire projection of [`meerkat_core::ConnectionRef`].\n\nPure structural shape — no `\"realm:binding\"` string form. Wave-b deleted\n`parse` and `Display` on both the core type and the wire projection so\nthe colon-joined form cannot travel across wire boundaries.",
+        "properties": {
+          "binding": {
+            "$ref": "#/$defs/BindingId"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ProfileId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "realm": {
+            "$ref": "#/$defs/RealmId"
+          }
+        },
+        "required": [
+          "realm",
+          "binding"
+        ],
+        "type": "object"
+      },
+      "WireContentBlock": {
+        "description": "Wire-safe content block (no `source_path` — internal only).",
+        "oneOf": [
+          {
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "const": "text",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "text"
+            ],
+            "type": "object"
+          },
+          {
+            "oneOf": [
+              {
+                "properties": {
+                  "data": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "const": "inline",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "data"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "blob_id": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "const": "blob",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "blob_id"
+                ],
+                "type": "object"
+              }
+            ],
+            "properties": {
+              "media_type": {
+                "type": "string"
+              },
+              "type": {
+                "const": "image",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "media_type"
+            ],
+            "type": "object"
+          },
+          {
+            "oneOf": [
+              {
+                "properties": {
+                  "data": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "const": "inline",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "data"
+                ],
+                "type": "object"
+              }
+            ],
+            "properties": {
+              "duration_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "media_type": {
+                "type": "string"
+              },
+              "type": {
+                "const": "video",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "media_type",
+              "duration_ms"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Forward-compatibility for unknown block types.",
+            "properties": {
+              "type": {
+                "const": "unknown",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WireContentInput": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "items": {
+              "$ref": "#/$defs/WireContentBlock"
+            },
+            "type": "array"
+          }
+        ],
+        "description": "Wire-safe content input (mirrors `ContentInput`)."
+      }
+    },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "additionalProperties": true,
+    "additionalProperties": false,
     "description": "Request payload for `mob/turn_start`.",
     "properties": {
+      "additional_instructions": {
+        "items": {
+          "type": "string"
+        },
+        "type": [
+          "array",
+          "null"
+        ]
+      },
       "agent_identity": {
         "type": "string"
+      },
+      "clear_connection_ref": {
+        "default": false,
+        "type": "boolean"
+      },
+      "clear_provider_params": {
+        "default": false,
+        "type": "boolean"
+      },
+      "connection_ref": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/WireConnectionRef"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "flow_tool_overlay": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/TurnToolOverlay"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "keep_alive": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "max_tokens": {
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
       },
       "mob_id": {
         "type": "string"
       },
-      "prompt": true
+      "model": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "output_schema": true,
+      "prompt": {
+        "$ref": "#/$defs/WireContentInput"
+      },
+      "provider": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "provider_params": true,
+      "skill_refs": {
+        "items": {
+          "$ref": "#/$defs/SkillRef"
+        },
+        "type": [
+          "array",
+          "null"
+        ]
+      },
+      "structured_output_retries": {
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "system_prompt": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
     },
     "required": [
       "mob_id",

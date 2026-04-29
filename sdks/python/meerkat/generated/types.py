@@ -164,6 +164,578 @@ class MobUnwireParams:
 
 
 @dataclass
+class MobIdParams:
+    """Shared request payload for mob methods that address a mob by id."""
+    mob_id: str
+
+
+@dataclass
+class MobMemberParams:
+    """Shared request payload for mob methods that address one member by identity."""
+    agent_identity: str
+    mob_id: str
+
+
+@dataclass
+class MobCreateParams:
+    """Request payload for `mob/create`."""
+    definition: dict[str, Any]
+
+
+@dataclass
+class MobCreateResult:
+    """Response payload for `mob/create`."""
+    mob_id: str
+
+
+@dataclass
+class MobListResult:
+    """Response payload for `mob/list`."""
+    mobs: list[dict[str, Any]]
+
+
+@dataclass
+class MobStatusResult:
+    """One active mob row returned by `mob/list`."""
+    mob_id: str
+    status: str
+
+
+@dataclass
+class MobLifecycleParams:
+    """Request payload for `mob/lifecycle`."""
+    action: Literal['stop', 'resume', 'complete', 'reset', 'destroy']
+    mob_id: str
+
+
+@dataclass
+class MobLifecycleResult:
+    """Response payload for `mob/lifecycle`."""
+    action: Literal['stop', 'resume', 'complete', 'reset', 'destroy']
+    mob_id: str
+    ok: bool
+    destroy_report: Optional[Any] = None
+
+
+@dataclass
+class MobSpawnParams:
+    """Request payload for `mob/spawn`.
+
+The public catalog uses wire-owned projections only. Advanced Rust-native
+spawn options such as launch mode, tool access policy, budget splitting,
+inherited tool filtering, and override profiles are intentionally not
+advertised here until `meerkat-contracts` owns stable wire schemas for them."""
+    agent_identity: str
+    mob_id: str
+    profile: str
+    additional_instructions: Optional[list[str]] = None
+    auto_wire_parent: Optional[bool] = None
+    backend: Optional[Literal['session', 'external']] = None
+    binding: Optional[dict[str, Any]] = None
+    connection_ref: Optional[dict[str, Any]] = None
+    context: Optional[Any] = None
+    initial_message: Optional[str | list[dict[str, Any]]] = None
+    labels: Optional[dict[str, Any]] = None
+    runtime_mode: Optional[WireMobRuntimeMode] = None
+    shell_env: Optional[dict[str, Any]] = None
+
+
+@dataclass
+class MobSpawnResult:
+    """Response payload for `mob/spawn`."""
+    agent_identity: str
+    member_ref: WireMemberRef
+    mob_id: str
+
+
+@dataclass
+class MobSpawnManyParams:
+    """Request payload for `mob/spawn_many`."""
+    mob_id: str
+    specs: list[dict[str, Any]]
+
+
+@dataclass
+class MobSpawnManyResult:
+    """Response payload for `mob/spawn_many`."""
+    results: list[dict[str, Any]]
+
+
+@dataclass
+class MobSpawnReceiptWire:
+    """Identity-native payload for `EnsureMemberOutcome::Spawned`."""
+    agent_identity: str
+    member_ref: WireMemberRef
+
+
+@dataclass
+class MobMemberListEntryWire:
+    """Public roster entry returned by `mob/ensure_member`'s `Existed` outcome
+(and other surfaces that want a typed snapshot of a single member). Mirrors
+the public-facing fields of `meerkat_mob::runtime::MobMemberListEntry`
+without leaking bridge-internal fields."""
+    agent_identity: str
+    is_final: bool
+    member_ref: WireMemberRef
+    role: str
+    runtime_mode: WireMobRuntimeMode
+    state: WireMemberState
+    status: WireMobMemberStatus
+    error: Optional[str] = None
+    labels: Optional[dict[str, Any]] = None
+    wired_to: Optional[list[str]] = None
+
+
+@dataclass
+class MobEnsureMemberParams:
+    """Request payload for `mob/ensure_member`."""
+    mob_id: str
+    spec: dict[str, Any]
+
+
+@dataclass
+class MobEnsureMemberResult:
+    """Response payload for `mob/ensure_member`."""
+    outcome: dict[str, MobSpawnReceiptWire] | dict[str, MobMemberListEntryWire]
+
+
+@dataclass
+class MobReconcileParams:
+    """Request payload for `mob/reconcile`."""
+    mob_id: str
+    desired: Optional[list[dict[str, Any]]] = None
+    options: Optional[dict[str, bool]] = None
+
+
+@dataclass
+class MobReconcileResult:
+    """Response payload for `mob/reconcile`."""
+    report: dict[str, Any]
+
+
+@dataclass
+class MobListMembersMatchingParams:
+    """Request payload for `mob/list_members_matching`."""
+    mob_id: str
+    filter: Optional[dict[str, Any]] = None
+
+
+@dataclass
+class MobListMembersMatchingResult:
+    """Response payload for `mob/list_members_matching`. Each member is the raw
+roster entry JSON."""
+    members: Optional[list[Any]] = None
+
+
+@dataclass
+class MobRetireResult:
+    """Response payload for `mob/retire`."""
+    retired: bool
+
+
+@dataclass
+class MobRespawnParams:
+    """Request payload for `mob/respawn`."""
+    agent_identity: str
+    mob_id: str
+    initial_message: Optional[str | list[dict[str, Any]]] = None
+
+
+@dataclass
+class MobRespawnResult:
+    """Response payload for `mob/respawn`."""
+    receipt: dict[str, Any]
+    status: str
+    failed_peer_ids: Optional[list[str]] = None
+
+
+@dataclass
+class MobWireResult:
+    """Response payload for `mob/wire`."""
+    wired: bool
+
+
+@dataclass
+class MobUnwireResult:
+    """Response payload for `mob/unwire`."""
+    unwired: bool
+
+
+@dataclass
+class MobMembersResult:
+    """Response payload for `mob/members`."""
+    members: list[MobMemberListEntryWire]
+    mob_id: str
+
+
+@dataclass
+class MobEventsParams:
+    """Request payload for `mob/events`."""
+    mob_id: str
+    after_cursor: Optional[int] = None
+    limit: Optional[int] = None
+    strict: Optional[bool] = None
+
+
+@dataclass
+class MobEventsResult:
+    """Response payload for `mob/events`."""
+    events: list[Any]
+
+
+@dataclass
+class MobMemberSendParams:
+    """Request payload for host-side mob member delivery."""
+    agent_identity: str
+    content: str | list[dict[str, Any]]
+    mob_id: str
+    handling_mode: Optional[Literal['queue', 'steer']] = None
+    render_metadata: Optional[dict[str, Any]] = None
+
+
+@dataclass
+class MobMemberSendResult:
+    """Response payload for host-side mob member delivery."""
+    agent_identity: str
+    handling_mode: Literal['queue', 'steer']
+    member_ref: WireMemberRef
+    mob_id: str
+
+
+@dataclass
+class MobIngressInteractionParams:
+    """Request payload for `mob/ingress_interaction`.
+
+This is the ergonomic "ensure an ingress member, then deliver user input"
+path. It composes the existing declarative roster and member-send
+semantics without introducing a separate thread/project runtime."""
+    content: str | list[dict[str, Any]]
+    mob_id: str
+    spec: dict[str, Any]
+    handling_mode: Optional[Literal['queue', 'steer']] = None
+    render_metadata: Optional[dict[str, Any]] = None
+
+
+@dataclass
+class MobIngressInteractionResult:
+    """Response payload for `mob/ingress_interaction`."""
+    agent_identity: str
+    delivery: dict[str, Any]
+    ensure_outcome: dict[str, MobSpawnReceiptWire] | dict[str, MobMemberListEntryWire]
+    events_after_cursor: int
+    latest_event_cursor: int
+    member_ref: WireMemberRef
+    mob_id: str
+
+
+@dataclass
+class MobAppendSystemContextParams:
+    """Request payload for `mob/append_system_context`."""
+    agent_identity: str
+    mob_id: str
+    text: str
+    idempotency_key: Optional[str] = None
+    source: Optional[str] = None
+
+
+@dataclass
+class MobAppendSystemContextResult:
+    """Response payload for `mob/append_system_context`."""
+    agent_identity: str
+    mob_id: str
+    status: str
+
+
+@dataclass
+class MobFlowsResult:
+    """Response payload for `mob/flows`."""
+    flows: list[str]
+    mob_id: str
+
+
+@dataclass
+class MobFlowRunParams:
+    """Request payload for `mob/flow_run`."""
+    flow_id: str
+    mob_id: str
+    params: Optional[Any] = None
+
+
+@dataclass
+class MobFlowRunResult:
+    """Response payload for `mob/flow_run`."""
+    run_id: str
+
+
+@dataclass
+class MobFlowStatusParams:
+    """Request payload for `mob/flow_status`."""
+    mob_id: str
+    run_id: str
+
+
+@dataclass
+class MobFlowStatusResult:
+    """Response payload for `mob/flow_status`."""
+    run: Any
+
+
+@dataclass
+class MobFlowCancelParams:
+    """Request payload for `mob/flow_cancel`."""
+    mob_id: str
+    run_id: str
+
+
+@dataclass
+class MobFlowCancelResult:
+    """Response payload for `mob/flow_cancel`."""
+    canceled: bool
+
+
+@dataclass
+class MobSpawnHelperParams:
+    """Request payload for `mob/spawn_helper`."""
+    mob_id: str
+    prompt: str
+    agent_identity: Optional[str] = None
+    backend: Optional[Literal['session', 'external']] = None
+    role_name: Optional[str] = None
+    runtime_mode: Optional[WireMobRuntimeMode] = None
+
+
+@dataclass
+class MobForkHelperParams:
+    """Request payload for `mob/fork_helper`."""
+    mob_id: str
+    prompt: str
+    source_member_id: str
+    agent_identity: Optional[str] = None
+    backend: Optional[Literal['session', 'external']] = None
+    fork_context: Optional[Any] = None
+    role_name: Optional[str] = None
+    runtime_mode: Optional[WireMobRuntimeMode] = None
+
+
+@dataclass
+class MobHelperResult:
+    """Response payload for `mob/spawn_helper` and `mob/fork_helper`."""
+    agent_identity: str
+    member_ref: WireMemberRef
+    tokens_used: int
+    output: Optional[str] = None
+
+
+@dataclass
+class MobForceCancelResult:
+    """Response payload for `mob/force_cancel`."""
+    cancelled: bool
+
+
+@dataclass
+class MobTurnStartParams:
+    """Request payload for `mob/turn_start`."""
+    agent_identity: str
+    mob_id: str
+    prompt: str | list[dict[str, Any]]
+    additional_instructions: Optional[list[str]] = None
+    clear_connection_ref: Optional[bool] = None
+    clear_provider_params: Optional[bool] = None
+    connection_ref: Optional[dict[str, Any]] = None
+    flow_tool_overlay: Optional[dict[str, Any]] = None
+    keep_alive: Optional[bool] = None
+    max_tokens: Optional[int] = None
+    model: Optional[str] = None
+    output_schema: Optional[Any] = None
+    provider: Optional[str] = None
+    provider_params: Optional[Any] = None
+    skill_refs: Optional[list[dict[str, Any]]] = None
+    structured_output_retries: Optional[int] = None
+    system_prompt: Optional[str] = None
+
+
+@dataclass
+class MobMemberStatusResult:
+    """Response payload for `mob/member_status`."""
+    is_final: bool
+    status: WireMobMemberStatus
+    tokens_used: int
+    current_session_id: Optional[str] = None
+    error: Optional[str] = None
+    external_member: Optional[Any] = None
+    kickoff: Optional[Any] = None
+    output_preview: Optional[str] = None
+    peer_connectivity: Optional[Any] = None
+    realtime_attachment_status: Optional[str] = None
+
+
+@dataclass
+class MobSnapshotResult:
+    """Response payload for `mob/snapshot`."""
+    members: list[Any]
+    mob_id: str
+    status: str
+
+
+@dataclass
+class MobDestroyResult:
+    """Response payload for `mob/destroy`."""
+    destroy_report: Any
+    mob_id: str
+    ok: bool
+
+
+@dataclass
+class MobRotateSupervisorResult:
+    """Response payload for `mob/rotate_supervisor`."""
+    mob_id: str
+    ok: bool
+    report: Any
+
+
+@dataclass
+class MobSubmitWorkParams:
+    """Request payload for `mob/submit_work`.
+
+Identifies the member through the opaque [`WireMemberRef`] handle the
+server resolves against the live roster — callers do not pass
+`generation` or `fence_token`."""
+    content: str | list[dict[str, Any]]
+    member_ref: WireMemberRef
+    origin: Optional[Literal['external', 'internal']] = None
+    work_ref: Optional[str] = None
+
+
+@dataclass
+class MobSubmitWorkResult:
+    """Response payload for `mob/submit_work`."""
+    member_ref: WireMemberRef
+    mob_id: str
+    work_ref: str
+
+
+@dataclass
+class MobCancelWorkParams:
+    """Request payload for `mob/cancel_work`."""
+    mob_id: str
+    work_ref: str
+
+
+@dataclass
+class MobCancelWorkResult:
+    """Response payload for `mob/cancel_work`."""
+    mob_id: str
+    ok: bool
+
+
+@dataclass
+class MobCancelAllWorkParams:
+    """Request payload for `mob/cancel_all_work`."""
+    member_ref: WireMemberRef
+
+
+@dataclass
+class MobCancelAllWorkResult:
+    """Response payload for `mob/cancel_all_work`."""
+    mob_id: str
+    ok: bool
+
+
+@dataclass
+class MobWaitParams:
+    """Shared request payload for mob readiness waits."""
+    mob_id: str
+    member_ids: Optional[list[str]] = None
+    timeout_ms: Optional[int] = None
+
+
+@dataclass
+class MobWaitMembersResult:
+    """Response payload for `mob/wait_kickoff` and `mob/wait_ready`."""
+    members: list[Any]
+
+
+@dataclass
+class MobProfileCreateParams:
+    """Request payload for `mob/profile/create`."""
+    name: str
+    profile: dict[str, Any]
+
+
+@dataclass
+class MobProfileNameParams:
+    """Request payload for `mob/profile/get`."""
+    name: str
+
+
+@dataclass
+class MobProfileLookupResult:
+    """Stored realm profile projection returned by `mob/profile/*`."""
+    name: str
+    created_at: Optional[str] = None
+    not_found: Optional[bool] = None
+    profile: Optional[Any] = None
+    revision: Optional[int] = None
+    updated_at: Optional[str] = None
+
+
+@dataclass
+class MobProfileListResult:
+    """Response payload for `mob/profile/list`."""
+    profiles: list[dict[str, Any]]
+
+
+@dataclass
+class MobProfileUpdateParams:
+    """Request payload for `mob/profile/update`."""
+    expected_revision: int
+    name: str
+    profile: dict[str, Any]
+
+
+@dataclass
+class MobProfileDeleteParams:
+    """Request payload for `mob/profile/delete`."""
+    expected_revision: int
+    name: str
+
+
+@dataclass
+class MobProfileDeleteResult:
+    """Response payload for `mob/profile/delete`."""
+    deleted_revision: int
+    name: str
+
+
+@dataclass
+class MobStreamOpenParams:
+    """Request payload for `mob/stream_open`."""
+    mob_id: str
+    agent_identity: Optional[str] = None
+
+
+@dataclass
+class MobStreamOpenResult:
+    """Response payload for `mob/stream_open`."""
+    opened: bool
+    stream_id: str
+
+
+@dataclass
+class MobStreamCloseParams:
+    """Request payload for `mob/stream_close`."""
+    stream_id: str
+
+
+@dataclass
+class MobStreamCloseResult:
+    """Response payload for `mob/stream_close`."""
+    already_closed: bool
+    closed: bool
+    stream_id: str
+
+
+@dataclass
 class RuntimeStateParams:
     """Request payload for `runtime/session_status`."""
     session_id: str
@@ -307,18 +879,6 @@ not provide raw peer IDs, and missing key material fails at the boundary."""
     address: str
     identity: WireTrustedPeerIdentity
     name: str
-
-
-@dataclass
-class MobWireResult:
-    """Response payload for `mob/wire`."""
-    wired: bool
-
-
-@dataclass
-class MobUnwireResult:
-    """Response payload for `mob/unwire`."""
-    unwired: bool
 
 
 @dataclass
@@ -974,6 +1534,28 @@ WireContentBlock = WireContentBlockText | WireContentBlockImage | WireContentBlo
 
 # Wire-safe content input (mirrors `ContentInput`).
 WireContentInput = str | list[dict[str, Any]]
+
+# Server-resolved opaque handle for a mob member.
+#
+# Encodes `{mob_id, agent_identity}` as a single base64url-encoded token
+# that callers treat as opaque. The server resolves the current
+# `AgentRuntimeId` and fence token against the live mob roster on every
+# dispatch — clients never reason about `generation` or `fence_token`
+# directly.
+#
+# Use [`WireMemberRef::encode`] to produce a token and
+# [`WireMemberRef::decode`] inside an RPC handler to recover the
+# `(mob_id, agent_identity)` pair before resolving against the runtime.
+WireMemberRef = str
+
+# Roster member lifecycle state for `MobMemberFilterWire`.
+WireMemberState = Literal['active', 'retiring']
+
+# Execution status mirroring `meerkat_mob::runtime::MobMemberStatus`.
+WireMobMemberStatus = Literal['active', 'retiring', 'broken', 'completed', 'unknown']
+
+# Mob RPC helper wire type for WireMobRuntimeMode.
+WireMobRuntimeMode = Literal['autonomous_host', 'turn_driven']
 
 # Shared operation kind for live MCP operations.
 McpLiveOperation = Literal['add', 'remove', 'reload']

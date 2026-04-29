@@ -4842,7 +4842,7 @@
       },
       "MobSpawnParams": {
         "additionalProperties": false,
-        "description": "Request payload for `mob/spawn`.\n\nThe public catalog uses wire-owned projections for stable fields and JSON\nextension slots for advanced Rust-native spawn options whose schemas are\nnot yet owned by `meerkat-contracts`.",
+        "description": "Request payload for `mob/spawn`.\n\nThe public catalog uses wire-owned projections only. Advanced Rust-native\nspawn options such as launch mode, tool access policy, budget splitting,\ninherited tool filtering, and override profiles are intentionally not\nadvertised here until `meerkat-contracts` owns stable wire schemas for them.",
         "properties": {
           "additional_instructions": {
             "items": {
@@ -4882,7 +4882,6 @@
               }
             ]
           },
-          "budget_split_policy": true,
           "connection_ref": {
             "anyOf": [
               {
@@ -4894,7 +4893,6 @@
             ]
           },
           "context": true,
-          "inherited_tool_filter": true,
           "initial_message": {
             "anyOf": [
               {
@@ -4914,11 +4912,9 @@
               "null"
             ]
           },
-          "launch_mode": true,
           "mob_id": {
             "type": "string"
           },
-          "override_profile": true,
           "profile": {
             "type": "string"
           },
@@ -4940,8 +4936,7 @@
               "object",
               "null"
             ]
-          },
-          "tool_access_policy": true
+          }
         },
         "required": [
           "mob_id",
@@ -5459,16 +5454,106 @@
         "type": "object"
       },
       "MobTurnStartParams": {
-        "additionalProperties": true,
+        "additionalProperties": false,
         "description": "Request payload for `mob/turn_start`.",
         "properties": {
+          "additional_instructions": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "agent_identity": {
             "type": "string"
+          },
+          "clear_connection_ref": {
+            "default": false,
+            "type": "boolean"
+          },
+          "clear_provider_params": {
+            "default": false,
+            "type": "boolean"
+          },
+          "connection_ref": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WireConnectionRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "flow_tool_overlay": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TurnToolOverlay"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "keep_alive": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "max_tokens": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "mob_id": {
             "type": "string"
           },
-          "prompt": true
+          "model": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "output_schema": true,
+          "prompt": {
+            "$ref": "#/components/schemas/WireContentInput"
+          },
+          "provider": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider_params": true,
+          "skill_refs": {
+            "items": {
+              "$ref": "#/components/schemas/SkillRef"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "structured_output_retries": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "system_prompt": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
         },
         "required": [
           "mob_id",
@@ -10466,6 +10551,34 @@
             "type": "object"
           }
         ]
+      },
+      "TurnToolOverlay": {
+        "description": "Ephemeral per-turn tool overlay for flow-dispatched turns.",
+        "properties": {
+          "allowed_tools": {
+            "default": null,
+            "description": "Optional allow-list for this turn.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "blocked_tools": {
+            "default": null,
+            "description": "Optional deny-list for this turn.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
       },
       "UpdateScheduleParams": {
         "properties": {

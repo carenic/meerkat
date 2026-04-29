@@ -489,9 +489,10 @@ pub struct MobListResult {
 
 /// Request payload for `mob/spawn`.
 ///
-/// The public catalog uses wire-owned projections for stable fields and JSON
-/// extension slots for advanced Rust-native spawn options whose schemas are
-/// not yet owned by `meerkat-contracts`.
+/// The public catalog uses wire-owned projections only. Advanced Rust-native
+/// spawn options such as launch mode, tool access policy, budget splitting,
+/// inherited tool filtering, and override profiles are intentionally not
+/// advertised here until `meerkat-contracts` owns stable wire schemas for them.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(deny_unknown_fields)]
@@ -517,16 +518,6 @@ pub struct MobSpawnParams {
     pub shell_env: Option<BTreeMap<String, String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub auto_wire_parent: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub launch_mode: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub tool_access_policy: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub budget_split_policy: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub inherited_tool_filter: Option<Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub override_profile: Option<Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connection_ref: Option<WireConnectionRef>,
 }
@@ -1437,12 +1428,39 @@ pub struct MobForceCancelResult {
 /// Request payload for `mob/turn_start`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
 pub struct MobTurnStartParams {
     pub mob_id: String,
     pub agent_identity: String,
-    pub prompt: Value,
-    #[serde(flatten)]
-    pub turn_overrides: BTreeMap<String, Value>,
+    pub prompt: WireContentInput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub skill_refs: Option<Vec<meerkat_core::skills::SkillRef>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_tool_overlay: Option<meerkat_core::service::TurnToolOverlay>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additional_instructions: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_alive: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub structured_output_retries: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider_params: Option<Value>,
+    #[serde(default)]
+    pub clear_provider_params: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_ref: Option<WireConnectionRef>,
+    #[serde(default)]
+    pub clear_connection_ref: bool,
 }
 
 /// Response payload for `mob/member_status`.
@@ -1979,18 +1997,27 @@ mod tests {
             "output_schema": { "type": "object" },
             "structured_output_retries": 2
         }))
-        .expect("turn_start should accept flattened turn override fields");
+        .expect("turn_start should accept explicit turn override fields");
 
         assert_eq!(params.mob_id, "mob-1");
         assert_eq!(params.agent_identity, "worker");
-        assert_eq!(params.prompt, serde_json::json!("continue"));
+        assert_eq!(params.prompt, WireContentInput::Text("continue".into()));
         assert_eq!(
-            params.turn_overrides.get("output_schema"),
-            Some(&serde_json::json!({ "type": "object" }))
+            params.output_schema,
+            Some(serde_json::json!({ "type": "object" }))
         );
-        assert_eq!(
-            params.turn_overrides.get("structured_output_retries"),
-            Some(&serde_json::json!(2))
+        assert_eq!(params.structured_output_retries, Some(2));
+
+        let err = serde_json::from_value::<MobTurnStartParams>(serde_json::json!({
+            "mob_id": "mob-1",
+            "agent_identity": "worker",
+            "prompt": "continue",
+            "unknown_override": true
+        }))
+        .expect_err("turn_start must reject unknown override fields");
+        assert!(
+            err.to_string().contains("unknown field"),
+            "unexpected error: {err}"
         );
     }
 

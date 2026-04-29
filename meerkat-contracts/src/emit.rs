@@ -1219,8 +1219,40 @@ mod tests {
     }
 
     #[test]
-    fn emitted_mob_turn_start_params_allow_override_fields() {
-        let output_dir = temp_output_dir("mob-turn-start-overrides");
+    fn emitted_mob_spawn_params_do_not_advertise_unowned_advanced_json_slots() {
+        let output_dir = temp_output_dir("mob-spawn-advanced-slots");
+        emit_all_schemas(&output_dir).expect("emit schemas");
+
+        let params: serde_json::Value =
+            serde_json::from_slice(&fs::read(output_dir.join("params.json")).unwrap()).unwrap();
+        let spawn = params
+            .get("MobSpawnParams")
+            .expect("MobSpawnParams schema must be emitted");
+        let properties = spawn
+            .pointer("/properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("MobSpawnParams schema must expose properties");
+
+        for field in [
+            "launch_mode",
+            "tool_access_policy",
+            "budget_split_policy",
+            "inherited_tool_filter",
+            "override_profile",
+        ] {
+            assert_ne!(
+                properties.get(field),
+                Some(&serde_json::Value::Bool(true)),
+                "MobSpawnParams.{field} must be omitted or backed by a concrete wire-owned schema"
+            );
+        }
+
+        fs::remove_dir_all(&output_dir).unwrap();
+    }
+
+    #[test]
+    fn emitted_mob_turn_start_params_expose_typed_prompt_and_known_overrides() {
+        let output_dir = temp_output_dir("mob-turn-start-typed");
         emit_all_schemas(&output_dir).expect("emit schemas");
 
         let params: serde_json::Value =
@@ -1228,10 +1260,40 @@ mod tests {
         let turn_start = params
             .get("MobTurnStartParams")
             .expect("MobTurnStartParams schema must be emitted");
+        let properties = turn_start
+            .pointer("/properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("MobTurnStartParams schema must expose properties");
         assert_ne!(
+            properties.get("prompt"),
+            Some(&serde_json::Value::Bool(true)),
+            "mob/turn_start prompt must use the canonical content input schema"
+        );
+        for field in [
+            "skill_refs",
+            "flow_tool_overlay",
+            "additional_instructions",
+            "keep_alive",
+            "model",
+            "provider",
+            "max_tokens",
+            "system_prompt",
+            "output_schema",
+            "structured_output_retries",
+            "provider_params",
+            "clear_provider_params",
+            "connection_ref",
+            "clear_connection_ref",
+        ] {
+            assert!(
+                properties.contains_key(field),
+                "mob/turn_start params missing explicit turn override field {field}"
+            );
+        }
+        assert_eq!(
             turn_start.get("additionalProperties"),
             Some(&serde_json::Value::Bool(false)),
-            "mob/turn_start params must permit flattened turn override fields"
+            "mob/turn_start params must fail closed instead of accepting arbitrary flattened overrides"
         );
 
         fs::remove_dir_all(&output_dir).unwrap();

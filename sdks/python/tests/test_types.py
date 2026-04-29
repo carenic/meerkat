@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 from pathlib import Path
+from typing import get_args, get_type_hints
 
 import pytest
 
@@ -140,6 +141,116 @@ def test_generated_runtime_state_result_carries_state():
     result = GeneratedRuntimeStateResult(state="idle")
 
     assert result.state == "idle"
+
+
+def test_generated_mob_contract_types_include_spawn_and_turn_start_shapes():
+    from meerkat.generated.types import (
+        MobMemberStatusResult as GeneratedMobMemberStatusResult,
+        MobSpawnParams as GeneratedMobSpawnParams,
+        MobSpawnResult as GeneratedMobSpawnResult,
+        MobTurnStartParams as GeneratedMobTurnStartParams,
+    )
+
+    spawn = GeneratedMobSpawnParams(
+        mob_id="mob-1",
+        profile="worker",
+        agent_identity="worker-1",
+    )
+    assert spawn.mob_id == "mob-1"
+    assert not hasattr(spawn, "launch_mode")
+
+    turn = GeneratedMobTurnStartParams(
+        mob_id="mob-1",
+        agent_identity="worker-1",
+        prompt=[{"type": "text", "text": "continue"}],
+        model="gpt-test",
+        clear_provider_params=True,
+    )
+    assert turn.prompt == [{"type": "text", "text": "continue"}]
+    assert turn.model == "gpt-test"
+
+    result = GeneratedMobSpawnResult(
+        mob_id="mob-1",
+        agent_identity="worker-1",
+        member_ref="opaque-member-ref",
+    )
+    assert result.member_ref == "opaque-member-ref"
+
+    status = GeneratedMobMemberStatusResult(
+        status="active",
+        tokens_used=0,
+        is_final=False,
+    )
+    assert status.status == "active"
+
+
+def test_generated_mob_member_result_helpers_preserve_schema_types():
+    from meerkat.generated.types import (
+        MobEnsureMemberResult as GeneratedMobEnsureMemberResult,
+        MobMemberListEntryWire as GeneratedMobMemberListEntryWire,
+        MobMembersResult as GeneratedMobMembersResult,
+        MobSpawnReceiptWire as GeneratedMobSpawnReceiptWire,
+        MobSubmitWorkParams as GeneratedMobSubmitWorkParams,
+        WireMemberRef as GeneratedWireMemberRef,
+        WireMemberState as GeneratedWireMemberState,
+        WireMobMemberStatus as GeneratedWireMobMemberStatus,
+        WireMobRuntimeMode as GeneratedWireMobRuntimeMode,
+    )
+
+    assert GeneratedWireMemberRef is str
+    assert get_args(GeneratedWireMobRuntimeMode) == (
+        "autonomous_host",
+        "turn_driven",
+    )
+    assert get_args(GeneratedWireMemberState) == ("active", "retiring")
+    assert get_args(GeneratedWireMobMemberStatus) == (
+        "active",
+        "retiring",
+        "broken",
+        "completed",
+        "unknown",
+    )
+
+    spawn_hints = get_type_hints(GeneratedMobSpawnReceiptWire)
+    assert spawn_hints["member_ref"] is GeneratedWireMemberRef
+
+    submit_hints = get_type_hints(GeneratedMobSubmitWorkParams)
+    assert submit_hints["member_ref"] is GeneratedWireMemberRef
+
+    member_hints = get_type_hints(GeneratedMobMemberListEntryWire)
+    assert member_hints["member_ref"] is GeneratedWireMemberRef
+    assert member_hints["runtime_mode"] == GeneratedWireMobRuntimeMode
+    assert member_hints["state"] == GeneratedWireMemberState
+    assert member_hints["status"] == GeneratedWireMobMemberStatus
+
+    member_ref = _make_member_ref("mob-1", "worker-1")
+    member = GeneratedMobMemberListEntryWire(
+        agent_identity="worker-1",
+        member_ref=member_ref,
+        role="worker",
+        runtime_mode="turn_driven",
+        state="active",
+        status="active",
+        is_final=False,
+    )
+    members = GeneratedMobMembersResult(mob_id="mob-1", members=[member])
+    assert members.members[0].member_ref == member_ref
+
+    spawned = GeneratedMobEnsureMemberResult(
+        outcome={
+            "spawned": GeneratedMobSpawnReceiptWire(
+                agent_identity="worker-1",
+                member_ref=member_ref,
+            ),
+        },
+    )
+    assert spawned.outcome["spawned"].member_ref == member_ref
+
+    submit = GeneratedMobSubmitWorkParams(
+        member_ref=members.members[0].member_ref,
+        content="continue",
+    )
+    assert submit.member_ref == member_ref
 
 
 # ---------------------------------------------------------------------------
