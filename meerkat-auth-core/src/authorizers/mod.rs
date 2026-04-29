@@ -155,6 +155,59 @@ pub(crate) fn token_is_fresh_at(expires_at: DateTime<Utc>, now: DateTime<Utc>) -
 }
 
 #[cfg(any(feature = "azure-ad", feature = "gcp-auth"))]
+pub(crate) fn oauth_endpoint_failure_is_permanent(status: u16, body: &str) -> bool {
+    if endpoint_failure_is_transient(status, body) {
+        return false;
+    }
+
+    if matches!(status, 401 | 403) {
+        return true;
+    }
+
+    matches!(status, 400) && body_mentions_permanent_oauth_error(body)
+}
+
+#[cfg(any(feature = "azure-ad", feature = "gcp-auth"))]
+pub(crate) fn endpoint_failure_is_transient(status: u16, body: &str) -> bool {
+    matches!(status, 408 | 409 | 425 | 429 | 500..=599)
+        || body_mentions_any(
+            body,
+            &[
+                "temporarily_unavailable",
+                "temporary_unavailable",
+                "server_error",
+                "rate_limit",
+                "rate_limited",
+                "too_many_requests",
+                "timeout",
+                "timed out",
+                "try again",
+            ],
+        )
+}
+
+#[cfg(any(feature = "azure-ad", feature = "gcp-auth"))]
+fn body_mentions_permanent_oauth_error(body: &str) -> bool {
+    body_mentions_any(
+        body,
+        &[
+            "invalid_client",
+            "invalid_grant",
+            "unauthorized_client",
+            "invalid_scope",
+            "access_denied",
+            "permission_denied",
+        ],
+    )
+}
+
+#[cfg(any(feature = "azure-ad", feature = "gcp-auth"))]
+fn body_mentions_any(body: &str, needles: &[&str]) -> bool {
+    let body = body.to_ascii_lowercase();
+    needles.iter().any(|needle| body.contains(needle))
+}
+
+#[cfg(any(feature = "azure-ad", feature = "gcp-auth"))]
 fn epoch_secs(ts: DateTime<Utc>) -> u64 {
     ts.timestamp().max(0) as u64
 }

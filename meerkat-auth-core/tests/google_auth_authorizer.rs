@@ -22,7 +22,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::Router;
 use axum::extract::{Form, State};
-use axum::response::{IntoResponse, Json};
+use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
 use chrono::Utc;
 use serde::Deserialize;
@@ -55,36 +55,65 @@ struct MockState {
     counter: Arc<AtomicUsize>,
     captured: Arc<Mutex<Vec<OAuthForm>>>,
     token_value: String,
-    expires_in: u64,
+    expires_in_by_call: Vec<u64>,
+    failure: Option<MockFailure>,
 }
 
-async fn token_endpoint(
-    State(state): State<MockState>,
-    Form(form): Form<OAuthForm>,
-) -> Json<serde_json::Value> {
-    state.counter.fetch_add(1, Ordering::SeqCst);
+#[derive(Clone)]
+struct MockFailure {
+    from_call: usize,
+    status: axum::http::StatusCode,
+    body: serde_json::Value,
+}
+
+async fn token_endpoint(State(state): State<MockState>, Form(form): Form<OAuthForm>) -> Response {
+    let call = state.counter.fetch_add(1, Ordering::SeqCst) + 1;
     state.captured.lock().unwrap().push(form);
+    if let Some(failure) = &state.failure {
+        if call >= failure.from_call {
+            return (failure.status, Json(failure.body.clone())).into_response();
+        }
+    }
+    let expires_in = state
+        .expires_in_by_call
+        .get(call.saturating_sub(1))
+        .or_else(|| state.expires_in_by_call.last())
+        .copied()
+        .unwrap_or(3600);
     Json(serde_json::json!({
         "access_token": state.token_value,
         "token_type": "Bearer",
-        "expires_in": state.expires_in,
+        "expires_in": expires_in,
     }))
+    .into_response()
 }
 
 async fn metadata_endpoint(
     State(state): State<MockState>,
     headers: axum::http::HeaderMap,
-) -> Result<Json<serde_json::Value>, axum::http::StatusCode> {
+) -> Response {
     // GCE metadata server requires Metadata-Flavor: Google header.
     if headers.get("metadata-flavor").and_then(|v| v.to_str().ok()) != Some("Google") {
-        return Err(axum::http::StatusCode::FORBIDDEN);
+        return axum::http::StatusCode::FORBIDDEN.into_response();
     }
-    state.counter.fetch_add(1, Ordering::SeqCst);
-    Ok(Json(serde_json::json!({
+    let call = state.counter.fetch_add(1, Ordering::SeqCst) + 1;
+    if let Some(failure) = &state.failure {
+        if call >= failure.from_call {
+            return (failure.status, Json(failure.body.clone())).into_response();
+        }
+    }
+    let expires_in = state
+        .expires_in_by_call
+        .get(call.saturating_sub(1))
+        .or_else(|| state.expires_in_by_call.last())
+        .copied()
+        .unwrap_or(3600);
+    Json(serde_json::json!({
         "access_token": state.token_value,
         "token_type": "Bearer",
-        "expires_in": state.expires_in,
-    })))
+        "expires_in": expires_in,
+    }))
+    .into_response()
 }
 
 struct MockServer {
@@ -268,13 +297,22 @@ async fn start_mock(token_value: &str) -> MockServer {
 }
 
 async fn start_mock_with_expiry(token_value: &str, expires_in: u64) -> MockServer {
+    start_mock_with_config(token_value, vec![expires_in], None).await
+}
+
+async fn start_mock_with_config(
+    token_value: &str,
+    expires_in_by_call: Vec<u64>,
+    failure: Option<MockFailure>,
+) -> MockServer {
     let counter = Arc::new(AtomicUsize::new(0));
     let captured = Arc::new(Mutex::new(Vec::new()));
     let state = MockState {
         counter: counter.clone(),
         captured: captured.clone(),
         token_value: token_value.into(),
-        expires_in,
+        expires_in_by_call,
+        failure,
     };
     let app = Router::new()
         .route("/token", post(token_endpoint))
@@ -660,6 +698,141 @@ async fn short_lived_token_expiry_is_observable_and_refetched() {
         mock.counter.load(Ordering::SeqCst),
         2,
         "token inside the canonical refresh window must be refetched"
+    );
+}
+
+#[tokio::test]
+async fn token_endpoint_transient_failure_keeps_auth_lease_retryable() {
+    let mock = start_mock_with_config(
+        "google-transient-token",
+        vec![30],
+        Some(MockFailure {
+            from_call: 2,
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            body: serde_json::json!({"error": "temporarily_unavailable"}),
+        }),
+    )
+    .await;
+    let tempdir = tempfile::tempdir().unwrap();
+    let sa_path = write_sa_key(tempdir.path(), &format!("{}/token", mock.base_url));
+    let env_lookup = {
+        let sa_path = sa_path.clone();
+        Arc::new(move |k: &str| {
+            if k == "GOOGLE_APPLICATION_CREDENTIALS" {
+                Some(sa_path.to_string_lossy().to_string())
+            } else {
+                None
+            }
+        }) as Arc<dyn Fn(&str) -> Option<String> + Send + Sync>
+    };
+    let handle = Arc::new(RecordingAuthLeaseHandle::default());
+    let lease_key = LeaseKey::new(
+        RealmId::parse("dev").unwrap(),
+        BindingId::parse("gemini").unwrap(),
+        Some(ProfileId::parse("google_adc").unwrap()),
+    );
+    let lease_handle: Arc<dyn AuthLeaseHandle> = handle.clone();
+    let authorizer = GoogleAuthAuthorizer::with_env_lookup(GoogleAuthChain::Default, env_lookup)
+        .with_home_dir(tempdir.path())
+        .with_auth_lease_observer(lease_handle, lease_key.clone())
+        .with_token_url_override(format!("{}/token", mock.base_url));
+
+    let mut headers = Vec::new();
+    let mut req = HttpAuthorizationRequest {
+        method: "POST",
+        url: "https://x.googleapis.com/",
+        headers: &mut headers,
+    };
+    authorizer.authorize(&mut req).await.unwrap();
+
+    let mut headers = Vec::new();
+    let mut req = HttpAuthorizationRequest {
+        method: "POST",
+        url: "https://x.googleapis.com/",
+        headers: &mut headers,
+    };
+    let err = authorizer.authorize(&mut req).await.unwrap_err();
+    assert!(
+        matches!(err, meerkat_core::AuthError::RefreshFailed(_)),
+        "token endpoint outage should still fail the caller visibly, got {err:?}"
+    );
+
+    let snapshot = handle.snapshot(&lease_key);
+    assert_eq!(
+        snapshot.phase,
+        Some(AuthLeasePhase::Expiring),
+        "transient Google token endpoint failure must remain retryable in AuthMachine"
+    );
+    assert!(
+        handle
+            .events()
+            .iter()
+            .any(|event| matches!(event, LeaseEvent::RefreshFailed(_, false))),
+        "transient Google token endpoint failure should not force reauth"
+    );
+}
+
+#[tokio::test]
+async fn metadata_endpoint_transient_failure_keeps_auth_lease_retryable() {
+    let mock = start_mock_with_config(
+        "metadata-transient-token",
+        vec![30],
+        Some(MockFailure {
+            from_call: 2,
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            body: serde_json::json!({"error": "temporarily_unavailable"}),
+        }),
+    )
+    .await;
+    let env_lookup =
+        Arc::new(|_: &str| None::<String>) as Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+    let handle = Arc::new(RecordingAuthLeaseHandle::default());
+    let lease_key = LeaseKey::new(
+        RealmId::parse("dev").unwrap(),
+        BindingId::parse("gemini").unwrap(),
+        Some(ProfileId::parse("google_metadata").unwrap()),
+    );
+    let lease_handle: Arc<dyn AuthLeaseHandle> = handle.clone();
+    let authorizer =
+        GoogleAuthAuthorizer::with_env_lookup(GoogleAuthChain::ComputeOnly, env_lookup)
+            .with_auth_lease_observer(lease_handle, lease_key.clone())
+            .with_metadata_url_override(format!(
+                "{}/computeMetadata/v1/instance/service-accounts/default/token",
+                mock.base_url
+            ));
+
+    let mut headers = Vec::new();
+    let mut req = HttpAuthorizationRequest {
+        method: "POST",
+        url: "https://generativelanguage.googleapis.com/v1/models",
+        headers: &mut headers,
+    };
+    authorizer.authorize(&mut req).await.unwrap();
+
+    let mut headers = Vec::new();
+    let mut req = HttpAuthorizationRequest {
+        method: "POST",
+        url: "https://generativelanguage.googleapis.com/v1/models",
+        headers: &mut headers,
+    };
+    let err = authorizer.authorize(&mut req).await.unwrap_err();
+    assert!(
+        matches!(err, meerkat_core::AuthError::RefreshFailed(_)),
+        "metadata outage should still fail the caller visibly, got {err:?}"
+    );
+
+    let snapshot = handle.snapshot(&lease_key);
+    assert_eq!(
+        snapshot.phase,
+        Some(AuthLeasePhase::Expiring),
+        "transient metadata failure must remain retryable in AuthMachine"
+    );
+    assert!(
+        handle
+            .events()
+            .iter()
+            .any(|event| matches!(event, LeaseEvent::RefreshFailed(_, false))),
+        "transient metadata failure should not force reauth"
     );
 }
 

@@ -22,6 +22,7 @@ use axum::routing::post;
 use chrono::Utc;
 use serde::Deserialize;
 use tokio::net::TcpListener;
+use tokio::time::{Duration as TokioDuration, sleep, timeout};
 
 use meerkat_auth_core::authorizers::{AzureAdAuthorizer, AzureClientCredentials};
 use meerkat_core::handles::{
@@ -42,27 +43,43 @@ struct MockState {
     counter: Arc<AtomicUsize>,
     captured: Arc<std::sync::Mutex<Vec<TokenForm>>>,
     token_value: String,
-    expires_in: u64,
-    fail_from_call: Option<usize>,
+    expires_in_by_call: Vec<u64>,
+    failure: Option<MockFailure>,
+    delay_from_call: Option<usize>,
+    delay: TokioDuration,
+}
+
+#[derive(Clone)]
+struct MockFailure {
+    from_call: usize,
+    status: axum::http::StatusCode,
+    body: serde_json::Value,
 }
 
 async fn token_handler(State(state): State<MockState>, Form(form): Form<TokenForm>) -> Response {
     let call = state.counter.fetch_add(1, Ordering::SeqCst) + 1;
     state.captured.lock().unwrap().push(form);
     if state
-        .fail_from_call
-        .is_some_and(|fail_from_call| call >= fail_from_call)
+        .delay_from_call
+        .is_some_and(|delay_from_call| call >= delay_from_call)
     {
-        return (
-            axum::http::StatusCode::UNAUTHORIZED,
-            Json(serde_json::json!({"error": "invalid_client"})),
-        )
-            .into_response();
+        sleep(state.delay).await;
     }
+    if let Some(failure) = &state.failure {
+        if call >= failure.from_call {
+            return (failure.status, Json(failure.body.clone())).into_response();
+        }
+    }
+    let expires_in = state
+        .expires_in_by_call
+        .get(call.saturating_sub(1))
+        .or_else(|| state.expires_in_by_call.last())
+        .copied()
+        .unwrap_or(3600);
     Json(serde_json::json!({
         "access_token": state.token_value,
         "token_type": "Bearer",
-        "expires_in": state.expires_in,
+        "expires_in": expires_in,
     }))
     .into_response()
 }
@@ -244,7 +261,7 @@ impl AuthLeaseHandle for RecordingAuthLeaseHandle {
 }
 
 async fn start_mock(token_value: &str, expires_in: u64) -> MockServer {
-    start_mock_with_failure(token_value, expires_in, None).await
+    start_mock_with_config(token_value, vec![expires_in], None, None).await
 }
 
 async fn start_mock_with_failure(
@@ -252,14 +269,30 @@ async fn start_mock_with_failure(
     expires_in: u64,
     fail_from_call: Option<usize>,
 ) -> MockServer {
+    let failure = fail_from_call.map(|from_call| MockFailure {
+        from_call,
+        status: axum::http::StatusCode::UNAUTHORIZED,
+        body: serde_json::json!({"error": "invalid_client"}),
+    });
+    start_mock_with_config(token_value, vec![expires_in], failure, None).await
+}
+
+async fn start_mock_with_config(
+    token_value: &str,
+    expires_in_by_call: Vec<u64>,
+    failure: Option<MockFailure>,
+    delay_from_call: Option<usize>,
+) -> MockServer {
     let counter = Arc::new(AtomicUsize::new(0));
     let captured = Arc::new(std::sync::Mutex::new(Vec::new()));
     let state = MockState {
         counter: counter.clone(),
         captured: captured.clone(),
         token_value: token_value.into(),
-        expires_in,
-        fail_from_call,
+        expires_in_by_call,
+        failure,
+        delay_from_call,
+        delay: TokioDuration::from_millis(150),
     };
     let app = Router::new()
         .route("/tenant-id/oauth2/v2.0/token", post(token_handler))
@@ -561,6 +594,154 @@ async fn refresh_failure_is_visible_on_auth_lease_snapshot() {
         snapshot.phase,
         Some(AuthLeasePhase::ReauthRequired),
         "failed cloud token refresh must leave a visible AuthMachine failure state"
+    );
+    assert!(
+        handle
+            .events()
+            .iter()
+            .any(|event| matches!(event, LeaseEvent::RefreshFailed(_, true))),
+        "invalid Azure client refresh failure should be marked permanent"
+    );
+}
+
+#[tokio::test]
+async fn transient_token_endpoint_failure_keeps_auth_lease_retryable() {
+    let mock = start_mock_with_config(
+        "expires-before-transient-refresh",
+        vec![30],
+        Some(MockFailure {
+            from_call: 2,
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            body: serde_json::json!({"error": "temporarily_unavailable"}),
+        }),
+        None,
+    )
+    .await;
+    let handle = Arc::new(RecordingAuthLeaseHandle::default());
+    let lease_key = LeaseKey::new(
+        RealmId::parse("dev").unwrap(),
+        BindingId::parse("azure_foundry").unwrap(),
+        Some(ProfileId::parse("foundry_azure_ad").unwrap()),
+    );
+    let lease_handle: Arc<dyn AuthLeaseHandle> = handle.clone();
+    let authorizer = AzureAdAuthorizer::new(
+        "https://cognitiveservices.azure.com/.default",
+        creds(&mock.base_url),
+    )
+    .with_auth_lease_observer(lease_handle, lease_key.clone())
+    .with_token_url_override(format!("{}/tenant-id/oauth2/v2.0/token", mock.base_url));
+
+    let mut headers = Vec::new();
+    let mut req = HttpAuthorizationRequest {
+        method: "POST",
+        url: "https://example.foundry.azure.com/v1/messages",
+        headers: &mut headers,
+    };
+    authorizer.authorize(&mut req).await.unwrap();
+
+    let mut headers = Vec::new();
+    let mut req = HttpAuthorizationRequest {
+        method: "POST",
+        url: "https://example.foundry.azure.com/v1/messages",
+        headers: &mut headers,
+    };
+    let err = authorizer.authorize(&mut req).await.unwrap_err();
+    assert!(
+        matches!(err, meerkat_core::AuthError::RefreshFailed(_)),
+        "token endpoint outage should still fail the caller visibly, got {err:?}"
+    );
+
+    let snapshot = handle.snapshot(&lease_key);
+    assert_eq!(
+        snapshot.phase,
+        Some(AuthLeasePhase::Expiring),
+        "transient Azure endpoint failure must remain retryable in AuthMachine"
+    );
+    assert!(
+        handle
+            .events()
+            .iter()
+            .any(|event| matches!(event, LeaseEvent::RefreshFailed(_, false))),
+        "transient Azure endpoint failure should not force reauth"
+    );
+}
+
+#[tokio::test]
+async fn concurrent_refresh_observers_wait_for_inflight_refresh() {
+    let mock =
+        start_mock_with_config("concurrent-refresh-token", vec![30, 3600], None, Some(2)).await;
+    let handle = Arc::new(RecordingAuthLeaseHandle::default());
+    let lease_key = LeaseKey::new(
+        RealmId::parse("dev").unwrap(),
+        BindingId::parse("azure_foundry").unwrap(),
+        Some(ProfileId::parse("foundry_azure_ad").unwrap()),
+    );
+    let lease_handle: Arc<dyn AuthLeaseHandle> = handle.clone();
+    let authorizer = Arc::new(
+        AzureAdAuthorizer::new(
+            "https://cognitiveservices.azure.com/.default",
+            creds(&mock.base_url),
+        )
+        .with_auth_lease_observer(lease_handle, lease_key)
+        .with_token_url_override(format!("{}/tenant-id/oauth2/v2.0/token", mock.base_url)),
+    );
+
+    let mut headers = Vec::new();
+    let mut req = HttpAuthorizationRequest {
+        method: "POST",
+        url: "https://example.foundry.azure.com/v1/messages",
+        headers: &mut headers,
+    };
+    authorizer.authorize(&mut req).await.unwrap();
+
+    let first = {
+        let authorizer = authorizer.clone();
+        tokio::spawn(async move {
+            let mut headers = Vec::new();
+            let mut req = HttpAuthorizationRequest {
+                method: "POST",
+                url: "https://example.foundry.azure.com/v1/messages",
+                headers: &mut headers,
+            };
+            authorizer.authorize(&mut req).await
+        })
+    };
+
+    timeout(TokioDuration::from_secs(1), async {
+        loop {
+            if handle
+                .events()
+                .iter()
+                .any(|event| matches!(event, LeaseEvent::BeginRefresh(_)))
+            {
+                break;
+            }
+            sleep(TokioDuration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("first task should enter the refresh lease window");
+
+    let second = {
+        let authorizer = authorizer.clone();
+        tokio::spawn(async move {
+            let mut headers = Vec::new();
+            let mut req = HttpAuthorizationRequest {
+                method: "POST",
+                url: "https://example.foundry.azure.com/v1/messages",
+                headers: &mut headers,
+            };
+            authorizer.authorize(&mut req).await
+        })
+    };
+
+    let (first, second) = tokio::join!(first, second);
+    first.unwrap().unwrap();
+    second.unwrap().unwrap();
+    assert_eq!(
+        mock.counter.load(Ordering::SeqCst),
+        2,
+        "concurrent observer should wait for the in-flight refresh instead of starting another"
     );
 }
 

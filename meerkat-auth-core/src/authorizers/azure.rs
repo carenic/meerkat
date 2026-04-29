@@ -23,7 +23,7 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use thiserror::Error;
 
-use super::{LeaseFreshnessObserver, token_is_fresh_at};
+use super::{LeaseFreshnessObserver, oauth_endpoint_failure_is_permanent, token_is_fresh_at};
 use meerkat_core::handles::{AuthLeaseHandle, LeaseKey};
 use meerkat_core::{AuthError, HttpAuthorizationRequest, HttpAuthorizer};
 
@@ -101,6 +101,7 @@ pub struct AzureAdAuthorizer {
     creds: AzureClientCredentials,
     http: reqwest::Client,
     cache: Arc<Mutex<Option<CachedToken>>>,
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
     label: String,
     token_url_override: Option<String>,
     lease_observer: Option<LeaseFreshnessObserver>,
@@ -115,6 +116,7 @@ impl AzureAdAuthorizer {
             creds,
             http: reqwest::Client::new(),
             cache: Arc::new(Mutex::new(None)),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             label,
             token_url_override: None,
             lease_observer: None,
@@ -189,9 +191,7 @@ impl AzureAdAuthorizer {
         self.cache.lock().as_ref().map(|token| token.expires_at)
     }
 
-    async fn get_token(&self) -> Result<String, AuthError> {
-        // Check cache without taking the refresh path.
-        let now = Utc::now();
+    fn fresh_cached_token(&self, now: DateTime<Utc>) -> Result<Option<String>, AuthError> {
         if let Some((access_token, expires_at)) = {
             let guard = self.cache.lock();
             guard
@@ -204,8 +204,21 @@ impl AzureAdAuthorizer {
                 token_is_fresh_at(expires_at, now)
             };
             if fresh {
-                return Ok(access_token);
+                return Ok(Some(access_token));
             }
+        }
+        Ok(None)
+    }
+
+    async fn get_token(&self) -> Result<String, AuthError> {
+        // Check cache without taking the refresh path.
+        if let Some(access_token) = self.fresh_cached_token(Utc::now())? {
+            return Ok(access_token);
+        }
+
+        let _refresh_guard = self.refresh_lock.lock().await;
+        if let Some(access_token) = self.fresh_cached_token(Utc::now())? {
+            return Ok(access_token);
         }
 
         let lifecycle = if let Some(observer) = &self.lease_observer {
@@ -239,12 +252,13 @@ impl AzureAdAuthorizer {
 }
 
 fn azure_refresh_failure_is_permanent(err: &AzureAuthError) -> bool {
-    matches!(
-        err,
-        AzureAuthError::MissingEnv(_)
-            | AzureAuthError::TokenEndpoint { .. }
-            | AzureAuthError::InvalidResponse(_)
-    )
+    match err {
+        AzureAuthError::MissingEnv(_) | AzureAuthError::InvalidResponse(_) => true,
+        AzureAuthError::Network(_) => false,
+        AzureAuthError::TokenEndpoint { status, body } => {
+            oauth_endpoint_failure_is_permanent(*status, body)
+        }
+    }
 }
 
 #[async_trait]

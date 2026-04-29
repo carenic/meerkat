@@ -24,7 +24,9 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::{EnvLookup, LeaseFreshnessObserver, token_is_fresh_at};
+use super::{
+    EnvLookup, LeaseFreshnessObserver, oauth_endpoint_failure_is_permanent, token_is_fresh_at,
+};
 use meerkat_core::handles::{AuthLeaseHandle, LeaseKey};
 use meerkat_core::{AuthError, HttpAuthorizationRequest, HttpAuthorizer};
 
@@ -124,6 +126,7 @@ pub struct GoogleAuthAuthorizer {
     env_lookup: EnvLookup,
     home_dir: Option<PathBuf>,
     http: reqwest::Client,
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
     label: String,
     token_url_override: Option<String>,
     metadata_url_override: Option<String>,
@@ -158,6 +161,7 @@ impl GoogleAuthAuthorizer {
             env_lookup,
             home_dir: dirs::home_dir(),
             http: reqwest::Client::new(),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             label,
             token_url_override: None,
             metadata_url_override: None,
@@ -214,8 +218,7 @@ impl GoogleAuthAuthorizer {
         self.cache.lock().as_ref().map(|token| token.expires_at)
     }
 
-    async fn get_token(&self) -> Result<String, AuthError> {
-        let now = Utc::now();
+    fn fresh_cached_token(&self, now: DateTime<Utc>) -> Result<Option<String>, AuthError> {
         if let Some((access_token, expires_at)) = {
             let guard = self.cache.lock();
             guard
@@ -228,8 +231,20 @@ impl GoogleAuthAuthorizer {
                 token_is_fresh_at(expires_at, now)
             };
             if fresh {
-                return Ok(access_token);
+                return Ok(Some(access_token));
             }
+        }
+        Ok(None)
+    }
+
+    async fn get_token(&self) -> Result<String, AuthError> {
+        if let Some(access_token) = self.fresh_cached_token(Utc::now())? {
+            return Ok(access_token);
+        }
+
+        let _refresh_guard = self.refresh_lock.lock().await;
+        if let Some(access_token) = self.fresh_cached_token(Utc::now())? {
+            return Ok(access_token);
         }
 
         let lifecycle = if let Some(observer) = &self.lease_observer {
@@ -433,14 +448,16 @@ impl GoogleAuthAuthorizer {
 }
 
 fn google_refresh_failure_is_permanent(err: &GoogleAuthError) -> bool {
-    matches!(
-        err,
+    match err {
         GoogleAuthError::NoCredentialSource
-            | GoogleAuthError::Json(_)
-            | GoogleAuthError::JwtSign(_)
-            | GoogleAuthError::TokenEndpoint { .. }
-            | GoogleAuthError::MetadataEndpoint { .. }
-    )
+        | GoogleAuthError::Json(_)
+        | GoogleAuthError::JwtSign(_) => true,
+        GoogleAuthError::Io(_) | GoogleAuthError::Network(_) => false,
+        GoogleAuthError::TokenEndpoint { status, body } => {
+            oauth_endpoint_failure_is_permanent(*status, body)
+        }
+        GoogleAuthError::MetadataEndpoint { .. } => false,
+    }
 }
 
 #[async_trait]
