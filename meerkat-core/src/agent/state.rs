@@ -1748,7 +1748,6 @@ where
                             .collect();
                         let tools_ref = Arc::clone(&self.tools);
                         let mut executable_tool_calls = Vec::new();
-                        let mut terminalized_tool_calls = Vec::new();
                         let mut tool_results = Vec::with_capacity(tool_calls.len());
                         let visible_tool_names = tool_defs
                             .iter()
@@ -1828,8 +1827,12 @@ where
                                 &visible_tool_names,
                                 tc.name.as_str(),
                             ) {
-                                terminalized_tool_calls.push((tool_index, tc, Err(error), 0));
-                                continue;
+                                let error = AgentError::ToolError(error.to_string());
+                                self.terminalize_fatal_error(
+                                    &run_id, turn_count, &event_tx, &error,
+                                )
+                                .await?;
+                                return Err(error);
                             }
 
                             emit_event!(AgentEvent::ToolExecutionStarted {
@@ -1855,7 +1858,6 @@ where
 
                         let mut dispatch_results =
                             futures::future::join_all(dispatch_futures).await;
-                        dispatch_results.extend(terminalized_tool_calls);
                         dispatch_results.sort_by_key(|(tool_index, _, _, _)| *tool_index);
 
                         // Process results and emit events
@@ -3616,24 +3618,15 @@ mod tests {
             let mut calls = self.call_count.lock().unwrap();
             let response = if *calls == 0 {
                 super::LlmStreamResult::new(
-                    vec![
-                        AssistantBlock::ToolUse {
-                            id: "call-hidden".to_string(),
-                            name: "secret".into(),
-                            args: serde_json::value::RawValue::from_string("{}".to_string())
-                                .unwrap(),
-                            meta: None,
-                        },
-                        AssistantBlock::ToolUse {
-                            id: "call-control".to_string(),
-                            name: "tool_catalog_search".into(),
-                            args: serde_json::value::RawValue::from_string(
-                                "{\"query\":\"secret\"}".to_string(),
-                            )
-                            .unwrap(),
-                            meta: None,
-                        },
-                    ],
+                    vec![AssistantBlock::ToolUse {
+                        id: "call-control".to_string(),
+                        name: "tool_catalog_search".into(),
+                        args: serde_json::value::RawValue::from_string(
+                            "{\"query\":\"secret\"}".to_string(),
+                        )
+                        .unwrap(),
+                        meta: None,
+                    }],
                     StopReason::ToolUse,
                     Usage::default(),
                 )
@@ -4418,7 +4411,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_receives_filtered_tools_and_dispatch_blocks_hidden_tools() {
+    async fn provider_receives_filtered_tools_and_hidden_tool_calls_terminalize() {
         let client = Arc::new(VisibilityRecordingLlmClient::new());
         let tools = Arc::new(FullToolDispatcher::new(&["visible", "secret"]));
         let mut agent = with_test_turn_state_handle(AgentBuilder::new())
@@ -4432,14 +4425,22 @@ mod tests {
             .unwrap();
         agent.config.max_turns = Some(2);
 
-        let result = agent.run("prompt".to_string().into()).await.unwrap();
-        assert_eq!(result.text, "done");
+        let err = agent
+            .run("prompt".to_string().into())
+            .await
+            .expect_err("hidden LLM tool denial should terminalize the run");
+        assert!(
+            matches!(err, AgentError::ToolError(message) if message.contains("not allowed by policy"))
+        );
 
         // Provider sees only visible tools (filtered by ToolScope)
         let seen = client.seen_tools();
-        assert_eq!(seen.len(), 2);
+        assert_eq!(
+            seen.len(),
+            1,
+            "hidden tool denial must not continue into a follow-up LLM turn"
+        );
         assert_eq!(seen[0], vec!["visible".to_string()]);
-        assert_eq!(seen[1], vec!["visible".to_string()]);
 
         // Hidden tools are NOT dispatched — blocked at execution time too
         let dispatched = tools.dispatched();
@@ -4554,7 +4555,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn llm_hidden_tool_denial_runs_through_post_tool_terminalization() {
+    async fn llm_hidden_tool_denial_terminalizes_without_tool_result() {
         use crate::hooks::{
             HookEngine, HookEngineError, HookExecutionReport, HookInvocation, HookPatch, HookPoint,
         };
@@ -4603,7 +4604,7 @@ mod tests {
             .with_hook_engine(Arc::new(RecordingPostToolHook {
                 calls: Arc::clone(&calls),
             }))
-            .build(client, tools.clone(), Arc::new(NoopStore))
+            .build(client.clone(), tools.clone(), Arc::new(NoopStore))
             .await;
 
         agent
@@ -4613,20 +4614,66 @@ mod tests {
             .expect("stage hidden-tool filter");
         agent.config.max_turns = Some(2);
 
-        let result = agent
-            .run("prompt".to_string().into())
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(32);
+        let err = agent
+            .run_with_events("prompt".to_string().into(), tx)
             .await
-            .expect("hidden tool denial should continue as a terminal tool result");
+            .expect_err("hidden LLM tool denial should fail the run");
 
-        assert_eq!(result.text, "done");
+        assert!(
+            matches!(err, AgentError::ToolError(message) if message.contains("not allowed by policy"))
+        );
+        let seen = client.seen_tools();
+        assert_eq!(
+            seen.len(),
+            1,
+            "hidden LLM tool denial should not continue into a follow-up model turn"
+        );
+        assert!(
+            !agent
+                .session()
+                .messages()
+                .iter()
+                .any(|message| matches!(message, Message::ToolResults { .. })),
+            "hidden LLM tool denial must not fabricate a transcript ToolResult"
+        );
         assert_eq!(
             calls.load(Ordering::SeqCst),
-            1,
-            "hidden LLM tool denial should pass through post-tool terminalization"
+            0,
+            "hidden LLM tool denial should not pass through post-tool hooks as a tool result"
         );
         assert!(
             tools.dispatched().is_empty(),
             "hidden tools must not reach the dispatcher"
+        );
+        let snapshot = agent
+            .execution_snapshot()
+            .expect("test turn-state handle should expose a snapshot");
+        assert_eq!(snapshot.turn_phase, crate::TurnPhase::Failed);
+        assert_eq!(
+            snapshot.terminal_outcome,
+            crate::TurnTerminalOutcome::Failed
+        );
+
+        let mut saw_run_failed = false;
+        let mut saw_tool_result_event = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                crate::event::AgentEvent::RunFailed { .. } => saw_run_failed = true,
+                crate::event::AgentEvent::ToolExecutionCompleted { .. }
+                | crate::event::AgentEvent::ToolResultReceived { .. } => {
+                    saw_tool_result_event = true;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            saw_run_failed,
+            "hidden LLM tool denial should emit RunFailed"
+        );
+        assert!(
+            !saw_tool_result_event,
+            "hidden LLM tool denial should not emit recoverable tool-result events"
         );
     }
 
@@ -5101,7 +5148,7 @@ mod tests {
 
     #[tokio::test]
     async fn builder_restores_persisted_external_filter_from_session_metadata() {
-        let client = Arc::new(VisibilityRecordingLlmClient::new());
+        let client = Arc::new(SingleTurnVisibilityClient::new());
         let tools = Arc::new(FullToolDispatcher::new(&["visible", "secret"]));
         let mut session = crate::Session::new();
         session.set_metadata(
@@ -5120,15 +5167,12 @@ mod tests {
 
         let result = agent.run("prompt".to_string().into()).await.unwrap();
         assert_eq!(result.text, "done");
-        assert_eq!(
-            client.seen_tools(),
-            vec![vec!["visible".to_string()], vec!["visible".to_string()]]
-        );
+        assert_eq!(client.seen_tools(), vec![vec!["visible".to_string()]]);
     }
 
     #[tokio::test]
     async fn builder_preserves_unknown_persisted_filter_tools_as_dormant_intent() {
-        let client = Arc::new(VisibilityRecordingLlmClient::new());
+        let client = Arc::new(SingleTurnVisibilityClient::new());
         let tools = Arc::new(FullToolDispatcher::new(&["visible", "secret"]));
         let mut session = crate::Session::new();
         session.set_metadata(
@@ -5150,10 +5194,7 @@ mod tests {
         let result = agent.run("prompt".to_string().into()).await.unwrap();
         assert_eq!(result.text, "done");
         let seen = client.seen_tools();
-        assert_eq!(
-            seen,
-            vec![vec!["visible".to_string()], vec!["visible".to_string()]]
-        );
+        assert_eq!(seen, vec![vec!["visible".to_string()]]);
         let visibility_state = agent
             .session()
             .tool_visibility_state()
@@ -5171,7 +5212,7 @@ mod tests {
 
     #[tokio::test]
     async fn builder_restores_inherited_filter_from_session_metadata() {
-        let client = Arc::new(VisibilityRecordingLlmClient::new());
+        let client = Arc::new(SingleTurnVisibilityClient::new());
         let tools = Arc::new(FullToolDispatcher::new(&["visible", "secret"]));
         let mut session = crate::Session::new();
         session.set_metadata(
@@ -5191,10 +5232,7 @@ mod tests {
         let result = agent.run("prompt".to_string().into()).await.unwrap();
         assert_eq!(result.text, "done");
         // The inherited base filter restricts to only "visible"
-        assert_eq!(
-            client.seen_tools(),
-            vec![vec!["visible".to_string()], vec!["visible".to_string()]]
-        );
+        assert_eq!(client.seen_tools(), vec![vec!["visible".to_string()]]);
     }
 
     /// Mock LLM client that returns high usage, causing budget exhaustion
