@@ -240,6 +240,29 @@ fn session_tool_visibility_kernel_rejects_deferred_names_without_witnesses() {
 }
 
 #[test]
+fn session_tool_visibility_kernel_rejects_deferred_names_with_empty_witness() {
+    let kernel = GeneratedMachineKernel::new(meerkat::schema());
+    let attached = prepared_meerkat_state(&kernel);
+    let err = kernel
+        .transition(
+            &attached,
+            &KernelInput {
+                variant: input("RequestDeferredTools"),
+                fields: BTreeMap::from([
+                    (field("names"), string_set(&["search"])),
+                    (field("witnesses"), witness_map(&[("search", "")])),
+                ]),
+            },
+        )
+        .expect_err("empty witness must be rejected before staging names");
+
+    assert!(
+        format!("{err:?}").contains("NoMatchingTransition"),
+        "empty authority must leave no admissible transition: {err:?}"
+    );
+}
+
+#[test]
 fn session_tool_visibility_kernel_rejects_legacy_stage_deferred_names_input() {
     let kernel = GeneratedMachineKernel::new(meerkat::schema());
     let attached = prepared_meerkat_state(&kernel);

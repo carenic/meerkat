@@ -205,6 +205,16 @@ pub struct ToolVisibilityWitness {
     pub last_seen_provenance: Option<ToolProvenance>,
 }
 
+impl ToolVisibilityWitness {
+    fn has_identity_witness(&self) -> bool {
+        self.stable_owner_key.is_some() || self.last_seen_provenance.is_some()
+    }
+
+    fn len(&self) -> u64 {
+        u64::from(self.has_identity_witness())
+    }
+}
+
 /// Per-session realtime binding-state lifecycle.
 ///
 /// Unit variants only — carried inside `MeerkatMachine` state as a closed
@@ -2339,6 +2349,22 @@ macro_rules! meerkat_catalog_machine_dsl {
         disposition CommsTrustReconcileRequested => external,
 
         // =====================================================================
+        // Helpers
+        // =====================================================================
+
+        helper deferred_authority_has_identity(witness: ToolVisibilityWitness) -> bool {
+            witness.len() > 0
+        }
+
+        helper deferred_authorities_have_identity(
+            names: Set<String>,
+            witnesses: Map<String, ToolVisibilityWitness>
+        ) -> bool {
+            for_all(requested_name in names,
+                deferred_authority_has_identity(witnesses.get_cloned(requested_name).get("value")))
+        }
+
+        // =====================================================================
         // Invariants
         // =====================================================================
 
@@ -3021,6 +3047,9 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "deferred_authorities_are_name_scoped" {
                 for_all(witnessed_name in witnesses.keys(), names.contains(witnessed_name))
             }
+            guard "deferred_authorities_have_identity" {
+                deferred_authorities_have_identity(names, witnesses)
+            }
             update {
                 self.next_staged_visibility_revision = self.next_staged_visibility_revision + 1;
                 self.staged_deferred_names = names;
@@ -3192,6 +3221,12 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "staged_deferred_authorities_are_name_scoped" {
                 for_all(witnessed_name in staged_deferred_authorities.keys(), staged_requested_deferred_names.contains(witnessed_name))
             }
+            guard "active_deferred_authorities_have_identity" {
+                deferred_authorities_have_identity(active_requested_deferred_names, active_deferred_authorities)
+            }
+            guard "staged_deferred_authorities_have_identity" {
+                deferred_authorities_have_identity(staged_requested_deferred_names, staged_deferred_authorities)
+            }
             update {
                 self.active_filter = active_filter;
                 self.staged_filter = staged_filter;
@@ -3245,6 +3280,12 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "staged_deferred_authorities_are_name_scoped" {
                 for_all(witnessed_name in staged_deferred_authorities.keys(), staged_requested_deferred_names.contains(witnessed_name))
             }
+            guard "active_deferred_authorities_have_identity" {
+                deferred_authorities_have_identity(active_requested_deferred_names, active_deferred_authorities)
+            }
+            guard "staged_deferred_authorities_have_identity" {
+                deferred_authorities_have_identity(staged_requested_deferred_names, staged_deferred_authorities)
+            }
             update {
                 self.active_filter = active_filter;
                 self.staged_filter = staged_filter;
@@ -3291,6 +3332,12 @@ macro_rules! meerkat_catalog_machine_dsl {
             }
             guard "staged_deferred_authorities_are_name_scoped" {
                 for_all(witnessed_name in staged_deferred_authorities.keys(), staged_requested_deferred_names.contains(witnessed_name))
+            }
+            guard "active_deferred_authorities_have_identity" {
+                deferred_authorities_have_identity(active_requested_deferred_names, active_deferred_authorities)
+            }
+            guard "staged_deferred_authorities_have_identity" {
+                deferred_authorities_have_identity(staged_requested_deferred_names, staged_deferred_authorities)
             }
             update {
                 self.active_filter = active_filter;
@@ -3339,6 +3386,12 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "staged_deferred_authorities_are_name_scoped" {
                 for_all(witnessed_name in staged_deferred_authorities.keys(), staged_requested_deferred_names.contains(witnessed_name))
             }
+            guard "active_deferred_authorities_have_identity" {
+                deferred_authorities_have_identity(active_requested_deferred_names, active_deferred_authorities)
+            }
+            guard "staged_deferred_authorities_have_identity" {
+                deferred_authorities_have_identity(staged_requested_deferred_names, staged_deferred_authorities)
+            }
             update {
                 self.active_filter = active_filter;
                 self.staged_filter = staged_filter;
@@ -3385,6 +3438,12 @@ macro_rules! meerkat_catalog_machine_dsl {
             }
             guard "staged_deferred_authorities_are_name_scoped" {
                 for_all(witnessed_name in staged_deferred_authorities.keys(), staged_requested_deferred_names.contains(witnessed_name))
+            }
+            guard "active_deferred_authorities_have_identity" {
+                deferred_authorities_have_identity(active_requested_deferred_names, active_deferred_authorities)
+            }
+            guard "staged_deferred_authorities_have_identity" {
+                deferred_authorities_have_identity(staged_requested_deferred_names, staged_deferred_authorities)
             }
             update {
                 self.active_filter = active_filter;
@@ -6253,6 +6312,9 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "deferred_authorities_are_name_scoped" {
                 for_all(witnessed_name in witnesses.keys(), names.contains(witnessed_name))
             }
+            guard "deferred_authorities_have_identity" {
+                deferred_authorities_have_identity(names, witnesses)
+            }
             update {
                 self.active_deferred_names = names;
                 self.active_deferred_authorities = witnesses;
@@ -6298,6 +6360,12 @@ macro_rules! meerkat_catalog_machine_dsl {
             }
             guard "staged_deferred_authorities_are_name_scoped" {
                 for_all(witnessed_name in staged_deferred_authorities.keys(), staged_deferred_names.contains(witnessed_name))
+            }
+            guard "active_deferred_authorities_have_identity" {
+                deferred_authorities_have_identity(active_deferred_names, active_deferred_authorities)
+            }
+            guard "staged_deferred_authorities_have_identity" {
+                deferred_authorities_have_identity(staged_deferred_names, staged_deferred_authorities)
             }
             update {
                 self.active_deferred_names = active_deferred_names;

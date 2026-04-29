@@ -942,8 +942,23 @@ impl GeneratedMachineKernel {
                     KernelValue::Set(items) => items.len(),
                     KernelValue::Map(items) => items.len(),
                     KernelValue::String(items) => items.chars().count(),
+                    KernelValue::Named { value, .. } => match *value {
+                        KernelValue::Seq(items) => items.len(),
+                        KernelValue::Set(items) => items.len(),
+                        KernelValue::Map(items) => items.len(),
+                        KernelValue::String(items) => items.chars().count(),
+                        KernelValue::NamedVariant { .. }
+                        | KernelValue::Named { .. }
+                        | KernelValue::Bool(_)
+                        | KernelValue::U64(_)
+                        | KernelValue::None => {
+                            return Err(self.eval_error(
+                                transition_name,
+                                "Len expects seq, set, map, or string".to_string(),
+                            ));
+                        }
+                    },
                     KernelValue::NamedVariant { .. }
-                    | KernelValue::Named { .. }
                     | KernelValue::Bool(_)
                     | KernelValue::U64(_)
                     | KernelValue::None => {

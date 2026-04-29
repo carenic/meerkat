@@ -29,6 +29,7 @@ use tokio::sync::Notify;
 
 use crate::completion::CompletionOutcome;
 use crate::identifiers::IdempotencyKey;
+use crate::meerkat_machine::dsl as mm_dsl;
 use crate::meerkat_machine_types::{
     ImageOperationRoutingRequest, ImageOperationRoutingResult, ModelRoutingApprovalDisposition,
     ModelRoutingRealtimePolicy, SwitchTurnRequest,
@@ -12398,6 +12399,85 @@ async fn request_deferred_tools_requires_machine_visible_witnesses() {
     );
 }
 
+fn registered_dsl_authority_for_visibility_tests() -> mm_dsl::MeerkatMachineAuthority {
+    let mut authority = mm_dsl::MeerkatMachineAuthority::new();
+    authority
+        .apply_signal(mm_dsl::MeerkatMachineSignal::Initialize)
+        .expect("initialize DSL authority");
+    mm_dsl::MeerkatMachineMutator::apply(
+        &mut authority,
+        mm_dsl::MeerkatMachineInput::RegisterSession {
+            session_id: mm_dsl::SessionId("session-1".to_string()),
+        },
+    )
+    .expect("register session");
+    authority
+}
+
+#[test]
+fn request_deferred_tools_rejects_empty_dsl_authority_witness() {
+    let mut authority = registered_dsl_authority_for_visibility_tests();
+    let witnesses = [(
+        "deferred_tool".to_string(),
+        mm_dsl::ToolVisibilityWitness::from(&meerkat_core::ToolVisibilityWitness::default()),
+    )]
+    .into_iter()
+    .collect();
+    let err = mm_dsl::MeerkatMachineMutator::apply(
+        &mut authority,
+        mm_dsl::MeerkatMachineInput::RequestDeferredTools {
+            names: ["deferred_tool".to_string()].into_iter().collect(),
+            witnesses,
+        },
+    )
+    .expect_err("machine authority must reject empty/default deferred-tool witness");
+
+    assert!(
+        matches!(
+            err,
+            mm_dsl::MeerkatMachineTransitionError::GuardRejected { .. }
+        ),
+        "empty witness should be rejected by a DSL guard: {err:?}"
+    );
+    assert!(
+        authority.state.staged_deferred_names.is_empty(),
+        "failed DSL admission must not stage routing names"
+    );
+}
+
+#[test]
+fn request_deferred_tools_accepts_provenance_only_dsl_authority_witness() {
+    let mut authority = registered_dsl_authority_for_visibility_tests();
+    let witness = mm_dsl::ToolVisibilityWitness::from(&meerkat_core::ToolVisibilityWitness {
+        stable_owner_key: None,
+        last_seen_provenance: Some(meerkat_core::ToolProvenance {
+            kind: meerkat_core::ToolSourceKind::Callback,
+            source_id: "test".into(),
+        }),
+    });
+    let witnesses = [("deferred_tool".to_string(), witness.clone())]
+        .into_iter()
+        .collect();
+
+    mm_dsl::MeerkatMachineMutator::apply(
+        &mut authority,
+        mm_dsl::MeerkatMachineInput::RequestDeferredTools {
+            names: ["deferred_tool".to_string()].into_iter().collect(),
+            witnesses,
+        },
+    )
+    .expect("provenance witness should carry DSL admission authority");
+
+    assert_eq!(
+        authority
+            .state
+            .staged_deferred_authorities
+            .get("deferred_tool"),
+        Some(&witness),
+        "provenance-only witness must be retained as the typed admission authority"
+    );
+}
+
 #[tokio::test]
 async fn machine_owned_visibility_owner_promotes_staged_state_at_boundary() {
     let adapter = Arc::new(MeerkatMachine::ephemeral());
@@ -12506,6 +12586,45 @@ async fn replace_visibility_state_rejects_deferred_names_without_authority() {
     assert!(
         state.staged_requested_deferred_names.is_empty(),
         "failed authority sync must not install staged routing names"
+    );
+}
+
+#[tokio::test]
+async fn replace_visibility_state_rejects_deferred_names_with_empty_authority() {
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    let bindings = adapter
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("bindings should prepare");
+    let replacement = meerkat_core::SessionToolVisibilityState {
+        staged_requested_deferred_names: ["deferred_tool".to_string()].into_iter().collect(),
+        requested_witnesses: [(
+            "deferred_tool".to_string(),
+            meerkat_core::ToolVisibilityWitness::default(),
+        )]
+        .into_iter()
+        .collect(),
+        staged_revision: 1,
+        ..Default::default()
+    };
+
+    let err = bindings
+        .tool_visibility_owner
+        .replace_visibility_state(replacement)
+        .expect_err("replacement must not install deferred names with empty typed authority");
+
+    assert!(
+        err.to_string().contains("SyncVisibilityRevisions"),
+        "rejection should come from the DSL authority sync: {err}"
+    );
+    let state = bindings
+        .tool_visibility_owner
+        .visibility_state()
+        .expect("owner state should still be readable");
+    assert!(
+        state.staged_requested_deferred_names.is_empty(),
+        "failed empty-authority sync must not install staged routing names"
     );
 }
 

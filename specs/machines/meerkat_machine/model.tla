@@ -71,6 +71,9 @@ VARIABLES phase, model_step_count, session_id, active_runtime_id, active_fence_t
 
 vars == << phase, model_step_count, session_id, active_runtime_id, active_fence_token, current_run_id, pre_run_phase, turn_phase, primitive_kind, admitted_content_shape, vision_enabled, image_tool_results_enabled, tool_calls_pending, pending_op_refs, barrier_operation_ids, has_barrier_ops, barrier_satisfied, boundary_count, cancel_after_boundary, terminal_outcome, extraction_attempts, max_extraction_retries, llm_retry_attempt, llm_retry_max_retries, llm_retry_selected_delay_ms, llm_retry_last_failure_kind, silent_intent_overrides, model_routing_baseline_model, model_routing_baseline_realtime, model_routing_topology_epoch, model_routing_turn_override_id, model_routing_turn_request_id, model_routing_turn_target_model, model_routing_turn_realtime, model_routing_turn_remaining_turns, model_routing_operation_override_id, model_routing_operation_target_model, model_routing_operation_realtime, model_routing_pending_switch_request_id, model_routing_pending_switch_target_model, model_routing_pending_switch_realtime, model_routing_pending_switch_turns, model_routing_pending_switch_phase, model_routing_switch_terminal, model_routing_switch_denials, model_routing_image_operation_phases, model_routing_image_operation_target_models, model_routing_image_operation_realtime, model_routing_image_operation_requires_scoped_override, model_routing_image_terminals, model_routing_image_terminal_payloads, model_routing_image_denials, model_routing_approval_phases, model_routing_approval_parent_kind, registration_phase, drain_phase, drain_mode, next_staged_visibility_revision, active_filter, staged_filter, active_visibility_revision, staged_visibility_revision, active_deferred_names, staged_deferred_names, active_deferred_authorities, staged_deferred_authorities, input_phases, input_terminal_kind, input_superseded_by, input_aggregate_id, input_abandon_reason, input_abandon_attempt_count, input_attempt_counts, input_run_associations, input_boundary_sequences, next_admission_seq, input_admission_seq, input_lane, op_statuses, op_completion_seq, op_terminal_outcomes, op_terminal_payload, op_kinds, op_peer_ready, op_progress_counts, active_op_count, wait_active, wait_request_id, wait_operation_ids, wait_operation_id_tokens, next_completion_seq, known_surfaces, active_surfaces, visible_surfaces, surface_base_state, surface_pending_op, surface_staged_op, reload_staged_surfaces, surface_staged_intent_sequence, next_staged_intent_sequence, surface_pending_task_sequence, next_pending_task_sequence, surface_pending_lineage_sequence, surface_inflight_calls, surface_last_delta_operation, surface_last_delta_phase, snapshot_epoch, snapshot_aligned_epoch, surface_draining_since_ms, surface_removal_timeout_at_ms, surface_removal_applied_at_turn, surface_phase, removal_timeout_ms, realtime_intent_present, realtime_binding_state, realtime_binding_authority_epoch, realtime_reattach_required, realtime_next_authority_epoch, realtime_reconnect_cycle_state, realtime_reconnect_attempt_count, realtime_reconnect_next_retry_at_ms, realtime_reconnect_deadline_at_ms, live_topology_phase, mcp_server_states, pending_peer_requests, inbound_peer_requests, last_session_context_updated_at_ms, reserved_interaction_streams, attached_interaction_streams, realtime_product_turn_phase, realtime_projection_freshness, realtime_projection_frontier_ms, realtime_reconnect_policy, peer_ingress_owner_kind, peer_ingress_comms_runtime_id, peer_ingress_mob_id, supervisor_binding_kind, supervisor_bound_name, supervisor_bound_peer_id, supervisor_bound_address, supervisor_bound_epoch, local_endpoint, direct_peer_endpoints, mob_overlay_peer_endpoints, peer_projection_epoch, mob_overlay_epoch >>
 
+deferred_authority_has_identity(witness) == (Len(witness) > 0)
+deferred_authorities_have_identity(names, witnesses) == (\A requested_name \in names : deferred_authority_has_identity((IF "value" \in DOMAIN (IF (requested_name \in DOMAIN witnesses) THEN Some((IF requested_name \in DOMAIN witnesses THEN witnesses[requested_name] ELSE "None")) ELSE None) THEN (IF (requested_name \in DOMAIN witnesses) THEN Some((IF requested_name \in DOMAIN witnesses THEN witnesses[requested_name] ELSE "None")) ELSE None)["value"] ELSE None)))
+
 Init ==
     /\ phase = "Initializing"
     /\ model_step_count = 0
@@ -1328,6 +1331,7 @@ RequestDeferredToolsIdle(names, witnesses) ==
     /\ (session_id # None)
     /\ (\A requested_name \in names : (requested_name \in DOMAIN witnesses))
     /\ (\A witnessed_name \in DOMAIN witnesses : (witnessed_name \in names))
+    /\ deferred_authorities_have_identity(names, witnesses)
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
     /\ next_staged_visibility_revision' = (next_staged_visibility_revision + 1)
@@ -1342,6 +1346,7 @@ RequestDeferredToolsAttached(names, witnesses) ==
     /\ (session_id # None)
     /\ (\A requested_name \in names : (requested_name \in DOMAIN witnesses))
     /\ (\A witnessed_name \in DOMAIN witnesses : (witnessed_name \in names))
+    /\ deferred_authorities_have_identity(names, witnesses)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
     /\ next_staged_visibility_revision' = (next_staged_visibility_revision + 1)
@@ -1356,6 +1361,7 @@ RequestDeferredToolsRunning(names, witnesses) ==
     /\ (session_id # None)
     /\ (\A requested_name \in names : (requested_name \in DOMAIN witnesses))
     /\ (\A witnessed_name \in DOMAIN witnesses : (witnessed_name \in names))
+    /\ deferred_authorities_have_identity(names, witnesses)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ next_staged_visibility_revision' = (next_staged_visibility_revision + 1)
@@ -1370,6 +1376,7 @@ RequestDeferredToolsRetired(names, witnesses) ==
     /\ (session_id # None)
     /\ (\A requested_name \in names : (requested_name \in DOMAIN witnesses))
     /\ (\A witnessed_name \in DOMAIN witnesses : (witnessed_name \in names))
+    /\ deferred_authorities_have_identity(names, witnesses)
     /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
     /\ next_staged_visibility_revision' = (next_staged_visibility_revision + 1)
@@ -1384,6 +1391,7 @@ RequestDeferredToolsStopped(names, witnesses) ==
     /\ (session_id # None)
     /\ (\A requested_name \in names : (requested_name \in DOMAIN witnesses))
     /\ (\A witnessed_name \in DOMAIN witnesses : (witnessed_name \in names))
+    /\ deferred_authorities_have_identity(names, witnesses)
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
     /\ next_staged_visibility_revision' = (next_staged_visibility_revision + 1)
@@ -1572,6 +1580,8 @@ PublishCommittedVisibleSetIdle(arg_active_filter, arg_staged_filter, active_requ
     /\ (\A requested_name \in staged_requested_deferred_names : (requested_name \in DOMAIN arg_staged_deferred_authorities))
     /\ (\A witnessed_name \in DOMAIN arg_active_deferred_authorities : (witnessed_name \in active_requested_deferred_names))
     /\ (\A witnessed_name \in DOMAIN arg_staged_deferred_authorities : (witnessed_name \in staged_requested_deferred_names))
+    /\ deferred_authorities_have_identity(active_requested_deferred_names, arg_active_deferred_authorities)
+    /\ deferred_authorities_have_identity(staged_requested_deferred_names, arg_staged_deferred_authorities)
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
     /\ next_staged_visibility_revision' = IF (arg_active_visibility_revision > next_staged_visibility_revision) THEN arg_active_visibility_revision ELSE next_staged_visibility_revision
@@ -1596,6 +1606,8 @@ PublishCommittedVisibleSetAttached(arg_active_filter, arg_staged_filter, active_
     /\ (\A requested_name \in staged_requested_deferred_names : (requested_name \in DOMAIN arg_staged_deferred_authorities))
     /\ (\A witnessed_name \in DOMAIN arg_active_deferred_authorities : (witnessed_name \in active_requested_deferred_names))
     /\ (\A witnessed_name \in DOMAIN arg_staged_deferred_authorities : (witnessed_name \in staged_requested_deferred_names))
+    /\ deferred_authorities_have_identity(active_requested_deferred_names, arg_active_deferred_authorities)
+    /\ deferred_authorities_have_identity(staged_requested_deferred_names, arg_staged_deferred_authorities)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
     /\ next_staged_visibility_revision' = IF (arg_active_visibility_revision > next_staged_visibility_revision) THEN arg_active_visibility_revision ELSE next_staged_visibility_revision
@@ -1620,6 +1632,8 @@ PublishCommittedVisibleSetRunning(arg_active_filter, arg_staged_filter, active_r
     /\ (\A requested_name \in staged_requested_deferred_names : (requested_name \in DOMAIN arg_staged_deferred_authorities))
     /\ (\A witnessed_name \in DOMAIN arg_active_deferred_authorities : (witnessed_name \in active_requested_deferred_names))
     /\ (\A witnessed_name \in DOMAIN arg_staged_deferred_authorities : (witnessed_name \in staged_requested_deferred_names))
+    /\ deferred_authorities_have_identity(active_requested_deferred_names, arg_active_deferred_authorities)
+    /\ deferred_authorities_have_identity(staged_requested_deferred_names, arg_staged_deferred_authorities)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ next_staged_visibility_revision' = IF (arg_active_visibility_revision > next_staged_visibility_revision) THEN arg_active_visibility_revision ELSE next_staged_visibility_revision
@@ -1644,6 +1658,8 @@ PublishCommittedVisibleSetRetired(arg_active_filter, arg_staged_filter, active_r
     /\ (\A requested_name \in staged_requested_deferred_names : (requested_name \in DOMAIN arg_staged_deferred_authorities))
     /\ (\A witnessed_name \in DOMAIN arg_active_deferred_authorities : (witnessed_name \in active_requested_deferred_names))
     /\ (\A witnessed_name \in DOMAIN arg_staged_deferred_authorities : (witnessed_name \in staged_requested_deferred_names))
+    /\ deferred_authorities_have_identity(active_requested_deferred_names, arg_active_deferred_authorities)
+    /\ deferred_authorities_have_identity(staged_requested_deferred_names, arg_staged_deferred_authorities)
     /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
     /\ next_staged_visibility_revision' = IF (arg_active_visibility_revision > next_staged_visibility_revision) THEN arg_active_visibility_revision ELSE next_staged_visibility_revision
@@ -1668,6 +1684,8 @@ PublishCommittedVisibleSetStopped(arg_active_filter, arg_staged_filter, active_r
     /\ (\A requested_name \in staged_requested_deferred_names : (requested_name \in DOMAIN arg_staged_deferred_authorities))
     /\ (\A witnessed_name \in DOMAIN arg_active_deferred_authorities : (witnessed_name \in active_requested_deferred_names))
     /\ (\A witnessed_name \in DOMAIN arg_staged_deferred_authorities : (witnessed_name \in staged_requested_deferred_names))
+    /\ deferred_authorities_have_identity(active_requested_deferred_names, arg_active_deferred_authorities)
+    /\ deferred_authorities_have_identity(staged_requested_deferred_names, arg_staged_deferred_authorities)
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
     /\ next_staged_visibility_revision' = IF (arg_active_visibility_revision > next_staged_visibility_revision) THEN arg_active_visibility_revision ELSE next_staged_visibility_revision
@@ -5616,6 +5634,7 @@ CommitDeferredNamesIdle(names, witnesses) ==
     /\ phase = "Idle"
     /\ (\A requested_name \in names : (requested_name \in DOMAIN witnesses))
     /\ (\A witnessed_name \in DOMAIN witnesses : (witnessed_name \in names))
+    /\ deferred_authorities_have_identity(names, witnesses)
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
     /\ active_deferred_names' = names
@@ -5627,6 +5646,7 @@ CommitDeferredNamesAttached(names, witnesses) ==
     /\ phase = "Attached"
     /\ (\A requested_name \in names : (requested_name \in DOMAIN witnesses))
     /\ (\A witnessed_name \in DOMAIN witnesses : (witnessed_name \in names))
+    /\ deferred_authorities_have_identity(names, witnesses)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
     /\ active_deferred_names' = names
@@ -5638,6 +5658,7 @@ CommitDeferredNamesRunning(names, witnesses) ==
     /\ phase = "Running"
     /\ (\A requested_name \in names : (requested_name \in DOMAIN witnesses))
     /\ (\A witnessed_name \in DOMAIN witnesses : (witnessed_name \in names))
+    /\ deferred_authorities_have_identity(names, witnesses)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ active_deferred_names' = names
@@ -5649,6 +5670,7 @@ CommitDeferredNamesRetired(names, witnesses) ==
     /\ phase = "Retired"
     /\ (\A requested_name \in names : (requested_name \in DOMAIN witnesses))
     /\ (\A witnessed_name \in DOMAIN witnesses : (witnessed_name \in names))
+    /\ deferred_authorities_have_identity(names, witnesses)
     /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
     /\ active_deferred_names' = names
@@ -5660,6 +5682,7 @@ CommitDeferredNamesStopped(names, witnesses) ==
     /\ phase = "Stopped"
     /\ (\A requested_name \in names : (requested_name \in DOMAIN witnesses))
     /\ (\A witnessed_name \in DOMAIN witnesses : (witnessed_name \in names))
+    /\ deferred_authorities_have_identity(names, witnesses)
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
     /\ active_deferred_names' = names
@@ -5674,6 +5697,8 @@ SyncVisibilityRevisionsIdle(active_revision, staged_revision, arg_active_deferre
     /\ (\A requested_name \in arg_staged_deferred_names : (requested_name \in DOMAIN arg_staged_deferred_authorities))
     /\ (\A witnessed_name \in DOMAIN arg_active_deferred_authorities : (witnessed_name \in arg_active_deferred_names))
     /\ (\A witnessed_name \in DOMAIN arg_staged_deferred_authorities : (witnessed_name \in arg_staged_deferred_names))
+    /\ deferred_authorities_have_identity(arg_active_deferred_names, arg_active_deferred_authorities)
+    /\ deferred_authorities_have_identity(arg_staged_deferred_names, arg_staged_deferred_authorities)
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
     /\ next_staged_visibility_revision' = IF (staged_revision > IF (active_revision > next_staged_visibility_revision) THEN active_revision ELSE next_staged_visibility_revision) THEN staged_revision ELSE IF (active_revision > next_staged_visibility_revision) THEN active_revision ELSE next_staged_visibility_revision
@@ -5691,6 +5716,8 @@ SyncVisibilityRevisionsAttached(active_revision, staged_revision, arg_active_def
     /\ (\A requested_name \in arg_staged_deferred_names : (requested_name \in DOMAIN arg_staged_deferred_authorities))
     /\ (\A witnessed_name \in DOMAIN arg_active_deferred_authorities : (witnessed_name \in arg_active_deferred_names))
     /\ (\A witnessed_name \in DOMAIN arg_staged_deferred_authorities : (witnessed_name \in arg_staged_deferred_names))
+    /\ deferred_authorities_have_identity(arg_active_deferred_names, arg_active_deferred_authorities)
+    /\ deferred_authorities_have_identity(arg_staged_deferred_names, arg_staged_deferred_authorities)
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
     /\ next_staged_visibility_revision' = IF (staged_revision > IF (active_revision > next_staged_visibility_revision) THEN active_revision ELSE next_staged_visibility_revision) THEN staged_revision ELSE IF (active_revision > next_staged_visibility_revision) THEN active_revision ELSE next_staged_visibility_revision
@@ -5708,6 +5735,8 @@ SyncVisibilityRevisionsRunning(active_revision, staged_revision, arg_active_defe
     /\ (\A requested_name \in arg_staged_deferred_names : (requested_name \in DOMAIN arg_staged_deferred_authorities))
     /\ (\A witnessed_name \in DOMAIN arg_active_deferred_authorities : (witnessed_name \in arg_active_deferred_names))
     /\ (\A witnessed_name \in DOMAIN arg_staged_deferred_authorities : (witnessed_name \in arg_staged_deferred_names))
+    /\ deferred_authorities_have_identity(arg_active_deferred_names, arg_active_deferred_authorities)
+    /\ deferred_authorities_have_identity(arg_staged_deferred_names, arg_staged_deferred_authorities)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ next_staged_visibility_revision' = IF (staged_revision > IF (active_revision > next_staged_visibility_revision) THEN active_revision ELSE next_staged_visibility_revision) THEN staged_revision ELSE IF (active_revision > next_staged_visibility_revision) THEN active_revision ELSE next_staged_visibility_revision
@@ -5725,6 +5754,8 @@ SyncVisibilityRevisionsRetired(active_revision, staged_revision, arg_active_defe
     /\ (\A requested_name \in arg_staged_deferred_names : (requested_name \in DOMAIN arg_staged_deferred_authorities))
     /\ (\A witnessed_name \in DOMAIN arg_active_deferred_authorities : (witnessed_name \in arg_active_deferred_names))
     /\ (\A witnessed_name \in DOMAIN arg_staged_deferred_authorities : (witnessed_name \in arg_staged_deferred_names))
+    /\ deferred_authorities_have_identity(arg_active_deferred_names, arg_active_deferred_authorities)
+    /\ deferred_authorities_have_identity(arg_staged_deferred_names, arg_staged_deferred_authorities)
     /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
     /\ next_staged_visibility_revision' = IF (staged_revision > IF (active_revision > next_staged_visibility_revision) THEN active_revision ELSE next_staged_visibility_revision) THEN staged_revision ELSE IF (active_revision > next_staged_visibility_revision) THEN active_revision ELSE next_staged_visibility_revision
@@ -5742,6 +5773,8 @@ SyncVisibilityRevisionsStopped(active_revision, staged_revision, arg_active_defe
     /\ (\A requested_name \in arg_staged_deferred_names : (requested_name \in DOMAIN arg_staged_deferred_authorities))
     /\ (\A witnessed_name \in DOMAIN arg_active_deferred_authorities : (witnessed_name \in arg_active_deferred_names))
     /\ (\A witnessed_name \in DOMAIN arg_staged_deferred_authorities : (witnessed_name \in arg_staged_deferred_names))
+    /\ deferred_authorities_have_identity(arg_active_deferred_names, arg_active_deferred_authorities)
+    /\ deferred_authorities_have_identity(arg_staged_deferred_names, arg_staged_deferred_authorities)
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
     /\ next_staged_visibility_revision' = IF (staged_revision > IF (active_revision > next_staged_visibility_revision) THEN active_revision ELSE next_staged_visibility_revision) THEN staged_revision ELSE IF (active_revision > next_staged_visibility_revision) THEN active_revision ELSE next_staged_visibility_revision

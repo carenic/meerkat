@@ -439,6 +439,10 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `PeerProjectionChanged`(peer_projection_epoch: u64)
 - `CommsTrustReconcileRequested`(peer_projection_epoch: u64)
 
+## Helpers
+- `deferred_authority_has_identity`(witness: ToolVisibilityWitness) -> `Bool`
+- `deferred_authorities_have_identity`(names: Set<String>, witnesses: Map<String, ToolVisibilityWitness>) -> `Bool`
+
 ## Invariants
 - `fence_requires_bound_runtime`
 - `running_has_current_run`
@@ -1183,6 +1187,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `session_registered`
   - `deferred_authorities_cover_names`
   - `deferred_authorities_are_name_scoped`
+  - `deferred_authorities_have_identity`
 - To: `Idle`
 
 ### `RequestDeferredToolsAttached`
@@ -1192,6 +1197,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `session_registered`
   - `deferred_authorities_cover_names`
   - `deferred_authorities_are_name_scoped`
+  - `deferred_authorities_have_identity`
 - To: `Attached`
 
 ### `RequestDeferredToolsRunning`
@@ -1201,6 +1207,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `session_registered`
   - `deferred_authorities_cover_names`
   - `deferred_authorities_are_name_scoped`
+  - `deferred_authorities_have_identity`
 - To: `Running`
 
 ### `RequestDeferredToolsRetired`
@@ -1210,6 +1217,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `session_registered`
   - `deferred_authorities_cover_names`
   - `deferred_authorities_are_name_scoped`
+  - `deferred_authorities_have_identity`
 - To: `Retired`
 
 ### `RequestDeferredToolsStopped`
@@ -1219,6 +1227,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `session_registered`
   - `deferred_authorities_cover_names`
   - `deferred_authorities_are_name_scoped`
+  - `deferred_authorities_have_identity`
 - To: `Stopped`
 
 ### `PrepareBindingsInitializing`
@@ -1374,6 +1383,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `staged_deferred_authorities_cover_names`
   - `active_deferred_authorities_are_name_scoped`
   - `staged_deferred_authorities_are_name_scoped`
+  - `active_deferred_authorities_have_identity`
+  - `staged_deferred_authorities_have_identity`
 - Emits: `CommittedVisibleSetPublished`
 - To: `Idle`
 
@@ -1389,6 +1400,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `staged_deferred_authorities_cover_names`
   - `active_deferred_authorities_are_name_scoped`
   - `staged_deferred_authorities_are_name_scoped`
+  - `active_deferred_authorities_have_identity`
+  - `staged_deferred_authorities_have_identity`
 - Emits: `CommittedVisibleSetPublished`
 - To: `Attached`
 
@@ -1404,6 +1417,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `staged_deferred_authorities_cover_names`
   - `active_deferred_authorities_are_name_scoped`
   - `staged_deferred_authorities_are_name_scoped`
+  - `active_deferred_authorities_have_identity`
+  - `staged_deferred_authorities_have_identity`
 - Emits: `CommittedVisibleSetPublished`
 - To: `Running`
 
@@ -1419,6 +1434,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `staged_deferred_authorities_cover_names`
   - `active_deferred_authorities_are_name_scoped`
   - `staged_deferred_authorities_are_name_scoped`
+  - `active_deferred_authorities_have_identity`
+  - `staged_deferred_authorities_have_identity`
 - Emits: `CommittedVisibleSetPublished`
 - To: `Retired`
 
@@ -1434,6 +1451,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `staged_deferred_authorities_cover_names`
   - `active_deferred_authorities_are_name_scoped`
   - `staged_deferred_authorities_are_name_scoped`
+  - `active_deferred_authorities_have_identity`
+  - `staged_deferred_authorities_have_identity`
 - Emits: `CommittedVisibleSetPublished`
 - To: `Stopped`
 
@@ -4049,6 +4068,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `deferred_authorities_cover_names`
   - `deferred_authorities_are_name_scoped`
+  - `deferred_authorities_have_identity`
 - Emits: `RefreshVisibleSurfaceSet`
 - To: `Idle`
 
@@ -4058,6 +4078,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `deferred_authorities_cover_names`
   - `deferred_authorities_are_name_scoped`
+  - `deferred_authorities_have_identity`
 - Emits: `RefreshVisibleSurfaceSet`
 - To: `Attached`
 
@@ -4067,6 +4088,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `deferred_authorities_cover_names`
   - `deferred_authorities_are_name_scoped`
+  - `deferred_authorities_have_identity`
 - Emits: `RefreshVisibleSurfaceSet`
 - To: `Running`
 
@@ -4076,6 +4098,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `deferred_authorities_cover_names`
   - `deferred_authorities_are_name_scoped`
+  - `deferred_authorities_have_identity`
 - Emits: `RefreshVisibleSurfaceSet`
 - To: `Retired`
 
@@ -4085,6 +4108,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `deferred_authorities_cover_names`
   - `deferred_authorities_are_name_scoped`
+  - `deferred_authorities_have_identity`
 - Emits: `RefreshVisibleSurfaceSet`
 - To: `Stopped`
 
@@ -4097,6 +4121,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `staged_deferred_authorities_cover_names`
   - `active_deferred_authorities_are_name_scoped`
   - `staged_deferred_authorities_are_name_scoped`
+  - `active_deferred_authorities_have_identity`
+  - `staged_deferred_authorities_have_identity`
 - To: `Idle`
 
 ### `SyncVisibilityRevisionsAttached`
@@ -4108,6 +4134,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `staged_deferred_authorities_cover_names`
   - `active_deferred_authorities_are_name_scoped`
   - `staged_deferred_authorities_are_name_scoped`
+  - `active_deferred_authorities_have_identity`
+  - `staged_deferred_authorities_have_identity`
 - To: `Attached`
 
 ### `SyncVisibilityRevisionsRunning`
@@ -4119,6 +4147,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `staged_deferred_authorities_cover_names`
   - `active_deferred_authorities_are_name_scoped`
   - `staged_deferred_authorities_are_name_scoped`
+  - `active_deferred_authorities_have_identity`
+  - `staged_deferred_authorities_have_identity`
 - To: `Running`
 
 ### `SyncVisibilityRevisionsRetired`
@@ -4130,6 +4160,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `staged_deferred_authorities_cover_names`
   - `active_deferred_authorities_are_name_scoped`
   - `staged_deferred_authorities_are_name_scoped`
+  - `active_deferred_authorities_have_identity`
+  - `staged_deferred_authorities_have_identity`
 - To: `Retired`
 
 ### `SyncVisibilityRevisionsStopped`
@@ -4141,6 +4173,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `staged_deferred_authorities_cover_names`
   - `active_deferred_authorities_are_name_scoped`
   - `staged_deferred_authorities_are_name_scoped`
+  - `active_deferred_authorities_have_identity`
+  - `staged_deferred_authorities_have_identity`
 - To: `Stopped`
 
 ### `ProjectRealtimeIntentIdle`
