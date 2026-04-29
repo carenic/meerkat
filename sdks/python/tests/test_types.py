@@ -4,6 +4,7 @@ import asyncio
 import base64
 import json
 from pathlib import Path
+from typing import get_args, get_origin, get_type_hints
 
 import pytest
 
@@ -140,6 +141,265 @@ def test_generated_runtime_state_result_carries_state():
     result = GeneratedRuntimeStateResult(state="idle")
 
     assert result.state == "idle"
+
+
+def test_generated_mob_contract_types_include_spawn_and_turn_start_shapes():
+    from meerkat.generated.types import (
+        MobMemberStatusResult as GeneratedMobMemberStatusResult,
+        MobSpawnParams as GeneratedMobSpawnParams,
+        MobSpawnResult as GeneratedMobSpawnResult,
+        MobTurnStartParams as GeneratedMobTurnStartParams,
+        WireBudgetSplitPolicy as GeneratedWireBudgetSplitPolicy,
+        WireMemberLaunchMode as GeneratedWireMemberLaunchMode,
+        WireMobProfile as GeneratedWireMobProfile,
+        WireMobToolConfig as GeneratedWireMobToolConfig,
+        WireToolAccessPolicy as GeneratedWireToolAccessPolicy,
+        WireToolFilter as GeneratedWireToolFilter,
+    )
+
+    spawn = GeneratedMobSpawnParams(
+        mob_id="mob-1",
+        profile="worker",
+        agent_identity="worker-1",
+    )
+    assert spawn.mob_id == "mob-1"
+
+    spawn_with_advanced = GeneratedMobSpawnParams(
+        mob_id="mob-1",
+        profile="worker",
+        agent_identity="worker-2",
+        launch_mode={"mode": "fresh"},
+        tool_access_policy={"type": "allow_list", "value": ["grep"]},
+        budget_split_policy={"type": "remaining"},
+        inherited_tool_filter={"Allow": ["grep"]},
+        override_profile=GeneratedWireMobProfile(model="claude-sonnet-4-6"),
+    )
+    assert spawn_with_advanced.launch_mode == {"mode": "fresh"}
+    spawn_hints = get_type_hints(GeneratedMobSpawnParams)
+    assert "Any" not in str(spawn_hints["launch_mode"])
+    assert "Any" not in str(spawn_hints["tool_access_policy"])
+    assert "Any" not in str(spawn_hints["budget_split_policy"])
+    assert "Any" not in str(spawn_hints["inherited_tool_filter"])
+    assert "WireMobProfile" in str(spawn_hints["override_profile"])
+    tool_config_hints = get_type_hints(GeneratedWireMobToolConfig)
+    assert "rust_bundles" not in tool_config_hints
+    assert GeneratedWireMemberLaunchMode is not None
+    assert GeneratedWireToolAccessPolicy is not None
+    assert GeneratedWireBudgetSplitPolicy is not None
+    assert GeneratedWireToolFilter is not None
+
+    turn = GeneratedMobTurnStartParams(
+        mob_id="mob-1",
+        agent_identity="worker-1",
+        prompt=[{"type": "text", "text": "continue"}],
+        model="gpt-test",
+        clear_provider_params=True,
+    )
+    assert turn.prompt == [{"type": "text", "text": "continue"}]
+    assert turn.model == "gpt-test"
+
+    result = GeneratedMobSpawnResult(
+        mob_id="mob-1",
+        agent_identity="worker-1",
+        member_ref="opaque-member-ref",
+    )
+    assert result.member_ref == "opaque-member-ref"
+
+    status = GeneratedMobMemberStatusResult(
+        status="active",
+        tokens_used=0,
+        is_final=False,
+    )
+    assert status.status == "active"
+
+
+def test_generated_mob_spawn_many_preserves_nested_contract_types():
+    from meerkat.generated.types import (
+        MobSpawnManyParams as GeneratedMobSpawnManyParams,
+        MobSpawnManyResult as GeneratedMobSpawnManyResult,
+        MobSpawnManyResultEntry as GeneratedMobSpawnManyResultEntry,
+        MobSpawnSpecParams as GeneratedMobSpawnSpecParams,
+    )
+
+    params_hints = get_type_hints(GeneratedMobSpawnManyParams)
+    assert get_origin(params_hints["specs"]) is list
+    assert get_args(params_hints["specs"]) == (GeneratedMobSpawnSpecParams,)
+
+    spec_hints = get_type_hints(GeneratedMobSpawnSpecParams)
+    assert "Any" not in str(spec_hints["initial_message"])
+    assert "Any" not in str(spec_hints["backend"])
+    assert "WireConnectionRef" in str(spec_hints["connection_ref"])
+
+    result_hints = get_type_hints(GeneratedMobSpawnManyResult)
+    assert get_origin(result_hints["results"]) is list
+    assert get_args(result_hints["results"]) == (GeneratedMobSpawnManyResultEntry,)
+
+    spec = GeneratedMobSpawnSpecParams(
+        profile="worker",
+        agent_identity="worker-1",
+        initial_message="hello",
+    )
+    params = GeneratedMobSpawnManyParams(mob_id="mob-1", specs=[spec])
+    assert params.specs[0].agent_identity == "worker-1"
+
+    entry = GeneratedMobSpawnManyResultEntry(
+        ok=True,
+        agent_identity="worker-1",
+        member_ref="opaque-member-ref",
+    )
+    result = GeneratedMobSpawnManyResult(results=[entry])
+    assert result.results[0].member_ref == "opaque-member-ref"
+
+
+@pytest.mark.asyncio
+async def test_spawn_mob_members_preserves_generated_result_envelope_failures():
+    from meerkat import MobSpawnManyResult as PublicMobSpawnManyResult
+    from meerkat import MobSpawnManyResultEntry as PublicMobSpawnManyResultEntry
+    from meerkat.generated.types import MobSpawnManyResult as GeneratedMobSpawnManyResult
+    from meerkat.generated.types import (
+        MobSpawnManyResultEntry as GeneratedMobSpawnManyResultEntry,
+    )
+
+    assert PublicMobSpawnManyResult is GeneratedMobSpawnManyResult
+    assert PublicMobSpawnManyResultEntry is GeneratedMobSpawnManyResultEntry
+
+    client = MeerkatClient()
+
+    async def fake_request(method: str, params: dict[str, object]) -> dict[str, object]:
+        assert method == "mob/spawn_many"
+        assert params == {
+            "mob_id": "mob-1",
+            "specs": [{"profile": "worker", "agent_identity": "worker-1"}],
+        }
+        return {
+            "results": [
+                {
+                    "ok": True,
+                    "agent_identity": "worker-1",
+                    "member_ref": _make_member_ref("mob-1", "worker-1"),
+                },
+                {
+                    "ok": False,
+                    "error": "profile missing",
+                },
+            ]
+        }
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    result = await client.spawn_mob_members(
+        "mob-1",
+        [{"profile": "worker", "agent_identity": "worker-1"}],
+    )
+
+    assert isinstance(result, GeneratedMobSpawnManyResult)
+    assert [entry.ok for entry in result.results] == [True, False]
+    assert result.results[0].agent_identity == "worker-1"
+    assert result.results[0].member_ref == _make_member_ref("mob-1", "worker-1")
+    assert result.results[1].error == "profile missing"
+
+
+def test_generated_mob_create_ensure_reconcile_preserve_nested_param_types():
+    from meerkat.generated.types import (
+        MobCreateParams as GeneratedMobCreateParams,
+        MobDefinitionInput as GeneratedMobDefinitionInput,
+        MobEnsureMemberParams as GeneratedMobEnsureMemberParams,
+        MobMemberSpecWire as GeneratedMobMemberSpecWire,
+        MobReconcileParams as GeneratedMobReconcileParams,
+    )
+
+    create_hints = get_type_hints(GeneratedMobCreateParams)
+    assert create_hints["definition"] is GeneratedMobDefinitionInput
+
+    ensure_hints = get_type_hints(GeneratedMobEnsureMemberParams)
+    assert ensure_hints["spec"] is GeneratedMobMemberSpecWire
+
+    reconcile_hints = get_type_hints(GeneratedMobReconcileParams)
+    assert "MobMemberSpecWire" in str(reconcile_hints["desired"])
+    assert "Any" not in str(reconcile_hints["desired"])
+
+    definition = GeneratedMobDefinitionInput(
+        id="mob-1",
+        profiles={"worker": {"model": "claude-sonnet-4-6"}},
+    )
+    create = GeneratedMobCreateParams(definition=definition)
+    assert create.definition.id == "mob-1"
+
+    spec = GeneratedMobMemberSpecWire(profile="worker", agent_identity="worker-1")
+    ensure = GeneratedMobEnsureMemberParams(mob_id="mob-1", spec=spec)
+    assert ensure.spec.agent_identity == "worker-1"
+
+    reconcile = GeneratedMobReconcileParams(mob_id="mob-1", desired=[spec])
+    assert reconcile.desired[0].profile == "worker"
+
+
+def test_generated_mob_member_result_helpers_preserve_schema_types():
+    from meerkat.generated.types import (
+        MobEnsureMemberResult as GeneratedMobEnsureMemberResult,
+        MobMemberListEntryWire as GeneratedMobMemberListEntryWire,
+        MobMembersResult as GeneratedMobMembersResult,
+        MobSpawnReceiptWire as GeneratedMobSpawnReceiptWire,
+        MobSubmitWorkParams as GeneratedMobSubmitWorkParams,
+        WireMemberRef as GeneratedWireMemberRef,
+        WireMemberState as GeneratedWireMemberState,
+        WireMobMemberStatus as GeneratedWireMobMemberStatus,
+        WireMobRuntimeMode as GeneratedWireMobRuntimeMode,
+    )
+
+    assert GeneratedWireMemberRef is str
+    assert get_args(GeneratedWireMobRuntimeMode) == (
+        "autonomous_host",
+        "turn_driven",
+    )
+    assert get_args(GeneratedWireMemberState) == ("active", "retiring")
+    assert get_args(GeneratedWireMobMemberStatus) == (
+        "active",
+        "retiring",
+        "broken",
+        "completed",
+        "unknown",
+    )
+
+    spawn_hints = get_type_hints(GeneratedMobSpawnReceiptWire)
+    assert spawn_hints["member_ref"] is GeneratedWireMemberRef
+
+    submit_hints = get_type_hints(GeneratedMobSubmitWorkParams)
+    assert submit_hints["member_ref"] is GeneratedWireMemberRef
+
+    member_hints = get_type_hints(GeneratedMobMemberListEntryWire)
+    assert member_hints["member_ref"] is GeneratedWireMemberRef
+    assert member_hints["runtime_mode"] == GeneratedWireMobRuntimeMode
+    assert member_hints["state"] == GeneratedWireMemberState
+    assert member_hints["status"] == GeneratedWireMobMemberStatus
+
+    member_ref = _make_member_ref("mob-1", "worker-1")
+    member = GeneratedMobMemberListEntryWire(
+        agent_identity="worker-1",
+        member_ref=member_ref,
+        role="worker",
+        runtime_mode="turn_driven",
+        state="active",
+        status="active",
+        is_final=False,
+    )
+    members = GeneratedMobMembersResult(mob_id="mob-1", members=[member])
+    assert members.members[0].member_ref == member_ref
+
+    spawned = GeneratedMobEnsureMemberResult(
+        outcome={
+            "spawned": GeneratedMobSpawnReceiptWire(
+                agent_identity="worker-1",
+                member_ref=member_ref,
+            ),
+        },
+    )
+    assert spawned.outcome["spawned"].member_ref == member_ref
+
+    submit = GeneratedMobSubmitWorkParams(
+        member_ref=members.members[0].member_ref,
+        content="continue",
+    )
+    assert submit.member_ref == member_ref
 
 
 # ---------------------------------------------------------------------------
@@ -1292,6 +1552,84 @@ async def test_client_mcp_methods_reject_malformed_response():
         await client.mcp_add("s1", "filesystem", {"cmd": "npx"})
 
 
+@pytest.mark.asyncio
+async def test_mob_turn_start_wrapper_uses_typed_prompt_and_overrides():
+    client = MeerkatClient()
+    calls = []
+
+    async def fake_request(method: str, params: dict[str, object]) -> dict[str, object]:
+        calls.append((method, params))
+        return {"status": "started"}
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    await client.mob_turn_start(
+        "mob-1",
+        "worker-1",
+        [{"type": "text", "text": "continue"}],
+        skill_refs=[
+            SkillKey(
+                source_uuid="00000000-0000-4000-8000-000000000001",
+                skill_name="read",
+            )
+        ],
+        flow_tool_overlay={"allowed_tools": ["read"], "blocked_tools": []},
+        additional_instructions=["stay concise"],
+        keep_alive=True,
+        model="gpt-test",
+        provider="openai",
+        max_tokens=128,
+        system_prompt="system",
+        output_schema={"type": "object"},
+        structured_output_retries=2,
+        provider_params={"temperature": 0.2},
+        clear_provider_params=True,
+        connection_ref={"realm": "dev", "binding": "default_openai"},
+        clear_connection_ref=True,
+    )
+
+    assert calls == [
+        (
+            "mob/turn_start",
+            {
+                "mob_id": "mob-1",
+                "agent_identity": "worker-1",
+                "prompt": [{"type": "text", "text": "continue"}],
+                "skill_refs": [
+                    {
+                        "source_uuid": "00000000-0000-4000-8000-000000000001",
+                        "skill_name": "read",
+                    }
+                ],
+                "flow_tool_overlay": {
+                    "allowed_tools": ["read"],
+                    "blocked_tools": [],
+                },
+                "additional_instructions": ["stay concise"],
+                "keep_alive": True,
+                "model": "gpt-test",
+                "provider": "openai",
+                "max_tokens": 128,
+                "system_prompt": "system",
+                "output_schema": {"type": "object"},
+                "structured_output_retries": 2,
+                "provider_params": {"temperature": 0.2},
+                "clear_provider_params": True,
+                "connection_ref": {"realm": "dev", "binding": "default_openai"},
+                "clear_connection_ref": True,
+            },
+        )
+    ]
+
+    with pytest.raises(TypeError):
+        await client.mob_turn_start(
+            "mob-1",
+            "worker-1",
+            "continue",
+            unexpected_override=True,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Pattern matching
 # ---------------------------------------------------------------------------
@@ -1453,6 +1791,24 @@ async def test_client_mob_lifecycle_and_send_methods_use_explicit_rpc_methods():
         "mob-1",
         profile="planner",
         agent_identity="agent-a",
+        initial_message=[{"type": "text", "text": "hello"}],
+        runtime_mode="autonomous_host",
+        backend="session",
+        labels={"role": "planner"},
+        context={"ticket": "LUC-134"},
+        additional_instructions=["stay focused"],
+        binding={"kind": "session"},
+        shell_env={"TEST_MODE": "1"},
+        auto_wire_parent=True,
+        launch_mode={"mode": "fresh"},
+        tool_access_policy={"type": "allow_list", "value": ["grep"]},
+        budget_split_policy={"type": "remaining"},
+        inherited_tool_filter={"Allow": ["grep"]},
+        override_profile={
+            "model": "claude-sonnet-4-6",
+            "tools": {"shell": True},
+        },
+        connection_ref={"realm": "dev", "binding": "default_anthropic"},
     )
     assert spawn_receipt == {
         "mob_id": "mob-1",
@@ -1566,7 +1922,29 @@ async def test_client_mob_lifecycle_and_send_methods_use_explicit_rpc_methods():
         "timeout_ms": 1234,
     }
     assert calls[13][1] == {"mob_id": "mob-1", "timeout_ms": 99}
-    assert calls[4][1]["agent_identity"] == "agent-a"
+    assert calls[4][1] == {
+        "mob_id": "mob-1",
+        "profile": "planner",
+        "agent_identity": "agent-a",
+        "initial_message": [{"type": "text", "text": "hello"}],
+        "runtime_mode": "autonomous_host",
+        "backend": "session",
+        "labels": {"role": "planner"},
+        "context": {"ticket": "LUC-134"},
+        "additional_instructions": ["stay focused"],
+        "binding": {"kind": "session"},
+        "shell_env": {"TEST_MODE": "1"},
+        "auto_wire_parent": True,
+        "launch_mode": {"mode": "fresh"},
+        "tool_access_policy": {"type": "allow_list", "value": ["grep"]},
+        "budget_split_policy": {"type": "remaining"},
+        "inherited_tool_filter": {"Allow": ["grep"]},
+        "override_profile": {
+            "model": "claude-sonnet-4-6",
+            "tools": {"shell": True},
+        },
+        "connection_ref": {"realm": "dev", "binding": "default_anthropic"},
+    }
 
 
 @pytest.mark.asyncio

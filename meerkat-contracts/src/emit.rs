@@ -38,6 +38,16 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "McpLiveOpResponse": schema_for!(crate::wire::McpLiveOpResponse),
         "WireTrustedPeerSpec": schema_for!(crate::wire::WireTrustedPeerSpec),
         "MobPeerTarget": schema_for!(crate::wire::MobPeerTarget),
+        "WireMobBackendKind": schema_for!(crate::wire::WireMobBackendKind),
+        "WireMobRuntimeMode": schema_for!(crate::wire::WireMobRuntimeMode),
+        "WireRuntimeBinding": schema_for!(crate::wire::WireRuntimeBinding),
+        "WireMemberLaunchMode": schema_for!(crate::wire::WireMemberLaunchMode),
+        "WireForkContext": schema_for!(crate::wire::WireForkContext),
+        "WireToolAccessPolicy": schema_for!(crate::wire::WireToolAccessPolicy),
+        "WireBudgetSplitPolicy": schema_for!(crate::wire::WireBudgetSplitPolicy),
+        "WireToolFilter": schema_for!(crate::wire::WireToolFilter),
+        "WireMobToolConfig": schema_for!(crate::wire::WireMobToolConfig),
+        "WireMobProfile": schema_for!(crate::wire::WireMobProfile),
         "MobDefinitionInput": schema_for!(crate::wire::MobDefinitionInput),
         "MobCreateResult": schema_for!(crate::wire::MobCreateResult),
         "MobListResult": schema_for!(crate::wire::MobListResult),
@@ -1219,8 +1229,93 @@ mod tests {
     }
 
     #[test]
-    fn emitted_mob_turn_start_params_allow_override_fields() {
-        let output_dir = temp_output_dir("mob-turn-start-overrides");
+    fn emitted_mob_spawn_params_expose_advanced_fields_as_concrete_wire_schemas() {
+        let output_dir = temp_output_dir("mob-spawn-advanced-slots");
+        emit_all_schemas(&output_dir).expect("emit schemas");
+
+        let params: serde_json::Value =
+            serde_json::from_slice(&fs::read(output_dir.join("params.json")).unwrap()).unwrap();
+        let spawn = params
+            .get("MobSpawnParams")
+            .expect("MobSpawnParams schema must be emitted");
+        let properties = spawn
+            .pointer("/properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("MobSpawnParams schema must expose properties");
+
+        for (field, expected_ref) in [
+            ("launch_mode", "WireMemberLaunchMode"),
+            ("tool_access_policy", "WireToolAccessPolicy"),
+            ("budget_split_policy", "WireBudgetSplitPolicy"),
+            ("inherited_tool_filter", "WireToolFilter"),
+            ("override_profile", "WireMobProfile"),
+        ] {
+            let field_schema = properties
+                .get(field)
+                .unwrap_or_else(|| panic!("MobSpawnParams missing accepted field {field}"));
+            let field_schema = serde_json::to_string(field_schema).unwrap();
+            assert!(
+                field_schema.contains(&format!("#/$defs/{expected_ref}")),
+                "MobSpawnParams.{field} must reference concrete {expected_ref} schema, got {field_schema}"
+            );
+        }
+        assert_eq!(
+            spawn.get("additionalProperties"),
+            Some(&serde_json::Value::Bool(false)),
+            "mob/spawn can be closed only when all accepted fields are in the typed schema"
+        );
+
+        fs::remove_dir_all(&output_dir).unwrap();
+    }
+
+    #[test]
+    fn emitted_mob_spawn_override_profile_omits_internal_tool_bundles() {
+        let output_dir = temp_output_dir("mob-spawn-public-profile");
+        emit_all_schemas(&output_dir).expect("emit schemas");
+
+        let params: serde_json::Value =
+            serde_json::from_slice(&fs::read(output_dir.join("params.json")).unwrap()).unwrap();
+        let spawn_profile = params
+            .pointer("/MobSpawnParams/$defs/WireMobProfile")
+            .expect("MobSpawnParams must define WireMobProfile");
+        assert_eq!(
+            spawn_profile.get("additionalProperties"),
+            Some(&serde_json::Value::Bool(false)),
+            "mob/spawn override_profile must fail closed on unknown profile fields"
+        );
+        let spawn_tool_config = params
+            .pointer("/MobSpawnParams/$defs/WireMobToolConfig")
+            .expect("MobSpawnParams must define WireMobToolConfig");
+        assert_eq!(
+            spawn_tool_config.get("additionalProperties"),
+            Some(&serde_json::Value::Bool(false)),
+            "mob/spawn override_profile.tools must fail closed on unknown tool fields"
+        );
+        assert!(
+            spawn_tool_config
+                .pointer("/properties/rust_bundles")
+                .is_none(),
+            "mob/spawn override_profile.tools must not expose internal rust_bundles"
+        );
+
+        let wire_types: serde_json::Value =
+            serde_json::from_slice(&fs::read(output_dir.join("wire-types.json")).unwrap()).unwrap();
+        let public_tool_config = wire_types
+            .get("WireMobToolConfig")
+            .expect("WireMobToolConfig schema must be emitted");
+        assert!(
+            public_tool_config
+                .pointer("/properties/rust_bundles")
+                .is_none(),
+            "top-level WireMobToolConfig must not expose internal rust_bundles"
+        );
+
+        fs::remove_dir_all(&output_dir).unwrap();
+    }
+
+    #[test]
+    fn emitted_mob_turn_start_params_expose_typed_prompt_and_known_overrides() {
+        let output_dir = temp_output_dir("mob-turn-start-typed");
         emit_all_schemas(&output_dir).expect("emit schemas");
 
         let params: serde_json::Value =
@@ -1228,10 +1323,40 @@ mod tests {
         let turn_start = params
             .get("MobTurnStartParams")
             .expect("MobTurnStartParams schema must be emitted");
+        let properties = turn_start
+            .pointer("/properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("MobTurnStartParams schema must expose properties");
         assert_ne!(
+            properties.get("prompt"),
+            Some(&serde_json::Value::Bool(true)),
+            "mob/turn_start prompt must use the canonical content input schema"
+        );
+        for field in [
+            "skill_refs",
+            "flow_tool_overlay",
+            "additional_instructions",
+            "keep_alive",
+            "model",
+            "provider",
+            "max_tokens",
+            "system_prompt",
+            "output_schema",
+            "structured_output_retries",
+            "provider_params",
+            "clear_provider_params",
+            "connection_ref",
+            "clear_connection_ref",
+        ] {
+            assert!(
+                properties.contains_key(field),
+                "mob/turn_start params missing explicit turn override field {field}"
+            );
+        }
+        assert_eq!(
             turn_start.get("additionalProperties"),
             Some(&serde_json::Value::Bool(false)),
-            "mob/turn_start params must permit flattened turn override fields"
+            "mob/turn_start params must fail closed instead of accepting arbitrary flattened overrides"
         );
 
         fs::remove_dir_all(&output_dir).unwrap();

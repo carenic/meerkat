@@ -4936,6 +4936,65 @@
         "description": "Opaque slug identifying a realm.",
         "type": "string"
       },
+      "WireBudgetSplitPolicy": {
+        "description": "Budget split policy for a spawned mob member.",
+        "oneOf": [
+          {
+            "properties": {
+              "type": {
+                "const": "equal",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "type": {
+                "const": "proportional",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "type": {
+                "const": "remaining",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "type": {
+                "const": "fixed",
+                "type": "string"
+              },
+              "value": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "type",
+              "value"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "WireConnectionRef": {
         "description": "Wire projection of [`meerkat_core::ConnectionRef`].\n\nPure structural shape — no `\"realm:binding\"` string form. Wave-b deleted\n`parse` and `Display` on both the core type and the wire projection so\nthe colon-joined form cannot travel across wire boundaries.",
         "properties": {
@@ -5100,6 +5159,96 @@
         ],
         "description": "Wire-safe content input (mirrors `ContentInput`)."
       },
+      "WireForkContext": {
+        "description": "Conversation history scope used when forking a mob member.",
+        "oneOf": [
+          {
+            "properties": {
+              "type": {
+                "const": "full_history",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "count": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "type": {
+                "const": "last_messages",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "count"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WireMemberLaunchMode": {
+        "description": "How a mob member should be launched by `mob/spawn`.",
+        "oneOf": [
+          {
+            "properties": {
+              "mode": {
+                "const": "fresh",
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "bridge_session_id": {
+                "type": "string"
+              },
+              "mode": {
+                "const": "resume",
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode",
+              "bridge_session_id"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "fork_context": {
+                "$ref": "#/$defs/WireForkContext",
+                "default": {
+                  "type": "full_history"
+                }
+              },
+              "mode": {
+                "const": "fork",
+                "type": "string"
+              },
+              "source_member_id": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode",
+              "source_member_id"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "WireMobBackendKind": {
         "enum": [
           "session",
@@ -5107,12 +5256,118 @@
         ],
         "type": "string"
       },
+      "WireMobProfile": {
+        "additionalProperties": false,
+        "description": "Profile override for `mob/spawn`.",
+        "properties": {
+          "backend": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireMobBackendKind"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "external_addressable": {
+            "default": false,
+            "type": "boolean"
+          },
+          "max_inline_peer_notifications": {
+            "format": "int32",
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "model": {
+            "type": "string"
+          },
+          "output_schema": true,
+          "peer_description": {
+            "default": "",
+            "type": "string"
+          },
+          "provider_params": true,
+          "runtime_mode": {
+            "$ref": "#/$defs/WireMobRuntimeMode",
+            "default": "autonomous_host"
+          },
+          "skills": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "tools": {
+            "$ref": "#/$defs/WireMobToolConfig",
+            "default": {
+              "builtins": false,
+              "comms": false,
+              "mcp": [],
+              "memory": false,
+              "mob": false,
+              "mob_tasks": false,
+              "schedule": false,
+              "shell": false
+            }
+          }
+        },
+        "required": [
+          "model"
+        ],
+        "type": "object"
+      },
       "WireMobRuntimeMode": {
         "enum": [
           "autonomous_host",
           "turn_driven"
         ],
         "type": "string"
+      },
+      "WireMobToolConfig": {
+        "additionalProperties": false,
+        "description": "Tool configuration embedded in a wire mob profile override.",
+        "properties": {
+          "builtins": {
+            "default": false,
+            "type": "boolean"
+          },
+          "comms": {
+            "default": false,
+            "type": "boolean"
+          },
+          "mcp": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "memory": {
+            "default": false,
+            "type": "boolean"
+          },
+          "mob": {
+            "default": false,
+            "type": "boolean"
+          },
+          "mob_tasks": {
+            "default": false,
+            "type": "boolean"
+          },
+          "schedule": {
+            "default": false,
+            "type": "boolean"
+          },
+          "shell": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "type": "object"
       },
       "WireRuntimeBinding": {
         "description": "Runtime binding for spawn requests.\n\nFirst step toward identity-first mobs. Carries backend-specific binding\ndetails at spawn time. `External` requires typed process identity; callers\ndo not supply raw comms peer IDs.",
@@ -5164,6 +5419,102 @@
           }
         ]
       },
+      "WireToolAccessPolicy": {
+        "description": "Tool access policy for a spawned mob member.",
+        "oneOf": [
+          {
+            "properties": {
+              "type": {
+                "const": "inherit",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "type": {
+                "const": "allow_list",
+                "type": "string"
+              },
+              "value": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "type",
+              "value"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "type": {
+                "const": "deny_list",
+                "type": "string"
+              },
+              "value": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "type",
+              "value"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WireToolFilter": {
+        "description": "Pre-resolved tool filter inherited by a spawned mob member.",
+        "oneOf": [
+          {
+            "enum": [
+              "All"
+            ],
+            "type": "string"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "Allow": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "Allow"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "Deny": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              }
+            },
+            "required": [
+              "Deny"
+            ],
+            "type": "object"
+          }
+        ]
+      },
       "WireTrustedPeerIdentity": {
         "description": "Typed external peer identity for public mob wiring surfaces.",
         "oneOf": [
@@ -5190,7 +5541,7 @@
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "additionalProperties": false,
-    "description": "Request payload for `mob/spawn`.\n\nThe public catalog uses wire-owned projections for stable fields and JSON\nextension slots for advanced Rust-native spawn options whose schemas are\nnot yet owned by `meerkat-contracts`.",
+    "description": "Request payload for `mob/spawn`.",
     "properties": {
       "additional_instructions": {
         "items": {
@@ -5230,7 +5581,16 @@
           }
         ]
       },
-      "budget_split_policy": true,
+      "budget_split_policy": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/WireBudgetSplitPolicy"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
       "connection_ref": {
         "anyOf": [
           {
@@ -5242,7 +5602,16 @@
         ]
       },
       "context": true,
-      "inherited_tool_filter": true,
+      "inherited_tool_filter": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/WireToolFilter"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
       "initial_message": {
         "anyOf": [
           {
@@ -5262,11 +5631,29 @@
           "null"
         ]
       },
-      "launch_mode": true,
+      "launch_mode": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/WireMemberLaunchMode"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
       "mob_id": {
         "type": "string"
       },
-      "override_profile": true,
+      "override_profile": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/WireMobProfile"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
       "profile": {
         "type": "string"
       },
@@ -5289,7 +5676,16 @@
           "null"
         ]
       },
-      "tool_access_policy": true
+      "tool_access_policy": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/WireToolAccessPolicy"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
     },
     "required": [
       "mob_id",
@@ -5518,17 +5914,355 @@
     "type": "object"
   },
   "MobTurnStartParams": {
+    "$defs": {
+      "BindingId": {
+        "description": "Opaque slug identifying a binding inside a realm.",
+        "type": "string"
+      },
+      "ProfileId": {
+        "description": "Opaque slug identifying an auth profile override on a connection.",
+        "type": "string"
+      },
+      "RealmId": {
+        "description": "Opaque slug identifying a realm.",
+        "type": "string"
+      },
+      "SkillKey": {
+        "description": "Canonical runtime identity for a skill.\n\nThis is the single identity carried across every surface — the wire parses\ndirectly into this struct, tools receive this struct, the registry stores\nthis struct. There is no slash-delimited string path form.",
+        "properties": {
+          "skill_name": {
+            "$ref": "#/$defs/SkillName"
+          },
+          "source_uuid": {
+            "$ref": "#/$defs/SourceUuid"
+          }
+        },
+        "required": [
+          "source_uuid",
+          "skill_name"
+        ],
+        "type": "object"
+      },
+      "SkillName": {
+        "description": "Canonical skill slug (lowercase, dash-separated).",
+        "type": "string"
+      },
+      "SkillRef": {
+        "description": "Structured skill reference for wire/surface input.\n\nPost-V4 this has exactly one variant — `Structured` — and is kept only as a\ntyped enum to leave room for future source-scoped variants (e.g. alias or\ncapability-scoped forms) without changing the trait surface. No legacy\nstring form, no slash-delimited path, no untagged fallback.",
+        "oneOf": [
+          {
+            "$ref": "#/$defs/SkillKey",
+            "properties": {
+              "kind": {
+                "const": "structured",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "SourceUuid": {
+        "description": "Canonical source identifier.",
+        "type": "string"
+      },
+      "TurnToolOverlay": {
+        "description": "Ephemeral per-turn tool overlay for flow-dispatched turns.",
+        "properties": {
+          "allowed_tools": {
+            "default": null,
+            "description": "Optional allow-list for this turn.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "blocked_tools": {
+            "default": null,
+            "description": "Optional deny-list for this turn.",
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          }
+        },
+        "type": "object"
+      },
+      "WireConnectionRef": {
+        "description": "Wire projection of [`meerkat_core::ConnectionRef`].\n\nPure structural shape — no `\"realm:binding\"` string form. Wave-b deleted\n`parse` and `Display` on both the core type and the wire projection so\nthe colon-joined form cannot travel across wire boundaries.",
+        "properties": {
+          "binding": {
+            "$ref": "#/$defs/BindingId"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ProfileId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "realm": {
+            "$ref": "#/$defs/RealmId"
+          }
+        },
+        "required": [
+          "realm",
+          "binding"
+        ],
+        "type": "object"
+      },
+      "WireContentBlock": {
+        "description": "Wire-safe content block (no `source_path` — internal only).",
+        "oneOf": [
+          {
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "const": "text",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "text"
+            ],
+            "type": "object"
+          },
+          {
+            "oneOf": [
+              {
+                "properties": {
+                  "data": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "const": "inline",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "data"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "blob_id": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "const": "blob",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "blob_id"
+                ],
+                "type": "object"
+              }
+            ],
+            "properties": {
+              "media_type": {
+                "type": "string"
+              },
+              "type": {
+                "const": "image",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "media_type"
+            ],
+            "type": "object"
+          },
+          {
+            "oneOf": [
+              {
+                "properties": {
+                  "data": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "const": "inline",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "data"
+                ],
+                "type": "object"
+              }
+            ],
+            "properties": {
+              "duration_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "media_type": {
+                "type": "string"
+              },
+              "type": {
+                "const": "video",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "media_type",
+              "duration_ms"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Forward-compatibility for unknown block types.",
+            "properties": {
+              "type": {
+                "const": "unknown",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WireContentInput": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "items": {
+              "$ref": "#/$defs/WireContentBlock"
+            },
+            "type": "array"
+          }
+        ],
+        "description": "Wire-safe content input (mirrors `ContentInput`)."
+      }
+    },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "additionalProperties": true,
+    "additionalProperties": false,
     "description": "Request payload for `mob/turn_start`.",
     "properties": {
+      "additional_instructions": {
+        "items": {
+          "type": "string"
+        },
+        "type": [
+          "array",
+          "null"
+        ]
+      },
       "agent_identity": {
         "type": "string"
+      },
+      "clear_connection_ref": {
+        "default": false,
+        "type": "boolean"
+      },
+      "clear_provider_params": {
+        "default": false,
+        "type": "boolean"
+      },
+      "connection_ref": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/WireConnectionRef"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "flow_tool_overlay": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/TurnToolOverlay"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "keep_alive": {
+        "type": [
+          "boolean",
+          "null"
+        ]
+      },
+      "max_tokens": {
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
       },
       "mob_id": {
         "type": "string"
       },
-      "prompt": true
+      "model": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "output_schema": true,
+      "prompt": {
+        "$ref": "#/$defs/WireContentInput"
+      },
+      "provider": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "provider_params": true,
+      "skill_refs": {
+        "items": {
+          "$ref": "#/$defs/SkillRef"
+        },
+        "type": [
+          "array",
+          "null"
+        ]
+      },
+      "structured_output_retries": {
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "system_prompt": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
     },
     "required": [
       "mob_id",

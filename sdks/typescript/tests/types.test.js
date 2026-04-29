@@ -1432,6 +1432,9 @@ describe("Parity wrappers", () => {
           }],
         };
       }
+      if (method === "mob/turn_start") {
+        return { status: "started" };
+      }
       if (method === "mob/events") {
         return { events: [{ cursor: 1 }] };
       }
@@ -1462,11 +1465,51 @@ describe("Parity wrappers", () => {
     const spawnedOne = await client.spawnMobMember("mob-1", {
       profile: "worker",
       agentIdentity: "worker-0",
+      initialMessage: [{ type: "text", text: "hello" }],
+      runtimeMode: "autonomous_host",
+      backend: "session",
+      labels: { role: "worker" },
+      context: { ticket: "LUC-134" },
+      additionalInstructions: ["stay focused"],
+      binding: { kind: "session" },
+      shellEnv: { TEST_MODE: "1" },
+      autoWireParent: true,
+      launchMode: { mode: "fresh" },
+      toolAccessPolicy: { type: "allow_list", value: ["grep"] },
+      budgetSplitPolicy: { type: "remaining" },
+      inheritedToolFilter: { Allow: ["grep"] },
+      overrideProfile: {
+        model: "claude-sonnet-4-6",
+        tools: { shell: true },
+      },
+      connectionRef: { realm: "dev", binding: "default_anthropic" },
     });
     const spawned = await client.spawnMobMembers("mob-1", [{
       profile: "worker",
       agentIdentity: "worker-1",
+      connectionRef: { realm: "dev", binding: "default_anthropic" },
     }]);
+    await client.mobTurnStart(
+      "mob-1",
+      "worker-1",
+      [{ type: "text", text: "continue" }],
+      {
+        skillRefs: [{ sourceUuid: "00000000-0000-4000-8000-000000000001", skillName: "read" }],
+        flowToolOverlay: { allowedTools: ["read"], blockedTools: [] },
+        additionalInstructions: ["stay concise"],
+        keepAlive: true,
+        model: "gpt-test",
+        provider: "openai",
+        maxTokens: 128,
+        systemPrompt: "system",
+        outputSchema: { type: "object" },
+        structuredOutputRetries: 2,
+        providerParams: { temperature: 0.2 },
+        clearProviderParams: true,
+        connectionRef: { realm: "dev", binding: "default_openai" },
+        clearConnectionRef: true,
+      },
+    );
     const append = await client.appendMobSystemContext("mob-1", "worker-1", "remember this");
     const events = await client.readMobEvents("mob-1", { afterCursor: 10, limit: 5 });
     const created = await client.createMobProfile("worker", { model: "claude-sonnet-4-6" });
@@ -1494,6 +1537,7 @@ describe("Parity wrappers", () => {
     assert.deepEqual(calls.map((c) => c.method), [
       "mob/spawn",
       "mob/spawn_many",
+      "mob/turn_start",
       "mob/append_system_context",
       "mob/events",
       "mob/profile/create",
@@ -1502,8 +1546,75 @@ describe("Parity wrappers", () => {
       "mob/profile/update",
       "mob/profile/delete",
     ]);
-    assert.equal(calls[3].params.after_cursor, 10);
-    assert.equal(calls[3].params.limit, 5);
+    assert.deepEqual(calls[0].params, {
+      mob_id: "mob-1",
+      profile: "worker",
+      agent_identity: "worker-0",
+      initial_message: [{ type: "text", text: "hello" }],
+      runtime_mode: "autonomous_host",
+      backend: "session",
+      labels: { role: "worker" },
+      context: { ticket: "LUC-134" },
+      additional_instructions: ["stay focused"],
+      binding: { kind: "session" },
+      shell_env: { TEST_MODE: "1" },
+      auto_wire_parent: true,
+      launch_mode: { mode: "fresh" },
+      tool_access_policy: { type: "allow_list", value: ["grep"] },
+      budget_split_policy: { type: "remaining" },
+      inherited_tool_filter: { Allow: ["grep"] },
+      override_profile: {
+        model: "claude-sonnet-4-6",
+        tools: { shell: true },
+      },
+      connection_ref: { realm: "dev", binding: "default_anthropic" },
+    });
+    assert.deepEqual(calls[1].params.specs[0].connection_ref, {
+      realm: "dev",
+      binding: "default_anthropic",
+    });
+    assert.deepEqual(calls[2].params, {
+      mob_id: "mob-1",
+      agent_identity: "worker-1",
+      prompt: [{ type: "text", text: "continue" }],
+      skill_refs: [
+        {
+          source_uuid: "00000000-0000-4000-8000-000000000001",
+          skill_name: "read",
+        },
+      ],
+      flow_tool_overlay: { allowed_tools: ["read"], blocked_tools: [] },
+      additional_instructions: ["stay concise"],
+      keep_alive: true,
+      model: "gpt-test",
+      provider: "openai",
+      max_tokens: 128,
+      system_prompt: "system",
+      output_schema: { type: "object" },
+      structured_output_retries: 2,
+      provider_params: { temperature: 0.2 },
+      clear_provider_params: true,
+      connection_ref: { realm: "dev", binding: "default_openai" },
+      clear_connection_ref: true,
+    });
+    assert.equal(calls[4].params.after_cursor, 10);
+    assert.equal(calls[4].params.limit, 5);
+  });
+
+  it("builds mob turn_start params against the generated contract shape", () => {
+    const clientSource = fs.readFileSync(
+      new URL("../src/client.ts", import.meta.url),
+      "utf8",
+    );
+    const helperStart = clientSource.indexOf("function mobTurnStartPayload(");
+    const helperEnd = clientSource.indexOf("\n}\n", helperStart);
+    assert.notEqual(helperStart, -1, "mobTurnStartPayload helper should exist");
+    assert.notEqual(helperEnd, -1, "mobTurnStartPayload helper should have a body");
+    const helperSource = clientSource.slice(helperStart, helperEnd);
+
+    assert.match(helperSource, /\): MobTurnStartParams \{/);
+    assert.match(helperSource, /const payload: MobTurnStartParams = \{/);
+    assert.doesNotMatch(helperSource, /Record<string, unknown>/);
   });
 
   it("returns identity-native mob member listings", async () => {

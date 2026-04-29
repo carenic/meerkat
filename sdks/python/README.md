@@ -129,7 +129,7 @@ updated = await client.patch_config(
 
 - `await client.read_mob_events(mob_id, after_cursor=0, limit=100)`
 - `await mob.read_events(after_cursor=0, limit=100)`
-- `await mob.spawn_many(specs)`
+- `await mob.spawn_many(specs) -> MobSpawnManyResult`
 - `await mob.wait_for_kickoff_complete(...)`
 - helper methods use canonical `role_name` (legacy `profile_name` alias is still accepted)
 

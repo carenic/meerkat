@@ -49,6 +49,7 @@ import {
   type RealtimeOpenRequest,
   type RealtimeStatusResult,
   type RuntimeAcceptResult,
+  type MobTurnStartParams,
   type RuntimeRealtimeAttachmentStatusResult,
   type RuntimeResetResult,
   type RuntimeRetireResult,
@@ -99,6 +100,7 @@ import type {
   MobSpawnManyResultEntry,
   MobStatus,
   MobSummary,
+  MobTurnStartOptions,
   RunResult,
   Schedule,
   ScheduleListOptions,
@@ -119,6 +121,7 @@ import type {
   SkillKey,
   SkillRef,
   SkillRuntimeDiagnostics,
+  SpawnManySpec,
   SpawnSpec,
   UpdateScheduleRequest,
   TurnOptions,
@@ -175,6 +178,93 @@ function normalizeSkillRef(ref: SkillRef): { source_uuid: string; skill_name: st
 function skillRefsToWire(refs: SkillRef[] | undefined): Array<{ source_uuid: string; skill_name: string }> | undefined {
   if (!refs) return undefined;
   return refs.map(normalizeSkillRef);
+}
+
+function setIfDefined<T extends object, K extends keyof T>(
+  payload: T,
+  key: K,
+  value: T[K] | undefined,
+): void {
+  if (value !== undefined) {
+    payload[key] = value;
+  }
+}
+
+function mobSpawnPayload(mobId: string, spec: SpawnSpec): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    mob_id: mobId,
+    profile: spec.profile,
+    agent_identity: spec.agentIdentity,
+  };
+  setIfDefined(payload, "initial_message", spec.initialMessage);
+  setIfDefined(payload, "runtime_mode", spec.runtimeMode);
+  setIfDefined(payload, "backend", spec.backend);
+  setIfDefined(payload, "labels", spec.labels);
+  setIfDefined(payload, "context", spec.context);
+  setIfDefined(payload, "additional_instructions", spec.additionalInstructions);
+  setIfDefined(payload, "binding", spec.binding);
+  setIfDefined(payload, "shell_env", spec.shellEnv);
+  setIfDefined(payload, "auto_wire_parent", spec.autoWireParent);
+  setIfDefined(payload, "launch_mode", spec.launchMode);
+  setIfDefined(payload, "tool_access_policy", spec.toolAccessPolicy);
+  setIfDefined(payload, "budget_split_policy", spec.budgetSplitPolicy);
+  setIfDefined(payload, "inherited_tool_filter", spec.inheritedToolFilter);
+  setIfDefined(payload, "override_profile", spec.overrideProfile);
+  setIfDefined(payload, "connection_ref", spec.connectionRef);
+  return payload;
+}
+
+function mobSpawnManySpecPayload(spec: SpawnManySpec): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    profile: spec.profile,
+    agent_identity: spec.agentIdentity,
+  };
+  setIfDefined(payload, "initial_message", spec.initialMessage);
+  setIfDefined(payload, "runtime_mode", spec.runtimeMode);
+  setIfDefined(payload, "backend", spec.backend);
+  setIfDefined(payload, "labels", spec.labels);
+  setIfDefined(payload, "context", spec.context);
+  setIfDefined(payload, "additional_instructions", spec.additionalInstructions);
+  setIfDefined(payload, "connection_ref", spec.connectionRef);
+  return payload;
+}
+
+function mobTurnStartPayload(
+  mobId: string,
+  agentIdentity: string,
+  prompt: ContentInput,
+  options?: MobTurnStartOptions,
+): MobTurnStartParams {
+  const payload: MobTurnStartParams = {
+    mob_id: mobId,
+    agent_identity: agentIdentity,
+    prompt: typeof prompt === "string"
+      ? prompt
+      : prompt.map((block) => ({ ...block })) as MobTurnStartParams["prompt"],
+  };
+  const wireRefs = skillRefsToWire(options?.skillRefs);
+  if (wireRefs) {
+    payload.skill_refs = wireRefs as MobTurnStartParams["skill_refs"];
+  }
+  if (options?.flowToolOverlay) {
+    payload.flow_tool_overlay = {
+      allowed_tools: options.flowToolOverlay.allowedTools,
+      blocked_tools: options.flowToolOverlay.blockedTools,
+    } as MobTurnStartParams["flow_tool_overlay"];
+  }
+  setIfDefined(payload, "additional_instructions", options?.additionalInstructions);
+  setIfDefined(payload, "keep_alive", options?.keepAlive);
+  setIfDefined(payload, "model", options?.model);
+  setIfDefined(payload, "provider", options?.provider);
+  setIfDefined(payload, "max_tokens", options?.maxTokens);
+  setIfDefined(payload, "system_prompt", options?.systemPrompt);
+  setIfDefined(payload, "output_schema", options?.outputSchema);
+  setIfDefined(payload, "structured_output_retries", options?.structuredOutputRetries);
+  setIfDefined(payload, "provider_params", options?.providerParams);
+  setIfDefined(payload, "clear_provider_params", options?.clearProviderParams);
+  setIfDefined(payload, "connection_ref", options?.connectionRef);
+  setIfDefined(payload, "clear_connection_ref", options?.clearConnectionRef);
+  return payload;
 }
 
 export class MeerkatClient {
@@ -916,17 +1006,7 @@ export class MeerkatClient {
     mobId: string,
     options: SpawnSpec,
   ): Promise<MobSpawnResult> {
-    const result = await this.request("mob/spawn", {
-      mob_id: mobId,
-      profile: options.profile,
-      agent_identity: options.agentIdentity,
-      initial_message: options.initialMessage,
-      runtime_mode: options.runtimeMode,
-      backend: options.backend,
-      labels: options.labels,
-      context: options.context,
-      additional_instructions: options.additionalInstructions,
-    });
+    const result = await this.request("mob/spawn", mobSpawnPayload(mobId, options));
     const memberRef =
       typeof result.member_ref === "string" && result.member_ref.length > 0
         ? result.member_ref
@@ -949,20 +1029,11 @@ export class MeerkatClient {
 
   async spawnMobMembers(
     mobId: string,
-    specs: SpawnSpec[],
+    specs: SpawnManySpec[],
   ): Promise<MobSpawnManyResultEntry[]> {
     const result = await this.request("mob/spawn_many", {
       mob_id: mobId,
-      specs: specs.map((spec) => ({
-        profile: spec.profile,
-        agent_identity: spec.agentIdentity,
-        initial_message: spec.initialMessage,
-        runtime_mode: spec.runtimeMode,
-        backend: spec.backend,
-        labels: spec.labels,
-        context: spec.context,
-        additional_instructions: spec.additionalInstructions,
-      })),
+      specs: specs.map(mobSpawnManySpecPayload),
     });
     const entries = Array.isArray(result.results)
       ? (result.results as Array<Record<string, unknown>>)
@@ -1056,15 +1127,15 @@ export class MeerkatClient {
   async mobTurnStart(
     mobId: string,
     agentIdentity: string,
-    prompt: string,
-    overrides?: Record<string, unknown>,
+    prompt: ContentInput,
+    options?: MobTurnStartOptions,
   ): Promise<Record<string, unknown>> {
-    return await this.request("mob/turn_start", {
-      mob_id: mobId,
-      agent_identity: agentIdentity,
+    return await this.request("mob/turn_start", mobTurnStartPayload(
+      mobId,
+      agentIdentity,
       prompt,
-      ...overrides,
-    });
+      options,
+    ));
   }
 
   async mobMemberStatus(
