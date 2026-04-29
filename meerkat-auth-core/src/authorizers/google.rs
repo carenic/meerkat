@@ -24,8 +24,11 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::{EnvLookup, LeaseFreshnessObserver};
-use meerkat_core::handles::{AUTH_LEASE_TTL_REFRESH_WINDOW_SECS, AuthLeaseHandle, LeaseKey};
+use super::{
+    EnvLookup, LeaseFreshnessObserver, endpoint_failure_is_transient,
+    oauth_endpoint_failure_is_permanent, token_is_fresh_at,
+};
+use meerkat_core::handles::{AuthLeaseHandle, LeaseKey};
 use meerkat_core::{AuthError, HttpAuthorizationRequest, HttpAuthorizer};
 
 const DEFAULT_SCOPE: &str = "https://www.googleapis.com/auth/cloud-platform";
@@ -64,9 +67,11 @@ impl From<GoogleAuthError> for AuthError {
         match e {
             GoogleAuthError::NoCredentialSource => AuthError::MissingSecret,
             GoogleAuthError::Io(msg) | GoogleAuthError::Network(msg) => AuthError::Io(msg),
-            GoogleAuthError::TokenEndpoint { status, body }
-            | GoogleAuthError::MetadataEndpoint { status, body } => {
+            GoogleAuthError::TokenEndpoint { status, body } => {
                 AuthError::RefreshFailed(format!("google token endpoint {status}: {body}"))
+            }
+            GoogleAuthError::MetadataEndpoint { status, body } => {
+                AuthError::RefreshFailed(format!("google metadata endpoint {status}: {body}"))
             }
             GoogleAuthError::Json(msg) => AuthError::Other(format!("google json: {msg}")),
             GoogleAuthError::JwtSign(msg) => AuthError::Other(format!("google jwt sign: {msg}")),
@@ -124,6 +129,7 @@ pub struct GoogleAuthAuthorizer {
     env_lookup: EnvLookup,
     home_dir: Option<PathBuf>,
     http: reqwest::Client,
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
     label: String,
     token_url_override: Option<String>,
     metadata_url_override: Option<String>,
@@ -158,6 +164,7 @@ impl GoogleAuthAuthorizer {
             env_lookup,
             home_dir: dirs::home_dir(),
             http: reqwest::Client::new(),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             label,
             token_url_override: None,
             metadata_url_override: None,
@@ -214,37 +221,75 @@ impl GoogleAuthAuthorizer {
         self.cache.lock().as_ref().map(|token| token.expires_at)
     }
 
-    fn publish_expires_at(&self, expires_at: DateTime<Utc>) {
-        if let Some(observer) = &self.lease_observer {
-            observer.observe_expires_at(&self.label, expires_at);
+    fn fresh_cached_token(&self, now: DateTime<Utc>) -> Result<Option<String>, AuthError> {
+        if let Some((access_token, expires_at)) = {
+            let guard = self.cache.lock();
+            guard
+                .as_ref()
+                .map(|t| (t.access_token.clone(), t.expires_at))
+        } {
+            let fresh = if let Some(observer) = &self.lease_observer {
+                observer.cached_token_is_fresh(&self.label, expires_at, now)?
+            } else {
+                token_is_fresh_at(expires_at, now)
+            };
+            if fresh {
+                return Ok(Some(access_token));
+            }
         }
+        Ok(None)
     }
 
     async fn get_token(&self) -> Result<String, AuthError> {
-        let cached = {
-            let guard = self.cache.lock();
-            if let Some(t) = guard.as_ref()
-                && t.expires_at - Utc::now()
-                    > Duration::seconds(AUTH_LEASE_TTL_REFRESH_WINDOW_SECS as i64)
-            {
-                Some((t.access_token.clone(), t.expires_at))
-            } else {
-                None
-            }
-        };
-        if let Some((access_token, expires_at)) = cached {
-            self.publish_expires_at(expires_at);
+        if let Some(access_token) = self.fresh_cached_token(Utc::now())? {
             return Ok(access_token);
         }
 
+        let _refresh_guard = self.refresh_lock.lock().await;
+        if let Some(access_token) = self.fresh_cached_token(Utc::now())? {
+            return Ok(access_token);
+        }
+
+        let lifecycle = if let Some(observer) = &self.lease_observer {
+            Some(observer.begin_refresh(&self.label).await?)
+        } else {
+            None
+        };
+
         let token = match self.chain {
-            GoogleAuthChain::ComputeOnly => self.fetch_from_metadata().await?,
-            GoogleAuthChain::Default => self.fetch_full_chain().await?,
+            GoogleAuthChain::ComputeOnly => match self.fetch_from_metadata().await {
+                Ok(token) => token,
+                Err(err) => {
+                    if let (Some(observer), Some(lifecycle)) = (&self.lease_observer, lifecycle) {
+                        observer.refresh_failed(
+                            &self.label,
+                            lifecycle,
+                            google_refresh_failure_is_permanent(&err),
+                        )?;
+                    }
+                    return Err(err.into());
+                }
+            },
+            GoogleAuthChain::Default => match self.fetch_full_chain().await {
+                Ok(token) => token,
+                Err(err) => {
+                    if let (Some(observer), Some(lifecycle)) = (&self.lease_observer, lifecycle) {
+                        observer.refresh_failed(
+                            &self.label,
+                            lifecycle,
+                            google_refresh_failure_is_permanent(&err),
+                        )?;
+                    }
+                    return Err(err.into());
+                }
+            },
         };
         let access = token.access_token.clone();
         let expires_at = token.expires_at;
+        if let (Some(observer), Some(lifecycle)) = (&self.lease_observer, lifecycle) {
+            observer.complete_refresh(&self.label, lifecycle, expires_at, Utc::now())?;
+        }
         *self.cache.lock() = Some(token);
-        self.publish_expires_at(expires_at);
         Ok(access)
     }
 
@@ -266,6 +311,7 @@ impl GoogleAuthAuthorizer {
         // 3. Metadata server
         match self.fetch_from_metadata().await {
             Ok(t) => Ok(t),
+            Err(err) if default_chain_metadata_error_is_retryable(&err) => Err(err),
             Err(_) => Err(GoogleAuthError::NoCredentialSource),
         }
     }
@@ -402,6 +448,28 @@ impl GoogleAuthAuthorizer {
             access_token: body.access_token,
             expires_at: Utc::now() + Duration::seconds(body.expires_in as i64),
         })
+    }
+}
+
+fn google_refresh_failure_is_permanent(err: &GoogleAuthError) -> bool {
+    match err {
+        GoogleAuthError::NoCredentialSource
+        | GoogleAuthError::Json(_)
+        | GoogleAuthError::JwtSign(_) => true,
+        GoogleAuthError::Io(_) | GoogleAuthError::Network(_) => false,
+        GoogleAuthError::TokenEndpoint { status, body } => {
+            oauth_endpoint_failure_is_permanent(*status, body)
+        }
+        GoogleAuthError::MetadataEndpoint { .. } => false,
+    }
+}
+
+fn default_chain_metadata_error_is_retryable(err: &GoogleAuthError) -> bool {
+    match err {
+        GoogleAuthError::MetadataEndpoint { status, body } => {
+            endpoint_failure_is_transient(*status, body)
+        }
+        _ => false,
     }
 }
 

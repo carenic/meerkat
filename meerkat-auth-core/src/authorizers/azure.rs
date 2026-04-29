@@ -23,8 +23,8 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use thiserror::Error;
 
-use super::LeaseFreshnessObserver;
-use meerkat_core::handles::{AUTH_LEASE_TTL_REFRESH_WINDOW_SECS, AuthLeaseHandle, LeaseKey};
+use super::{LeaseFreshnessObserver, oauth_endpoint_failure_is_permanent, token_is_fresh_at};
+use meerkat_core::handles::{AuthLeaseHandle, LeaseKey};
 use meerkat_core::{AuthError, HttpAuthorizationRequest, HttpAuthorizer};
 
 const DEFAULT_AUTHORITY: &str = "https://login.microsoftonline.com";
@@ -101,6 +101,7 @@ pub struct AzureAdAuthorizer {
     creds: AzureClientCredentials,
     http: reqwest::Client,
     cache: Arc<Mutex<Option<CachedToken>>>,
+    refresh_lock: Arc<tokio::sync::Mutex<()>>,
     label: String,
     token_url_override: Option<String>,
     lease_observer: Option<LeaseFreshnessObserver>,
@@ -115,6 +116,7 @@ impl AzureAdAuthorizer {
             creds,
             http: reqwest::Client::new(),
             cache: Arc::new(Mutex::new(None)),
+            refresh_lock: Arc::new(tokio::sync::Mutex::new(())),
             label,
             token_url_override: None,
             lease_observer: None,
@@ -189,36 +191,73 @@ impl AzureAdAuthorizer {
         self.cache.lock().as_ref().map(|token| token.expires_at)
     }
 
-    fn publish_expires_at(&self, expires_at: DateTime<Utc>) {
-        if let Some(observer) = &self.lease_observer {
-            observer.observe_expires_at(&self.label, expires_at);
+    fn fresh_cached_token(&self, now: DateTime<Utc>) -> Result<Option<String>, AuthError> {
+        if let Some((access_token, expires_at)) = {
+            let guard = self.cache.lock();
+            guard
+                .as_ref()
+                .map(|t| (t.access_token.clone(), t.expires_at))
+        } {
+            let fresh = if let Some(observer) = &self.lease_observer {
+                observer.cached_token_is_fresh(&self.label, expires_at, now)?
+            } else {
+                token_is_fresh_at(expires_at, now)
+            };
+            if fresh {
+                return Ok(Some(access_token));
+            }
         }
+        Ok(None)
     }
 
     async fn get_token(&self) -> Result<String, AuthError> {
         // Check cache without taking the refresh path.
-        let cached = {
-            let guard = self.cache.lock();
-            if let Some(t) = guard.as_ref()
-                && t.expires_at - Utc::now()
-                    > Duration::seconds(AUTH_LEASE_TTL_REFRESH_WINDOW_SECS as i64)
-            {
-                Some((t.access_token.clone(), t.expires_at))
-            } else {
-                None
-            }
-        };
-        if let Some((access_token, expires_at)) = cached {
-            self.publish_expires_at(expires_at);
+        if let Some(access_token) = self.fresh_cached_token(Utc::now())? {
             return Ok(access_token);
         }
+
+        let _refresh_guard = self.refresh_lock.lock().await;
+        if let Some(access_token) = self.fresh_cached_token(Utc::now())? {
+            return Ok(access_token);
+        }
+
+        let lifecycle = if let Some(observer) = &self.lease_observer {
+            Some(observer.begin_refresh(&self.label).await?)
+        } else {
+            None
+        };
+
         // Miss — fetch a fresh token.
-        let new_token = self.fetch_token().await?;
+        let new_token = match self.fetch_token().await {
+            Ok(token) => token,
+            Err(err) => {
+                if let (Some(observer), Some(lifecycle)) = (&self.lease_observer, lifecycle) {
+                    observer.refresh_failed(
+                        &self.label,
+                        lifecycle,
+                        azure_refresh_failure_is_permanent(&err),
+                    )?;
+                }
+                return Err(err.into());
+            }
+        };
         let access = new_token.access_token.clone();
         let expires_at = new_token.expires_at;
+        if let (Some(observer), Some(lifecycle)) = (&self.lease_observer, lifecycle) {
+            observer.complete_refresh(&self.label, lifecycle, expires_at, Utc::now())?;
+        }
         *self.cache.lock() = Some(new_token);
-        self.publish_expires_at(expires_at);
         Ok(access)
+    }
+}
+
+fn azure_refresh_failure_is_permanent(err: &AzureAuthError) -> bool {
+    match err {
+        AzureAuthError::MissingEnv(_) | AzureAuthError::InvalidResponse(_) => true,
+        AzureAuthError::Network(_) => false,
+        AzureAuthError::TokenEndpoint { status, body } => {
+            oauth_endpoint_failure_is_permanent(*status, body)
+        }
     }
 }
 
