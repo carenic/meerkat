@@ -3067,7 +3067,7 @@ impl AgentFactory {
                     Ok(s) => s,
                     Err(e) => {
                         tracing::warn!("Failed to generate skill inventory section: {e}");
-                        String::new()
+                        meerkat_skills::renderer::render_inventory_failure(&e.to_string())
                     }
                 };
 

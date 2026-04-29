@@ -50,6 +50,14 @@ pub fn render_inventory(
     }
 }
 
+/// Render an explicit inventory failure block for prompt surfaces.
+pub fn render_inventory_failure(message: &str) -> String {
+    format!(
+        "<available_skills state=\"unavailable\">\n  <inventory_failure>{}</inventory_failure>\n</available_skills>",
+        escape_xml(message)
+    )
+}
+
 /// Escape XML-special characters in text content.
 /// Note: O(5n) worst case — five sequential replace() calls, each allocating.
 /// Acceptable for short strings (skill names/descriptions). For large content,
@@ -235,6 +243,16 @@ mod tests {
     fn test_render_inventory_empty() {
         let output = render_inventory(&[], &[], 12);
         assert!(output.is_empty());
+    }
+
+    #[test]
+    fn test_render_inventory_failure_xml() {
+        let output = render_inventory_failure("source identity resolution failed: <bad>");
+
+        assert!(output.starts_with("<available_skills state=\"unavailable\">"));
+        assert!(output.ends_with("</available_skills>"));
+        assert!(output.contains("<inventory_failure>"));
+        assert!(output.contains("&lt;bad&gt;"));
     }
 
     // --- Injection tests ---
