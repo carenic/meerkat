@@ -399,17 +399,7 @@ impl TryFrom<&BridgePeerSpec> for meerkat_core::comms::TrustedPeerDescriptor {
 }
 
 fn parse_peer_address(raw: &str) -> Result<meerkat_core::comms::PeerAddress, String> {
-    use meerkat_core::comms::{PeerAddress, PeerTransport};
-    let (scheme, endpoint) = raw
-        .split_once("://")
-        .ok_or_else(|| format!("peer address missing transport scheme: {raw}"))?;
-    let transport = match scheme {
-        "inproc" => PeerTransport::Inproc,
-        "uds" => PeerTransport::Uds,
-        "tcp" => PeerTransport::Tcp,
-        other => return Err(format!("unknown peer address transport: {other}")),
-    };
-    Ok(PeerAddress::new(transport, endpoint))
+    meerkat_core::comms::PeerAddress::parse(raw).map_err(|err| err.to_string())
 }
 
 // ---------------------------------------------------------------------------
@@ -781,6 +771,23 @@ mod tests {
             bootstrap_token: "bootstrap-secret".into(),
         });
         assert_command_round_trip(&cmd);
+    }
+
+    #[test]
+    fn bridge_peer_spec_rejects_unknown_address_scheme() {
+        let spec = BridgePeerSpec {
+            name: "member-a".to_string(),
+            peer_id: "aaaaaaaa-0000-4000-8000-000000000001".to_string(),
+            address: "http://127.0.0.1:7000".to_string(),
+            pubkey: [0u8; 32],
+        };
+
+        let err = meerkat_core::comms::TrustedPeerDescriptor::try_from(&spec)
+            .expect_err("supervisor bridge peer specs must fail closed on unknown schemes");
+        assert!(
+            err.contains("unknown peer address transport"),
+            "unexpected error: {err}",
+        );
     }
 
     #[test]

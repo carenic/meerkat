@@ -41,9 +41,7 @@ use std::sync::Arc;
 
 use crate::meerkat_machine::dsl::PeerEndpoint;
 use meerkat_core::agent::{CommsCapabilityError, CommsRuntime};
-use meerkat_core::comms::{
-    PeerAddress, PeerId, PeerName, PeerTransport, SendError, TrustedPeerDescriptor,
-};
+use meerkat_core::comms::{PeerAddress, PeerId, PeerName, SendError, TrustedPeerDescriptor};
 
 /// Typed error surfaced by the reconciliation handler.
 #[derive(Debug, thiserror::Error)]
@@ -220,16 +218,7 @@ fn endpoint_to_descriptor(
 }
 
 fn parse_peer_address(raw: &str) -> Result<PeerAddress, String> {
-    let (scheme, endpoint) = raw
-        .split_once("://")
-        .ok_or_else(|| format!("address missing transport scheme: {raw}"))?;
-    let transport = match scheme {
-        "inproc" => PeerTransport::Inproc,
-        "uds" => PeerTransport::Uds,
-        "tcp" => PeerTransport::Tcp,
-        other => return Err(format!("unknown transport `{other}` in address `{raw}`")),
-    };
-    Ok(PeerAddress::new(transport, endpoint))
+    PeerAddress::parse(raw).map_err(|err| err.to_string())
 }
 
 fn descriptor_to_endpoint(
@@ -517,6 +506,27 @@ mod tests {
             matches!(err, CommsTrustReconcileError::InvalidEndpoint { .. }),
             "expected InvalidEndpoint, got {err:?}",
         );
+        assert!(comms.add_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn unknown_address_scheme_surfaces_typed_error_without_touching_trust_store() {
+        let comms = Arc::new(RecordingCommsRuntime::default());
+        let reconciler = CommsTrustReconciler::new(comms.clone());
+        let mut bad = endpoint("bad", UUID_A);
+        bad.address = crate::meerkat_machine::dsl::PeerAddress("http://127.0.0.1:4200".into());
+
+        let err = reconciler
+            .reconcile(1, BTreeSet::from([bad]))
+            .await
+            .expect_err("unknown address scheme must surface a typed error");
+        match err {
+            CommsTrustReconcileError::InvalidEndpoint { detail, .. } => assert!(
+                detail.contains("unknown peer address transport"),
+                "unexpected detail: {detail}",
+            ),
+            other => panic!("expected InvalidEndpoint, got {other:?}"),
+        }
         assert!(comms.add_calls().is_empty());
     }
 }

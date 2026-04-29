@@ -151,6 +151,15 @@ pub struct PeerAddress {
     pub endpoint: String,
 }
 
+/// Error parsing a typed [`PeerAddress`] from its URI-shaped string form.
+#[derive(Debug, Clone, thiserror::Error, PartialEq, Eq)]
+pub enum PeerAddressParseError {
+    #[error("peer address missing transport scheme: {input}")]
+    MissingTransportScheme { input: String },
+    #[error("unknown peer address transport {scheme:?} in address {input:?}")]
+    UnknownTransport { input: String, scheme: String },
+}
+
 impl PeerAddress {
     pub fn new(transport: PeerTransport, endpoint: impl Into<String>) -> Self {
         Self {
@@ -166,11 +175,78 @@ impl PeerAddress {
     pub fn endpoint(&self) -> &str {
         &self.endpoint
     }
+
+    /// Strictly parse `scheme://endpoint` peer addresses.
+    ///
+    /// Only the currently supported transport schemes are accepted. Unknown
+    /// schemes and schemeless input fail closed so callers cannot silently
+    /// reinterpret address truth as TCP.
+    pub fn parse(raw: impl AsRef<str>) -> Result<Self, PeerAddressParseError> {
+        let raw = raw.as_ref();
+        let (scheme, endpoint) =
+            raw.split_once("://")
+                .ok_or_else(|| PeerAddressParseError::MissingTransportScheme {
+                    input: raw.to_string(),
+                })?;
+        let transport = match scheme {
+            "inproc" => PeerTransport::Inproc,
+            "uds" => PeerTransport::Uds,
+            "tcp" => PeerTransport::Tcp,
+            other => {
+                return Err(PeerAddressParseError::UnknownTransport {
+                    input: raw.to_string(),
+                    scheme: other.to_string(),
+                });
+            }
+        };
+        Ok(Self::new(transport, endpoint))
+    }
+
+    /// Parse with the explicit legacy compatibility rule that schemeless
+    /// addresses are TCP endpoints.
+    ///
+    /// This compatibility path is intentionally separate from [`Self::parse`]:
+    /// it accepts `host:port` as `tcp://host:port`, but still rejects any
+    /// unknown `scheme://...` input.
+    pub fn parse_legacy_schemeless_tcp(
+        raw: impl AsRef<str>,
+    ) -> Result<Self, PeerAddressParseError> {
+        let raw = raw.as_ref();
+        if raw.contains("://") {
+            Self::parse(raw)
+        } else {
+            Ok(Self::new(PeerTransport::Tcp, raw))
+        }
+    }
 }
 
 impl std::fmt::Display for PeerAddress {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}://{}", self.transport.as_scheme(), self.endpoint)
+    }
+}
+
+impl std::str::FromStr for PeerAddress {
+    type Err = PeerAddressParseError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
+impl TryFrom<&str> for PeerAddress {
+    type Error = PeerAddressParseError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::parse(value)
+    }
+}
+
+impl TryFrom<String> for PeerAddress {
+    type Error = PeerAddressParseError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::parse(value)
     }
 }
 
@@ -306,20 +382,11 @@ impl TrustedPeerDescriptor {
         let name = PeerName::new(name).map_err(|e| format!("invalid peer name: {e}"))?;
         let peer_id =
             PeerId::parse(peer_id.as_ref()).map_err(|e| format!("invalid peer_id: {e}"))?;
-        let address_raw = address.as_ref();
-        let (scheme, endpoint) = address_raw
-            .split_once("://")
-            .ok_or_else(|| format!("peer address missing transport scheme: {address_raw}"))?;
-        let transport = match scheme {
-            "inproc" => PeerTransport::Inproc,
-            "uds" => PeerTransport::Uds,
-            "tcp" => PeerTransport::Tcp,
-            other => return Err(format!("unknown peer address transport: {other}")),
-        };
+        let address = PeerAddress::parse(address.as_ref()).map_err(|e| e.to_string())?;
         Ok(Self {
             peer_id,
             name,
-            address: PeerAddress::new(transport, endpoint),
+            address,
             pubkey: [0u8; 32],
         })
     }
@@ -349,20 +416,11 @@ impl TrustedPeerDescriptor {
         address: impl AsRef<str>,
     ) -> Result<Self, String> {
         let name = PeerName::new(name).map_err(|e| format!("invalid peer name: {e}"))?;
-        let address_raw = address.as_ref();
-        let (scheme, endpoint) = address_raw
-            .split_once("://")
-            .ok_or_else(|| format!("peer address missing transport scheme: {address_raw}"))?;
-        let transport = match scheme {
-            "inproc" => PeerTransport::Inproc,
-            "uds" => PeerTransport::Uds,
-            "tcp" => PeerTransport::Tcp,
-            other => return Err(format!("unknown peer address transport: {other}")),
-        };
+        let address = PeerAddress::parse(address.as_ref()).map_err(|e| e.to_string())?;
         Ok(Self {
             peer_id,
             name,
-            address: PeerAddress::new(transport, endpoint),
+            address,
             pubkey: [0u8; 32],
         })
     }
@@ -938,6 +996,62 @@ mod tests {
     fn peer_address_display() {
         let addr = PeerAddress::new(PeerTransport::Tcp, "127.0.0.1:4200");
         assert_eq!(addr.to_string(), "tcp://127.0.0.1:4200");
+    }
+
+    #[test]
+    fn peer_address_parse_round_trips_supported_schemes() {
+        let cases = [
+            ("inproc://agent-a", PeerTransport::Inproc, "agent-a"),
+            (
+                "uds:///tmp/meerkat.sock",
+                PeerTransport::Uds,
+                "/tmp/meerkat.sock",
+            ),
+            ("tcp://127.0.0.1:4200", PeerTransport::Tcp, "127.0.0.1:4200"),
+        ];
+
+        for (raw, transport, endpoint) in cases {
+            let parsed = PeerAddress::parse(raw).expect("supported address parses");
+            assert_eq!(parsed.transport(), transport);
+            assert_eq!(parsed.endpoint(), endpoint);
+            assert_eq!(parsed.to_string(), raw);
+        }
+    }
+
+    #[test]
+    fn peer_address_parse_rejects_unknown_scheme() {
+        let err = PeerAddress::parse("http://127.0.0.1:4200")
+            .expect_err("unknown transport schemes must fail closed");
+        assert!(
+            err.to_string().contains("unknown peer address transport"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn peer_address_parse_rejects_schemeless_input() {
+        let err = PeerAddress::parse("127.0.0.1:4200")
+            .expect_err("strict parser requires an address scheme");
+        assert!(
+            err.to_string().contains("missing transport scheme"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn peer_address_legacy_schemeless_tcp_is_explicit() {
+        let parsed = PeerAddress::parse_legacy_schemeless_tcp("127.0.0.1:4200")
+            .expect("legacy schemeless TCP input remains explicit");
+        assert_eq!(parsed.transport(), PeerTransport::Tcp);
+        assert_eq!(parsed.endpoint(), "127.0.0.1:4200");
+        assert_eq!(parsed.to_string(), "tcp://127.0.0.1:4200");
+
+        let err = PeerAddress::parse_legacy_schemeless_tcp("http://127.0.0.1:4200")
+            .expect_err("legacy schemeless compatibility must not accept unknown schemes");
+        assert!(
+            err.to_string().contains("unknown peer address transport"),
+            "unexpected error: {err}",
+        );
     }
 
     #[test]
