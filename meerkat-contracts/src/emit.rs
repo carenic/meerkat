@@ -40,14 +40,42 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "MobPeerTarget": schema_for!(crate::wire::MobPeerTarget),
         "MobDefinitionInput": schema_for!(crate::wire::MobDefinitionInput),
         "MobCreateResult": schema_for!(crate::wire::MobCreateResult),
+        "MobListResult": schema_for!(crate::wire::MobListResult),
+        "MobStatusResult": schema_for!(crate::wire::MobStatusResult),
+        "MobLifecycleResult": schema_for!(crate::wire::MobLifecycleResult),
+        "MobSpawnResult": schema_for!(crate::wire::MobSpawnResult),
+        "MobSpawnManyResult": schema_for!(crate::wire::MobSpawnManyResult),
+        "MobRetireResult": schema_for!(crate::wire::MobRetireResult),
+        "MobRespawnResult": schema_for!(crate::wire::MobRespawnResult),
+        "MobMembersResult": schema_for!(crate::wire::MobMembersResult),
+        "MobEventsResult": schema_for!(crate::wire::MobEventsResult),
         "MobMemberSendParams": schema_for!(crate::wire::MobMemberSendParams),
         "MobMemberSendResult": schema_for!(crate::wire::MobMemberSendResult),
         "MobIngressInteractionParams": schema_for!(crate::wire::MobIngressInteractionParams),
         "MobIngressInteractionResult": schema_for!(crate::wire::MobIngressInteractionResult),
+        "MobAppendSystemContextResult": schema_for!(crate::wire::MobAppendSystemContextResult),
+        "MobFlowsResult": schema_for!(crate::wire::MobFlowsResult),
+        "MobFlowRunResult": schema_for!(crate::wire::MobFlowRunResult),
+        "MobFlowStatusResult": schema_for!(crate::wire::MobFlowStatusResult),
+        "MobFlowCancelResult": schema_for!(crate::wire::MobFlowCancelResult),
+        "MobHelperResult": schema_for!(crate::wire::MobHelperResult),
+        "MobForceCancelResult": schema_for!(crate::wire::MobForceCancelResult),
+        "MobMemberStatusResult": schema_for!(crate::wire::MobMemberStatusResult),
+        "MobSnapshotResult": schema_for!(crate::wire::MobSnapshotResult),
+        "MobDestroyResult": schema_for!(crate::wire::MobDestroyResult),
+        "MobRotateSupervisorResult": schema_for!(crate::wire::MobRotateSupervisorResult),
+        "MobWaitMembersResult": schema_for!(crate::wire::MobWaitMembersResult),
         "MobEnsureMemberResult": schema_for!(crate::wire::MobEnsureMemberResult),
         "MobReconcileResult": schema_for!(crate::wire::MobReconcileResult),
         "MobListMembersMatchingResult": schema_for!(crate::wire::MobListMembersMatchingResult),
         "MobSubmitWorkResult": schema_for!(crate::wire::MobSubmitWorkResult),
+        "MobCancelWorkResult": schema_for!(crate::wire::MobCancelWorkResult),
+        "MobCancelAllWorkResult": schema_for!(crate::wire::MobCancelAllWorkResult),
+        "MobProfileLookupResult": schema_for!(crate::wire::MobProfileLookupResult),
+        "MobProfileListResult": schema_for!(crate::wire::MobProfileListResult),
+        "MobProfileDeleteResult": schema_for!(crate::wire::MobProfileDeleteResult),
+        "MobStreamOpenResult": schema_for!(crate::wire::MobStreamOpenResult),
+        "MobStreamCloseResult": schema_for!(crate::wire::MobStreamCloseResult),
         "WireHandlingMode": schema_for!(crate::wire::WireHandlingMode),
         "WireRenderClass": schema_for!(crate::wire::WireRenderClass),
         "WireRenderSalience": schema_for!(crate::wire::WireRenderSalience),
@@ -160,9 +188,29 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "McpRemoveParams": schema_for!(crate::wire::McpRemoveParams),
         "McpReloadParams": schema_for!(crate::wire::McpReloadParams),
         "MobCreateParams": schema_for!(crate::wire::MobCreateParams),
+        "MobIdParams": schema_for!(crate::wire::MobIdParams),
+        "MobMemberParams": schema_for!(crate::wire::MobMemberParams),
+        "MobSpawnParams": schema_for!(crate::wire::MobSpawnParams),
+        "MobSpawnManyParams": schema_for!(crate::wire::MobSpawnManyParams),
+        "MobRespawnParams": schema_for!(crate::wire::MobRespawnParams),
+        "MobEventsParams": schema_for!(crate::wire::MobEventsParams),
         "MobWireParams": schema_for!(crate::wire::MobWireParams),
         "MobUnwireParams": schema_for!(crate::wire::MobUnwireParams),
         "MobLifecycleParams": schema_for!(crate::wire::MobLifecycleParams),
+        "MobAppendSystemContextParams": schema_for!(crate::wire::MobAppendSystemContextParams),
+        "MobFlowRunParams": schema_for!(crate::wire::MobFlowRunParams),
+        "MobFlowStatusParams": schema_for!(crate::wire::MobFlowStatusParams),
+        "MobFlowCancelParams": schema_for!(crate::wire::MobFlowCancelParams),
+        "MobSpawnHelperParams": schema_for!(crate::wire::MobSpawnHelperParams),
+        "MobForkHelperParams": schema_for!(crate::wire::MobForkHelperParams),
+        "MobTurnStartParams": schema_for!(crate::wire::MobTurnStartParams),
+        "MobWaitParams": schema_for!(crate::wire::MobWaitParams),
+        "MobProfileCreateParams": schema_for!(crate::wire::MobProfileCreateParams),
+        "MobProfileNameParams": schema_for!(crate::wire::MobProfileNameParams),
+        "MobProfileUpdateParams": schema_for!(crate::wire::MobProfileUpdateParams),
+        "MobProfileDeleteParams": schema_for!(crate::wire::MobProfileDeleteParams),
+        "MobStreamOpenParams": schema_for!(crate::wire::MobStreamOpenParams),
+        "MobStreamCloseParams": schema_for!(crate::wire::MobStreamCloseParams),
         "MobMemberSendParams": schema_for!(crate::wire::MobMemberSendParams),
         "MobIngressInteractionParams": schema_for!(crate::wire::MobIngressInteractionParams),
         "MobEnsureMemberParams": schema_for!(crate::wire::MobEnsureMemberParams),
@@ -1131,6 +1179,14 @@ mod tests {
                 "MobIngressInteractionParams",
                 "MobIngressInteractionResult",
             ),
+            ("mob/spawn", "MobSpawnParams", "MobSpawnResult"),
+            ("mob/spawn_many", "MobSpawnManyParams", "MobSpawnManyResult"),
+            ("mob/events", "MobEventsParams", "MobEventsResult"),
+            (
+                "mob/append_system_context",
+                "MobAppendSystemContextParams",
+                "MobAppendSystemContextResult",
+            ),
         ] {
             let method = methods
                 .iter()
@@ -1154,9 +1210,28 @@ mod tests {
             cancel_all_work["params_type"], "MobCancelAllWorkParams",
             "mob/cancel_all_work emitted params_type drifted"
         );
-        assert!(
-            cancel_all_work.get("result_type").is_none(),
-            "mob/cancel_all_work must not advertise a phantom result contract"
+        assert_eq!(
+            cancel_all_work["result_type"], "MobCancelAllWorkResult",
+            "mob/cancel_all_work emitted result_type drifted"
+        );
+
+        fs::remove_dir_all(&output_dir).unwrap();
+    }
+
+    #[test]
+    fn emitted_mob_turn_start_params_allow_override_fields() {
+        let output_dir = temp_output_dir("mob-turn-start-overrides");
+        emit_all_schemas(&output_dir).expect("emit schemas");
+
+        let params: serde_json::Value =
+            serde_json::from_slice(&fs::read(output_dir.join("params.json")).unwrap()).unwrap();
+        let turn_start = params
+            .get("MobTurnStartParams")
+            .expect("MobTurnStartParams schema must be emitted");
+        assert_ne!(
+            turn_start.get("additionalProperties"),
+            Some(&serde_json::Value::Bool(false)),
+            "mob/turn_start params must permit flattened turn override fields"
         );
 
         fs::remove_dir_all(&output_dir).unwrap();

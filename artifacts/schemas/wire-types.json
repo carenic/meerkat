@@ -1158,6 +1158,64 @@
     "title": "McpLiveOperation",
     "type": "string"
   },
+  "MobAppendSystemContextResult": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/append_system_context`.",
+    "properties": {
+      "agent_identity": {
+        "type": "string"
+      },
+      "mob_id": {
+        "type": "string"
+      },
+      "status": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "mob_id",
+      "agent_identity",
+      "status"
+    ],
+    "title": "MobAppendSystemContextResult",
+    "type": "object"
+  },
+  "MobCancelAllWorkResult": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/cancel_all_work`.",
+    "properties": {
+      "mob_id": {
+        "type": "string"
+      },
+      "ok": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "mob_id",
+      "ok"
+    ],
+    "title": "MobCancelAllWorkResult",
+    "type": "object"
+  },
+  "MobCancelWorkResult": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/cancel_work`.",
+    "properties": {
+      "mob_id": {
+        "type": "string"
+      },
+      "ok": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "mob_id",
+      "ok"
+    ],
+    "title": "MobCancelWorkResult",
+    "type": "object"
+  },
   "MobCreateResult": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "description": "Response payload for `mob/create`.",
@@ -2551,6 +2609,26 @@
     "title": "MobDefinitionInput",
     "type": "object"
   },
+  "MobDestroyResult": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/destroy`.",
+    "properties": {
+      "destroy_report": true,
+      "mob_id": {
+        "type": "string"
+      },
+      "ok": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "mob_id",
+      "ok",
+      "destroy_report"
+    ],
+    "title": "MobDestroyResult",
+    "type": "object"
+  },
   "MobEnsureMemberResult": {
     "$defs": {
       "MobEnsureMemberOutcomeWire": {
@@ -2695,6 +2773,132 @@
       "outcome"
     ],
     "title": "MobEnsureMemberResult",
+    "type": "object"
+  },
+  "MobEventsResult": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/events`.",
+    "properties": {
+      "events": {
+        "items": true,
+        "type": "array"
+      }
+    },
+    "required": [
+      "events"
+    ],
+    "title": "MobEventsResult",
+    "type": "object"
+  },
+  "MobFlowCancelResult": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/flow_cancel`.",
+    "properties": {
+      "canceled": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "canceled"
+    ],
+    "title": "MobFlowCancelResult",
+    "type": "object"
+  },
+  "MobFlowRunResult": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/flow_run`.",
+    "properties": {
+      "run_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "run_id"
+    ],
+    "title": "MobFlowRunResult",
+    "type": "object"
+  },
+  "MobFlowStatusResult": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/flow_status`.",
+    "properties": {
+      "run": true
+    },
+    "required": [
+      "run"
+    ],
+    "title": "MobFlowStatusResult",
+    "type": "object"
+  },
+  "MobFlowsResult": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/flows`.",
+    "properties": {
+      "flows": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "mob_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "mob_id",
+      "flows"
+    ],
+    "title": "MobFlowsResult",
+    "type": "object"
+  },
+  "MobForceCancelResult": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/force_cancel`.",
+    "properties": {
+      "cancelled": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "cancelled"
+    ],
+    "title": "MobForceCancelResult",
+    "type": "object"
+  },
+  "MobHelperResult": {
+    "$defs": {
+      "WireMemberRef": {
+        "description": "Server-resolved opaque handle for a mob member.\n\nEncodes `{mob_id, agent_identity}` as a single base64url-encoded token\nthat callers treat as opaque. The server resolves the current\n`AgentRuntimeId` and fence token against the live mob roster on every\ndispatch — clients never reason about `generation` or `fence_token`\ndirectly.\n\nUse [`WireMemberRef::encode`] to produce a token and\n[`WireMemberRef::decode`] inside an RPC handler to recover the\n`(mob_id, agent_identity)` pair before resolving against the runtime.",
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/spawn_helper` and `mob/fork_helper`.",
+    "properties": {
+      "agent_identity": {
+        "type": "string"
+      },
+      "member_ref": {
+        "$ref": "#/$defs/WireMemberRef"
+      },
+      "output": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "tokens_used": {
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "tokens_used",
+      "agent_identity",
+      "member_ref"
+    ],
+    "title": "MobHelperResult",
     "type": "object"
   },
   "MobIngressInteractionParams": {
@@ -3303,6 +3507,42 @@
     "title": "MobIngressInteractionResult",
     "type": "object"
   },
+  "MobLifecycleResult": {
+    "$defs": {
+      "WireMobLifecycleAction": {
+        "description": "Typed lifecycle action for `mob/lifecycle`. Replaces the prior\n`action: String` discriminator with an exhaustive enum so callers and\nhandlers reason about lifecycle transitions through the type system\nrather than string folklore.",
+        "enum": [
+          "stop",
+          "resume",
+          "complete",
+          "reset",
+          "destroy"
+        ],
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/lifecycle`.",
+    "properties": {
+      "action": {
+        "$ref": "#/$defs/WireMobLifecycleAction"
+      },
+      "destroy_report": true,
+      "mob_id": {
+        "type": "string"
+      },
+      "ok": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "mob_id",
+      "action",
+      "ok"
+    ],
+    "title": "MobLifecycleResult",
+    "type": "object"
+  },
   "MobListMembersMatchingResult": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "description": "Response payload for `mob/list_members_matching`. Each member is the raw\nroster entry JSON.",
@@ -3314,6 +3554,41 @@
       }
     },
     "title": "MobListMembersMatchingResult",
+    "type": "object"
+  },
+  "MobListResult": {
+    "$defs": {
+      "MobStatusResult": {
+        "description": "One active mob row returned by `mob/list`.",
+        "properties": {
+          "mob_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mob_id",
+          "status"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/list`.",
+    "properties": {
+      "mobs": {
+        "items": {
+          "$ref": "#/$defs/MobStatusResult"
+        },
+        "type": "array"
+      }
+    },
+    "required": [
+      "mobs"
+    ],
+    "title": "MobListResult",
     "type": "object"
   },
   "MobMemberSendParams": {
@@ -3591,6 +3866,177 @@
     "title": "MobMemberSendResult",
     "type": "object"
   },
+  "MobMemberStatusResult": {
+    "$defs": {
+      "WireMobMemberStatus": {
+        "description": "Execution status mirroring `meerkat_mob::runtime::MobMemberStatus`.",
+        "enum": [
+          "active",
+          "retiring",
+          "broken",
+          "completed",
+          "unknown"
+        ],
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/member_status`.",
+    "properties": {
+      "current_session_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "error": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "external_member": true,
+      "is_final": {
+        "type": "boolean"
+      },
+      "kickoff": true,
+      "output_preview": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "peer_connectivity": true,
+      "realtime_attachment_status": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "status": {
+        "$ref": "#/$defs/WireMobMemberStatus"
+      },
+      "tokens_used": {
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      }
+    },
+    "required": [
+      "status",
+      "tokens_used",
+      "is_final"
+    ],
+    "title": "MobMemberStatusResult",
+    "type": "object"
+  },
+  "MobMembersResult": {
+    "$defs": {
+      "MobMemberListEntryWire": {
+        "description": "Public roster entry returned by `mob/ensure_member`'s `Existed` outcome\n(and other surfaces that want a typed snapshot of a single member). Mirrors\nthe public-facing fields of `meerkat_mob::runtime::MobMemberListEntry`\nwithout leaking bridge-internal fields.",
+        "properties": {
+          "agent_identity": {
+            "type": "string"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "is_final": {
+            "type": "boolean"
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "member_ref": {
+            "$ref": "#/$defs/WireMemberRef"
+          },
+          "role": {
+            "type": "string"
+          },
+          "runtime_mode": {
+            "$ref": "#/$defs/WireMobRuntimeMode"
+          },
+          "state": {
+            "$ref": "#/$defs/WireMemberState"
+          },
+          "status": {
+            "$ref": "#/$defs/WireMobMemberStatus"
+          },
+          "wired_to": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "agent_identity",
+          "member_ref",
+          "role",
+          "runtime_mode",
+          "state",
+          "status",
+          "is_final"
+        ],
+        "type": "object"
+      },
+      "WireMemberRef": {
+        "description": "Server-resolved opaque handle for a mob member.\n\nEncodes `{mob_id, agent_identity}` as a single base64url-encoded token\nthat callers treat as opaque. The server resolves the current\n`AgentRuntimeId` and fence token against the live mob roster on every\ndispatch — clients never reason about `generation` or `fence_token`\ndirectly.\n\nUse [`WireMemberRef::encode`] to produce a token and\n[`WireMemberRef::decode`] inside an RPC handler to recover the\n`(mob_id, agent_identity)` pair before resolving against the runtime.",
+        "type": "string"
+      },
+      "WireMemberState": {
+        "description": "Roster member lifecycle state for `MobMemberFilterWire`.",
+        "enum": [
+          "active",
+          "retiring"
+        ],
+        "type": "string"
+      },
+      "WireMobMemberStatus": {
+        "description": "Execution status mirroring `meerkat_mob::runtime::MobMemberStatus`.",
+        "enum": [
+          "active",
+          "retiring",
+          "broken",
+          "completed",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "WireMobRuntimeMode": {
+        "enum": [
+          "autonomous_host",
+          "turn_driven"
+        ],
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/members`.",
+    "properties": {
+      "members": {
+        "items": {
+          "$ref": "#/$defs/MobMemberListEntryWire"
+        },
+        "type": "array"
+      },
+      "mob_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "mob_id",
+      "members"
+    ],
+    "title": "MobMembersResult",
+    "type": "object"
+  },
   "MobPeerTarget": {
     "$defs": {
       "WireTrustedPeerSpec": {
@@ -3688,6 +4134,121 @@
       }
     ],
     "title": "MobPeerTarget"
+  },
+  "MobProfileDeleteResult": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/profile/delete`.",
+    "properties": {
+      "deleted_revision": {
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "name": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "name",
+      "deleted_revision"
+    ],
+    "title": "MobProfileDeleteResult",
+    "type": "object"
+  },
+  "MobProfileListResult": {
+    "$defs": {
+      "MobProfileLookupResult": {
+        "description": "Stored realm profile projection returned by `mob/profile/*`.",
+        "properties": {
+          "created_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "not_found": {
+            "default": false,
+            "type": "boolean"
+          },
+          "profile": true,
+          "revision": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/profile/list`.",
+    "properties": {
+      "profiles": {
+        "items": {
+          "$ref": "#/$defs/MobProfileLookupResult"
+        },
+        "type": "array"
+      }
+    },
+    "required": [
+      "profiles"
+    ],
+    "title": "MobProfileListResult",
+    "type": "object"
+  },
+  "MobProfileLookupResult": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Stored realm profile projection returned by `mob/profile/*`.",
+    "properties": {
+      "created_at": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "name": {
+        "type": "string"
+      },
+      "not_found": {
+        "default": false,
+        "type": "boolean"
+      },
+      "profile": true,
+      "revision": {
+        "format": "uint64",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "updated_at": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "name"
+    ],
+    "title": "MobProfileLookupResult",
+    "type": "object"
   },
   "MobReconcileResult": {
     "$defs": {
@@ -3791,6 +4352,252 @@
     "title": "MobReconcileResult",
     "type": "object"
   },
+  "MobRespawnResult": {
+    "$defs": {
+      "MobRespawnReceipt": {
+        "description": "Identity-native respawn receipt returned inside `MobRespawnResult`.",
+        "properties": {
+          "identity": {
+            "type": "string"
+          },
+          "member_ref": {
+            "$ref": "#/$defs/WireMemberRef"
+          }
+        },
+        "required": [
+          "identity",
+          "member_ref"
+        ],
+        "type": "object"
+      },
+      "WireMemberRef": {
+        "description": "Server-resolved opaque handle for a mob member.\n\nEncodes `{mob_id, agent_identity}` as a single base64url-encoded token\nthat callers treat as opaque. The server resolves the current\n`AgentRuntimeId` and fence token against the live mob roster on every\ndispatch — clients never reason about `generation` or `fence_token`\ndirectly.\n\nUse [`WireMemberRef::encode`] to produce a token and\n[`WireMemberRef::decode`] inside an RPC handler to recover the\n`(mob_id, agent_identity)` pair before resolving against the runtime.",
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/respawn`.",
+    "properties": {
+      "failed_peer_ids": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      },
+      "receipt": {
+        "$ref": "#/$defs/MobRespawnReceipt"
+      },
+      "status": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "status",
+      "receipt"
+    ],
+    "title": "MobRespawnResult",
+    "type": "object"
+  },
+  "MobRetireResult": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/retire`.",
+    "properties": {
+      "retired": {
+        "type": "boolean"
+      }
+    },
+    "required": [
+      "retired"
+    ],
+    "title": "MobRetireResult",
+    "type": "object"
+  },
+  "MobRotateSupervisorResult": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/rotate_supervisor`.",
+    "properties": {
+      "mob_id": {
+        "type": "string"
+      },
+      "ok": {
+        "type": "boolean"
+      },
+      "report": true
+    },
+    "required": [
+      "mob_id",
+      "ok",
+      "report"
+    ],
+    "title": "MobRotateSupervisorResult",
+    "type": "object"
+  },
+  "MobSnapshotResult": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/snapshot`.",
+    "properties": {
+      "members": {
+        "items": true,
+        "type": "array"
+      },
+      "mob_id": {
+        "type": "string"
+      },
+      "status": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "mob_id",
+      "status",
+      "members"
+    ],
+    "title": "MobSnapshotResult",
+    "type": "object"
+  },
+  "MobSpawnManyResult": {
+    "$defs": {
+      "MobSpawnManyResultEntry": {
+        "description": "One result entry in a `mob/spawn_many` response.",
+        "properties": {
+          "agent_identity": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "member_ref": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireMemberRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "type": "object"
+      },
+      "WireMemberRef": {
+        "description": "Server-resolved opaque handle for a mob member.\n\nEncodes `{mob_id, agent_identity}` as a single base64url-encoded token\nthat callers treat as opaque. The server resolves the current\n`AgentRuntimeId` and fence token against the live mob roster on every\ndispatch — clients never reason about `generation` or `fence_token`\ndirectly.\n\nUse [`WireMemberRef::encode`] to produce a token and\n[`WireMemberRef::decode`] inside an RPC handler to recover the\n`(mob_id, agent_identity)` pair before resolving against the runtime.",
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/spawn_many`.",
+    "properties": {
+      "results": {
+        "items": {
+          "$ref": "#/$defs/MobSpawnManyResultEntry"
+        },
+        "type": "array"
+      }
+    },
+    "required": [
+      "results"
+    ],
+    "title": "MobSpawnManyResult",
+    "type": "object"
+  },
+  "MobSpawnResult": {
+    "$defs": {
+      "WireMemberRef": {
+        "description": "Server-resolved opaque handle for a mob member.\n\nEncodes `{mob_id, agent_identity}` as a single base64url-encoded token\nthat callers treat as opaque. The server resolves the current\n`AgentRuntimeId` and fence token against the live mob roster on every\ndispatch — clients never reason about `generation` or `fence_token`\ndirectly.\n\nUse [`WireMemberRef::encode`] to produce a token and\n[`WireMemberRef::decode`] inside an RPC handler to recover the\n`(mob_id, agent_identity)` pair before resolving against the runtime.",
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/spawn`.",
+    "properties": {
+      "agent_identity": {
+        "type": "string"
+      },
+      "member_ref": {
+        "$ref": "#/$defs/WireMemberRef"
+      },
+      "mob_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "mob_id",
+      "agent_identity",
+      "member_ref"
+    ],
+    "title": "MobSpawnResult",
+    "type": "object"
+  },
+  "MobStatusResult": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "One active mob row returned by `mob/list`.",
+    "properties": {
+      "mob_id": {
+        "type": "string"
+      },
+      "status": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "mob_id",
+      "status"
+    ],
+    "title": "MobStatusResult",
+    "type": "object"
+  },
+  "MobStreamCloseResult": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/stream_close`.",
+    "properties": {
+      "already_closed": {
+        "type": "boolean"
+      },
+      "closed": {
+        "type": "boolean"
+      },
+      "stream_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "stream_id",
+      "closed",
+      "already_closed"
+    ],
+    "title": "MobStreamCloseResult",
+    "type": "object"
+  },
+  "MobStreamOpenResult": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/stream_open`.",
+    "properties": {
+      "opened": {
+        "type": "boolean"
+      },
+      "stream_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "stream_id",
+      "opened"
+    ],
+    "title": "MobStreamOpenResult",
+    "type": "object"
+  },
   "MobSubmitWorkResult": {
     "$defs": {
       "WireMemberRef": {
@@ -3831,6 +4638,21 @@
       "unwired"
     ],
     "title": "MobUnwireResult",
+    "type": "object"
+  },
+  "MobWaitMembersResult": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/wait_kickoff` and `mob/wait_ready`.",
+    "properties": {
+      "members": {
+        "items": true,
+        "type": "array"
+      }
+    },
+    "required": [
+      "members"
+    ],
+    "title": "MobWaitMembersResult",
     "type": "object"
   },
   "MobWireResult": {

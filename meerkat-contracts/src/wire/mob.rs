@@ -1,5 +1,6 @@
 //! Mob RPC wire contracts.
 
+use super::connection::WireConnectionRef;
 use super::session::WireContentInput;
 use super::supervisor_bridge::BridgeBootstrapToken;
 use meerkat_core::OutputSchema;
@@ -453,6 +454,212 @@ pub struct MobCreateParams {
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct MobCreateResult {
     pub mob_id: String,
+}
+
+/// Shared request payload for mob methods that address a mob by id.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MobIdParams {
+    pub mob_id: String,
+}
+
+/// Shared request payload for mob methods that address one member by identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MobMemberParams {
+    pub mob_id: String,
+    pub agent_identity: String,
+}
+
+/// One active mob row returned by `mob/list`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobStatusResult {
+    pub mob_id: String,
+    pub status: String,
+}
+
+/// Response payload for `mob/list`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobListResult {
+    pub mobs: Vec<MobStatusResult>,
+}
+
+/// Request payload for `mob/spawn`.
+///
+/// The public catalog uses wire-owned projections for stable fields and JSON
+/// extension slots for advanced Rust-native spawn options whose schemas are
+/// not yet owned by `meerkat-contracts`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MobSpawnParams {
+    pub mob_id: String,
+    pub profile: String,
+    pub agent_identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_message: Option<WireContentInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_mode: Option<WireMobRuntimeMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<WireMobBackendKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additional_instructions: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding: Option<WireRuntimeBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shell_env: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_wire_parent: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_mode: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_access_policy: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub budget_split_policy: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherited_tool_filter: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub override_profile: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_ref: Option<WireConnectionRef>,
+}
+
+/// Response payload for `mob/spawn`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobSpawnResult {
+    pub mob_id: String,
+    pub agent_identity: String,
+    pub member_ref: WireMemberRef,
+}
+
+/// Per-member request payload inside `mob/spawn_many`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MobSpawnSpecParams {
+    pub profile: String,
+    pub agent_identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_message: Option<WireContentInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_mode: Option<WireMobRuntimeMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<WireMobBackendKind>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub labels: Option<BTreeMap<String, String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub additional_instructions: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub connection_ref: Option<WireConnectionRef>,
+}
+
+/// Request payload for `mob/spawn_many`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MobSpawnManyParams {
+    pub mob_id: String,
+    pub specs: Vec<MobSpawnSpecParams>,
+}
+
+/// One result entry in a `mob/spawn_many` response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobSpawnManyResultEntry {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_ref: Option<WireMemberRef>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// Response payload for `mob/spawn_many`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobSpawnManyResult {
+    pub results: Vec<MobSpawnManyResultEntry>,
+}
+
+/// Response payload for `mob/retire`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobRetireResult {
+    pub retired: bool,
+}
+
+/// Request payload for `mob/respawn`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MobRespawnParams {
+    pub mob_id: String,
+    pub agent_identity: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub initial_message: Option<WireContentInput>,
+}
+
+/// Identity-native respawn receipt returned inside `MobRespawnResult`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobRespawnReceipt {
+    pub identity: String,
+    pub member_ref: WireMemberRef,
+}
+
+/// Response payload for `mob/respawn`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobRespawnResult {
+    pub status: String,
+    pub receipt: MobRespawnReceipt,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed_peer_ids: Vec<String>,
+}
+
+/// Response payload for `mob/members`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobMembersResult {
+    pub mob_id: String,
+    pub members: Vec<MobMemberListEntryWire>,
+}
+
+/// Request payload for `mob/events`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MobEventsParams {
+    pub mob_id: String,
+    #[serde(default)]
+    pub after_cursor: u64,
+    #[serde(default = "default_mob_events_limit")]
+    pub limit: usize,
+    #[serde(default)]
+    pub strict: bool,
+}
+
+const fn default_mob_events_limit() -> usize {
+    100
+}
+
+/// Response payload for `mob/events`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobEventsResult {
+    pub events: Vec<Value>,
 }
 
 /// Minimal trusted peer spec for public mob wiring surfaces.
@@ -1025,6 +1232,352 @@ pub struct MobLifecycleParams {
     pub action: WireMobLifecycleAction,
 }
 
+/// Response payload for `mob/lifecycle`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobLifecycleResult {
+    pub mob_id: String,
+    pub action: WireMobLifecycleAction,
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub destroy_report: Option<Value>,
+}
+
+/// Request payload for `mob/append_system_context`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MobAppendSystemContextParams {
+    pub mob_id: String,
+    pub agent_identity: String,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
+}
+
+/// Response payload for `mob/append_system_context`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobAppendSystemContextResult {
+    pub mob_id: String,
+    pub agent_identity: String,
+    pub status: String,
+}
+
+/// Response payload for `mob/flows`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobFlowsResult {
+    pub mob_id: String,
+    pub flows: Vec<String>,
+}
+
+/// Request payload for `mob/flow_run`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MobFlowRunParams {
+    pub mob_id: String,
+    pub flow_id: String,
+    #[serde(default)]
+    pub params: Value,
+}
+
+/// Response payload for `mob/flow_run`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobFlowRunResult {
+    pub run_id: String,
+}
+
+/// Request payload for `mob/flow_status`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MobFlowStatusParams {
+    pub mob_id: String,
+    pub run_id: String,
+}
+
+/// Response payload for `mob/flow_status`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobFlowStatusResult {
+    pub run: Value,
+}
+
+/// Request payload for `mob/flow_cancel`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MobFlowCancelParams {
+    pub mob_id: String,
+    pub run_id: String,
+}
+
+/// Response payload for `mob/flow_cancel`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobFlowCancelResult {
+    pub canceled: bool,
+}
+
+/// Request payload for `mob/spawn_helper`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MobSpawnHelperParams {
+    pub mob_id: String,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_mode: Option<WireMobRuntimeMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<WireMobBackendKind>,
+}
+
+/// Request payload for `mob/fork_helper`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MobForkHelperParams {
+    pub mob_id: String,
+    pub source_member_id: String,
+    pub prompt: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_identity: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_context: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_mode: Option<WireMobRuntimeMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backend: Option<WireMobBackendKind>,
+}
+
+/// Response payload for `mob/spawn_helper` and `mob/fork_helper`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobHelperResult {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output: Option<String>,
+    pub tokens_used: u64,
+    pub agent_identity: String,
+    pub member_ref: WireMemberRef,
+}
+
+/// Response payload for `mob/force_cancel`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobForceCancelResult {
+    pub cancelled: bool,
+}
+
+/// Request payload for `mob/turn_start`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobTurnStartParams {
+    pub mob_id: String,
+    pub agent_identity: String,
+    pub prompt: Value,
+    #[serde(flatten)]
+    pub turn_overrides: BTreeMap<String, Value>,
+}
+
+/// Response payload for `mob/member_status`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobMemberStatusResult {
+    pub status: WireMobMemberStatus,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_preview: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub tokens_used: u64,
+    pub is_final: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realtime_attachment_status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub current_session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peer_connectivity: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kickoff: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_member: Option<Value>,
+}
+
+/// Response payload for `mob/snapshot`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobSnapshotResult {
+    pub mob_id: String,
+    pub status: String,
+    pub members: Vec<Value>,
+}
+
+/// Response payload for `mob/destroy`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobDestroyResult {
+    pub mob_id: String,
+    pub ok: bool,
+    pub destroy_report: Value,
+}
+
+/// Response payload for `mob/rotate_supervisor`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobRotateSupervisorResult {
+    pub mob_id: String,
+    pub ok: bool,
+    pub report: Value,
+}
+
+/// Shared request payload for mob readiness waits.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MobWaitParams {
+    pub mob_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub member_ids: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_ms: Option<u64>,
+}
+
+/// Response payload for `mob/wait_kickoff` and `mob/wait_ready`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobWaitMembersResult {
+    pub members: Vec<Value>,
+}
+
+/// Response payload for `mob/cancel_work`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobCancelWorkResult {
+    pub mob_id: String,
+    pub ok: bool,
+}
+
+/// Response payload for `mob/cancel_all_work`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobCancelAllWorkResult {
+    pub mob_id: String,
+    pub ok: bool,
+}
+
+/// Request payload for `mob/profile/create`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MobProfileCreateParams {
+    pub name: String,
+    pub profile: MobProfileInput,
+}
+
+/// Request payload for `mob/profile/get`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MobProfileNameParams {
+    pub name: String,
+}
+
+/// Request payload for `mob/profile/update`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MobProfileUpdateParams {
+    pub name: String,
+    pub profile: MobProfileInput,
+    pub expected_revision: u64,
+}
+
+/// Request payload for `mob/profile/delete`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MobProfileDeleteParams {
+    pub name: String,
+    pub expected_revision: u64,
+}
+
+/// Stored realm profile projection returned by `mob/profile/*`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobProfileLookupResult {
+    #[serde(default)]
+    pub not_found: bool,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub created_at: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<String>,
+}
+
+/// Response payload for `mob/profile/list`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobProfileListResult {
+    pub profiles: Vec<MobProfileLookupResult>,
+}
+
+/// Response payload for `mob/profile/delete`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobProfileDeleteResult {
+    pub name: String,
+    pub deleted_revision: u64,
+}
+
+/// Request payload for `mob/stream_open`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MobStreamOpenParams {
+    pub mob_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_identity: Option<String>,
+}
+
+/// Response payload for `mob/stream_open`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobStreamOpenResult {
+    pub stream_id: String,
+    pub opened: bool,
+}
+
+/// Request payload for `mob/stream_close`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct MobStreamCloseParams {
+    pub stream_id: String,
+}
+
+/// Response payload for `mob/stream_close`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct MobStreamCloseResult {
+    pub stream_id: String,
+    pub closed: bool,
+    pub already_closed: bool,
+}
+
 /// Origin for `MobSubmitWorkParams`. Replaces the prior free-form
 /// `origin: Option<String>` shape.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -1228,6 +1781,30 @@ mod tests {
         assert!(
             msg.contains("unknown field `local`") || msg.contains("missing field `member`"),
             "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn mob_turn_start_params_capture_turn_override_fields() {
+        let params = serde_json::from_value::<MobTurnStartParams>(serde_json::json!({
+            "mob_id": "mob-1",
+            "agent_identity": "worker",
+            "prompt": "continue",
+            "output_schema": { "type": "object" },
+            "structured_output_retries": 2
+        }))
+        .expect("turn_start should accept flattened turn override fields");
+
+        assert_eq!(params.mob_id, "mob-1");
+        assert_eq!(params.agent_identity, "worker");
+        assert_eq!(params.prompt, serde_json::json!("continue"));
+        assert_eq!(
+            params.turn_overrides.get("output_schema"),
+            Some(&serde_json::json!({ "type": "object" }))
+        );
+        assert_eq!(
+            params.turn_overrides.get("structured_output_retries"),
+            Some(&serde_json::json!(2))
         );
     }
 

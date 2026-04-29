@@ -2496,6 +2496,61 @@
         ],
         "type": "string"
       },
+      "MobAppendSystemContextParams": {
+        "additionalProperties": false,
+        "description": "Request payload for `mob/append_system_context`.",
+        "properties": {
+          "agent_identity": {
+            "type": "string"
+          },
+          "idempotency_key": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mob_id": {
+            "type": "string"
+          },
+          "source": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mob_id",
+          "agent_identity",
+          "text"
+        ],
+        "title": "MobAppendSystemContextParams",
+        "type": "object"
+      },
+      "MobAppendSystemContextResult": {
+        "description": "Response payload for `mob/append_system_context`.",
+        "properties": {
+          "agent_identity": {
+            "type": "string"
+          },
+          "mob_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mob_id",
+          "agent_identity",
+          "status"
+        ],
+        "title": "MobAppendSystemContextResult",
+        "type": "object"
+      },
       "MobBackendConfigInput": {
         "additionalProperties": false,
         "properties": {
@@ -2530,6 +2585,23 @@
         "title": "MobCancelAllWorkParams",
         "type": "object"
       },
+      "MobCancelAllWorkResult": {
+        "description": "Response payload for `mob/cancel_all_work`.",
+        "properties": {
+          "mob_id": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "mob_id",
+          "ok"
+        ],
+        "title": "MobCancelAllWorkResult",
+        "type": "object"
+      },
       "MobCancelWorkParams": {
         "additionalProperties": false,
         "description": "Request payload for `mob/cancel_work`.",
@@ -2546,6 +2618,23 @@
           "work_ref"
         ],
         "title": "MobCancelWorkParams",
+        "type": "object"
+      },
+      "MobCancelWorkResult": {
+        "description": "Response payload for `mob/cancel_work`.",
+        "properties": {
+          "mob_id": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "mob_id",
+          "ok"
+        ],
+        "title": "MobCancelWorkResult",
         "type": "object"
       },
       "MobCollectionPolicyInput": {
@@ -2873,6 +2962,25 @@
         ],
         "type": "string"
       },
+      "MobDestroyResult": {
+        "description": "Response payload for `mob/destroy`.",
+        "properties": {
+          "destroy_report": true,
+          "mob_id": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "mob_id",
+          "ok",
+          "destroy_report"
+        ],
+        "title": "MobDestroyResult",
+        "type": "object"
+      },
       "MobDispatchModeInput": {
         "enum": [
           "fan_out",
@@ -2971,6 +3079,50 @@
         },
         "type": "object"
       },
+      "MobEventsParams": {
+        "additionalProperties": false,
+        "description": "Request payload for `mob/events`.",
+        "properties": {
+          "after_cursor": {
+            "default": 0,
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "limit": {
+            "default": 100,
+            "format": "uint",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "mob_id": {
+            "type": "string"
+          },
+          "strict": {
+            "default": false,
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "mob_id"
+        ],
+        "title": "MobEventsParams",
+        "type": "object"
+      },
+      "MobEventsResult": {
+        "description": "Response payload for `mob/events`.",
+        "properties": {
+          "events": {
+            "items": true,
+            "type": "array"
+          }
+        },
+        "required": [
+          "events"
+        ],
+        "title": "MobEventsResult",
+        "type": "object"
+      },
       "MobExternalBackendConfigInput": {
         "additionalProperties": false,
         "properties": {
@@ -2981,6 +3133,37 @@
         "required": [
           "address_base"
         ],
+        "type": "object"
+      },
+      "MobFlowCancelParams": {
+        "additionalProperties": false,
+        "description": "Request payload for `mob/flow_cancel`.",
+        "properties": {
+          "mob_id": {
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mob_id",
+          "run_id"
+        ],
+        "title": "MobFlowCancelParams",
+        "type": "object"
+      },
+      "MobFlowCancelResult": {
+        "description": "Response payload for `mob/flow_cancel`.",
+        "properties": {
+          "canceled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "canceled"
+        ],
+        "title": "MobFlowCancelResult",
         "type": "object"
       },
       "MobFlowNodeInput": {
@@ -3061,6 +3244,40 @@
           }
         ]
       },
+      "MobFlowRunParams": {
+        "additionalProperties": false,
+        "description": "Request payload for `mob/flow_run`.",
+        "properties": {
+          "flow_id": {
+            "type": "string"
+          },
+          "mob_id": {
+            "type": "string"
+          },
+          "params": {
+            "default": null
+          }
+        },
+        "required": [
+          "mob_id",
+          "flow_id"
+        ],
+        "title": "MobFlowRunParams",
+        "type": "object"
+      },
+      "MobFlowRunResult": {
+        "description": "Response payload for `mob/flow_run`.",
+        "properties": {
+          "run_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id"
+        ],
+        "title": "MobFlowRunResult",
+        "type": "object"
+      },
       "MobFlowSpecInput": {
         "additionalProperties": false,
         "properties": {
@@ -3087,6 +3304,35 @@
             "type": "object"
           }
         },
+        "type": "object"
+      },
+      "MobFlowStatusParams": {
+        "additionalProperties": false,
+        "description": "Request payload for `mob/flow_status`.",
+        "properties": {
+          "mob_id": {
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mob_id",
+          "run_id"
+        ],
+        "title": "MobFlowStatusParams",
+        "type": "object"
+      },
+      "MobFlowStatusResult": {
+        "description": "Response payload for `mob/flow_status`.",
+        "properties": {
+          "run": true
+        },
+        "required": [
+          "run"
+        ],
+        "title": "MobFlowStatusResult",
         "type": "object"
       },
       "MobFlowStepInput": {
@@ -3177,6 +3423,94 @@
         ],
         "type": "object"
       },
+      "MobFlowsResult": {
+        "description": "Response payload for `mob/flows`.",
+        "properties": {
+          "flows": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "mob_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mob_id",
+          "flows"
+        ],
+        "title": "MobFlowsResult",
+        "type": "object"
+      },
+      "MobForceCancelResult": {
+        "description": "Response payload for `mob/force_cancel`.",
+        "properties": {
+          "cancelled": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "cancelled"
+        ],
+        "title": "MobForceCancelResult",
+        "type": "object"
+      },
+      "MobForkHelperParams": {
+        "additionalProperties": false,
+        "description": "Request payload for `mob/fork_helper`.",
+        "properties": {
+          "agent_identity": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "backend": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WireMobBackendKind"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "fork_context": true,
+          "mob_id": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "role_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "runtime_mode": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WireMobRuntimeMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "source_member_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mob_id",
+          "source_member_id",
+          "prompt"
+        ],
+        "title": "MobForkHelperParams",
+        "type": "object"
+      },
       "MobFrameSpecInput": {
         "additionalProperties": false,
         "properties": {
@@ -3190,6 +3524,49 @@
         "required": [
           "nodes"
         ],
+        "type": "object"
+      },
+      "MobHelperResult": {
+        "description": "Response payload for `mob/spawn_helper` and `mob/fork_helper`.",
+        "properties": {
+          "agent_identity": {
+            "type": "string"
+          },
+          "member_ref": {
+            "$ref": "#/components/schemas/WireMemberRef"
+          },
+          "output": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "tokens_used": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "tokens_used",
+          "agent_identity",
+          "member_ref"
+        ],
+        "title": "MobHelperResult",
+        "type": "object"
+      },
+      "MobIdParams": {
+        "additionalProperties": false,
+        "description": "Shared request payload for mob methods that address a mob by id.",
+        "properties": {
+          "mob_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mob_id"
+        ],
+        "title": "MobIdParams",
         "type": "object"
       },
       "MobIngressInteractionParams": {
@@ -3289,6 +3666,28 @@
         "title": "MobLifecycleParams",
         "type": "object"
       },
+      "MobLifecycleResult": {
+        "description": "Response payload for `mob/lifecycle`.",
+        "properties": {
+          "action": {
+            "$ref": "#/components/schemas/WireMobLifecycleAction"
+          },
+          "destroy_report": true,
+          "mob_id": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "mob_id",
+          "action",
+          "ok"
+        ],
+        "title": "MobLifecycleResult",
+        "type": "object"
+      },
       "MobLimitsSpecInput": {
         "additionalProperties": false,
         "properties": {
@@ -3379,6 +3778,22 @@
           }
         },
         "title": "MobListMembersMatchingResult",
+        "type": "object"
+      },
+      "MobListResult": {
+        "description": "Response payload for `mob/list`.",
+        "properties": {
+          "mobs": {
+            "items": {
+              "$ref": "#/components/schemas/MobStatusResult"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "mobs"
+        ],
+        "title": "MobListResult",
         "type": "object"
       },
       "MobMcpServerConfigInput": {
@@ -3489,6 +3904,24 @@
           "status",
           "is_final"
         ],
+        "type": "object"
+      },
+      "MobMemberParams": {
+        "additionalProperties": false,
+        "description": "Shared request payload for mob methods that address one member by identity.",
+        "properties": {
+          "agent_identity": {
+            "type": "string"
+          },
+          "mob_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mob_id",
+          "agent_identity"
+        ],
+        "title": "MobMemberParams",
         "type": "object"
       },
       "MobMemberSendParams": {
@@ -3636,6 +4069,76 @@
         ],
         "type": "object"
       },
+      "MobMemberStatusResult": {
+        "description": "Response payload for `mob/member_status`.",
+        "properties": {
+          "current_session_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "external_member": true,
+          "is_final": {
+            "type": "boolean"
+          },
+          "kickoff": true,
+          "output_preview": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "peer_connectivity": true,
+          "realtime_attachment_status": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "status": {
+            "$ref": "#/components/schemas/WireMobMemberStatus"
+          },
+          "tokens_used": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status",
+          "tokens_used",
+          "is_final"
+        ],
+        "title": "MobMemberStatusResult",
+        "type": "object"
+      },
+      "MobMembersResult": {
+        "description": "Response payload for `mob/members`.",
+        "properties": {
+          "members": {
+            "items": {
+              "$ref": "#/components/schemas/MobMemberListEntryWire"
+            },
+            "type": "array"
+          },
+          "mob_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mob_id",
+          "members"
+        ],
+        "title": "MobMembersResult",
+        "type": "object"
+      },
       "MobOrchestratorInput": {
         "additionalProperties": false,
         "properties": {
@@ -3706,6 +4209,63 @@
           }
         ],
         "description": "Profile binding input: either an inline profile or a realm profile reference.\n\nNot `Eq`: `Inline(MobProfileInput)` transitively carries float provider\nparams (`temperature`, `top_p`) so `Eq` cannot be derived without\nlosing fidelity."
+      },
+      "MobProfileCreateParams": {
+        "additionalProperties": false,
+        "description": "Request payload for `mob/profile/create`.",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "profile": {
+            "$ref": "#/components/schemas/MobProfileInput"
+          }
+        },
+        "required": [
+          "name",
+          "profile"
+        ],
+        "title": "MobProfileCreateParams",
+        "type": "object"
+      },
+      "MobProfileDeleteParams": {
+        "additionalProperties": false,
+        "description": "Request payload for `mob/profile/delete`.",
+        "properties": {
+          "expected_revision": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "expected_revision"
+        ],
+        "title": "MobProfileDeleteParams",
+        "type": "object"
+      },
+      "MobProfileDeleteResult": {
+        "description": "Response payload for `mob/profile/delete`.",
+        "properties": {
+          "deleted_revision": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name",
+          "deleted_revision"
+        ],
+        "title": "MobProfileDeleteResult",
+        "type": "object"
       },
       "MobProfileInput": {
         "additionalProperties": false,
@@ -3784,6 +4344,97 @@
         "required": [
           "model"
         ],
+        "type": "object"
+      },
+      "MobProfileListResult": {
+        "description": "Response payload for `mob/profile/list`.",
+        "properties": {
+          "profiles": {
+            "items": {
+              "$ref": "#/components/schemas/MobProfileLookupResult"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "profiles"
+        ],
+        "title": "MobProfileListResult",
+        "type": "object"
+      },
+      "MobProfileLookupResult": {
+        "description": "Stored realm profile projection returned by `mob/profile/*`.",
+        "properties": {
+          "created_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "name": {
+            "type": "string"
+          },
+          "not_found": {
+            "default": false,
+            "type": "boolean"
+          },
+          "profile": true,
+          "revision": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "updated_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "type": "object"
+      },
+      "MobProfileNameParams": {
+        "additionalProperties": false,
+        "description": "Request payload for `mob/profile/get`.",
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "name"
+        ],
+        "title": "MobProfileNameParams",
+        "type": "object"
+      },
+      "MobProfileUpdateParams": {
+        "additionalProperties": false,
+        "description": "Request payload for `mob/profile/update`.",
+        "properties": {
+          "expected_revision": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "name": {
+            "type": "string"
+          },
+          "profile": {
+            "$ref": "#/components/schemas/MobProfileInput"
+          }
+        },
+        "required": [
+          "name",
+          "profile",
+          "expected_revision"
+        ],
+        "title": "MobProfileUpdateParams",
         "type": "object"
       },
       "MobReconcileFailureWire": {
@@ -3895,6 +4546,86 @@
         "title": "MobReconcileResult",
         "type": "object"
       },
+      "MobRespawnParams": {
+        "additionalProperties": false,
+        "description": "Request payload for `mob/respawn`.",
+        "properties": {
+          "agent_identity": {
+            "type": "string"
+          },
+          "initial_message": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WireContentInput"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "mob_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mob_id",
+          "agent_identity"
+        ],
+        "title": "MobRespawnParams",
+        "type": "object"
+      },
+      "MobRespawnReceipt": {
+        "description": "Identity-native respawn receipt returned inside `MobRespawnResult`.",
+        "properties": {
+          "identity": {
+            "type": "string"
+          },
+          "member_ref": {
+            "$ref": "#/components/schemas/WireMemberRef"
+          }
+        },
+        "required": [
+          "identity",
+          "member_ref"
+        ],
+        "type": "object"
+      },
+      "MobRespawnResult": {
+        "description": "Response payload for `mob/respawn`.",
+        "properties": {
+          "failed_peer_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "receipt": {
+            "$ref": "#/components/schemas/MobRespawnReceipt"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "receipt"
+        ],
+        "title": "MobRespawnResult",
+        "type": "object"
+      },
+      "MobRetireResult": {
+        "description": "Response payload for `mob/retire`.",
+        "properties": {
+          "retired": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "retired"
+        ],
+        "title": "MobRetireResult",
+        "type": "object"
+      },
       "MobRoleWiringRuleInput": {
         "additionalProperties": false,
         "properties": {
@@ -3909,6 +4640,25 @@
           "a",
           "b"
         ],
+        "type": "object"
+      },
+      "MobRotateSupervisorResult": {
+        "description": "Response payload for `mob/rotate_supervisor`.",
+        "properties": {
+          "mob_id": {
+            "type": "string"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "report": true
+        },
+        "required": [
+          "mob_id",
+          "ok",
+          "report"
+        ],
+        "title": "MobRotateSupervisorResult",
         "type": "object"
       },
       "MobSkillSourceInput": {
@@ -3946,6 +4696,260 @@
             "type": "object"
           }
         ]
+      },
+      "MobSnapshotResult": {
+        "description": "Response payload for `mob/snapshot`.",
+        "properties": {
+          "members": {
+            "items": true,
+            "type": "array"
+          },
+          "mob_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mob_id",
+          "status",
+          "members"
+        ],
+        "title": "MobSnapshotResult",
+        "type": "object"
+      },
+      "MobSpawnHelperParams": {
+        "additionalProperties": false,
+        "description": "Request payload for `mob/spawn_helper`.",
+        "properties": {
+          "agent_identity": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "backend": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WireMobBackendKind"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "mob_id": {
+            "type": "string"
+          },
+          "prompt": {
+            "type": "string"
+          },
+          "role_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "runtime_mode": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WireMobRuntimeMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "mob_id",
+          "prompt"
+        ],
+        "title": "MobSpawnHelperParams",
+        "type": "object"
+      },
+      "MobSpawnManyParams": {
+        "additionalProperties": false,
+        "description": "Request payload for `mob/spawn_many`.",
+        "properties": {
+          "mob_id": {
+            "type": "string"
+          },
+          "specs": {
+            "items": {
+              "$ref": "#/components/schemas/MobSpawnSpecParams"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "mob_id",
+          "specs"
+        ],
+        "title": "MobSpawnManyParams",
+        "type": "object"
+      },
+      "MobSpawnManyResult": {
+        "description": "Response payload for `mob/spawn_many`.",
+        "properties": {
+          "results": {
+            "items": {
+              "$ref": "#/components/schemas/MobSpawnManyResultEntry"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "results"
+        ],
+        "title": "MobSpawnManyResult",
+        "type": "object"
+      },
+      "MobSpawnManyResultEntry": {
+        "description": "One result entry in a `mob/spawn_many` response.",
+        "properties": {
+          "agent_identity": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "member_ref": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WireMemberRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "ok": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok"
+        ],
+        "type": "object"
+      },
+      "MobSpawnParams": {
+        "additionalProperties": false,
+        "description": "Request payload for `mob/spawn`.\n\nThe public catalog uses wire-owned projections for stable fields and JSON\nextension slots for advanced Rust-native spawn options whose schemas are\nnot yet owned by `meerkat-contracts`.",
+        "properties": {
+          "additional_instructions": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "agent_identity": {
+            "type": "string"
+          },
+          "auto_wire_parent": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "backend": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WireMobBackendKind"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "binding": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WireRuntimeBinding"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "budget_split_policy": true,
+          "connection_ref": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WireConnectionRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "context": true,
+          "inherited_tool_filter": true,
+          "initial_message": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WireContentInput"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "launch_mode": true,
+          "mob_id": {
+            "type": "string"
+          },
+          "override_profile": true,
+          "profile": {
+            "type": "string"
+          },
+          "runtime_mode": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WireMobRuntimeMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "shell_env": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "tool_access_policy": true
+        },
+        "required": [
+          "mob_id",
+          "profile",
+          "agent_identity"
+        ],
+        "title": "MobSpawnParams",
+        "type": "object"
       },
       "MobSpawnPolicyInput": {
         "oneOf": [
@@ -3999,12 +5003,197 @@
         ],
         "type": "object"
       },
+      "MobSpawnResult": {
+        "description": "Response payload for `mob/spawn`.",
+        "properties": {
+          "agent_identity": {
+            "type": "string"
+          },
+          "member_ref": {
+            "$ref": "#/components/schemas/WireMemberRef"
+          },
+          "mob_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mob_id",
+          "agent_identity",
+          "member_ref"
+        ],
+        "title": "MobSpawnResult",
+        "type": "object"
+      },
+      "MobSpawnSpecParams": {
+        "additionalProperties": false,
+        "description": "Per-member request payload inside `mob/spawn_many`.",
+        "properties": {
+          "additional_instructions": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "agent_identity": {
+            "type": "string"
+          },
+          "backend": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WireMobBackendKind"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "connection_ref": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WireConnectionRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "context": true,
+          "initial_message": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WireContentInput"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "profile": {
+            "type": "string"
+          },
+          "runtime_mode": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/WireMobRuntimeMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "profile",
+          "agent_identity"
+        ],
+        "type": "object"
+      },
+      "MobStatusResult": {
+        "description": "One active mob row returned by `mob/list`.",
+        "properties": {
+          "mob_id": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mob_id",
+          "status"
+        ],
+        "type": "object"
+      },
       "MobStepOutputFormatInput": {
         "enum": [
           "json",
           "text"
         ],
         "type": "string"
+      },
+      "MobStreamCloseParams": {
+        "additionalProperties": false,
+        "description": "Request payload for `mob/stream_close`.",
+        "properties": {
+          "stream_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "stream_id"
+        ],
+        "title": "MobStreamCloseParams",
+        "type": "object"
+      },
+      "MobStreamCloseResult": {
+        "description": "Response payload for `mob/stream_close`.",
+        "properties": {
+          "already_closed": {
+            "type": "boolean"
+          },
+          "closed": {
+            "type": "boolean"
+          },
+          "stream_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "stream_id",
+          "closed",
+          "already_closed"
+        ],
+        "title": "MobStreamCloseResult",
+        "type": "object"
+      },
+      "MobStreamOpenParams": {
+        "additionalProperties": false,
+        "description": "Request payload for `mob/stream_open`.",
+        "properties": {
+          "agent_identity": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "mob_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mob_id"
+        ],
+        "title": "MobStreamOpenParams",
+        "type": "object"
+      },
+      "MobStreamOpenResult": {
+        "description": "Response payload for `mob/stream_open`.",
+        "properties": {
+          "opened": {
+            "type": "boolean"
+          },
+          "stream_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "stream_id",
+          "opened"
+        ],
+        "title": "MobStreamOpenResult",
+        "type": "object"
       },
       "MobSubmitWorkParams": {
         "additionalProperties": false,
@@ -4269,6 +5458,26 @@
         ],
         "type": "object"
       },
+      "MobTurnStartParams": {
+        "additionalProperties": true,
+        "description": "Request payload for `mob/turn_start`.",
+        "properties": {
+          "agent_identity": {
+            "type": "string"
+          },
+          "mob_id": {
+            "type": "string"
+          },
+          "prompt": true
+        },
+        "required": [
+          "mob_id",
+          "agent_identity",
+          "prompt"
+        ],
+        "title": "MobTurnStartParams",
+        "type": "object"
+      },
       "MobUnwireParams": {
         "additionalProperties": false,
         "description": "Request payload for `mob/unwire`.",
@@ -4302,6 +5511,51 @@
           "unwired"
         ],
         "title": "MobUnwireResult",
+        "type": "object"
+      },
+      "MobWaitMembersResult": {
+        "description": "Response payload for `mob/wait_kickoff` and `mob/wait_ready`.",
+        "properties": {
+          "members": {
+            "items": true,
+            "type": "array"
+          }
+        },
+        "required": [
+          "members"
+        ],
+        "title": "MobWaitMembersResult",
+        "type": "object"
+      },
+      "MobWaitParams": {
+        "additionalProperties": false,
+        "description": "Shared request payload for mob readiness waits.",
+        "properties": {
+          "member_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "mob_id": {
+            "type": "string"
+          },
+          "timeout_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "mob_id"
+        ],
+        "title": "MobWaitParams",
         "type": "object"
       },
       "MobWireParams": {
