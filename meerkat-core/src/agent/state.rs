@@ -221,11 +221,8 @@ where
     Err(ToolError::not_found(name))
 }
 
-fn tool_error_result(tool_use_id: String, error: ToolError) -> ToolResult {
-    let payload = error.to_error_payload();
-    let serialized = serde_json::to_string(&payload)
-        .unwrap_or_else(|_| "{\"error\":\"tool_error\",\"message\":\"tool error\"}".to_string());
-    ToolResult::new(tool_use_id, serialized, true)
+fn parse_runtime_operation_id(value: &str) -> Option<crate::ops::OperationId> {
+    Uuid::parse_str(value).ok().map(crate::ops::OperationId)
 }
 
 impl<C, T, S> Agent<C, T, S>
@@ -972,6 +969,25 @@ where
         Ok(())
     }
 
+    async fn terminalize_fatal_error(
+        &mut self,
+        run_id: &RunId,
+        turn_count: u32,
+        event_tx: &Option<mpsc::Sender<AgentEvent>>,
+        error: &AgentError,
+    ) -> Result<(), AgentError> {
+        if self.turn_phase()?.is_terminal() {
+            return Ok(());
+        }
+        let transition = self.apply_turn_input(TurnExecutionInput::FatalFailure {
+            run_id: run_id.clone(),
+            reason: TurnFailureReason::from_agent_error(error),
+        })?;
+        self.execute_turn_effects(&transition, turn_count, event_tx)
+            .await;
+        Ok(())
+    }
+
     /// The main agent loop
     #[allow(unused_assignments)]
     pub(super) async fn run_loop(
@@ -1498,11 +1514,8 @@ where
                             message,
                             payload,
                         };
-                        let reason = TurnFailureReason::from_agent_error(&error);
-                        self.apply_turn_input(TurnExecutionInput::FatalFailure {
-                            run_id: run_id.clone(),
-                            reason,
-                        })?;
+                        self.terminalize_fatal_error(&run_id, turn_count, &event_tx, &error)
+                            .await?;
                         return Err(error);
                     }
 
@@ -1671,12 +1684,15 @@ where
                         ..
                     }) = post_llm_report.decision
                     {
-                        return Err(AgentError::HookDenied {
+                        let error = AgentError::HookDenied {
                             point: HookPoint::PostLlmResponse,
                             reason_code,
                             message,
                             payload,
-                        });
+                        };
+                        self.terminalize_fatal_error(&run_id, turn_count, &event_tx, &error)
+                            .await?;
+                        return Err(error);
                     }
 
                     for outcome in &post_llm_report.outcomes {
@@ -1732,6 +1748,7 @@ where
                             .collect();
                         let tools_ref = Arc::clone(&self.tools);
                         let mut executable_tool_calls = Vec::new();
+                        let mut terminalized_tool_calls = Vec::new();
                         let mut tool_results = Vec::with_capacity(tool_calls.len());
                         let visible_tool_names = tool_defs
                             .iter()
@@ -1766,8 +1783,10 @@ where
                             }))
                             .await;
 
-                        for (mut tc, pre_tool_report) in
-                            tool_calls.into_iter().zip(pre_tool_reports.into_iter())
+                        for (tool_index, (mut tc, pre_tool_report)) in tool_calls
+                            .into_iter()
+                            .zip(pre_tool_reports.into_iter())
+                            .enumerate()
                         {
                             let pre_tool_report = pre_tool_report?;
 
@@ -1833,23 +1852,7 @@ where
                                 &visible_tool_names,
                                 tc.name.as_str(),
                             ) {
-                                let tool_result = tool_error_result(tc.id.clone(), error);
-                                emit_event!(AgentEvent::ToolExecutionCompleted {
-                                    id: tc.id.clone(),
-                                    name: tc.name.clone(),
-                                    result: tool_result.text_content(),
-                                    is_error: true,
-                                    duration_ms: 0,
-                                    has_images: false,
-                                });
-                                emit_event!(AgentEvent::ToolResultReceived {
-                                    id: tc.id.clone(),
-                                    name: tc.name.clone(),
-                                    is_error: true,
-                                });
-                                tool_results.push(tool_result);
-                                self.budget.record_tool_call();
-                                tool_call_count += 1;
+                                terminalized_tool_calls.push((tool_index, tc, Err(error), 0));
                                 continue;
                             }
 
@@ -1857,30 +1860,33 @@ where
                                 id: tc.id.clone(),
                                 name: tc.name.clone(),
                             });
-                            executable_tool_calls.push(tc);
+                            executable_tool_calls.push((tool_index, tc));
                         }
 
                         // Execute all allowed tool calls in parallel using join_all
                         let dispatch_futures: Vec<_> = executable_tool_calls
                             .into_iter()
-                            .map(|tc| {
+                            .map(|(tool_index, tc)| {
                                 let tools_ref = Arc::clone(&tools_ref);
                                 async move {
                                     let start = crate::time_compat::Instant::now();
                                     let dispatch_result = tools_ref.dispatch(tc.as_view()).await;
                                     let duration_ms = start.elapsed().as_millis() as u64;
-                                    (tc, dispatch_result, duration_ms)
+                                    (tool_index, tc, dispatch_result, duration_ms)
                                 }
                             })
                             .collect();
 
-                        let dispatch_results = futures::future::join_all(dispatch_futures).await;
+                        let mut dispatch_results =
+                            futures::future::join_all(dispatch_futures).await;
+                        dispatch_results.extend(terminalized_tool_calls);
+                        dispatch_results.sort_by_key(|(tool_index, _, _, _)| *tool_index);
 
                         // Process results and emit events
                         let mut all_async_ops = Vec::<crate::ops::AsyncOpRef>::new();
                         let mut accumulated_session_effects =
                             Vec::<crate::ops::SessionEffect>::new();
-                        for (tc, dispatch_result, duration_ms) in dispatch_results {
+                        for (_, tc, dispatch_result, duration_ms) in dispatch_results {
                             let mut tool_session_effects = Vec::new();
                             let mut tool_result = match dispatch_result {
                                 Ok(outcome) => {
@@ -1905,13 +1911,8 @@ where
                                     });
                                 }
                                 Err(e) => {
-                                    let payload = e.to_error_payload();
-                                    let serialized = serde_json::to_string(&payload)
-                                        .unwrap_or_else(|_| {
-                                            "{\"error\":\"tool_error\",\"message\":\"tool error\"}"
-                                                .to_string()
-                                        });
-                                    ToolResult::new(tc.id.clone(), serialized, true)
+                                    crate::ops::terminal_tool_outcome_for_error(tc.id.clone(), e)
+                                        .result
                                 }
                             };
 
@@ -2076,8 +2077,14 @@ where
                         self.apply_turn_input(TurnExecutionInput::ToolCallsResolved {
                             run_id: run_id.clone(),
                         })?;
-                        self.drain_turn_boundary(turn_count, event_tx.as_ref())
-                            .await?;
+                        if let Err(error) = self
+                            .drain_turn_boundary(turn_count, event_tx.as_ref())
+                            .await
+                        {
+                            self.terminalize_fatal_error(&run_id, turn_count, &event_tx, &error)
+                                .await?;
+                            return Err(error);
+                        }
                         let t = self.apply_turn_input(TurnExecutionInput::BoundaryContinue {
                             run_id: run_id.clone(),
                         })?;
@@ -2091,8 +2098,14 @@ where
                         self.apply_turn_input(TurnExecutionInput::LlmReturnedTerminal {
                             run_id: run_id.clone(),
                         })?;
-                        self.drain_turn_boundary(turn_count, event_tx.as_ref())
-                            .await?;
+                        if let Err(error) = self
+                            .drain_turn_boundary(turn_count, event_tx.as_ref())
+                            .await
+                        {
+                            self.terminalize_fatal_error(&run_id, turn_count, &event_tx, &error)
+                                .await?;
+                            return Err(error);
+                        }
                         self.observe_cancel_after_boundary_request(&run_id)?;
                         emit_event!(AgentEvent::TurnCompleted { stop_reason, usage });
 
@@ -2186,8 +2199,14 @@ where
                         self.apply_turn_input(TurnExecutionInput::LlmReturnedTerminal {
                             run_id: run_id.clone(),
                         })?;
-                        self.drain_turn_boundary(turn_count, event_tx.as_ref())
-                            .await?;
+                        if let Err(error) = self
+                            .drain_turn_boundary(turn_count, event_tx.as_ref())
+                            .await
+                        {
+                            self.terminalize_fatal_error(&run_id, turn_count, &event_tx, &error)
+                                .await?;
+                            return Err(error);
+                        }
                         self.observe_cancel_after_boundary_request(&run_id)?;
 
                         // Emit turn completed only after turn-boundary hooks
@@ -2289,8 +2308,14 @@ where
                     self.apply_turn_input(TurnExecutionInput::ToolCallsResolved {
                         run_id: run_id.clone(),
                     })?;
-                    self.drain_turn_boundary(turn_count, event_tx.as_ref())
-                        .await?;
+                    if let Err(error) = self
+                        .drain_turn_boundary(turn_count, event_tx.as_ref())
+                        .await
+                    {
+                        self.terminalize_fatal_error(&run_id, turn_count, &event_tx, &error)
+                            .await?;
+                        return Err(error);
+                    }
                     let t = self.apply_turn_input(TurnExecutionInput::BoundaryContinue {
                         run_id: run_id.clone(),
                     })?;
@@ -4162,6 +4187,80 @@ mod tests {
             "boundary denial should not emit TurnCompleted before failing the run"
         );
         assert!(saw_run_failed, "boundary denial should emit RunFailed");
+
+        let snapshot = agent
+            .execution_snapshot()
+            .expect("test turn-state handle should expose a snapshot");
+        assert_eq!(snapshot.turn_phase, crate::TurnPhase::Failed);
+        assert_eq!(
+            snapshot.terminal_outcome,
+            crate::TurnTerminalOutcome::Failed,
+            "boundary hook denial should terminalize through the turn authority"
+        );
+    }
+
+    #[tokio::test]
+    async fn post_llm_denial_terminalizes_turn_authority() {
+        use crate::hooks::{
+            HookDecision, HookEngine, HookEngineError, HookExecutionReport, HookInvocation,
+            HookPoint, HookReasonCode,
+        };
+
+        struct DenyPostLlmHook;
+
+        #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+        impl HookEngine for DenyPostLlmHook {
+            async fn execute(
+                &self,
+                invocation: HookInvocation,
+                _overrides: Option<&crate::config::HookRunOverrides>,
+            ) -> Result<HookExecutionReport, HookEngineError> {
+                if invocation.point != HookPoint::PostLlmResponse {
+                    return Ok(HookExecutionReport::empty());
+                }
+                Ok(HookExecutionReport {
+                    decision: Some(HookDecision::Deny {
+                        hook_id: crate::hooks::HookId::new("deny-post-llm"),
+                        reason_code: HookReasonCode::PolicyViolation,
+                        message: "deny post llm".to_string(),
+                        payload: None,
+                    }),
+                    ..HookExecutionReport::empty()
+                })
+            }
+        }
+
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .with_hook_engine(Arc::new(DenyPostLlmHook))
+            .build(
+                Arc::new(StaticLlmClient),
+                Arc::new(NoTools),
+                Arc::new(NoopStore),
+            )
+            .await;
+
+        let err = agent
+            .run("prompt".to_string().into())
+            .await
+            .expect_err("PostLlmResponse denial should fail the run");
+        assert!(matches!(
+            err,
+            AgentError::HookDenied {
+                point: HookPoint::PostLlmResponse,
+                ..
+            }
+        ));
+
+        let snapshot = agent
+            .execution_snapshot()
+            .expect("test turn-state handle should expose a snapshot");
+        assert_eq!(snapshot.turn_phase, crate::TurnPhase::Failed);
+        assert_eq!(
+            snapshot.terminal_outcome,
+            crate::TurnTerminalOutcome::Failed,
+            "post-LLM hook denial should terminalize through the turn authority"
+        );
     }
 
     #[tokio::test]
@@ -4397,7 +4496,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn external_tool_dispatch_blocks_hidden_tools() {
+    async fn external_tool_dispatch_terminalizes_hidden_tools() {
         let client = Arc::new(StaticLlmClient);
         let tools = Arc::new(FullToolDispatcher::new(&["visible", "secret"]));
         let mut agent = with_test_turn_state_handle(AgentBuilder::new())
@@ -4422,18 +4521,25 @@ mod tests {
             )
             .expect("apply staged filter at boundary");
 
-        let error = agent
+        let outcome = agent
             .dispatch_external_tool_call(ToolCall::new(
                 "tool-call-hidden".to_string(),
                 "secret".to_string(),
                 serde_json::json!({}),
             ))
             .await
-            .expect_err("hidden external tool dispatch should be rejected");
+            .expect("hidden external tool dispatch should terminalize as a tool result");
 
+        assert_eq!(outcome.result.tool_use_id, "tool-call-hidden");
+        assert!(outcome.result.is_error);
+        let payload: serde_json::Value =
+            serde_json::from_str(&outcome.result.text_content()).expect("error payload JSON");
         assert!(
-            matches!(error, AgentError::ToolError(ref message) if message.contains("secret")),
-            "expected hidden tool rejection, got {error:?}"
+            payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|code| code == "access_denied"),
+            "expected access_denied payload, got {payload:?}"
         );
         assert!(
             tools.dispatched().is_empty(),
@@ -4468,6 +4574,83 @@ mod tests {
                 .staged_requested_deferred_names
                 .contains("deferred_tool"),
             "expected deferred_tool to be staged after tool session effects"
+        );
+    }
+
+    #[tokio::test]
+    async fn llm_hidden_tool_denial_runs_through_post_tool_terminalization() {
+        use crate::hooks::{
+            HookEngine, HookEngineError, HookExecutionReport, HookInvocation, HookPatch, HookPoint,
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct RecordingPostToolHook {
+            calls: Arc<AtomicUsize>,
+        }
+
+        #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+        #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+        impl HookEngine for RecordingPostToolHook {
+            async fn execute(
+                &self,
+                invocation: HookInvocation,
+                _overrides: Option<&crate::config::HookRunOverrides>,
+            ) -> Result<HookExecutionReport, HookEngineError> {
+                if invocation.point != HookPoint::PostToolExecution {
+                    return Ok(HookExecutionReport::empty());
+                }
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                Ok(HookExecutionReport {
+                    outcomes: vec![crate::hooks::HookOutcome {
+                        hook_id: crate::hooks::HookId::new("record-post-tool"),
+                        point: HookPoint::PostToolExecution,
+                        priority: 0,
+                        registration_index: 0,
+                        decision: None,
+                        patches: vec![HookPatch::ToolResult {
+                            content: "{\"error\":\"hook_observed_hidden_denial\"}".to_string(),
+                            is_error: Some(true),
+                        }],
+                        published_patches: Vec::new(),
+                        error: None,
+                        duration_ms: None,
+                    }],
+                    ..HookExecutionReport::empty()
+                })
+            }
+        }
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let client = Arc::new(VisibilityRecordingLlmClient::new());
+        let tools = Arc::new(FullToolDispatcher::new(&["visible", "secret"]));
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .with_hook_engine(Arc::new(RecordingPostToolHook {
+                calls: Arc::clone(&calls),
+            }))
+            .build(client, tools.clone(), Arc::new(NoopStore))
+            .await;
+
+        agent
+            .stage_external_tool_filter(ToolFilter::Deny(
+                ["secret".to_string()].into_iter().collect(),
+            ))
+            .expect("stage hidden-tool filter");
+        agent.config.max_turns = Some(2);
+
+        let result = agent
+            .run("prompt".to_string().into())
+            .await
+            .expect("hidden tool denial should continue as a terminal tool result");
+
+        assert_eq!(result.text, "done");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "hidden LLM tool denial should pass through post-tool terminalization"
+        );
+        assert!(
+            tools.dispatched().is_empty(),
+            "hidden tools must not reach the dispatcher"
         );
     }
 

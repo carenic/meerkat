@@ -1886,6 +1886,22 @@ pub fn openai_live_function_call_success_events(
     ]
 }
 
+/// Build the raw client event used to submit a terminal tool-error result.
+pub fn openai_live_function_call_error_result_event(
+    call_id: impl Into<String>,
+    output: impl Into<String>,
+) -> ClientEvent {
+    ClientEvent::ConversationItemCreate {
+        event_id: None,
+        previous_item_id: None,
+        item: Box::new(Item::FunctionCallOutput {
+            id: None,
+            call_id: call_id.into(),
+            output: output.into(),
+        }),
+    }
+}
+
 /// Build the raw client event used to report a function-call dispatch error.
 pub fn openai_live_function_call_error_event(
     call_id: impl Into<String>,
@@ -4306,6 +4322,31 @@ mod tests {
                 } => {
                     assert_eq!(call_id, "call_2");
                     assert!(output.contains("boom"));
+                }
+                other => panic!("unexpected item: {other:?}"),
+            },
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn function_call_terminal_error_result_event_preserves_tool_payload() {
+        let output = serde_json::json!({
+            "error": "access_denied",
+            "message": "hidden tool denied"
+        })
+        .to_string();
+        let event = openai_live_function_call_error_result_event("call_3", output.clone());
+
+        match event {
+            ClientEvent::ConversationItemCreate { item, .. } => match *item {
+                Item::FunctionCallOutput {
+                    call_id,
+                    output: actual,
+                    ..
+                } => {
+                    assert_eq!(call_id, "call_3");
+                    assert_eq!(actual, output);
                 }
                 other => panic!("unexpected item: {other:?}"),
             },

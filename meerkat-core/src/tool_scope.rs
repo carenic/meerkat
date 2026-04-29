@@ -149,6 +149,8 @@ pub struct ExternalToolSurfaceSnapshot {
 pub enum ToolScopeStageError {
     #[error("Unknown tool(s) in filter: {names:?}")]
     UnknownTools { names: Vec<String> },
+    #[error("Missing tool visibility witness(es) for deferred tool(s): {names:?}")]
+    MissingWitnesses { names: Vec<String> },
     #[error("Tool scope state lock poisoned")]
     LockPoisoned,
     #[error("Tool visibility owner error: {message}")]
@@ -258,6 +260,11 @@ impl ToolVisibilityOwner for LocalToolVisibilityOwner {
         &self,
         names: BTreeSet<String>,
     ) -> Result<ToolScopeRevision, ToolScopeStageError> {
+        if !names.is_empty() {
+            return Err(ToolScopeStageError::MissingWitnesses {
+                names: names.into_iter().collect(),
+            });
+        }
         let mut state = self
             .state
             .write()
@@ -277,9 +284,20 @@ impl ToolVisibilityOwner for LocalToolVisibilityOwner {
             .state
             .write()
             .map_err(|_| ToolScopeStageError::LockPoisoned)?;
+        let extended = state
+            .staged_requested_deferred_names
+            .union(&names)
+            .cloned()
+            .collect();
+        let mut combined_witnesses = state.requested_witnesses.clone();
+        combined_witnesses.extend(witnesses);
+        let missing = missing_visibility_witness_names(&extended, &combined_witnesses);
+        if !missing.is_empty() {
+            return Err(ToolScopeStageError::MissingWitnesses { names: missing });
+        }
         let revision = ToolScopeRevision(self.next_revision.fetch_add(1, Ordering::SeqCst) + 1);
-        state.staged_requested_deferred_names.extend(names);
-        state.requested_witnesses.extend(witnesses);
+        state.staged_requested_deferred_names = extended;
+        state.requested_witnesses = combined_witnesses;
         state.staged_revision = revision.0;
         Ok(revision)
     }
@@ -1110,6 +1128,17 @@ fn extend_filter_witnesses(
     }
 }
 
+fn missing_visibility_witness_names(
+    names: &BTreeSet<String>,
+    witnesses: &std::collections::BTreeMap<String, ToolVisibilityWitness>,
+) -> Vec<String> {
+    names
+        .iter()
+        .filter(|name| !witnesses.contains_key(name.as_str()))
+        .cloned()
+        .collect()
+}
+
 fn sorted_names(names: &ToolNameSet) -> Vec<String> {
     let mut values = names
         .iter()
@@ -1267,7 +1296,15 @@ mod tests {
         scope
             .add_requested_deferred_names(
                 &["deferred".to_string()].into_iter().collect(),
-                &std::collections::BTreeMap::new(),
+                &[(
+                    "deferred".to_string(),
+                    crate::ToolVisibilityWitness {
+                        stable_owner_key: None,
+                        last_seen_provenance: None,
+                    },
+                )]
+                .into_iter()
+                .collect(),
             )
             .unwrap();
 
@@ -1542,6 +1579,89 @@ mod tests {
             scope.visible_tool_names().unwrap().is_empty(),
             "a different owner must not inherit prior deferred visibility intent"
         );
+    }
+
+    #[test]
+    fn requested_deferred_names_require_witnesses() {
+        let requested = tool_with_provenance("deferred", "owner-a");
+        let scope = ToolScope::new_with_projection_names(
+            vec![Arc::clone(&requested)].into(),
+            HashSet::new(),
+            raw_set(&["deferred"]),
+        );
+
+        let err = scope
+            .add_requested_deferred_names(
+                &["deferred".to_string()].into_iter().collect(),
+                &std::collections::BTreeMap::new(),
+            )
+            .expect_err("requesting a deferred tool without a witness must fail");
+
+        assert!(
+            err.to_string().contains("deferred"),
+            "missing-witness error should name the requested tool: {err}"
+        );
+        assert!(
+            scope
+                .visibility_state()
+                .unwrap()
+                .staged_requested_deferred_names
+                .is_empty(),
+            "failed witness validation must not stage deferred names"
+        );
+    }
+
+    #[test]
+    fn requested_deferred_names_reuse_existing_witnesses_for_extended_sets() {
+        let requested_a = tool_with_provenance("deferred_a", "owner-a");
+        let requested_b = tool_with_provenance("deferred_b", "owner-b");
+        let scope = ToolScope::new_with_projection_names(
+            vec![Arc::clone(&requested_a), Arc::clone(&requested_b)].into(),
+            HashSet::new(),
+            raw_set(&["deferred_a", "deferred_b"]),
+        );
+
+        scope
+            .add_requested_deferred_names(
+                &["deferred_a".to_string()].into_iter().collect(),
+                &[(
+                    "deferred_a".to_string(),
+                    crate::ToolVisibilityWitness {
+                        stable_owner_key: Some("owner-a".to_string()),
+                        last_seen_provenance: requested_a.provenance.clone(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .expect("initial deferred request should stage witness");
+
+        scope
+            .add_requested_deferred_names(
+                &["deferred_a".to_string(), "deferred_b".to_string()]
+                    .into_iter()
+                    .collect(),
+                &[(
+                    "deferred_b".to_string(),
+                    crate::ToolVisibilityWitness {
+                        stable_owner_key: Some("owner-b".to_string()),
+                        last_seen_provenance: requested_b.provenance.clone(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .expect("extended deferred request should reuse already staged witnesses");
+
+        let state = scope.visibility_state().unwrap();
+        assert_eq!(
+            state.staged_requested_deferred_names,
+            ["deferred_a".to_string(), "deferred_b".to_string()]
+                .into_iter()
+                .collect()
+        );
+        assert!(state.requested_witnesses.contains_key("deferred_a"));
+        assert!(state.requested_witnesses.contains_key("deferred_b"));
     }
 
     #[test]

@@ -417,8 +417,11 @@ where
             .map_err(|err| AgentError::InternalError(err.to_string()))?
             .into_iter()
             .collect::<ToolNameSet>();
-        precheck_visible_tool_call(self.tools.as_ref(), &visible_tool_names, call.name.as_str())
-            .map_err(|error| AgentError::ToolError(error.to_string()))?;
+        if let Err(error) =
+            precheck_visible_tool_call(self.tools.as_ref(), &visible_tool_names, call.name.as_str())
+        {
+            return Ok(crate::ops::terminal_tool_outcome_for_error(call.id, error));
+        }
         let args = to_raw_value(&call.args).map_err(|err| {
             AgentError::InternalError(format!(
                 "failed to serialize external tool-call arguments: {err}"
@@ -444,7 +447,7 @@ where
             Err(crate::error::ToolError::CallbackPending { tool_name, args }) => {
                 Err(AgentError::CallbackPending { tool_name, args })
             }
-            Err(error) => Err(AgentError::ToolError(error.to_string())),
+            Err(error) => Ok(crate::ops::terminal_tool_outcome_for_error(call.id, error)),
         }
     }
 
