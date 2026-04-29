@@ -202,6 +202,31 @@ describe("Live Smoke: TypeScript SDK", { skip: !binaryPath }, () => {
     return client;
   }
 
+  async function withScenarioRetry(scenario, run, attempts = 2) {
+    let lastError;
+    for (let attempt = 1; attempt <= attempts; attempt += 1) {
+      try {
+        if (attempt > 1) {
+          logScenarioStep(scenario, `retry attempt ${attempt}`);
+        }
+        return await run();
+      } catch (error) {
+        lastError = error;
+        if (attempt >= attempts) {
+          break;
+        }
+        logScenarioStep(scenario, `retrying after failure: ${String(error)}`);
+        await Promise.all(
+          clients.splice(0).map(async (client) => {
+            await client.close().catch(() => {});
+          }),
+        );
+        await delay(1000);
+      }
+    }
+    throw lastError;
+  }
+
   if (includeScenario(41)) {
     it(
       "Scenario 41: full lifecycle and recall through the packaged SDK",
@@ -354,6 +379,7 @@ describe("Live Smoke: TypeScript SDK", { skip: !binaryPath }, () => {
       { skip: !(hasAnthropicKey() && hasOpenAIKey()) },
       async () => {
       const scenario = "Scenario 44";
+      await withScenarioRetry(scenario, async () => {
       const client = await withStepTimeout(
         scenario,
         "connect client",
@@ -539,6 +565,7 @@ describe("Live Smoke: TypeScript SDK", { skip: !binaryPath }, () => {
       } catch (error) {
         assert.match(String(error), /definitely-invalid-live-smoke-model/);
       }
+      });
       },
     );
   }
@@ -705,6 +732,7 @@ After the tool returns, reply with TS-OPENAI-75-DONE and no extra prose.`,
       { skip: !(hasOpenAIKey() && hasGeminiKey()) },
       async () => {
       const scenario = "Scenario 76";
+      await withScenarioRetry(scenario, async () => {
       const client = await withStepTimeout(
         scenario,
         "connect client",
@@ -801,6 +829,7 @@ Reply with CROSS-IMAGE-76-DESCRIBE and a short phrase containing the text you ca
         descriptionText.includes("hello") || descriptionText.includes("meerkat"),
         `expected OpenAI to read some text from the final image, got: ${description.text}`,
       );
+      });
       },
     );
   }

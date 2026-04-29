@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use meerkat_integration_tests::e2e_lanes::{
-    E2eSelection, Lane, materialize_local_cargo_plan, plan_for_selection,
-    run_prebuilt_smoke_selection, smoke_test_filter_for_selection,
+    E2eSelection, Lane, materialize_e2e_plan, plan_for_selection, run_prebuilt_smoke_selection,
+    smoke_test_filter_for_selection,
 };
 
 #[tokio::main(flavor = "current_thread")]
@@ -43,7 +43,7 @@ async fn run() -> Result<(), String> {
             let manifest =
                 manifest.ok_or_else(|| "materialize requires --manifest <path>".to_string())?;
             let selection = parse_selection(rest)?;
-            let plan = materialize_local_cargo_plan(&selection, &manifest)?;
+            let plan = materialize_e2e_plan(&selection, &manifest)?;
             eprintln!(
                 "e2e artifact manifest written: {} ({} specs, {} requirements)",
                 manifest.display(),

@@ -2085,6 +2085,16 @@ fn cargo_target_dir() -> Result<PathBuf, String> {
         .clone()
 }
 
+pub fn materialize_e2e_plan(
+    selection: &E2eSelection,
+    manifest_path: &Path,
+) -> Result<E2ePlan, String> {
+    if let Ok(bazel_bin_dir) = std::env::var("MEERKAT_E2E_BAZEL_BIN_DIR") {
+        return materialize_bazel_plan(selection, manifest_path, Path::new(&bazel_bin_dir));
+    }
+    materialize_local_cargo_plan(selection, manifest_path)
+}
+
 pub fn materialize_local_cargo_plan(
     selection: &E2eSelection,
     manifest_path: &Path,
@@ -2125,6 +2135,115 @@ pub fn materialize_local_cargo_plan(
     })?;
 
     Ok(plan)
+}
+
+fn materialize_bazel_plan(
+    selection: &E2eSelection,
+    manifest_path: &Path,
+    bazel_bin_dir: &Path,
+) -> Result<E2ePlan, String> {
+    let plan = plan_for_selection(selection)?;
+    let mut manifest = ArtifactManifest::default();
+
+    for requirement in &plan.requirements {
+        match requirement {
+            ArtifactRequirement::RustBin(requirement) => {
+                let path = bazel_rust_bin_path(bazel_bin_dir, requirement)?;
+                manifest.rust_bins.insert(requirement.bin.clone(), path);
+            }
+            ArtifactRequirement::RustTest(requirement) => {
+                let path = bazel_rust_test_path(bazel_bin_dir, requirement)?;
+                manifest.rust_tests.insert(requirement.key(), path);
+            }
+            ArtifactRequirement::NodeBuild { cwd } => materialize_node_build(cwd)?,
+            ArtifactRequirement::PythonEnv { cwd } => materialize_python_env(cwd)?,
+        }
+    }
+
+    write_artifact_manifest(manifest_path, &manifest)?;
+    Ok(plan)
+}
+
+fn write_artifact_manifest(
+    manifest_path: &Path,
+    manifest: &ArtifactManifest,
+) -> Result<(), String> {
+    if let Some(parent) = manifest_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create e2e artifact manifest directory {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+    let json = serde_json::to_string_pretty(manifest)
+        .map_err(|error| format!("failed to serialize e2e artifact manifest: {error}"))?;
+    std::fs::write(manifest_path, format!("{json}\n")).map_err(|error| {
+        format!(
+            "failed to write e2e artifact manifest {}: {error}",
+            manifest_path.display()
+        )
+    })
+}
+
+fn bazel_rust_bin_path(
+    bazel_bin_dir: &Path,
+    requirement: &RustBinRequirement,
+) -> Result<PathBuf, String> {
+    let relative = match requirement.bin.as_str() {
+        "rkat" => "meerkat-cli/rkat",
+        "rkat-mcp" => "meerkat-mcp-server/rkat_mcp_bin",
+        "rkat-rest" => "meerkat-rest/rkat_rest_bin",
+        "rkat-rpc" => "meerkat-rpc/rkat_rpc_bin",
+        other => {
+            return Err(format!(
+                "no Bazel e2e artifact mapping for Rust bin {} ({})",
+                other,
+                requirement.key()
+            ));
+        }
+    };
+    require_executable_artifact(bazel_bin_dir.join(relative), &requirement.key())
+}
+
+fn bazel_rust_test_path(
+    bazel_bin_dir: &Path,
+    requirement: &RustTestRequirement,
+) -> Result<PathBuf, String> {
+    let key = requirement.key();
+    let relative = match key.as_str() {
+        "meerkat-integration-tests:smoke_shared_realm" => {
+            "tests/integration/smoke_shared_realm_test"
+        }
+        "meerkat-mob:smoke_mob_flow_runtime" => "meerkat-mob/smoke_mob_flow_runtime_test",
+        "meerkat-mob:smoke_mob_pictionary" => "meerkat-mob/smoke_mob_pictionary_test",
+        "meerkat-mob:smoke_mob_resume" => "meerkat-mob/smoke_mob_resume_test",
+        "meerkat-rpc:live_smoke_rpc" => "meerkat-rpc/live_smoke_rpc_test",
+        "rkat:cli_mobpack_live_smoke" => "meerkat-cli/cli_mobpack_live_smoke_test",
+        "rkat:live_smoke_cli" => "meerkat-cli/live_smoke_cli_test",
+        other => {
+            return Err(format!(
+                "no Bazel e2e artifact mapping for Rust test {other}"
+            ));
+        }
+    };
+    require_executable_artifact(bazel_bin_dir.join(relative), &key)
+}
+
+fn require_executable_artifact(path: PathBuf, label: &str) -> Result<PathBuf, String> {
+    let metadata = std::fs::metadata(&path).map_err(|error| {
+        format!(
+            "missing Bazel e2e artifact for {label}: {} ({error})",
+            path.display()
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err(format!(
+            "Bazel e2e artifact for {label} is not a file: {}",
+            path.display()
+        ));
+    }
+    Ok(path)
 }
 
 fn materialize_rust_bin(requirement: &RustBinRequirement) -> Result<PathBuf, String> {

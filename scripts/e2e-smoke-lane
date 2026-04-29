@@ -24,6 +24,68 @@ fi
 
 root="$(git rev-parse --show-toplevel)"
 cd "${root}"
+export WORKSPACE_ROOT="${root}"
+
+buildbuddy_enabled() {
+  case "${MEERKAT_BUILDBUDDY:-}" in
+    1|true|TRUE|yes|YES|on|ON|buildbuddy)
+      return 0
+      ;;
+    *)
+      return 1
+      ;;
+  esac
+}
+
+buildbuddy_output_base() {
+  if [[ -n "${BUILDBUDDY_OUTPUT_BASE:-}" ]]; then
+    printf '%s\n' "${BUILDBUDDY_OUTPUT_BASE}"
+    return 0
+  fi
+
+  local cache_root workspace_hash config lane_key agent_lane
+  cache_root="${MEERKAT_BUILDBUDDY_OUTPUT_ROOT:-${XDG_CACHE_HOME:-${HOME}/.cache}/meerkat/buildbuddy-bazel}"
+  workspace_hash="$(printf '%s' "${root}" | shasum -a 256 | awk '{print substr($1, 1, 16)}')"
+  config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+  lane_key="${BUILDBUDDY_OUTPUT_LANE:-e2e-smoke-rbe-${config}}"
+  agent_lane="${BUILDBUDDY_AGENT_LANE:-${RUST_LANE_ID:-${CODEX_AGENT_ID:-}}}"
+  if [[ -n "${agent_lane}" ]]; then
+    lane_key="${lane_key}-${agent_lane}"
+  fi
+  lane_key="$(printf '%s' "${lane_key}" | tr -c 'A-Za-z0-9_.-' '-')"
+  printf '%s/%s-%s-%s\n' "${cache_root}" "$(basename "${root}")" "${workspace_hash}" "${lane_key}"
+}
+
+buildbuddy_e2e_artifacts_bin() {
+  local output_base candidate
+  output_base="$(buildbuddy_output_base)"
+  candidate="$(
+    find "${output_base}/execroot/_main/bazel-out" \
+      -type f \
+      -name e2e_artifacts_bin \
+      -path '*/bin/tests/integration/e2e_artifacts_bin' \
+      -perm -111 \
+      2>/dev/null |
+      head -n 1
+  )"
+  if [[ -n "${candidate}" ]]; then
+    printf '%s\n' "${candidate}"
+    return 0
+  fi
+  return 1
+}
+
+e2e_artifacts_cmd=("${root}/scripts/repo-cargo" run -p meerkat-integration-tests --bin e2e_artifacts --)
+if buildbuddy_enabled; then
+  if artifact_bin="$(buildbuddy_e2e_artifacts_bin)"; then
+    e2e_artifacts_cmd=("${artifact_bin}")
+    export MEERKAT_E2E_BAZEL_BIN_DIR="$(cd "$(dirname "${artifact_bin}")/../.." && pwd)"
+  else
+    echo "error: BuildBuddy e2e-smoke foundation did not produce e2e_artifacts_bin" >&2
+    echo "Run MEERKAT_BUILDBUDDY=1 make e2e-smoke so scripts/buildbuddy-dev builds //tests/integration:e2e_artifacts_bin first." >&2
+    exit 1
+  fi
+fi
 
 selection_count=0
 selection_args=()
@@ -98,13 +160,13 @@ if [[ -z "${MEERKAT_E2E_ARTIFACT_MANIFEST:-}" ]]; then
   export MEERKAT_E2E_ARTIFACT_MANIFEST="${target_dir}/e2e-lanes/prebuilt/${selection_key}/artifact-manifest.json"
 fi
 
-"${root}/scripts/repo-cargo" run -p meerkat-integration-tests --bin e2e_artifacts -- \
+"${e2e_artifacts_cmd[@]}" \
   materialize \
   --manifest "${MEERKAT_E2E_ARTIFACT_MANIFEST}" \
   "${selection_args[@]}"
 
 export MEERKAT_E2E_EXECUTION_MODE=prebuilt
-exec "${root}/scripts/repo-cargo" run -p meerkat-integration-tests --bin e2e_artifacts -- \
+exec "${e2e_artifacts_cmd[@]}" \
   run-smoke \
   --manifest "${MEERKAT_E2E_ARTIFACT_MANIFEST}" \
   "${selection_args[@]}"

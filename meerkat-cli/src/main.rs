@@ -74,6 +74,7 @@ use meerkat_core::error::AgentError;
 use meerkat_core::mcp_config::{McpScope, McpTransportKind};
 use meerkat_core::types::OutputSchema;
 use meerkat_store::{RealmBackend, RealmOrigin};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -721,11 +722,8 @@ impl RealtimeRpcProcess {
 }
 
 fn resolve_rkat_rpc_binary() -> anyhow::Result<PathBuf> {
-    if let Ok(configured) = std::env::var("MEERKAT_BIN_PATH") {
-        let candidate = PathBuf::from(configured);
-        if candidate.exists() {
-            return Ok(candidate);
-        }
+    if let Some(configured) = configured_rkat_rpc_binary_from_env(|name| std::env::var_os(name)) {
+        return Ok(configured);
     }
     if let Ok(current_exe) = std::env::current_exe() {
         let sibling = current_exe.with_file_name("rkat-rpc");
@@ -734,6 +732,19 @@ fn resolve_rkat_rpc_binary() -> anyhow::Result<PathBuf> {
         }
     }
     Ok(PathBuf::from("rkat-rpc"))
+}
+
+fn configured_rkat_rpc_binary_from_env(
+    mut lookup: impl FnMut(&str) -> Option<OsString>,
+) -> Option<PathBuf> {
+    [
+        "MEERKAT_BIN_PATH",
+        "CARGO_BIN_EXE_rkat-rpc",
+        "RKAT_TEST_BIN_RKAT_RPC",
+    ]
+    .into_iter()
+    .filter_map(|name| lookup(name).map(PathBuf::from))
+    .find(|candidate| candidate.exists())
 }
 
 fn realtime_rpc_args(scope: &RuntimeScope) -> Vec<String> {
@@ -11403,6 +11414,21 @@ mod tests {
             }
             _ => unreachable!("expected realtime bridge"),
         }
+    }
+
+    #[test]
+    fn test_realtime_rpc_resolver_uses_prebuilt_artifact_env() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cargo_path = temp.path().join("rkat_rpc_bin");
+        std::fs::write(&cargo_path, "").expect("stub helper binary");
+
+        let resolved = configured_rkat_rpc_binary_from_env(|name| match name {
+            "CARGO_BIN_EXE_rkat-rpc" => Some(cargo_path.clone().into_os_string()),
+            _ => None,
+        })
+        .expect("prebuilt helper path should resolve");
+
+        assert_eq!(resolved, cargo_path);
     }
 
     #[tokio::test]
