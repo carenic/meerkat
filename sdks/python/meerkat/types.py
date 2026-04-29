@@ -42,6 +42,7 @@ from .generated.types import (
     MobReconcileResult as MobReconcileResult,
     MobSpawnManyParams as MobSpawnManyParams,
     MobSpawnManyResult as MobSpawnManyResult,
+    MobSpawnManyResultEntry as MobSpawnManyResultEntry,
     MobSpawnParams as MobSpawnParams,
     MobSpawnPolicyInput as MobSpawnPolicyInput,
     MobSpawnReceiptWire as MobSpawnReceiptWire,

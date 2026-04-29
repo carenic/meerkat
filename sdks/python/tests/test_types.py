@@ -251,6 +251,54 @@ def test_generated_mob_spawn_many_preserves_nested_contract_types():
     assert result.results[0].member_ref == "opaque-member-ref"
 
 
+@pytest.mark.asyncio
+async def test_spawn_mob_members_preserves_generated_result_envelope_failures():
+    from meerkat import MobSpawnManyResult as PublicMobSpawnManyResult
+    from meerkat import MobSpawnManyResultEntry as PublicMobSpawnManyResultEntry
+    from meerkat.generated.types import MobSpawnManyResult as GeneratedMobSpawnManyResult
+    from meerkat.generated.types import (
+        MobSpawnManyResultEntry as GeneratedMobSpawnManyResultEntry,
+    )
+
+    assert PublicMobSpawnManyResult is GeneratedMobSpawnManyResult
+    assert PublicMobSpawnManyResultEntry is GeneratedMobSpawnManyResultEntry
+
+    client = MeerkatClient()
+
+    async def fake_request(method: str, params: dict[str, object]) -> dict[str, object]:
+        assert method == "mob/spawn_many"
+        assert params == {
+            "mob_id": "mob-1",
+            "specs": [{"profile": "worker", "agent_identity": "worker-1"}],
+        }
+        return {
+            "results": [
+                {
+                    "ok": True,
+                    "agent_identity": "worker-1",
+                    "member_ref": _make_member_ref("mob-1", "worker-1"),
+                },
+                {
+                    "ok": False,
+                    "error": "profile missing",
+                },
+            ]
+        }
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    result = await client.spawn_mob_members(
+        "mob-1",
+        [{"profile": "worker", "agent_identity": "worker-1"}],
+    )
+
+    assert isinstance(result, GeneratedMobSpawnManyResult)
+    assert [entry.ok for entry in result.results] == [True, False]
+    assert result.results[0].agent_identity == "worker-1"
+    assert result.results[0].member_ref == _make_member_ref("mob-1", "worker-1")
+    assert result.results[1].error == "profile missing"
+
+
 def test_generated_mob_create_ensure_reconcile_preserve_nested_param_types():
     from meerkat.generated.types import (
         MobCreateParams as GeneratedMobCreateParams,

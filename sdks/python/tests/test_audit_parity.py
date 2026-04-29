@@ -387,8 +387,8 @@ async def test_spawn_many_uses_explicit_rpc_method():
             "specs": specs,
         },
     )
-    assert results[0]["agent_identity"] == "m1"
-    assert results[0]["member_ref"] == _make_member_ref("mob1", "m1")
+    assert results.results[0].agent_identity == "m1"
+    assert results.results[0].member_ref == _make_member_ref("mob1", "m1")
 
 
 @pytest.mark.asyncio

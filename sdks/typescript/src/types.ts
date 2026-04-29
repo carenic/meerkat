@@ -16,6 +16,7 @@ import type {
   MobSupervisorSpecInput,
   MobToolConfigInput,
   MobTopologySpecInput,
+  MobTurnStartParams,
   MobWiringRulesInput,
   WireBudgetSplitPolicy,
   WireConnectionRef,
@@ -352,21 +353,26 @@ export interface MobSpawnManyResultEntry {
   readonly error?: string;
 }
 
+type MobTurnStartWireOptions = Omit<
+  MobTurnStartParams,
+  "mob_id" | "agent_identity" | "prompt"
+>;
+
 export interface MobTurnStartOptions {
   readonly skillRefs?: SkillRef[];
   readonly flowToolOverlay?: TurnToolOverlay;
-  readonly additionalInstructions?: string[];
-  readonly keepAlive?: boolean;
-  readonly model?: string;
-  readonly provider?: string;
-  readonly maxTokens?: number;
-  readonly systemPrompt?: string;
-  readonly outputSchema?: unknown;
-  readonly structuredOutputRetries?: number;
-  readonly providerParams?: unknown;
-  readonly clearProviderParams?: boolean;
-  readonly connectionRef?: WireConnectionRef;
-  readonly clearConnectionRef?: boolean;
+  readonly additionalInstructions?: MobTurnStartWireOptions["additional_instructions"];
+  readonly keepAlive?: MobTurnStartWireOptions["keep_alive"];
+  readonly model?: MobTurnStartWireOptions["model"];
+  readonly provider?: MobTurnStartWireOptions["provider"];
+  readonly maxTokens?: MobTurnStartWireOptions["max_tokens"];
+  readonly systemPrompt?: MobTurnStartWireOptions["system_prompt"];
+  readonly outputSchema?: MobTurnStartWireOptions["output_schema"];
+  readonly structuredOutputRetries?: MobTurnStartWireOptions["structured_output_retries"];
+  readonly providerParams?: MobTurnStartWireOptions["provider_params"];
+  readonly clearProviderParams?: MobTurnStartWireOptions["clear_provider_params"];
+  readonly connectionRef?: MobTurnStartWireOptions["connection_ref"];
+  readonly clearConnectionRef?: MobTurnStartWireOptions["clear_connection_ref"];
 }
 
 export interface MobEventsOptions {

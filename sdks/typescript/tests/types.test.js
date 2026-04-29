@@ -1601,6 +1601,22 @@ describe("Parity wrappers", () => {
     assert.equal(calls[4].params.limit, 5);
   });
 
+  it("builds mob turn_start params against the generated contract shape", () => {
+    const clientSource = fs.readFileSync(
+      new URL("../src/client.ts", import.meta.url),
+      "utf8",
+    );
+    const helperStart = clientSource.indexOf("function mobTurnStartPayload(");
+    const helperEnd = clientSource.indexOf("\n}\n", helperStart);
+    assert.notEqual(helperStart, -1, "mobTurnStartPayload helper should exist");
+    assert.notEqual(helperEnd, -1, "mobTurnStartPayload helper should have a body");
+    const helperSource = clientSource.slice(helperStart, helperEnd);
+
+    assert.match(helperSource, /\): MobTurnStartParams \{/);
+    assert.match(helperSource, /const payload: MobTurnStartParams = \{/);
+    assert.doesNotMatch(helperSource, /Record<string, unknown>/);
+  });
+
   it("returns identity-native mob member listings", async () => {
     const client = new MeerkatClient();
     const expectedRef = makeMemberRef("mob-1", "worker-1");

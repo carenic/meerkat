@@ -49,6 +49,7 @@ import {
   type RealtimeOpenRequest,
   type RealtimeStatusResult,
   type RuntimeAcceptResult,
+  type MobTurnStartParams,
   type RuntimeRealtimeAttachmentStatusResult,
   type RuntimeResetResult,
   type RuntimeRetireResult,
@@ -179,7 +180,11 @@ function skillRefsToWire(refs: SkillRef[] | undefined): Array<{ source_uuid: str
   return refs.map(normalizeSkillRef);
 }
 
-function setIfDefined(payload: Record<string, unknown>, key: string, value: unknown): void {
+function setIfDefined<T extends object, K extends keyof T>(
+  payload: T,
+  key: K,
+  value: T[K] | undefined,
+): void {
   if (value !== undefined) {
     payload[key] = value;
   }
@@ -229,21 +234,23 @@ function mobTurnStartPayload(
   agentIdentity: string,
   prompt: ContentInput,
   options?: MobTurnStartOptions,
-): Record<string, unknown> {
-  const payload: Record<string, unknown> = {
+): MobTurnStartParams {
+  const payload: MobTurnStartParams = {
     mob_id: mobId,
     agent_identity: agentIdentity,
-    prompt,
+    prompt: typeof prompt === "string"
+      ? prompt
+      : prompt.map((block) => ({ ...block })) as MobTurnStartParams["prompt"],
   };
   const wireRefs = skillRefsToWire(options?.skillRefs);
   if (wireRefs) {
-    payload.skill_refs = wireRefs;
+    payload.skill_refs = wireRefs as MobTurnStartParams["skill_refs"];
   }
   if (options?.flowToolOverlay) {
     payload.flow_tool_overlay = {
       allowed_tools: options.flowToolOverlay.allowedTools,
       blocked_tools: options.flowToolOverlay.blockedTools,
-    };
+    } as MobTurnStartParams["flow_tool_overlay"];
   }
   setIfDefined(payload, "additional_instructions", options?.additionalInstructions);
   setIfDefined(payload, "keep_alive", options?.keepAlive);

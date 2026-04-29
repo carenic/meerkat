@@ -183,6 +183,31 @@ const publicMobTurnStartOptionsWithUnknown: MobTurnStartOptions = {
   unexpectedOverride: true,
 };
 
+type MobTurnStartSupportedWireOptionKeys =
+  | "additional_instructions"
+  | "clear_connection_ref"
+  | "clear_provider_params"
+  | "connection_ref"
+  | "flow_tool_overlay"
+  | "keep_alive"
+  | "max_tokens"
+  | "model"
+  | "output_schema"
+  | "provider"
+  | "provider_params"
+  | "skill_refs"
+  | "structured_output_retries"
+  | "system_prompt";
+type MobTurnStartUncoveredWireOptionKeys = Exclude<
+  keyof Omit<MobTurnStartParams, "mob_id" | "agent_identity" | "prompt">,
+  MobTurnStartSupportedWireOptionKeys
+>;
+type AssertNever<T extends never> = T;
+type MobTurnStartNoUncoveredWireOptionKeys =
+  AssertNever<MobTurnStartUncoveredWireOptionKeys>;
+const generatedMobTurnStartOptionCoverage: MobTurnStartNoUncoveredWireOptionKeys =
+  null as never;
+
 const publicMobTurnStartClient = new MeerkatClient();
 void publicMobTurnStartClient.mobTurnStart(
   "mob-1",
@@ -192,6 +217,7 @@ void publicMobTurnStartClient.mobTurnStart(
 );
 void publicMobTurnStartOptions;
 void publicMobTurnStartOptionsWithUnknown;
+void generatedMobTurnStartOptionCoverage;
 
 const generatedMobSpawn: MobSpawnParams = {
   mob_id: "mob-1",

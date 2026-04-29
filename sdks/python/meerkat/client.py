@@ -38,6 +38,8 @@ from .events import Usage, parse_event
 from .generated.types import CONTRACT_VERSION
 from .generated.types import (
     MobDefinitionInput,
+    MobSpawnManyResult,
+    MobSpawnManyResultEntry,
     MobTurnStartParams,
     RealtimeCapabilitiesResult,
     RealtimeOpenInfo,
@@ -1302,44 +1304,59 @@ class MeerkatClient:
         self,
         mob_id: str,
         specs: list[MobSpawnSpec],
-    ) -> list[MobSpawnResult]:
+    ) -> MobSpawnManyResult:
         params: dict[str, Any] = {
             "mob_id": mob_id,
             "specs": _wire_value(specs),
         }
         result = await self._request("mob/spawn_many", params)
-        entries = result.get("results", [])
+        entries = result.get("results")
         if not isinstance(entries, list):
-            return []
-        normalized: list[MobSpawnResult] = []
-        for index, entry in enumerate(entries):
-            if not isinstance(entry, dict) or not bool(entry.get("ok")):
-                continue
-            requested_identity = (
-                str(specs[index].get("agent_identity", ""))
-                if index < len(specs)
-                else ""
+            raise MeerkatError(
+                "INVALID_RESPONSE",
+                "Invalid mob/spawn_many response: results must be a list",
             )
-            resolved_identity = (
-                str(entry["agent_identity"])
-                if isinstance(entry.get("agent_identity"), str)
-                and str(entry["agent_identity"])
-                else requested_identity
-            )
+
+        normalized: list[MobSpawnManyResultEntry] = []
+        for entry in entries:
+            if not isinstance(entry, dict) or not isinstance(entry.get("ok"), bool):
+                raise MeerkatError(
+                    "INVALID_RESPONSE",
+                    "Invalid mob/spawn_many response: malformed result entry",
+                )
+            ok = entry["ok"]
+            agent_identity = entry.get("agent_identity")
             member_ref = entry.get("member_ref")
-            if not isinstance(member_ref, str) or not member_ref:
+            error = entry.get("error")
+            if agent_identity is not None and not isinstance(agent_identity, str):
+                raise MeerkatError(
+                    "INVALID_RESPONSE",
+                    "Invalid mob/spawn_many response: agent_identity must be a string",
+                )
+            if member_ref is not None and not isinstance(member_ref, str):
+                raise MeerkatError(
+                    "INVALID_RESPONSE",
+                    "Invalid mob/spawn_many response: member_ref must be a string",
+                )
+            if error is not None and not isinstance(error, str):
+                raise MeerkatError(
+                    "INVALID_RESPONSE",
+                    "Invalid mob/spawn_many response: error must be a string",
+                )
+            if ok and (not agent_identity or not member_ref):
                 raise MeerkatError(
                     "INVALID_RESPONSE",
                     "Invalid mob/spawn_many response: successful entry missing member_ref",
                 )
             normalized.append(
-                {
-                    "mob_id": str(entry.get("mob_id", mob_id)),
-                    "agent_identity": resolved_identity,
-                    "member_ref": member_ref,
-                }
+                MobSpawnManyResultEntry(
+                    ok=ok,
+                    agent_identity=agent_identity,
+                    member_ref=member_ref,
+                    error=error,
+                )
             )
-        return normalized
+        return MobSpawnManyResult(results=normalized)
 
     async def read_mob_events(
         self,

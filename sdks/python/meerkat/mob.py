@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Literal, NotRequired, TypedDict
 
 from .generated.types import (
+    MobSpawnManyResult,
     WireBudgetSplitPolicy,
     WireConnectionRef,
     WireContentInput,
@@ -269,7 +270,7 @@ class Mob:
     async def spawn_many(
         self,
         specs: list[MobSpawnSpec],
-    ) -> list[MobSpawnResult]:
+    ) -> MobSpawnManyResult:
         return await self._client.spawn_mob_members(self.id, specs)
 
     async def read_events(
