@@ -1550,9 +1550,17 @@ impl RealtimeSession for OpenAiRealtimeSession {
     async fn submit_tool_result(&mut self, result: ToolResult) -> Result<(), LlmError> {
         let call_id = result.tool_use_id.clone();
         let output = result.text_content();
-        let events = openai_live_function_call_success_events(call_id, &output);
-        for event in events {
-            self.raw_mut()?.send_raw(event).await?;
+        if result.is_error {
+            self.raw_mut()?
+                .send_raw(openai_live_function_call_error_result_event(
+                    call_id, output,
+                ))
+                .await?;
+        } else {
+            let events = openai_live_function_call_success_events(call_id, &output);
+            for event in events {
+                self.raw_mut()?.send_raw(event).await?;
+            }
         }
         Ok(())
     }
@@ -4202,6 +4210,50 @@ mod tests {
             other => panic!("unexpected first event: {other:?}"),
         }
         assert_response_create_requests_audio(&seen[1]);
+    }
+
+    #[tokio::test]
+    async fn provider_neutral_session_submits_terminal_tool_error_result_without_response_create() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut session = OpenAiRealtimeSession::new(
+            Box::new(FakeOpenAiLiveSession {
+                seen: Arc::clone(&seen),
+                next_events: Arc::new(Mutex::new(VecDeque::new())),
+            }),
+            RealtimeTurningMode::ProviderManaged,
+        );
+
+        session
+            .submit_tool_result(ToolResult::new(
+                "call_terminal_error".to_string(),
+                serde_json::json!({
+                    "error": "access_denied",
+                    "message": "hidden tool denied"
+                })
+                .to_string(),
+                true,
+            ))
+            .await
+            .expect("terminal tool error result submission should succeed");
+
+        let seen = seen.lock().await;
+        assert_eq!(
+            seen.len(),
+            1,
+            "terminal tool error results must not continue the provider response"
+        );
+        match &seen[0] {
+            ClientEvent::ConversationItemCreate { item, .. } => match item.as_ref() {
+                Item::FunctionCallOutput {
+                    call_id, output, ..
+                } => {
+                    assert_eq!(call_id, "call_terminal_error");
+                    assert!(output.contains("access_denied"));
+                }
+                other => panic!("unexpected terminal tool error item: {other:?}"),
+            },
+            other => panic!("unexpected terminal tool error event: {other:?}"),
+        }
     }
 
     #[tokio::test]

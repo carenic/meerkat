@@ -934,6 +934,15 @@ mod tests {
                 active_requested_deferred_names: ["loaded_secret_lookup".to_string()]
                     .into_iter()
                     .collect(),
+                requested_witnesses: [(
+                    "loaded_secret_lookup".to_string(),
+                    meerkat_core::ToolVisibilityWitness {
+                        stable_owner_key: Some("callback:test".to_string()),
+                        last_seen_provenance: loaded.provenance.clone(),
+                    },
+                )]
+                .into_iter()
+                .collect(),
                 staged_filter: ToolFilter::Deny(
                     ["blocked_secret_lookup".to_string()].into_iter().collect(),
                 ),

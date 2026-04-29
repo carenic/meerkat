@@ -11358,6 +11358,34 @@ async fn request_deferred_tools_requires_machine_visible_witnesses() {
         state.staged_requested_deferred_names.is_empty(),
         "failed witness validation must not stage names"
     );
+
+    let names = ["deferred_tool".to_string()].into_iter().collect();
+    let err = adapter
+        .request_deferred_tools(
+            &session_id,
+            names,
+            [(
+                "deferred_tool".to_string(),
+                meerkat_core::ToolVisibilityWitness::default(),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .await
+        .expect_err("empty deferred-tool witnesses should fail");
+
+    assert!(
+        err.to_string().contains("deferred_tool"),
+        "empty-witness error should name the requested tool: {err}"
+    );
+    let state = bindings
+        .tool_visibility_owner
+        .visibility_state()
+        .expect("owner state should be readable");
+    assert!(
+        state.staged_requested_deferred_names.is_empty(),
+        "failed empty-witness validation must not stage names"
+    );
 }
 
 #[tokio::test]

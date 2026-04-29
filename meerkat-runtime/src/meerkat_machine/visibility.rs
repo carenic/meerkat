@@ -104,7 +104,11 @@ fn missing_visibility_witness_names(
 ) -> Vec<String> {
     names
         .iter()
-        .filter(|name| !witnesses.contains_key(name.as_str()))
+        .filter(|name| {
+            witnesses
+                .get(name.as_str())
+                .is_none_or(|witness| !witness.has_identity_witness())
+        })
         .cloned()
         .collect()
 }

@@ -724,6 +724,15 @@ impl ToolScope {
         true
     }
 
+    fn requested_witness_matches_tool(
+        witness: Option<&ToolVisibilityWitness>,
+        tool: &ToolDef,
+    ) -> bool {
+        witness.is_some_and(|witness| {
+            witness.has_identity_witness() && Self::witness_matches_tool(Some(witness), tool)
+        })
+    }
+
     fn filter_name_applies(
         state: &ToolScopeState,
         visibility_state: &SessionToolVisibilityState,
@@ -773,7 +782,7 @@ impl ToolScope {
         visibility_state
             .active_requested_deferred_names
             .contains(tool.name.as_str())
-            && Self::witness_matches_tool(
+            && Self::requested_witness_matches_tool(
                 visibility_state.requested_witnesses.get(tool.name.as_str()),
                 tool,
             )
@@ -1134,7 +1143,11 @@ fn missing_visibility_witness_names(
 ) -> Vec<String> {
     names
         .iter()
-        .filter(|name| !witnesses.contains_key(name.as_str()))
+        .filter(|name| {
+            witnesses
+                .get(name.as_str())
+                .is_none_or(|witness| !witness.has_identity_witness())
+        })
         .cloned()
         .collect()
 }
@@ -1281,8 +1294,10 @@ mod tests {
 
     #[test]
     fn deferred_tools_stay_hidden_until_requested_boundary_applies() {
+        let visible = tools(&["visible"])[0].clone();
+        let deferred = tool_with_provenance("deferred", "owner-a");
         let scope = ToolScope::new_with_projection_names(
-            tools(&["visible", "deferred"]),
+            vec![Arc::clone(&visible), Arc::clone(&deferred)].into(),
             HashSet::new(),
             raw_set(&["deferred"]),
         );
@@ -1299,8 +1314,8 @@ mod tests {
                 &[(
                     "deferred".to_string(),
                     crate::ToolVisibilityWitness {
-                        stable_owner_key: None,
-                        last_seen_provenance: None,
+                        stable_owner_key: Some("callback:owner-a".to_string()),
+                        last_seen_provenance: deferred.provenance.clone(),
                     },
                 )]
                 .into_iter()
@@ -1314,7 +1329,9 @@ mod tests {
             "staged requests should not publish deferred tools before the next boundary"
         );
 
-        let applied = scope.apply_staged(tools(&["visible", "deferred"])).unwrap();
+        let applied = scope
+            .apply_staged(vec![Arc::clone(&visible), Arc::clone(&deferred)].into())
+            .unwrap();
         assert_eq!(
             applied.visible_names,
             vec!["visible".to_string(), "deferred".to_string()],
@@ -1582,6 +1599,35 @@ mod tests {
     }
 
     #[test]
+    fn empty_requested_witness_does_not_admit_deferred_tool() {
+        let requested = tool_with_provenance("deferred", "owner-a");
+        let scope = ToolScope::new_with_projection_names(
+            vec![Arc::clone(&requested)].into(),
+            HashSet::new(),
+            raw_set(&["deferred"]),
+        );
+
+        scope
+            .set_visibility_state(crate::SessionToolVisibilityState {
+                active_requested_deferred_names: ["deferred".to_string()].into_iter().collect(),
+                staged_requested_deferred_names: ["deferred".to_string()].into_iter().collect(),
+                requested_witnesses: [(
+                    "deferred".to_string(),
+                    crate::ToolVisibilityWitness::default(),
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            })
+            .expect("visibility state should install for regression test");
+
+        assert!(
+            scope.visible_tool_names().unwrap().is_empty(),
+            "a name with an empty witness must not admit a deferred tool"
+        );
+    }
+
+    #[test]
     fn requested_deferred_names_require_witnesses() {
         let requested = tool_with_provenance("deferred", "owner-a");
         let scope = ToolScope::new_with_projection_names(
@@ -1608,6 +1654,41 @@ mod tests {
                 .staged_requested_deferred_names
                 .is_empty(),
             "failed witness validation must not stage deferred names"
+        );
+    }
+
+    #[test]
+    fn requested_deferred_names_reject_empty_witnesses() {
+        let requested = tool_with_provenance("deferred", "owner-a");
+        let scope = ToolScope::new_with_projection_names(
+            vec![Arc::clone(&requested)].into(),
+            HashSet::new(),
+            raw_set(&["deferred"]),
+        );
+
+        let err = scope
+            .add_requested_deferred_names(
+                &["deferred".to_string()].into_iter().collect(),
+                &[(
+                    "deferred".to_string(),
+                    crate::ToolVisibilityWitness::default(),
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .expect_err("empty deferred-tool witnesses should fail");
+
+        assert!(
+            err.to_string().contains("deferred"),
+            "missing-witness error should name the requested tool: {err}"
+        );
+        assert!(
+            scope
+                .visibility_state()
+                .unwrap()
+                .staged_requested_deferred_names
+                .is_empty(),
+            "failed empty-witness validation must not stage deferred names"
         );
     }
 
