@@ -99,9 +99,14 @@ case "${lane}" in
     ;;
   e2e-smoke)
     if meerkat_buildbuddy_enabled; then
-      exec "${root}/scripts/buildbuddy-dev" e2e-smoke
+      "${root}/scripts/buildbuddy-dev" e2e-smoke
+      case "${BUILDBUDDY_DRY_RUN:-}" in
+        1|true|TRUE|yes|YES|on|ON)
+          exit 0
+          ;;
+      esac
     fi
-    exec "${cargo_bin}" e2e-smoke
+    exec "${root}/scripts/e2e-smoke-lane"
     ;;
   *)
     echo "unknown build backend lane: ${lane}" >&2
