@@ -76,15 +76,17 @@ impl BuiltinTool for BrowseSkillsTool {
 
         let filter = SkillFilter { query, source_uuid };
 
-        let skills = self
+        let entries = self
             .engine
-            .list_skills(&filter)
+            .list_all_with_provenance(&filter)
             .await
             .map_err(|e| BuiltinToolError::ExecutionFailed(e.to_string()))?;
 
-        let skill_values: Vec<Value> = skills
+        let skill_values: Vec<Value> = entries
             .iter()
-            .map(|s| {
+            .filter(|entry| entry.is_active)
+            .map(|entry| {
+                let s = &entry.descriptor;
                 json!({
                     "source_uuid": s.key.source_uuid.to_string(),
                     "skill_name": s.key.skill_name.as_str(),

@@ -112,8 +112,14 @@ where
 {
     fn inventory_section(&self) -> impl Future<Output = Result<String, SkillError>> + Send {
         async move {
-            let all_skills = self.list_skills(&SkillFilter::default()).await?;
-            let available = filter_by_capabilities(all_skills, &self.available_capabilities);
+            let entries = self
+                .list_all_with_provenance(&SkillFilter::default())
+                .await?;
+            let available: Vec<_> = entries
+                .into_iter()
+                .filter(|entry| entry.is_active)
+                .map(|entry| entry.descriptor)
+                .collect();
             let collections = meerkat_core::skills::derive_collections(&available);
             Ok(renderer::render_inventory(
                 &available,
@@ -240,11 +246,8 @@ where
             let entries = self.source.list_all_with_provenance(filter).await?;
             let mut active_entries = Vec::new();
             for mut entry in entries {
-                let Ok((canonical_key, source_identity)) =
-                    self.resolve_source_identity(&entry.descriptor.key)
-                else {
-                    continue;
-                };
+                let (canonical_key, source_identity) =
+                    self.resolve_source_identity(&entry.descriptor.key)?;
                 if entry.is_active
                     && !entry
                         .descriptor
@@ -260,10 +263,9 @@ where
                 entry.source_identity = Some(source_identity);
                 if let Some(source_uuid) = entry.shadowed_by_source_uuid.clone() {
                     let shadow_key = SkillKey::new(source_uuid, skill_name);
-                    if let Ok((_, shadow_identity)) = self.resolve_source_identity(&shadow_key) {
-                        entry.shadowed_by = Some(shadow_identity.display_name.clone());
-                        entry.shadowed_by_identity = Some(shadow_identity);
-                    }
+                    let (_, shadow_identity) = self.resolve_source_identity(&shadow_key)?;
+                    entry.shadowed_by = Some(shadow_identity.display_name.clone());
+                    entry.shadowed_by_identity = Some(shadow_identity);
                 }
                 active_entries.push(entry);
             }
@@ -299,15 +301,42 @@ where
 #[allow(clippy::unwrap_used)]
 mod tests {
     use super::*;
-    use crate::source::InMemorySkillSource;
+    use crate::source::{CompositeSkillSource, InMemorySkillSource, NamedSource, SourceNode};
     use indexmap::IndexMap;
-    use meerkat_core::skills::{SkillName, SkillScope, SourceUuid};
+    use meerkat_core::skills::{
+        SkillName, SkillScope, SourceIdentityRecord, SourceIdentityStatus, SourceTransportKind,
+        SourceUuid,
+    };
 
     fn test_key(skill: &str) -> SkillKey {
         SkillKey {
             source_uuid: SourceUuid::builtin(),
             skill_name: SkillName::parse(skill).unwrap(),
         }
+    }
+
+    fn source_uuid(raw: &str) -> SourceUuid {
+        SourceUuid::parse(raw).unwrap()
+    }
+
+    fn source_record(
+        source_uuid: SourceUuid,
+        display_name: &str,
+        status: SourceIdentityStatus,
+    ) -> SourceIdentityRecord {
+        SourceIdentityRecord {
+            source_uuid,
+            display_name: display_name.to_string(),
+            transport_kind: SourceTransportKind::Filesystem,
+            fingerprint: format!("fixture:{display_name}"),
+            status,
+        }
+    }
+
+    fn test_skill_from_source(source_uuid: SourceUuid, skill: &str, name: &str) -> SkillDocument {
+        let mut doc = test_skill(skill, name, &[]);
+        doc.descriptor.key.source_uuid = source_uuid;
+        doc
     }
 
     fn test_skill(skill: &str, name: &str, caps: &[&str]) -> SkillDocument {
@@ -363,6 +392,206 @@ mod tests {
         let section = engine.inventory_section().await.unwrap();
         assert!(section.contains("task-workflow"));
         assert!(!section.contains("shell-patterns"));
+    }
+
+    #[tokio::test]
+    async fn inventory_section_reports_source_identity_resolution_failures() {
+        let unknown_source = source_uuid("aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa");
+        let source = InMemorySkillSource::new(vec![test_skill_from_source(
+            unknown_source.clone(),
+            "orphaned",
+            "Orphaned",
+        )]);
+        let registry = SourceIdentityRegistry::default();
+        let engine = DefaultSkillEngine::new(source, vec![])
+            .with_source_identity_registry(Arc::new(registry));
+
+        let err = engine.inventory_section().await.unwrap_err();
+        let message = err.to_string();
+
+        assert!(
+            message.contains("source identity resolution failed"),
+            "inventory error must name source identity resolution; got {message}"
+        );
+        assert!(
+            message.contains(&unknown_source.to_string()),
+            "inventory error must identify the failing source; got {message}"
+        );
+        assert!(
+            message.contains("source unknown"),
+            "inventory error must include the registry failure; got {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_all_with_provenance_reports_source_identity_failures() {
+        let disabled_source = source_uuid("bbbbbbbb-bbbb-4bbb-bbbb-bbbbbbbbbbbb");
+        let source = InMemorySkillSource::new(vec![test_skill_from_source(
+            disabled_source.clone(),
+            "disabled",
+            "Disabled",
+        )]);
+        let registry = SourceIdentityRegistry::build(
+            vec![source_record(
+                disabled_source.clone(),
+                "disabled fixture",
+                SourceIdentityStatus::Disabled,
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let engine = DefaultSkillEngine::new(source, vec![])
+            .with_source_identity_registry(Arc::new(registry));
+
+        let err = engine
+            .list_all_with_provenance(&SkillFilter::default())
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+
+        assert!(
+            message.contains("source identity resolution failed"),
+            "provenance listing error must name source identity resolution; got {message}"
+        );
+        assert!(
+            message.contains(&disabled_source.to_string()),
+            "provenance listing error must identify the failing source; got {message}"
+        );
+        assert!(
+            message.contains("Disabled"),
+            "provenance listing error must include the registry status; got {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_skills_preserves_valid_entries_when_another_source_identity_fails() {
+        let active_source = source_uuid("99999999-9999-4999-8999-999999999999");
+        let unknown_source = source_uuid("88888888-8888-4888-8888-888888888888");
+        let source = InMemorySkillSource::new(vec![
+            test_skill_from_source(active_source.clone(), "valid", "Valid"),
+            test_skill_from_source(unknown_source, "orphaned", "Orphaned"),
+        ]);
+        let registry = SourceIdentityRegistry::build(
+            vec![source_record(
+                active_source.clone(),
+                "active fixture",
+                SourceIdentityStatus::Active,
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let engine = DefaultSkillEngine::new(source, vec![])
+            .with_source_identity_registry(Arc::new(registry));
+
+        let listed = engine.list_skills(&SkillFilter::default()).await.unwrap();
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].key.source_uuid, active_source);
+        assert_eq!(listed[0].key.skill_name.as_str(), "valid");
+    }
+
+    #[tokio::test]
+    async fn list_all_with_provenance_reports_composite_source_identity_failures() {
+        let active_source = source_uuid("cccccccc-cccc-4ccc-8ccc-cccccccccccc");
+        let unknown_source = source_uuid("dddddddd-dddd-4ddd-8ddd-dddddddddddd");
+        let skill = "shadowed";
+        let unknown_key = SkillKey::new(unknown_source.clone(), SkillName::parse(skill).unwrap());
+        let active_named = NamedSource::new(
+            source_record(
+                active_source.clone(),
+                "active fixture",
+                SourceIdentityStatus::Active,
+            ),
+            SourceNode::Memory(InMemorySkillSource::new(vec![test_skill_from_source(
+                active_source.clone(),
+                skill,
+                "Active",
+            )])),
+        );
+        let unknown_named = NamedSource::new(
+            source_record(
+                unknown_source.clone(),
+                "unknown fixture",
+                SourceIdentityStatus::Active,
+            ),
+            SourceNode::Memory(InMemorySkillSource::new(vec![test_skill_from_source(
+                unknown_source,
+                skill,
+                "Unknown",
+            )])),
+        );
+        let registry = SourceIdentityRegistry::build(
+            vec![source_record(
+                active_source,
+                "active fixture",
+                SourceIdentityStatus::Active,
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let composite = CompositeSkillSource::from_named(vec![active_named, unknown_named]);
+        let engine = DefaultSkillEngine::new(composite, vec![])
+            .with_source_identity_registry(Arc::new(registry));
+
+        let err = engine
+            .list_all_with_provenance(&SkillFilter::default())
+            .await
+            .unwrap_err();
+        let message = err.to_string();
+
+        assert!(
+            message.contains(&unknown_key.to_string()),
+            "composite provenance listing must identify the failing source; got {message}"
+        );
+        assert!(
+            message.contains("source unknown"),
+            "composite provenance listing must include the registry failure; got {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_load_from_source_reports_source_identity_failures() {
+        let disabled_source = source_uuid("eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee");
+        let source = InMemorySkillSource::new(vec![test_skill_from_source(
+            disabled_source.clone(),
+            "disabled-load",
+            "Disabled Load",
+        )]);
+        let registry = SourceIdentityRegistry::build(
+            vec![source_record(
+                disabled_source.clone(),
+                "disabled fixture",
+                SourceIdentityStatus::Disabled,
+            )],
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap();
+        let engine = DefaultSkillEngine::new(source, vec![])
+            .with_source_identity_registry(Arc::new(registry));
+        let key = SkillKey::new(
+            disabled_source.clone(),
+            SkillName::parse("disabled-load").unwrap(),
+        );
+
+        let err = engine.load_from_source(&key, None).await.unwrap_err();
+        let message = err.to_string();
+
+        assert!(
+            message.contains("source identity resolution failed"),
+            "direct load error must name source identity resolution; got {message}"
+        );
+        assert!(
+            message.contains(&disabled_source.to_string()),
+            "direct load error must identify the failing source; got {message}"
+        );
     }
 
     #[tokio::test]

@@ -97,6 +97,19 @@ fn fixture_runtime() -> (Arc<SkillRuntime>, SourceUuid, SourceUuid) {
     (runtime, primary, secondary)
 }
 
+fn runtime_with_unknown_source_identity() -> (Arc<SkillRuntime>, SourceUuid) {
+    let unknown = SourceUuid::parse("aaaaaaaa-aaaa-4aaa-aaaa-aaaaaaaaaaaa").unwrap();
+    let source = InMemorySkillSource::new(vec![skill_doc(
+        &unknown,
+        "orphaned",
+        "Orphaned",
+        "# Orphaned\n\nbody-orphaned",
+    )]);
+    let engine = DefaultSkillEngine::new(source, Vec::new())
+        .with_source_identity_registry(Arc::new(SourceIdentityRegistry::default()));
+    (Arc::new(SkillRuntime::new(Arc::new(engine))), unknown)
+}
+
 #[tokio::test]
 async fn browse_no_filter_returns_all_skills() {
     let (runtime, _primary, _secondary) = fixture_runtime();
@@ -178,6 +191,32 @@ async fn browse_rejects_unparseable_source_uuid() {
             );
         }
         other => panic!("expected ExecutionFailed for bad uuid, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn browse_surfaces_source_identity_registry_failures() {
+    let (runtime, unknown) = runtime_with_unknown_source_identity();
+    let tool = BrowseSkillsTool::new(runtime);
+
+    let err = tool.call(serde_json::json!({})).await.unwrap_err();
+
+    match &err {
+        meerkat_tools::BuiltinToolError::ExecutionFailed(msg) => {
+            assert!(
+                msg.contains("source identity resolution failed"),
+                "browse failure must name source identity resolution; got {msg:?}",
+            );
+            assert!(
+                msg.contains(&unknown.to_string()),
+                "browse failure must identify the failing source; got {msg:?}",
+            );
+            assert!(
+                msg.contains("source unknown"),
+                "browse failure must include the registry failure; got {msg:?}",
+            );
+        }
+        other => panic!("expected ExecutionFailed for source identity failure, got {other:?}"),
     }
 }
 
