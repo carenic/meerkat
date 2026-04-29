@@ -2716,6 +2716,13 @@ impl AgentFactory {
         if let RuntimeBuildMode::SessionOwned(bindings) = resolved_mode {
             tools.bind_external_tool_surface_handle(Arc::clone(&bindings.external_tool_surface));
             tools.bind_mcp_server_lifecycle_handle(Arc::clone(&bindings.mcp_server_lifecycle));
+            // LUC-104: classified comms ingress must hand raw external/plain
+            // ingress through the session's MeerkatMachine before the comms
+            // shell computes compatibility auth/routing projections.
+            #[cfg(feature = "comms")]
+            if let Some(runtime) = &comms_runtime {
+                runtime.install_peer_comms_handle(Arc::clone(&bindings.peer_comms));
+            }
             // W1-A: install the peer-interaction DSL handle on the session's
             // comms runtime so outbound PeerRequest sends record into
             // `pending_peer_requests` and `comms_drain` fires response

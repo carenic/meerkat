@@ -1130,6 +1130,7 @@ pub struct CommsRuntime {
     peer_directory_reachability: Arc<Mutex<PeerDirectoryReachabilityAuthority>>,
     #[allow(dead_code)] // Kept for runtime inspection symmetry with IngressClassificationContext.
     ingress_policy: Arc<meerkat_core::PeerIngressMachinePolicy>,
+    peer_comms_handle: crate::classify::PeerCommsHandleSlot,
     /// Narrow notify that fires only for actionable peer input (messages/requests).
     /// Set during construction when classified inbox is used.
     actionable_notify: Option<Arc<tokio::sync::Notify>>,
@@ -1204,10 +1205,12 @@ impl CommsRuntime {
         let ingress_policy = Self::ingress_policy_from_silent_intents(&silent_intents);
 
         // Build classified inbox using the same trusted_peers Arc
+        let peer_comms_handle = Arc::new(parking_lot::RwLock::new(None));
         let classification_context = Arc::new(crate::classify::IngressClassificationContext {
             require_peer_auth: config.require_peer_auth,
             trusted_peers: trusted_peers.clone(),
             ingress_policy: ingress_policy.clone(),
+            peer_comms_handle: peer_comms_handle.clone(),
         });
         let (inbox, inbox_sender) = crate::Inbox::new_classified(classification_context);
         let inbox_notify = inbox.notify();
@@ -1242,6 +1245,7 @@ impl CommsRuntime {
                 PeerDirectoryReachabilityAuthority::new(),
             )),
             ingress_policy,
+            peer_comms_handle,
             actionable_notify,
             blob_store: None,
             peer_interaction_handle: parking_lot::RwLock::new(None),
@@ -1288,10 +1292,12 @@ impl CommsRuntime {
         let trusted_peers = Arc::new(parking_lot::RwLock::new(TrustedPeers::new()));
         let ingress_policy = Self::ingress_policy_from_silent_intents(&silent_intents);
 
+        let peer_comms_handle = Arc::new(parking_lot::RwLock::new(None));
         let classification_context = Arc::new(crate::classify::IngressClassificationContext {
             require_peer_auth: true,
             trusted_peers: trusted_peers.clone(),
             ingress_policy: ingress_policy.clone(),
+            peer_comms_handle: peer_comms_handle.clone(),
         });
         let (inbox, inbox_sender) = crate::Inbox::new_classified(classification_context);
         let inbox_notify = inbox.notify();
@@ -1350,6 +1356,7 @@ impl CommsRuntime {
                 PeerDirectoryReachabilityAuthority::new(),
             )),
             ingress_policy,
+            peer_comms_handle,
             actionable_notify,
             blob_store: None,
             peer_interaction_handle: parking_lot::RwLock::new(None),
@@ -1417,10 +1424,12 @@ impl CommsRuntime {
         let trusted_peers = Arc::new(parking_lot::RwLock::new(TrustedPeers::new()));
         let ingress_policy = Self::ingress_policy_from_silent_intents(&silent_intents);
 
+        let peer_comms_handle = Arc::new(parking_lot::RwLock::new(None));
         let classification_context = Arc::new(crate::classify::IngressClassificationContext {
             require_peer_auth: true,
             trusted_peers: trusted_peers.clone(),
             ingress_policy: ingress_policy.clone(),
+            peer_comms_handle: peer_comms_handle.clone(),
         });
         let (inbox, inbox_sender) = crate::Inbox::new_classified(classification_context);
         let inbox_notify = inbox.notify();
@@ -1470,6 +1479,7 @@ impl CommsRuntime {
                 PeerDirectoryReachabilityAuthority::new(),
             )),
             ingress_policy,
+            peer_comms_handle,
             actionable_notify,
             blob_store: None,
             peer_interaction_handle: parking_lot::RwLock::new(None),
@@ -1501,6 +1511,25 @@ impl CommsRuntime {
     /// boundary.
     pub fn set_blob_store(&mut self, blob_store: Arc<dyn BlobStore>) {
         self.blob_store = Some(blob_store);
+    }
+
+    /// Install the session's peer-comms ingress DSL handle.
+    ///
+    /// When present, every classified inbox item first fires the
+    /// MeerkatMachine `ClassifyExternalEnvelope` / `ClassifyPlainEvent`
+    /// signal. A DSL rejection fails closed before the comms shell computes
+    /// auth exemptions, silent routing, lifecycle subjects, or rendered text.
+    /// Standalone comms runtimes leave this unset for wire-compatible local
+    /// operation without a session DSL.
+    pub fn install_peer_comms_handle(
+        &self,
+        handle: Arc<dyn meerkat_core::handles::PeerCommsHandle>,
+    ) {
+        *self.peer_comms_handle.write() = Some(handle);
+    }
+
+    pub fn peer_comms_handle(&self) -> Option<Arc<dyn meerkat_core::handles::PeerCommsHandle>> {
+        self.peer_comms_handle.read().clone()
     }
 
     /// Install the session's peer-interaction DSL handle (W1-A).
