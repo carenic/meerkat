@@ -78,11 +78,11 @@ impl From<&meerkat_core::BackendProfile> for WireBackendProfile {
 }
 
 /// Wire projection of [`meerkat_core::AuthProfile`]. Sensitive credential
-/// material is NOT wire-projected — callers that want to read secret
-/// material have to go through the server-side
-/// `auth.profile.get` / `/auth/profiles/:id` endpoints which return
-/// typed redacted shapes. `source_kind` is a discriminator for the
-/// credential-source variant.
+/// material is NOT wire-projected; callers that inspect profile metadata use
+/// the server-side `auth.profile.get` RPC or the
+/// `GET /auth/bindings/{binding_id}` REST path; both return typed redacted
+/// shapes. `source_kind` is a
+/// discriminator for the credential-source variant.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WireAuthProfile {
@@ -225,7 +225,7 @@ impl From<meerkat_core::AuthError> for WireAuthError {
 }
 
 /// Wire projection of the auth-profile status. Returned from
-/// `auth.status.get` / `GET /auth/status/:id`.
+/// `auth.status.get` / `GET /auth/bindings/{binding_id}/status`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WireAuthStatus {
@@ -285,7 +285,7 @@ pub struct WireAuthProfileCreated {
     pub stored: bool,
 }
 
-/// `GET /auth/profiles/:binding_id` success body.
+/// `GET /auth/bindings/{binding_id}` success body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WireAuthProfileDetail {
@@ -295,7 +295,8 @@ pub struct WireAuthProfileDetail {
     pub auth_profile: WireAuthProfile,
 }
 
-/// `DELETE /auth/profiles/:binding_id` / `POST /auth/logout` success body.
+/// `DELETE /auth/bindings/{binding_id}` /
+/// `POST /auth/bindings/{binding_id}/logout` success body.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WireAuthProfileCleared {
@@ -380,7 +381,7 @@ pub struct WireAuthProfilesList {
     pub bindings: Vec<WireProviderBinding>,
 }
 
-/// `GET /auth/status/:binding_id` success body. Richer than
+/// `GET /auth/bindings/{binding_id}/status` success body. Richer than
 /// [`WireAuthStatus`] — also carries `realm_id` / `binding_id` /
 /// `connection_ref` / `has_refresh_token` so the caller can key by
 /// binding directly.

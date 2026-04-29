@@ -5,8 +5,8 @@
 //! reachable through the router and return well-formed responses
 //! (status code + JSON content-type) even without live credentials.
 //!
-//! Plan choke point K6 reads: "POST /auth/profiles → GET
-//! /auth/profiles/:id → POST /sessions with connection_ref". The
+//! Plan choke point K6 reads: "POST /auth/profiles -> GET
+//! /auth/bindings/{binding_id} -> POST /sessions with connection_ref". The
 //! live-provider half belongs in the `e2e-auth` lane; this file
 //! exercises the offline router half: each route is registered,
 //! dispatches, and returns a structured response.
