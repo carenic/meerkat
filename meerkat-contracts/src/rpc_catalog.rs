@@ -77,6 +77,19 @@ impl RpcMethodDescriptor {
         }
     }
 
+    const fn params_only(
+        name: &'static str,
+        description: &'static str,
+        params_type: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            description,
+            params_type: Some(params_type),
+            result_type: None,
+        }
+    }
+
     const fn result_only(
         name: &'static str,
         description: &'static str,
@@ -450,36 +463,15 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
                 "MobCreateParams",
                 "MobCreateResult",
             ),
-            RpcMethodDescriptor::typed(
-                "mob/list",
-                "List active mobs",
-                "MobListParams",
-                "MobListResult",
-            ),
-            RpcMethodDescriptor::typed(
-                "mob/status",
-                "Get mob lifecycle status",
-                "MobIdParams",
-                "MobStatusResult",
-            ),
-            RpcMethodDescriptor::typed(
+            RpcMethodDescriptor::basic("mob/list", "List active mobs"),
+            RpcMethodDescriptor::basic("mob/status", "Get mob lifecycle status"),
+            RpcMethodDescriptor::params_only(
                 "mob/lifecycle",
                 "Apply a mob lifecycle action",
                 "MobLifecycleParams",
-                "MobLifecycleResult",
             ),
-            RpcMethodDescriptor::typed(
-                "mob/spawn",
-                "Spawn a new mob member",
-                "MobSpawnParams",
-                "MobSpawnResult",
-            ),
-            RpcMethodDescriptor::typed(
-                "mob/spawn_many",
-                "Spawn multiple new mob members",
-                "MobSpawnManyParams",
-                "MobSpawnManyResult",
-            ),
+            RpcMethodDescriptor::basic("mob/spawn", "Spawn a new mob member"),
+            RpcMethodDescriptor::basic("mob/spawn_many", "Spawn multiple new mob members"),
             RpcMethodDescriptor::typed(
                 "mob/ensure_member",
                 "Declarative: spawn if absent, otherwise return the existing roster entry",
@@ -498,18 +490,8 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
                 "MobListMembersMatchingParams",
                 "MobListMembersMatchingResult",
             ),
-            RpcMethodDescriptor::typed(
-                "mob/retire",
-                "Retire a mob member",
-                "MobMemberParams",
-                "MobRetireResult",
-            ),
-            RpcMethodDescriptor::typed(
-                "mob/respawn",
-                "Respawn a mob member with topology restore",
-                "MobRespawnParams",
-                "MobRespawnResult",
-            ),
+            RpcMethodDescriptor::basic("mob/retire", "Retire a mob member"),
+            RpcMethodDescriptor::basic("mob/respawn", "Respawn a mob member with topology restore"),
             RpcMethodDescriptor::typed(
                 "mob/wire",
                 "Wire a local mob member to a local or external peer",
@@ -522,18 +504,8 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
                 "MobUnwireParams",
                 "MobUnwireResult",
             ),
-            RpcMethodDescriptor::typed(
-                "mob/members",
-                "List members in a mob roster",
-                "MobMembersParams",
-                "MobMembersResult",
-            ),
-            RpcMethodDescriptor::typed(
-                "mob/events",
-                "Read mob event history",
-                "MobEventsParams",
-                "MobEventsResult",
-            ),
+            RpcMethodDescriptor::basic("mob/members", "List members in a mob roster"),
+            RpcMethodDescriptor::basic("mob/events", "Read mob event history"),
             RpcMethodDescriptor::typed(
                 "mob/member_send",
                 "Deliver ordinary content to a specific mob member via the host control plane",
@@ -546,83 +518,39 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
                 "MobIngressInteractionParams",
                 "MobIngressInteractionResult",
             ),
-            RpcMethodDescriptor::typed(
+            RpcMethodDescriptor::basic(
                 "mob/append_system_context",
                 "Append system context for a mob member",
-                "MobAppendSystemContextParams",
-                "MobAppendSystemContextResult",
             ),
-            RpcMethodDescriptor::typed(
-                "mob/flows",
-                "List flows defined for a mob",
-                "MobFlowsParams",
-                "MobFlowsResult",
-            ),
-            RpcMethodDescriptor::typed(
-                "mob/flow_run",
-                "Start a mob flow run",
-                "MobFlowRunParams",
-                "MobFlowRunResult",
-            ),
-            RpcMethodDescriptor::typed(
-                "mob/flow_status",
-                "Get status for a mob flow run",
-                "MobFlowStatusParams",
-                "MobFlowStatusResult",
-            ),
-            RpcMethodDescriptor::typed(
-                "mob/flow_cancel",
-                "Cancel a mob flow run",
-                "MobFlowCancelParams",
-                "MobFlowCancelResult",
-            ),
-            RpcMethodDescriptor::typed(
+            RpcMethodDescriptor::basic("mob/flows", "List flows defined for a mob"),
+            RpcMethodDescriptor::basic("mob/flow_run", "Start a mob flow run"),
+            RpcMethodDescriptor::basic("mob/flow_status", "Get status for a mob flow run"),
+            RpcMethodDescriptor::basic("mob/flow_cancel", "Cancel a mob flow run"),
+            RpcMethodDescriptor::basic(
                 "mob/spawn_helper",
                 "Spawn a helper member and wait for completion",
-                "MobSpawnHelperParams",
-                "MobSpawnHelperResult",
             ),
-            RpcMethodDescriptor::typed(
+            RpcMethodDescriptor::basic(
                 "mob/fork_helper",
                 "Fork a helper member and wait for completion",
-                "MobForkHelperParams",
-                "MobForkHelperResult",
             ),
-            RpcMethodDescriptor::typed(
-                "mob/force_cancel",
-                "Force-cancel a mob member",
-                "MobMemberParams",
-                "MobForceCancelResult",
-            ),
-            RpcMethodDescriptor::typed(
+            RpcMethodDescriptor::basic("mob/force_cancel", "Force-cancel a mob member"),
+            RpcMethodDescriptor::basic(
                 "mob/turn_start",
                 "Start a turn on a mob member by identity",
-                "MobTurnStartParams",
-                "WireRunResult",
             ),
-            RpcMethodDescriptor::typed(
-                "mob/member_status",
-                "Get live status for a mob member",
-                "MobMemberParams",
-                "MobMemberStatusResult",
-            ),
-            RpcMethodDescriptor::typed(
+            RpcMethodDescriptor::basic("mob/member_status", "Get live status for a mob member"),
+            RpcMethodDescriptor::basic(
                 "mob/snapshot",
                 "Point-in-time aggregate of mob status plus member list",
-                "MobIdParams",
-                "MobSnapshotResult",
             ),
-            RpcMethodDescriptor::typed(
+            RpcMethodDescriptor::basic(
                 "mob/destroy",
                 "Destroy a mob and surface the structured MobDestroyReport",
-                "MobIdParams",
-                "MobDestroyResult",
             ),
-            RpcMethodDescriptor::typed(
+            RpcMethodDescriptor::basic(
                 "mob/rotate_supervisor",
                 "Rotate the supervisor bridge for all members of a mob",
-                "MobIdParams",
-                "MobRotateSupervisorResult",
             ),
             RpcMethodDescriptor::typed(
                 "mob/submit_work",
@@ -630,72 +558,31 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
                 "MobSubmitWorkParams",
                 "MobSubmitWorkResult",
             ),
-            RpcMethodDescriptor::typed(
+            RpcMethodDescriptor::params_only(
                 "mob/cancel_work",
                 "Cancel a previously submitted unit of work",
                 "MobCancelWorkParams",
-                "MobCancelWorkResult",
             ),
-            RpcMethodDescriptor::typed(
+            RpcMethodDescriptor::params_only(
                 "mob/cancel_all_work",
                 "Cancel all in-flight work for a mob member",
                 "MobCancelAllWorkParams",
-                "MobCancelAllWorkResult",
             ),
-            RpcMethodDescriptor::typed(
+            RpcMethodDescriptor::basic(
                 "mob/wait_kickoff",
                 "Wait for kickoff completion for a member",
-                "MobWaitKickoffParams",
-                "MobWaitKickoffResult",
             ),
-            RpcMethodDescriptor::typed(
+            RpcMethodDescriptor::basic(
                 "mob/wait_ready",
                 "Wait for mob startup readiness (members bound but kickoff not required)",
-                "MobWaitReadyParams",
-                "MobWaitReadyResult",
             ),
-            RpcMethodDescriptor::typed(
-                "mob/profile/create",
-                "Create a realm-scoped mob profile",
-                "MobProfileCreateParams",
-                "MobProfileCreateResult",
-            ),
-            RpcMethodDescriptor::typed(
-                "mob/profile/get",
-                "Read a realm-scoped mob profile",
-                "MobProfileGetParams",
-                "MobProfileGetResult",
-            ),
-            RpcMethodDescriptor::typed(
-                "mob/profile/list",
-                "List realm-scoped mob profiles",
-                "MobProfileListParams",
-                "MobProfileListResult",
-            ),
-            RpcMethodDescriptor::typed(
-                "mob/profile/update",
-                "Update a realm-scoped mob profile",
-                "MobProfileUpdateParams",
-                "MobProfileUpdateResult",
-            ),
-            RpcMethodDescriptor::typed(
-                "mob/profile/delete",
-                "Delete a realm-scoped mob profile",
-                "MobProfileDeleteParams",
-                "MobProfileDeleteResult",
-            ),
-            RpcMethodDescriptor::typed(
-                "mob/stream_open",
-                "Open a mob event stream",
-                "MobStreamOpenParams",
-                "MobStreamOpenResult",
-            ),
-            RpcMethodDescriptor::typed(
-                "mob/stream_close",
-                "Close a mob event stream",
-                "MobStreamCloseParams",
-                "MobStreamCloseResult",
-            ),
+            RpcMethodDescriptor::basic("mob/profile/create", "Create a realm-scoped mob profile"),
+            RpcMethodDescriptor::basic("mob/profile/get", "Read a realm-scoped mob profile"),
+            RpcMethodDescriptor::basic("mob/profile/list", "List realm-scoped mob profiles"),
+            RpcMethodDescriptor::basic("mob/profile/update", "Update a realm-scoped mob profile"),
+            RpcMethodDescriptor::basic("mob/profile/delete", "Delete a realm-scoped mob profile"),
+            RpcMethodDescriptor::basic("mob/stream_open", "Open a mob event stream"),
+            RpcMethodDescriptor::basic("mob/stream_close", "Close a mob event stream"),
         ]);
     }
 
@@ -987,133 +874,111 @@ mod tests {
     }
 
     #[test]
-    fn mob_methods_advertise_concrete_request_and_response_contracts() {
+    fn mob_methods_advertise_only_real_exported_contracts() {
         let methods = rpc_method_catalog(RpcMethodCatalogOptions::documented_surface());
         for (name, expected_params_type, expected_result_type) in [
-            ("mob/list", "MobListParams", "MobListResult"),
-            ("mob/status", "MobIdParams", "MobStatusResult"),
-            ("mob/lifecycle", "MobLifecycleParams", "MobLifecycleResult"),
-            ("mob/spawn", "MobSpawnParams", "MobSpawnResult"),
-            ("mob/spawn_many", "MobSpawnManyParams", "MobSpawnManyResult"),
-            ("mob/retire", "MobMemberParams", "MobRetireResult"),
-            ("mob/respawn", "MobRespawnParams", "MobRespawnResult"),
-            ("mob/members", "MobMembersParams", "MobMembersResult"),
-            ("mob/events", "MobEventsParams", "MobEventsResult"),
             (
-                "mob/append_system_context",
-                "MobAppendSystemContextParams",
-                "MobAppendSystemContextResult",
+                "mob/create",
+                Some("MobCreateParams"),
+                Some("MobCreateResult"),
             ),
-            ("mob/flows", "MobFlowsParams", "MobFlowsResult"),
-            ("mob/flow_run", "MobFlowRunParams", "MobFlowRunResult"),
+            ("mob/lifecycle", Some("MobLifecycleParams"), None),
             (
-                "mob/flow_status",
-                "MobFlowStatusParams",
-                "MobFlowStatusResult",
+                "mob/ensure_member",
+                Some("MobEnsureMemberParams"),
+                Some("MobEnsureMemberResult"),
             ),
             (
-                "mob/flow_cancel",
-                "MobFlowCancelParams",
-                "MobFlowCancelResult",
+                "mob/reconcile",
+                Some("MobReconcileParams"),
+                Some("MobReconcileResult"),
             ),
             (
-                "mob/spawn_helper",
-                "MobSpawnHelperParams",
-                "MobSpawnHelperResult",
+                "mob/list_members_matching",
+                Some("MobListMembersMatchingParams"),
+                Some("MobListMembersMatchingResult"),
+            ),
+            ("mob/wire", Some("MobWireParams"), Some("MobWireResult")),
+            (
+                "mob/unwire",
+                Some("MobUnwireParams"),
+                Some("MobUnwireResult"),
             ),
             (
-                "mob/fork_helper",
-                "MobForkHelperParams",
-                "MobForkHelperResult",
+                "mob/member_send",
+                Some("MobMemberSendParams"),
+                Some("MobMemberSendResult"),
             ),
             (
-                "mob/force_cancel",
-                "MobMemberParams",
-                "MobForceCancelResult",
-            ),
-            ("mob/turn_start", "MobTurnStartParams", "WireRunResult"),
-            (
-                "mob/member_status",
-                "MobMemberParams",
-                "MobMemberStatusResult",
-            ),
-            ("mob/snapshot", "MobIdParams", "MobSnapshotResult"),
-            ("mob/destroy", "MobIdParams", "MobDestroyResult"),
-            (
-                "mob/rotate_supervisor",
-                "MobIdParams",
-                "MobRotateSupervisorResult",
+                "mob/ingress_interaction",
+                Some("MobIngressInteractionParams"),
+                Some("MobIngressInteractionResult"),
             ),
             (
                 "mob/submit_work",
-                "MobSubmitWorkParams",
-                "MobSubmitWorkResult",
+                Some("MobSubmitWorkParams"),
+                Some("MobSubmitWorkResult"),
             ),
-            (
-                "mob/cancel_work",
-                "MobCancelWorkParams",
-                "MobCancelWorkResult",
-            ),
-            (
-                "mob/cancel_all_work",
-                "MobCancelAllWorkParams",
-                "MobCancelAllWorkResult",
-            ),
-            (
-                "mob/wait_kickoff",
-                "MobWaitKickoffParams",
-                "MobWaitKickoffResult",
-            ),
-            ("mob/wait_ready", "MobWaitReadyParams", "MobWaitReadyResult"),
-            (
-                "mob/profile/create",
-                "MobProfileCreateParams",
-                "MobProfileCreateResult",
-            ),
-            (
-                "mob/profile/get",
-                "MobProfileGetParams",
-                "MobProfileGetResult",
-            ),
-            (
-                "mob/profile/list",
-                "MobProfileListParams",
-                "MobProfileListResult",
-            ),
-            (
-                "mob/profile/update",
-                "MobProfileUpdateParams",
-                "MobProfileUpdateResult",
-            ),
-            (
-                "mob/profile/delete",
-                "MobProfileDeleteParams",
-                "MobProfileDeleteResult",
-            ),
-            (
-                "mob/stream_open",
-                "MobStreamOpenParams",
-                "MobStreamOpenResult",
-            ),
-            (
-                "mob/stream_close",
-                "MobStreamCloseParams",
-                "MobStreamCloseResult",
-            ),
+            ("mob/cancel_work", Some("MobCancelWorkParams"), None),
+            ("mob/cancel_all_work", Some("MobCancelAllWorkParams"), None),
         ] {
             let descriptor = methods
                 .iter()
                 .find(|method| method.name == name)
                 .unwrap_or_else(|| panic!("missing descriptor for {name}"));
             assert_eq!(
-                descriptor.params_type,
-                Some(expected_params_type),
+                descriptor.params_type, expected_params_type,
                 "{name} must advertise its concrete params type"
             );
             assert_eq!(
-                descriptor.result_type,
-                Some(expected_result_type),
+                descriptor.result_type, expected_result_type,
                 "{name} must advertise its concrete result type"
+            );
+        }
+
+        for name in [
+            "mob/list",
+            "mob/status",
+            "mob/spawn",
+            "mob/spawn_many",
+            "mob/retire",
+            "mob/respawn",
+            "mob/members",
+            "mob/events",
+            "mob/append_system_context",
+            "mob/flows",
+            "mob/flow_run",
+            "mob/flow_status",
+            "mob/flow_cancel",
+            "mob/spawn_helper",
+            "mob/fork_helper",
+            "mob/force_cancel",
+            "mob/turn_start",
+            "mob/member_status",
+            "mob/snapshot",
+            "mob/destroy",
+            "mob/rotate_supervisor",
+            "mob/wait_kickoff",
+            "mob/wait_ready",
+            "mob/profile/create",
+            "mob/profile/get",
+            "mob/profile/list",
+            "mob/profile/update",
+            "mob/profile/delete",
+            "mob/stream_open",
+            "mob/stream_close",
+        ] {
+            let descriptor = methods
+                .iter()
+                .find(|method| method.name == name)
+                .unwrap_or_else(|| panic!("missing descriptor for {name}"));
+            assert_eq!(
+                descriptor.params_type, None,
+                "{name} must not advertise unresolved params contracts"
+            );
+            assert_eq!(
+                descriptor.result_type, None,
+                "{name} must not advertise unresolved result contracts"
             );
         }
     }

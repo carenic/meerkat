@@ -347,33 +347,24 @@
     },
     {
       "description": "List active mobs",
-      "name": "mob/list",
-      "params_type": "MobListParams",
-      "result_type": "MobListResult"
+      "name": "mob/list"
     },
     {
       "description": "Get mob lifecycle status",
-      "name": "mob/status",
-      "params_type": "MobIdParams",
-      "result_type": "MobStatusResult"
+      "name": "mob/status"
     },
     {
       "description": "Apply a mob lifecycle action",
       "name": "mob/lifecycle",
-      "params_type": "MobLifecycleParams",
-      "result_type": "MobLifecycleResult"
+      "params_type": "MobLifecycleParams"
     },
     {
       "description": "Spawn a new mob member",
-      "name": "mob/spawn",
-      "params_type": "MobSpawnParams",
-      "result_type": "MobSpawnResult"
+      "name": "mob/spawn"
     },
     {
       "description": "Spawn multiple new mob members",
-      "name": "mob/spawn_many",
-      "params_type": "MobSpawnManyParams",
-      "result_type": "MobSpawnManyResult"
+      "name": "mob/spawn_many"
     },
     {
       "description": "Declarative: spawn if absent, otherwise return the existing roster entry",
@@ -395,15 +386,11 @@
     },
     {
       "description": "Retire a mob member",
-      "name": "mob/retire",
-      "params_type": "MobMemberParams",
-      "result_type": "MobRetireResult"
+      "name": "mob/retire"
     },
     {
       "description": "Respawn a mob member with topology restore",
-      "name": "mob/respawn",
-      "params_type": "MobRespawnParams",
-      "result_type": "MobRespawnResult"
+      "name": "mob/respawn"
     },
     {
       "description": "Wire a local mob member to a local or external peer",
@@ -419,15 +406,11 @@
     },
     {
       "description": "List members in a mob roster",
-      "name": "mob/members",
-      "params_type": "MobMembersParams",
-      "result_type": "MobMembersResult"
+      "name": "mob/members"
     },
     {
       "description": "Read mob event history",
-      "name": "mob/events",
-      "params_type": "MobEventsParams",
-      "result_type": "MobEventsResult"
+      "name": "mob/events"
     },
     {
       "description": "Deliver ordinary content to a specific mob member via the host control plane",
@@ -443,81 +426,55 @@
     },
     {
       "description": "Append system context for a mob member",
-      "name": "mob/append_system_context",
-      "params_type": "MobAppendSystemContextParams",
-      "result_type": "MobAppendSystemContextResult"
+      "name": "mob/append_system_context"
     },
     {
       "description": "List flows defined for a mob",
-      "name": "mob/flows",
-      "params_type": "MobFlowsParams",
-      "result_type": "MobFlowsResult"
+      "name": "mob/flows"
     },
     {
       "description": "Start a mob flow run",
-      "name": "mob/flow_run",
-      "params_type": "MobFlowRunParams",
-      "result_type": "MobFlowRunResult"
+      "name": "mob/flow_run"
     },
     {
       "description": "Get status for a mob flow run",
-      "name": "mob/flow_status",
-      "params_type": "MobFlowStatusParams",
-      "result_type": "MobFlowStatusResult"
+      "name": "mob/flow_status"
     },
     {
       "description": "Cancel a mob flow run",
-      "name": "mob/flow_cancel",
-      "params_type": "MobFlowCancelParams",
-      "result_type": "MobFlowCancelResult"
+      "name": "mob/flow_cancel"
     },
     {
       "description": "Spawn a helper member and wait for completion",
-      "name": "mob/spawn_helper",
-      "params_type": "MobSpawnHelperParams",
-      "result_type": "MobSpawnHelperResult"
+      "name": "mob/spawn_helper"
     },
     {
       "description": "Fork a helper member and wait for completion",
-      "name": "mob/fork_helper",
-      "params_type": "MobForkHelperParams",
-      "result_type": "MobForkHelperResult"
+      "name": "mob/fork_helper"
     },
     {
       "description": "Force-cancel a mob member",
-      "name": "mob/force_cancel",
-      "params_type": "MobMemberParams",
-      "result_type": "MobForceCancelResult"
+      "name": "mob/force_cancel"
     },
     {
       "description": "Start a turn on a mob member by identity",
-      "name": "mob/turn_start",
-      "params_type": "MobTurnStartParams",
-      "result_type": "WireRunResult"
+      "name": "mob/turn_start"
     },
     {
       "description": "Get live status for a mob member",
-      "name": "mob/member_status",
-      "params_type": "MobMemberParams",
-      "result_type": "MobMemberStatusResult"
+      "name": "mob/member_status"
     },
     {
       "description": "Point-in-time aggregate of mob status plus member list",
-      "name": "mob/snapshot",
-      "params_type": "MobIdParams",
-      "result_type": "MobSnapshotResult"
+      "name": "mob/snapshot"
     },
     {
       "description": "Destroy a mob and surface the structured MobDestroyReport",
-      "name": "mob/destroy",
-      "params_type": "MobIdParams",
-      "result_type": "MobDestroyResult"
+      "name": "mob/destroy"
     },
     {
       "description": "Rotate the supervisor bridge for all members of a mob",
-      "name": "mob/rotate_supervisor",
-      "params_type": "MobIdParams",
-      "result_type": "MobRotateSupervisorResult"
+      "name": "mob/rotate_supervisor"
     },
     {
       "description": "Submit a unit of work to a mob member through the work lane",
@@ -528,68 +485,48 @@
     {
       "description": "Cancel a previously submitted unit of work",
       "name": "mob/cancel_work",
-      "params_type": "MobCancelWorkParams",
-      "result_type": "MobCancelWorkResult"
+      "params_type": "MobCancelWorkParams"
     },
     {
       "description": "Cancel all in-flight work for a mob member",
       "name": "mob/cancel_all_work",
-      "params_type": "MobCancelAllWorkParams",
-      "result_type": "MobCancelAllWorkResult"
+      "params_type": "MobCancelAllWorkParams"
     },
     {
       "description": "Wait for kickoff completion for a member",
-      "name": "mob/wait_kickoff",
-      "params_type": "MobWaitKickoffParams",
-      "result_type": "MobWaitKickoffResult"
+      "name": "mob/wait_kickoff"
     },
     {
       "description": "Wait for mob startup readiness (members bound but kickoff not required)",
-      "name": "mob/wait_ready",
-      "params_type": "MobWaitReadyParams",
-      "result_type": "MobWaitReadyResult"
+      "name": "mob/wait_ready"
     },
     {
       "description": "Create a realm-scoped mob profile",
-      "name": "mob/profile/create",
-      "params_type": "MobProfileCreateParams",
-      "result_type": "MobProfileCreateResult"
+      "name": "mob/profile/create"
     },
     {
       "description": "Read a realm-scoped mob profile",
-      "name": "mob/profile/get",
-      "params_type": "MobProfileGetParams",
-      "result_type": "MobProfileGetResult"
+      "name": "mob/profile/get"
     },
     {
       "description": "List realm-scoped mob profiles",
-      "name": "mob/profile/list",
-      "params_type": "MobProfileListParams",
-      "result_type": "MobProfileListResult"
+      "name": "mob/profile/list"
     },
     {
       "description": "Update a realm-scoped mob profile",
-      "name": "mob/profile/update",
-      "params_type": "MobProfileUpdateParams",
-      "result_type": "MobProfileUpdateResult"
+      "name": "mob/profile/update"
     },
     {
       "description": "Delete a realm-scoped mob profile",
-      "name": "mob/profile/delete",
-      "params_type": "MobProfileDeleteParams",
-      "result_type": "MobProfileDeleteResult"
+      "name": "mob/profile/delete"
     },
     {
       "description": "Open a mob event stream",
-      "name": "mob/stream_open",
-      "params_type": "MobStreamOpenParams",
-      "result_type": "MobStreamOpenResult"
+      "name": "mob/stream_open"
     },
     {
       "description": "Close a mob event stream",
-      "name": "mob/stream_close",
-      "params_type": "MobStreamCloseParams",
-      "result_type": "MobStreamCloseResult"
+      "name": "mob/stream_close"
     },
     {
       "description": "Stage live MCP server add for a session",

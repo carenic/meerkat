@@ -322,6 +322,46 @@
     "title": "McpRemoveParams",
     "type": "object"
   },
+  "MobCancelAllWorkParams": {
+    "$defs": {
+      "WireMemberRef": {
+        "description": "Server-resolved opaque handle for a mob member.\n\nEncodes `{mob_id, agent_identity}` as a single base64url-encoded token\nthat callers treat as opaque. The server resolves the current\n`AgentRuntimeId` and fence token against the live mob roster on every\ndispatch — clients never reason about `generation` or `fence_token`\ndirectly.\n\nUse [`WireMemberRef::encode`] to produce a token and\n[`WireMemberRef::decode`] inside an RPC handler to recover the\n`(mob_id, agent_identity)` pair before resolving against the runtime.",
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request payload for `mob/cancel_all_work`.",
+    "properties": {
+      "member_ref": {
+        "$ref": "#/$defs/WireMemberRef"
+      }
+    },
+    "required": [
+      "member_ref"
+    ],
+    "title": "MobCancelAllWorkParams",
+    "type": "object"
+  },
+  "MobCancelWorkParams": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request payload for `mob/cancel_work`.",
+    "properties": {
+      "mob_id": {
+        "type": "string"
+      },
+      "work_ref": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "mob_id",
+      "work_ref"
+    ],
+    "title": "MobCancelWorkParams",
+    "type": "object"
+  },
   "MobCreateParams": {
     "$defs": {
       "MeerkatSchema": {
@@ -1712,6 +1752,1575 @@
       "definition"
     ],
     "title": "MobCreateParams",
+    "type": "object"
+  },
+  "MobEnsureMemberParams": {
+    "$defs": {
+      "BridgeBootstrapToken": {
+        "description": "One-time bootstrap proof exchanged between a mob supervisor and a\nmember runtime on initial bind.\n\nTransparent over the wire (`#[serde(transparent)]` — a bare JSON string),\nbut carries a redacting `Debug` impl and has no `Display` impl so the\nraw secret cannot accidentally land in logs or panic messages. Treat it\nlike an API key: read `as_str()` only at the comms/transport boundary.",
+        "type": "string"
+      },
+      "MobMemberSpecWire": {
+        "description": "Per-member spec for `mob/ensure_member` and the `desired` entries of\n`mob/reconcile`.\n\nMirrors the essential, codegen-friendly fields of\n[`meerkat_mob::SpawnMemberSpec`]. Complex sub-types (tool access policy,\nbudget split, inherited tool filter, override profile) are not on this\nwire surface — callers that need that parity should use the non-declarative\n`mob/spawn` method.",
+        "properties": {
+          "additional_instructions": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "agent_identity": {
+            "description": "Stable member identity within the mob.",
+            "type": "string"
+          },
+          "auto_wire_parent": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "backend": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireMobBackendKind"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "binding": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireRuntimeBinding"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "context": true,
+          "initial_message": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireContentInput"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "profile": {
+            "description": "Profile name (role) in the mob definition.",
+            "type": "string"
+          },
+          "runtime_mode": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireMobRuntimeMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "profile",
+          "agent_identity"
+        ],
+        "type": "object"
+      },
+      "WireContentBlock": {
+        "description": "Wire-safe content block (no `source_path` — internal only).",
+        "oneOf": [
+          {
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "const": "text",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "text"
+            ],
+            "type": "object"
+          },
+          {
+            "oneOf": [
+              {
+                "properties": {
+                  "data": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "const": "inline",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "data"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "blob_id": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "const": "blob",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "blob_id"
+                ],
+                "type": "object"
+              }
+            ],
+            "properties": {
+              "media_type": {
+                "type": "string"
+              },
+              "type": {
+                "const": "image",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "media_type"
+            ],
+            "type": "object"
+          },
+          {
+            "oneOf": [
+              {
+                "properties": {
+                  "data": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "const": "inline",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "data"
+                ],
+                "type": "object"
+              }
+            ],
+            "properties": {
+              "duration_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "media_type": {
+                "type": "string"
+              },
+              "type": {
+                "const": "video",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "media_type",
+              "duration_ms"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Forward-compatibility for unknown block types.",
+            "properties": {
+              "type": {
+                "const": "unknown",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WireContentInput": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "items": {
+              "$ref": "#/$defs/WireContentBlock"
+            },
+            "type": "array"
+          }
+        ],
+        "description": "Wire-safe content input (mirrors `ContentInput`)."
+      },
+      "WireMobBackendKind": {
+        "enum": [
+          "session",
+          "external"
+        ],
+        "type": "string"
+      },
+      "WireMobRuntimeMode": {
+        "enum": [
+          "autonomous_host",
+          "turn_driven"
+        ],
+        "type": "string"
+      },
+      "WireRuntimeBinding": {
+        "description": "Runtime binding for spawn requests.\n\nFirst step toward identity-first mobs. Carries backend-specific binding\ndetails at spawn time. `External` requires real process identity.",
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "session",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "address": {
+                "type": "string"
+              },
+              "bootstrap_token": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/BridgeBootstrapToken"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "kind": {
+                "const": "external",
+                "type": "string"
+              },
+              "peer_id": {
+                "type": "string"
+              },
+              "pubkey": {
+                "description": "Ed25519 signing pubkey (32 bytes) of the external peer. Required\nfor the supervisor to install a non-zero-pubkey trust entry so\nreal-comms signed-envelope replies admit past ingress trust\ncheck. Absent on legacy bindings that pre-date pubkey plumbing.",
+                "items": {
+                  "format": "uint8",
+                  "maximum": 255,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "maxItems": 32,
+                "minItems": 32,
+                "type": [
+                  "array",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "peer_id",
+              "address"
+            ],
+            "type": "object"
+          }
+        ]
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request payload for `mob/ensure_member`.",
+    "properties": {
+      "mob_id": {
+        "type": "string"
+      },
+      "spec": {
+        "$ref": "#/$defs/MobMemberSpecWire"
+      }
+    },
+    "required": [
+      "mob_id",
+      "spec"
+    ],
+    "title": "MobEnsureMemberParams",
+    "type": "object"
+  },
+  "MobIngressInteractionParams": {
+    "$defs": {
+      "BridgeBootstrapToken": {
+        "description": "One-time bootstrap proof exchanged between a mob supervisor and a\nmember runtime on initial bind.\n\nTransparent over the wire (`#[serde(transparent)]` — a bare JSON string),\nbut carries a redacting `Debug` impl and has no `Display` impl so the\nraw secret cannot accidentally land in logs or panic messages. Treat it\nlike an API key: read `as_str()` only at the comms/transport boundary.",
+        "type": "string"
+      },
+      "MobMemberSpecWire": {
+        "description": "Per-member spec for `mob/ensure_member` and the `desired` entries of\n`mob/reconcile`.\n\nMirrors the essential, codegen-friendly fields of\n[`meerkat_mob::SpawnMemberSpec`]. Complex sub-types (tool access policy,\nbudget split, inherited tool filter, override profile) are not on this\nwire surface — callers that need that parity should use the non-declarative\n`mob/spawn` method.",
+        "properties": {
+          "additional_instructions": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "agent_identity": {
+            "description": "Stable member identity within the mob.",
+            "type": "string"
+          },
+          "auto_wire_parent": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "backend": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireMobBackendKind"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "binding": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireRuntimeBinding"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "context": true,
+          "initial_message": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireContentInput"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "profile": {
+            "description": "Profile name (role) in the mob definition.",
+            "type": "string"
+          },
+          "runtime_mode": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireMobRuntimeMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "profile",
+          "agent_identity"
+        ],
+        "type": "object"
+      },
+      "WireContentBlock": {
+        "description": "Wire-safe content block (no `source_path` — internal only).",
+        "oneOf": [
+          {
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "const": "text",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "text"
+            ],
+            "type": "object"
+          },
+          {
+            "oneOf": [
+              {
+                "properties": {
+                  "data": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "const": "inline",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "data"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "blob_id": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "const": "blob",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "blob_id"
+                ],
+                "type": "object"
+              }
+            ],
+            "properties": {
+              "media_type": {
+                "type": "string"
+              },
+              "type": {
+                "const": "image",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "media_type"
+            ],
+            "type": "object"
+          },
+          {
+            "oneOf": [
+              {
+                "properties": {
+                  "data": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "const": "inline",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "data"
+                ],
+                "type": "object"
+              }
+            ],
+            "properties": {
+              "duration_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "media_type": {
+                "type": "string"
+              },
+              "type": {
+                "const": "video",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "media_type",
+              "duration_ms"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Forward-compatibility for unknown block types.",
+            "properties": {
+              "type": {
+                "const": "unknown",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WireContentInput": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "items": {
+              "$ref": "#/$defs/WireContentBlock"
+            },
+            "type": "array"
+          }
+        ],
+        "description": "Wire-safe content input (mirrors `ContentInput`)."
+      },
+      "WireHandlingMode": {
+        "description": "Public handling mode for mob member delivery.",
+        "enum": [
+          "queue",
+          "steer"
+        ],
+        "type": "string"
+      },
+      "WireMobBackendKind": {
+        "enum": [
+          "session",
+          "external"
+        ],
+        "type": "string"
+      },
+      "WireMobRuntimeMode": {
+        "enum": [
+          "autonomous_host",
+          "turn_driven"
+        ],
+        "type": "string"
+      },
+      "WireRenderClass": {
+        "description": "Public render class contract for mob member delivery.",
+        "enum": [
+          "user_prompt",
+          "peer_message",
+          "peer_request",
+          "peer_response",
+          "external_event",
+          "flow_step",
+          "continuation",
+          "system_notice",
+          "tool_scope_notice",
+          "ops_progress"
+        ],
+        "type": "string"
+      },
+      "WireRenderMetadata": {
+        "description": "Public render metadata contract for mob member delivery.",
+        "properties": {
+          "class": {
+            "$ref": "#/$defs/WireRenderClass"
+          },
+          "salience": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireRenderSalience"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "class"
+        ],
+        "type": "object"
+      },
+      "WireRenderSalience": {
+        "description": "Public render salience contract for mob member delivery.",
+        "enum": [
+          "background",
+          "normal",
+          "important",
+          "urgent"
+        ],
+        "type": "string"
+      },
+      "WireRuntimeBinding": {
+        "description": "Runtime binding for spawn requests.\n\nFirst step toward identity-first mobs. Carries backend-specific binding\ndetails at spawn time. `External` requires real process identity.",
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "session",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "address": {
+                "type": "string"
+              },
+              "bootstrap_token": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/BridgeBootstrapToken"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "kind": {
+                "const": "external",
+                "type": "string"
+              },
+              "peer_id": {
+                "type": "string"
+              },
+              "pubkey": {
+                "description": "Ed25519 signing pubkey (32 bytes) of the external peer. Required\nfor the supervisor to install a non-zero-pubkey trust entry so\nreal-comms signed-envelope replies admit past ingress trust\ncheck. Absent on legacy bindings that pre-date pubkey plumbing.",
+                "items": {
+                  "format": "uint8",
+                  "maximum": 255,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "maxItems": 32,
+                "minItems": 32,
+                "type": [
+                  "array",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "peer_id",
+              "address"
+            ],
+            "type": "object"
+          }
+        ]
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request payload for `mob/ingress_interaction`.\n\nThis is the ergonomic \"ensure an ingress member, then deliver user input\"\npath. It composes the existing declarative roster and member-send\nsemantics without introducing a separate thread/project runtime.",
+    "properties": {
+      "content": {
+        "$ref": "#/$defs/WireContentInput"
+      },
+      "handling_mode": {
+        "$ref": "#/$defs/WireHandlingMode",
+        "default": "queue"
+      },
+      "mob_id": {
+        "type": "string"
+      },
+      "render_metadata": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/WireRenderMetadata"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "spec": {
+        "$ref": "#/$defs/MobMemberSpecWire"
+      }
+    },
+    "required": [
+      "mob_id",
+      "spec",
+      "content"
+    ],
+    "title": "MobIngressInteractionParams",
+    "type": "object"
+  },
+  "MobLifecycleParams": {
+    "$defs": {
+      "WireMobLifecycleAction": {
+        "description": "Typed lifecycle action for `mob/lifecycle`. Replaces the prior\n`action: String` discriminator with an exhaustive enum so callers and\nhandlers reason about lifecycle transitions through the type system\nrather than string folklore.",
+        "enum": [
+          "stop",
+          "resume",
+          "complete",
+          "reset",
+          "destroy"
+        ],
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request payload for `mob/lifecycle`.",
+    "properties": {
+      "action": {
+        "$ref": "#/$defs/WireMobLifecycleAction"
+      },
+      "mob_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "mob_id",
+      "action"
+    ],
+    "title": "MobLifecycleParams",
+    "type": "object"
+  },
+  "MobListMembersMatchingParams": {
+    "$defs": {
+      "MobMemberFilterWire": {
+        "additionalProperties": false,
+        "description": "Filter for `mob/list_members_matching`. Non-empty / `Some` fields are\ncombined conjunctively; an empty filter matches every member.",
+        "properties": {
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "description": "Required exact matches on member labels.",
+            "type": "object"
+          },
+          "role": {
+            "description": "Required profile name (role).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "state": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireMemberState"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Required roster state."
+          }
+        },
+        "type": "object"
+      },
+      "WireMemberState": {
+        "description": "Roster member lifecycle state for `MobMemberFilterWire`.",
+        "enum": [
+          "active",
+          "retiring"
+        ],
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request payload for `mob/list_members_matching`.",
+    "properties": {
+      "filter": {
+        "$ref": "#/$defs/MobMemberFilterWire",
+        "default": {}
+      },
+      "mob_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "mob_id"
+    ],
+    "title": "MobListMembersMatchingParams",
+    "type": "object"
+  },
+  "MobMemberSendParams": {
+    "$defs": {
+      "WireContentBlock": {
+        "description": "Wire-safe content block (no `source_path` — internal only).",
+        "oneOf": [
+          {
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "const": "text",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "text"
+            ],
+            "type": "object"
+          },
+          {
+            "oneOf": [
+              {
+                "properties": {
+                  "data": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "const": "inline",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "data"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "blob_id": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "const": "blob",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "blob_id"
+                ],
+                "type": "object"
+              }
+            ],
+            "properties": {
+              "media_type": {
+                "type": "string"
+              },
+              "type": {
+                "const": "image",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "media_type"
+            ],
+            "type": "object"
+          },
+          {
+            "oneOf": [
+              {
+                "properties": {
+                  "data": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "const": "inline",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "data"
+                ],
+                "type": "object"
+              }
+            ],
+            "properties": {
+              "duration_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "media_type": {
+                "type": "string"
+              },
+              "type": {
+                "const": "video",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "media_type",
+              "duration_ms"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Forward-compatibility for unknown block types.",
+            "properties": {
+              "type": {
+                "const": "unknown",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WireContentInput": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "items": {
+              "$ref": "#/$defs/WireContentBlock"
+            },
+            "type": "array"
+          }
+        ],
+        "description": "Wire-safe content input (mirrors `ContentInput`)."
+      },
+      "WireHandlingMode": {
+        "description": "Public handling mode for mob member delivery.",
+        "enum": [
+          "queue",
+          "steer"
+        ],
+        "type": "string"
+      },
+      "WireRenderClass": {
+        "description": "Public render class contract for mob member delivery.",
+        "enum": [
+          "user_prompt",
+          "peer_message",
+          "peer_request",
+          "peer_response",
+          "external_event",
+          "flow_step",
+          "continuation",
+          "system_notice",
+          "tool_scope_notice",
+          "ops_progress"
+        ],
+        "type": "string"
+      },
+      "WireRenderMetadata": {
+        "description": "Public render metadata contract for mob member delivery.",
+        "properties": {
+          "class": {
+            "$ref": "#/$defs/WireRenderClass"
+          },
+          "salience": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireRenderSalience"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "class"
+        ],
+        "type": "object"
+      },
+      "WireRenderSalience": {
+        "description": "Public render salience contract for mob member delivery.",
+        "enum": [
+          "background",
+          "normal",
+          "important",
+          "urgent"
+        ],
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request payload for host-side mob member delivery.",
+    "properties": {
+      "agent_identity": {
+        "type": "string"
+      },
+      "content": {
+        "$ref": "#/$defs/WireContentInput"
+      },
+      "handling_mode": {
+        "$ref": "#/$defs/WireHandlingMode",
+        "default": "queue"
+      },
+      "mob_id": {
+        "type": "string"
+      },
+      "render_metadata": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/WireRenderMetadata"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      }
+    },
+    "required": [
+      "mob_id",
+      "agent_identity",
+      "content"
+    ],
+    "title": "MobMemberSendParams",
+    "type": "object"
+  },
+  "MobReconcileParams": {
+    "$defs": {
+      "BridgeBootstrapToken": {
+        "description": "One-time bootstrap proof exchanged between a mob supervisor and a\nmember runtime on initial bind.\n\nTransparent over the wire (`#[serde(transparent)]` — a bare JSON string),\nbut carries a redacting `Debug` impl and has no `Display` impl so the\nraw secret cannot accidentally land in logs or panic messages. Treat it\nlike an API key: read `as_str()` only at the comms/transport boundary.",
+        "type": "string"
+      },
+      "MobMemberSpecWire": {
+        "description": "Per-member spec for `mob/ensure_member` and the `desired` entries of\n`mob/reconcile`.\n\nMirrors the essential, codegen-friendly fields of\n[`meerkat_mob::SpawnMemberSpec`]. Complex sub-types (tool access policy,\nbudget split, inherited tool filter, override profile) are not on this\nwire surface — callers that need that parity should use the non-declarative\n`mob/spawn` method.",
+        "properties": {
+          "additional_instructions": {
+            "items": {
+              "type": "string"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "agent_identity": {
+            "description": "Stable member identity within the mob.",
+            "type": "string"
+          },
+          "auto_wire_parent": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
+          "backend": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireMobBackendKind"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "binding": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireRuntimeBinding"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "context": true,
+          "initial_message": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireContentInput"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "profile": {
+            "description": "Profile name (role) in the mob definition.",
+            "type": "string"
+          },
+          "runtime_mode": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/WireMobRuntimeMode"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "profile",
+          "agent_identity"
+        ],
+        "type": "object"
+      },
+      "MobReconcileOptionsWire": {
+        "additionalProperties": false,
+        "description": "Options controlling a `mob/reconcile` pass.",
+        "properties": {
+          "retire_stale": {
+            "default": false,
+            "description": "When `true`, members on the roster whose identity is not in the\n`desired` set are retired.",
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "WireContentBlock": {
+        "description": "Wire-safe content block (no `source_path` — internal only).",
+        "oneOf": [
+          {
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "const": "text",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "text"
+            ],
+            "type": "object"
+          },
+          {
+            "oneOf": [
+              {
+                "properties": {
+                  "data": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "const": "inline",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "data"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "blob_id": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "const": "blob",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "blob_id"
+                ],
+                "type": "object"
+              }
+            ],
+            "properties": {
+              "media_type": {
+                "type": "string"
+              },
+              "type": {
+                "const": "image",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "media_type"
+            ],
+            "type": "object"
+          },
+          {
+            "oneOf": [
+              {
+                "properties": {
+                  "data": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "const": "inline",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "data"
+                ],
+                "type": "object"
+              }
+            ],
+            "properties": {
+              "duration_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "media_type": {
+                "type": "string"
+              },
+              "type": {
+                "const": "video",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "media_type",
+              "duration_ms"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Forward-compatibility for unknown block types.",
+            "properties": {
+              "type": {
+                "const": "unknown",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WireContentInput": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "items": {
+              "$ref": "#/$defs/WireContentBlock"
+            },
+            "type": "array"
+          }
+        ],
+        "description": "Wire-safe content input (mirrors `ContentInput`)."
+      },
+      "WireMobBackendKind": {
+        "enum": [
+          "session",
+          "external"
+        ],
+        "type": "string"
+      },
+      "WireMobRuntimeMode": {
+        "enum": [
+          "autonomous_host",
+          "turn_driven"
+        ],
+        "type": "string"
+      },
+      "WireRuntimeBinding": {
+        "description": "Runtime binding for spawn requests.\n\nFirst step toward identity-first mobs. Carries backend-specific binding\ndetails at spawn time. `External` requires real process identity.",
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "session",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "address": {
+                "type": "string"
+              },
+              "bootstrap_token": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/BridgeBootstrapToken"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "kind": {
+                "const": "external",
+                "type": "string"
+              },
+              "peer_id": {
+                "type": "string"
+              },
+              "pubkey": {
+                "description": "Ed25519 signing pubkey (32 bytes) of the external peer. Required\nfor the supervisor to install a non-zero-pubkey trust entry so\nreal-comms signed-envelope replies admit past ingress trust\ncheck. Absent on legacy bindings that pre-date pubkey plumbing.",
+                "items": {
+                  "format": "uint8",
+                  "maximum": 255,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "maxItems": 32,
+                "minItems": 32,
+                "type": [
+                  "array",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "kind",
+              "peer_id",
+              "address"
+            ],
+            "type": "object"
+          }
+        ]
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request payload for `mob/reconcile`.",
+    "properties": {
+      "desired": {
+        "default": [],
+        "items": {
+          "$ref": "#/$defs/MobMemberSpecWire"
+        },
+        "type": "array"
+      },
+      "mob_id": {
+        "type": "string"
+      },
+      "options": {
+        "$ref": "#/$defs/MobReconcileOptionsWire",
+        "default": {
+          "retire_stale": false
+        }
+      }
+    },
+    "required": [
+      "mob_id"
+    ],
+    "title": "MobReconcileParams",
+    "type": "object"
+  },
+  "MobSubmitWorkParams": {
+    "$defs": {
+      "WireContentBlock": {
+        "description": "Wire-safe content block (no `source_path` — internal only).",
+        "oneOf": [
+          {
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "const": "text",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "text"
+            ],
+            "type": "object"
+          },
+          {
+            "oneOf": [
+              {
+                "properties": {
+                  "data": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "const": "inline",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "data"
+                ],
+                "type": "object"
+              },
+              {
+                "properties": {
+                  "blob_id": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "const": "blob",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "blob_id"
+                ],
+                "type": "object"
+              }
+            ],
+            "properties": {
+              "media_type": {
+                "type": "string"
+              },
+              "type": {
+                "const": "image",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "media_type"
+            ],
+            "type": "object"
+          },
+          {
+            "oneOf": [
+              {
+                "properties": {
+                  "data": {
+                    "type": "string"
+                  },
+                  "source": {
+                    "const": "inline",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "source",
+                  "data"
+                ],
+                "type": "object"
+              }
+            ],
+            "properties": {
+              "duration_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "media_type": {
+                "type": "string"
+              },
+              "type": {
+                "const": "video",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "media_type",
+              "duration_ms"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Forward-compatibility for unknown block types.",
+            "properties": {
+              "type": {
+                "const": "unknown",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WireContentInput": {
+        "anyOf": [
+          {
+            "type": "string"
+          },
+          {
+            "items": {
+              "$ref": "#/$defs/WireContentBlock"
+            },
+            "type": "array"
+          }
+        ],
+        "description": "Wire-safe content input (mirrors `ContentInput`)."
+      },
+      "WireMemberRef": {
+        "description": "Server-resolved opaque handle for a mob member.\n\nEncodes `{mob_id, agent_identity}` as a single base64url-encoded token\nthat callers treat as opaque. The server resolves the current\n`AgentRuntimeId` and fence token against the live mob roster on every\ndispatch — clients never reason about `generation` or `fence_token`\ndirectly.\n\nUse [`WireMemberRef::encode`] to produce a token and\n[`WireMemberRef::decode`] inside an RPC handler to recover the\n`(mob_id, agent_identity)` pair before resolving against the runtime.",
+        "type": "string"
+      },
+      "WireWorkOrigin": {
+        "description": "Origin for `MobSubmitWorkParams`. Replaces the prior free-form\n`origin: Option<String>` shape.",
+        "enum": [
+          "external",
+          "internal"
+        ],
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Request payload for `mob/submit_work`.\n\nIdentifies the member through the opaque [`WireMemberRef`] handle the\nserver resolves against the live roster — callers do not pass\n`generation` or `fence_token`.",
+    "properties": {
+      "content": {
+        "$ref": "#/$defs/WireContentInput"
+      },
+      "member_ref": {
+        "$ref": "#/$defs/WireMemberRef"
+      },
+      "origin": {
+        "$ref": "#/$defs/WireWorkOrigin",
+        "default": "external"
+      },
+      "work_ref": {
+        "description": "Optional caller-supplied work reference. When absent the server\ngenerates a fresh UUID.",
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "member_ref",
+      "content"
+    ],
+    "title": "MobSubmitWorkParams",
     "type": "object"
   },
   "MobUnwireParams": {
