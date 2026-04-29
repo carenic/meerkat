@@ -1,6 +1,6 @@
 ---
 title: "Mini surfaces"
-description: "Use the shipped slim Meerkat binaries or compose your own smaller surface builds."
+description: "Use the shipped slim Meerkat binaries or compose your own custom surface builds."
 icon: "boxes-stacked"
 ---
 
@@ -10,6 +10,14 @@ Meerkat now ships two official slim binaries alongside the full product surfaces
 - `rkat-rpc-mini`
 
 These are static, capability-gated builds of the existing CLI and RPC crates. They are not separate reimplementations, and they are not runtime-dynamic command subsets.
+
+## What this guide is for
+
+Use this guide when you want:
+
+- the shipped slim binaries
+- a smaller surface for embedding or packaging
+- a starting point for custom product-surface builds
 
 ## Shipped surface tiers
 
@@ -149,3 +157,9 @@ These binaries exist because the shared surface/runtime work moved the product s
 - shared runtime materialization and binding helpers
 
 If you want to build a smaller surface than the official minis, start from those shared seams rather than forking the full batteries-included CLI.
+
+## See also
+
+- [CLI commands](/cli/commands)
+- [CD and distribution](/guides/cd-and-distribution)
+- [Reference architecture](/reference/architecture)

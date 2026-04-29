@@ -475,8 +475,11 @@ impl MeerkatMachine {
     /// runtime loop has realised an async stop into the driver's control
     /// projection. Called via `Weak<Self>` from `control_plane`.
     pub(crate) async fn notify_runtime_executor_exited(&self, session_id: &SessionId) {
-        let mut sessions = self.sessions.write().await;
-        if let Some(entry) = sessions.get_mut(session_id) {
+        let driver = {
+            let mut sessions = self.sessions.write().await;
+            let Some(entry) = sessions.get_mut(session_id) else {
+                return;
+            };
             let mut authority = entry
                 .dsl_authority
                 .lock()
@@ -491,7 +494,11 @@ impl MeerkatMachine {
                     "DSL rejected RuntimeExecutorExited (terminal or phase-not-covered)"
                 );
             }
-        }
+            Arc::clone(&entry.driver)
+        };
+
+        let mut driver = driver.lock().await;
+        driver.sync_control_projection_from_dsl_authority();
     }
 }
 
@@ -513,6 +520,9 @@ pub struct MeerkatMachine {
     blob_store: Option<Arc<dyn BlobStore>>,
     /// Runtime-owned shell seam for live session LLM reconfiguration I/O.
     llm_reconfigure_host: StdRwLock<Option<Arc<dyn SessionLlmReconfigureHost>>>,
+    /// AuthMachine lifecycle authority shared by runtime-backed auth
+    /// resolution/refresh paths and public auth-status surfaces.
+    auth_lease: StdRwLock<Arc<dyn meerkat_core::handles::AuthLeaseHandle>>,
     /// Canonical owner of "this session id is currently active" — replaces
     /// the deleted process-global `SESSION_IDENTITY_CLAIMS` static in the
     /// comms shell (dogma #2). Comms runtimes acquire a typed
@@ -545,6 +555,7 @@ impl MeerkatMachine {
             store: None,
             blob_store: None,
             llm_reconfigure_host: StdRwLock::new(None),
+            auth_lease: StdRwLock::new(Arc::new(crate::handles::RuntimeAuthLeaseHandle::new())),
             session_claims: Arc::new(crate::handles::RuntimeSessionClaimRegistry::new()),
             composition_signal_dispatcher: StdRwLock::new(None),
         }
@@ -558,6 +569,7 @@ impl MeerkatMachine {
             store: Some(store),
             blob_store: Some(blob_store),
             llm_reconfigure_host: StdRwLock::new(None),
+            auth_lease: StdRwLock::new(Arc::new(crate::handles::RuntimeAuthLeaseHandle::new())),
             session_claims: Arc::new(crate::handles::RuntimeSessionClaimRegistry::new()),
             composition_signal_dispatcher: StdRwLock::new(None),
         }
@@ -575,9 +587,33 @@ impl MeerkatMachine {
             store: Some(store),
             blob_store: Some(Arc::new(UnavailableBlobStore)),
             llm_reconfigure_host: StdRwLock::new(None),
+            auth_lease: StdRwLock::new(Arc::new(crate::handles::RuntimeAuthLeaseHandle::new())),
             session_claims: Arc::new(crate::handles::RuntimeSessionClaimRegistry::new()),
             composition_signal_dispatcher: StdRwLock::new(None),
         }
+    }
+
+    /// Shared auth lifecycle handle used by all runtime-backed session
+    /// bindings created by this adapter.
+    pub fn auth_lease_handle(&self) -> Arc<dyn meerkat_core::handles::AuthLeaseHandle> {
+        Arc::clone(
+            &self
+                .auth_lease
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+    }
+
+    /// Install the auth lifecycle authority that public surfaces also read.
+    ///
+    /// Surfaces construct the adapter before all state fields are available, so
+    /// this setter lets them align the adapter's runtime-backed traffic with
+    /// the surface-visible status handle without creating a competing registry.
+    pub fn set_auth_lease_handle(&self, handle: Arc<dyn meerkat_core::handles::AuthLeaseHandle>) {
+        *self
+            .auth_lease
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = handle;
     }
 
     /// The canonical session-identity claim handle owned by this

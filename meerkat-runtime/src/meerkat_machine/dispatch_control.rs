@@ -419,17 +419,12 @@ impl MeerkatMachine {
                 if matches!(state, RuntimeState::Initializing) {
                     return Err(RuntimeControlPlaneError::InvalidState { state });
                 }
-                self.preview_session_dsl_input(
-                    &session_id,
-                    crate::meerkat_machine::dsl::MeerkatMachineInput::Destroy {
-                        session_id: crate::meerkat_machine::dsl::SessionId::from_domain(
-                            &session_id,
-                        ),
-                    },
-                    "Destroy",
-                )
-                .await
-                .map_err(RuntimeControlPlaneError::Internal)?;
+                let destroy_input = crate::meerkat_machine::dsl::MeerkatMachineInput::Destroy {
+                    session_id: crate::meerkat_machine::dsl::SessionId::from_domain(&session_id),
+                };
+                self.preview_session_dsl_input(&session_id, destroy_input.clone(), "Destroy")
+                    .await
+                    .map_err(RuntimeControlPlaneError::Internal)?;
 
                 let mut drv = driver.lock().await;
                 let report = match machine_destroy(&mut drv).await {
@@ -438,17 +433,13 @@ impl MeerkatMachine {
                 };
                 drop(drv);
 
-                self.apply_session_dsl_input(
-                    &session_id,
-                    crate::meerkat_machine::dsl::MeerkatMachineInput::Destroy {
-                        session_id: crate::meerkat_machine::dsl::SessionId::from_domain(
-                            &session_id,
-                        ),
-                    },
-                    "Destroy",
-                )
-                .await
-                .map_err(RuntimeControlPlaneError::Internal)?;
+                self.apply_session_dsl_input(&session_id, destroy_input, "Destroy")
+                    .await
+                    .map_err(RuntimeControlPlaneError::Internal)?;
+                driver
+                    .lock()
+                    .await
+                    .sync_control_projection_from_dsl_authority();
 
                 let mut comp = completions.lock().await;
                 comp.resolve_all_terminated("runtime destroyed");
@@ -600,7 +591,9 @@ impl MeerkatMachine {
                                         model: Some(request.intent.target_model.to_string()),
                                         provider: None,
                                         provider_params: None,
+                                        clear_provider_params: false,
                                         connection_ref: None,
+                                        clear_connection_ref: false,
                                     },
                                 )
                                 .await
@@ -1131,7 +1124,7 @@ fn project_realtime_attachment_status(
 
 /// Wave-c C-9c R4: project the DSL's reconnect-progress fields onto the
 /// shell-facing `ReconnectProgress` struct. Returns `None` when the
-/// overlay has cleared (`attempt_count == 0` and no pending retry) —
+/// retry machine has cleared (`attempt_count == 0` and no pending retry) —
 /// the default state for a binding that isn't actively reconnecting.
 fn project_realtime_reconnect_progress(
     state: &super::dsl::MeerkatMachineState,

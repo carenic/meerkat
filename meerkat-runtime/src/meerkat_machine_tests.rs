@@ -49,6 +49,28 @@ fn realtime_policy(target_realtime_capable: bool) -> ModelRoutingRealtimePolicy 
     }
 }
 
+fn memory_blob_store() -> Arc<dyn meerkat_core::BlobStore> {
+    Arc::new(meerkat_store::MemoryBlobStore::new())
+}
+
+#[test]
+fn legacy_run_handler_does_not_restore_dsl_snapshots_by_hand() {
+    let source = include_str!("meerkat_machine/dispatch_ingress.rs");
+    let start = source
+        .find("pub(super) async fn execute_meerkat_machine_legacy_run_command")
+        .expect("legacy run handler should exist");
+    let legacy_run_handler = &source[start..];
+
+    assert!(
+        !legacy_run_handler.contains("previous_dsl_state"),
+        "legacy run must not manually snapshot DSL authority",
+    );
+    assert!(
+        !legacy_run_handler.contains("restore_session_dsl_state"),
+        "legacy run must not manually restore DSL authority",
+    );
+}
+
 fn finite_switch_request(
     n: u128,
     target_model: &str,
@@ -1982,6 +2004,43 @@ async fn meerkat_machine_spine_snapshot_clears_completion_waiters_after_destroy(
         }
         other => panic!("expected runtime destroyed termination, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn persistent_destroy_synchronizes_driver_control_projection_shadow() {
+    let store = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let adapter = Arc::new(MeerkatMachine::persistent(
+        store as Arc<dyn crate::store::RuntimeStore>,
+        memory_blob_store(),
+    ));
+    let session_id = SessionId::new();
+
+    adapter.register_session(session_id.clone()).await;
+
+    let runtime_id = crate::identifiers::LogicalRuntimeId::new(session_id.to_string());
+    let report = crate::traits::RuntimeControlPlane::destroy(&*adapter, &runtime_id)
+        .await
+        .expect("persistent destroy should succeed");
+    assert_eq!(report.inputs_abandoned, 0);
+
+    let sessions = adapter.sessions.read().await;
+    let entry = sessions
+        .get(&session_id)
+        .expect("destroy keeps the session entry available for terminal snapshots");
+    assert_eq!(
+        entry.control_snapshot().phase,
+        RuntimeState::Destroyed,
+        "persistent destroy must not leave a stale driver-side control shadow",
+    );
+    let authority = entry
+        .dsl_authority
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert_eq!(
+        crate::meerkat_machine::dsl_authority::runtime_phase_from_authority(&authority),
+        RuntimeState::Destroyed,
+        "DSL remains the canonical destroyed authority",
+    );
 }
 
 #[tokio::test]
@@ -11444,7 +11503,9 @@ async fn modeled_stage_persistent_filter_matches_runtime_after_active_ahead_reco
             model: Some("gpt-5.2".to_string()),
             provider: Some("openai".to_string()),
             provider_params: None,
+            clear_provider_params: false,
             connection_ref: None,
+            clear_connection_ref: false,
         },
     )
     .await
@@ -11506,7 +11567,9 @@ async fn modeled_request_deferred_tools_matches_runtime_after_active_ahead_recon
             model: Some("gpt-5.2".to_string()),
             provider: Some("openai".to_string()),
             provider_params: None,
+            clear_provider_params: false,
             connection_ref: None,
+            clear_connection_ref: false,
         },
     )
     .await
@@ -11732,7 +11795,9 @@ async fn reconfigure_session_llm_identity_rejects_idle_session() {
                 model: Some("gpt-5.2".to_string()),
                 provider: Some("openai".to_string()),
                 provider_params: None,
+                clear_provider_params: false,
                 connection_ref: None,
+                clear_connection_ref: false,
             },
         )
         .await
@@ -11824,7 +11889,9 @@ async fn reconfigure_session_llm_identity_updates_machine_owned_visibility_on_at
                 model: Some("gpt-5.2".to_string()),
                 provider: Some("openai".to_string()),
                 provider_params: Some(serde_json::json!({ "reasoning_effort": "high" })),
+                clear_provider_params: false,
                 connection_ref: None,
+                clear_connection_ref: false,
             },
         )
         .await
@@ -11962,7 +12029,9 @@ async fn reconfigure_session_llm_identity_succeeds_while_running() {
                 model: Some("gpt-5.2".to_string()),
                 provider: Some("openai".to_string()),
                 provider_params: None,
+                clear_provider_params: false,
                 connection_ref: None,
+                clear_connection_ref: false,
             },
         )
         .await
@@ -12075,7 +12144,9 @@ async fn reconfigure_session_llm_identity_rolls_back_on_persist_failure() {
                 model: Some("gpt-5.2".to_string()),
                 provider: Some("openai".to_string()),
                 provider_params: None,
+                clear_provider_params: false,
                 connection_ref: None,
+                clear_connection_ref: false,
             },
         )
         .await
@@ -12265,7 +12336,9 @@ async fn reconfigure_session_llm_identity_discards_live_session_when_rollback_fa
                 model: Some("gpt-5.2".to_string()),
                 provider: Some("openai".to_string()),
                 provider_params: None,
+                clear_provider_params: false,
                 connection_ref: None,
+                clear_connection_ref: false,
             },
         )
         .await
@@ -12420,7 +12493,9 @@ async fn reconfigure_live_topology_drives_running_session_to_boundary_and_rebind
                         model: Some("gpt-realtime".to_string()),
                         provider: Some("openai".to_string()),
                         provider_params: None,
+                        clear_provider_params: false,
                         connection_ref: None,
+                        clear_connection_ref: false,
                     },
                 )
                 .await
@@ -12562,7 +12637,9 @@ async fn reconfigure_live_topology_failure_before_detach_restores_prior_binding(
                 model: Some("gpt-5.2".to_string()),
                 provider: Some("openai".to_string()),
                 provider_params: None,
+                clear_provider_params: false,
                 connection_ref: None,
+                clear_connection_ref: false,
             },
         )
         .await
@@ -12700,7 +12777,9 @@ async fn reconfigure_live_topology_failure_after_detach_discards_and_requires_re
                 model: Some("gpt-5.2".to_string()),
                 provider: Some("openai".to_string()),
                 provider_params: None,
+                clear_provider_params: false,
                 connection_ref: None,
+                clear_connection_ref: false,
             },
         )
         .await
@@ -15197,7 +15276,9 @@ async fn execute_runtime_parity_probe(
                 model: Some("gpt-5.2".to_string()),
                 provider: Some("openai".to_string()),
                 provider_params: None,
+                clear_provider_params: false,
                 connection_ref: None,
+                clear_connection_ref: false,
             },
         )
         .await

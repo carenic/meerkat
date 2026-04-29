@@ -890,9 +890,7 @@ where
         if self.runtime_execution_kind.is_none() {
             self.runtime_execution_kind = Some(crate::lifecycle::RuntimeExecutionKind::ContentTurn);
         }
-        self.extraction_result = None;
-        self.extraction_last_error = None;
-        self.extraction_schema_warnings = None;
+        self.extraction_state.reset();
 
         // Apply canonical per-turn skill references staged by the surface.
         // Skill refs are text-only so they operate on the text projection.
@@ -991,9 +989,7 @@ where
             self.runtime_execution_kind =
                 Some(crate::lifecycle::RuntimeExecutionKind::ResumePending);
         }
-        self.extraction_result = None;
-        self.extraction_last_error = None;
-        self.extraction_schema_warnings = None;
+        self.extraction_state.reset();
 
         self.emit_run_started_event(ContentInput::Text(prompt.clone()), event_tx.as_ref())
             .await;
