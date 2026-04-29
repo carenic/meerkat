@@ -126,20 +126,11 @@ fn peer_id_from_pubkey(pubkey: &crate::identity::PubKey) -> meerkat_core::comms:
     crate::router::peer_id_from_pubkey(pubkey)
 }
 
-fn parse_peer_address(raw: &str) -> meerkat_core::comms::PeerAddress {
-    use meerkat_core::comms::{PeerAddress, PeerTransport};
-    if let Some(rest) = raw.strip_prefix("inproc://") {
-        PeerAddress::new(PeerTransport::Inproc, rest)
-    } else if let Some(rest) = raw.strip_prefix("uds://") {
-        PeerAddress::new(PeerTransport::Uds, rest)
-    } else if let Some(rest) = raw.strip_prefix("tcp://") {
-        PeerAddress::new(PeerTransport::Tcp, rest)
-    } else {
-        // Unknown scheme: default to TCP so legacy callers remain addressable.
-        // Wave-C will tighten this into a typed parse error at the ingress
-        // boundary so no unknown-scheme peers enter the directory.
-        PeerAddress::new(PeerTransport::Tcp, raw)
-    }
+fn parse_peer_address_legacy_schemeless_tcp(
+    raw: &str,
+) -> Result<meerkat_core::comms::PeerAddress, String> {
+    meerkat_core::comms::PeerAddress::parse_legacy_schemeless_tcp(raw)
+        .map_err(|err| err.to_string())
 }
 
 /// Build a core-seam [`TrustedPeerDescriptor`] for an inproc peer with a
@@ -992,10 +983,23 @@ impl CoreCommsRuntime for CommsRuntime {
                         return None;
                     }
                 };
+                let address = match parse_peer_address_legacy_schemeless_tcp(&peer.addr) {
+                    Ok(address) => address,
+                    Err(err) => {
+                        tracing::warn!(
+                            peer_name = %peer.name,
+                            peer_id = %peer.pubkey.to_peer_id(),
+                            address = %peer.addr,
+                            error = %err,
+                            "skipping trusted peer with invalid address in snapshot"
+                        );
+                        return None;
+                    }
+                };
                 Some(TrustedPeerDescriptor {
                     peer_id: self.router.peer_id_for_pubkey(&peer.pubkey),
                     name,
-                    address: parse_peer_address(&peer.addr),
+                    address,
                     pubkey: *peer.pubkey.as_bytes(),
                 })
             })
@@ -1744,7 +1748,10 @@ impl CommsRuntime {
     /// Trust truth lives in the router's `Arc<RwLock<TrustedPeers>>`, which
     /// the classified inbox queue and ingress classifier consult directly.
     /// There is no separate inbox-side mirror to keep in sync.
-    pub async fn register_trusted_peer(&self, peer: TrustedPeer) -> Result<(), SendError> {
+    pub async fn register_trusted_peer(&self, mut peer: TrustedPeer) -> Result<(), SendError> {
+        peer.addr = parse_peer_address_legacy_schemeless_tcp(&peer.addr)
+            .map_err(SendError::Validation)?
+            .to_string();
         self.router.add_trusted_peer(peer);
         Ok(())
     }
@@ -1779,7 +1786,13 @@ impl CommsRuntime {
     /// session-backed mob members, where delivery AND reply-routing must
     /// work but the recipient must not appear as an ordinary sendable
     /// peer on user-facing surfaces.
-    pub async fn register_private_trusted_peer(&self, peer: TrustedPeer) -> Result<(), SendError> {
+    pub async fn register_private_trusted_peer(
+        &self,
+        mut peer: TrustedPeer,
+    ) -> Result<(), SendError> {
+        peer.addr = parse_peer_address_legacy_schemeless_tcp(&peer.addr)
+            .map_err(SendError::Validation)?
+            .to_string();
         let pubkey = peer.pubkey;
         self.router.add_trusted_peer(peer);
         self.router.mark_private(pubkey);
@@ -1928,10 +1941,23 @@ impl CommsRuntime {
                         continue;
                     }
                 };
+                let address = match parse_peer_address_legacy_schemeless_tcp(&peer.addr) {
+                    Ok(address) => address,
+                    Err(err) => {
+                        tracing::warn!(
+                            peer_name = %peer.name,
+                            peer_id = %peer_id,
+                            address = %peer.addr,
+                            error = %err,
+                            "skipping trusted peer with invalid address in peer directory"
+                        );
+                        continue;
+                    }
+                };
                 on_peer(ResolvedPeer {
                     name,
                     peer_id,
-                    address: parse_peer_address(&peer.addr),
+                    address,
                     source,
                     meta: peer.meta.clone(),
                 });
@@ -2555,7 +2581,8 @@ mod tests {
         BlobId, BlobPayload, BlobRef, BlobStore, BlobStoreError, SendError,
         comms::{
             InputSource, InputStreamMode, PeerDirectorySource, PeerId, PeerName, PeerReachability,
-            PeerReachabilityReason, PeerRoute, StreamError, StreamScope, TrustedPeerDescriptor,
+            PeerReachabilityReason, PeerRoute, PeerTransport, StreamError, StreamScope,
+            TrustedPeerDescriptor,
         },
         interaction::InteractionId,
         types::{ContentBlock, ImageData, SessionId},
@@ -2568,7 +2595,7 @@ mod tests {
         TrustedPeerDescriptor {
             peer_id: crate::router::peer_id_from_pubkey(&pubkey),
             name: PeerName::new(name.to_string()).expect("valid peer name"),
-            address: parse_peer_address(address),
+            address: parse_peer_address_legacy_schemeless_tcp(address).expect("valid peer address"),
             pubkey: *pubkey.as_bytes(),
         }
     }
@@ -4402,6 +4429,101 @@ mod tests {
         assert!(peer.sendable_kinds.contains(&"peer_response".to_string()));
         assert_eq!(peer.reachability, PeerReachability::Unknown);
         assert_eq!(peer.last_unreachable_reason, None);
+    }
+
+    #[tokio::test]
+    async fn test_core_peers_rejects_unknown_scheme_but_keeps_schemeless_tcp_legacy() {
+        let suffix = Uuid::new_v4().simple().to_string();
+        let runtime_name = format!("runtime-address-parse-{suffix}");
+        let unknown_name = format!("unknown-scheme-{suffix}");
+        let legacy_name = format!("legacy-schemeless-{suffix}");
+        let runtime = CommsRuntime::inproc_only(&runtime_name).unwrap();
+        let unknown_pubkey = Keypair::generate().public_key();
+        let legacy_pubkey = Keypair::generate().public_key();
+
+        {
+            let mut trusted = runtime.trusted_peers.write();
+            trusted.upsert(crate::TrustedPeer {
+                name: unknown_name.clone(),
+                pubkey: unknown_pubkey,
+                addr: "http://127.0.0.1:4200".to_string(),
+                meta: crate::PeerMeta::default(),
+            });
+            trusted.upsert(crate::TrustedPeer {
+                name: legacy_name.clone(),
+                pubkey: legacy_pubkey,
+                addr: "127.0.0.1:4201".to_string(),
+                meta: crate::PeerMeta::default(),
+            });
+        }
+
+        let peers = CoreCommsRuntime::peers(&runtime).await;
+        assert!(
+            peers
+                .iter()
+                .all(|entry| entry.name.as_str() != unknown_name),
+            "unknown-scheme trusted peer must not be advertised as TCP"
+        );
+        let legacy = peers
+            .iter()
+            .find(|entry| entry.name.as_str() == legacy_name)
+            .expect("schemeless legacy TCP peer should remain visible");
+        assert_eq!(legacy.address.transport(), PeerTransport::Tcp);
+        assert_eq!(legacy.address.endpoint(), "127.0.0.1:4201");
+        assert_eq!(legacy.address.to_string(), "tcp://127.0.0.1:4201");
+    }
+
+    #[tokio::test]
+    async fn test_register_trusted_peer_rejects_unknown_scheme_and_normalizes_legacy_tcp() {
+        let suffix = Uuid::new_v4().simple().to_string();
+        let runtime =
+            CommsRuntime::inproc_only(&format!("runtime-register-address-{suffix}")).unwrap();
+        let unknown_name = format!("register-unknown-{suffix}");
+        let legacy_name = format!("register-legacy-{suffix}");
+
+        let err = runtime
+            .register_trusted_peer(crate::TrustedPeer {
+                name: unknown_name.clone(),
+                pubkey: Keypair::generate().public_key(),
+                addr: "http://127.0.0.1:4202".to_string(),
+                meta: crate::PeerMeta::default(),
+            })
+            .await
+            .expect_err("unknown address scheme must be rejected at registration");
+        assert!(
+            matches!(err, SendError::Validation(ref message) if message.contains("unknown peer address transport")),
+            "unexpected error: {err:?}",
+        );
+
+        runtime
+            .register_trusted_peer(crate::TrustedPeer {
+                name: legacy_name.clone(),
+                pubkey: Keypair::generate().public_key(),
+                addr: "127.0.0.1:4203".to_string(),
+                meta: crate::PeerMeta::default(),
+            })
+            .await
+            .expect("schemeless legacy TCP address should register");
+
+        let stored_addr = runtime
+            .trusted_peers
+            .read()
+            .peers
+            .iter()
+            .find(|peer| peer.name == legacy_name)
+            .expect("legacy peer stored")
+            .addr
+            .clone();
+        assert_eq!(stored_addr, "tcp://127.0.0.1:4203");
+        assert!(
+            runtime
+                .trusted_peers
+                .read()
+                .peers
+                .iter()
+                .all(|peer| peer.name != unknown_name),
+            "unknown-scheme peer must not be stored"
+        );
     }
 
     #[tokio::test]
