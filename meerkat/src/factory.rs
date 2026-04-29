@@ -2288,12 +2288,8 @@ impl AgentFactory {
                 "invalid self-hosted legacy realm id '{SELF_HOSTED_LEGACY_REALM_ID}': {err}"
             ))
         })?;
-        let binding_id = meerkat_core::BindingId::parse(spec.server_id.clone()).map_err(|err| {
-            FactoryError::ClientCreationFailed(format!(
-                "self-hosted server id '{}' cannot be used as a legacy binding id: {err}",
-                spec.server_id
-            ))
-        })?;
+        let binding_id = Self::legacy_self_hosted_binding_id(&spec.server_id)?;
+        let binding_key = binding_id.as_str().to_string();
 
         let (auth_method, source) = match (&spec.bearer_token, &spec.bearer_token_env) {
             (Some(secret), _) => (
@@ -2334,7 +2330,7 @@ impl AgentFactory {
             metadata_defaults: Default::default(),
         };
         let binding = meerkat_core::ProviderBinding {
-            id: spec.server_id.clone(),
+            id: binding_key.clone(),
             backend_profile: backend.id.clone(),
             auth_profile: auth.id.clone(),
             default_model: Some(spec.remote_model.clone()),
@@ -2354,7 +2350,7 @@ impl AgentFactory {
                 backends,
                 auth_profiles,
                 bindings,
-                default_binding: Some(spec.server_id.clone()),
+                default_binding: Some(binding_key),
             },
             ConnectionRef {
                 realm: realm_id,
@@ -2362,6 +2358,27 @@ impl AgentFactory {
                 profile: None,
             },
         ))
+    }
+
+    #[cfg(feature = "openai")]
+    fn legacy_self_hosted_binding_id(
+        server_id: &str,
+    ) -> Result<meerkat_core::BindingId, FactoryError> {
+        if let Ok(binding_id) = meerkat_core::BindingId::parse(server_id.to_string()) {
+            return Ok(binding_id);
+        }
+
+        let mut hash = 0xcbf29ce484222325_u64;
+        for byte in server_id.as_bytes() {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        let generated = format!("legacy-{hash:016x}");
+        meerkat_core::BindingId::parse(generated).map_err(|err| {
+            FactoryError::ClientCreationFailed(format!(
+                "failed to derive transient legacy binding id for self-hosted server '{server_id}': {err}"
+            ))
+        })
     }
 
     #[cfg(feature = "openai")]
@@ -4575,15 +4592,23 @@ mod tests {
 
     #[cfg(all(feature = "openai", not(target_arch = "wasm32")))]
     fn config_with_self_hosted_legacy_server(server: SelfHostedServerConfig) -> Config {
+        config_with_self_hosted_legacy_server_id("local", server)
+    }
+
+    #[cfg(all(feature = "openai", not(target_arch = "wasm32")))]
+    fn config_with_self_hosted_legacy_server_id(
+        server_id: &str,
+        server: SelfHostedServerConfig,
+    ) -> Config {
         let mut config = Config::default();
         config
             .self_hosted
             .servers
-            .insert("local".to_string(), server);
+            .insert(server_id.to_string(), server);
         config.self_hosted.models.insert(
             "gemma-4-e2b".to_string(),
             SelfHostedModelConfig {
-                server: "local".to_string(),
+                server: server_id.to_string(),
                 remote_model: "gemma4:e2b".to_string(),
                 display_name: "Gemma 4 E2B".into(),
                 family: "gemma-4".to_string(),
@@ -4740,6 +4765,52 @@ mod tests {
                     if secret == "literal-legacy-token"
             ),
             "legacy literal bearer_token must preserve precedence over bearer_token_env"
+        );
+    }
+
+    #[cfg(all(feature = "openai", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn self_hosted_legacy_non_slug_server_id_uses_safe_transient_binding() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut factory = AgentFactory::new(temp.path().join("sessions")).builtins(false);
+        let calls = install_recording_self_hosted_runtime(&mut factory);
+
+        let config = config_with_self_hosted_legacy_server_id(
+            "localhost:11434",
+            SelfHostedServerConfig {
+                transport: SelfHostedTransport::OpenAiCompatible,
+                base_url: "http://localhost:11434".to_string(),
+                api_style: SelfHostedApiStyle::ChatCompletions,
+                bearer_token: Some("literal-legacy-token".to_string()),
+                bearer_token_env: None,
+            },
+        );
+        let mut build = AgentBuildConfig::new("gemma-4-e2b");
+        build.provider = Some(Provider::SelfHosted);
+        build.override_builtins = ToolCategoryOverride::Disable;
+
+        let agent = factory.build_agent(build, &config).await.unwrap();
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].connection_ref.realm.as_str(), "self_hosted_legacy");
+        assert_ne!(calls[0].connection_ref.binding.as_str(), "localhost:11434");
+        assert!(
+            calls[0]
+                .connection_ref
+                .binding
+                .as_str()
+                .starts_with("legacy-"),
+            "non-slug legacy server IDs should map to a generated transient binding ID"
+        );
+        assert!(
+            agent
+                .session()
+                .session_metadata()
+                .unwrap()
+                .connection_ref
+                .is_none(),
+            "generated legacy compatibility binding must remain transient"
         );
     }
 
