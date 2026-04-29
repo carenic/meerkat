@@ -24,6 +24,7 @@ use crate::error::AgentError;
 use crate::event::ExternalToolDelta;
 use crate::hooks::HookEngine;
 use crate::lifecycle::RunId;
+use crate::lifecycle::run_primitive::ProviderParamsOverride;
 use crate::ops::OperationId;
 use crate::ops_lifecycle::{OperationKind, OperationStatus, OperationTerminalOutcome};
 use crate::retry::RetryPolicy;
@@ -46,7 +47,6 @@ use crate::types::{
 };
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::collections::BTreeSet;
 use std::sync::Arc;
 
@@ -64,7 +64,7 @@ pub trait AgentLlmClient: Send + Sync {
         tools: &[Arc<ToolDef>],
         max_tokens: u32,
         temperature: Option<f32>,
-        provider_params: Option<&Value>,
+        provider_params: Option<&ProviderParamsOverride>,
     ) -> Result<LlmStreamResult, AgentError>;
 
     /// Get the provider name

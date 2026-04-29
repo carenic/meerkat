@@ -10,7 +10,7 @@ use meerkat_core::compact::{CompactionContext, CompactionResult, Compactor};
 use meerkat_core::error::ToolError;
 use meerkat_core::event::AgentEvent;
 use meerkat_core::lifecycle::core_executor::CoreApplyTerminal;
-use meerkat_core::lifecycle::run_primitive::RunApplyBoundary;
+use meerkat_core::lifecycle::run_primitive::{ProviderParamsOverride, RunApplyBoundary};
 use meerkat_core::service::{
     AppendSystemContextRequest, AppendSystemContextStatus, CreateSessionRequest,
     DeferredPromptPolicy, InitialTurnPolicy, SessionBuildOptions, SessionError,
@@ -27,7 +27,7 @@ use meerkat_core::{
 };
 use meerkat_session::ephemeral::SessionSnapshot;
 use meerkat_session::{EphemeralSessionService, SessionAgent, SessionAgentBuilder};
-use serde_json::{Value, json};
+use serde_json::json;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
@@ -390,7 +390,7 @@ impl AgentLlmClient for RecordingLlmClient {
         tools: &[Arc<ToolDef>],
         _max_tokens: u32,
         _temperature: Option<f32>,
-        _provider_params: Option<&Value>,
+        _provider_params: Option<&ProviderParamsOverride>,
     ) -> Result<LlmStreamResult, meerkat_core::error::AgentError> {
         let names = tools.iter().map(|t| t.name.to_string()).collect::<Vec<_>>();
         self.provider_visible_tools
@@ -617,7 +617,7 @@ impl AgentLlmClient for CompactionTrackingLlmClient {
         _tools: &[Arc<ToolDef>],
         _max_tokens: u32,
         _temperature: Option<f32>,
-        _provider_params: Option<&Value>,
+        _provider_params: Option<&ProviderParamsOverride>,
     ) -> Result<LlmStreamResult, meerkat_core::error::AgentError> {
         let last_user = messages
             .iter()

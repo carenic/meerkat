@@ -77,6 +77,19 @@ impl RpcMethodDescriptor {
         }
     }
 
+    const fn params_only(
+        name: &'static str,
+        description: &'static str,
+        params_type: &'static str,
+    ) -> Self {
+        Self {
+            name,
+            description,
+            params_type: Some(params_type),
+            result_type: None,
+        }
+    }
+
     const fn result_only(
         name: &'static str,
         description: &'static str,
@@ -185,57 +198,70 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
             "ModelsCatalogResponse",
         ),
         // Auth-profile management (Phase 4c — always available).
-        RpcMethodDescriptor::result_only(
+        RpcMethodDescriptor::typed(
             "auth/profile/list",
             "List configured auth profiles",
+            "RealmIdParams",
             "WireAuthProfilesList",
         ),
-        RpcMethodDescriptor::result_only(
+        RpcMethodDescriptor::typed(
             "auth/profile/get",
             "Get one auth profile by id",
+            "BindingIdParams",
             "WireAuthProfileDetail",
         ),
-        RpcMethodDescriptor::result_only(
+        RpcMethodDescriptor::typed(
             "auth/profile/create",
             "Create an auth profile",
+            "CreateProfileParams",
             "WireAuthProfileCreated",
         ),
-        RpcMethodDescriptor::result_only(
+        RpcMethodDescriptor::typed(
             "auth/profile/delete",
             "Delete an auth profile",
+            "BindingIdParams",
             "WireAuthProfileCleared",
         ),
-        RpcMethodDescriptor::result_only(
+        RpcMethodDescriptor::typed(
             "auth/login/start",
             "Begin an OAuth login; returns authorize URL, state, PKCE verifier",
+            "LoginStartParams",
             "WireLoginStart",
         ),
-        RpcMethodDescriptor::result_only(
+        RpcMethodDescriptor::typed(
             "auth/login/complete",
             "Finish an OAuth login by exchanging an authorization code",
+            "LoginCompleteParams",
             "WireLoginReady",
         ),
-        RpcMethodDescriptor::result_only(
+        RpcMethodDescriptor::typed(
             "auth/login/device_start",
             "Begin a device-code OAuth login; returns user-code + verification URL",
+            "DeviceStartParams",
             "WireDeviceStart",
         ),
-        RpcMethodDescriptor::basic(
+        RpcMethodDescriptor::typed(
             "auth/login/device_complete",
             "Single-poll completion for a device-code OAuth login; returns pending / slow_down / access_denied / expired / ready",
+            "DeviceCompleteParams",
+            "WireDeviceCompleteResult",
         ),
-        RpcMethodDescriptor::basic(
+        RpcMethodDescriptor::typed(
             "auth/login/provision_api_key",
             "Console-OAuth → API key provisioning (Anthropic oauth_to_api_key): POST access_token to create_api_key endpoint, persist returned api_key",
+            "ProvisionApiKeyParams",
+            "WireProvisionApiKeyResult",
         ),
-        RpcMethodDescriptor::result_only(
+        RpcMethodDescriptor::typed(
             "auth/status/get",
             "Get auth status for a profile",
+            "BindingIdParams",
             "WireAuthStatusDetail",
         ),
-        RpcMethodDescriptor::result_only(
+        RpcMethodDescriptor::typed(
             "auth/logout",
             "Revoke + remove persisted credentials",
+            "BindingIdParams",
             "WireAuthProfileCleared",
         ),
         RpcMethodDescriptor::result_only(
@@ -243,9 +269,10 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
             "List realms with binding summaries",
             "WireRealmList",
         ),
-        RpcMethodDescriptor::result_only(
+        RpcMethodDescriptor::typed(
             "realm/get",
             "Get one realm's full connection set",
+            "RealmIdParams",
             "WireRealmConnectionSet",
         ),
     ];
@@ -437,7 +464,11 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
             ),
             RpcMethodDescriptor::basic("mob/list", "List active mobs"),
             RpcMethodDescriptor::basic("mob/status", "Get mob lifecycle status"),
-            RpcMethodDescriptor::basic("mob/lifecycle", "Apply a mob lifecycle action"),
+            RpcMethodDescriptor::params_only(
+                "mob/lifecycle",
+                "Apply a mob lifecycle action",
+                "MobLifecycleParams",
+            ),
             RpcMethodDescriptor::basic("mob/spawn", "Spawn a new mob member"),
             RpcMethodDescriptor::basic("mob/spawn_many", "Spawn multiple new mob members"),
             RpcMethodDescriptor::typed(
@@ -520,17 +551,21 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
                 "mob/rotate_supervisor",
                 "Rotate the supervisor bridge for all members of a mob",
             ),
-            RpcMethodDescriptor::basic(
+            RpcMethodDescriptor::typed(
                 "mob/submit_work",
                 "Submit a unit of work to a mob member through the work lane",
+                "MobSubmitWorkParams",
+                "MobSubmitWorkResult",
             ),
-            RpcMethodDescriptor::basic(
+            RpcMethodDescriptor::params_only(
                 "mob/cancel_work",
                 "Cancel a previously submitted unit of work",
+                "MobCancelWorkParams",
             ),
-            RpcMethodDescriptor::basic(
+            RpcMethodDescriptor::params_only(
                 "mob/cancel_all_work",
                 "Cancel all in-flight work for a mob member",
+                "MobCancelAllWorkParams",
             ),
             RpcMethodDescriptor::basic(
                 "mob/wait_kickoff",
@@ -770,6 +805,197 @@ mod tests {
                 descriptor.result_type,
                 Some(expected_result_type),
                 "{name} must advertise its concrete result type"
+            );
+        }
+    }
+
+    #[test]
+    fn auth_methods_advertise_concrete_request_and_response_contracts() {
+        let methods = rpc_method_catalog(RpcMethodCatalogOptions::documented_surface());
+        for (name, expected_params_type, expected_result_type) in [
+            (
+                "auth/profile/list",
+                Some("RealmIdParams"),
+                Some("WireAuthProfilesList"),
+            ),
+            (
+                "auth/profile/get",
+                Some("BindingIdParams"),
+                Some("WireAuthProfileDetail"),
+            ),
+            (
+                "auth/profile/create",
+                Some("CreateProfileParams"),
+                Some("WireAuthProfileCreated"),
+            ),
+            (
+                "auth/profile/delete",
+                Some("BindingIdParams"),
+                Some("WireAuthProfileCleared"),
+            ),
+            (
+                "auth/login/start",
+                Some("LoginStartParams"),
+                Some("WireLoginStart"),
+            ),
+            (
+                "auth/login/complete",
+                Some("LoginCompleteParams"),
+                Some("WireLoginReady"),
+            ),
+            (
+                "auth/login/device_start",
+                Some("DeviceStartParams"),
+                Some("WireDeviceStart"),
+            ),
+            (
+                "auth/login/device_complete",
+                Some("DeviceCompleteParams"),
+                Some("WireDeviceCompleteResult"),
+            ),
+            (
+                "auth/login/provision_api_key",
+                Some("ProvisionApiKeyParams"),
+                Some("WireProvisionApiKeyResult"),
+            ),
+            (
+                "auth/status/get",
+                Some("BindingIdParams"),
+                Some("WireAuthStatusDetail"),
+            ),
+            (
+                "auth/logout",
+                Some("BindingIdParams"),
+                Some("WireAuthProfileCleared"),
+            ),
+            ("realm/list", None, Some("WireRealmList")),
+            (
+                "realm/get",
+                Some("RealmIdParams"),
+                Some("WireRealmConnectionSet"),
+            ),
+        ] {
+            let descriptor = methods
+                .iter()
+                .find(|method| method.name == name)
+                .unwrap_or_else(|| panic!("missing descriptor for {name}"));
+            assert_eq!(
+                descriptor.params_type, expected_params_type,
+                "{name} must advertise its concrete params type"
+            );
+            assert_eq!(
+                descriptor.result_type, expected_result_type,
+                "{name} must advertise its concrete result type"
+            );
+        }
+    }
+
+    #[test]
+    fn mob_methods_advertise_only_real_exported_contracts() {
+        let methods = rpc_method_catalog(RpcMethodCatalogOptions::documented_surface());
+        for (name, expected_params_type, expected_result_type) in [
+            (
+                "mob/create",
+                Some("MobCreateParams"),
+                Some("MobCreateResult"),
+            ),
+            ("mob/lifecycle", Some("MobLifecycleParams"), None),
+            (
+                "mob/ensure_member",
+                Some("MobEnsureMemberParams"),
+                Some("MobEnsureMemberResult"),
+            ),
+            (
+                "mob/reconcile",
+                Some("MobReconcileParams"),
+                Some("MobReconcileResult"),
+            ),
+            (
+                "mob/list_members_matching",
+                Some("MobListMembersMatchingParams"),
+                Some("MobListMembersMatchingResult"),
+            ),
+            ("mob/wire", Some("MobWireParams"), Some("MobWireResult")),
+            (
+                "mob/unwire",
+                Some("MobUnwireParams"),
+                Some("MobUnwireResult"),
+            ),
+            (
+                "mob/member_send",
+                Some("MobMemberSendParams"),
+                Some("MobMemberSendResult"),
+            ),
+            (
+                "mob/ingress_interaction",
+                Some("MobIngressInteractionParams"),
+                Some("MobIngressInteractionResult"),
+            ),
+            (
+                "mob/submit_work",
+                Some("MobSubmitWorkParams"),
+                Some("MobSubmitWorkResult"),
+            ),
+            ("mob/cancel_work", Some("MobCancelWorkParams"), None),
+            ("mob/cancel_all_work", Some("MobCancelAllWorkParams"), None),
+        ] {
+            let descriptor = methods
+                .iter()
+                .find(|method| method.name == name)
+                .unwrap_or_else(|| panic!("missing descriptor for {name}"));
+            assert_eq!(
+                descriptor.params_type, expected_params_type,
+                "{name} must advertise its concrete params type"
+            );
+            assert_eq!(
+                descriptor.result_type, expected_result_type,
+                "{name} must advertise its concrete result type"
+            );
+        }
+
+        for name in [
+            "mob/list",
+            "mob/status",
+            "mob/spawn",
+            "mob/spawn_many",
+            "mob/retire",
+            "mob/respawn",
+            "mob/members",
+            "mob/events",
+            "mob/append_system_context",
+            "mob/flows",
+            "mob/flow_run",
+            "mob/flow_status",
+            "mob/flow_cancel",
+            "mob/spawn_helper",
+            "mob/fork_helper",
+            "mob/force_cancel",
+            "mob/turn_start",
+            "mob/member_status",
+            "mob/snapshot",
+            "mob/destroy",
+            "mob/rotate_supervisor",
+            "mob/wait_kickoff",
+            "mob/wait_ready",
+            "mob/profile/create",
+            "mob/profile/get",
+            "mob/profile/list",
+            "mob/profile/update",
+            "mob/profile/delete",
+            "mob/stream_open",
+            "mob/stream_close",
+        ] {
+            let descriptor = methods
+                .iter()
+                .find(|method| method.name == name)
+                .unwrap_or_else(|| panic!("missing descriptor for {name}"));
+            assert_eq!(
+                descriptor.params_type, None,
+                "{name} must not advertise unresolved params contracts"
+            );
+            assert_eq!(
+                descriptor.result_type, None,
+                "{name} must not advertise unresolved result contracts"
             );
         }
     }

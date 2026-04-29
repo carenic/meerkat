@@ -533,7 +533,7 @@ pub enum BridgeDeliveryOutcome {
 #[non_exhaustive]
 pub enum BridgeDeliveryRejectionCause {
     /// Runtime was not in a state that accepts input.
-    NotReady { state: String },
+    NotReady { state: BridgeMemberRuntimeState },
     /// Input failed durability validation.
     DurabilityViolation { detail: String },
     /// Peer input carried a forbidden handling mode.
@@ -1132,6 +1132,32 @@ mod tests {
                 },
             }),
         );
+    }
+
+    #[test]
+    fn bridge_delivery_not_ready_carries_typed_member_state() {
+        let outcome = BridgeDeliveryOutcome::Rejected {
+            cause: BridgeDeliveryRejectionCause::NotReady {
+                state: BridgeMemberRuntimeState::Stopped,
+            },
+            reason: "runtime not accepting input while in state: stopped".to_string(),
+        };
+        let value = serde_json::to_value(&outcome).expect("serialize outcome");
+        assert_eq!(
+            value,
+            json!({
+                "outcome": "rejected",
+                "cause": {
+                    "kind": "not_ready",
+                    "state": "stopped",
+                },
+                "reason": "runtime not accepting input while in state: stopped",
+            })
+        );
+
+        let decoded: BridgeDeliveryOutcome =
+            serde_json::from_value(value).expect("legacy wire state string remains compatible");
+        assert_eq!(decoded, outcome);
     }
 
     #[test]

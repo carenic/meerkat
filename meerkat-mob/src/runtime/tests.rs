@@ -3985,7 +3985,7 @@ impl AgentLlmClient for OverlayProbeLlmClient {
         tools: &[Arc<ToolDef>],
         _max_tokens: u32,
         _temperature: Option<f32>,
-        _provider_params: Option<&serde_json::Value>,
+        _provider_params: Option<&meerkat_core::lifecycle::run_primitive::ProviderParamsOverride>,
     ) -> Result<LlmStreamResult, meerkat_core::error::AgentError> {
         self.provider_visible_tools
             .lock()

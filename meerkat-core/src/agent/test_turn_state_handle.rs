@@ -713,25 +713,13 @@ impl TurnStateHandle for TestTurnStateHandle {
 
     fn register_pending_ops(
         &self,
-        op_refs: BTreeSet<String>,
-        barrier_operation_ids: BTreeSet<String>,
+        op_refs: BTreeSet<crate::ops::AsyncOpRef>,
+        barrier_operation_ids: BTreeSet<OperationId>,
     ) -> Result<(), DslTransitionError> {
         let mut guard = self.lock_state()?;
         let run_id = active_run_or_err(&guard, "register_pending_ops")?;
-        let op_refs_vec = op_refs
-            .into_iter()
-            .map(|s| {
-                crate::ops::AsyncOpRef::barrier(OperationId(
-                    uuid::Uuid::parse_str(&s).unwrap_or_else(|_| uuid::Uuid::new_v4()),
-                ))
-            })
-            .collect();
-        let barrier_vec = barrier_operation_ids
-            .into_iter()
-            .map(|s| {
-                OperationId(uuid::Uuid::parse_str(&s).unwrap_or_else(|_| uuid::Uuid::new_v4()))
-            })
-            .collect::<Vec<_>>();
+        let op_refs_vec = op_refs.into_iter().collect();
+        let barrier_vec = barrier_operation_ids.into_iter().collect::<Vec<_>>();
         let has_barrier_ops = !barrier_vec.is_empty();
         guard.apply(TurnExecutionInput::RegisterPendingOps {
             run_id,
@@ -749,16 +737,11 @@ impl TurnStateHandle for TestTurnStateHandle {
 
     fn ops_barrier_satisfied(
         &self,
-        operation_ids: BTreeSet<String>,
+        operation_ids: BTreeSet<OperationId>,
     ) -> Result<(), DslTransitionError> {
         let mut guard = self.lock_state()?;
         let run_id = active_run_or_err(&guard, "ops_barrier_satisfied")?;
-        let ops_vec = operation_ids
-            .into_iter()
-            .map(|s| {
-                OperationId(uuid::Uuid::parse_str(&s).unwrap_or_else(|_| uuid::Uuid::new_v4()))
-            })
-            .collect::<Vec<_>>();
+        let ops_vec = operation_ids.into_iter().collect::<Vec<_>>();
         guard.apply(TurnExecutionInput::OpsBarrierSatisfied {
             run_id,
             operation_ids: ops_vec,
@@ -920,13 +903,15 @@ impl TurnStateHandle for TestTurnStateHandle {
             pending_op_refs: fields
                 .pending_op_ids
                 .iter()
-                .map(ToString::to_string)
+                .map(|operation_id| {
+                    if fields.barrier_operation_ids.contains(operation_id) {
+                        crate::ops::AsyncOpRef::barrier(operation_id.clone())
+                    } else {
+                        crate::ops::AsyncOpRef::detached(operation_id.clone())
+                    }
+                })
                 .collect(),
-            barrier_operation_ids: fields
-                .barrier_operation_ids
-                .iter()
-                .map(ToString::to_string)
-                .collect(),
+            barrier_operation_ids: fields.barrier_operation_ids.iter().cloned().collect(),
             has_barrier_ops: fields.has_barrier_ops,
             barrier_satisfied: fields.barrier_satisfied,
             boundary_count: u64::from(fields.boundary_count),
@@ -956,5 +941,54 @@ fn loop_state_from_turn_phase(phase: TurnPhase) -> crate::LoopState {
         TurnPhase::Completed | TurnPhase::Failed | TurnPhase::Cancelled => {
             crate::LoopState::Completed
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ops::{AsyncOpRef, OperationId};
+
+    #[test]
+    fn test_turn_state_handle_preserves_typed_operation_ids() {
+        let handle = TestTurnStateHandle::new();
+        let run_id = RunId::new();
+        let detached_id = OperationId::new();
+        let barrier_id = OperationId::new();
+
+        handle
+            .start_conversation_run(
+                run_id,
+                TurnPrimitiveKind::ConversationTurn,
+                "conversation".to_string(),
+                false,
+                false,
+                2,
+            )
+            .expect("start run");
+        handle.primitive_applied().expect("primitive applied");
+        handle.llm_returned_tool_calls(2).expect("tool calls");
+        handle
+            .register_pending_ops(
+                BTreeSet::from([
+                    AsyncOpRef::detached(detached_id.clone()),
+                    AsyncOpRef::barrier(barrier_id.clone()),
+                ]),
+                BTreeSet::from([barrier_id.clone()]),
+            )
+            .expect("register pending ops");
+
+        let snapshot = handle.snapshot();
+        assert!(
+            snapshot
+                .pending_op_refs
+                .contains(&AsyncOpRef::detached(detached_id))
+        );
+        assert!(
+            snapshot
+                .pending_op_refs
+                .contains(&AsyncOpRef::barrier(barrier_id.clone()))
+        );
+        assert!(snapshot.barrier_operation_ids.contains(&barrier_id));
     }
 }

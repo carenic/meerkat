@@ -611,7 +611,7 @@ mod tests {
             _tools: &[Arc<ToolDef>],
             _max_tokens: u32,
             _temperature: Option<f32>,
-            _provider_params: Option<&Value>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
         ) -> Result<LlmStreamResult, AgentError> {
             Ok(LlmStreamResult::new(
                 vec![AssistantBlock::Text {

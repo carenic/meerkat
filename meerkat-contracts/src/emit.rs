@@ -43,6 +43,10 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "MobMemberSendResult": schema_for!(crate::wire::MobMemberSendResult),
         "MobIngressInteractionParams": schema_for!(crate::wire::MobIngressInteractionParams),
         "MobIngressInteractionResult": schema_for!(crate::wire::MobIngressInteractionResult),
+        "MobEnsureMemberResult": schema_for!(crate::wire::MobEnsureMemberResult),
+        "MobReconcileResult": schema_for!(crate::wire::MobReconcileResult),
+        "MobListMembersMatchingResult": schema_for!(crate::wire::MobListMembersMatchingResult),
+        "MobSubmitWorkResult": schema_for!(crate::wire::MobSubmitWorkResult),
         "WireHandlingMode": schema_for!(crate::wire::WireHandlingMode),
         "WireRenderClass": schema_for!(crate::wire::WireRenderClass),
         "WireRenderSalience": schema_for!(crate::wire::WireRenderSalience),
@@ -131,6 +135,8 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "WireLoginStart": schema_for!(crate::wire::WireLoginStart),
         "WireLoginReady": schema_for!(crate::wire::WireLoginReady),
         "WireDeviceStart": schema_for!(crate::wire::WireDeviceStart),
+        "WireDeviceCompleteResult": schema_for!(crate::wire::WireDeviceCompleteResult),
+        "WireProvisionApiKeyResult": schema_for!(crate::wire::WireProvisionApiKeyResult),
         "WireRealmSummary": schema_for!(crate::wire::WireRealmSummary),
         "WireRealmList": schema_for!(crate::wire::WireRealmList),
         "WireAuthProfilesList": schema_for!(crate::wire::WireAuthProfilesList),
@@ -152,6 +158,23 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "MobCreateParams": schema_for!(crate::wire::MobCreateParams),
         "MobWireParams": schema_for!(crate::wire::MobWireParams),
         "MobUnwireParams": schema_for!(crate::wire::MobUnwireParams),
+        "MobLifecycleParams": schema_for!(crate::wire::MobLifecycleParams),
+        "MobMemberSendParams": schema_for!(crate::wire::MobMemberSendParams),
+        "MobIngressInteractionParams": schema_for!(crate::wire::MobIngressInteractionParams),
+        "MobEnsureMemberParams": schema_for!(crate::wire::MobEnsureMemberParams),
+        "MobReconcileParams": schema_for!(crate::wire::MobReconcileParams),
+        "MobListMembersMatchingParams": schema_for!(crate::wire::MobListMembersMatchingParams),
+        "MobSubmitWorkParams": schema_for!(crate::wire::MobSubmitWorkParams),
+        "MobCancelWorkParams": schema_for!(crate::wire::MobCancelWorkParams),
+        "MobCancelAllWorkParams": schema_for!(crate::wire::MobCancelAllWorkParams),
+        "RealmIdParams": schema_for!(crate::wire::RealmIdParams),
+        "BindingIdParams": schema_for!(crate::wire::BindingIdParams),
+        "CreateProfileParams": schema_for!(crate::wire::CreateProfileParams),
+        "LoginStartParams": schema_for!(crate::wire::LoginStartParams),
+        "LoginCompleteParams": schema_for!(crate::wire::LoginCompleteParams),
+        "DeviceStartParams": schema_for!(crate::wire::DeviceStartParams),
+        "DeviceCompleteParams": schema_for!(crate::wire::DeviceCompleteParams),
+        "ProvisionApiKeyParams": schema_for!(crate::wire::ProvisionApiKeyParams),
         "RealtimeOpenRequest": schema_for!(crate::wire::RealtimeOpenRequest),
         "RealtimeStatusParams": schema_for!(crate::wire::RealtimeStatusParams),
         "RealtimeCapabilitiesParams": schema_for!(crate::wire::RealtimeCapabilitiesParams),
@@ -357,6 +380,161 @@ mod tests {
             auth_status["result_type"], "WireAuthStatusDetail",
             "auth/status/get should catalog its concrete detailed response"
         );
+
+        fs::remove_dir_all(&output_dir).unwrap();
+    }
+
+    #[test]
+    fn emitted_rpc_catalog_carries_typed_auth_and_mob_contracts() {
+        let output_dir = temp_output_dir("typed-rpc-catalog");
+        emit_all_schemas(&output_dir).expect("emit schemas");
+
+        let rpc_methods: serde_json::Value =
+            serde_json::from_slice(&fs::read(output_dir.join("rpc-methods.json")).unwrap())
+                .unwrap();
+        let methods = rpc_methods["methods"].as_array().expect("methods array");
+
+        for (name, params_type, result_type) in [
+            (
+                "auth/login/device_complete",
+                "DeviceCompleteParams",
+                "WireDeviceCompleteResult",
+            ),
+            (
+                "auth/profile/create",
+                "CreateProfileParams",
+                "WireAuthProfileCreated",
+            ),
+            (
+                "mob/ensure_member",
+                "MobEnsureMemberParams",
+                "MobEnsureMemberResult",
+            ),
+            (
+                "mob/submit_work",
+                "MobSubmitWorkParams",
+                "MobSubmitWorkResult",
+            ),
+            (
+                "mob/ingress_interaction",
+                "MobIngressInteractionParams",
+                "MobIngressInteractionResult",
+            ),
+        ] {
+            let method = methods
+                .iter()
+                .find(|method| method["name"] == name)
+                .unwrap_or_else(|| panic!("missing emitted RPC catalog entry for {name}"));
+            assert_eq!(
+                method["params_type"], params_type,
+                "{name} emitted params_type drifted"
+            );
+            assert_eq!(
+                method["result_type"], result_type,
+                "{name} emitted result_type drifted"
+            );
+        }
+
+        let cancel_all_work = methods
+            .iter()
+            .find(|method| method["name"] == "mob/cancel_all_work")
+            .expect("missing emitted RPC catalog entry for mob/cancel_all_work");
+        assert_eq!(
+            cancel_all_work["params_type"], "MobCancelAllWorkParams",
+            "mob/cancel_all_work emitted params_type drifted"
+        );
+        assert!(
+            cancel_all_work.get("result_type").is_none(),
+            "mob/cancel_all_work must not advertise a phantom result contract"
+        );
+
+        fs::remove_dir_all(&output_dir).unwrap();
+    }
+
+    #[test]
+    fn emitted_mob_rpc_contract_names_resolve_to_exported_schemas() {
+        let output_dir = temp_output_dir("typed-mob-rpc-catalog-resolution");
+        emit_all_schemas(&output_dir).expect("emit schemas");
+
+        let exported_contracts = ["params.json", "wire-types.json"]
+            .into_iter()
+            .flat_map(|file| {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&fs::read(output_dir.join(file)).unwrap()).unwrap();
+                value
+                    .as_object()
+                    .expect("schema artifact is an object")
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let rpc_methods: serde_json::Value =
+            serde_json::from_slice(&fs::read(output_dir.join("rpc-methods.json")).unwrap())
+                .unwrap();
+
+        for method in rpc_methods["methods"].as_array().expect("methods array") {
+            let Some(name) = method["name"].as_str() else {
+                continue;
+            };
+            if !name.starts_with("mob/") {
+                continue;
+            }
+            for field in ["params_type", "result_type"] {
+                let Some(contract_name) = method.get(field).and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                assert!(
+                    exported_contracts.contains(contract_name),
+                    "{name} advertises {field}={contract_name}, but no emitted schema exports that contract"
+                );
+            }
+        }
+
+        fs::remove_dir_all(&output_dir).unwrap();
+    }
+
+    #[test]
+    fn emitted_auth_rpc_contract_names_resolve_to_exported_schemas() {
+        let output_dir = temp_output_dir("typed-auth-rpc-catalog-resolution");
+        emit_all_schemas(&output_dir).expect("emit schemas");
+
+        let exported_contracts = ["params.json", "wire-types.json"]
+            .into_iter()
+            .flat_map(|file| {
+                let value: serde_json::Value =
+                    serde_json::from_slice(&fs::read(output_dir.join(file)).unwrap()).unwrap();
+                value
+                    .as_object()
+                    .expect("schema artifact is an object")
+                    .keys()
+                    .cloned()
+                    .collect::<Vec<_>>()
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let rpc_methods: serde_json::Value =
+            serde_json::from_slice(&fs::read(output_dir.join("rpc-methods.json")).unwrap())
+                .unwrap();
+
+        for method in rpc_methods["methods"].as_array().expect("methods array") {
+            let Some(name) = method["name"].as_str() else {
+                continue;
+            };
+            if !(name.starts_with("auth/") || name.starts_with("realm/")) {
+                continue;
+            }
+            for field in ["params_type", "result_type"] {
+                let Some(contract_name) = method.get(field).and_then(serde_json::Value::as_str)
+                else {
+                    continue;
+                };
+                assert!(
+                    exported_contracts.contains(contract_name),
+                    "{name} advertises {field}={contract_name}, but no emitted schema exports that contract"
+                );
+            }
+        }
 
         fs::remove_dir_all(&output_dir).unwrap();
     }

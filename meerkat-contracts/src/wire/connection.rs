@@ -48,6 +48,94 @@ impl From<WireConnectionRef> for meerkat_core::ConnectionRef {
     }
 }
 
+/// Request payload for `auth/profile/list` and `realm/get`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct RealmIdParams {
+    pub realm_id: String,
+}
+
+/// Request payload for binding-scoped auth methods.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct BindingIdParams {
+    pub realm_id: String,
+    pub binding_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+/// Request payload for `auth/profile/create`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct CreateProfileParams {
+    pub realm_id: String,
+    pub binding_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+    pub auth_method: String,
+    pub secret: String,
+}
+
+/// Request payload for `auth/login/start`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct LoginStartParams {
+    pub provider: String,
+    pub redirect_uri: String,
+}
+
+/// Request payload for `auth/login/complete`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct LoginCompleteParams {
+    pub provider: String,
+    pub code: String,
+    pub state: String,
+    pub redirect_uri: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realm_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+/// Request payload for `auth/login/device_start`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DeviceStartParams {
+    pub provider: String,
+}
+
+/// Request payload for `auth/login/device_complete`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct DeviceCompleteParams {
+    pub provider: String,
+    pub device_code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realm_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
+/// Request payload for `auth/login/provision_api_key`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct ProvisionApiKeyParams {
+    /// Access token acquired from a prior Console-OAuth flow.
+    pub access_token: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realm_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binding_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_id: Option<String>,
+}
+
 /// Wire projection of [`meerkat_core::BackendProfile`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -350,6 +438,40 @@ pub struct WireDeviceStart {
     pub provider: String,
 }
 
+/// `auth/login/device_complete` success body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WireDeviceCompleteResult {
+    Pending,
+    SlowDown,
+    AccessDenied,
+    Expired,
+    Ready {
+        #[serde(flatten)]
+        identity: Box<WireBindingIdentity>,
+        profile_id: String,
+        provider: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expires_at: Option<String>,
+        has_refresh_token: bool,
+        scopes: Vec<String>,
+    },
+}
+
+/// `auth/login/provision_api_key` success body.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct WireProvisionApiKeyResult {
+    #[serde(flatten)]
+    pub identity: WireBindingIdentity,
+    pub profile_id: String,
+    pub provider: String,
+    pub auth_mode: String,
+    pub has_api_key: bool,
+    pub scopes: Vec<String>,
+}
+
 /// Realm summary entry returned by `GET /realms`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
@@ -458,6 +580,59 @@ mod tests {
         let s = serde_json::to_string(&w).unwrap();
         assert!(s.contains("\"kind\":\"refresh_failed\""));
         assert!(s.contains("\"detail\":\"timeout\""));
+    }
+
+    #[test]
+    fn device_complete_result_serializes_terminal_and_ready_shapes() {
+        let pending = serde_json::to_value(WireDeviceCompleteResult::Pending).unwrap();
+        assert_eq!(pending, serde_json::json!({ "state": "pending" }));
+
+        let cref = meerkat_core::ConnectionRef {
+            realm: meerkat_core::connection::RealmId::parse("prod").unwrap(),
+            binding: meerkat_core::connection::BindingId::parse("anthropic_main").unwrap(),
+            profile: None,
+        };
+        let ready = serde_json::to_value(WireDeviceCompleteResult::Ready {
+            identity: Box::new(WireBindingIdentity::from(&cref)),
+            profile_id: "console".to_string(),
+            provider: "anthropic".to_string(),
+            expires_at: Some("2026-04-29T00:00:00Z".to_string()),
+            has_refresh_token: true,
+            scopes: vec!["org:create_api_key".to_string()],
+        })
+        .unwrap();
+
+        assert_eq!(ready["state"], "ready");
+        assert_eq!(ready["realm_id"], "prod");
+        assert_eq!(ready["binding_id"], "anthropic_main");
+        assert_eq!(ready["connection_ref"]["realm"], "prod");
+        assert_eq!(ready["connection_ref"]["binding"], "anthropic_main");
+        assert_eq!(ready["profile_id"], "console");
+        assert_eq!(ready["has_refresh_token"], true);
+    }
+
+    #[test]
+    fn provision_api_key_result_serializes_binding_identity() {
+        let cref = meerkat_core::ConnectionRef {
+            realm: meerkat_core::connection::RealmId::parse("prod").unwrap(),
+            binding: meerkat_core::connection::BindingId::parse("anthropic_main").unwrap(),
+            profile: Some(meerkat_core::connection::ProfileId::parse("console").unwrap()),
+        };
+        let value = serde_json::to_value(WireProvisionApiKeyResult {
+            identity: WireBindingIdentity::from(&cref),
+            profile_id: "console".to_string(),
+            provider: "anthropic".to_string(),
+            auth_mode: "oauth_to_api_key".to_string(),
+            has_api_key: true,
+            scopes: vec!["user:profile".to_string()],
+        })
+        .unwrap();
+
+        assert_eq!(value["realm_id"], "prod");
+        assert_eq!(value["binding_id"], "anthropic_main");
+        assert_eq!(value["connection_ref"]["profile"], "console");
+        assert_eq!(value["auth_mode"], "oauth_to_api_key");
+        assert_eq!(value["has_api_key"], true);
     }
 
     #[test]

@@ -25,7 +25,7 @@ def main() -> int:
         {
             m
             for m in re.findall(
-                r'RpcMethodDescriptor::(?:basic|typed|result_only)\(\s*"([^"]+)"',
+                r'RpcMethodDescriptor::(?:basic|typed|params_only|result_only)\(\s*"([^"]+)"',
                 catalog_text,
             )
         }

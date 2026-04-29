@@ -163,7 +163,7 @@
         "type": "string"
       },
       "PeerId": {
-        "description": "Canonical runtime identity for a peer.\n\n`PeerId` is the routing key: the router and trust store key by `PeerId`,\nnever by `PeerName`. Two peers may legitimately share a display `PeerName`\n(per the Wave-B V5 dogma note), but their `PeerId`s never collide — the\nunderlying UUID is globally unique.\n\nConstructed either freshly (`PeerId::new`) for a peer minted locally,\nor parsed from a hyphenated UUID (`PeerId::parse`) when we've been given\nan identity over the wire.",
+        "description": "Canonical runtime identity for a peer.\n\n`PeerId` is the routing key: the router and trust store key by `PeerId`,\nnever by `PeerName`. Two peers may legitimately share a display `PeerName`\n(per the Wave-B V5 dogma note), but their `PeerId`s never collide — the\nunderlying UUID is globally unique.\n\nConstructed freshly (`PeerId::new`) for a peer minted locally, parsed\nfrom a hyphenated UUID (`PeerId::parse`) when we've been given an identity\nover the wire, or derived from a 32-byte Ed25519 public key when a transport\nstill authenticates by raw signing key.",
         "type": "string"
       },
       "PeerLifecycleKind": {
@@ -2551,6 +2551,152 @@
     "title": "MobDefinitionInput",
     "type": "object"
   },
+  "MobEnsureMemberResult": {
+    "$defs": {
+      "MobEnsureMemberOutcomeWire": {
+        "description": "Outcome of a `mob/ensure_member` call.\n\n`Existed` returns the typed [`MobMemberListEntryWire`] roster snapshot so\npublic consumers do not need out-of-band knowledge of the Rust domain\n`MobMemberListEntry` shape.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "spawned": {
+                "$ref": "#/$defs/MobSpawnReceiptWire"
+              }
+            },
+            "required": [
+              "spawned"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "properties": {
+              "existed": {
+                "$ref": "#/$defs/MobMemberListEntryWire"
+              }
+            },
+            "required": [
+              "existed"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "MobMemberListEntryWire": {
+        "description": "Public roster entry returned by `mob/ensure_member`'s `Existed` outcome\n(and other surfaces that want a typed snapshot of a single member). Mirrors\nthe public-facing fields of `meerkat_mob::runtime::MobMemberListEntry`\nwithout leaking bridge-internal fields.",
+        "properties": {
+          "agent_identity": {
+            "type": "string"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "is_final": {
+            "type": "boolean"
+          },
+          "labels": {
+            "additionalProperties": {
+              "type": "string"
+            },
+            "type": "object"
+          },
+          "member_ref": {
+            "$ref": "#/$defs/WireMemberRef"
+          },
+          "role": {
+            "type": "string"
+          },
+          "runtime_mode": {
+            "$ref": "#/$defs/WireMobRuntimeMode"
+          },
+          "state": {
+            "$ref": "#/$defs/WireMemberState"
+          },
+          "status": {
+            "$ref": "#/$defs/WireMobMemberStatus"
+          },
+          "wired_to": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "agent_identity",
+          "member_ref",
+          "role",
+          "runtime_mode",
+          "state",
+          "status",
+          "is_final"
+        ],
+        "type": "object"
+      },
+      "MobSpawnReceiptWire": {
+        "description": "Identity-native payload for `EnsureMemberOutcome::Spawned`.",
+        "properties": {
+          "agent_identity": {
+            "type": "string"
+          },
+          "member_ref": {
+            "$ref": "#/$defs/WireMemberRef",
+            "description": "Server-resolved opaque handle for subsequent member-targeted calls\n(work submission, cancellation, lifecycle). Replaces the binding-era\n`generation` / `fence_token` pair on app-facing surfaces."
+          }
+        },
+        "required": [
+          "agent_identity",
+          "member_ref"
+        ],
+        "type": "object"
+      },
+      "WireMemberRef": {
+        "description": "Server-resolved opaque handle for a mob member.\n\nEncodes `{mob_id, agent_identity}` as a single base64url-encoded token\nthat callers treat as opaque. The server resolves the current\n`AgentRuntimeId` and fence token against the live mob roster on every\ndispatch — clients never reason about `generation` or `fence_token`\ndirectly.\n\nUse [`WireMemberRef::encode`] to produce a token and\n[`WireMemberRef::decode`] inside an RPC handler to recover the\n`(mob_id, agent_identity)` pair before resolving against the runtime.",
+        "type": "string"
+      },
+      "WireMemberState": {
+        "description": "Roster member lifecycle state for `MobMemberFilterWire`.",
+        "enum": [
+          "active",
+          "retiring"
+        ],
+        "type": "string"
+      },
+      "WireMobMemberStatus": {
+        "description": "Execution status mirroring `meerkat_mob::runtime::MobMemberStatus`.",
+        "enum": [
+          "active",
+          "retiring",
+          "broken",
+          "completed",
+          "unknown"
+        ],
+        "type": "string"
+      },
+      "WireMobRuntimeMode": {
+        "enum": [
+          "autonomous_host",
+          "turn_driven"
+        ],
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/ensure_member`.",
+    "properties": {
+      "outcome": {
+        "$ref": "#/$defs/MobEnsureMemberOutcomeWire"
+      }
+    },
+    "required": [
+      "outcome"
+    ],
+    "title": "MobEnsureMemberResult",
+    "type": "object"
+  },
   "MobIngressInteractionParams": {
     "$defs": {
       "BridgeBootstrapToken": {
@@ -3157,6 +3303,19 @@
     "title": "MobIngressInteractionResult",
     "type": "object"
   },
+  "MobListMembersMatchingResult": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/list_members_matching`. Each member is the raw\nroster entry JSON.",
+    "properties": {
+      "members": {
+        "default": [],
+        "items": true,
+        "type": "array"
+      }
+    },
+    "title": "MobListMembersMatchingResult",
+    "type": "object"
+  },
   "MobMemberSendParams": {
     "$defs": {
       "WireContentBlock": {
@@ -3529,6 +3688,129 @@
       }
     ],
     "title": "MobPeerTarget"
+  },
+  "MobReconcileResult": {
+    "$defs": {
+      "MobReconcileFailureWire": {
+        "description": "Per-identity failure in a `mob/reconcile` pass.",
+        "properties": {
+          "agent_identity": {
+            "type": "string"
+          },
+          "error": {
+            "description": "Stringified mob error.",
+            "type": "string"
+          },
+          "stage": {
+            "description": "One of `\"spawn\"` or `\"retire\"`.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "agent_identity",
+          "stage",
+          "error"
+        ],
+        "type": "object"
+      },
+      "MobReconcileReportWire": {
+        "description": "Summary produced by a `mob/reconcile` pass.",
+        "properties": {
+          "desired": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "failures": {
+            "items": {
+              "$ref": "#/$defs/MobReconcileFailureWire"
+            },
+            "type": "array"
+          },
+          "retained": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "retired": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "spawned": {
+            "items": {
+              "$ref": "#/$defs/MobSpawnReceiptWire"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "MobSpawnReceiptWire": {
+        "description": "Identity-native payload for `EnsureMemberOutcome::Spawned`.",
+        "properties": {
+          "agent_identity": {
+            "type": "string"
+          },
+          "member_ref": {
+            "$ref": "#/$defs/WireMemberRef",
+            "description": "Server-resolved opaque handle for subsequent member-targeted calls\n(work submission, cancellation, lifecycle). Replaces the binding-era\n`generation` / `fence_token` pair on app-facing surfaces."
+          }
+        },
+        "required": [
+          "agent_identity",
+          "member_ref"
+        ],
+        "type": "object"
+      },
+      "WireMemberRef": {
+        "description": "Server-resolved opaque handle for a mob member.\n\nEncodes `{mob_id, agent_identity}` as a single base64url-encoded token\nthat callers treat as opaque. The server resolves the current\n`AgentRuntimeId` and fence token against the live mob roster on every\ndispatch — clients never reason about `generation` or `fence_token`\ndirectly.\n\nUse [`WireMemberRef::encode`] to produce a token and\n[`WireMemberRef::decode`] inside an RPC handler to recover the\n`(mob_id, agent_identity)` pair before resolving against the runtime.",
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/reconcile`.",
+    "properties": {
+      "report": {
+        "$ref": "#/$defs/MobReconcileReportWire"
+      }
+    },
+    "required": [
+      "report"
+    ],
+    "title": "MobReconcileResult",
+    "type": "object"
+  },
+  "MobSubmitWorkResult": {
+    "$defs": {
+      "WireMemberRef": {
+        "description": "Server-resolved opaque handle for a mob member.\n\nEncodes `{mob_id, agent_identity}` as a single base64url-encoded token\nthat callers treat as opaque. The server resolves the current\n`AgentRuntimeId` and fence token against the live mob roster on every\ndispatch — clients never reason about `generation` or `fence_token`\ndirectly.\n\nUse [`WireMemberRef::encode`] to produce a token and\n[`WireMemberRef::decode`] inside an RPC handler to recover the\n`(mob_id, agent_identity)` pair before resolving against the runtime.",
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `mob/submit_work`.",
+    "properties": {
+      "member_ref": {
+        "$ref": "#/$defs/WireMemberRef"
+      },
+      "mob_id": {
+        "type": "string"
+      },
+      "work_ref": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "mob_id",
+      "work_ref",
+      "member_ref"
+    ],
+    "title": "MobSubmitWorkResult",
+    "type": "object"
   },
   "MobUnwireResult": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -12236,6 +12518,151 @@
     "description": "Wire-safe content input (mirrors `ContentInput`).",
     "title": "WireContentInput"
   },
+  "WireDeviceCompleteResult": {
+    "$defs": {
+      "BindingId": {
+        "description": "Opaque slug identifying a binding inside a realm.",
+        "type": "string"
+      },
+      "ProfileId": {
+        "description": "Opaque slug identifying an auth profile override on a connection.",
+        "type": "string"
+      },
+      "RealmId": {
+        "description": "Opaque slug identifying a realm.",
+        "type": "string"
+      },
+      "WireConnectionRef": {
+        "description": "Wire projection of [`meerkat_core::ConnectionRef`].\n\nPure structural shape — no `\"realm:binding\"` string form. Wave-b deleted\n`parse` and `Display` on both the core type and the wire projection so\nthe colon-joined form cannot travel across wire boundaries.",
+        "properties": {
+          "binding": {
+            "$ref": "#/$defs/BindingId"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ProfileId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "realm": {
+            "$ref": "#/$defs/RealmId"
+          }
+        },
+        "required": [
+          "realm",
+          "binding"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "`auth/login/device_complete` success body.",
+    "oneOf": [
+      {
+        "properties": {
+          "state": {
+            "const": "pending",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "state": {
+            "const": "slow_down",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "state": {
+            "const": "access_denied",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "state": {
+            "const": "expired",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "Identifies a binding inside a realm on the wire. Shared by every\nauth REST response that returns a `{realm_id, binding_id, connection_ref}`\ntrio. Built from a typed [`meerkat_core::ConnectionRef`] so the three\nfields always agree; the `realm_id`/`binding_id` strings carry the\nslug form for wire consumers that key by string.",
+        "properties": {
+          "binding_id": {
+            "type": "string"
+          },
+          "connection_ref": {
+            "$ref": "#/$defs/WireConnectionRef"
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "has_refresh_token": {
+            "type": "boolean"
+          },
+          "profile_id": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "realm_id": {
+            "type": "string"
+          },
+          "scopes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "state": {
+            "const": "ready",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "realm_id",
+          "binding_id",
+          "connection_ref",
+          "profile_id",
+          "provider",
+          "has_refresh_token",
+          "scopes"
+        ],
+        "type": "object"
+      }
+    ],
+    "title": "WireDeviceCompleteResult"
+  },
   "WireDeviceStart": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "description": "`POST /auth/login/device/start` success body.",
@@ -15109,6 +15536,91 @@
       }
     ],
     "title": "WireProviderMeta"
+  },
+  "WireProvisionApiKeyResult": {
+    "$defs": {
+      "BindingId": {
+        "description": "Opaque slug identifying a binding inside a realm.",
+        "type": "string"
+      },
+      "ProfileId": {
+        "description": "Opaque slug identifying an auth profile override on a connection.",
+        "type": "string"
+      },
+      "RealmId": {
+        "description": "Opaque slug identifying a realm.",
+        "type": "string"
+      },
+      "WireConnectionRef": {
+        "description": "Wire projection of [`meerkat_core::ConnectionRef`].\n\nPure structural shape — no `\"realm:binding\"` string form. Wave-b deleted\n`parse` and `Display` on both the core type and the wire projection so\nthe colon-joined form cannot travel across wire boundaries.",
+        "properties": {
+          "binding": {
+            "$ref": "#/$defs/BindingId"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ProfileId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "realm": {
+            "$ref": "#/$defs/RealmId"
+          }
+        },
+        "required": [
+          "realm",
+          "binding"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "`auth/login/provision_api_key` success body.",
+    "properties": {
+      "auth_mode": {
+        "type": "string"
+      },
+      "binding_id": {
+        "type": "string"
+      },
+      "connection_ref": {
+        "$ref": "#/$defs/WireConnectionRef"
+      },
+      "has_api_key": {
+        "type": "boolean"
+      },
+      "profile_id": {
+        "type": "string"
+      },
+      "provider": {
+        "type": "string"
+      },
+      "realm_id": {
+        "type": "string"
+      },
+      "scopes": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      }
+    },
+    "required": [
+      "realm_id",
+      "binding_id",
+      "connection_ref",
+      "profile_id",
+      "provider",
+      "auth_mode",
+      "has_api_key",
+      "scopes"
+    ],
+    "title": "WireProvisionApiKeyResult",
+    "type": "object"
   },
   "WireRealmConnectionSet": {
     "$defs": {

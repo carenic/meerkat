@@ -109,54 +109,67 @@
     {
       "description": "List configured auth profiles",
       "name": "auth/profile/list",
+      "params_type": "RealmIdParams",
       "result_type": "WireAuthProfilesList"
     },
     {
       "description": "Get one auth profile by id",
       "name": "auth/profile/get",
+      "params_type": "BindingIdParams",
       "result_type": "WireAuthProfileDetail"
     },
     {
       "description": "Create an auth profile",
       "name": "auth/profile/create",
+      "params_type": "CreateProfileParams",
       "result_type": "WireAuthProfileCreated"
     },
     {
       "description": "Delete an auth profile",
       "name": "auth/profile/delete",
+      "params_type": "BindingIdParams",
       "result_type": "WireAuthProfileCleared"
     },
     {
       "description": "Begin an OAuth login; returns authorize URL, state, PKCE verifier",
       "name": "auth/login/start",
+      "params_type": "LoginStartParams",
       "result_type": "WireLoginStart"
     },
     {
       "description": "Finish an OAuth login by exchanging an authorization code",
       "name": "auth/login/complete",
+      "params_type": "LoginCompleteParams",
       "result_type": "WireLoginReady"
     },
     {
       "description": "Begin a device-code OAuth login; returns user-code + verification URL",
       "name": "auth/login/device_start",
+      "params_type": "DeviceStartParams",
       "result_type": "WireDeviceStart"
     },
     {
       "description": "Single-poll completion for a device-code OAuth login; returns pending / slow_down / access_denied / expired / ready",
-      "name": "auth/login/device_complete"
+      "name": "auth/login/device_complete",
+      "params_type": "DeviceCompleteParams",
+      "result_type": "WireDeviceCompleteResult"
     },
     {
       "description": "Console-OAuth → API key provisioning (Anthropic oauth_to_api_key): POST access_token to create_api_key endpoint, persist returned api_key",
-      "name": "auth/login/provision_api_key"
+      "name": "auth/login/provision_api_key",
+      "params_type": "ProvisionApiKeyParams",
+      "result_type": "WireProvisionApiKeyResult"
     },
     {
       "description": "Get auth status for a profile",
       "name": "auth/status/get",
+      "params_type": "BindingIdParams",
       "result_type": "WireAuthStatusDetail"
     },
     {
       "description": "Revoke + remove persisted credentials",
       "name": "auth/logout",
+      "params_type": "BindingIdParams",
       "result_type": "WireAuthProfileCleared"
     },
     {
@@ -167,6 +180,7 @@
     {
       "description": "Get one realm's full connection set",
       "name": "realm/get",
+      "params_type": "RealmIdParams",
       "result_type": "WireRealmConnectionSet"
     },
     {
@@ -340,7 +354,8 @@
     },
     {
       "description": "Apply a mob lifecycle action",
-      "name": "mob/lifecycle"
+      "name": "mob/lifecycle",
+      "params_type": "MobLifecycleParams"
     },
     {
       "description": "Spawn a new mob member",
@@ -462,15 +477,19 @@
     },
     {
       "description": "Submit a unit of work to a mob member through the work lane",
-      "name": "mob/submit_work"
+      "name": "mob/submit_work",
+      "params_type": "MobSubmitWorkParams",
+      "result_type": "MobSubmitWorkResult"
     },
     {
       "description": "Cancel a previously submitted unit of work",
-      "name": "mob/cancel_work"
+      "name": "mob/cancel_work",
+      "params_type": "MobCancelWorkParams"
     },
     {
       "description": "Cancel all in-flight work for a mob member",
-      "name": "mob/cancel_all_work"
+      "name": "mob/cancel_all_work",
+      "params_type": "MobCancelAllWorkParams"
     },
     {
       "description": "Wait for kickoff completion for a member",

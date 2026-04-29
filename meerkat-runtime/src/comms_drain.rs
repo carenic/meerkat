@@ -18,13 +18,15 @@ use meerkat_core::interaction::{InteractionContent, PeerInputCandidate, PeerInpu
 use meerkat_core::lifecycle::RunControlCommand;
 use meerkat_core::types::SessionId;
 
+#[cfg(test)]
+use meerkat_contracts::wire::supervisor_bridge::SUPERVISOR_BRIDGE_BOOTSTRAP_TOKEN_PARAM;
 use meerkat_contracts::wire::supervisor_bridge::{
     BridgeAck, BridgeBindResponse, BridgeCapabilities, BridgeCommand, BridgeDeliveryOutcome,
     BridgeDeliveryPayload, BridgeDeliveryRejectionCause, BridgeDeliveryResponse,
     BridgeDestroyResponse, BridgeMemberRuntimeState, BridgeObservationResponse,
     BridgePeerConnectivity, BridgePeerSpec, BridgeRejectionCause, BridgeReply,
-    BridgeRetireResponse, BridgeSupervisorPayload, SUPERVISOR_BRIDGE_BOOTSTRAP_TOKEN_PARAM,
-    SUPERVISOR_BRIDGE_INTENT, SUPERVISOR_BRIDGE_PROTOCOL_VERSION, canonicalize_bridge_address,
+    BridgeRetireResponse, BridgeSupervisorPayload, SUPERVISOR_BRIDGE_INTENT,
+    SUPERVISOR_BRIDGE_PROTOCOL_VERSION, canonicalize_bridge_address,
 };
 
 use crate::comms_bridge::classified_interaction_to_runtime_input;
@@ -504,7 +506,7 @@ fn bridge_delivery_rejection_cause(
 ) -> BridgeDeliveryRejectionCause {
     match reason {
         crate::accept::RejectReason::NotReady { state } => BridgeDeliveryRejectionCause::NotReady {
-            state: state.clone(),
+            state: runtime_state_to_bridge(*state),
         },
         crate::accept::RejectReason::DurabilityViolation { detail } => {
             BridgeDeliveryRejectionCause::DurabilityViolation {
@@ -527,36 +529,9 @@ fn advertised_bind_bootstrap_token(
     {
         return Ok(token);
     }
-    let address = comms_runtime.advertised_address().ok_or_else(|| {
-        (
-            BridgeRejectionCause::Internal,
-            "runtime does not expose an advertised address for bind bootstrap".to_string(),
-        )
-    })?;
-    let query = address
-        .split_once('?')
-        .map(|(_, query)| query)
-        .ok_or_else(|| {
-            (
-                BridgeRejectionCause::InvalidBootstrapToken,
-                format!(
-                    "runtime advertised address '{address}' is missing '{SUPERVISOR_BRIDGE_BOOTSTRAP_TOKEN_PARAM}' query param"
-                ),
-            )
-        })?;
-    for pair in query.split('&') {
-        let Some((key, value)) = pair.split_once('=') else {
-            continue;
-        };
-        if key == SUPERVISOR_BRIDGE_BOOTSTRAP_TOKEN_PARAM && !value.is_empty() {
-            return Ok(value.to_string());
-        }
-    }
     Err((
         BridgeRejectionCause::InvalidBootstrapToken,
-        format!(
-            "runtime advertised address '{address}' is missing '{SUPERVISOR_BRIDGE_BOOTSTRAP_TOKEN_PARAM}' query param"
-        ),
+        "runtime does not expose a typed bridge bootstrap token".to_string(),
     ))
 }
 
@@ -3094,6 +3069,37 @@ mod tests {
         let (cause, _error) = validate_bind_request(&runtime, &supervisor.peer_id, &payload)
             .expect_err("runtime with empty token must refuse to validate");
         assert_eq!(cause, BridgeRejectionCause::InvalidBootstrapToken);
+    }
+
+    #[test]
+    fn validate_bind_request_rejects_query_string_bootstrap_without_typed_runtime_token() {
+        let runtime: Arc<dyn CommsRuntime> = Arc::new(bootstrap_runtime(
+            PEER_ID_RECEIVER,
+            &format!("inproc://receiver?{SUPERVISOR_BRIDGE_BOOTSTRAP_TOKEN_PARAM}=expected-token"),
+            None,
+        ));
+        let supervisor = BridgePeerSpec {
+            name: "mob/__mob_supervisor__".to_string(),
+            peer_id: PEER_ID_SUPERVISOR.to_string(),
+            address: "inproc://mob/__mob_supervisor__".to_string(),
+            pubkey: [0u8; 32],
+        };
+        let payload = meerkat_contracts::wire::supervisor_bridge::BridgeBindPayload {
+            supervisor: supervisor.clone(),
+            epoch: 0,
+            protocol_version: SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
+            expected_peer_id: PEER_ID_RECEIVER.to_string(),
+            expected_address: "inproc://receiver".to_string(),
+            bootstrap_token: "expected-token".into(),
+        };
+
+        let (cause, error) = validate_bind_request(&runtime, &supervisor.peer_id, &payload)
+            .expect_err("query-string token must not satisfy typed bootstrap proof");
+        assert_eq!(cause, BridgeRejectionCause::InvalidBootstrapToken);
+        assert!(
+            error.contains("typed bridge bootstrap token"),
+            "runtime should explain that the typed token field is required, got: {error}"
+        );
     }
 
     // -----------------------------------------------------------------------

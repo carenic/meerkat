@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use meerkat_core::handles::{DslTransitionError, TurnStateHandle, TurnStateSnapshot};
 use meerkat_core::lifecycle::RunId;
+use meerkat_core::ops::{AsyncOpRef, OperationId, WaitPolicy};
 use meerkat_core::retry::LlmRetrySchedule;
 use meerkat_core::turn_execution_authority::{
     TurnFailureReason, TurnPhase, TurnPrimitiveKind, TurnTerminalOutcome,
@@ -144,14 +145,20 @@ impl TurnStateHandle for RuntimeTurnStateHandle {
 
     fn register_pending_ops(
         &self,
-        op_refs: BTreeSet<String>,
-        barrier_operation_ids: BTreeSet<String>,
+        op_refs: BTreeSet<AsyncOpRef>,
+        barrier_operation_ids: BTreeSet<OperationId>,
     ) -> Result<(), DslTransitionError> {
         // intra-machine: no route; dispatcher not applicable (handle targets the meerkat DSL directly, not a CompositionDispatcher seam)
         self.dsl.apply_input(
             mm_dsl::MeerkatMachineInput::RegisterPendingOps {
-                op_refs,
-                barrier_operation_ids,
+                op_refs: op_refs
+                    .iter()
+                    .map(|op_ref| op_ref.operation_id.to_string())
+                    .collect(),
+                barrier_operation_ids: barrier_operation_ids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect(),
             },
             "TurnStateHandle::register_pending_ops",
         )
@@ -167,11 +174,13 @@ impl TurnStateHandle for RuntimeTurnStateHandle {
 
     fn ops_barrier_satisfied(
         &self,
-        operation_ids: BTreeSet<String>,
+        operation_ids: BTreeSet<OperationId>,
     ) -> Result<(), DslTransitionError> {
         // intra-machine: no route; dispatcher not applicable (handle targets the meerkat DSL directly, not a CompositionDispatcher seam)
         self.dsl.apply_input(
-            mm_dsl::MeerkatMachineInput::OpsBarrierSatisfied { operation_ids },
+            mm_dsl::MeerkatMachineInput::OpsBarrierSatisfied {
+                operation_ids: operation_ids.iter().map(ToString::to_string).collect(),
+            },
             "TurnStateHandle::ops_barrier_satisfied",
         )
     }
@@ -367,6 +376,25 @@ impl TurnStateHandle for RuntimeTurnStateHandle {
     fn snapshot(&self) -> TurnStateSnapshot {
         let state = self.dsl.snapshot_state();
         let turn_phase = map_turn_phase(state.turn_phase);
+        let barrier_operation_ids: BTreeSet<_> = state
+            .barrier_operation_ids
+            .iter()
+            .filter_map(|id| parse_operation_id(id))
+            .collect();
+        let pending_op_refs = state
+            .pending_op_refs
+            .iter()
+            .filter_map(|id| {
+                parse_operation_id(id).map(|operation_id| AsyncOpRef {
+                    wait_policy: if barrier_operation_ids.contains(&operation_id) {
+                        WaitPolicy::Barrier
+                    } else {
+                        WaitPolicy::Detached
+                    },
+                    operation_id,
+                })
+            })
+            .collect();
         let active_run_id = if matches!(
             turn_phase,
             TurnPhase::Completed | TurnPhase::Failed | TurnPhase::Cancelled
@@ -387,8 +415,8 @@ impl TurnStateHandle for RuntimeTurnStateHandle {
             vision_enabled: state.vision_enabled,
             image_tool_results_enabled: state.image_tool_results_enabled,
             tool_calls_pending: state.tool_calls_pending,
-            pending_op_refs: state.pending_op_refs.clone(),
-            barrier_operation_ids: state.barrier_operation_ids.clone(),
+            pending_op_refs,
+            barrier_operation_ids,
             has_barrier_ops: state.has_barrier_ops,
             barrier_satisfied: state.barrier_satisfied,
             boundary_count: state.boundary_count,
@@ -401,6 +429,10 @@ impl TurnStateHandle for RuntimeTurnStateHandle {
             llm_retry_selected_delay_ms: state.llm_retry_selected_delay_ms,
         }
     }
+}
+
+fn parse_operation_id(value: &str) -> Option<OperationId> {
+    uuid::Uuid::parse_str(value).ok().map(OperationId)
 }
 
 /// Exhaustive 1-to-1 projection of the DSL's typed turn phase into the

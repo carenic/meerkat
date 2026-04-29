@@ -915,6 +915,28 @@ async fn meerkat_machine_spine_snapshot_reports_registered_idle_session() {
 }
 
 #[tokio::test]
+async fn persistent_without_blobs_keeps_persistent_driver() {
+    let store = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let adapter = Arc::new(MeerkatMachine::persistent_without_blobs(
+        store as Arc<dyn crate::store::RuntimeStore>,
+    ));
+    let session_id = SessionId::new();
+
+    adapter.register_session(session_id.clone()).await;
+
+    let snapshot = adapter
+        .meerkat_machine_spine_snapshot(&session_id)
+        .await
+        .expect("snapshot should exist for registered session");
+
+    assert_eq!(
+        snapshot.binding.driver_kind,
+        crate::meerkat_machine_types::MeerkatDriverKind::Persistent,
+        "persistent_without_blobs must keep durable runtime semantics and fail blob use explicitly instead of downgrading to ephemeral"
+    );
+}
+
+#[tokio::test]
 async fn meerkat_machine_spine_snapshot_tracks_queued_prompt_input() {
     let adapter = Arc::new(MeerkatMachine::ephemeral());
     let session_id = SessionId::new();

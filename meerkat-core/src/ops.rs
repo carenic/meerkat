@@ -10,14 +10,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use uuid::Uuid;
 
 /// Unique identifier for an operation
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct OperationId(pub Uuid);
 
 /// Wait policy for async operations.
 ///
 /// Determines whether an operation blocks the turn boundary (`Barrier`) or runs
 /// independently (`Detached`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WaitPolicy {
     /// Operation must complete before `ToolCallsResolved` can fire.
@@ -31,7 +31,7 @@ pub enum WaitPolicy {
 /// Replaces raw `OperationId` sequences in the TurnExecution machine state to
 /// enable barrier-aware scheduling. Only `Barrier` ops block the turn boundary;
 /// `Detached` ops are recorded but do not gate `ToolCallsResolved`.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct AsyncOpRef {
     pub operation_id: OperationId,
     pub wait_policy: WaitPolicy,

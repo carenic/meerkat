@@ -55,7 +55,7 @@ impl AgentLlmClient for LoggingLlmAdapter {
         tools: &[Arc<ToolDef>],
         max_tokens: u32,
         temperature: Option<f32>,
-        provider_params: Option<&serde_json::Value>,
+        provider_params: Option<&meerkat_core::lifecycle::run_primitive::ProviderParamsOverride>,
     ) -> Result<LlmStreamResult, AgentError> {
         let call_num = API_CALL_COUNT.fetch_add(1, Ordering::SeqCst) + 1;
 
