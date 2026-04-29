@@ -10,7 +10,8 @@
  *   - `registerExternalAuthResolver` — wraps the WASM-bundled
  *     `register_external_auth_resolver` binding so a browser host page
  *     can install an OAuth-backed resolver callback that hands Meerkat
- *     a resolved bearer token per structural connection reference.
+ *     either a legacy bearer token string or a typed lease envelope per
+ *     structural connection reference.
  *   - `withConnectionRef` — convenience helper that wires an existing
  *     session config with a connection reference for `createSession`.
  *
@@ -27,12 +28,66 @@ import type { ConnectionRef, SessionConfig } from './types.js';
 /** Canonical WASM external-auth resolver handle for host-owned browser auth. */
 export const WASM_EXTERNAL_AUTH_RESOLVER_HANDLE = 'wasm_host' as const;
 
+/** Non-secret metadata attached to a resolved host-owned auth lease. */
+export interface ExternalAuthMetadata {
+  account_id?: string;
+  workspace_id?: string;
+  organization_id?: string;
+  user_id?: string;
+  plan?: string;
+  route_hints?: unknown;
+  provider_metadata?: unknown;
+}
+
+/** Typed auth lease shape accepted by the WASM external-auth resolver. */
+export type ExternalAuthLease =
+  | {
+      kind: 'inline_secret';
+      secret: string;
+      metadata: ExternalAuthMetadata;
+      expires_at?: string | null;
+    }
+  | {
+      kind: 'static_headers';
+      headers: Array<[string, string]>;
+      metadata: ExternalAuthMetadata;
+      expires_at?: string | null;
+    }
+  | {
+      kind: 'dynamic_authorizer';
+      metadata: ExternalAuthMetadata;
+      expires_at?: string | null;
+    }
+  | {
+      kind: 'none';
+      metadata: ExternalAuthMetadata;
+    };
+
+/** Structured auth failure shape that host resolvers may reject with. */
+export type ExternalAuthFailure =
+  | { kind: 'missing_secret' }
+  | { kind: 'unsupported_combination'; backend: string; auth: string }
+  | { kind: 'missing_required_metadata'; field: string }
+  | { kind: 'workspace_mismatch' }
+  | { kind: 'expired' }
+  | { kind: 'refresh_failed'; detail: string }
+  | { kind: 'interactive_login_required' }
+  | { kind: 'host_owned_unavailable' }
+  | { kind: 'io'; detail: string }
+  | { kind: 'other'; detail: string };
+
+/** Successful resolver result. A string is the legacy compatibility shape;
+ * typed leases preserve expiration and metadata across the WASM boundary. */
+export type ExternalAuthResolverResult = string | ExternalAuthLease;
+
 /** Host-page resolver callback that the WASM runtime invokes when the
  * selected binding's credential source is `external_resolver`. Takes a
- * structural connection reference, returns a bearer token string (or a promise). */
+ * structural connection reference, returns a bearer token string or typed
+ * lease envelope. Reject the returned promise with `ExternalAuthFailure`
+ * to preserve stable failure truth. */
 export type ExternalAuthResolver = (
   connectionRef: ConnectionRef,
-) => string | Promise<string>;
+) => ExternalAuthResolverResult | Promise<ExternalAuthResolverResult>;
 
 /** JSON-RPC-style transport used by the `Auth` class. Minimal: just
  * async request/response of (method, params) -> result. */
@@ -291,13 +346,19 @@ export class Auth {
  *
  * Plan §4d.wasm.1 + §4d.wasm.3: browser OAuth flows run in the host
  * page; the resolver hands Meerkat a resolved bearer token on
- * demand. Meerkat never touches the host's refresh token.
+ * demand. For compatibility the resolver may still return a plain string;
+ * hosts that know expiration/provenance should return an `ExternalAuthLease`.
+ * Meerkat never touches the host's refresh token. Reject with
+ * `ExternalAuthFailure` to preserve denial, refresh, or missing-credential
+ * truth across the WASM boundary.
  */
 export function registerExternalAuthResolver(
   wasm: { register_external_auth_resolver: (cb: unknown) => void },
   resolver: ExternalAuthResolver,
 ): void {
-  const adapter = (connectionRef: ConnectionRef): Promise<string> =>
+  const adapter = (
+    connectionRef: ConnectionRef,
+  ): Promise<ExternalAuthResolverResult> =>
     Promise.resolve(resolver(connectionRef));
   wasm.register_external_auth_resolver(adapter);
 }

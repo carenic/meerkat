@@ -15,6 +15,10 @@ import type {
   AuthLoginReady,
   AuthStatus,
   AuthTransport,
+  ExternalAuthFailure,
+  ExternalAuthLease,
+  ExternalAuthResolver,
+  ExternalAuthResolverResult,
   RuntimeConfig,
   SessionConfig,
   SessionState,
@@ -108,6 +112,25 @@ const authBinding: AuthBindingIdentity = {
   connection_ref: { realm: 'default', binding: 'openai' },
   profile_id: 'openai_apikey',
 };
+
+const externalAuthLease: ExternalAuthLease = {
+  kind: 'inline_secret',
+  secret: 'browser-access-token',
+  metadata: {
+    account_id: 'acct_browser',
+    workspace_id: 'workspace_browser',
+    user_id: 'user_browser',
+  },
+  expires_at: '2030-01-02T03:04:05Z',
+};
+const externalAuthFailure: ExternalAuthFailure = {
+  kind: 'refresh_failed',
+  detail: 'browser refresh token revoked',
+};
+const legacyExternalAuthResolver: ExternalAuthResolver = (connectionRef) =>
+  `bearer-${connectionRef.realm}-${connectionRef.binding}`;
+const typedExternalAuthResolver: ExternalAuthResolver = async () => externalAuthLease;
+const externalAuthResult: ExternalAuthResolverResult = externalAuthLease;
 
 const appendSystemContextOptions: AppendSystemContextOptions = {
   text: 'Coordinate with the orchestrator.',
@@ -297,6 +320,11 @@ void authLogout;
 void authStatusWithProfile;
 void authLogoutWithProfile;
 void authBinding;
+void externalAuthLease;
+void externalAuthFailure;
+void legacyExternalAuthResolver;
+void typedExternalAuthResolver;
+void externalAuthResult;
 void sessionState;
 void appendSystemContextOptions;
 void appendSystemContextResult;
