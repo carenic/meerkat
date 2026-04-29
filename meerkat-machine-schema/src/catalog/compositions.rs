@@ -743,14 +743,12 @@ pub fn compat_composition_schemas() -> Vec<CompositionSchema> {
 /// Modes: primary `ShellBridge` (accept + authority.apply submitters),
 /// secondary `HandleBridge` (handle-driven submitter suffixed `_handle`).
 fn mob_bundle_composition() -> CompositionSchema {
-    // Handle method takes `operation_ids: BTreeSet<String>` — the obligation
-    // field is `Set<OperationId>` which renders as `Vec<OperationId>`. The
-    // accessor rewrites the reference to stringify each operation id.
+    // Handle method takes `operation_ids: BTreeSet<OperationId>` — the
+    // obligation field is `Set<OperationId>` which renders as
+    // `Vec<OperationId>`. The accessor consumes the obligation vector into the
+    // handle's typed set.
     let mut handle_accessors = BTreeMap::new();
-    handle_accessors.insert(
-        fld_id("operation_ids"),
-        ".iter().map(ToString::to_string).collect()".into(),
-    );
+    handle_accessors.insert(fld_id("operation_ids"), ".into_iter().collect()".into());
     // Handle method takes only `operation_ids`; the obligation carries
     // a `wait_request_id` correlation token that the turn-state handle
     // never consumes (the ops-lifecycle owner matches on it internally,
