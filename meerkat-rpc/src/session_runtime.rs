@@ -223,16 +223,7 @@ fn registered_model_provider_mismatch_reason(
     provider: meerkat_core::Provider,
     model: &str,
 ) -> Option<String> {
-    let registered_provider = registry.entry(model)?.provider;
-    if registered_provider == provider {
-        return None;
-    }
-
-    Some(format!(
-        "model '{model}' is registered for provider '{}', not provider '{}'; specify a matching provider with the model override",
-        registered_provider.as_str(),
-        provider.as_str()
-    ))
+    registry.provider_override_mismatch_reason(provider, model)
 }
 
 fn profile_to_capability_surface(
@@ -1287,6 +1278,15 @@ impl SessionRuntime {
         let registry = self.model_registry().await?;
         let model = build_config.model.clone();
         let provider = if let Some(provider) = build_config.provider {
+            if let Some(reason) =
+                registered_model_provider_mismatch_reason(&registry, provider, &model)
+            {
+                return Err(RpcError {
+                    code: error::INVALID_PARAMS,
+                    message: reason,
+                    data: None,
+                });
+            }
             provider
         } else {
             registry
@@ -6006,6 +6006,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn pending_build_rejects_explicit_provider_that_contradicts_catalog_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = make_runtime(temp_factory(&temp), 10);
+        let mut build_config = AgentBuildConfig::new("gpt-5.4");
+        build_config.provider = Some(meerkat_core::Provider::Anthropic);
+        build_config.llm_client_override = Some(Arc::new(MockLlmClient));
+
+        let err = runtime
+            .llm_identity_from_pending_build(&build_config)
+            .await
+            .expect_err("pending explicit provider must match catalog owner");
+
+        assert_eq!(err.code, error::INVALID_PARAMS);
+        assert!(
+            err.message.contains("registered for provider 'openai'")
+                && err.message.contains("not provider 'anthropic'")
+                && err.message.contains("gpt-5.4"),
+            "error should identify the rejected provider/model pair: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
     async fn turn_model_override_without_provider_preserves_current_provider_for_owned_model() {
         let temp = tempfile::tempdir().unwrap();
         let runtime = make_runtime(temp_factory(&temp), 10);
@@ -6059,6 +6082,38 @@ mod tests {
         assert!(
             err.message.contains("openai")
                 && err.message.contains("anthropic")
+                && err.message.contains("gpt-5.4"),
+            "error should identify the rejected provider/model pair: {}",
+            err.message
+        );
+    }
+
+    #[tokio::test]
+    async fn turn_explicit_provider_model_override_rejects_catalog_owner_mismatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = make_runtime(temp_factory(&temp), 10);
+        let current = SessionLlmIdentity {
+            model: "claude-sonnet-4-5".to_string(),
+            provider: meerkat_core::Provider::Anthropic,
+            self_hosted_server_id: None,
+            provider_params: None,
+            connection_ref: None,
+        };
+        let overrides = crate::handlers::turn::TurnOverrides {
+            model: Some("gpt-5.4".to_string()),
+            provider: Some("anthropic".to_string()),
+            ..Default::default()
+        };
+
+        let err = runtime
+            .resolve_target_llm_identity(&current, &overrides)
+            .await
+            .expect_err("explicit turn provider must match catalog owner");
+
+        assert_eq!(err.code, error::INVALID_PARAMS);
+        assert!(
+            err.message.contains("registered for provider 'openai'")
+                && err.message.contains("not provider 'anthropic'")
                 && err.message.contains("gpt-5.4"),
             "error should identify the rejected provider/model pair: {}",
             err.message

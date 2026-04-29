@@ -497,12 +497,17 @@ async fn resolve_validation_identity(
     config_runtime: &meerkat_core::ConfigRuntime,
     model: &str,
     provider: Option<meerkat_core::Provider>,
-) -> SessionLlmIdentity {
+) -> Result<SessionLlmIdentity, String> {
     let snapshot = config_runtime.get().await.ok().map(|state| state.config);
     let registry = snapshot
         .as_ref()
         .and_then(|config| config.model_registry().ok());
     let entry = registry.as_ref().and_then(|registry| registry.entry(model));
+    if let (Some(registry), Some(provider)) = (registry.as_ref(), provider)
+        && let Some(reason) = registry.provider_override_mismatch_reason(provider, model)
+    {
+        return Err(reason);
+    }
     let provider = provider
         .or_else(|| entry.map(|entry| entry.provider))
         .or_else(|| meerkat_core::Provider::infer_from_model(model))
@@ -515,13 +520,13 @@ async fn resolve_validation_identity(
         None
     };
 
-    SessionLlmIdentity {
+    Ok(SessionLlmIdentity {
         model: model.to_string(),
         provider,
         self_hosted_server_id,
         provider_params: None,
         connection_ref: None,
-    }
+    })
 }
 
 async fn validate_prompt_video_input(
@@ -2820,7 +2825,14 @@ async fn create_session_inner(
 
     let current_generation = state.config_runtime.get().await.ok().map(|s| s.generation);
     let initial_identity =
-        resolve_validation_identity(&state.config_runtime, &model, req.provider).await;
+        match resolve_validation_identity(&state.config_runtime, &model, req.provider).await {
+            Ok(identity) => identity,
+            Err(err) => {
+                drop(caller_event_tx);
+                drain_event_forwarder(&session_id, forward_task).await;
+                return RequestTerminal::RespondWithoutPublish(Err(ApiError::BadRequest(err)));
+            }
+        };
     let mut build = SessionBuildOptions {
         provider: req.provider,
         self_hosted_server_id: initial_identity.self_hosted_server_id.clone(),
@@ -2897,7 +2909,14 @@ async fn create_session_inner(
     };
 
     let validation_identity =
-        resolve_validation_identity(&state.config_runtime, &svc_req.model, create_provider).await;
+        match resolve_validation_identity(&state.config_runtime, &svc_req.model, create_provider)
+            .await
+        {
+            Ok(identity) => identity,
+            Err(err) => {
+                return RequestTerminal::RespondWithoutPublish(Err(ApiError::BadRequest(err)));
+            }
+        };
     if let Err(err) =
         validate_prompt_video_input(&state.config_runtime, &svc_req.prompt, &validation_identity)
             .await
@@ -3646,9 +3665,20 @@ async fn continue_session_inner(
             labels: None,
         };
         let create_provider = create_req.build.as_ref().and_then(|build| build.provider);
-        let validation_identity =
-            resolve_validation_identity(&state.config_runtime, &create_req.model, create_provider)
-                .await;
+        let validation_identity = match resolve_validation_identity(
+            &state.config_runtime,
+            &create_req.model,
+            create_provider,
+        )
+        .await
+        {
+            Ok(identity) => identity,
+            Err(err) => {
+                drop(caller_event_tx);
+                drain_event_forwarder(&session_id, forward_task).await;
+                return RequestTerminal::RespondWithoutPublish(Err(ApiError::BadRequest(err)));
+            }
+        };
         if let Err(err) = validate_prompt_video_input(
             &state.config_runtime,
             &create_req.prompt,
@@ -3797,7 +3827,16 @@ async fn continue_session_inner(
         }
 
         let fallback_identity =
-            resolve_validation_identity(&state.config_runtime, &state.default_model, None).await;
+            match resolve_validation_identity(&state.config_runtime, &state.default_model, None)
+                .await
+            {
+                Ok(identity) => identity,
+                Err(err) => {
+                    drop(caller_event_tx);
+                    drain_event_forwarder(&session_id, forward_task).await;
+                    return RequestTerminal::RespondWithoutPublish(Err(ApiError::BadRequest(err)));
+                }
+            };
         let current_identity = stored_metadata
             .as_ref()
             .map(meerkat::SessionMetadata::llm_identity)
@@ -4657,12 +4696,35 @@ mod tests {
         let config_runtime =
             meerkat_core::ConfigRuntime::new(store, temp.path().join("config_state.json"));
 
-        let identity = resolve_validation_identity(&config_runtime, "gemma-4-e2b", None).await;
+        let identity = resolve_validation_identity(&config_runtime, "gemma-4-e2b", None)
+            .await
+            .expect("self-hosted alias should resolve");
         assert_eq!(identity.provider, Provider::SelfHosted);
 
         validate_prompt_video_input(&config_runtime, &inline_video_prompt(), &identity)
             .await
             .expect("self-hosted aliases should validate inline video against the active registry");
+    }
+
+    #[tokio::test]
+    async fn validation_identity_rejects_explicit_provider_that_contradicts_catalog_owner() {
+        let temp = TempDir::new().unwrap();
+        let store: Arc<dyn meerkat_core::ConfigStore> =
+            Arc::new(MemoryConfigStore::new(Config::default()));
+        let config_runtime =
+            meerkat_core::ConfigRuntime::new(store, temp.path().join("config_state.json"));
+
+        let err =
+            resolve_validation_identity(&config_runtime, "gpt-5.4", Some(Provider::Anthropic))
+                .await
+                .expect_err("validation identity should fail closed for wrong-provider overrides");
+
+        assert!(
+            err.contains("registered for provider 'openai'")
+                && err.contains("not provider 'anthropic'")
+                && err.contains("gpt-5.4"),
+            "error should identify the rejected provider/model pair: {err}"
+        );
     }
 
     #[test]

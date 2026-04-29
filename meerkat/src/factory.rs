@@ -1841,6 +1841,12 @@ impl AgentFactory {
         build_config: &AgentBuildConfig,
     ) -> Result<(Provider, Option<String>), BuildAgentError> {
         if let Some(provider) = build_config.provider {
+            if let Some(reason) =
+                registry.provider_override_mismatch_reason(provider, &build_config.model)
+            {
+                return Err(BuildAgentError::Config(reason));
+            }
+
             return match provider {
                 Provider::SelfHosted => {
                     let entry = registry
@@ -3575,6 +3581,62 @@ mod tests {
             None,
             "provider-aware default lookup must not reuse OpenAI defaults for Anthropic"
         );
+    }
+
+    #[test]
+    fn default_provider_resolution_uses_catalog_owner_without_explicit_override() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = AgentFactory::new(temp.path().join("sessions"));
+        let registry = factory
+            .model_registry(&Config::default())
+            .expect("registry");
+        let build = AgentBuildConfig::new("gpt-5.4");
+
+        let (provider, server_id) = factory
+            .resolve_provider_from_registry(&registry, &build)
+            .expect("catalog model should infer provider");
+
+        assert_eq!(provider, Provider::OpenAI);
+        assert_eq!(server_id, None);
+    }
+
+    #[test]
+    fn explicit_provider_override_rejects_catalog_owner_contradiction() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = AgentFactory::new(temp.path().join("sessions"));
+        let registry = factory
+            .model_registry(&Config::default())
+            .expect("registry");
+        let mut build = AgentBuildConfig::new("gpt-5.4");
+        build.provider = Some(Provider::Anthropic);
+
+        let err = factory
+            .resolve_provider_from_registry(&registry, &build)
+            .expect_err("explicit provider must match catalog ownership");
+        assert!(
+            err.to_string().contains("registered for provider 'openai'")
+                && err.to_string().contains("not provider 'anthropic'")
+                && err.to_string().contains("gpt-5.4"),
+            "error should identify the rejected provider/model pair: {err}"
+        );
+    }
+
+    #[test]
+    fn explicit_provider_override_allows_uncatalogued_model_without_catalog_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = AgentFactory::new(temp.path().join("sessions"));
+        let registry = factory
+            .model_registry(&Config::default())
+            .expect("registry");
+        let mut build = AgentBuildConfig::new("custom-openai-compatible");
+        build.provider = Some(Provider::OpenAI);
+
+        let (provider, server_id) = factory
+            .resolve_provider_from_registry(&registry, &build)
+            .expect("uncatalogued explicit provider has no catalog owner to contradict");
+
+        assert_eq!(provider, Provider::OpenAI);
+        assert_eq!(server_id, None);
     }
 
     #[test]
