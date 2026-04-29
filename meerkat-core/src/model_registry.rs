@@ -18,16 +18,6 @@ pub struct SelfHostedServerRef {
     pub bearer_token_env: Option<String>,
 }
 
-impl SelfHostedServerRef {
-    pub fn resolve_bearer_token(&self) -> Option<String> {
-        self.bearer_token.clone().or_else(|| {
-            self.bearer_token_env
-                .as_deref()
-                .and_then(|env_key| std::env::var(env_key).ok())
-        })
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct ModelRegistryEntry {
     pub id: String,
