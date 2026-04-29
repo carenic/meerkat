@@ -281,7 +281,7 @@ let mut agent = AgentBuilder::new()
     .output_schema(OutputSchema::new(triage_schema)?)
     .budget(BudgetLimits::default().with_max_tokens(2000))
     .build(llm, tools, store)
-    .await;
+    .await?;
 
 let result = agent.run(raw_alert_text.into()).await?;
 let output = result.structured_output.ok_or("schema validation returned no output")?;

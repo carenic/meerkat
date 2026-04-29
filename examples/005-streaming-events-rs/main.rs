@@ -44,7 +44,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .system_prompt("You are a creative writing assistant.")
         .max_tokens_per_turn(1024)
         .build(Arc::new(llm), Arc::new(EmptyToolDispatcher), store)
-        .await;
+        .await?;
 
     // --- Option A: Use the built-in event logger (simplest) ---
     println!("=== Streaming with built-in logger ===\n");

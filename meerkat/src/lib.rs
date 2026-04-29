@@ -37,7 +37,6 @@ pub mod tokio {
 pub use meerkat_core::{
     // Agent
     Agent,
-    AgentBuilder,
     AgentConfig,
     // Errors
     AgentError,
@@ -142,6 +141,11 @@ pub use meerkat_core::{
     // Operations
     WorkKind,
 };
+
+mod agent_builder;
+pub use agent_builder::AgentBuilder;
+pub use meerkat_core::AgentBuilder as CoreAgentBuilder;
+pub use meerkat_core::AgentBuilder as StandaloneAgentBuilder;
 
 // Config store types (filesystem-dependent — not available on wasm32)
 #[cfg(not(target_arch = "wasm32"))]

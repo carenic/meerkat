@@ -35,7 +35,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .system_prompt("You are a helpful assistant. Be concise in your responses.")
         .max_tokens_per_turn(1024)
         .build(Arc::new(llm), tools, store)
-        .await;
+        .await?;
 
     let result = agent
         .run("What is the capital of France? Answer in one sentence.".into())

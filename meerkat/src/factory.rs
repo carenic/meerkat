@@ -216,6 +216,13 @@ pub struct AgentBuildConfig {
     pub event_tx: Option<mpsc::Sender<AgentEvent>>,
     /// Override LLM client (for testing or embedding).
     pub llm_client_override: Option<Arc<dyn LlmClient>>,
+    /// Override pre-adapted low-level agent LLM client.
+    ///
+    /// This preserves full `AssistantBlock` output for compatibility surfaces
+    /// that already own the core agent client, while the surrounding factory
+    /// still owns provider defaults, hooks, session metadata, and runtime
+    /// setup.
+    pub agent_llm_client_override: Option<Arc<dyn AgentLlmClient>>,
     /// Provider-specific parameters (e.g., thinking config, reasoning effort).
     pub provider_params: Option<serde_json::Value>,
     /// External tool dispatcher to compose with builtins (e.g., MCP callback tools).
@@ -370,6 +377,10 @@ impl std::fmt::Debug for AgentBuildConfig {
             .field("budget_limits", &self.budget_limits)
             .field("event_tx", &self.event_tx.is_some())
             .field("llm_client_override", &self.llm_client_override.is_some())
+            .field(
+                "agent_llm_client_override",
+                &self.agent_llm_client_override.is_some(),
+            )
             .field("provider_params", &self.provider_params.is_some())
             .field("external_tools", &self.external_tools.is_some())
             .field("recoverable_tool_defs", &self.recoverable_tool_defs)
@@ -441,6 +452,7 @@ impl AgentBuildConfig {
             budget_limits: None,
             event_tx: None,
             llm_client_override: None,
+            agent_llm_client_override: None,
             provider_params: None,
             external_tools: None,
             recoverable_tool_defs: None,
@@ -1898,6 +1910,9 @@ impl AgentFactory {
         if let Some(client) = build_config.llm_client_override.as_ref() {
             return Ok((Provider::from_name(client.provider()), None));
         }
+        if let Some(client) = build_config.agent_llm_client_override.as_ref() {
+            return Ok((Provider::from_name(client.provider()), None));
+        }
 
         Err(BuildAgentError::UnknownProvider {
             model: build_config.model.clone(),
@@ -2255,168 +2270,176 @@ impl AgentFactory {
         let mut auto_image_generation_executor: Option<
             Arc<dyn meerkat_llm_core::ImageGenerationExecutor>,
         > = None;
-        let llm_client: Arc<dyn LlmClient> = match build_config.llm_client_override.as_ref() {
-            Some(client) => Arc::clone(client),
-            None if std::env::var("RKAT_TEST_CLIENT").ok().as_deref() == Some("1") => {
-                // Test shim: when RKAT_TEST_CLIENT=1 is set by integration
-                // tests, short-circuit to an in-process TestClient so tests
-                // don't need real provider credentials.
-                Arc::new(meerkat_client::TestClient::default())
-            }
-            None => {
-                // Self-hosted routes through the legacy path until it's
-                // folded into the backend-kind taxonomy.
-                if matches!(provider, Provider::SelfHosted) && build_config.connection_ref.is_none()
-                {
-                    self.build_self_hosted_client_from_registry(
-                        &registry,
-                        &SessionLlmIdentity {
-                            model: build_config.model.clone(),
-                            provider,
-                            self_hosted_server_id: self_hosted_server_id.clone(),
-                            provider_params: build_config.provider_params.clone(),
-                            connection_ref: None,
-                        },
-                    )
-                    .map_err(BuildAgentError::LlmClient)?
-                } else {
-                    let (realm, _binding_id, resolved_connection_ref) =
-                        Self::resolve_realm_binding_for_provider(
-                            config,
-                            provider,
-                            build_config.connection_ref.as_ref(),
-                            build_config.realm_id.as_deref(),
+        let llm_client: Option<Arc<dyn LlmClient>> = if build_config
+            .agent_llm_client_override
+            .is_some()
+        {
+            None
+        } else {
+            Some(match build_config.llm_client_override.as_ref() {
+                Some(client) => Arc::clone(client),
+                None if std::env::var("RKAT_TEST_CLIENT").ok().as_deref() == Some("1") => {
+                    // Test shim: when RKAT_TEST_CLIENT=1 is set by integration
+                    // tests, short-circuit to an in-process TestClient so tests
+                    // don't need real provider credentials.
+                    Arc::new(meerkat_client::TestClient::default())
+                }
+                None => {
+                    // Self-hosted routes through the legacy path until it's
+                    // folded into the backend-kind taxonomy.
+                    if matches!(provider, Provider::SelfHosted)
+                        && build_config.connection_ref.is_none()
+                    {
+                        self.build_self_hosted_client_from_registry(
+                            &registry,
+                            &SessionLlmIdentity {
+                                model: build_config.model.clone(),
+                                provider,
+                                self_hosted_server_id: self_hosted_server_id.clone(),
+                                provider_params: build_config.provider_params.clone(),
+                                connection_ref: None,
+                            },
                         )
-                        .map_err(BuildAgentError::ConnectionResolution)?;
-                    if resolved_connection_ref.is_env_default()
-                        && build_config
-                            .connection_ref
-                            .as_ref()
-                            .map(ConnectionRef::is_env_default)
-                            .unwrap_or(true)
-                    {
-                        build_config.connection_ref = None;
+                        .map_err(BuildAgentError::LlmClient)?
                     } else {
-                        build_config.connection_ref = Some(resolved_connection_ref.clone());
-                    }
-
-                    // Provider-runtime registry needs the OAuth-backed
-                    // TokenStore attached so persisted tokens (written by
-                    // `rkat auth login`, server-side OAuth completion, etc.)
-                    // are read during resolve_binding.
-                    #[allow(unused_mut)]
-                    let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        if let Some(store) = self.token_store.clone() {
-                            env = env.with_token_store(store);
-                        }
-                        if let Some(coord) = self.refresh_coord.clone() {
-                            env = env.with_refresh_coordinator(coord);
-                        }
-                    }
-                    if let RuntimeBuildMode::SessionOwned(bindings) =
-                        &build_config.runtime_build_mode
-                    {
-                        env = env.with_auth_lease_handle(Arc::clone(&bindings.auth_lease));
-                    }
-                    for (handle, resolver) in &self.external_auth_resolvers {
-                        env = env.with_external_resolver(handle.clone(), resolver.clone());
-                    }
-                    let provider_registry = Arc::clone(&self.provider_registry);
-                    let connection = provider_registry
-                        .resolve(&realm, &resolved_connection_ref, &env)
-                        .await
-                        .map_err(|e| BuildAgentError::ConnectionResolution(e.to_string()))?;
-                    provider = connection.provider;
-                    #[cfg(not(target_arch = "wasm32"))]
-                    {
-                        let selected_realm = build_config.realm_id.as_deref();
-                        let connection_is_in_selected_realm = selected_realm
-                            .map(|realm| resolved_connection_ref.realm.as_str() == realm)
-                            .unwrap_or(true);
-                        if connection_is_in_selected_realm {
-                            auto_image_generation_executor = provider_registry
-                                .build_image_generation_executor(connection.clone())
-                                .map_err(|e| {
-                                    BuildAgentError::ConnectionResolution(e.to_string())
-                                })?;
+                        let (realm, _binding_id, resolved_connection_ref) =
+                            Self::resolve_realm_binding_for_provider(
+                                config,
+                                provider,
+                                build_config.connection_ref.as_ref(),
+                                build_config.realm_id.as_deref(),
+                            )
+                            .map_err(BuildAgentError::ConnectionResolution)?;
+                        if resolved_connection_ref.is_env_default()
+                            && build_config
+                                .connection_ref
+                                .as_ref()
+                                .map(ConnectionRef::is_env_default)
+                                .unwrap_or(true)
+                        {
+                            build_config.connection_ref = None;
                         } else {
-                            tracing::debug!(
-                                provider = provider.as_str(),
-                                ?selected_realm,
-                                resolved_realm = resolved_connection_ref.realm.as_str(),
-                                "skipping image executor reuse for LLM connection outside selected realm"
-                            );
+                            build_config.connection_ref = Some(resolved_connection_ref.clone());
                         }
-                    }
 
-                    // Phase 1.5-rev loop closure — refresh-loop middle:
-                    // The DSL tracks per-binding auth lifecycle state.
-                    // On successful resolve, record the lease's expiry
-                    // in the DSL so the runner's CallingLlm arm can
-                    // observe `valid` / `expiring` / `reauth_required`
-                    // states for this binding. Connects the resolver
-                    // side to the state the agent runner consults.
-                    if let RuntimeBuildMode::SessionOwned(bindings) =
-                        &build_config.runtime_build_mode
-                    {
-                        let lease_key = meerkat_core::handles::LeaseKey::from_connection_ref(
-                            &resolved_connection_ref,
-                        );
-                        let expires_at = connection
-                            .auth_lease
-                            .expires_at()
-                            .map(|ts| ts.timestamp().max(0) as u64)
-                            .unwrap_or(u64::MAX);
-                        // Ignore result: the DSL may reject if an earlier
-                        // hot-swap already transitioned this binding; the
-                        // lease state is orthogonal to error semantics.
-                        let _ = bindings.auth_lease.acquire_lease(&lease_key, expires_at);
-                    }
+                        // Provider-runtime registry needs the OAuth-backed
+                        // TokenStore attached so persisted tokens (written by
+                        // `rkat auth login`, server-side OAuth completion, etc.)
+                        // are read during resolve_binding.
+                        #[allow(unused_mut)]
+                        let mut env = meerkat_providers::ResolverEnvironment::with_process_env();
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            if let Some(store) = self.token_store.clone() {
+                                env = env.with_token_store(store);
+                            }
+                            if let Some(coord) = self.refresh_coord.clone() {
+                                env = env.with_refresh_coordinator(coord);
+                            }
+                        }
+                        if let RuntimeBuildMode::SessionOwned(bindings) =
+                            &build_config.runtime_build_mode
+                        {
+                            env = env.with_auth_lease_handle(Arc::clone(&bindings.auth_lease));
+                        }
+                        for (handle, resolver) in &self.external_auth_resolvers {
+                            env = env.with_external_resolver(handle.clone(), resolver.clone());
+                        }
+                        let provider_registry = Arc::clone(&self.provider_registry);
+                        let connection = provider_registry
+                            .resolve(&realm, &resolved_connection_ref, &env)
+                            .await
+                            .map_err(|e| BuildAgentError::ConnectionResolution(e.to_string()))?;
+                        provider = connection.provider;
+                        #[cfg(not(target_arch = "wasm32"))]
+                        {
+                            let selected_realm = build_config.realm_id.as_deref();
+                            let connection_is_in_selected_realm = selected_realm
+                                .map(|realm| resolved_connection_ref.realm.as_str() == realm)
+                                .unwrap_or(true);
+                            if connection_is_in_selected_realm {
+                                auto_image_generation_executor = provider_registry
+                                    .build_image_generation_executor(connection.clone())
+                                    .map_err(|e| {
+                                        BuildAgentError::ConnectionResolution(e.to_string())
+                                    })?;
+                            } else {
+                                tracing::debug!(
+                                    provider = provider.as_str(),
+                                    ?selected_realm,
+                                    resolved_realm = resolved_connection_ref.realm.as_str(),
+                                    "skipping image executor reuse for LLM connection outside selected realm"
+                                );
+                            }
+                        }
 
-                    // Realtime-capable OpenAI models (e.g. gpt-realtime-1.5)
-                    // cannot go through the Responses API — POST /v1/responses
-                    // returns 404 model_not_found. Route those through the
-                    // OpenAI Realtime WebSocket via `OpenAiRealtimeTextAdapter`.
-                    // Capability-driven routing owns this decision at the
-                    // composition seam (dogma §9).
-                    let realtime_route = matches!(provider, Provider::OpenAI)
-                        && is_openai_realtime_capable(&build_config.model);
-                    #[cfg(not(feature = "openai-realtime"))]
-                    if realtime_route {
-                        return Err(BuildAgentError::ConnectionResolution(format!(
-                            "model '{}' advertises ModelCapabilities.realtime=true; \
+                        // Phase 1.5-rev loop closure — refresh-loop middle:
+                        // The DSL tracks per-binding auth lifecycle state.
+                        // On successful resolve, record the lease's expiry
+                        // in the DSL so the runner's CallingLlm arm can
+                        // observe `valid` / `expiring` / `reauth_required`
+                        // states for this binding. Connects the resolver
+                        // side to the state the agent runner consults.
+                        if let RuntimeBuildMode::SessionOwned(bindings) =
+                            &build_config.runtime_build_mode
+                        {
+                            let lease_key = meerkat_core::handles::LeaseKey::from_connection_ref(
+                                &resolved_connection_ref,
+                            );
+                            let expires_at = connection
+                                .auth_lease
+                                .expires_at()
+                                .map(|ts| ts.timestamp().max(0) as u64)
+                                .unwrap_or(u64::MAX);
+                            // Ignore result: the DSL may reject if an earlier
+                            // hot-swap already transitioned this binding; the
+                            // lease state is orthogonal to error semantics.
+                            let _ = bindings.auth_lease.acquire_lease(&lease_key, expires_at);
+                        }
+
+                        // Realtime-capable OpenAI models (e.g. gpt-realtime-1.5)
+                        // cannot go through the Responses API — POST /v1/responses
+                        // returns 404 model_not_found. Route those through the
+                        // OpenAI Realtime WebSocket via `OpenAiRealtimeTextAdapter`.
+                        // Capability-driven routing owns this decision at the
+                        // composition seam (dogma §9).
+                        let realtime_route = matches!(provider, Provider::OpenAI)
+                            && is_openai_realtime_capable(&build_config.model);
+                        #[cfg(not(feature = "openai-realtime"))]
+                        if realtime_route {
+                            return Err(BuildAgentError::ConnectionResolution(format!(
+                                "model '{}' advertises ModelCapabilities.realtime=true; \
                              the meerkat facade must be built with the \
                              `openai-realtime` feature to route text turns over the \
                              Realtime WebSocket",
-                            build_config.model
-                        )));
-                    }
-                    #[cfg(feature = "openai-realtime")]
-                    if realtime_route {
-                        let secret = connection.resolved_secret().ok_or_else(|| {
-                            BuildAgentError::ConnectionResolution(
-                                "openai realtime text adapter requires an inline API key (\
+                                build_config.model
+                            )));
+                        }
+                        #[cfg(feature = "openai-realtime")]
+                        if realtime_route {
+                            let secret = connection.resolved_secret().ok_or_else(|| {
+                                BuildAgentError::ConnectionResolution(
+                                    "openai realtime text adapter requires an inline API key (\
                                  dynamic authorizers for realtime WS are not yet supported)"
-                                    .to_string(),
-                            )
-                        })?;
-                        Arc::new(meerkat_openai::OpenAiRealtimeTextAdapter::new(secret))
-                            as Arc<dyn LlmClient>
-                    } else {
-                        provider_registry
-                            .build_client(connection)
-                            .map_err(|e| BuildAgentError::ConnectionResolution(e.to_string()))?
-                    }
-                    #[cfg(not(feature = "openai-realtime"))]
-                    {
-                        provider_registry
-                            .build_client(connection)
-                            .map_err(|e| BuildAgentError::ConnectionResolution(e.to_string()))?
+                                        .to_string(),
+                                )
+                            })?;
+                            Arc::new(meerkat_openai::OpenAiRealtimeTextAdapter::new(secret))
+                                as Arc<dyn LlmClient>
+                        } else {
+                            provider_registry
+                                .build_client(connection)
+                                .map_err(|e| BuildAgentError::ConnectionResolution(e.to_string()))?
+                        }
+                        #[cfg(not(feature = "openai-realtime"))]
+                        {
+                            provider_registry
+                                .build_client(connection)
+                                .map_err(|e| BuildAgentError::ConnectionResolution(e.to_string()))?
+                        }
                     }
                 }
-            }
+            })
         };
         #[cfg(not(target_arch = "wasm32"))]
         if build_config.image_generation_executor_override.is_none() {
@@ -2498,44 +2521,55 @@ impl AgentFactory {
                 .map_err(|err| BuildAgentError::Config(format!("model routing baseline: {err}")))?;
         }
         let event_tap = meerkat_core::new_event_tap();
-        let mut llm_adapter_inner = match build_config.event_tx.clone() {
-            Some(tx) => LlmClientAdapter::with_event_channel(llm_client, model.clone(), tx),
-            None => LlmClientAdapter::new(llm_client, model.clone()),
-        };
-        llm_adapter_inner = llm_adapter_inner.with_event_tap(event_tap.clone());
-        if let Some(params_value) = build_config.provider_params.as_ref() {
-            // Project the legacy `Option<serde_json::Value>` per-turn
-            // blob into the typed `ProviderTag` the adapter wants.
-            // Per-provider `from_legacy_value` maps well-known shapes;
-            // unknown keys surface as `LegacyProviderParamsError`
-            // (lossless round-trip via `ProviderTag::Unknown { bag }`
-            // is the runtime-boundary responsibility, not this seam).
-            use meerkat_core::lifecycle::run_primitive::{
-                AnthropicProviderTag, GeminiProviderTag, OpenAiProviderTag, ProviderTag,
-            };
-            let typed_tag = match provider {
-                Provider::Anthropic => AnthropicProviderTag::from_legacy_value(params_value)
-                    .map(ProviderTag::Anthropic),
-                Provider::OpenAI => {
-                    OpenAiProviderTag::from_legacy_value(params_value).map(ProviderTag::OpenAi)
-                }
-                Provider::Gemini => {
-                    GeminiProviderTag::from_legacy_value(params_value).map(ProviderTag::Gemini)
-                }
-                Provider::SelfHosted | Provider::Other => {
-                    // Self-hosted and Other route through OpenAI-compatible
-                    // APIs; use the OpenAI shape for per-turn overrides.
-                    OpenAiProviderTag::from_legacy_value(params_value).map(ProviderTag::OpenAi)
-                }
-            }
-            .map_err(|e| {
-                BuildAgentError::Config(format!(
-                    "invalid provider_params for provider {provider:?}: {e}"
-                ))
+        let llm_adapter: Arc<dyn AgentLlmClient> = if let Some(agent_client) =
+            build_config.agent_llm_client_override.take()
+        {
+            agent_client
+        } else {
+            let llm_client = llm_client.ok_or_else(|| {
+                BuildAgentError::Config(
+                    "internal error: missing LLM client for adapter build".to_string(),
+                )
             })?;
-            llm_adapter_inner = llm_adapter_inner.with_provider_params(Some(typed_tag));
-        }
-        let llm_adapter: Arc<dyn AgentLlmClient> = Arc::new(llm_adapter_inner);
+            let mut llm_adapter_inner = match build_config.event_tx.clone() {
+                Some(tx) => LlmClientAdapter::with_event_channel(llm_client, model.clone(), tx),
+                None => LlmClientAdapter::new(llm_client, model.clone()),
+            };
+            llm_adapter_inner = llm_adapter_inner.with_event_tap(event_tap.clone());
+            if let Some(params_value) = build_config.provider_params.as_ref() {
+                // Project the legacy `Option<serde_json::Value>` per-turn
+                // blob into the typed `ProviderTag` the adapter wants.
+                // Per-provider `from_legacy_value` maps well-known shapes;
+                // unknown keys surface as `LegacyProviderParamsError`
+                // (lossless round-trip via `ProviderTag::Unknown { bag }`
+                // is the runtime-boundary responsibility, not this seam).
+                use meerkat_core::lifecycle::run_primitive::{
+                    AnthropicProviderTag, GeminiProviderTag, OpenAiProviderTag, ProviderTag,
+                };
+                let typed_tag = match provider {
+                    Provider::Anthropic => AnthropicProviderTag::from_legacy_value(params_value)
+                        .map(ProviderTag::Anthropic),
+                    Provider::OpenAI => {
+                        OpenAiProviderTag::from_legacy_value(params_value).map(ProviderTag::OpenAi)
+                    }
+                    Provider::Gemini => {
+                        GeminiProviderTag::from_legacy_value(params_value).map(ProviderTag::Gemini)
+                    }
+                    Provider::SelfHosted | Provider::Other => {
+                        // Self-hosted and Other route through OpenAI-compatible
+                        // APIs; use the OpenAI shape for per-turn overrides.
+                        OpenAiProviderTag::from_legacy_value(params_value).map(ProviderTag::OpenAi)
+                    }
+                }
+                .map_err(|e| {
+                    BuildAgentError::Config(format!(
+                        "invalid provider_params for provider {provider:?}: {e}"
+                    ))
+                })?;
+                llm_adapter_inner = llm_adapter_inner.with_provider_params(Some(typed_tag));
+            }
+            Arc::new(llm_adapter_inner)
+        };
 
         // 5. Resolve max_tokens
         let max_tokens = build_config.max_tokens.unwrap_or(config.max_tokens);

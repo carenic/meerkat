@@ -172,7 +172,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .max_tokens_per_turn(2048)
         .build(Arc::new(llm), Arc::new(WeatherAndConvertDispatcher), store)
-        .await;
+        .await?;
 
     let result = agent
         .run(

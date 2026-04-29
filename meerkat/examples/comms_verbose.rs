@@ -406,7 +406,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              Use peers to see available peers.",
         )
         .build(llm_a, tools_a, store.clone())
-        .await;
+        .await?;
     println!("Agent A built with system prompt and comms tools");
 
     let agent_b_inner = AgentBuilder::new()
@@ -416,7 +416,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             "You are Agent B. When you receive messages from other agents, acknowledge them.",
         )
         .build(llm_b, tools_b, store)
-        .await;
+        .await?;
     println!("Agent B built with system prompt and comms tools");
 
     let mut agent_a = CommsAgent::new(agent_a_inner, comms_manager_a);

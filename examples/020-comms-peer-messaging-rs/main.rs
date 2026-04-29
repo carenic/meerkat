@@ -171,7 +171,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              Use the peers tool to discover available peers, then send messages to them.",
         )
         .build(Arc::new(llm_a), tools_a, store_a)
-        .await;
+        .await?;
 
     let agent_b_inner = AgentBuilder::new()
         .model(&model)
@@ -181,7 +181,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
              acknowledge them and respond thoughtfully.",
         )
         .build(Arc::new(llm_b), tools_b, store_b)
-        .await;
+        .await?;
 
     // Wrap each agent with its CommsManager so inbox messages are
     // automatically injected into the conversation.

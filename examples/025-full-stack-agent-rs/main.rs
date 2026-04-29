@@ -182,7 +182,7 @@ Professional, concise, action-oriented. Always provide next steps.
         .max_tokens_per_turn(2048)
         .budget(budget)
         .build(Arc::new(llm), tools, store)
-        .await;
+        .await?;
 
     // ── 5. Run with event streaming ────────────────────────────────────────
     println!("=== Full-Stack Agent: Production Support ===\n");

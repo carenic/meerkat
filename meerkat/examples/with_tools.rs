@@ -94,7 +94,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .system_prompt("You are a math assistant. Use the provided tools to perform calculations.")
         .max_tokens_per_turn(1024)
         .build(Arc::new(llm), tools, store)
-        .await;
+        .await?;
 
     let result = agent
         .run("What is 25 + 17, and then multiply the result by 3?".into())

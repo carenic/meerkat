@@ -20,11 +20,15 @@ recovery-safe background completion handling.
 
 ## AgentBuilder vs AgentFactory
 
-`AgentBuilder` (in `meerkat-core`) wires the agent loop primitives: LLM client, tool dispatcher, and session store. It has no dependency on `meerkat-tools` and no opinions about which tools exist.
+`meerkat::AgentBuilder` is the public facade builder. It accepts explicit client/tool/store overrides for embedded use, then still routes through `AgentFactory::build_agent()` so provider defaults, session metadata, hook wiring, and runtime build-mode defaults stay aligned with the factory path.
 
 `AgentFactory` (in the `meerkat` facade) is the opinionated composition layer. It knows about tool categories, runtime resources, comms, memory, mobs, and skills, and wires them into the dispatcher before passing them to `AgentBuilder`. All public surfaces go through the runtime-backed session path built on top of `AgentFactory`.
 
-**Use `AgentFactory` via `build_persistent_service()` (main path) or `build_ephemeral_service()` (substrate/testing path) unless you explicitly need to bypass session lifecycle orchestration.** Direct `AgentBuilder` usage means you own composition, persistence, event handling, and any drift from the standard runtime-backed path.
+`meerkat::CoreAgentBuilder` is the lower-level `meerkat-core` builder. It is the intentional builder-only escape hatch for tests or embeddings that own every primitive directly and do not want facade-owned provider/auth/session/runtime composition.
+
+`meerkat::StandaloneAgentBuilder` is an alias for `CoreAgentBuilder` for code migrating from the older concrete `Agent<C, T, S>` builder contract. The facade `AgentBuilder::build(...)` now returns `Result<DynAgent, BuildAgentError>` because the factory pipeline may wrap or compose the supplied resources before the agent is runnable.
+
+**Use `AgentFactory` via `build_persistent_service()` (main path), `build_ephemeral_service()` (substrate/testing path), or the public `meerkat::AgentBuilder` facade unless you explicitly need to bypass session lifecycle orchestration.** Direct `CoreAgentBuilder` usage means you own composition, persistence, event handling, and any drift from the standard runtime-backed path.
 
 If you are building a runtime-backed surface around `SessionService`, avoid the
 old hand-rolled `register_session()` + registry extraction pattern. Prefer the
@@ -34,12 +38,13 @@ binding seam above so the runtime/session owner stays canonical.
 
 <Note>
 For most use cases, prefer `SessionService` via the runtime-backed persistent path (see
-[overview](/rust/overview)). `AgentBuilder` is used internally by `AgentFactory::build_agent()`.
-Direct usage is only needed when bypassing the session service entirely.
+[overview](/rust/overview)). The public `AgentBuilder` delegates to the factory
+pipeline. Use `CoreAgentBuilder` only when bypassing the session service and
+facade composition entirely.
 </Note>
 
 <Warning>
-If you are embedding Meerkat into an application, start with `SessionService`. Reach for `AgentBuilder` only when you deliberately want an expert-only execution API with no runtime-managed session identity.
+If you are embedding Meerkat into an application, start with `SessionService`. Reach for `CoreAgentBuilder` or `StandaloneAgentBuilder` only when you deliberately want an expert-only execution API with no runtime-managed session identity. Facade `AgentBuilder` rejects direct `provider_tool_defaults`, `compactor`, `memory_store`, and `with_turn_state_handle` injection so those standalone-only behaviors cannot be silently dropped.
 </Warning>
 
 ```rust
@@ -51,7 +56,7 @@ let mut agent = AgentBuilder::new()
     .max_tokens_per_turn(4096)
     .temperature(0.7)
     .build(llm_client, tool_dispatcher, session_store)
-    .await;
+    .await?;
 ```
 
 <Accordion title="All builder methods">

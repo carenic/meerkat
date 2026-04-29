@@ -377,7 +377,8 @@ mod simple_chat {
             .max_tokens_per_turn(256)
             .system_prompt("You are a helpful assistant. Respond briefly.")
             .build(llm_adapter, tools, store_adapter)
-            .await;
+            .await
+            .expect("public builder build");
 
         // Run with simple prompt
         let result = agent
@@ -429,7 +430,8 @@ mod simple_chat {
             .max_tokens_per_turn(256)
             .system_prompt("You are a helpful assistant. Respond briefly.")
             .build(llm_adapter, tools, store_adapter)
-            .await;
+            .await
+            .expect("public builder build");
 
         let result = agent
             .run("What is 2+2? Answer with just the number.".into())
@@ -463,7 +465,8 @@ mod simple_chat {
             .max_tokens_per_turn(256)
             .system_prompt("You are a helpful assistant. Respond briefly.")
             .build(llm_adapter, tools, store_adapter)
-            .await;
+            .await
+            .expect("public builder build");
 
         let result = agent
             .run("What is 2+2? Answer with just the number.".into())
@@ -585,7 +588,8 @@ mod tool_invocation {
                 "You have access to an 'echo' tool. When asked to echo something, use it.",
             )
             .build(llm_adapter, dispatcher, store_adapter)
-            .await;
+            .await
+            .expect("public builder build");
 
         // Run agent with prompt that should trigger tool use
         let result = agent
@@ -633,7 +637,8 @@ mod multi_turn {
             .max_tokens_per_turn(256)
             .system_prompt("You are a helpful assistant. Keep your responses brief.")
             .build(llm_adapter, tools, store_adapter)
-            .await;
+            .await
+            .expect("public builder build");
 
         // Turn 1: Establish context
         let result1 = agent
@@ -726,7 +731,8 @@ mod session_resume {
                 .max_tokens_per_turn(256)
                 .system_prompt("You are a helpful assistant. Keep your responses brief.")
                 .build(llm_adapter, tools, store_adapter)
-                .await;
+                .await
+                .expect("public builder build");
 
             // Establish context
             let _ = agent
@@ -759,7 +765,8 @@ mod session_resume {
                 .max_tokens_per_turn(256)
                 .resume_session(saved_session)
                 .build(llm_adapter, tools, store_adapter)
-                .await;
+                .await
+                .expect("public builder build");
 
             // Verify context is maintained
             let result = agent
@@ -811,7 +818,8 @@ mod budget_exhaustion {
                 max_tool_calls: None,
             })
             .build(llm_adapter, tools, store_adapter)
-            .await;
+            .await
+            .expect("public builder build");
 
         // First turn should succeed
         let result1 = agent
@@ -880,7 +888,8 @@ mod budget_exhaustion {
                 max_tool_calls: Some(2), // Very low tool call limit
             })
             .build(llm_adapter, tools, store_adapter)
-            .await;
+            .await
+            .expect("public builder build");
 
         // Run a query that might trigger tool calls
         let result = agent
@@ -987,7 +996,8 @@ mod parallel_tools {
             .max_tokens_per_turn(512)
             .system_prompt("You have access to an 'add' tool that adds two numbers.")
             .build(llm_adapter, dispatcher, store_adapter)
-            .await;
+            .await
+            .expect("public builder build");
 
         // Ask for multiple calculations - LLM may issue multiple tool calls
         let result = agent
@@ -1126,7 +1136,8 @@ mod parallel_tools {
                  Do not call them one at a time.",
             )
             .build(llm_adapter, dispatcher.clone(), store_adapter)
-            .await;
+            .await
+            .expect("public builder build");
 
         // Ask for multiple pieces of info to encourage parallel tool calls
         let overall_start = std::time::Instant::now();
@@ -1203,7 +1214,8 @@ mod parallel_tools {
                  Use multiple tools when appropriate.",
             )
             .build(llm_adapter, dispatcher.clone(), store_adapter)
-            .await;
+            .await
+            .expect("public builder build");
 
         // Turn 1: Multiple tool calls
         let result1 = agent
@@ -1326,7 +1338,8 @@ mod parallel_tools {
                  If a tool fails, acknowledge the error and report results from successful tools.",
             )
             .build(llm_adapter, dispatcher, store_adapter)
-            .await;
+            .await
+            .expect("public builder build");
 
         // Request that should trigger all three tools
         let result = agent
@@ -1445,6 +1458,7 @@ mod sanity {
             .model("test-model")
             .system_prompt("test prompt")
             .build(client, tools, store)
-            .await;
+            .await
+            .expect("public builder build");
     }
 }

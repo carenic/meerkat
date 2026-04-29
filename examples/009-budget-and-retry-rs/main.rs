@@ -50,7 +50,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_tokens_per_turn(512)
         .budget(budget)
         .build(Arc::new(llm), Arc::new(EmptyToolDispatcher), store.clone())
-        .await;
+        .await?;
 
     let result = agent
         .run("Explain quantum computing in simple terms.".into())
@@ -95,7 +95,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .max_tokens_per_turn(50)
         .budget(tight_budget)
         .build(Arc::new(llm2), Arc::new(EmptyToolDispatcher), store2)
-        .await;
+        .await?;
 
     match agent2
         .run("Write a 500-word essay about machine learning.".into())
