@@ -221,10 +221,6 @@ where
     Err(ToolError::not_found(name))
 }
 
-fn parse_runtime_operation_id(value: &str) -> Option<crate::ops::OperationId> {
-    Uuid::parse_str(value).ok().map(crate::ops::OperationId)
-}
-
 impl<C, T, S> Agent<C, T, S>
 where
     C: AgentLlmClient + ?Sized + 'static,
