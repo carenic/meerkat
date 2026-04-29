@@ -264,10 +264,9 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
             "BindingIdParams",
             "WireAuthProfileCleared",
         ),
-        RpcMethodDescriptor::typed(
+        RpcMethodDescriptor::result_only(
             "realm/list",
             "List realms with binding summaries",
-            "RealmListParams",
             "WireRealmList",
         ),
         RpcMethodDescriptor::typed(
@@ -814,60 +813,78 @@ mod tests {
     fn auth_methods_advertise_concrete_request_and_response_contracts() {
         let methods = rpc_method_catalog(RpcMethodCatalogOptions::documented_surface());
         for (name, expected_params_type, expected_result_type) in [
-            ("auth/profile/list", "RealmIdParams", "WireAuthProfilesList"),
+            (
+                "auth/profile/list",
+                Some("RealmIdParams"),
+                Some("WireAuthProfilesList"),
+            ),
             (
                 "auth/profile/get",
-                "BindingIdParams",
-                "WireAuthProfileDetail",
+                Some("BindingIdParams"),
+                Some("WireAuthProfileDetail"),
             ),
             (
                 "auth/profile/create",
-                "CreateProfileParams",
-                "WireAuthProfileCreated",
+                Some("CreateProfileParams"),
+                Some("WireAuthProfileCreated"),
             ),
             (
                 "auth/profile/delete",
-                "BindingIdParams",
-                "WireAuthProfileCleared",
+                Some("BindingIdParams"),
+                Some("WireAuthProfileCleared"),
             ),
-            ("auth/login/start", "LoginStartParams", "WireLoginStart"),
+            (
+                "auth/login/start",
+                Some("LoginStartParams"),
+                Some("WireLoginStart"),
+            ),
             (
                 "auth/login/complete",
-                "LoginCompleteParams",
-                "WireLoginReady",
+                Some("LoginCompleteParams"),
+                Some("WireLoginReady"),
             ),
             (
                 "auth/login/device_start",
-                "DeviceStartParams",
-                "WireDeviceStart",
+                Some("DeviceStartParams"),
+                Some("WireDeviceStart"),
             ),
             (
                 "auth/login/device_complete",
-                "DeviceCompleteParams",
-                "WireDeviceCompleteResult",
+                Some("DeviceCompleteParams"),
+                Some("WireDeviceCompleteResult"),
             ),
             (
                 "auth/login/provision_api_key",
-                "ProvisionApiKeyParams",
-                "WireProvisionApiKeyResult",
+                Some("ProvisionApiKeyParams"),
+                Some("WireProvisionApiKeyResult"),
             ),
-            ("auth/status/get", "BindingIdParams", "WireAuthStatusDetail"),
-            ("auth/logout", "BindingIdParams", "WireAuthProfileCleared"),
-            ("realm/list", "RealmListParams", "WireRealmList"),
-            ("realm/get", "RealmIdParams", "WireRealmConnectionSet"),
+            (
+                "auth/status/get",
+                Some("BindingIdParams"),
+                Some("WireAuthStatusDetail"),
+            ),
+            (
+                "auth/logout",
+                Some("BindingIdParams"),
+                Some("WireAuthProfileCleared"),
+            ),
+            ("realm/list", None, Some("WireRealmList")),
+            (
+                "realm/get",
+                Some("RealmIdParams"),
+                Some("WireRealmConnectionSet"),
+            ),
         ] {
             let descriptor = methods
                 .iter()
                 .find(|method| method.name == name)
                 .unwrap_or_else(|| panic!("missing descriptor for {name}"));
             assert_eq!(
-                descriptor.params_type,
-                Some(expected_params_type),
+                descriptor.params_type, expected_params_type,
                 "{name} must advertise its concrete params type"
             );
             assert_eq!(
-                descriptor.result_type,
-                Some(expected_result_type),
+                descriptor.result_type, expected_result_type,
                 "{name} must advertise its concrete result type"
             );
         }

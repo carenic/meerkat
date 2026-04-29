@@ -12518,6 +12518,151 @@
     "description": "Wire-safe content input (mirrors `ContentInput`).",
     "title": "WireContentInput"
   },
+  "WireDeviceCompleteResult": {
+    "$defs": {
+      "BindingId": {
+        "description": "Opaque slug identifying a binding inside a realm.",
+        "type": "string"
+      },
+      "ProfileId": {
+        "description": "Opaque slug identifying an auth profile override on a connection.",
+        "type": "string"
+      },
+      "RealmId": {
+        "description": "Opaque slug identifying a realm.",
+        "type": "string"
+      },
+      "WireConnectionRef": {
+        "description": "Wire projection of [`meerkat_core::ConnectionRef`].\n\nPure structural shape — no `\"realm:binding\"` string form. Wave-b deleted\n`parse` and `Display` on both the core type and the wire projection so\nthe colon-joined form cannot travel across wire boundaries.",
+        "properties": {
+          "binding": {
+            "$ref": "#/$defs/BindingId"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ProfileId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "realm": {
+            "$ref": "#/$defs/RealmId"
+          }
+        },
+        "required": [
+          "realm",
+          "binding"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "`auth/login/device_complete` success body.",
+    "oneOf": [
+      {
+        "properties": {
+          "state": {
+            "const": "pending",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "state": {
+            "const": "slow_down",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "state": {
+            "const": "access_denied",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "state": {
+            "const": "expired",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "Identifies a binding inside a realm on the wire. Shared by every\nauth REST response that returns a `{realm_id, binding_id, connection_ref}`\ntrio. Built from a typed [`meerkat_core::ConnectionRef`] so the three\nfields always agree; the `realm_id`/`binding_id` strings carry the\nslug form for wire consumers that key by string.",
+        "properties": {
+          "binding_id": {
+            "type": "string"
+          },
+          "connection_ref": {
+            "$ref": "#/$defs/WireConnectionRef"
+          },
+          "expires_at": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "has_refresh_token": {
+            "type": "boolean"
+          },
+          "profile_id": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          },
+          "realm_id": {
+            "type": "string"
+          },
+          "scopes": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "state": {
+            "const": "ready",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "realm_id",
+          "binding_id",
+          "connection_ref",
+          "profile_id",
+          "provider",
+          "has_refresh_token",
+          "scopes"
+        ],
+        "type": "object"
+      }
+    ],
+    "title": "WireDeviceCompleteResult"
+  },
   "WireDeviceStart": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "description": "`POST /auth/login/device/start` success body.",
@@ -15391,6 +15536,91 @@
       }
     ],
     "title": "WireProviderMeta"
+  },
+  "WireProvisionApiKeyResult": {
+    "$defs": {
+      "BindingId": {
+        "description": "Opaque slug identifying a binding inside a realm.",
+        "type": "string"
+      },
+      "ProfileId": {
+        "description": "Opaque slug identifying an auth profile override on a connection.",
+        "type": "string"
+      },
+      "RealmId": {
+        "description": "Opaque slug identifying a realm.",
+        "type": "string"
+      },
+      "WireConnectionRef": {
+        "description": "Wire projection of [`meerkat_core::ConnectionRef`].\n\nPure structural shape — no `\"realm:binding\"` string form. Wave-b deleted\n`parse` and `Display` on both the core type and the wire projection so\nthe colon-joined form cannot travel across wire boundaries.",
+        "properties": {
+          "binding": {
+            "$ref": "#/$defs/BindingId"
+          },
+          "profile": {
+            "anyOf": [
+              {
+                "$ref": "#/$defs/ProfileId"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "realm": {
+            "$ref": "#/$defs/RealmId"
+          }
+        },
+        "required": [
+          "realm",
+          "binding"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "`auth/login/provision_api_key` success body.",
+    "properties": {
+      "auth_mode": {
+        "type": "string"
+      },
+      "binding_id": {
+        "type": "string"
+      },
+      "connection_ref": {
+        "$ref": "#/$defs/WireConnectionRef"
+      },
+      "has_api_key": {
+        "type": "boolean"
+      },
+      "profile_id": {
+        "type": "string"
+      },
+      "provider": {
+        "type": "string"
+      },
+      "realm_id": {
+        "type": "string"
+      },
+      "scopes": {
+        "items": {
+          "type": "string"
+        },
+        "type": "array"
+      }
+    },
+    "required": [
+      "realm_id",
+      "binding_id",
+      "connection_ref",
+      "profile_id",
+      "provider",
+      "auth_mode",
+      "has_api_key",
+      "scopes"
+    ],
+    "title": "WireProvisionApiKeyResult",
+    "type": "object"
   },
   "WireRealmConnectionSet": {
     "$defs": {

@@ -175,7 +175,6 @@
     {
       "description": "List realms with binding summaries",
       "name": "realm/list",
-      "params_type": "RealmListParams",
       "result_type": "WireRealmList"
     },
     {

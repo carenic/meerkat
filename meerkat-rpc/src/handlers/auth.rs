@@ -12,8 +12,10 @@ use serde_json::value::RawValue;
 
 use meerkat_anthropic::runtime::oauth as a_oauth;
 use meerkat_contracts::{
-    WireAuthProfile, WireAuthStatusDetail, WireBackendProfile, WireBindingIdentity,
-    WireProviderBinding, WireRealmConnectionSet,
+    BindingIdParams, CreateProfileParams, DeviceCompleteParams, DeviceStartParams,
+    LoginCompleteParams, LoginStartParams, ProvisionApiKeyParams, RealmIdParams, WireAuthProfile,
+    WireAuthStatusDetail, WireBackendProfile, WireBindingIdentity, WireDeviceCompleteResult,
+    WireProviderBinding, WireProvisionApiKeyResult, WireRealmConnectionSet,
 };
 use meerkat_core::{
     AuthStatusPhase, ConnectionRef, ConnectionTargetError, CredentialSourceSpec, Provider,
@@ -32,19 +34,6 @@ use super::{RpcResponseExt, parse_params};
 use crate::error;
 use crate::protocol::{RpcId, RpcResponse};
 use crate::session_runtime::SessionRuntime;
-
-#[derive(serde::Deserialize)]
-struct RealmIdParams {
-    realm_id: String,
-}
-
-#[derive(serde::Deserialize)]
-struct BindingIdParams {
-    realm_id: String,
-    binding_id: String,
-    #[serde(default)]
-    profile_id: Option<String>,
-}
 
 async fn load_config(runtime: &SessionRuntime) -> Result<meerkat_core::Config, RpcResponse> {
     if let Some(cfg_runtime) = runtime.config_runtime() {
@@ -362,16 +351,6 @@ pub async fn handle_auth_profile_get(
     }
 }
 
-#[derive(serde::Deserialize)]
-struct CreateProfileParams {
-    realm_id: String,
-    binding_id: String,
-    #[serde(default)]
-    profile_id: Option<String>,
-    auth_method: String,
-    secret: String,
-}
-
 pub async fn handle_auth_profile_create(
     id: Option<RpcId>,
     params: Option<&RawValue>,
@@ -521,12 +500,6 @@ pub async fn handle_auth_profile_delete(
 
 // --- OAuth login ------------------------------------------------------
 
-#[derive(serde::Deserialize)]
-struct LoginStartParams {
-    provider: String,
-    redirect_uri: String,
-}
-
 pub async fn handle_auth_login_start(id: Option<RpcId>, params: Option<&RawValue>) -> RpcResponse {
     let parsed: LoginStartParams = match parse_params(params) {
         Ok(v) => v,
@@ -573,20 +546,6 @@ pub async fn handle_auth_login_start(id: Option<RpcId>, params: Option<&RawValue
             "provider": parsed.provider,
         }),
     )
-}
-
-#[derive(serde::Deserialize)]
-struct LoginCompleteParams {
-    provider: String,
-    code: String,
-    state: String,
-    redirect_uri: String,
-    #[serde(default)]
-    realm_id: Option<String>,
-    #[serde(default)]
-    binding_id: Option<String>,
-    #[serde(default)]
-    profile_id: Option<String>,
 }
 
 pub async fn handle_auth_login_complete(
@@ -742,11 +701,6 @@ pub async fn handle_auth_login_complete(
     )
 }
 
-#[derive(serde::Deserialize)]
-struct DeviceStartParams {
-    provider: String,
-}
-
 pub async fn handle_auth_login_device_start(
     id: Option<RpcId>,
     params: Option<&RawValue>,
@@ -789,18 +743,6 @@ pub async fn handle_auth_login_device_start(
             format!("device-code request failed: {e}"),
         ),
     }
-}
-
-#[derive(serde::Deserialize)]
-struct DeviceCompleteParams {
-    provider: String,
-    device_code: String,
-    #[serde(default)]
-    realm_id: Option<String>,
-    #[serde(default)]
-    binding_id: Option<String>,
-    #[serde(default)]
-    profile_id: Option<String>,
 }
 
 /// Plan §1.5r.9 device-flow completion leg. Single-poll semantics — the
@@ -889,18 +831,12 @@ pub async fn handle_auth_login_device_complete(
         }
     };
     match outcome {
-        DevicePollOutcome::Pending => {
-            RpcResponse::success(id, serde_json::json!({ "state": "pending" }))
-        }
-        DevicePollOutcome::SlowDown => {
-            RpcResponse::success(id, serde_json::json!({ "state": "slow_down" }))
-        }
+        DevicePollOutcome::Pending => RpcResponse::success(id, WireDeviceCompleteResult::Pending),
+        DevicePollOutcome::SlowDown => RpcResponse::success(id, WireDeviceCompleteResult::SlowDown),
         DevicePollOutcome::AccessDenied => {
-            RpcResponse::success(id, serde_json::json!({ "state": "access_denied" }))
+            RpcResponse::success(id, WireDeviceCompleteResult::AccessDenied)
         }
-        DevicePollOutcome::Expired => {
-            RpcResponse::success(id, serde_json::json!({ "state": "expired" }))
-        }
+        DevicePollOutcome::Expired => RpcResponse::success(id, WireDeviceCompleteResult::Expired),
         DevicePollOutcome::Ready(result) => {
             let store = match require_token_store(runtime, id.clone()) {
                 Ok(s) => s,
@@ -942,32 +878,17 @@ pub async fn handle_auth_login_device_complete(
             );
             RpcResponse::success(
                 id,
-                serde_json::json!({
-                    "state": "ready",
-                    "realm_id": connection_ref.realm.as_str(),
-                    "binding_id": connection_ref.binding.as_str(),
-                    "connection_ref": &connection_ref,
-                    "profile_id": &auth_profile.id,
-                    "provider": parsed.provider,
-                    "expires_at": expires_at.map(|e| e.to_rfc3339()),
-                    "has_refresh_token": tokens.refresh_token.is_some(),
-                    "scopes": tokens.scopes,
-                }),
+                WireDeviceCompleteResult::Ready {
+                    identity: Box::new(WireBindingIdentity::from(&connection_ref)),
+                    profile_id: auth_profile.id,
+                    provider: parsed.provider,
+                    expires_at: expires_at.map(|e| e.to_rfc3339()),
+                    has_refresh_token: tokens.refresh_token.is_some(),
+                    scopes: tokens.scopes,
+                },
             )
         }
     }
-}
-
-#[derive(serde::Deserialize)]
-struct ProvisionApiKeyParams {
-    /// Access token acquired from a prior Console-OAuth flow.
-    access_token: String,
-    #[serde(default)]
-    realm_id: Option<String>,
-    #[serde(default)]
-    binding_id: Option<String>,
-    #[serde(default)]
-    profile_id: Option<String>,
 }
 
 /// Plan §4b.5 closure: Console OAuth → API key provisioning. The
@@ -1026,16 +947,14 @@ pub async fn handle_auth_login_provision_api_key(
     match oauth_runtime.provision_api_key(&parsed.access_token).await {
         Ok(tokens) => RpcResponse::success(
             id,
-            serde_json::json!({
-                "realm_id": connection_ref.realm.as_str(),
-                "binding_id": connection_ref.binding.as_str(),
-                "connection_ref": &connection_ref,
-                "profile_id": &auth_profile.id,
-                "provider": "anthropic",
-                "auth_mode": "oauth_to_api_key",
-                "has_api_key": tokens.primary_secret.is_some(),
-                "scopes": tokens.scopes,
-            }),
+            WireProvisionApiKeyResult {
+                identity: WireBindingIdentity::from(&connection_ref),
+                profile_id: auth_profile.id,
+                provider: "anthropic".to_string(),
+                auth_mode: "oauth_to_api_key".to_string(),
+                has_api_key: tokens.primary_secret.is_some(),
+                scopes: tokens.scopes,
+            },
         ),
         Err(e) => RpcResponse::error(
             id,

@@ -33,10 +33,13 @@ pub use comms::{
     PeerName as WireCommsPeerName, ResponseStatus as WireCommsResponseStatus,
 };
 pub use connection::{
-    WireAuthError, WireAuthProfile, WireAuthProfileCleared, WireAuthProfileCreated,
-    WireAuthProfileDetail, WireAuthProfilesList, WireAuthStatus, WireAuthStatusDetail,
-    WireBackendProfile, WireBindingIdentity, WireConnectionRef, WireDeviceStart, WireLoginReady,
-    WireLoginStart, WireProviderBinding, WireRealmConnectionSet, WireRealmList, WireRealmSummary,
+    BindingIdParams, CreateProfileParams, DeviceCompleteParams, DeviceStartParams,
+    LoginCompleteParams, LoginStartParams, ProvisionApiKeyParams, RealmIdParams, WireAuthError,
+    WireAuthProfile, WireAuthProfileCleared, WireAuthProfileCreated, WireAuthProfileDetail,
+    WireAuthProfilesList, WireAuthStatus, WireAuthStatusDetail, WireBackendProfile,
+    WireBindingIdentity, WireConnectionRef, WireDeviceCompleteResult, WireDeviceStart,
+    WireLoginReady, WireLoginStart, WireProviderBinding, WireProvisionApiKeyResult,
+    WireRealmConnectionSet, WireRealmList, WireRealmSummary,
 };
 
 pub use artifact::{

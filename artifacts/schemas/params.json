@@ -1,4 +1,28 @@
 {
+  "BindingIdParams": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Request payload for binding-scoped auth methods.",
+    "properties": {
+      "binding_id": {
+        "type": "string"
+      },
+      "profile_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "realm_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "realm_id",
+      "binding_id"
+    ],
+    "title": "BindingIdParams",
+    "type": "object"
+  },
   "CommsParams": {
     "$defs": {
       "PeerMeta": {
@@ -188,6 +212,88 @@
     "title": "CoreCreateParams",
     "type": "object"
   },
+  "CreateProfileParams": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Request payload for `auth/profile/create`.",
+    "properties": {
+      "auth_method": {
+        "type": "string"
+      },
+      "binding_id": {
+        "type": "string"
+      },
+      "profile_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "realm_id": {
+        "type": "string"
+      },
+      "secret": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "realm_id",
+      "binding_id",
+      "auth_method",
+      "secret"
+    ],
+    "title": "CreateProfileParams",
+    "type": "object"
+  },
+  "DeviceCompleteParams": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Request payload for `auth/login/device_complete`.",
+    "properties": {
+      "binding_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "device_code": {
+        "type": "string"
+      },
+      "profile_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "provider": {
+        "type": "string"
+      },
+      "realm_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "provider",
+      "device_code"
+    ],
+    "title": "DeviceCompleteParams",
+    "type": "object"
+  },
+  "DeviceStartParams": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Request payload for `auth/login/device_start`.",
+    "properties": {
+      "provider": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "provider"
+    ],
+    "title": "DeviceStartParams",
+    "type": "object"
+  },
   "InputListParams": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "description": "Request payload for `runtime/session_submissions`.",
@@ -250,6 +356,68 @@
       }
     },
     "title": "ListSchedulesParams",
+    "type": "object"
+  },
+  "LoginCompleteParams": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Request payload for `auth/login/complete`.",
+    "properties": {
+      "binding_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "code": {
+        "type": "string"
+      },
+      "profile_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "provider": {
+        "type": "string"
+      },
+      "realm_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "redirect_uri": {
+        "type": "string"
+      },
+      "state": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "provider",
+      "code",
+      "state",
+      "redirect_uri"
+    ],
+    "title": "LoginCompleteParams",
+    "type": "object"
+  },
+  "LoginStartParams": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Request payload for `auth/login/start`.",
+    "properties": {
+      "provider": {
+        "type": "string"
+      },
+      "redirect_uri": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "provider",
+      "redirect_uri"
+    ],
+    "title": "LoginStartParams",
     "type": "object"
   },
   "McpAddParams": {
@@ -3559,6 +3727,53 @@
       "peer"
     ],
     "title": "MobWireParams",
+    "type": "object"
+  },
+  "ProvisionApiKeyParams": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Request payload for `auth/login/provision_api_key`.",
+    "properties": {
+      "access_token": {
+        "description": "Access token acquired from a prior Console-OAuth flow.",
+        "type": "string"
+      },
+      "binding_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "profile_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "realm_id": {
+        "type": [
+          "string",
+          "null"
+        ]
+      }
+    },
+    "required": [
+      "access_token"
+    ],
+    "title": "ProvisionApiKeyParams",
+    "type": "object"
+  },
+  "RealmIdParams": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Request payload for `auth/profile/list` and `realm/get`.",
+    "properties": {
+      "realm_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "realm_id"
+    ],
+    "title": "RealmIdParams",
     "type": "object"
   },
   "RealtimeCapabilitiesParams": {
