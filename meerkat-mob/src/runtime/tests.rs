@@ -5786,6 +5786,20 @@ async fn test_stopped_runtime_commands_are_rejected_by_machine_admission() {
 
     handle.stop().await.expect("stop");
 
+    let spawn = handle
+        .spawn(ProfileName::from("worker"), MeerkatId::from("w-2"), None)
+        .await;
+    assert!(
+        matches!(
+            spawn,
+            Err(MobError::InvalidTransition {
+                from: MobState::Stopped,
+                to: MobState::Running,
+            })
+        ),
+        "Spawn must surface the MobMachine stopped-phase rejection: {spawn:?}"
+    );
+
     let submit = handle
         .submit_work(
             entry.agent_runtime_id.clone(),
@@ -5805,6 +5819,20 @@ async fn test_stopped_runtime_commands_are_rejected_by_machine_admission() {
         "SubmitWork must surface the MobMachine stopped-phase rejection: {submit:?}"
     );
 
+    let cancel_all_work = handle
+        .cancel_all_work(entry.agent_runtime_id.clone(), entry.fence_token)
+        .await;
+    assert!(
+        matches!(
+            cancel_all_work,
+            Err(MobError::InvalidTransition {
+                from: MobState::Stopped,
+                to: MobState::Running,
+            })
+        ),
+        "CancelAllWork must surface the MobMachine stopped-phase rejection: {cancel_all_work:?}"
+    );
+
     let run_flow = handle
         .run_flow(FlowId::from("demo"), serde_json::json!({}))
         .await;
@@ -5817,6 +5845,24 @@ async fn test_stopped_runtime_commands_are_rejected_by_machine_admission() {
             })
         ),
         "RunFlow must surface the MobMachine stopped-phase rejection: {run_flow:?}"
+    );
+
+    let task_create = handle
+        .task_create(
+            "stopped task".to_string(),
+            "must be admitted by MobMachine".to_string(),
+            vec![],
+        )
+        .await;
+    assert!(
+        matches!(
+            task_create,
+            Err(MobError::InvalidTransition {
+                from: MobState::Stopped,
+                to: MobState::Running,
+            })
+        ),
+        "TaskCreate must surface the MobMachine stopped-phase rejection: {task_create:?}"
     );
 
     let respawn = handle.respawn(AgentIdentity::from("w-1"), None).await;
@@ -5832,6 +5878,267 @@ async fn test_stopped_runtime_commands_are_rejected_by_machine_admission() {
         ),
         "Respawn must surface the MobMachine stopped-phase rejection: {respawn:?}"
     );
+}
+
+#[tokio::test]
+async fn test_stopped_empty_task_create_is_rejected_by_machine_admission() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    handle.stop().await.expect("stop");
+
+    let result = handle
+        .task_create(
+            "   ".to_string(),
+            "empty subject must not shadow stopped admission".to_string(),
+            vec![],
+        )
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(MobError::InvalidTransition {
+                from: MobState::Stopped,
+                to: MobState::Running,
+            })
+        ),
+        "empty task subject must not shadow MobMachine stopped-phase admission: {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_stopped_unknown_profile_spawn_is_rejected_by_machine_admission() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    handle.stop().await.expect("stop");
+
+    let result = handle
+        .spawn(
+            ProfileName::from("missing-profile"),
+            MeerkatId::from("w-missing-profile"),
+            None,
+        )
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(MobError::InvalidTransition {
+                from: MobState::Stopped,
+                to: MobState::Running,
+            })
+        ),
+        "unknown profile must not shadow MobMachine stopped-phase admission: {result:?}"
+    );
+    assert_eq!(
+        service.active_session_count().await,
+        0,
+        "stopped rejected spawn must not provision a session"
+    );
+}
+
+#[tokio::test]
+async fn test_stopped_unknown_flow_run_flow_is_rejected_by_machine_admission() {
+    let (handle, _service) =
+        create_test_mob(sample_definition_with_single_step_flow(60_000, 8)).await;
+    handle.stop().await.expect("stop");
+
+    let result = handle
+        .run_flow(FlowId::from("missing-flow"), serde_json::json!({}))
+        .await;
+
+    assert!(
+        matches!(
+            result,
+            Err(MobError::InvalidTransition {
+                from: MobState::Stopped,
+                to: MobState::Running,
+            })
+        ),
+        "unknown flow must not shadow MobMachine stopped-phase admission: {result:?}"
+    );
+}
+
+fn mob_command_arm_source<'a>(source: &'a str, command: &str) -> &'a str {
+    let marker = format!("                MobCommand::{command}");
+    let start = source
+        .find(&marker)
+        .unwrap_or_else(|| panic!("MobCommand::{command} arm exists"));
+    let rest = &source[start + marker.len()..];
+    let end = rest
+        .find("\n                MobCommand::")
+        .map(|offset| start + marker.len() + offset)
+        .unwrap_or(source.len());
+    &source[start..end]
+}
+
+#[test]
+fn test_mob_command_admission_arms_do_not_shadow_mob_machine_guards() {
+    let source = include_str!("actor.rs");
+    for command in [
+        "Spawn",
+        "Respawn",
+        "RunFlow",
+        "CancelFlow",
+        "SubmitWork",
+        "CancelAllWork",
+        "TaskCreate",
+        "TaskUpdate",
+    ] {
+        let arm = mob_command_arm_source(source, command);
+        for disallowed in [
+            "require_state(",
+            "require_live_lifecycle_phase(",
+            "require_live_reset_admission(",
+            "require_live_stop_admission(",
+        ] {
+            assert!(
+                !arm.contains(disallowed),
+                "MobCommand::{command} admission must be delegated to MobMachine guards, not shell `{disallowed}`"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn test_task_create_store_failure_does_not_commit_mob_machine_task() {
+    let events = Arc::new(FaultInjectedMobEventStore::new());
+    let (handle, _service) = create_test_mob_with_events(sample_definition(), events.clone()).await;
+
+    events.fail_appends_for("TaskCreated").await;
+    let error = handle
+        .task_create(
+            "uncommitted task".to_string(),
+            "fault-injected append failure".to_string(),
+            vec![],
+        )
+        .await
+        .expect_err("fault-injected TaskCreated append failure should reject task creation");
+    assert!(
+        error.to_string().contains("TaskCreated"),
+        "task create should surface the task-board append failure, got: {error}"
+    );
+
+    let dsl = handle
+        .debug_dsl_t2_snapshot()
+        .await
+        .expect("query DSL task state after failed create");
+    assert!(
+        dsl.tasks.is_empty(),
+        "TaskCreated append failure must not commit MobMachine task projection: {:?}",
+        dsl.tasks
+    );
+    assert!(
+        handle.task_list().await.expect("task list").is_empty(),
+        "TaskCreated append failure must not project a shell task"
+    );
+}
+
+#[tokio::test]
+async fn test_task_update_board_failure_does_not_commit_mob_machine_status() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    handle
+        .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
+        .await
+        .expect("spawn task owner");
+    let blocker = handle
+        .task_create(
+            "blocker".to_string(),
+            "must complete before dependent can be claimed".to_string(),
+            vec![],
+        )
+        .await
+        .expect("create blocker");
+    let dependent = handle
+        .task_create(
+            "dependent".to_string(),
+            "blocked task".to_string(),
+            vec![blocker],
+        )
+        .await
+        .expect("create dependent");
+
+    let error = handle
+        .task_update(
+            dependent.clone(),
+            crate::tasks::TaskStatus::InProgress,
+            Some(AgentIdentity::from("w-1")),
+        )
+        .await
+        .expect_err("blocked dependency should reject task update");
+    assert!(
+        error
+            .to_string()
+            .contains("blocked by incomplete dependencies"),
+        "task update should surface task-board validation failure, got: {error}"
+    );
+
+    let dsl_task_id = crate::machines::mob_machine::TaskId::from(dependent.as_str());
+    let dsl = handle
+        .debug_dsl_t2_snapshot()
+        .await
+        .expect("query DSL task state after failed update");
+    assert_eq!(
+        dsl.tasks.get(&dsl_task_id).map(|task| task.status),
+        Some(crate::machines::mob_machine::TaskStatus::Pending),
+        "task-board validation failure must leave the MobMachine task status pending"
+    );
+    assert!(
+        !dsl.in_progress_task_ids.contains(&dsl_task_id),
+        "task-board validation failure must not insert the task into the MobMachine in-progress index"
+    );
+}
+
+#[tokio::test]
+async fn test_cancel_all_work_after_respawn_preserves_stale_fence_error() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let member_id = AgentIdentity::from("w-1");
+    handle
+        .spawn_with_options(
+            ProfileName::from("worker"),
+            MeerkatId::from(member_id.as_str()),
+            None,
+            Some(crate::MobRuntimeMode::TurnDriven),
+            None,
+        )
+        .await
+        .expect("spawn original member");
+    let original = handle
+        .get_member(&member_id)
+        .await
+        .expect("original member exists");
+    let old_runtime_id = original.agent_runtime_id.clone();
+    let old_fence_token = original.fence_token;
+
+    let receipt = handle
+        .respawn(member_id.clone(), None)
+        .await
+        .expect("respawn member");
+    let replacement = handle
+        .get_member(&member_id)
+        .await
+        .expect("replacement member exists");
+    assert_eq!(replacement.agent_runtime_id, receipt.agent_runtime_id);
+    assert_ne!(
+        old_runtime_id, replacement.agent_runtime_id,
+        "respawn should replace the runtime generation"
+    );
+
+    let result = handle
+        .cancel_all_work(old_runtime_id.clone(), old_fence_token)
+        .await;
+    match result {
+        Err(MobError::StaleFenceToken {
+            runtime_id,
+            expected,
+            actual,
+        }) => {
+            assert_eq!(runtime_id, old_runtime_id);
+            assert_eq!(expected, replacement.fence_token);
+            assert_eq!(actual, old_fence_token);
+        }
+        other => panic!(
+            "cancel_all_work with a pre-respawn runtime id/fence must preserve StaleFenceToken, got {other:?}"
+        ),
+    }
 }
 
 struct StaticWorkerSpawnPolicy;

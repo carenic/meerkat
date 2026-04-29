@@ -1225,6 +1225,39 @@ impl MobActor {
         self.publish_machine_state_projection();
     }
 
+    fn prepare_command_admission(
+        &self,
+        input: mob_dsl::MobMachineInput,
+        target: MobState,
+        context: &str,
+    ) -> Result<PreparedDslInput, MobError> {
+        self.prepare_dsl_input(input, context).map_err(|error| {
+            tracing::debug!(
+                context,
+                error = %error,
+                "MobMachine command admission rejected input"
+            );
+            self.invalid_transition_to(target)
+        })
+    }
+
+    fn apply_command_admission(
+        &mut self,
+        input: mob_dsl::MobMachineInput,
+        target: MobState,
+        context: &str,
+    ) -> Result<Vec<mob_dsl::MobMachineEffect>, MobError> {
+        self.apply_dsl_input_collect_effects(input, context)
+            .map_err(|error| {
+                tracing::debug!(
+                    context,
+                    error = %error,
+                    "MobMachine command admission rejected input"
+                );
+                self.invalid_transition_to(target)
+            })
+    }
+
     fn preview_dsl_input(
         &self,
         input: mob_dsl::MobMachineInput,
@@ -2132,6 +2165,37 @@ impl MobActor {
         )
         .map(|_| ())
         .map_err(|_| self.invalid_transition_to(MobState::Running))
+    }
+
+    fn preview_spawn_command_admission(&self, agent_identity: &MeerkatId) -> Result<(), MobError> {
+        // This is only the command-admission barrier; the real spawn payload is
+        // previewed again after profile resolution and before provisioning.
+        let placeholder_bridge_session_id = SessionId::new();
+        self.preview_spawn_admission(agent_identity, false, &placeholder_bridge_session_id)
+    }
+
+    fn preview_run_flow_command_admission(&self, run_id: &RunId) -> Result<(), MobError> {
+        self.prepare_command_admission(
+            mob_dsl::MobMachineInput::RunFlow {
+                run_id: mob_dsl::RunId::from(run_id.to_string()),
+                step_ids: Default::default(),
+                ordered_steps: Vec::new(),
+                step_has_conditions: Default::default(),
+                step_dependencies: Default::default(),
+                step_dependency_modes: Default::default(),
+                step_branches: Default::default(),
+                step_collection_policies: Default::default(),
+                step_quorum_thresholds: Default::default(),
+                escalation_threshold: 0,
+                max_step_retries: 0,
+                max_active_nodes: 0,
+                max_active_frames: 0,
+                max_frame_depth: 0,
+            },
+            MobState::Running,
+            "run_flow_command_admission",
+        )
+        .map(|_| ())
     }
 
     fn submit_work_rejection_for_machine_state(
@@ -3085,10 +3149,7 @@ impl MobActor {
                     let _ = reply_tx.send(result);
                 }
                 MobCommand::CancelFlow { run_id, reply_tx } => {
-                    let result = match self.require_state(&[MobState::Running]) {
-                        Ok(()) => self.handle_cancel_flow(run_id).await,
-                        Err(error) => Err(error),
-                    };
+                    let result = self.handle_cancel_flow(run_id).await;
                     let _ = reply_tx.send(result);
                 }
                 MobCommand::FlowStatus { run_id, reply_tx } => {
@@ -3456,13 +3517,9 @@ impl MobActor {
                     blocked_by,
                     reply_tx,
                 } => {
-                    let result = match self.require_state(&[MobState::Running]) {
-                        Ok(()) => {
-                            self.handle_task_create(subject, description, blocked_by)
-                                .await
-                        }
-                        Err(error) => Err(error),
-                    };
+                    let result = self
+                        .handle_task_create(subject, description, blocked_by)
+                        .await;
                     let _ = reply_tx.send(result);
                 }
                 MobCommand::TaskUpdate {
@@ -3471,10 +3528,7 @@ impl MobActor {
                     owner,
                     reply_tx,
                 } => {
-                    let result = match self.require_state(&[MobState::Running]) {
-                        Ok(()) => self.handle_task_update(task_id, status, owner).await,
-                        Err(error) => Err(error),
-                    };
+                    let result = self.handle_task_update(task_id, status, owner).await;
                     let _ = reply_tx.send(result);
                 }
                 MobCommand::TaskList { reply_tx } => {
@@ -3644,10 +3698,7 @@ impl MobActor {
                     fence_token,
                     reply_tx,
                 } => {
-                    let result = match self.require_state(&[MobState::Running]) {
-                        Ok(()) => self.handle_cancel_all_work(runtime_id, fence_token).await,
-                        Err(error) => Err(error),
-                    };
+                    let result = self.handle_cancel_all_work(runtime_id, fence_token).await;
                     let _ = reply_tx.send(result);
                 }
                 MobCommand::SetSpawnPolicy { policy, reply_tx } => {
@@ -3956,6 +4007,10 @@ impl MobActor {
             connection_ref,
         } = spec;
         let agent_identity = MeerkatId::from(identity.as_str());
+        if let Err(error) = self.preview_spawn_command_admission(&agent_identity) {
+            let _ = reply_tx.send(Err(error));
+            return;
+        }
         // Normalize launch-mode resume/fork details for the provisioning path.
         let resume_bridge_session_id = launch_mode.resume_bridge_session_id().cloned();
         let fork_spec = match launch_mode {
@@ -8660,30 +8715,21 @@ impl MobActor {
         description: String,
         blocked_by: Vec<TaskId>,
     ) -> Result<TaskId, MobError> {
-        if subject.trim().is_empty() {
-            return Err(MobError::Internal(
-                "task subject cannot be empty".to_string(),
-            ));
-        }
         let task_id = TaskId::from(uuid::Uuid::new_v4().to_string());
         let dsl_input = mob_dsl::MobMachineInput::TaskCreate {
             task_id: mob_dsl::TaskId::from(task_id.as_str()),
             task_payload: Self::task_payload_to_dsl(&subject, &description, &blocked_by),
         };
         // MobMachine is the admission authority. Allocate the id in the
-        // actor, fail closed through the DSL, then append/project the
-        // shell task-board event using the same id. This prevents the
-        // prior event-sourced-board/DSL split-brain where DSL rejection
-        // was only logged after the shell write.
-        self.apply_dsl_input(dsl_input, "handle_task_create")
-            .map_err(|error| {
-                MobError::Internal(format!(
-                    "task create rejected by MobMachine guards before task-board write: {error}"
-                ))
-            })?;
+        // actor, prepare through the DSL, append/project the shell
+        // task-board event using the same id, then commit the prepared DSL
+        // state only after the board write succeeds.
+        let prepared =
+            self.prepare_command_admission(dsl_input, MobState::Running, "handle_task_create")?;
         self.task_board_service
             .create_task_with_id(task_id.clone(), subject, description, blocked_by)
             .await?;
+        self.commit_prepared_dsl_input(prepared);
         Ok(task_id)
     }
 
@@ -8693,6 +8739,15 @@ impl MobActor {
         status: TaskStatus,
         owner: Option<AgentIdentity>,
     ) -> Result<(), MobError> {
+        let prepared = self.prepare_command_admission(
+            mob_dsl::MobMachineInput::TaskUpdate {
+                task_id: mob_dsl::TaskId::from(task_id.as_str()),
+                new_status: Self::task_status_to_dsl(status),
+            },
+            MobState::Running,
+            "handle_task_update",
+        )?;
+
         // TLA+ TaskBindingInvariant: owner must be a known identity (roster member).
         if let Some(ref owner_id) = owner {
             let roster = self.roster.read().await;
@@ -8703,25 +8758,15 @@ impl MobActor {
                 )));
             }
         }
-        // Gate the status transition through the DSL guard set before
-        // applying the shell-side event-sourced update. Rolling back from
-        // a terminal status (Completed / Cancelled) is rejected here
-        // rather than by the event projection.
-        self.apply_dsl_input(
-            mob_dsl::MobMachineInput::TaskUpdate {
-                task_id: mob_dsl::TaskId::from(task_id.as_str()),
-                new_status: Self::task_status_to_dsl(status),
-            },
-            "handle_task_update",
-        )
-        .map_err(|error| {
-            MobError::Internal(format!(
-                "task update rejected by MobMachine guards: {error}"
-            ))
-        })?;
+        // Gate the status transition through the DSL guard set before the
+        // shell-side event-sourced update, but commit only after the board
+        // write succeeds. Rolling back from a terminal status (Completed /
+        // Cancelled) is rejected here rather than by the event projection.
         self.task_board_service
             .update_task(task_id, status, owner)
-            .await
+            .await?;
+        self.commit_prepared_dsl_input(prepared);
+        Ok(())
     }
 
     /// Unified work-lane entry.
@@ -8921,14 +8966,45 @@ impl MobActor {
         fence_token: FenceToken,
     ) -> Result<(), MobError> {
         let agent_identity = MeerkatId::from(&runtime_id.identity);
-
         let entry = {
             let roster = self.roster.read().await;
-            roster
-                .get(&agent_identity)
-                .cloned()
-                .ok_or_else(|| MobError::MemberNotFound(agent_identity.clone()))?
+            roster.get(&agent_identity).cloned()
         };
+        let dsl_runtime_id = mob_dsl::AgentRuntimeId::from_domain(&runtime_id);
+        let dsl_fence_token = mob_dsl::FenceToken::from_domain(fence_token);
+        let prepared = self
+            .prepare_dsl_input(
+                mob_dsl::MobMachineInput::CancelAllWork {
+                    agent_runtime_id: dsl_runtime_id.clone(),
+                    fence_token: dsl_fence_token,
+                },
+                "handle_cancel_all_work",
+            )
+            .map_err(|_| {
+                if self.state() != MobState::Running {
+                    return self.invalid_transition_to(MobState::Running);
+                }
+                if let Some(entry) = &entry
+                    && entry.fence_token != fence_token
+                {
+                    return MobError::StaleFenceToken {
+                        runtime_id: runtime_id.clone(),
+                        expected: entry.fence_token,
+                        actual: fence_token,
+                    };
+                }
+                if !self
+                    .dsl_authority
+                    .state
+                    .live_runtime_ids
+                    .contains(&dsl_runtime_id)
+                {
+                    return MobError::MemberNotFound(agent_identity.clone());
+                }
+                self.invalid_transition_to(MobState::Running)
+            })?;
+
+        let entry = entry.ok_or_else(|| MobError::MemberNotFound(agent_identity.clone()))?;
         if entry.fence_token != fence_token {
             return Err(MobError::StaleFenceToken {
                 runtime_id,
@@ -8940,15 +9016,7 @@ impl MobActor {
         // Feed the DSL CancelAllWork input. Guards enforce live-runtime
         // membership + phase == Running. A rejection here is a state
         // legality violation.
-        let dsl_runtime_id = mob_dsl::AgentRuntimeId::from_domain(&entry.agent_runtime_id);
-        let dsl_fence_token = mob_dsl::FenceToken::from_domain(entry.fence_token);
-        self.apply_dsl_input(
-            mob_dsl::MobMachineInput::CancelAllWork {
-                agent_runtime_id: dsl_runtime_id,
-                fence_token: dsl_fence_token,
-            },
-            "handle_cancel_all_work",
-        )?;
+        self.commit_prepared_dsl_input(prepared);
 
         // Dispatch the interrupt now that the machine has authorized.
         self.provisioner.interrupt_member(&entry.member_ref).await
@@ -9022,8 +9090,9 @@ impl MobActor {
         self.ensure_pending_spawn_alignment("handle_run_flow preflight")?;
         self.ensure_flow_tracker_alignment("handle_run_flow preflight")
             .await?;
-        let config = FlowRunConfig::from_definition(flow_id, &self.definition)?;
         let run_id = RunId::new();
+        self.preview_run_flow_command_admission(&run_id)?;
+        let config = FlowRunConfig::from_definition(flow_id, &self.definition)?;
         let run_flow = MobRun::run_flow_input(&run_id, &config)?;
         debug_assert!(matches!(run_flow, mob_dsl::MobMachineInput::RunFlow { .. }));
         let prepared_run_flow = self
@@ -9249,10 +9318,11 @@ impl MobActor {
 
     async fn handle_cancel_flow(&mut self, run_id: RunId) -> Result<(), MobError> {
         self.ensure_pending_spawn_alignment("handle_cancel_flow preflight")?;
-        self.apply_dsl_input(
+        self.apply_command_admission(
             mob_dsl::MobMachineInput::CancelFlow {
                 run_id: mob_dsl::RunId::from(run_id.to_string()),
             },
+            MobState::Running,
             "cancel_flow",
         )?;
         let Some((cancel_token, flow_id)) = self
