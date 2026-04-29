@@ -90,6 +90,7 @@ Run local models through any OpenAI-compatible server (Ollama, vLLM, LM Studio).
 transport = "openai_compatible"
 base_url = "http://127.0.0.1:11434"
 api_style = "chat_completions"
+# Optional: bearer_token_env = "OLLAMA_TOKEN"
 
 [self_hosted.models.gemma-4-31b]
 server = "local"
@@ -106,6 +107,8 @@ Then use it like any other model:
 rkat run -m gemma-4-31b "Explain the code in main.rs"
 rkat doctor  # validate server connectivity
 ```
+
+Credential resolution for self-hosted LLM calls and `rkat doctor` probes uses the same connection/auth resolver as hosted providers. Precedence is: explicit `connection_ref`, selected realm `default_binding`, configured `default` realm binding, then legacy `[self_hosted.servers]` compatibility. A configured selected realm without a usable self-hosted binding fails closed instead of falling back to legacy credentials. In the legacy compatibility path, `bearer_token` wins over `bearer_token_env`, a configured but missing env var fails closed, and a server with neither remains authless for local deployments.
 
 Self-hosted models work across all surfaces -- CLI, REST, RPC, MCP, and SDKs. See the [self-hosted Gemma 4 guide](https://docs.rkat.ai/guides/self-hosted-gemma4) for Ollama, vLLM, and LM Studio recipes.
 
