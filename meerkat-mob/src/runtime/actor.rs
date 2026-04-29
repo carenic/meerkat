@@ -327,6 +327,10 @@ pub(super) struct MobActor {
     pub(super) task_board_service: crate::tasks::MobTaskBoardService,
     pub(super) spawn_policy: Arc<super::spawn_policy::SpawnPolicyService>,
     pub(super) dsl_authority: mob_dsl::MobMachineAuthority,
+    /// Read-only MobMachine state projection for handle-side status/list
+    /// surfaces. The actor is the sole writer; handles can borrow the latest
+    /// state without enqueueing behind long shell cleanup work.
+    pub(super) machine_state_watch_tx: tokio::sync::watch::Sender<mob_dsl::MobMachineState>,
     /// Terminal-phase projection for external observers. Written by the
     /// actor after every DSL phase transition and once more right before
     /// the actor task exits. `MobHandle::status()` falls back to this
@@ -1091,6 +1095,12 @@ impl MobActor {
         project_dsl_phase(self.dsl_authority.state.lifecycle_phase)
     }
 
+    fn publish_machine_state_projection(&self) {
+        let _ = self
+            .machine_state_watch_tx
+            .send(self.dsl_authority.state.clone());
+    }
+
     fn apply_dsl_input(
         &mut self,
         input: mob_dsl::MobMachineInput,
@@ -1120,6 +1130,7 @@ impl MobActor {
             // the sole write seam for the dogma-#13 projection watch.
             let _ = self.phase_watch_tx.send(self.state());
         }
+        self.publish_machine_state_projection();
         Ok(effects)
     }
 
@@ -1211,6 +1222,7 @@ impl MobActor {
         if phase_changed {
             let _ = self.phase_watch_tx.send(self.state());
         }
+        self.publish_machine_state_projection();
     }
 
     fn preview_dsl_input(
@@ -1253,6 +1265,7 @@ impl MobActor {
             self.dsl_authority.state.lifecycle_phase = transition.to_phase;
             let _ = self.phase_watch_tx.send(self.state());
         }
+        self.publish_machine_state_projection();
         Ok(())
     }
 
@@ -1525,6 +1538,7 @@ impl MobActor {
             #[cfg(feature = "runtime-adapter")]
             runtime_adapter: self.runtime_adapter.clone(),
             restore_diagnostics: self.restore_diagnostics.clone(),
+            machine_state_watch_rx: self.machine_state_watch_tx.subscribe(),
             phase_watch_rx: self.phase_watch_tx.subscribe(),
             // W2-E: the actor's internal handle-for-tools does not carry the
             // realtime factory — that seam lives on the caller-facing
@@ -1726,6 +1740,7 @@ impl MobActor {
         // prior `_ => {}` arm — they're lifted through
         // `lift_routed_effect` and await `flush_routed_effects`.
         self.queue_routed_effects_from(&transition.effects);
+        self.publish_machine_state_projection();
 
         for effect in transition.effects {
             match effect {
@@ -6959,6 +6974,7 @@ impl MobActor {
                             "MobMachine SessionIngressDetachedForMobDestroy transition rejected: {error}"
                         ))
                     })?;
+                self.publish_machine_state_projection();
                 Ok(())
             }
             Err(error) => {
@@ -6968,6 +6984,7 @@ impl MobActor {
                     obligation,
                     reason.clone(),
                 );
+                self.publish_machine_state_projection();
                 Err(MobError::Internal(format!(
                     "mob_destroying_session_ingress detach failed for {session_id}: {reason}"
                 )))
@@ -8865,6 +8882,7 @@ impl MobActor {
             self.dsl_authority.state.lifecycle_phase = transition.to_phase;
             let _ = self.phase_watch_tx.send(self.state());
         }
+        self.publish_machine_state_projection();
 
         // The MobMachine emits `RequestRuntimeIngress` whenever SubmitWork
         // is admitted. The shell realizes that routed-to-MeerkatMachine

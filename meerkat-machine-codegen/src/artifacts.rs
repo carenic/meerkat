@@ -2867,6 +2867,9 @@ struct CompositionTlaCompiler<'a> {
     fallback_machine: &'a MachineSchema,
 }
 
+const COMPOSITION_UNCHANGED_CHUNK_SIZE: usize = 64;
+const COMPOSITION_UNCHANGED_SPLIT_THRESHOLD: usize = 96;
+
 impl<'a> CompositionTlaCompiler<'a> {
     fn new(
         schema: &'a CompositionSchema,
@@ -2901,6 +2904,22 @@ impl<'a> CompositionTlaCompiler<'a> {
                 )
             })?,
         })
+    }
+
+    fn render_unchanged_vars(&self, out: &mut String, prefix: &str, vars: &[String]) {
+        if vars.is_empty() {
+            return;
+        }
+        if vars.len() <= COMPOSITION_UNCHANGED_SPLIT_THRESHOLD {
+            writeln!(out, "{prefix}UNCHANGED << {} >>", vars.join(", ")).expect("write to string");
+            return;
+        }
+
+        // TLC's semantic pass can overflow on very large repeated tuple frames in
+        // generated seam models. Split the frame into equivalent smaller tuples.
+        for chunk in vars.chunks(COMPOSITION_UNCHANGED_CHUNK_SIZE) {
+            writeln!(out, "{prefix}UNCHANGED << {} >>", chunk.join(", ")).expect("write to string");
+        }
     }
 
     fn render(&self) -> std::result::Result<String, String> {
@@ -3795,8 +3814,7 @@ impl<'a> CompositionTlaCompiler<'a> {
                     .map(std::string::ToString::to_string),
                 )
                 .collect();
-            writeln!(out, "    /\\ UNCHANGED << {} >>", unchanged_vars.join(", "))
-                .expect("write to string");
+            self.render_unchanged_vars(out, "    /\\ ", &unchanged_vars);
             pushln!(out);
         }
         Ok(())
@@ -4111,8 +4129,7 @@ impl<'a> CompositionTlaCompiler<'a> {
                     "witness_current_script_input".into(),
                     "witness_remaining_script_inputs".into(),
                 ]);
-                writeln!(out, "    /\\ UNCHANGED << {} >>", unchanged.join(", "))
-                    .expect("write to string");
+                self.render_unchanged_vars(out, "    /\\ ", &unchanged);
             }
             pushln!(out);
         }
@@ -4177,8 +4194,7 @@ impl<'a> CompositionTlaCompiler<'a> {
                 "witness_current_script_input".into(),
                 "witness_remaining_script_inputs".into(),
             ]);
-            writeln!(out, "       /\\ UNCHANGED << {} >>", unchanged.join(", "))
-                .expect("write to string");
+            self.render_unchanged_vars(out, "       /\\ ", &unchanged);
         }
         pushln!(out);
     }
@@ -4339,8 +4355,7 @@ impl<'a> CompositionTlaCompiler<'a> {
             "witness_current_script_input".into(),
             "witness_remaining_script_inputs".into(),
         ]);
-        writeln!(out, "       /\\ UNCHANGED << {} >>", unchanged.join(", "))
-            .expect("write to string");
+        self.render_unchanged_vars(out, "       /\\ ", &unchanged);
         pushln!(out);
     }
 
@@ -4619,8 +4634,7 @@ impl<'a> CompositionTlaCompiler<'a> {
                     "emitted_effects".into(),
                     "observed_transitions".into(),
                 ]);
-                writeln!(out, "    /\\ UNCHANGED << {} >>", unchanged.join(", "))
-                    .expect("write to string");
+                self.render_unchanged_vars(out, "    /\\ ", &unchanged);
             }
             pushln!(out);
         }
@@ -4967,12 +4981,7 @@ impl<'a> CompositionTlaCompiler<'a> {
         unchanged_machine_vars.push("witness_remaining_script_inputs".into());
 
         if !unchanged_machine_vars.is_empty() {
-            writeln!(
-                out,
-                "       /\\ UNCHANGED << {} >>",
-                unchanged_machine_vars.join(", ")
-            )
-            .expect("write to string");
+            self.render_unchanged_vars(out, "       /\\ ", &unchanged_machine_vars);
         }
 
         let pending_inputs_next = self.append_if_missing_chain(
@@ -5115,12 +5124,8 @@ impl<'a> CompositionTlaCompiler<'a> {
             }
         }
         if !unchanged_obligation_vars.is_empty() {
-            writeln!(
-                out,
-                "{route_update_prefix} UNCHANGED << {} >>",
-                unchanged_obligation_vars.join(", ")
-            )
-            .expect("write to string");
+            let unchanged_prefix = format!("{route_update_prefix} ");
+            self.render_unchanged_vars(out, &unchanged_prefix, &unchanged_obligation_vars);
         }
         writeln!(
             out,
