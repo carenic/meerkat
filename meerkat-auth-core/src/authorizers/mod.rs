@@ -32,6 +32,11 @@ pub(crate) struct LeaseFreshnessObserver {
 }
 
 #[cfg(any(feature = "azure-ad", feature = "gcp-auth"))]
+const AUTH_LEASE_REFRESH_WAIT_POLL_MS: u64 = 10;
+#[cfg(any(feature = "azure-ad", feature = "gcp-auth"))]
+const AUTH_LEASE_REFRESH_WAIT_TIMEOUT_SECS: u64 = 30;
+
+#[cfg(any(feature = "azure-ad", feature = "gcp-auth"))]
 impl LeaseFreshnessObserver {
     pub(crate) fn new(handle: Arc<dyn AuthLeaseHandle>, lease_key: LeaseKey) -> Self {
         Self { handle, lease_key }
@@ -70,23 +75,44 @@ impl LeaseFreshnessObserver {
         Ok(token_is_fresh_at(expires_at, now))
     }
 
-    pub(crate) fn begin_refresh(
+    pub(crate) async fn begin_refresh(
         &self,
         authorizer_label: &str,
     ) -> Result<LeaseRefreshLifecycle, AuthError> {
+        let deadline = tokio::time::Instant::now()
+            + std::time::Duration::from_secs(AUTH_LEASE_REFRESH_WAIT_TIMEOUT_SECS);
+        loop {
+            match self.try_begin_refresh(authorizer_label)? {
+                LeaseRefreshStart::Started(lifecycle) => return Ok(lifecycle),
+                LeaseRefreshStart::WaitForInFlight => {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err(AuthError::RefreshFailed(format!(
+                            "{authorizer_label} auth lease {} remained refreshing for {AUTH_LEASE_REFRESH_WAIT_TIMEOUT_SECS}s",
+                            self.lease_key
+                        )));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        AUTH_LEASE_REFRESH_WAIT_POLL_MS,
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+
+    fn try_begin_refresh(&self, authorizer_label: &str) -> Result<LeaseRefreshStart, AuthError> {
         match self.handle.snapshot(&self.lease_key).phase {
             Some(AuthLeasePhase::Valid | AuthLeasePhase::Expiring) => {
                 self.handle
                     .begin_refresh(&self.lease_key)
                     .map_err(|err| self.observer_error(authorizer_label, "begin_refresh", err))?;
-                Ok(LeaseRefreshLifecycle::Refresh)
+                Ok(LeaseRefreshStart::Started(LeaseRefreshLifecycle::Refresh))
             }
             Some(AuthLeasePhase::ReauthRequired) => Err(AuthError::Expired),
-            Some(AuthLeasePhase::Refreshing) => Err(AuthError::RefreshFailed(format!(
-                "{authorizer_label} auth lease {} is already refreshing",
-                self.lease_key
-            ))),
-            Some(AuthLeasePhase::Released) | None => Ok(LeaseRefreshLifecycle::InitialAcquire),
+            Some(AuthLeasePhase::Refreshing) => Ok(LeaseRefreshStart::WaitForInFlight),
+            Some(AuthLeasePhase::Released) | None => Ok(LeaseRefreshStart::Started(
+                LeaseRefreshLifecycle::InitialAcquire,
+            )),
         }
     }
 
@@ -147,6 +173,13 @@ impl LeaseFreshnessObserver {
 pub(crate) enum LeaseRefreshLifecycle {
     InitialAcquire,
     Refresh,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(any(feature = "azure-ad", feature = "gcp-auth"))]
+enum LeaseRefreshStart {
+    Started(LeaseRefreshLifecycle),
+    WaitForInFlight,
 }
 
 #[cfg(any(feature = "azure-ad", feature = "gcp-auth"))]

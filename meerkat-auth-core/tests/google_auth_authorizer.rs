@@ -836,6 +836,71 @@ async fn metadata_endpoint_transient_failure_keeps_auth_lease_retryable() {
     );
 }
 
+#[tokio::test]
+async fn default_chain_metadata_transient_failure_keeps_auth_lease_retryable() {
+    let mock = start_mock_with_config(
+        "default-metadata-transient-token",
+        vec![30],
+        Some(MockFailure {
+            from_call: 2,
+            status: axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            body: serde_json::json!({"error": "temporarily_unavailable"}),
+        }),
+    )
+    .await;
+    let tempdir = tempfile::tempdir().unwrap();
+    let env_lookup =
+        Arc::new(|_: &str| None::<String>) as Arc<dyn Fn(&str) -> Option<String> + Send + Sync>;
+    let handle = Arc::new(RecordingAuthLeaseHandle::default());
+    let lease_key = LeaseKey::new(
+        RealmId::parse("dev").unwrap(),
+        BindingId::parse("gemini").unwrap(),
+        Some(ProfileId::parse("google_default_metadata").unwrap()),
+    );
+    let lease_handle: Arc<dyn AuthLeaseHandle> = handle.clone();
+    let authorizer = GoogleAuthAuthorizer::with_env_lookup(GoogleAuthChain::Default, env_lookup)
+        .with_home_dir(tempdir.path())
+        .with_auth_lease_observer(lease_handle, lease_key.clone())
+        .with_metadata_url_override(format!(
+            "{}/computeMetadata/v1/instance/service-accounts/default/token",
+            mock.base_url
+        ));
+
+    let mut headers = Vec::new();
+    let mut req = HttpAuthorizationRequest {
+        method: "POST",
+        url: "https://generativelanguage.googleapis.com/v1/models",
+        headers: &mut headers,
+    };
+    authorizer.authorize(&mut req).await.unwrap();
+
+    let mut headers = Vec::new();
+    let mut req = HttpAuthorizationRequest {
+        method: "POST",
+        url: "https://generativelanguage.googleapis.com/v1/models",
+        headers: &mut headers,
+    };
+    let err = authorizer.authorize(&mut req).await.unwrap_err();
+    assert!(
+        matches!(err, meerkat_core::AuthError::RefreshFailed(_)),
+        "metadata outage should still fail the caller visibly, got {err:?}"
+    );
+
+    let snapshot = handle.snapshot(&lease_key);
+    assert_eq!(
+        snapshot.phase,
+        Some(AuthLeasePhase::Expiring),
+        "Default ADC metadata transient failure must remain retryable in AuthMachine"
+    );
+    assert!(
+        handle
+            .events()
+            .iter()
+            .any(|event| matches!(event, LeaseEvent::RefreshFailed(_, false))),
+        "Default ADC metadata transient failure should not force reauth"
+    );
+}
+
 // --- Error propagation ------------------------------------------------
 
 #[tokio::test]

@@ -746,6 +746,97 @@ async fn concurrent_refresh_observers_wait_for_inflight_refresh() {
 }
 
 #[tokio::test]
+async fn separate_authorizers_wait_when_shared_lease_is_refreshing() {
+    let mock =
+        start_mock_with_config("shared-lease-refresh-token", vec![30, 3600], None, Some(2)).await;
+    let handle = Arc::new(RecordingAuthLeaseHandle::default());
+    let lease_key = LeaseKey::new(
+        RealmId::parse("dev").unwrap(),
+        BindingId::parse("azure_foundry").unwrap(),
+        Some(ProfileId::parse("foundry_azure_ad").unwrap()),
+    );
+    let lease_handle_a: Arc<dyn AuthLeaseHandle> = handle.clone();
+    let lease_handle_b: Arc<dyn AuthLeaseHandle> = handle.clone();
+    let token_url = format!("{}/tenant-id/oauth2/v2.0/token", mock.base_url);
+    let authorizer_a = Arc::new(
+        AzureAdAuthorizer::new(
+            "https://cognitiveservices.azure.com/.default",
+            creds(&mock.base_url),
+        )
+        .with_auth_lease_observer(lease_handle_a, lease_key.clone())
+        .with_token_url_override(token_url.clone()),
+    );
+    let authorizer_b = Arc::new(
+        AzureAdAuthorizer::new(
+            "https://cognitiveservices.azure.com/.default",
+            creds(&mock.base_url),
+        )
+        .with_auth_lease_observer(lease_handle_b, lease_key)
+        .with_token_url_override(token_url),
+    );
+
+    let mut headers = Vec::new();
+    let mut req = HttpAuthorizationRequest {
+        method: "POST",
+        url: "https://example.foundry.azure.com/v1/messages",
+        headers: &mut headers,
+    };
+    authorizer_a.authorize(&mut req).await.unwrap();
+
+    let first = {
+        let authorizer = authorizer_a.clone();
+        tokio::spawn(async move {
+            let mut headers = Vec::new();
+            let mut req = HttpAuthorizationRequest {
+                method: "POST",
+                url: "https://example.foundry.azure.com/v1/messages",
+                headers: &mut headers,
+            };
+            authorizer.authorize(&mut req).await
+        })
+    };
+
+    timeout(TokioDuration::from_secs(1), async {
+        loop {
+            if handle
+                .events()
+                .iter()
+                .any(|event| matches!(event, LeaseEvent::BeginRefresh(_)))
+            {
+                break;
+            }
+            sleep(TokioDuration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("first authorizer should enter the shared refresh lease window");
+
+    let second = {
+        let authorizer = authorizer_b.clone();
+        tokio::spawn(async move {
+            let mut headers = Vec::new();
+            let mut req = HttpAuthorizationRequest {
+                method: "POST",
+                url: "https://example.foundry.azure.com/v1/messages",
+                headers: &mut headers,
+            };
+            authorizer.authorize(&mut req).await
+        })
+    };
+
+    let (first, second) = tokio::join!(first, second);
+    first.unwrap().unwrap();
+    second
+        .unwrap()
+        .expect("shared lease Refreshing must not fail a separate authorizer");
+    assert_eq!(
+        mock.counter.load(Ordering::SeqCst),
+        3,
+        "second authorizer has no private cache, but must wait for lease truth before refreshing"
+    );
+}
+
+#[tokio::test]
 async fn from_env_reads_azure_credentials() {
     let c = AzureClientCredentials::from_env(|k| match k {
         "AZURE_TENANT_ID" => Some("env-tenant".into()),

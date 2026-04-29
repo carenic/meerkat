@@ -25,7 +25,8 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use super::{
-    EnvLookup, LeaseFreshnessObserver, oauth_endpoint_failure_is_permanent, token_is_fresh_at,
+    EnvLookup, LeaseFreshnessObserver, endpoint_failure_is_transient,
+    oauth_endpoint_failure_is_permanent, token_is_fresh_at,
 };
 use meerkat_core::handles::{AuthLeaseHandle, LeaseKey};
 use meerkat_core::{AuthError, HttpAuthorizationRequest, HttpAuthorizer};
@@ -66,9 +67,11 @@ impl From<GoogleAuthError> for AuthError {
         match e {
             GoogleAuthError::NoCredentialSource => AuthError::MissingSecret,
             GoogleAuthError::Io(msg) | GoogleAuthError::Network(msg) => AuthError::Io(msg),
-            GoogleAuthError::TokenEndpoint { status, body }
-            | GoogleAuthError::MetadataEndpoint { status, body } => {
+            GoogleAuthError::TokenEndpoint { status, body } => {
                 AuthError::RefreshFailed(format!("google token endpoint {status}: {body}"))
+            }
+            GoogleAuthError::MetadataEndpoint { status, body } => {
+                AuthError::RefreshFailed(format!("google metadata endpoint {status}: {body}"))
             }
             GoogleAuthError::Json(msg) => AuthError::Other(format!("google json: {msg}")),
             GoogleAuthError::JwtSign(msg) => AuthError::Other(format!("google jwt sign: {msg}")),
@@ -248,7 +251,7 @@ impl GoogleAuthAuthorizer {
         }
 
         let lifecycle = if let Some(observer) = &self.lease_observer {
-            Some(observer.begin_refresh(&self.label)?)
+            Some(observer.begin_refresh(&self.label).await?)
         } else {
             None
         };
@@ -308,6 +311,7 @@ impl GoogleAuthAuthorizer {
         // 3. Metadata server
         match self.fetch_from_metadata().await {
             Ok(t) => Ok(t),
+            Err(err) if default_chain_metadata_error_is_retryable(&err) => Err(err),
             Err(_) => Err(GoogleAuthError::NoCredentialSource),
         }
     }
@@ -457,6 +461,15 @@ fn google_refresh_failure_is_permanent(err: &GoogleAuthError) -> bool {
             oauth_endpoint_failure_is_permanent(*status, body)
         }
         GoogleAuthError::MetadataEndpoint { .. } => false,
+    }
+}
+
+fn default_chain_metadata_error_is_retryable(err: &GoogleAuthError) -> bool {
+    match err {
+        GoogleAuthError::MetadataEndpoint { status, body } => {
+            endpoint_failure_is_transient(*status, body)
+        }
+        _ => false,
     }
 }
 

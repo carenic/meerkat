@@ -222,7 +222,7 @@ impl AzureAdAuthorizer {
         }
 
         let lifecycle = if let Some(observer) = &self.lease_observer {
-            Some(observer.begin_refresh(&self.label)?)
+            Some(observer.begin_refresh(&self.label).await?)
         } else {
             None
         };
