@@ -1197,7 +1197,19 @@ impl GeneratedMachineKernel {
         helper: &HelperSchema,
         transition_name: &TransitionId,
     ) -> Result<KernelValue, TransitionRefusal> {
-        self.eval_expr(state, bindings, &helper.body, transition_name)
+        let value = self.eval_expr(state, bindings, &helper.body, transition_name)?;
+        if self.type_contains_constrained_string_enum(&helper.returns)
+            && !self.value_matches_type(&value, &helper.returns)
+        {
+            return Err(self.eval_error(
+                transition_name,
+                format!(
+                    "helper `{}` return value does not match declared type",
+                    helper.name
+                ),
+            ));
+        }
+        Ok(value)
     }
 
     fn compare_values(
@@ -1731,6 +1743,27 @@ mod tests {
         );
     }
 
+    fn add_invalid_operation_status_helper(schema: &mut meerkat_machine_schema::MachineSchema) {
+        schema.helpers.push(meerkat_machine_schema::HelperSchema {
+            name: "invalid_operation_status".to_string(),
+            params: Vec::new(),
+            returns: meerkat_machine_schema::TypeRef::Enum(enum_type_id("OperationStatus")),
+            body: meerkat_machine_schema::Expr::String("Launched".to_string()),
+        });
+    }
+
+    fn add_wrong_domain_operation_kind_helper(schema: &mut meerkat_machine_schema::MachineSchema) {
+        schema.helpers.push(meerkat_machine_schema::HelperSchema {
+            name: "wrong_domain_operation_kind".to_string(),
+            params: Vec::new(),
+            returns: meerkat_machine_schema::TypeRef::Enum(enum_type_id("OperationKind")),
+            body: meerkat_machine_schema::Expr::NamedVariant {
+                enum_name: enum_type_id("OperationStatus"),
+                variant: enum_variant_id("Running"),
+            },
+        });
+    }
+
     #[allow(clippy::expect_used)]
     #[test]
     fn every_catalog_machine_builds_an_initial_state() {
@@ -1972,6 +2005,53 @@ mod tests {
                 );
             }
             other => panic!("expected state validation error, got {other:?}"),
+        }
+    }
+
+    #[allow(clippy::expect_used)]
+    #[test]
+    fn operation_status_rejects_unknown_helper_return_value() {
+        let mut schema = meerkat_machine();
+        add_invalid_operation_status_helper(&mut schema);
+        let kernel = GeneratedMachineKernel::new(schema);
+        let state = kernel.initial_state().expect("initial state");
+
+        let refusal = kernel
+            .evaluate_helper(&state, "invalid_operation_status", &BTreeMap::new())
+            .expect_err("invalid OperationStatus helper return must not be exposed");
+
+        match refusal {
+            TransitionRefusal::EvaluationError { reason, .. } => {
+                assert!(
+                    reason.contains("invalid_operation_status") && reason.contains("return value"),
+                    "helper return refusal should identify the bad helper, got: {reason}"
+                );
+            }
+            other => panic!("expected helper return evaluation error, got {other:?}"),
+        }
+    }
+
+    #[allow(clippy::expect_used)]
+    #[test]
+    fn operation_kind_rejects_wrong_domain_helper_return_value() {
+        let mut schema = meerkat_machine();
+        add_wrong_domain_operation_kind_helper(&mut schema);
+        let kernel = GeneratedMachineKernel::new(schema);
+        let state = kernel.initial_state().expect("initial state");
+
+        let refusal = kernel
+            .evaluate_helper(&state, "wrong_domain_operation_kind", &BTreeMap::new())
+            .expect_err("wrong-domain OperationKind helper return must not be exposed");
+
+        match refusal {
+            TransitionRefusal::EvaluationError { reason, .. } => {
+                assert!(
+                    reason.contains("wrong_domain_operation_kind")
+                        && reason.contains("return value"),
+                    "helper return refusal should identify the bad helper, got: {reason}"
+                );
+            }
+            other => panic!("expected helper return evaluation error, got {other:?}"),
         }
     }
 
