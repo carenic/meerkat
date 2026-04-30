@@ -17800,7 +17800,7 @@ async fn retire_from_retired_is_backed_by_dsl_idempotent_transition() {
     let session_id = SessionId::new();
     adapter.register_session(session_id.clone()).await;
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     crate::traits::RuntimeControlPlane::retire(adapter.as_ref(), &runtime_id)
         .await
         .expect("initial retire should succeed");
@@ -17850,7 +17850,7 @@ async fn reset_from_running_surfaces_dsl_rejection() {
 async fn destroy_from_bound_initializing_is_backed_by_dsl_guard() {
     let adapter = Arc::new(MeerkatMachine::ephemeral());
     let session_id = SessionId::new();
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
 
     adapter
         .prepare_bindings(session_id.clone())
