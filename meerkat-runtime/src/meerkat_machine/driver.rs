@@ -1160,6 +1160,9 @@ pub(super) async fn load_boundary_receipt_for_storage_aliases(
         {
             Ok(Some(receipt)) => return Ok(Some(receipt)),
             Ok(None) => {
+                if candidate_index == 0 && selected_primary_alias {
+                    return Ok(None);
+                }
                 if candidate_index == 0 {
                     primary_alias_loaded = true;
                 }

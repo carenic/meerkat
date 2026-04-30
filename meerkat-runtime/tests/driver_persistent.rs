@@ -1345,6 +1345,78 @@ async fn recover_ignores_legacy_boundary_receipt_load_error_after_canonical_miss
 }
 
 #[tokio::test]
+async fn recover_treats_canonical_boundary_receipt_miss_as_authoritative() {
+    use meerkat_core::lifecycle::RunId;
+    use meerkat_core::lifecycle::run_primitive::RunApplyBoundary;
+    use meerkat_core::lifecycle::run_receipt::RunBoundaryReceipt;
+    use meerkat_runtime::input_state::InputLifecycleState;
+
+    let store = Arc::new(InMemoryRuntimeStore::new());
+    let session_id = SessionId::new();
+    let canonical_rid = LogicalRuntimeId::for_session(&session_id);
+    let legacy_rid = LogicalRuntimeId::legacy_session_uuid_alias(&session_id);
+    let input = make_prompt("canonical missing receipt must not consume from legacy receipt");
+    let input_id = input.id().clone();
+    let run_id = RunId::new();
+
+    let mut state = InputState::new_accepted(input_id.clone());
+    state.persisted_input = Some(input);
+    state.durability = Some(InputDurability::Durable);
+    state.attempt_count = 1;
+    store
+        .persist_input_state(
+            &canonical_rid,
+            &StoredInputState {
+                state,
+                seed: InputStateSeed {
+                    phase: InputLifecycleState::AppliedPendingConsumption,
+                    last_run_id: Some(run_id.clone()),
+                    last_boundary_sequence: Some(0),
+                    terminal_outcome: None,
+                    attempt_count: 1,
+                },
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .atomic_apply(
+            &legacy_rid,
+            None,
+            RunBoundaryReceipt {
+                run_id,
+                boundary: RunApplyBoundary::RunStart,
+                contributing_input_ids: vec![input_id.clone()],
+                conversation_digest: None,
+                message_count: 1,
+                sequence: 0,
+            },
+            vec![],
+            None,
+        )
+        .await
+        .unwrap();
+
+    let mut driver = PersistentRuntimeDriver::new(canonical_rid, store, memory_blob_store());
+    let report = driver
+        .recover()
+        .await
+        .expect("canonical receipt miss should not be poisoned by legacy receipt presence");
+
+    assert_eq!(report.inputs_recovered, 1);
+    assert_eq!(
+        driver.inner_ref().input_phase(&input_id),
+        Some(InputLifecycleState::Queued),
+        "canonical receipt miss should requeue instead of consuming from stale legacy receipt"
+    );
+    assert_eq!(
+        driver.dequeue_next().map(|(queued_id, _)| queued_id),
+        Some(input_id),
+        "canonical missing-receipt input should remain queued for replay"
+    );
+}
+
+#[tokio::test]
 async fn recover_ignores_legacy_input_state_load_error_after_canonical_states() {
     let inner = Arc::new(InMemoryRuntimeStore::new());
     let session_id = SessionId::new();

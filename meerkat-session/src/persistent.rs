@@ -448,7 +448,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         let Some(runtime_store) = self.runtime_store.as_ref() else {
             return Ok(Vec::new());
         };
-        let mut stored_states: Vec<StoredInputState> = Vec::new();
+        let mut stored_states: Vec<(usize, StoredInputState)> = Vec::new();
         let mut primary_alias_loaded = false;
         for (candidate_index, runtime_id) in Self::runtime_id_candidates_for_session(id)
             .into_iter()
@@ -461,7 +461,15 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                     }
                     states
                 }
-                Err(err) if candidate_index > 0 && primary_alias_loaded => {
+                Err(err)
+                    if candidate_index > 0
+                        && primary_alias_loaded
+                        && contributing_input_ids.iter().all(|input_id| {
+                            stored_states
+                                .iter()
+                                .any(|(_, state)| &state.state.input_id == input_id)
+                        }) =>
+                {
                     tracing::warn!(
                         session_id = %id,
                         runtime_id = %runtime_id,
@@ -480,15 +488,23 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             };
             for state in candidate_states {
                 let input_id = state.state.input_id.clone();
-                if let Some(existing) = stored_states
+                if let Some((existing_index, existing_state)) = stored_states
                     .iter_mut()
-                    .find(|existing| existing.state.input_id == input_id)
+                    .find(|(_, existing)| existing.state.input_id == input_id)
                 {
-                    if state.state.updated_at() > existing.state.updated_at() {
-                        *existing = state;
+                    let candidate_updated_at = state.state.updated_at();
+                    let existing_updated_at = existing_state.state.updated_at();
+                    let should_replace = if candidate_index == *existing_index {
+                        candidate_updated_at > existing_updated_at
+                    } else {
+                        candidate_index < *existing_index
+                    };
+                    if should_replace {
+                        *existing_index = candidate_index;
+                        *existing_state = state;
                     }
                 } else {
-                    stored_states.push(state);
+                    stored_states.push((candidate_index, state));
                 }
             }
         }
@@ -498,7 +514,8 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             .filter_map(|input_id| {
                 let mut bundle = stored_states
                     .iter()
-                    .find(|candidate| &candidate.state.input_id == input_id)?
+                    .find(|(_, candidate)| &candidate.state.input_id == input_id)?
+                    .1
                     .clone();
                 // Stamp receipt metadata and mirror the Consumed terminal on
                 // the persisted snapshot. The authoritative DSL transition
@@ -5224,6 +5241,98 @@ mod tests {
             updates.is_empty(),
             "no-contributor boundary should not need legacy input-state data"
         );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_input_updates_require_legacy_alias_when_contributor_missing_from_canonical()
+     {
+        let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+        let runtime_store = Arc::new(GatedSnapshotRuntimeStore::new());
+        let service = PersistentSessionService::new(
+            DummyBuilder,
+            4,
+            Arc::clone(&store),
+            Some(runtime_store.clone()),
+            memory_blob_store(),
+        );
+
+        let id = SessionId::new();
+        let input_id = InputId::new();
+        runtime_store
+            .fail_input_state_load_for(LogicalRuntimeId::legacy_session_uuid_alias(&id))
+            .await;
+
+        let err = service
+            .runtime_input_updates(&id, &RunId::new(), 0, std::slice::from_ref(&input_id))
+            .await
+            .expect_err(
+                "missing canonical contributor must not be silently dropped when legacy is unreadable",
+            );
+
+        assert!(
+            err.to_string()
+                .contains("synthetic legacy input-state load failure"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_input_updates_prefer_canonical_duplicate_over_newer_stale_legacy_row() {
+        let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+        let runtime_store = Arc::new(GatedSnapshotRuntimeStore::new());
+        let service = PersistentSessionService::new(
+            DummyBuilder,
+            4,
+            Arc::clone(&store),
+            Some(runtime_store.clone()),
+            memory_blob_store(),
+        );
+
+        let id = SessionId::new();
+        let input_id = InputId::new();
+        let canonical_runtime_id =
+            PersistentSessionService::<DummyBuilder>::runtime_id_for_session(&id);
+        let legacy_runtime_id = LogicalRuntimeId::legacy_session_uuid_alias(&id);
+
+        let mut canonical_state = meerkat_runtime::InputState::new_accepted(input_id.clone());
+        canonical_state.durability = Some(meerkat_runtime::InputDurability::Durable);
+        canonical_state.recovery_count = 7;
+        let canonical_stored = StoredInputState {
+            state: canonical_state.clone(),
+            seed: meerkat_runtime::input_state::InputStateSeed::new_accepted(),
+        };
+        runtime_store
+            .persist_input_state(&canonical_runtime_id, &canonical_stored)
+            .await
+            .expect("test should seed canonical input state");
+
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        let mut legacy_state = meerkat_runtime::InputState::new_accepted(input_id.clone());
+        legacy_state.durability = Some(meerkat_runtime::InputDurability::Durable);
+        legacy_state.recovery_count = 99;
+        runtime_store
+            .persist_input_state(
+                &legacy_runtime_id,
+                &StoredInputState {
+                    state: legacy_state,
+                    seed: meerkat_runtime::input_state::InputStateSeed::new_accepted(),
+                },
+            )
+            .await
+            .expect("test should seed newer stale legacy input state");
+
+        let updates = service
+            .runtime_input_updates(&id, &RunId::new(), 3, std::slice::from_ref(&input_id))
+            .await
+            .expect("runtime input updates should merge duplicate aliases");
+
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0].state.recovery_count, 7,
+            "canonical contributor state must win over newer stale legacy duplicate"
+        );
+        assert_eq!(updates[0].seed.phase, InputLifecycleState::Consumed);
+        assert_eq!(updates[0].seed.last_boundary_sequence, Some(3));
     }
 
     #[tokio::test]
