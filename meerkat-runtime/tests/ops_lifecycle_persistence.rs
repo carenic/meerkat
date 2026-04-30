@@ -735,7 +735,7 @@ async fn cold_persistent_adapter_recovers_persisted_epoch() {
 }
 
 #[tokio::test]
-async fn cold_persistent_adapter_prefers_more_advanced_legacy_ops_alias_snapshot() {
+async fn cold_persistent_adapter_keeps_canonical_ops_snapshot_over_more_advanced_legacy_alias() {
     let store = Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
     let session_id = SessionId::new();
     let canonical_epoch = RuntimeEpochId::new();
@@ -777,13 +777,15 @@ async fn cold_persistent_adapter_prefers_more_advanced_legacy_ops_alias_snapshot
 
     let bindings = adapter.prepare_bindings(session_id.clone()).await.unwrap();
     assert_eq!(
-        bindings.epoch_id, legacy_epoch,
-        "register_session must not hide a more advanced legacy ops lifecycle alias snapshot"
+        bindings.epoch_id, canonical_snapshot.epoch_id,
+        "register_session must keep canonical ops lifecycle authority over legacy alias snapshots"
     );
     let feed = bindings.ops_lifecycle.completion_feed().unwrap();
     let batch = feed.list_since(0);
-    assert_eq!(batch.entries.len(), 1);
-    assert_eq!(batch.entries[0].operation_id, op_id);
+    assert!(
+        batch.entries.is_empty(),
+        "legacy completion entries must not be resurrected over canonical ops authority"
+    );
 }
 
 #[tokio::test]

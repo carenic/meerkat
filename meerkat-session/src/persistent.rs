@@ -687,12 +687,10 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         {
             match Self::load_runtime_session_snapshot(runtime_store, &runtime_id).await {
                 Ok(Some(session)) => {
-                    let replace = selected.as_ref().is_none_or(|existing: &Session| {
-                        session.updated_at() > existing.updated_at()
-                    });
-                    if replace {
-                        selected = Some(session);
+                    if candidate_index == 0 {
+                        return Ok(Some(session));
                     }
+                    selected = Some(session);
                 }
                 Ok(None) => {}
                 Err(err) if candidate_index > 0 && selected.is_some() => {
@@ -5053,7 +5051,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_runtime_backed_authoritative_load_prefers_newer_legacy_runtime_alias_snapshot() {
+    async fn test_runtime_backed_authoritative_load_keeps_canonical_over_newer_legacy_runtime_alias_snapshot()
+     {
         let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
         let runtime_store = Arc::new(InMemoryRuntimeStore::new());
         let service = PersistentSessionService::new(
@@ -5113,8 +5112,8 @@ mod tests {
             .expect("runtime alias snapshot should exist");
         assert_eq!(
             authoritative.messages().len(),
-            legacy_session.messages().len(),
-            "runtime-backed resume must not hide a newer legacy raw alias snapshot when both aliases exist"
+            canonical_session.messages().len(),
+            "canonical runtime authority must not be overwritten by a newer legacy raw alias snapshot"
         );
     }
 

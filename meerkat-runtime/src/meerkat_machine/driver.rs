@@ -1121,7 +1121,7 @@ pub(crate) async fn machine_normalize_recovered_input_state(
                 (Some(run_id), Some(sequence)) => load_boundary_receipt_for_storage_aliases(
                     store,
                     runtime_id,
-                    stored_runtime_id,
+                    stored_runtime_id == runtime_id,
                     &run_id,
                     sequence,
                 )
@@ -1143,11 +1143,10 @@ pub(crate) async fn machine_normalize_recovered_input_state(
 pub(super) async fn load_boundary_receipt_for_storage_aliases(
     store: &dyn crate::store::RuntimeStore,
     runtime_id: &LogicalRuntimeId,
-    stored_runtime_id: &LogicalRuntimeId,
+    canonical_miss_authoritative: bool,
     run_id: &RunId,
     sequence: u64,
 ) -> Result<Option<RunBoundaryReceipt>, crate::store::RuntimeStoreError> {
-    let selected_primary_alias = stored_runtime_id == runtime_id;
     let mut primary_alias_loaded = false;
     for (candidate_index, candidate) in runtime_id
         .storage_alias_candidates()
@@ -1160,14 +1159,16 @@ pub(super) async fn load_boundary_receipt_for_storage_aliases(
         {
             Ok(Some(receipt)) => return Ok(Some(receipt)),
             Ok(None) => {
-                if candidate_index == 0 && selected_primary_alias {
+                if candidate_index == 0 && canonical_miss_authoritative {
                     return Ok(None);
                 }
                 if candidate_index == 0 {
                     primary_alias_loaded = true;
                 }
             }
-            Err(_err) if candidate_index > 0 && primary_alias_loaded && selected_primary_alias => {
+            Err(_err)
+                if candidate_index > 0 && primary_alias_loaded && canonical_miss_authoritative =>
+            {
                 continue;
             }
             Err(err) => return Err(err),

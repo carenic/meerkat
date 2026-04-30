@@ -118,25 +118,6 @@ type MeerkatMachineCommandFuture<'a> = Pin<
     Box<dyn Future<Output = Result<MeerkatMachineCommandResult, MeerkatMachineCommandError>> + 'a>,
 >;
 
-fn ops_snapshot_resume_rank(
-    snapshot: &crate::ops_lifecycle::PersistedOpsSnapshot,
-) -> (u64, u64, u64, u64, usize, usize) {
-    let completion_watermark = snapshot
-        .completion_entries
-        .iter()
-        .map(|entry| entry.seq)
-        .max()
-        .unwrap_or(0);
-    (
-        completion_watermark,
-        snapshot.cursors.agent_applied_cursor,
-        snapshot.cursors.runtime_observed_seq,
-        snapshot.cursors.runtime_last_injected_seq,
-        snapshot.completion_entries.len(),
-        snapshot.authority_state.operation_count(),
-    )
-}
-
 pub(crate) use driver::{
     DriverEntry, SharedCompletionRegistry, SharedDriver, commit_runtime_loop_run,
     fail_machine_run_without_runtime_apply_cause, fail_runtime_loop_run,
@@ -894,12 +875,11 @@ impl MeerkatMachine {
             for candidate in candidates {
                 match store.load_ops_lifecycle(&candidate).await {
                     Ok(Some(snapshot)) => {
-                        let replace = recovered.as_ref().is_none_or(|(_, existing)| {
-                            ops_snapshot_resume_rank(&snapshot) > ops_snapshot_resume_rank(existing)
-                        });
-                        if replace {
+                        if candidate == *runtime_id {
                             recovered = Some((candidate, snapshot));
+                            break;
                         }
+                        recovered = Some((candidate, snapshot));
                     }
                     Ok(None) => {}
                     Err(err) if recovered.is_some() => {
