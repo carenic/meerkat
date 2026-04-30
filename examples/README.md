@@ -1,6 +1,6 @@
 # Meerkat Examples Library
 
-34 examples covering every Meerkat surface and feature,
+35 examples covering every Meerkat surface and feature,
 from "Hello World" to production multi-agent systems.
 
 ## Quick Start
@@ -49,7 +49,7 @@ branch.
 |--------|----------|
 | **Live-ran** | 001, 002, 003, 007, 008, 010, 021, 022, 023, 028, 029, 030, 034 via MCP stdio, 035 via Docker/TUX hive suite |
 | **Build-verified** | Registered Rust examples via `cargo check`; 031, 032, 033 via Vite builds |
-| **Syntax-checked / recipe-oriented** | 004 and shell entrypoints that are safe but intentionally operational rather than fully automated |
+| **Syntax-checked / recipe-oriented** | 004, 036, and shell entrypoints that are safe but intentionally operational rather than fully automated |
 
 ## Examples by Level
 
@@ -110,23 +110,24 @@ branch.
 | 032 | [wasm-webcm-agent](032-wasm-webcm-agent/) | Web (WASM) | Multi-provider coding agent mob in the browser — 4 agents (Anthropic + OpenAI + Gemini) collaborate via comms in a sandboxed Linux VM |
 | 034 | [codemob-mcp](034-codemob-mcp/) | Rust (MCP) | Multi-agent MCP server — 7 mobpacks (advisor, review, architect, brainstorm, red-team, panel, rct) with flow and comms execution, progress notifications, multi-provider model diversity |
 | 035 | [mdm-tux-rs](035-mdm-tux-rs/) | Rust + TUI + Docker | Meerkat Device Manager: TUX terminal controller, kennel rendezvous, remote targets, hive coordination, peer comms, and scheduler wakeups |
+| 036 | [realtime-audio-py](036-realtime-audio-py/) | Python | Command-line OpenAI realtime audio app with live transcript, callback tools, inline mob skills, and helper sub-agents |
 
 ## Examples by Feature
 
 | Feature | Examples |
 |---------|----------|
-| **Custom Tools** | 006, 025 |
+| **Custom Tools** | 006, 025, 036 |
 | **Built-in Tools** | 025 |
 | **Streaming** | 005, 007 |
 | **Sessions** | 004, 007, 015, 022, 023 |
 | **Budget & Retry** | 009 |
 | **MCP Integration** | 010 |
 | **Hooks** | 011 |
-| **Skills** | 012, 017, 018, 019, 026, 027 |
+| **Skills** | 012, 017, 018, 019, 026, 027, 036 |
 | **Compaction** | 013 |
 | **Semantic Memory** | 014 |
 | **Persistence** | 015 |
-| **Mobs** | 017, 018, 019, 028, 029, 030, 031, 032, 034, 035 |
+| **Mobs** | 017, 018, 019, 028, 029, 030, 031, 032, 034, 035, 036 |
 | **Mobpack** | 028, 029, 030, 031, 034 |
 | **WASM Web Build** | 029, 030, 031, 032 |
 | **Comms** | 020, 024, 032, 034, 035 |
@@ -136,6 +137,7 @@ branch.
 | **Flow Engine** | 034 |
 | **Remote Computer Control** | 035 |
 | **Scheduling** | 035 |
+| **Realtime Audio** | 036 |
 | **REST API** | 022 |
 | **JSON-RPC** | 023, 035 |
 | **Structured Output** | 008 |
@@ -145,7 +147,7 @@ branch.
 | Surface | Examples |
 |---------|----------|
 | **Rust SDK** | 001, 005, 006, 009, 011-020, 024, 025, 034, 035 |
-| **Python SDK** | 002, 007, 021, 022, 026 |
+| **Python SDK** | 002, 007, 021, 022, 026, 036 |
 | **TypeScript SDK** | 003, 008, 023, 027 |
 | **CLI (Shell)** | 004, 010, 028, 029, 030, 031 |
 | **WASM (Browser)** | 029, 030, 031, 032 |
@@ -176,7 +178,7 @@ cd examples && npm install
 ### API Keys
 ```bash
 export ANTHROPIC_API_KEY=sk-...     # Required for most examples
-export OPENAI_API_KEY=sk-...        # Optional (examples 021, 034, 035 live suite)
+export OPENAI_API_KEY=sk-...        # Optional (examples 021, 034, 035 live suite, 036)
 export GEMINI_API_KEY=...           # Optional (examples 021, 034, 035 live suite)
 ```
 
