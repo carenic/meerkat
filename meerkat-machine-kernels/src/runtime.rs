@@ -383,6 +383,7 @@ impl GeneratedMachineKernel {
             state.fields.insert(init.field.clone(), value);
         }
 
+        self.validate_state_fields(&state, &helper_transition)?;
         Ok(state)
     }
 
@@ -543,6 +544,7 @@ impl GeneratedMachineKernel {
             self.apply_update(&mut next_state, bindings, update, &transition.name)?;
         }
         next_state.phase = transition.to.clone();
+        self.validate_state_fields(&next_state, &transition.name)?;
 
         let mut effects = Vec::new();
         for effect in &transition.emit {
@@ -1227,6 +1229,57 @@ impl GeneratedMachineKernel {
     fn value_matches_type(&self, value: &KernelValue, ty: &TypeRef) -> bool {
         value_matches_type(&self.schema, value, ty)
     }
+
+    fn validate_state_fields(
+        &self,
+        state: &KernelState,
+        transition_name: &TransitionId,
+    ) -> Result<(), TransitionRefusal> {
+        for field in &self.schema.state.fields {
+            if !self.type_contains_constrained_string_enum(&field.ty) {
+                continue;
+            }
+            let Some(value) = state.fields.get(&field.name) else {
+                return Err(self.eval_error(
+                    transition_name,
+                    format!("missing state field `{}`", field.name),
+                ));
+            };
+            if !self.value_matches_type(value, &field.ty) {
+                return Err(self.eval_error(
+                    transition_name,
+                    format!("state field `{}` does not match declared type", field.name),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn type_contains_constrained_string_enum(&self, ty: &TypeRef) -> bool {
+        match ty {
+            TypeRef::Named(name) => matches!(
+                named_type_atom(&self.schema, name),
+                Some(meerkat_machine_schema::RustTypeAtom::StringEnum { .. })
+            ),
+            TypeRef::Enum(name) => {
+                let Ok(named_type_name) = NamedTypeId::parse(name.as_str()) else {
+                    return false;
+                };
+                matches!(
+                    named_type_atom(&self.schema, &named_type_name),
+                    Some(meerkat_machine_schema::RustTypeAtom::StringEnum { .. })
+                )
+            }
+            TypeRef::Option(inner) | TypeRef::Set(inner) | TypeRef::Seq(inner) => {
+                self.type_contains_constrained_string_enum(inner)
+            }
+            TypeRef::Map(key, value) => {
+                self.type_contains_constrained_string_enum(key)
+                    || self.type_contains_constrained_string_enum(value)
+            }
+            TypeRef::Bool | TypeRef::U32 | TypeRef::U64 | TypeRef::String => false,
+        }
+    }
 }
 
 /// Synthetic transition id used in error contexts that are not raised from a
@@ -1560,6 +1613,32 @@ mod tests {
         EnumVariantId::parse(slug).expect("valid enum variant slug")
     }
 
+    fn replace_register_op_status_update(schema: &mut meerkat_machine_schema::MachineSchema) {
+        let transition = schema
+            .transitions
+            .iter_mut()
+            .find(|transition| transition.name.as_str() == "RegisterOpIdle")
+            .expect("RegisterOpIdle transition");
+        let update = transition
+            .updates
+            .iter_mut()
+            .find(|update| {
+                matches!(
+                    update,
+                    meerkat_machine_schema::Update::MapInsert { field, .. }
+                        if field.as_str() == "op_statuses"
+                )
+            })
+            .expect("op_statuses update");
+        let meerkat_machine_schema::Update::MapInsert { value, .. } = update else {
+            panic!("op_statuses update must be a map insert");
+        };
+        *value = meerkat_machine_schema::Expr::NamedVariant {
+            enum_name: enum_type_id("OperationStatus"),
+            variant: enum_variant_id("Launched"),
+        };
+    }
+
     #[allow(clippy::expect_used)]
     #[test]
     fn every_catalog_machine_builds_an_initial_state() {
@@ -1631,6 +1710,44 @@ mod tests {
             ),
             "unknown OperationStatus string values must not enter kernel state"
         );
+    }
+
+    #[allow(clippy::expect_used)]
+    #[test]
+    fn operation_status_rejects_unknown_transition_update_value() {
+        let mut schema = meerkat_machine();
+        replace_register_op_status_update(&mut schema);
+        let kernel = GeneratedMachineKernel::new(schema);
+        let state = kernel.initial_state().expect("initial state");
+        let initialized = kernel
+            .transition_signal(
+                &state,
+                &KernelSignal {
+                    variant: signal_id("Initialize"),
+                    fields: BTreeMap::new(),
+                },
+            )
+            .expect("initialize");
+
+        let refusal = kernel
+            .transition(
+                &initialized.next_state,
+                &KernelInput {
+                    variant: input_id("RegisterOp"),
+                    fields: BTreeMap::from([
+                        (field_id("operation_id"), KernelValue::String("op-1".into())),
+                        (
+                            field_id("kind"),
+                            KernelValue::NamedVariant {
+                                enum_name: enum_type_id("OperationKind"),
+                                variant: enum_variant_id("BackgroundToolOp"),
+                            },
+                        ),
+                    ]),
+                },
+            )
+            .expect_err("invalid OperationStatus update must not enter state");
+        assert!(matches!(refusal, TransitionRefusal::EvaluationError { .. }));
     }
 
     #[allow(clippy::expect_used)]

@@ -1436,6 +1436,17 @@ fn render_named_type_definition(
             pushln!(out, "}}");
         }
         RustTypeAtom::StringEnum { variants } => {
+            if let Some((first, second, ident)) = string_enum_variant_ident_collision(variants) {
+                pushln!(
+                    out,
+                    "compile_error!(\"string enum {} variants `{}` and `{}` sanitize to duplicate Rust identifier `{}`\");",
+                    rust_name,
+                    first,
+                    second,
+                    ident
+                );
+                return;
+            }
             pushln!(out, "#[allow(non_camel_case_types)]");
             pushln!(
                 out,
@@ -1446,6 +1457,7 @@ fn render_named_type_definition(
                 if index == 0 {
                     pushln!(out, "    #[default]");
                 }
+                pushln!(out, "    #[serde(rename = \"{}\")]", variant.as_str());
                 pushln!(out, "    {},", rust_ident(variant.as_str()));
             }
             pushln!(out, "}}");
@@ -1530,6 +1542,22 @@ fn render_named_type_definition(
             pushln!(out, "}}");
         }
     }
+}
+
+#[cfg(not(test))]
+fn string_enum_variant_ident_collision<T: AsRef<str>>(
+    variants: &[T],
+) -> Option<(String, String, String)> {
+    let mut seen: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for variant in variants {
+        let raw = variant.as_ref();
+        let ident = rust_ident(raw);
+        if let Some(first) = seen.get(&ident) {
+            return Some((first.clone(), raw.to_owned(), ident));
+        }
+        seen.insert(ident, raw.to_owned());
+    }
+    None
 }
 
 /// Look up the authoritative Rust atom for a `TypeRef::Named` slug.

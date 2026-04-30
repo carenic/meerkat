@@ -221,6 +221,48 @@ fn rust_type_atom_string_enum_lowers_to_closed_enum() {
 }
 
 #[test]
+fn rust_type_atom_string_enum_preserves_raw_serde_values() {
+    let schema = with_atom(
+        schema_with_single_named_type("status", "AtomStatus"),
+        RustTypeAtom::StringEnum {
+            variants: vec![
+                EnumVariantId::parse("waiting-for-peer").expect("variant slug"),
+                EnumVariantId::parse("Running").expect("variant slug"),
+            ],
+        },
+    );
+    schema.validate().expect("schema validates");
+    let rendered = render_machine_kernel_module(&schema);
+
+    assert!(
+        rendered.contains("    #[serde(rename = \"waiting-for-peer\")]\n    waiting_for_peer,"),
+        "string enum serde must use the raw domain value, not the sanitized Rust identifier:\n{rendered}"
+    );
+}
+
+#[test]
+fn rust_type_atom_string_enum_rejects_sanitized_variant_collisions() {
+    let schema = with_atom(
+        schema_with_single_named_type("status", "AtomStatus"),
+        RustTypeAtom::StringEnum {
+            variants: vec![
+                EnumVariantId::parse("waiting-for-peer").expect("variant slug"),
+                EnumVariantId::parse("waiting_for_peer").expect("variant slug"),
+            ],
+        },
+    );
+    schema.validate().expect("schema validates");
+
+    let rendered = render_machine_kernel_module(&schema);
+    assert!(
+        rendered.contains(
+            "compile_error!(\"string enum AtomStatus variants `waiting-for-peer` and `waiting_for_peer` sanitize to duplicate Rust identifier `waiting_for_peer`\");"
+        ),
+        "string enum variants that sanitize to the same Rust identifier must be rejected:\n{rendered}"
+    );
+}
+
+#[test]
 fn rust_type_atom_type_path_lowers_verbatim_not_to_string() {
     let schema = with_atom(
         schema_with_single_named_type("custom", "AtomTypePath"),

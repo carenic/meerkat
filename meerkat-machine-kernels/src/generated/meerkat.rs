@@ -412,15 +412,25 @@ impl std::fmt::Display for OperationId {
 )]
 pub enum OperationStatus {
     #[default]
+    #[serde(rename = "Absent")]
     Absent,
+    #[serde(rename = "Provisioning")]
     Provisioning,
+    #[serde(rename = "Running")]
     Running,
+    #[serde(rename = "Retiring")]
     Retiring,
+    #[serde(rename = "Completed")]
     Completed,
+    #[serde(rename = "Failed")]
     Failed,
+    #[serde(rename = "Aborted")]
     Aborted,
+    #[serde(rename = "Cancelled")]
     Cancelled,
+    #[serde(rename = "Retired")]
     Retired,
+    #[serde(rename = "Terminated")]
     Terminated,
 }
 impl OperationStatus {
