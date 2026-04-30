@@ -694,17 +694,32 @@ No parameters required. The catalog is resolved from built-in model metadata plu
 
 ### meerkat_skills
 
-List or inspect available skills with provenance information.
+List available skills with provenance information, or inspect one skill's full
+body by typed `SkillKey`.
 
 <CodeGroup>
 ```json List all skills
 { "action": "list" }
 ```
 
-```json Inspect a specific skill
+```json Inspect a skill
 {
   "action": "inspect",
-  "skill_id": "task-workflow"
+  "skill_key": {
+    "source_uuid": "00000000-0000-4b11-8111-000000000001",
+    "skill_name": "task-workflow"
+  }
+}
+```
+
+```json Inspect a specific source
+{
+  "action": "inspect",
+  "skill_key": {
+    "source_uuid": "00000000-0000-4b11-8111-000000000001",
+    "skill_name": "task-workflow"
+  },
+  "source": "00000000-0000-4b11-8111-000000000001"
 }
 ```
 
@@ -712,11 +727,20 @@ List or inspect available skills with provenance information.
 {
   "skills": [
     {
-      "id": "task-workflow",
+      "key": {
+        "source_uuid": "00000000-0000-4b11-8111-000000000001",
+        "skill_name": "task-workflow"
+      },
       "name": "Task Workflow",
       "description": "How to use task tools",
       "scope": "builtin",
-      "source": "embedded",
+      "source": {
+        "source_uuid": "00000000-0000-4b11-8111-000000000001",
+        "display_name": "embedded",
+        "transport_kind": "embedded",
+        "fingerprint": "embedded:inventory",
+        "status": "active"
+      },
       "is_active": true
     }
   ]
@@ -725,22 +749,40 @@ List or inspect available skills with provenance information.
 
 ```json Inspect response
 {
-  "id": "task-workflow",
+  "key": {
+    "source_uuid": "00000000-0000-4b11-8111-000000000001",
+    "skill_name": "task-workflow"
+  },
   "name": "Task Workflow",
   "description": "How to use task tools",
   "scope": "builtin",
-  "source": "embedded",
-  "body": "# Task Workflow\n\nUse task_create to..."
+  "source": {
+    "source_uuid": "00000000-0000-4b11-8111-000000000001",
+    "display_name": "embedded",
+    "transport_kind": "embedded",
+    "fingerprint": "embedded:inventory",
+    "status": "active"
+  },
+  "body": "# Task Workflow\n\n..."
 }
 ```
 </CodeGroup>
 
 <ParamField body="action" type="string" required>
-  `"list"` to list all skills, `"inspect"` to inspect a specific skill.
+  `"list"` to list all skills, or `"inspect"` to load one skill's full body.
 </ParamField>
 
-<ParamField body="skill_id" type="string">
-  Skill ID to inspect (required when `action` is `"inspect"`).
+<ParamField body="skill_key" type="object">
+  Required for `inspect`. The typed skill identity with `source_uuid` and
+  `skill_name` fields.
 </ParamField>
 
-The list response includes both active and shadowed skills. Shadowed skills have `is_active: false` and a `shadowed_by` field indicating which source has precedence.
+<ParamField body="source" type="string">
+  Optional source UUID selector for `inspect`; omit it to load the canonical
+  source for `skill_key`.
+</ParamField>
+
+The list response includes both active and shadowed skills. Shadowed skills have
+`is_active: false` and a `shadowed_by` field indicating which source has
+precedence. Inspect canonicalizes `skill_key` through the identity registry
+before loading the body.

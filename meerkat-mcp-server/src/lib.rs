@@ -1255,7 +1255,7 @@ fn base_tools_list() -> Vec<Value> {
         }),
         json!({
             "name": "meerkat_skills",
-            "description": "List or inspect available skills. Use action 'list' to see all skills, or 'inspect' with a skill_id to see its full content.",
+            "description": "List or inspect available skills. Use action 'list' to see all skills, or 'inspect' with a typed skill_key and optional source UUID selector to see full content.",
             "inputSchema": meerkat_tools::schema_for::<MeerkatSkillsInput>()
         }),
         json!({

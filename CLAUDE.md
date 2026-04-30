@@ -226,7 +226,6 @@ The RPC server speaks JSON-RPC 2.0 over newline-delimited JSON (JSONL) on stdin/
 | `comms/send` | Push external event into session (comms feature) |
 | `comms/peers` | List discoverable peers (comms feature) |
 | `skills/list` | List skills with provenance |
-| `skills/inspect` | Inspect a skill's full content |
 | `mcp/add` | Stage live MCP server addition |
 | `mcp/remove` | Stage live MCP server removal |
 | `mcp/reload` | Reload one or all MCP servers |
