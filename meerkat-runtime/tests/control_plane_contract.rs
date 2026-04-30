@@ -327,7 +327,7 @@ async fn control_plane_contract_stop_runtime_executor_persists_stopped_state_wit
         RuntimeState::Stopped
     );
 
-    let runtime_id = LogicalRuntimeId::new(sid.to_string());
+    let runtime_id = LogicalRuntimeId::for_session(&sid);
     assert_eq!(
         store.load_runtime_state(&runtime_id).await.unwrap(),
         Some(RuntimeState::Stopped),

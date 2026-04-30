@@ -54,6 +54,10 @@ fn memory_blob_store() -> Arc<dyn meerkat_core::BlobStore> {
     Arc::new(meerkat_store::MemoryBlobStore::new())
 }
 
+fn runtime_id_for_session(session_id: &SessionId) -> LogicalRuntimeId {
+    MeerkatMachine::logical_runtime_id(session_id)
+}
+
 #[derive(Default)]
 struct RecordingMeerkatSignalSurface {
     log: tokio::sync::Mutex<
@@ -316,6 +320,33 @@ async fn authoritative_dsl_apply_rolls_back_state_when_effect_dispatch_fails() {
 }
 
 #[tokio::test]
+async fn control_plane_runtime_id_is_not_raw_session_uuid_alias() {
+    let machine = MeerkatMachine::ephemeral();
+    let session_id = SessionId::new();
+    machine.register_session(session_id.clone()).await;
+
+    let runtime_id = runtime_id_for_session(&session_id);
+    let raw_session_alias = LogicalRuntimeId::legacy_session_uuid_alias(&session_id);
+    assert_ne!(
+        runtime_id, raw_session_alias,
+        "runtime control-plane identity must not be the raw session UUID alias"
+    );
+
+    let state = crate::traits::RuntimeControlPlane::runtime_state(&machine, &runtime_id)
+        .await
+        .expect("canonical runtime id should resolve registered session");
+    assert_eq!(state, RuntimeState::Idle);
+
+    let err = crate::traits::RuntimeControlPlane::runtime_state(&machine, &raw_session_alias)
+        .await
+        .expect_err("raw session UUID alias must not resolve as a runtime id");
+    assert!(matches!(
+        err,
+        crate::traits::RuntimeControlPlaneError::NotFound(_)
+    ));
+}
+
+#[tokio::test]
 async fn destroy_keeps_committed_dsl_state_when_runtime_destroyed_signal_dispatch_fails() {
     let machine = MeerkatMachine::ephemeral();
     let session_id = SessionId::new();
@@ -325,7 +356,7 @@ async fn destroy_keeps_committed_dsl_state_when_runtime_destroyed_signal_dispatc
         .expect("prepare bindings before destroy");
     install_rejecting_meerkat_signal_dispatcher(&machine);
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let err = crate::traits::RuntimeControlPlane::destroy(&machine, &runtime_id)
         .await
         .expect_err("signal dispatch failure should surface");
@@ -351,7 +382,7 @@ async fn persistent_retire_keeps_committed_dsl_state_when_runtime_retired_signal
     machine.register_session(session_id.clone()).await;
     install_rejecting_meerkat_signal_dispatcher(&machine);
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let err = crate::traits::RuntimeControlPlane::retire(&machine, &runtime_id)
         .await
         .expect_err("signal dispatch failure should surface");
@@ -402,7 +433,7 @@ async fn prepare_bindings_dispatches_runtime_bound_after_shell_commit() {
     assert_eq!(log[0].1[0].0.as_str(), "agent_runtime_id");
     assert!(matches!(
         &log[0].1[0].1,
-        crate::composition::OwnedFieldValue::Str(value) if value == &session_id.to_string()
+        crate::composition::OwnedFieldValue::Str(value) if value == &runtime_id_for_session(&session_id).to_string()
     ));
 }
 
@@ -2198,7 +2229,7 @@ async fn meerkat_machine_spine_snapshot_preserves_completion_waiters_after_recyc
         input_id
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::recycle(&*adapter, &runtime_id)
         .await
         .expect("recycle should preserve queued work");
@@ -2286,7 +2317,7 @@ async fn meerkat_machine_spine_snapshot_recycle_reconciles_stale_completion_wait
         "stale waiter should be visible before recycle reconciliation"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::recycle(&*adapter, &runtime_id)
         .await
         .expect("recycle should reconcile waiters against active input truth");
@@ -2341,7 +2372,7 @@ async fn shared_ingress_authority_is_identical_after_register_recover_and_recycl
         "fresh registration should share one ingress authority between session and driver",
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     crate::traits::RuntimeControlPlane::recover(&*adapter, &runtime_id)
         .await
         .expect("recover should succeed");
@@ -2395,7 +2426,7 @@ async fn meerkat_machine_spine_snapshot_preserves_completion_waiters_after_recov
         input_id
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::recover(&*adapter, &runtime_id)
         .await
         .expect("recover should preserve queued work");
@@ -2558,7 +2589,7 @@ async fn meerkat_machine_spine_snapshot_recover_reconciles_stale_completion_wait
         "stale waiter should be visible before recover reconciliation"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::recover(&*adapter, &runtime_id)
         .await
         .expect("recover should reconcile waiters against active input truth");
@@ -2630,7 +2661,7 @@ async fn meerkat_machine_spine_snapshot_clears_completion_waiters_after_destroy(
         1
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::destroy(&*adapter, &runtime_id)
         .await
         .expect("destroy should terminate active completion waiters");
@@ -2675,7 +2706,7 @@ async fn persistent_destroy_synchronizes_driver_control_projection_shadow() {
 
     adapter.register_session(session_id.clone()).await;
 
-    let runtime_id = crate::identifiers::LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::destroy(&*adapter, &runtime_id)
         .await
         .expect("persistent destroy should succeed");
@@ -2854,7 +2885,7 @@ async fn persistent_destroy_durable_commit_observes_canonical_destroy_truth() {
     let session_id = SessionId::new();
     adapter.register_session(session_id.clone()).await;
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
     let destroy_task = tokio::spawn({
         let adapter = Arc::clone(&adapter);
         let runtime_id = runtime_id.clone();
@@ -2983,7 +3014,7 @@ async fn meerkat_machine_spine_snapshot_destroy_clears_steered_waiter_and_queue_
         "wait_all should track the active operation before destroy"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::destroy(&*adapter, &runtime_id)
         .await
         .expect("destroy should clear the steered completion waiter while preserving wait_all");
@@ -3160,7 +3191,7 @@ async fn meerkat_machine_spine_snapshot_clears_completion_waiters_after_destroy_
         "destroy has not yet attempted any executor control"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::destroy(&*adapter, &runtime_id)
         .await
         .expect("destroy should synchronously clear queued waiters even with a live loop");
@@ -4016,7 +4047,7 @@ async fn meerkat_machine_spine_snapshot_attached_steered_prompt_destroy_splits_c
     assert_eq!(apply_calls.load(Ordering::SeqCst), 1);
     assert_eq!(control_calls.load(Ordering::SeqCst), 1);
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     crate::traits::RuntimeControlPlane::destroy(&*adapter, &runtime_id)
         .await
         .expect("destroy should split attached steered completion and wait_all lifetimes");
@@ -5599,7 +5630,7 @@ async fn meerkat_machine_spine_snapshot_clears_completion_waiters_after_retire_w
         input_id
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::retire(&*adapter, &runtime_id)
         .await
         .expect("retire should clear queued waiters when no runtime loop can drain");
@@ -5709,7 +5740,7 @@ async fn meerkat_machine_spine_snapshot_preserves_completion_waiters_after_retir
         "queued progress input should remain pending until retire wakes the attached loop"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::retire(&*adapter, &runtime_id)
         .await
         .expect("retire should preserve queued work for the live runtime loop to drain");
@@ -5862,7 +5893,7 @@ async fn meerkat_machine_spine_snapshot_preserves_completion_waiters_after_recov
         "recover should not yet have attempted executor control"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::recover(&*adapter, &runtime_id)
         .await
         .expect(
@@ -6042,7 +6073,7 @@ async fn meerkat_machine_spine_snapshot_preserves_completion_waiters_after_recyc
         "recycle should not yet have attempted executor control"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::recycle(&*adapter, &runtime_id)
         .await
         .expect(
@@ -6336,7 +6367,7 @@ async fn meerkat_machine_spine_snapshot_preserves_wait_all_after_recover() {
         "wait_all should track the active operation before recover"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::recover(&*adapter, &runtime_id)
         .await
         .expect("recover should preserve the active wait_all carrier");
@@ -6471,7 +6502,7 @@ async fn meerkat_machine_spine_snapshot_recover_splits_completion_and_wait_all_l
         "wait_all should track the active operation before recover"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::recover(&*adapter, &runtime_id)
         .await
         .expect("recover should preserve both queued input and active wait_all");
@@ -6639,7 +6670,7 @@ async fn meerkat_machine_spine_snapshot_recover_preserves_steered_input_and_wait
         "wait_all should track the active operation before recover"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::recover(&*adapter, &runtime_id)
         .await
         .expect("recover should preserve steered input and active wait_all");
@@ -6803,7 +6834,7 @@ async fn meerkat_machine_spine_snapshot_recycle_preserves_steered_input_and_wait
         "wait_all should track the active operation before recycle"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::recycle(&*adapter, &runtime_id)
         .await
         .expect("recycle should preserve steered input and active wait_all");
@@ -6941,7 +6972,7 @@ async fn meerkat_machine_spine_snapshot_preserves_wait_all_after_recycle() {
         "wait_all should track the active operation before recycle"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::recycle(&*adapter, &runtime_id)
         .await
         .expect("recycle should preserve the active wait_all carrier");
@@ -7068,7 +7099,7 @@ async fn meerkat_machine_spine_snapshot_recycle_splits_completion_and_wait_all_l
         "wait_all should track the active operation before recycle"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::recycle(&*adapter, &runtime_id)
         .await
         .expect("recycle should preserve both queued input and active wait_all");
@@ -7279,7 +7310,7 @@ async fn meerkat_machine_spine_snapshot_preserves_wait_all_after_recover_with_ru
         "recover should not yet have attempted executor control"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::recover(&*adapter, &runtime_id)
         .await
         .expect("recover should preserve wait_all while replaying attached-loop work");
@@ -7556,7 +7587,7 @@ async fn meerkat_machine_spine_snapshot_recover_with_runtime_loop_splits_complet
         "recover should not yet have attempted executor control"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::recover(&*adapter, &runtime_id)
         .await
         .expect("recover should split completion and wait_all lifetimes on attached runtimes");
@@ -7826,7 +7857,7 @@ async fn meerkat_machine_spine_snapshot_preserves_wait_all_after_recycle_with_ru
         "recycle should not yet have attempted executor control"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::recycle(&*adapter, &runtime_id)
         .await
         .expect("recycle should preserve wait_all while requeueing attached-loop work");
@@ -8074,7 +8105,7 @@ async fn meerkat_machine_spine_snapshot_recycle_with_runtime_loop_splits_complet
         "recycle should not yet have attempted executor control"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::recycle(&*adapter, &runtime_id)
         .await
         .expect("recycle should split completion and wait_all lifetimes on attached runtimes");
@@ -9110,7 +9141,7 @@ async fn meerkat_machine_spine_snapshot_preserves_wait_all_after_destroy() {
         "wait_all should track the active operation before destroy"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::destroy(&*adapter, &runtime_id)
         .await
         .expect("destroy should succeed for an idle runtime");
@@ -9247,7 +9278,7 @@ async fn meerkat_machine_spine_snapshot_destroy_splits_completion_and_wait_all_l
         "wait_all should track the active operation before destroy"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::destroy(&*adapter, &runtime_id)
         .await
         .expect("destroy should split completion and wait_all lifetimes");
@@ -9440,7 +9471,7 @@ async fn meerkat_machine_spine_snapshot_preserves_wait_all_after_destroy_with_ru
         "destroy has not yet attempted any executor control"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::destroy(&*adapter, &runtime_id)
         .await
         .expect("destroy should preserve wait_all while abandoning queued attached-loop work");
@@ -9635,7 +9666,7 @@ async fn meerkat_machine_spine_snapshot_destroy_with_runtime_loop_splits_complet
         "wait_all should track the active operation before destroy"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::destroy(&*adapter, &runtime_id)
         .await
         .expect("destroy should split completion and wait_all lifetimes on attached runtimes");
@@ -10659,7 +10690,7 @@ async fn meerkat_machine_spine_snapshot_preserves_wait_all_after_retire() {
         "wait_all should track the active operation before retire"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::retire(&*adapter, &runtime_id)
         .await
         .expect("retire should preserve the active wait_all carrier");
@@ -10789,7 +10820,7 @@ async fn meerkat_machine_spine_snapshot_retire_splits_completion_and_wait_all_li
         "wait_all should track the active operation before retire"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::retire(&*adapter, &runtime_id)
         .await
         .expect("retire should split completion and wait_all lifetimes");
@@ -10947,7 +10978,7 @@ async fn meerkat_machine_spine_snapshot_retire_clears_steered_waiter_and_steer_q
         "wait_all should track the active operation before retire"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::retire(&*adapter, &runtime_id)
         .await
         .expect("retire should terminate the steered completion waiter while preserving wait_all");
@@ -11142,7 +11173,7 @@ async fn meerkat_machine_spine_snapshot_preserves_wait_all_after_retire_with_run
         "queued attached-loop work should remain pending until retire wakes the loop"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::retire(&*adapter, &runtime_id)
         .await
         .expect("retire should preserve wait_all while the live loop drains queued work");
@@ -11410,7 +11441,7 @@ async fn meerkat_machine_spine_snapshot_retire_with_runtime_loop_splits_completi
         "retire should not yet have attempted executor control"
     );
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let report = crate::traits::RuntimeControlPlane::retire(&*adapter, &runtime_id)
         .await
         .expect("retire should preserve queued work and wait_all while the live loop drains");
@@ -11628,7 +11659,7 @@ async fn register_session_rejects_destroyed_session() {
     adapter.register_session(session_id.clone()).await;
 
     // Transition to Destroyed via the control-plane destroy path.
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     crate::traits::RuntimeControlPlane::destroy(&*adapter, &runtime_id)
         .await
         .expect("destroy should succeed");
@@ -11684,7 +11715,7 @@ async fn interrupt_current_run_rejects_destroyed_session() {
 
     adapter.register_session(session_id.clone()).await;
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     crate::traits::RuntimeControlPlane::destroy(&*adapter, &runtime_id)
         .await
         .expect("destroy should succeed");
@@ -11706,7 +11737,7 @@ async fn cancel_after_boundary_rejects_destroyed_session() {
 
     adapter.register_session(session_id.clone()).await;
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     crate::traits::RuntimeControlPlane::destroy(&*adapter, &runtime_id)
         .await
         .expect("destroy should succeed");
@@ -11728,7 +11759,7 @@ async fn stop_runtime_executor_rejects_destroyed_session() {
 
     adapter.register_session(session_id.clone()).await;
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     crate::traits::RuntimeControlPlane::destroy(&*adapter, &runtime_id)
         .await
         .expect("destroy should succeed");
@@ -11774,7 +11805,7 @@ async fn set_peer_ingress_context_rejects_destroyed_session() {
 
     adapter.register_session(session_id.clone()).await;
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     crate::traits::RuntimeControlPlane::destroy(adapter.as_ref(), &runtime_id)
         .await
         .expect("destroy should succeed");
@@ -11806,7 +11837,7 @@ async fn notify_drain_exited_rejects_destroyed_session() {
 
     adapter.register_session(session_id.clone()).await;
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     crate::traits::RuntimeControlPlane::destroy(adapter.as_ref(), &runtime_id)
         .await
         .expect("destroy should succeed");
@@ -11847,7 +11878,7 @@ async fn ingest_rejects_retired_session() {
 
     adapter.register_session(session_id.clone()).await;
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     crate::traits::RuntimeControlPlane::retire(&*adapter, &runtime_id)
         .await
         .expect("retire should succeed");
@@ -11875,7 +11906,7 @@ async fn ingest_rejects_stopped_session() {
     adapter.register_session(session_id.clone()).await;
 
     // Stop the session by driving it through retire → stop.
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     adapter
         .stop_runtime_executor(
             &session_id,
@@ -11925,7 +11956,7 @@ async fn retire_rejects_initializing_session() {
         .await
         .expect("stop should succeed");
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     let err = crate::traits::RuntimeControlPlane::retire(&*adapter, &runtime_id)
         .await
         .expect_err("retire should reject a stopped session");
@@ -11951,7 +11982,7 @@ async fn accept_input_with_completion_rejects_retired_session() {
 
     adapter.register_session(session_id.clone()).await;
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     crate::traits::RuntimeControlPlane::retire(&*adapter, &runtime_id)
         .await
         .expect("retire should succeed");
@@ -11976,7 +12007,7 @@ async fn accept_input_with_completion_rejects_destroyed_session() {
 
     adapter.register_session(session_id.clone()).await;
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     crate::traits::RuntimeControlPlane::destroy(&*adapter, &runtime_id)
         .await
         .expect("destroy should succeed");
@@ -12039,7 +12070,7 @@ async fn legacy_run_prepare_rejects_retired_session() {
 
     adapter.register_session(session_id.clone()).await;
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     crate::traits::RuntimeControlPlane::retire(&*adapter, &runtime_id)
         .await
         .expect("retire should succeed");
@@ -12069,7 +12100,7 @@ async fn legacy_run_prepare_rejects_destroyed_session() {
 
     adapter.register_session(session_id.clone()).await;
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     crate::traits::RuntimeControlPlane::destroy(&*adapter, &runtime_id)
         .await
         .expect("destroy should succeed");
@@ -12446,7 +12477,7 @@ async fn spine_invariants_hold_after_destroy() {
         .await
         .expect("prompt should be accepted");
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     crate::traits::RuntimeControlPlane::destroy(&*adapter, &runtime_id)
         .await
         .expect("destroy should succeed");
@@ -12472,7 +12503,7 @@ async fn spine_invariants_hold_after_retire() {
         .await
         .expect("prompt should be accepted");
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     crate::traits::RuntimeControlPlane::retire(&*adapter, &runtime_id)
         .await
         .expect("retire should succeed");
@@ -12498,7 +12529,7 @@ async fn spine_invariants_hold_after_reset() {
         .await
         .expect("prompt should be accepted");
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     crate::traits::RuntimeControlPlane::reset(&*adapter, &runtime_id)
         .await
         .expect("reset should succeed");
@@ -12524,7 +12555,7 @@ async fn spine_invariants_hold_after_recycle() {
         .await
         .expect("prompt should be accepted");
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     crate::traits::RuntimeControlPlane::recycle(&*adapter, &runtime_id)
         .await
         .expect("recycle should succeed");
@@ -13097,7 +13128,7 @@ async fn publish_committed_visible_set_rejects_destroyed_session() {
     let session_id = SessionId::new();
     adapter.register_session(session_id.clone()).await;
 
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
     crate::traits::RuntimeControlPlane::destroy(&*adapter, &runtime_id)
         .await
         .expect("destroy should succeed");
@@ -16137,7 +16168,7 @@ async fn modeled_meerkat_accept_with_completion_idle_queue_signal_matches_runtim
 
     crate::traits::RuntimeControlPlane::destroy(
         adapter.as_ref(),
-        &LogicalRuntimeId::new(session_id.to_string()),
+        &runtime_id_for_session(&session_id),
     )
     .await
     .expect("idle queue test should destroy runtime cleanly");
@@ -16189,7 +16220,7 @@ async fn meerkat_reset_clears_silent_intent_overrides() {
         .set_session_silent_intents(&fixture.session_id, runtime_parity_silent_intents())
         .await;
 
-    let runtime_id = LogicalRuntimeId::new(fixture.session_id.to_string());
+    let runtime_id = runtime_id_for_session(&fixture.session_id);
     let result = fixture
         .adapter
         .execute_meerkat_machine_command(
@@ -16226,7 +16257,7 @@ async fn meerkat_destroy_clears_silent_intent_overrides() {
         .set_session_silent_intents(&fixture.session_id, runtime_parity_silent_intents())
         .await;
 
-    let runtime_id = LogicalRuntimeId::new(fixture.session_id.to_string());
+    let runtime_id = runtime_id_for_session(&fixture.session_id);
     let result = fixture
         .adapter
         .execute_meerkat_machine_command(
@@ -16559,7 +16590,7 @@ async fn wait_for_runtime_parity_phase(
 async fn build_runtime_parity_fixture(phase: RuntimeParityPhase) -> RuntimeParityFixture {
     let adapter = Arc::new(MeerkatMachine::ephemeral());
     let session_id = SessionId::new();
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = runtime_id_for_session(&session_id);
 
     match phase {
         RuntimeParityPhase::Idle => {

@@ -444,7 +444,7 @@ mod tests {
 
         assert_eq!(
             store
-                .load_session_snapshot(&LogicalRuntimeId::new(session_id.to_string()))
+                .load_session_snapshot(&LogicalRuntimeId::legacy_session_uuid_alias(&session_id))
                 .await
                 .unwrap(),
             Some(snapshot)
