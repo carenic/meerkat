@@ -493,6 +493,15 @@ async fn apply_runtime_turn(
             .await;
     }
 
+    let terminal_context_appends = if primitive.is_peer_response_terminal_context_and_run() {
+        let RunPrimitive::StagedInput(staged) = primitive else {
+            unreachable!("terminal peer-response apply helper only matches staged inputs");
+        };
+        pending_system_context_appends(&staged.context_appends)
+    } else {
+        Vec::new()
+    };
+
     let prompt = primitive.extract_content_input();
     let boundary = primitive.apply_boundary();
     let contributing_input_ids = primitive.contributing_input_ids().to_vec();
@@ -518,6 +527,36 @@ async fn apply_runtime_turn(
         turn_metadata: primitive.turn_metadata().cloned(),
     };
 
+    if !terminal_context_appends.is_empty() {
+        match context
+            .service
+            .apply_runtime_system_context_for_turn(session_id, terminal_context_appends.clone())
+            .await
+        {
+            Ok(()) => {}
+            Err(SessionError::NotFound { .. }) => {
+                Box::pin(context.rematerialize_persisted_session(session_id, state.clone()))
+                    .await
+                    .map(|_| ())?;
+                context
+                    .service
+                    .apply_runtime_system_context_for_turn(session_id, terminal_context_appends)
+                    .await?;
+                return context
+                    .service
+                    .apply_runtime_turn_outcome(
+                        session_id,
+                        run_id,
+                        turn_request,
+                        boundary,
+                        contributing_input_ids,
+                    )
+                    .await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+
     match context
         .service
         .apply_runtime_turn(
@@ -534,6 +573,12 @@ async fn apply_runtime_turn(
             Box::pin(context.rematerialize_persisted_session(session_id, state.clone()))
                 .await
                 .map(|_| ())?;
+            if !terminal_context_appends.is_empty() {
+                context
+                    .service
+                    .apply_runtime_system_context_for_turn(session_id, terminal_context_appends)
+                    .await?;
+            }
             context
                 .service
                 .apply_runtime_turn_outcome(

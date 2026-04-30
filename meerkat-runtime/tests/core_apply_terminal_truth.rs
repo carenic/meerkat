@@ -78,11 +78,16 @@ fn terminal_context_and_run_adapters_use_canonical_primitive_intent() {
         fs::read_to_string(root.join("meerkat-mcp-server/src/runtime_ingress.rs"))
             .expect("read MCP runtime ingress source");
 
-    let runtime_backed_context_shortcut =
-        extract_braced_item(&runtime_backed, "fn pending_system_context_appends");
+    let runtime_backed_apply = extract_braced_item(&runtime_backed, "async fn apply");
     assert!(
-        runtime_backed_context_shortcut.contains("primitive.is_context_only_apply_without_turn()"),
+        runtime_backed_apply.contains("primitive.is_context_only_apply_without_turn()"),
         "runtime-backed context shortcut must use the canonical primitive intent helper"
+    );
+
+    assert!(
+        runtime_backed_apply.contains("primitive.is_peer_response_terminal_context_and_run()")
+            && runtime_backed_apply.contains("apply_runtime_system_context_for_turn"),
+        "runtime-backed terminal context-and-run apply must append context before the reaction turn"
     );
 
     let mcp_runtime_apply =
@@ -90,5 +95,10 @@ fn terminal_context_and_run_adapters_use_canonical_primitive_intent() {
     assert!(
         mcp_runtime_apply.contains("primitive.is_context_only_apply_without_turn()"),
         "MCP runtime ingress must not re-derive context-only terminal behavior from append shape"
+    );
+    assert!(
+        mcp_runtime_apply.contains("primitive.is_peer_response_terminal_context_and_run()")
+            && mcp_runtime_apply.contains("apply_runtime_system_context_for_turn"),
+        "MCP runtime ingress must append terminal context-and-run context before the reaction turn"
     );
 }

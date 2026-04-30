@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use meerkat_core::lifecycle::core_executor::{CoreApplyOutput, CoreExecutor, CoreExecutorError};
 use meerkat_core::lifecycle::run_control::RunControlCommand;
-use meerkat_core::lifecycle::run_primitive::{CoreRenderable, RunPrimitive};
+use meerkat_core::lifecycle::run_primitive::{
+    ConversationContextAppend, CoreRenderable, RunPrimitive,
+};
 use meerkat_core::service::SessionService;
 use meerkat_core::types::HandlingMode;
 use meerkat_runtime::meerkat_machine::RuntimeBindingsError;
@@ -146,39 +148,28 @@ impl PersistentRuntimeExecutor {
 }
 
 fn pending_system_context_appends(
-    primitive: &RunPrimitive,
-) -> Option<Vec<meerkat_core::PendingSystemContextAppend>> {
-    if !primitive.is_context_only_apply_without_turn() {
-        return None;
-    }
-
-    let RunPrimitive::StagedInput(staged) = primitive else {
-        return None;
-    };
-
-    Some(
-        staged
-            .context_appends
-            .iter()
-            .map(|append| meerkat_core::PendingSystemContextAppend {
-                text: match &append.content {
-                    CoreRenderable::Text { text } => text.clone(),
-                    CoreRenderable::Blocks { blocks } => meerkat_core::types::text_content(blocks),
-                    CoreRenderable::Json { value } => {
-                        serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
-                    }
-                    CoreRenderable::Reference { uri, label } => match label {
-                        Some(label) => format!("{label}: {uri}"),
-                        None => uri.clone(),
-                    },
-                    _ => String::new(),
+    appends: &[ConversationContextAppend],
+) -> Vec<meerkat_core::PendingSystemContextAppend> {
+    appends
+        .iter()
+        .map(|append| meerkat_core::PendingSystemContextAppend {
+            text: match &append.content {
+                CoreRenderable::Text { text } => text.clone(),
+                CoreRenderable::Blocks { blocks } => meerkat_core::types::text_content(blocks),
+                CoreRenderable::Json { value } => {
+                    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+                }
+                CoreRenderable::Reference { uri, label } => match label {
+                    Some(label) => format!("{label}: {uri}"),
+                    None => uri.clone(),
                 },
-                source: Some(append.key.clone()),
-                idempotency_key: Some(append.key.clone()),
-                accepted_at: meerkat_core::time_compat::SystemTime::now(),
-            })
-            .collect(),
-    )
+                _ => String::new(),
+            },
+            source: Some(append.key.clone()),
+            idempotency_key: Some(append.key.clone()),
+            accepted_at: meerkat_core::time_compat::SystemTime::now(),
+        })
+        .collect()
 }
 
 fn start_turn_request_from_primitive(
@@ -207,20 +198,38 @@ impl CoreExecutor for PersistentRuntimeExecutor {
         run_id: meerkat_core::lifecycle::RunId,
         primitive: RunPrimitive,
     ) -> Result<CoreApplyOutput, CoreExecutorError> {
-        if let Some(appends) = pending_system_context_appends(&primitive) {
+        if primitive.is_context_only_apply_without_turn() {
+            let RunPrimitive::StagedInput(staged) = &primitive else {
+                unreachable!("context-only apply without turn only matches staged primitives");
+            };
             return self
                 .service
                 .apply_runtime_context_appends_with_boundary(
                     &self.session_id,
                     run_id,
-                    appends,
-                    primitive.apply_boundary(),
-                    primitive.contributing_input_ids().to_vec(),
+                    pending_system_context_appends(&staged.context_appends),
+                    staged.boundary,
+                    staged.contributing_input_ids.clone(),
                 )
                 .await
                 .map_err(|error| CoreExecutorError::ApplyFailed {
                     reason: error.to_string(),
                 });
+        }
+
+        if primitive.is_peer_response_terminal_context_and_run() {
+            let RunPrimitive::StagedInput(staged) = &primitive else {
+                unreachable!("terminal peer-response apply intent only matches staged primitives");
+            };
+            self.service
+                .apply_runtime_system_context_for_turn(
+                    &self.session_id,
+                    pending_system_context_appends(&staged.context_appends),
+                )
+                .await
+                .map_err(|error| CoreExecutorError::ApplyFailed {
+                    reason: error.to_string(),
+                })?;
         }
 
         let boundary = primitive.apply_boundary();
@@ -956,6 +965,27 @@ mod tests {
             }
             other => panic!("expected terminal peer response run result, got {other:?}"),
         }
+
+        let exported = service
+            .export_live_session(&result.session_id)
+            .await
+            .expect("export live session after terminal peer response");
+        let system_context = exported
+            .messages()
+            .iter()
+            .find_map(|message| match message {
+                meerkat_core::types::Message::System(system) => Some(system.content.as_str()),
+                _ => None,
+            })
+            .unwrap_or("");
+        assert!(
+            system_context.contains("peer_response_terminal:analyst-rt:req-456"),
+            "terminal peer response source must be applied before reaction turn: {system_context}"
+        );
+        assert!(
+            system_context.contains("[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL] done"),
+            "terminal peer response context must be applied before reaction turn: {system_context}"
+        );
 
         service
             .discard_live_session(&result.session_id)
