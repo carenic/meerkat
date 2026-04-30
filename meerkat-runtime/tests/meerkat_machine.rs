@@ -523,7 +523,7 @@ async fn cold_reregister_recovers_legacy_session_uuid_runtime_state_alias() {
 }
 
 #[tokio::test]
-async fn cold_reregister_prefers_terminal_legacy_runtime_state_over_canonical_idle_alias() {
+async fn cold_reregister_prefers_canonical_runtime_state_over_stale_legacy_alias() {
     let store = Arc::new(meerkat_runtime::store::InMemoryRuntimeStore::new());
     let sid = SessionId::new();
     let canonical_runtime_id = LogicalRuntimeId::for_session(&sid);
@@ -533,7 +533,7 @@ async fn cold_reregister_prefers_terminal_legacy_runtime_state_over_canonical_id
         .await
         .expect("seed canonical runtime state alias");
     store
-        .atomic_lifecycle_commit(&legacy_runtime_alias, RuntimeState::Destroyed, &[])
+        .atomic_lifecycle_commit(&legacy_runtime_alias, RuntimeState::Retired, &[])
         .await
         .expect("seed legacy runtime state alias");
 
@@ -544,8 +544,8 @@ async fn cold_reregister_prefers_terminal_legacy_runtime_state_over_canonical_id
     adapter.register_session(sid.clone()).await;
     assert_eq!(
         adapter.runtime_state(&sid).await.unwrap(),
-        RuntimeState::Destroyed,
-        "cold re-registration must not hide terminal legacy runtime state when both aliases exist",
+        RuntimeState::Idle,
+        "cold re-registration must not let stale legacy runtime state override canonical state when both aliases exist",
     );
 }
 

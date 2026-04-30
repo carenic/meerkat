@@ -13681,7 +13681,7 @@ capabilities = ["definitely_missing_capability"]
             .expect("runtime-backed CLI service should create deferred session");
 
         assert_eq!(created.session_id, session_id);
-        let runtime_id = meerkat_runtime::LogicalRuntimeId::new(session_id.to_string());
+        let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
         assert!(
             runtime_store
                 .load_session_snapshot(&runtime_id)
