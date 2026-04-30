@@ -182,6 +182,45 @@ fn rust_type_atom_string_lowers_to_string() {
 }
 
 #[test]
+fn rust_type_atom_string_enum_lowers_to_closed_enum() {
+    let schema = with_atom(
+        schema_with_single_named_type("status", "AtomStatus"),
+        RustTypeAtom::StringEnum {
+            variants: vec![
+                EnumVariantId::parse("Pending").expect("variant slug"),
+                EnumVariantId::parse("Running").expect("variant slug"),
+                EnumVariantId::parse("Completed").expect("variant slug"),
+            ],
+        },
+    );
+    schema.validate().expect("schema validates");
+    let rendered = render_machine_kernel_module(&schema);
+
+    assert!(
+        rendered.contains("pub enum AtomStatus"),
+        "string enum named type must render as a closed enum:\n{rendered}"
+    );
+    for variant in ["Pending", "Running", "Completed"] {
+        assert!(
+            rendered.contains(&format!("    {variant},")),
+            "string enum named type must include `{variant}`:\n{rendered}"
+        );
+    }
+    assert!(
+        rendered.contains("impl std::convert::TryFrom<&str> for AtomStatus"),
+        "string enum named type must expose checked string parsing:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("pub struct AtomStatus(pub String);"),
+        "string enum named type must not render as an arbitrary string newtype:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("impl From<&str> for AtomStatus"),
+        "string enum named type must not expose unchecked string conversion:\n{rendered}"
+    );
+}
+
+#[test]
 fn rust_type_atom_type_path_lowers_verbatim_not_to_string() {
     let schema = with_atom(
         schema_with_single_named_type("custom", "AtomTypePath"),

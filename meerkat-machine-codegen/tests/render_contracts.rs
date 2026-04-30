@@ -229,6 +229,41 @@ fn typed_kernel_module_contract_rejects_legacy_kernel_surface() {
 }
 
 #[test]
+fn generated_meerkat_operation_status_is_closed_enum() {
+    let rendered = render_machine_kernel_module(&meerkat_machine());
+
+    assert!(
+        rendered.contains("pub enum OperationStatus"),
+        "OperationStatus must be generated as a closed enum:\n{rendered}"
+    );
+    for variant in [
+        "Absent",
+        "Provisioning",
+        "Running",
+        "Retiring",
+        "Completed",
+        "Failed",
+        "Aborted",
+        "Cancelled",
+        "Retired",
+        "Terminated",
+    ] {
+        assert!(
+            rendered.contains(&format!("    {variant},")),
+            "OperationStatus must include variant `{variant}`:\n{rendered}"
+        );
+    }
+    assert!(
+        !rendered.contains("pub struct OperationStatus(pub String);"),
+        "OperationStatus must not accept arbitrary strings:\n{rendered}"
+    );
+    assert!(
+        !rendered.contains("impl From<&str> for OperationStatus"),
+        "OperationStatus must not expose unchecked string construction:\n{rendered}"
+    );
+}
+
+#[test]
 fn generated_kernel_inventory_contract_lists_all_typed_machine_modules() {
     let schemas = canonical_machine_schemas();
     let rendered = render_generated_kernel_mod(&schemas);

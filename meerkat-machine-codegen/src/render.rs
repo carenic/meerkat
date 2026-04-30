@@ -1387,6 +1387,7 @@ fn render_rust_type_atom(atom: &meerkat_machine_schema::RustTypeAtom) -> String 
         RustTypeAtom::U64 => "u64".to_string(),
         RustTypeAtom::Bool => "bool".to_string(),
         RustTypeAtom::String => "String".to_string(),
+        RustTypeAtom::StringEnum { .. } => "String".to_string(),
         RustTypeAtom::TypePath(path) => path
             .strip_prefix("crate::catalog::")
             .map(|suffix| format!("meerkat_machine_schema::catalog::{suffix}"))
@@ -1431,6 +1432,75 @@ fn render_named_type_definition(
             pushln!(
                 out,
                 "    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {{ f.write_str(&self.0) }}"
+            );
+            pushln!(out, "}}");
+        }
+        RustTypeAtom::StringEnum { variants } => {
+            pushln!(out, "#[allow(non_camel_case_types)]");
+            pushln!(
+                out,
+                "#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize)]"
+            );
+            pushln!(out, "pub enum {} {{", rust_name);
+            for (index, variant) in variants.iter().enumerate() {
+                if index == 0 {
+                    pushln!(out, "    #[default]");
+                }
+                pushln!(out, "    {},", rust_ident(variant.as_str()));
+            }
+            pushln!(out, "}}");
+            pushln!(out, "impl {} {{", rust_name);
+            pushln!(out, "    pub fn as_str(&self) -> &'static str {{");
+            pushln!(out, "        match self {{");
+            for variant in variants {
+                pushln!(
+                    out,
+                    "            Self::{} => \"{}\",",
+                    rust_ident(variant.as_str()),
+                    variant.as_str()
+                );
+            }
+            pushln!(out, "        }}");
+            pushln!(out, "    }}");
+            pushln!(out, "}}");
+            pushln!(out, "impl std::convert::TryFrom<&str> for {} {{", rust_name);
+            pushln!(out, "    type Error = String;");
+            pushln!(
+                out,
+                "    fn try_from(value: &str) -> Result<Self, Self::Error> {{"
+            );
+            pushln!(out, "        match value {{");
+            for variant in variants {
+                pushln!(
+                    out,
+                    "            \"{}\" => Ok(Self::{}),",
+                    variant.as_str(),
+                    rust_ident(variant.as_str())
+                );
+            }
+            pushln!(
+                out,
+                "            other => Err(format!(\"invalid {} value `{{other}}`\")),",
+                rust_name
+            );
+            pushln!(out, "        }}");
+            pushln!(out, "    }}");
+            pushln!(out, "}}");
+            pushln!(
+                out,
+                "impl std::convert::TryFrom<String> for {} {{",
+                rust_name
+            );
+            pushln!(out, "    type Error = String;");
+            pushln!(
+                out,
+                "    fn try_from(value: String) -> Result<Self, Self::Error> {{ Self::try_from(value.as_str()) }}"
+            );
+            pushln!(out, "}}");
+            pushln!(out, "impl std::fmt::Display for {} {{", rust_name);
+            pushln!(
+                out,
+                "    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {{ f.write_str(self.as_str()) }}"
             );
             pushln!(out, "}}");
         }

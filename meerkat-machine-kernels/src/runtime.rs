@@ -1381,8 +1381,10 @@ fn value_matches_type(schema: &MachineSchema, value: &KernelValue, ty: &TypeRef)
         (KernelValue::Named { type_name, value }, TypeRef::Named(name)) if type_name == name => {
             named_type_inner_matches(schema, name, value.as_ref())
         }
-        (KernelValue::NamedVariant { enum_name, .. }, TypeRef::Enum(name)) if enum_name == name => {
-            true
+        (KernelValue::NamedVariant { enum_name, variant }, TypeRef::Enum(name))
+            if enum_name == name =>
+        {
+            enum_variant_matches(schema, name, variant)
         }
         (KernelValue::None, TypeRef::Option(_)) => true,
         (inner, TypeRef::Option(inner_ty)) => {
@@ -1423,6 +1425,10 @@ fn default_value_for_named_type(schema: &MachineSchema, name: &NamedTypeId) -> K
             | meerkat_machine_schema::RustTypeAtom::TypePath(_),
         )
         | None => KernelValue::String(String::new()),
+        Some(meerkat_machine_schema::RustTypeAtom::StringEnum { variants }) => variants
+            .first()
+            .map(|variant| KernelValue::String(variant.as_str().to_owned()))
+            .unwrap_or_else(|| KernelValue::String(String::new())),
     }
 }
 
@@ -1448,6 +1454,9 @@ fn named_type_inner_matches(
             | meerkat_machine_schema::RustTypeAtom::TypePath(_),
         )
         | None => matches!(value, KernelValue::String(_)),
+        Some(meerkat_machine_schema::RustTypeAtom::StringEnum { variants }) => {
+            matches!(value, KernelValue::String(value) if variants.iter().any(|variant| variant.as_str() == value))
+        }
     }
 }
 
@@ -1456,6 +1465,22 @@ fn named_type_atom<'a>(
     name: &NamedTypeId,
 ) -> Option<&'a meerkat_machine_schema::RustTypeAtom> {
     schema.named_type_binding(name).map(|binding| &binding.rust)
+}
+
+fn enum_variant_matches(
+    schema: &MachineSchema,
+    name: &EnumTypeId,
+    variant: &EnumVariantId,
+) -> bool {
+    let Ok(named_type_name) = NamedTypeId::parse(name.as_str()) else {
+        return true;
+    };
+    match named_type_atom(schema, &named_type_name) {
+        Some(meerkat_machine_schema::RustTypeAtom::StringEnum { variants }) => {
+            variants.iter().any(|allowed| allowed == variant)
+        }
+        _ => true,
+    }
 }
 
 #[cfg(test)]
@@ -1473,7 +1498,7 @@ mod tests {
 
     use super::{
         GeneratedMachineKernel, KernelInput, KernelSignal, KernelValue, TransitionRefusal,
-        default_value_for_type,
+        default_value_for_type, value_matches_type,
     };
 
     fn input_id(slug: &str) -> InputVariantId {
@@ -1567,6 +1592,45 @@ mod tests {
                 if type_name == named_type_id("FenceToken")
                     && matches!(value.as_ref(), KernelValue::U64(0))
         ));
+    }
+
+    #[allow(clippy::expect_used)]
+    #[test]
+    fn operation_status_rejects_unknown_kernel_values() {
+        let schema = meerkat_machine();
+
+        assert!(value_matches_type(
+            &schema,
+            &KernelValue::NamedVariant {
+                enum_name: enum_type_id("OperationStatus"),
+                variant: enum_variant_id("Running"),
+            },
+            &meerkat_machine_schema::TypeRef::Enum(enum_type_id("OperationStatus")),
+        ));
+        assert!(
+            !value_matches_type(
+                &schema,
+                &KernelValue::NamedVariant {
+                    enum_name: enum_type_id("OperationStatus"),
+                    variant: enum_variant_id("Launched"),
+                },
+                &meerkat_machine_schema::TypeRef::Enum(enum_type_id("OperationStatus")),
+            ),
+            "unknown OperationStatus enum variants must not enter kernel state"
+        );
+        assert!(value_matches_type(
+            &schema,
+            &named_string("OperationStatus", "Running"),
+            &meerkat_machine_schema::TypeRef::Named(named_type_id("OperationStatus")),
+        ));
+        assert!(
+            !value_matches_type(
+                &schema,
+                &named_string("OperationStatus", "Launched"),
+                &meerkat_machine_schema::TypeRef::Named(named_type_id("OperationStatus")),
+            ),
+            "unknown OperationStatus string values must not enter kernel state"
+        );
     }
 
     #[allow(clippy::expect_used)]
