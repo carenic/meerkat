@@ -1022,11 +1022,25 @@ impl std::fmt::Display for LeaseKey {
 /// Observable snapshot of an auth lease's DSL state for a given [`LeaseKey`].
 ///
 /// Returned by [`AuthLeaseHandle::snapshot`]. If the binding is not tracked
-/// at all, `phase` is `None` and `expires_at` is `None`.
+/// at all, `phase` is `None` and `expires_at` is `None`. `generation`
+/// advances whenever the lease lifecycle accepts a transition, so consumers
+/// can distinguish a stale projection from a freshly reacquired lease even
+/// when the expiry timestamp is unchanged.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AuthLeaseSnapshot {
     pub phase: Option<AuthLeasePhase>,
     pub expires_at: Option<u64>,
+    pub generation: u64,
+}
+
+/// Result of an accepted auth lease lifecycle transition.
+///
+/// `generation` is the projection version assigned while the transition is
+/// accepted, so consumers can bind derived material to the exact lease state
+/// that published it without taking a later snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthLeaseTransition {
+    pub generation: u64,
 }
 
 /// Window (in seconds) before `expires_at` at which a `valid` lease is
@@ -1047,11 +1061,12 @@ pub trait AuthLeaseHandle: Send + Sync {
     /// Fire `AcquireAuthLease { lease_key, expires_at }` — unconditional.
     ///
     /// Moves the binding into `auth_valid_leases` and records its expiry.
+    /// Returns the generation assigned by the accepted transition.
     fn acquire_lease(
         &self,
         lease_key: &LeaseKey,
         expires_at: u64,
-    ) -> Result<(), DslTransitionError>;
+    ) -> Result<AuthLeaseTransition, DslTransitionError>;
 
     /// Fire `MarkAuthExpiring { lease_key }` — only legal from `valid`.
     fn mark_expiring(&self, lease_key: &LeaseKey) -> Result<(), DslTransitionError>;
@@ -1066,13 +1081,14 @@ pub trait AuthLeaseHandle: Send + Sync {
     fn begin_refresh(&self, lease_key: &LeaseKey) -> Result<(), DslTransitionError>;
 
     /// Fire `CompleteAuthRefresh { lease_key, new_expires_at, now }` — only
-    /// legal from `refreshing`.
+    /// legal from `refreshing`. Returns the generation assigned by the accepted
+    /// transition.
     fn complete_refresh(
         &self,
         lease_key: &LeaseKey,
         new_expires_at: u64,
         now: u64,
-    ) -> Result<(), DslTransitionError>;
+    ) -> Result<AuthLeaseTransition, DslTransitionError>;
 
     /// Fire `AuthRefreshFailed { lease_key, permanent }` — only legal from
     /// `refreshing`. `permanent=true` routes to `reauth_required` and emits a
