@@ -20232,8 +20232,8 @@ async fn test_peer_response_reaches_requester_in_runtime_backed_real_comms() {
         "terminal peer response reaction should be system-triggered, not a new user prompt"
     );
 
-    let duplicate_peer_id = meerkat_core::comms::PeerId::parse(&responder_route_identity)
-        .expect("responder peer id");
+    let duplicate_peer_id =
+        meerkat_core::comms::PeerId::parse(&responder_route_identity).expect("responder peer id");
     let duplicate_display_name =
         meerkat_core::comms::PeerName::new(responder_display_identity.clone())
             .expect("responder display name");

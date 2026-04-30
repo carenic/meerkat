@@ -2166,14 +2166,19 @@ async fn post_peer_response_terminal(
 
     let RestPeerResponseTerminalBody {
         peer_id,
-        display_name: _display_name,
+        display_name,
         request_id,
         status,
         result,
     } = body;
 
-    let input =
-        meerkat_runtime::peer_response_terminal_input(peer_id, display_name, request_id, status, result);
+    let input = meerkat_runtime::peer_response_terminal_input(
+        peer_id,
+        display_name,
+        request_id,
+        status,
+        result,
+    );
 
     admit_runtime_input_via_webhook(&state, &session_id, input, WebhookAdmissionMode::Wakeful).await
 }
