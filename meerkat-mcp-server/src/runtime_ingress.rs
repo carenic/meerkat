@@ -478,15 +478,10 @@ async fn apply_runtime_turn(
     run_id: meerkat_core::lifecycle::RunId,
     primitive: &RunPrimitive,
 ) -> Result<CoreApplyOutput, SessionError> {
-    // Context-only staged primitive — no conversation appends, just context
-    // (e.g. peer_response_terminal). The runtime boundary for these is
-    // Steer-derived (RunCheckpoint), so the stricter `is_context_only_
-    // immediate` gate (boundary == Immediate) doesn't match. Relaxing to
-    // "no appends + has context_appends" is the correct trigger.
-    if let RunPrimitive::StagedInput(staged) = primitive
-        && staged.appends.is_empty()
-        && !staged.context_appends.is_empty()
-    {
+    if primitive.is_context_only_apply_without_turn() {
+        let RunPrimitive::StagedInput(staged) = primitive else {
+            unreachable!("context-only apply helper only matches staged inputs");
+        };
         return context
             .service
             .apply_runtime_context_appends(

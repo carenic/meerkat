@@ -68,3 +68,27 @@ fn core_apply_terminal_truth_has_one_authority() {
         "runtime completion resolution must not keep a separate run_result branch"
     );
 }
+
+#[test]
+fn terminal_context_and_run_adapters_use_canonical_primitive_intent() {
+    let root = workspace_root();
+    let runtime_backed = fs::read_to_string(root.join("meerkat/src/surface/runtime_backed.rs"))
+        .expect("read runtime-backed surface source");
+    let mcp_runtime_ingress =
+        fs::read_to_string(root.join("meerkat-mcp-server/src/runtime_ingress.rs"))
+            .expect("read MCP runtime ingress source");
+
+    let runtime_backed_context_shortcut =
+        extract_braced_item(&runtime_backed, "fn pending_system_context_appends");
+    assert!(
+        runtime_backed_context_shortcut.contains("primitive.is_context_only_apply_without_turn()"),
+        "runtime-backed context shortcut must use the canonical primitive intent helper"
+    );
+
+    let mcp_runtime_apply =
+        extract_braced_item(&mcp_runtime_ingress, "async fn apply_runtime_turn");
+    assert!(
+        mcp_runtime_apply.contains("primitive.is_context_only_apply_without_turn()"),
+        "MCP runtime ingress must not re-derive context-only terminal behavior from append shape"
+    );
+}

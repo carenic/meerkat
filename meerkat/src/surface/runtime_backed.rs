@@ -148,12 +148,13 @@ impl PersistentRuntimeExecutor {
 fn pending_system_context_appends(
     primitive: &RunPrimitive,
 ) -> Option<Vec<meerkat_core::PendingSystemContextAppend>> {
+    if !primitive.is_context_only_apply_without_turn() {
+        return None;
+    }
+
     let RunPrimitive::StagedInput(staged) = primitive else {
         return None;
     };
-    if !staged.appends.is_empty() || staged.context_appends.is_empty() {
-        return None;
-    }
 
     Some(
         staged
@@ -883,6 +884,77 @@ mod tests {
                 assert_eq!(usage, meerkat_core::types::Usage::default());
             }
             other => panic!("expected run_completed, got {other:?}"),
+        }
+
+        service
+            .discard_live_session(&result.session_id)
+            .await
+            .expect("discard live session");
+        adapter.unregister_session(&result.session_id).await;
+    }
+
+    #[tokio::test]
+    async fn persistent_runtime_executor_runs_terminal_peer_response_context_and_run() {
+        use meerkat_core::lifecycle::InputId;
+        use meerkat_core::lifecycle::RunId;
+        use meerkat_core::lifecycle::core_executor::CoreApplyTerminal;
+        use meerkat_core::lifecycle::run_primitive::{
+            ConversationContextAppend, PeerResponseTerminalApplyIntent, RuntimeExecutionKind,
+            RuntimeTurnMetadata, StagedRunInput,
+        };
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (service, adapter) = build_test_service(&temp).await;
+        let result = Box::pin(materialize_session(
+            &service,
+            &adapter,
+            Session::new(),
+            make_request(SessionBuildOptions::default()),
+            {
+                let service = Arc::clone(&service);
+                let adapter = Arc::clone(&adapter);
+                move |session_id| default_persistent_executor(service, adapter, session_id)
+            },
+        ))
+        .await
+        .expect("materialize session");
+
+        let mut executor = PersistentRuntimeExecutor::new(
+            Arc::clone(&service),
+            Arc::clone(&adapter),
+            result.session_id.clone(),
+        );
+        let output = executor
+            .apply(
+                RunId::new(),
+                RunPrimitive::StagedInput(StagedRunInput {
+                    boundary: meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunStart,
+                    appends: Vec::new(),
+                    context_appends: vec![ConversationContextAppend {
+                        key: "peer_response_terminal:analyst-rt:req-456".to_string(),
+                        content: CoreRenderable::Text {
+                            text: "[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL] done".to_string(),
+                        },
+                    }],
+                    contributing_input_ids: vec![InputId::new()],
+                    turn_metadata: Some(RuntimeTurnMetadata {
+                        execution_kind: Some(RuntimeExecutionKind::ContentTurn),
+                        peer_response_terminal_apply_intent: Some(
+                            PeerResponseTerminalApplyIntent::AppendContextAndRun,
+                        ),
+                        ..Default::default()
+                    }),
+                }),
+            )
+            .await
+            .expect("terminal peer response should run requester reaction turn");
+
+        match output.terminal {
+            Some(CoreApplyTerminal::RunResult(run_result)) => {
+                assert_eq!(run_result.text, "ok");
+                assert_eq!(run_result.session_id, result.session_id);
+            }
+            other => panic!("expected terminal peer response run result, got {other:?}"),
         }
 
         service
