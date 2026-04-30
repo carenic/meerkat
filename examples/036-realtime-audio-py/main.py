@@ -465,68 +465,72 @@ async def realtime_receiver(
     stop_event: asyncio.Event,
     text_probe_signals: TextProbeSignals | None = None,
 ) -> None:
-    while not stop_event.is_set():
-        frame = await connection.recv()
-        if frame is None:
-            printer.status("realtime websocket closed")
-            if text_probe_signals is not None:
-                text_probe_signals.channel_closed.set()
-            stop_event.set()
-            break
-        frame_type = frame.get("type")
-        if frame_type == "channel.closed":
-            printer.status(f"channel closed: {frame.get('reason', 'done')}")
-            if text_probe_signals is not None:
-                text_probe_signals.channel_closed.set()
-            stop_event.set()
-            break
-        if frame_type == "channel.error":
-            printer.status(f"channel error {frame.get('code')}: {frame.get('message')}")
-            continue
-        if frame_type != "channel.event":
-            continue
+    try:
+        while not stop_event.is_set():
+            frame = await connection.recv()
+            if frame is None:
+                printer.status("realtime websocket closed")
+                if text_probe_signals is not None:
+                    text_probe_signals.channel_closed.set()
+                stop_event.set()
+                break
+            frame_type = frame.get("type")
+            if frame_type == "channel.closed":
+                printer.status(f"channel closed: {frame.get('reason', 'done')}")
+                if text_probe_signals is not None:
+                    text_probe_signals.channel_closed.set()
+                stop_event.set()
+                break
+            if frame_type == "channel.error":
+                code = frame.get("code", "unknown")
+                message = frame.get("message", "realtime channel error")
+                printer.status(f"channel error {code}: {message}")
+                stop_event.set()
+                raise RuntimeError(f"realtime channel error {code}: {message}")
+            if frame_type != "channel.event":
+                continue
 
-        event = frame.get("event", {})
-        event_type = event.get("type")
-        if event_type == "input_transcript_partial":
-            printer.user_partial(str(event.get("text", "")))
-        elif event_type == "input_transcript_final":
-            printer.user_final(str(event.get("text", "")))
-        elif event_type == "output_text_delta":
-            printer.assistant_delta(str(event.get("delta", "")))
-        elif event_type == "output_audio_chunk":
-            chunk = event.get("chunk", {})
-            data = read_field(chunk, "data", "")
-            if data:
-                await output_queue.put(base64.b64decode(data))
-        elif event_type == "turn_started":
-            printer.status("turn started")
-        elif event_type == "turn_committed":
-            printer.status("turn committed")
-        elif event_type == "turn_completed":
-            printer.turn_completed()
-            printer.status("turn completed")
-            if text_probe_signals is not None:
-                text_probe_signals.turn_completed.set()
-        elif event_type == "interrupted":
-            printer.status("interrupted")
-        elif event_type == "tool_call_requested":
-            printer.tool(f"requested {event.get('tool_name')} ({event.get('call_id')})")
-        elif event_type == "tool_call_completed":
-            printer.tool(f"completed {event.get('call_id')}")
-            if text_probe_signals is not None:
-                text_probe_signals.tool_completed.set()
-        elif event_type == "tool_call_failed":
-            printer.tool(f"failed {event.get('call_id')}: {event.get('error')}")
-        elif event_type == "tool_call_timed_out":
-            printer.tool(f"timed out {event.get('call_id')} after {event.get('elapsed_ms')} ms")
-        elif event_type == "status_changed":
-            status = event.get("status", {})
-            printer.status(f"channel {read_field(status, 'state', 'unknown')}")
-        elif event_type == "needs_reattach":
-            printer.status("channel needs reattach")
-
-    await output_queue.put(None)
+            event = frame.get("event", {})
+            event_type = event.get("type")
+            if event_type == "input_transcript_partial":
+                printer.user_partial(str(event.get("text", "")))
+            elif event_type == "input_transcript_final":
+                printer.user_final(str(event.get("text", "")))
+            elif event_type == "output_text_delta":
+                printer.assistant_delta(str(event.get("delta", "")))
+            elif event_type == "output_audio_chunk":
+                chunk = event.get("chunk", {})
+                data = read_field(chunk, "data", "")
+                if data:
+                    await output_queue.put(base64.b64decode(data))
+            elif event_type == "turn_started":
+                printer.status("turn started")
+            elif event_type == "turn_committed":
+                printer.status("turn committed")
+            elif event_type == "turn_completed":
+                printer.turn_completed()
+                printer.status("turn completed")
+                if text_probe_signals is not None:
+                    text_probe_signals.turn_completed.set()
+            elif event_type == "interrupted":
+                printer.status("interrupted")
+            elif event_type == "tool_call_requested":
+                printer.tool(f"requested {event.get('tool_name')} ({event.get('call_id')})")
+            elif event_type == "tool_call_completed":
+                printer.tool(f"completed {event.get('call_id')}")
+                if text_probe_signals is not None:
+                    text_probe_signals.tool_completed.set()
+            elif event_type == "tool_call_failed":
+                printer.tool(f"failed {event.get('call_id')}: {event.get('error')}")
+            elif event_type == "tool_call_timed_out":
+                printer.tool(f"timed out {event.get('call_id')} after {event.get('elapsed_ms')} ms")
+            elif event_type == "status_changed":
+                status = event.get("status", {})
+                printer.status(f"channel {read_field(status, 'state', 'unknown')}")
+            elif event_type == "needs_reattach":
+                printer.status("channel needs reattach")
+    finally:
+        await output_queue.put(None)
 
 
 async def wait_for_first_event(
@@ -654,6 +658,45 @@ def require_text_capabilities(open_info: Any) -> None:
         )
 
 
+def build_realtime_channel(
+    client: MeerkatClient,
+    mob_id: str,
+    args: argparse.Namespace,
+) -> RealtimeChannel:
+    return RealtimeChannel.mob_member(
+        client,
+        mob_id,
+        HOST_IDENTITY,
+        turning_mode="explicit_commit" if args.text_probe else "provider_managed",
+    )
+
+
+def check_completed_task(task: asyncio.Task[Any], stop_event: asyncio.Event) -> None:
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        stop_event.set()
+        raise RuntimeError(f"{task.get_name()} failed: {exc}") from exc
+    if not stop_event.is_set():
+        stop_event.set()
+        raise RuntimeError(f"{task.get_name()} stopped unexpectedly")
+
+
+async def surface_ready_task_failures(
+    stop_event: asyncio.Event,
+    tasks: list[asyncio.Task[Any]],
+) -> None:
+    for _ in range(2):
+        for task in tasks:
+            if task.done():
+                check_completed_task(task, stop_event)
+        await asyncio.sleep(0)
+    for task in tasks:
+        if task.done():
+            check_completed_task(task, stop_event)
+
+
 async def wait_for_stop_or_task_failure(
     stop_event: asyncio.Event,
     tasks: list[asyncio.Task[Any]],
@@ -663,19 +706,15 @@ async def wait_for_stop_or_task_failure(
     try:
         while pending:
             done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
-            if stop_waiter in done:
-                return
             for task in done:
-                if task.cancelled():
+                if task is stop_waiter:
                     continue
-                exc = task.exception()
-                if exc is not None:
-                    stop_event.set()
-                    raise RuntimeError(f"{task.get_name()} failed: {exc}") from exc
-                if not stop_event.is_set():
-                    stop_event.set()
-                    raise RuntimeError(f"{task.get_name()} stopped unexpectedly")
+                check_completed_task(task, stop_event)
+            if stop_waiter in done:
+                await surface_ready_task_failures(stop_event, tasks)
+                return
             if stop_event.is_set():
+                await surface_ready_task_failures(stop_event, tasks)
                 return
     finally:
         stop_waiter.cancel()
@@ -712,7 +751,7 @@ async def async_main(argv: list[str] | None = None) -> int:
         client.require_capability("mob")
         state.mob = await create_voice_mob(client, args, printer)
 
-        channel = RealtimeChannel.mob_member(client, state.mob.id, HOST_IDENTITY)
+        channel = build_realtime_channel(client, state.mob.id, args)
         open_info = await channel.open_info()
         input_audio: AudioFormat | None = None
         output_audio: AudioFormat | None = None
