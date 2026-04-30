@@ -12664,6 +12664,40 @@ async fn stage_persistent_filter_updates_machine_owned_visibility_state() {
     assert_eq!(state.active_revision, 0);
 }
 
+fn callback_tool_provenance(source_id: &str) -> meerkat_core::ToolProvenance {
+    meerkat_core::ToolProvenance {
+        kind: meerkat_core::ToolSourceKind::Callback,
+        source_id: source_id.to_string().into(),
+    }
+}
+
+fn runtime_deferred_tool(name: &str, owner: &str) -> Arc<meerkat_core::ToolDef> {
+    Arc::new(
+        meerkat_core::ToolDef::new(
+            name,
+            "deferred catalog-backed tool",
+            serde_json::json!({ "type": "object" }),
+        )
+        .with_provenance(callback_tool_provenance(owner)),
+    )
+}
+
+fn seed_deferred_tool_authority_catalog(
+    bindings: &meerkat_core::SessionRuntimeBindings,
+    tools: Vec<Arc<meerkat_core::ToolDef>>,
+    deferred_names: &[&str],
+) {
+    let _scope = meerkat_core::ToolScope::new_with_visibility_owner(
+        tools.into(),
+        std::collections::HashSet::new(),
+        deferred_names
+            .iter()
+            .map(|name| (*name).to_string())
+            .collect(),
+        Arc::clone(&bindings.tool_visibility_owner),
+    );
+}
+
 #[tokio::test]
 async fn request_deferred_tools_updates_machine_owned_visibility_state() {
     let adapter = Arc::new(MeerkatMachine::ephemeral());
@@ -12672,19 +12706,24 @@ async fn request_deferred_tools_updates_machine_owned_visibility_state() {
         .prepare_bindings(session_id.clone())
         .await
         .expect("bindings should prepare");
-    let names = ["deferred_tool".to_string()].into_iter().collect();
-    let witnesses = [(
+    let deferred_tool = runtime_deferred_tool("deferred_tool", "test");
+    seed_deferred_tool_authority_catalog(
+        &bindings,
+        vec![Arc::clone(&deferred_tool)],
+        &["deferred_tool"],
+    );
+    let authorities = [(
         "deferred_tool".to_string(),
         meerkat_core::ToolVisibilityWitness {
             stable_owner_key: Some("callback:test".to_string()),
-            last_seen_provenance: None,
+            last_seen_provenance: deferred_tool.provenance.clone(),
         },
     )]
     .into_iter()
     .collect();
 
     let revision = adapter
-        .request_deferred_tools(&session_id, names, witnesses)
+        .request_deferred_tools(&session_id, authorities)
         .await
         .expect("request should succeed");
     let state = bindings
@@ -12704,23 +12743,24 @@ async fn request_deferred_tools_updates_machine_owned_visibility_state() {
 async fn request_deferred_tools_records_typed_authority_in_dsl_state() {
     let adapter = Arc::new(MeerkatMachine::ephemeral());
     let session_id = SessionId::new();
-    let _bindings = adapter
+    let bindings = adapter
         .prepare_bindings(session_id.clone())
         .await
         .expect("bindings should prepare");
-    let names = ["deferred_tool".to_string()].into_iter().collect();
+    let deferred_tool = runtime_deferred_tool("deferred_tool", "test");
+    seed_deferred_tool_authority_catalog(
+        &bindings,
+        vec![Arc::clone(&deferred_tool)],
+        &["deferred_tool"],
+    );
     let witness = meerkat_core::ToolVisibilityWitness {
         stable_owner_key: Some("callback:test".to_string()),
-        last_seen_provenance: Some(meerkat_core::ToolProvenance {
-            kind: meerkat_core::ToolSourceKind::Callback,
-            source_id: "test".into(),
-        }),
+        last_seen_provenance: deferred_tool.provenance.clone(),
     };
 
     adapter
         .request_deferred_tools(
             &session_id,
-            names,
             [("deferred_tool".to_string(), witness.clone())]
                 .into_iter()
                 .collect(),
@@ -12759,17 +12799,20 @@ async fn request_deferred_tools_scopes_dsl_authority_to_requested_names() {
         .prepare_bindings(session_id.clone())
         .await
         .expect("bindings should prepare");
+    let first_tool = runtime_deferred_tool("first_tool", "first");
+    let second_tool = runtime_deferred_tool("second_tool", "second");
+    seed_deferred_tool_authority_catalog(
+        &bindings,
+        vec![Arc::clone(&first_tool), Arc::clone(&second_tool)],
+        &["first_tool", "second_tool"],
+    );
     let first_witness = meerkat_core::ToolVisibilityWitness {
         stable_owner_key: Some("callback:first".to_string()),
-        last_seen_provenance: Some(meerkat_core::ToolProvenance {
-            kind: meerkat_core::ToolSourceKind::Callback,
-            source_id: "first".into(),
-        }),
+        last_seen_provenance: first_tool.provenance.clone(),
     };
     adapter
         .request_deferred_tools(
             &session_id,
-            ["first_tool".to_string()].into_iter().collect(),
             [("first_tool".to_string(), first_witness)]
                 .into_iter()
                 .collect(),
@@ -12783,15 +12826,11 @@ async fn request_deferred_tools_scopes_dsl_authority_to_requested_names() {
 
     let second_witness = meerkat_core::ToolVisibilityWitness {
         stable_owner_key: Some("callback:second".to_string()),
-        last_seen_provenance: Some(meerkat_core::ToolProvenance {
-            kind: meerkat_core::ToolSourceKind::Callback,
-            source_id: "second".into(),
-        }),
+        last_seen_provenance: second_tool.provenance.clone(),
     };
     adapter
         .request_deferred_tools(
             &session_id,
-            ["second_tool".to_string()].into_iter().collect(),
             [("second_tool".to_string(), second_witness.clone())]
                 .into_iter()
                 .collect(),
@@ -12818,19 +12857,30 @@ async fn request_deferred_tools_scopes_dsl_authority_to_requested_names() {
 }
 
 #[tokio::test]
-async fn request_deferred_tools_requires_machine_visible_witnesses() {
+async fn request_deferred_tools_requires_machine_visible_provenance_authority() {
     let adapter = Arc::new(MeerkatMachine::ephemeral());
     let session_id = SessionId::new();
     let bindings = adapter
         .prepare_bindings(session_id.clone())
         .await
         .expect("bindings should prepare");
-    let names = ["deferred_tool".to_string()].into_iter().collect();
-
+    let deferred_tool = runtime_deferred_tool("deferred_tool", "test");
+    seed_deferred_tool_authority_catalog(&bindings, vec![deferred_tool], &["deferred_tool"]);
     let err = adapter
-        .request_deferred_tools(&session_id, names, Default::default())
+        .request_deferred_tools(
+            &session_id,
+            [(
+                "deferred_tool".to_string(),
+                meerkat_core::ToolVisibilityWitness {
+                    stable_owner_key: Some("callback:test".to_string()),
+                    last_seen_provenance: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        )
         .await
-        .expect_err("missing deferred-tool witnesses should fail");
+        .expect_err("missing deferred-tool provenance authority should fail");
 
     assert!(
         err.to_string().contains("deferred_tool"),
@@ -12845,11 +12895,9 @@ async fn request_deferred_tools_requires_machine_visible_witnesses() {
         "failed witness validation must not stage names"
     );
 
-    let names = ["deferred_tool".to_string()].into_iter().collect();
     let err = adapter
         .request_deferred_tools(
             &session_id,
-            names,
             [(
                 "deferred_tool".to_string(),
                 meerkat_core::ToolVisibilityWitness::default(),
@@ -12871,6 +12919,71 @@ async fn request_deferred_tools_requires_machine_visible_witnesses() {
     assert!(
         state.staged_requested_deferred_names.is_empty(),
         "failed empty-witness validation must not stage names"
+    );
+}
+
+#[tokio::test]
+async fn request_deferred_tools_rejects_public_authority_mismatched_with_visible_catalog() {
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    let bindings = adapter
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("bindings should prepare");
+    let catalog_provenance = callback_tool_provenance("catalog");
+    let catalog_tool = runtime_deferred_tool("deferred_tool", "catalog");
+    seed_deferred_tool_authority_catalog(&bindings, vec![catalog_tool], &["deferred_tool"]);
+
+    let unknown_err = adapter
+        .request_deferred_tools(
+            &session_id,
+            [(
+                "unknown_deferred_tool".to_string(),
+                meerkat_core::ToolVisibilityWitness {
+                    stable_owner_key: Some("callback:catalog".to_string()),
+                    last_seen_provenance: Some(catalog_provenance.clone()),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .await
+        .expect_err("unknown deferred authority must not stage through public request path");
+    assert!(
+        unknown_err.to_string().contains("unknown_deferred_tool"),
+        "unknown-key rejection should name the requested tool: {unknown_err}"
+    );
+
+    let forged_err = adapter
+        .request_deferred_tools(
+            &session_id,
+            [(
+                "deferred_tool".to_string(),
+                meerkat_core::ToolVisibilityWitness {
+                    stable_owner_key: Some("callback:forged".to_string()),
+                    last_seen_provenance: Some(meerkat_core::ToolProvenance {
+                        kind: meerkat_core::ToolSourceKind::Callback,
+                        source_id: "forged".into(),
+                    }),
+                },
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .await
+        .expect_err("mismatched deferred authority must not stage through public request path");
+    assert!(
+        forged_err.to_string().contains("deferred_tool"),
+        "mismatch rejection should name the requested tool: {forged_err}"
+    );
+
+    let state = bindings
+        .tool_visibility_owner
+        .visibility_state()
+        .expect("owner state should be readable");
+    assert!(
+        state.staged_requested_deferred_names.is_empty(),
+        "failed public authority validation must not stage deferred names"
     );
 }
 
@@ -12901,8 +13014,7 @@ fn request_deferred_tools_rejects_empty_dsl_authority_witness() {
     let err = mm_dsl::MeerkatMachineMutator::apply(
         &mut authority,
         mm_dsl::MeerkatMachineInput::RequestDeferredTools {
-            names: ["deferred_tool".to_string()].into_iter().collect(),
-            witnesses,
+            authorities: witnesses,
         },
     )
     .expect_err("machine authority must reject empty/default deferred-tool witness");
@@ -12937,8 +13049,7 @@ fn request_deferred_tools_accepts_provenance_only_dsl_authority_witness() {
     mm_dsl::MeerkatMachineMutator::apply(
         &mut authority,
         mm_dsl::MeerkatMachineInput::RequestDeferredTools {
-            names: ["deferred_tool".to_string()].into_iter().collect(),
-            witnesses,
+            authorities: witnesses,
         },
     )
     .expect("provenance witness should carry DSL admission authority");
@@ -12984,18 +13095,20 @@ async fn machine_owned_visibility_owner_promotes_deferred_authority_at_boundary(
         .prepare_bindings(session_id.clone())
         .await
         .expect("bindings should prepare");
+    let deferred_tool = runtime_deferred_tool("deferred_tool", "test");
+    seed_deferred_tool_authority_catalog(
+        &bindings,
+        vec![Arc::clone(&deferred_tool)],
+        &["deferred_tool"],
+    );
     let witness = meerkat_core::ToolVisibilityWitness {
         stable_owner_key: Some("callback:test".to_string()),
-        last_seen_provenance: Some(meerkat_core::ToolProvenance {
-            kind: meerkat_core::ToolSourceKind::Callback,
-            source_id: "test".into(),
-        }),
+        last_seen_provenance: deferred_tool.provenance.clone(),
     };
 
     adapter
         .request_deferred_tools(
             &session_id,
-            ["deferred_tool".to_string()].into_iter().collect(),
             [("deferred_tool".to_string(), witness.clone())]
                 .into_iter()
                 .collect(),
@@ -13051,8 +13164,8 @@ async fn replace_visibility_state_rejects_deferred_names_without_authority() {
         .expect_err("replacement must not install deferred names without typed authority");
 
     assert!(
-        err.to_string().contains("SyncVisibilityRevisions"),
-        "rejection should come from the DSL authority sync: {err}"
+        err.to_string().contains("deferred_tool"),
+        "rejection should name the missing deferred authority: {err}"
     );
     let state = bindings
         .tool_visibility_owner
@@ -13090,8 +13203,8 @@ async fn replace_visibility_state_rejects_deferred_names_with_empty_authority() 
         .expect_err("replacement must not install deferred names with empty typed authority");
 
     assert!(
-        err.to_string().contains("SyncVisibilityRevisions"),
-        "rejection should come from the DSL authority sync: {err}"
+        err.to_string().contains("deferred_tool"),
+        "rejection should name the empty deferred authority: {err}"
     );
     let state = bindings
         .tool_visibility_owner
@@ -13100,6 +13213,53 @@ async fn replace_visibility_state_rejects_deferred_names_with_empty_authority() 
     assert!(
         state.staged_requested_deferred_names.is_empty(),
         "failed empty-authority sync must not install staged routing names"
+    );
+}
+
+#[tokio::test]
+async fn replace_visibility_state_rejects_deferred_authority_mismatched_with_visible_catalog() {
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    let bindings = adapter
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("bindings should prepare");
+    let catalog_tool = runtime_deferred_tool("deferred_tool", "catalog");
+    seed_deferred_tool_authority_catalog(&bindings, vec![catalog_tool], &["deferred_tool"]);
+    let replacement = meerkat_core::SessionToolVisibilityState {
+        active_requested_deferred_names: ["deferred_tool".to_string()].into_iter().collect(),
+        staged_requested_deferred_names: ["deferred_tool".to_string()].into_iter().collect(),
+        requested_witnesses: [(
+            "deferred_tool".to_string(),
+            meerkat_core::ToolVisibilityWitness {
+                stable_owner_key: Some("callback:forged".to_string()),
+                last_seen_provenance: Some(callback_tool_provenance("forged")),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        active_revision: 1,
+        staged_revision: 1,
+        ..Default::default()
+    };
+
+    let err = bindings
+        .tool_visibility_owner
+        .replace_visibility_state(replacement)
+        .expect_err("replacement must reject forged deferred provenance authority");
+
+    assert!(
+        err.to_string().contains("deferred_tool"),
+        "rejection should name the mismatched deferred authority: {err}"
+    );
+    let state = bindings
+        .tool_visibility_owner
+        .visibility_state()
+        .expect("owner state should still be readable");
+    assert!(
+        state.active_requested_deferred_names.is_empty()
+            && state.staged_requested_deferred_names.is_empty(),
+        "failed replacement must not install deferred routing names"
     );
 }
 
@@ -13207,6 +13367,67 @@ async fn publish_committed_visible_set_rejects_active_requested_names_outside_st
     assert!(
         matches!(err, RuntimeDriverError::ValidationFailed { .. }),
         "expected ValidationFailed, got {err:?}"
+    );
+}
+
+#[tokio::test]
+async fn publish_committed_visible_set_rejects_deferred_authority_mismatched_with_visible_catalog()
+{
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    let bindings = adapter
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("bindings should prepare");
+    let catalog_tool = runtime_deferred_tool("deferred_tool", "catalog");
+    seed_deferred_tool_authority_catalog(&bindings, vec![catalog_tool], &["deferred_tool"]);
+
+    let state = meerkat_core::SessionToolVisibilityState {
+        active_requested_deferred_names: ["deferred_tool".to_string()].into_iter().collect(),
+        staged_requested_deferred_names: ["deferred_tool".to_string()].into_iter().collect(),
+        requested_witnesses: [(
+            "deferred_tool".to_string(),
+            meerkat_core::ToolVisibilityWitness {
+                stable_owner_key: Some("callback:forged".to_string()),
+                last_seen_provenance: Some(callback_tool_provenance("forged")),
+            },
+        )]
+        .into_iter()
+        .collect(),
+        active_revision: 4,
+        staged_revision: 4,
+        ..Default::default()
+    };
+
+    let err = adapter
+        .publish_committed_visible_set(&session_id, state)
+        .await
+        .expect_err("publish must reject forged deferred provenance authority");
+    assert!(
+        matches!(err, RuntimeDriverError::ValidationFailed { .. }),
+        "expected ValidationFailed, got {err:?}"
+    );
+
+    let owner_state = bindings
+        .tool_visibility_owner
+        .visibility_state()
+        .expect("owner state should still be readable");
+    assert!(
+        owner_state.active_requested_deferred_names.is_empty()
+            && owner_state.staged_requested_deferred_names.is_empty(),
+        "failed publish must not install deferred routing names"
+    );
+
+    let sessions = adapter.sessions.read().await;
+    let entry = sessions.get(&session_id).expect("session should exist");
+    let authority = entry
+        .dsl_authority
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        authority.state.active_deferred_authorities.is_empty()
+            && authority.state.staged_deferred_authorities.is_empty(),
+        "failed publish must not leave forged deferred authority in the DSL state"
     );
 }
 
@@ -13324,6 +13545,14 @@ async fn modeled_request_deferred_tools_matches_runtime_after_active_ahead_recon
     .await
     .expect("reconfigure should succeed for attached fixture");
 
+    let bindings = fixture
+        .adapter
+        .prepare_bindings(fixture.session_id.clone())
+        .await
+        .expect("bindings should prepare for request-deferred parity");
+    let probe_tool = runtime_deferred_tool("probe_tool", "runtime-parity");
+    seed_deferred_tool_authority_catalog(&bindings, vec![probe_tool], &["probe_tool"]);
+
     let before = runtime_parity_snapshot_summary(&fixture.adapter, &fixture.session_id)
         .await
         .expect("pre-request snapshot should exist");
@@ -13336,11 +13565,7 @@ async fn modeled_request_deferred_tools_matches_runtime_after_active_ahead_recon
 
     let revision = fixture
         .adapter
-        .request_deferred_tools(
-            &fixture.session_id,
-            ["probe_tool".to_string()].into_iter().collect(),
-            runtime_parity_witnesses(),
-        )
+        .request_deferred_tools(&fixture.session_id, runtime_parity_witnesses())
         .await
         .expect("request should succeed after active-ahead reconfigure");
     assert_eq!(
@@ -15767,7 +15992,7 @@ fn runtime_modeled_kernel_input(
                 serde_json::to_string(&meerkat_core::ToolFilter::All)
                     .unwrap_or_else(|_| "\"<tool-filter>\"".into()),
             ),
-            "witnesses" => runtime_modeled_witness_map(),
+            "witnesses" | "authorities" => runtime_modeled_witness_map(),
             "names" => runtime_modeled_string_set(&["probe_tool"]),
             "active_requested_deferred_names" | "staged_requested_deferred_names" => {
                 runtime_modeled_string_set(&[])
@@ -16009,7 +16234,10 @@ fn runtime_parity_witnesses() -> BTreeMap<String, meerkat_core::ToolVisibilityWi
         "probe_tool".to_string(),
         meerkat_core::ToolVisibilityWitness {
             stable_owner_key: Some("callback:runtime-parity".to_string()),
-            last_seen_provenance: None,
+            last_seen_provenance: Some(meerkat_core::ToolProvenance {
+                kind: meerkat_core::ToolSourceKind::Callback,
+                source_id: "runtime-parity".into(),
+            }),
         },
     )]
     .into_iter()
@@ -16837,6 +17065,17 @@ async fn prepare_runtime_parity_probe(
         }
     }
 
+    if matches!(probe, RuntimeParityProbeInput::RequestDeferredTools) {
+        let bindings = fixture
+            .adapter
+            .prepare_bindings(fixture.session_id.clone())
+            .await
+            .expect("bindings should prepare for request-deferred parity probe");
+        let probe_tool = runtime_deferred_tool("probe_tool", "runtime-parity");
+        seed_deferred_tool_authority_catalog(&bindings, vec![probe_tool], &["probe_tool"]);
+        setup_tags.push("deferred_authority_catalog".to_string());
+    }
+
     if phase == RuntimeParityPhase::Running
         && matches!(
             probe,
@@ -16950,8 +17189,7 @@ fn runtime_parity_probe_command(
         RuntimeParityProbeInput::RequestDeferredTools => {
             MeerkatMachineCommand::RequestDeferredTools {
                 session_id: fixture.session_id.clone(),
-                names: ["probe_tool".to_string()].into_iter().collect(),
-                witnesses: runtime_parity_witnesses(),
+                authorities: runtime_parity_witnesses(),
             }
         }
         RuntimeParityProbeInput::PublishCommittedVisibleSet => {

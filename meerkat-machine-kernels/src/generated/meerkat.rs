@@ -3862,8 +3862,7 @@ pub mod inputs {
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct RequestDeferredTools {
-        pub names: std::collections::BTreeSet<String>,
-        pub witnesses: std::collections::BTreeMap<String, ToolVisibilityWitness>,
+        pub authorities: std::collections::BTreeMap<String, ToolVisibilityWitness>,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct PublishCommittedVisibleSet {
@@ -4325,8 +4324,7 @@ pub mod inputs {
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct CommitDeferredNames {
-        pub names: std::collections::BTreeSet<String>,
-        pub witnesses: std::collections::BTreeMap<String, ToolVisibilityWitness>,
+        pub authorities: std::collections::BTreeMap<String, ToolVisibilityWitness>,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct SyncVisibilityRevisions {
