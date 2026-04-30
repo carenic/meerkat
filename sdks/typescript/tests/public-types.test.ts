@@ -3,6 +3,8 @@ import type {
   MobCreateOptions,
   MobDefinition,
   MobTurnStartOptions,
+  PeerCorrelationId,
+  PeerId,
   SpawnManySpec,
   SpawnSpec,
 } from "../src/index.js";
@@ -218,6 +220,35 @@ void publicMobTurnStartClient.mobTurnStart(
 void publicMobTurnStartOptions;
 void publicMobTurnStartOptionsWithUnknown;
 void generatedMobTurnStartOptionCoverage;
+
+const publicPeerResponsePeerId =
+  "00000000-0000-4000-8000-000000000161" as PeerId;
+const publicPeerResponseRequestId =
+  "00000000-0000-4000-8000-000000000162" as PeerCorrelationId;
+void publicMobTurnStartClient.sendPeerResponseTerminal(
+  "session-1",
+  publicPeerResponsePeerId,
+  publicPeerResponseRequestId,
+  "completed",
+  { ok: true },
+  { displayName: "analyst" },
+);
+void publicMobTurnStartClient.sendPeerResponseTerminal(
+  "session-1",
+  // @ts-expect-error peer id and peer correlation id are branded separately.
+  publicPeerResponseRequestId,
+  publicPeerResponsePeerId,
+  "completed",
+  { ok: true },
+);
+void publicMobTurnStartClient.sendPeerResponseTerminal(
+  "session-1",
+  // @ts-expect-error raw strings cannot satisfy the public peer-response identity contract.
+  "analyst",
+  "req-1",
+  "completed",
+  { ok: true },
+);
 
 const generatedMobSpawn: MobSpawnParams = {
   mob_id: "mob-1",

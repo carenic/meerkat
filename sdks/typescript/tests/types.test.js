@@ -884,6 +884,39 @@ describe("Session wrappers", () => {
     ]);
   });
 
+  it("sendPeerResponseTerminal forwards canonical peer id and correlation id", async () => {
+    const calls = [];
+    const client = new MeerkatClient();
+    client.request = async (method, params) => {
+      calls.push({ method, params });
+      return { status: "accepted" };
+    };
+
+    await client.sendPeerResponseTerminal(
+      "s1",
+      "00000000-0000-4000-8000-000000000161",
+      "00000000-0000-4000-8000-000000000162",
+      "completed",
+      { ok: true },
+      { displayName: "analyst" },
+    );
+
+    assert.deepEqual(calls, [
+      {
+        method: "session/peer_response_terminal",
+        params: {
+          session_id: "s1",
+          peer_id: "00000000-0000-4000-8000-000000000161",
+          request_id: "00000000-0000-4000-8000-000000000162",
+          status: "completed",
+          result: { ok: true },
+          display_name: "analyst",
+        },
+      },
+    ]);
+    assert.equal("peer_name" in calls[0].params, false);
+  });
+
   it("turn/start wrappers include per-turn overrides on streaming and non-streaming calls", async () => {
     const client = new MeerkatClient();
     const calls = [];

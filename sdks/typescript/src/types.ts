@@ -33,6 +33,22 @@ import type { Usage } from "./events.js";
 
 export type { Usage } from "./events.js";
 
+declare const peerIdBrand: unique symbol;
+declare const peerCorrelationIdBrand: unique symbol;
+
+/** Canonical comms routing identity for a peer. */
+export type PeerId = string & { readonly [peerIdBrand]: "PeerId" };
+
+/** Canonical request/response correlation identity for peer interactions. */
+export type PeerCorrelationId = string & {
+  readonly [peerCorrelationIdBrand]: "PeerCorrelationId";
+};
+
+/** Presentation-only metadata for terminal peer responses. */
+export interface PeerResponseTerminalOptions {
+  readonly displayName?: string;
+}
+
 /** Warning emitted when structured output doesn't match a provider's schema. */
 export interface SchemaWarning {
   readonly provider: string;

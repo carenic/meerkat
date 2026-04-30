@@ -94,6 +94,8 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "MobUnwireResult": schema_for!(crate::wire::MobUnwireResult),
         "WireRuntimeState": schema_for!(crate::wire::WireRuntimeState),
         "RuntimeStateResult": schema_for!(crate::wire::RuntimeStateResult),
+        "PeerResponseTerminalStatusWire": schema_for!(crate::wire::PeerResponseTerminalStatusWire),
+        "SessionExternalEventEnvelope": schema_for!(crate::wire::SessionExternalEventEnvelope),
         "WireRealtimeAttachmentStatus": schema_for!(crate::wire::WireRealtimeAttachmentStatus),
         "RuntimeRealtimeAttachmentStatusResult": schema_for!(crate::wire::RuntimeRealtimeAttachmentStatusResult),
         "RealtimeChannelTarget": schema_for!(crate::wire::RealtimeChannelTarget),
@@ -252,6 +254,7 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "RuntimeAcceptParams": schema_for!(crate::wire::RuntimeAcceptParams),
         "RuntimeRetireParams": schema_for!(crate::wire::RuntimeRetireParams),
         "RuntimeResetParams": schema_for!(crate::wire::RuntimeResetParams),
+        "SessionPeerResponseTerminalParams": schema_for!(crate::wire::SessionPeerResponseTerminalParams),
         "InputStateParams": schema_for!(crate::wire::InputStateParams),
         "InputListParams": schema_for!(crate::wire::InputListParams),
         "RuntimeRealtimeAttachmentStatusParams": schema_for!(crate::wire::RuntimeRealtimeAttachmentStatusParams),
@@ -416,6 +419,14 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
             "properties": Value::Object(property_map),
             "required": required,
         })
+    }
+
+    fn closed_object_schema(properties: Vec<(&str, Value)>, required: Vec<&str>) -> Value {
+        let mut schema = object_schema(properties, required);
+        if let Value::Object(object) = &mut schema {
+            object.insert("additionalProperties".to_string(), Value::Bool(false));
+        }
+        schema
     }
 
     fn string_schema() -> Value {
@@ -625,28 +636,15 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         );
         components.insert(
             "RestPeerResponseTerminalRequest".to_string(),
-            object_schema(
+            closed_object_schema(
                 vec![
-                    ("transport_identity", string_schema()),
-                    ("route_identity", string_schema()),
-                    ("display_identity", string_schema()),
-                    ("request_id", string_schema()),
-                    (
-                        "status",
-                        serde_json::json!({
-                            "type": "string",
-                            "enum": ["completed", "failed", "cancelled"]
-                        }),
-                    ),
+                    ("peer_id", schema_ref("PeerId")),
+                    ("display_name", schema_ref("PeerName")),
+                    ("request_id", schema_ref("PeerCorrelationId")),
+                    ("status", schema_ref("PeerResponseTerminalStatusWire")),
                     ("result", json_value.clone()),
                 ],
-                vec![
-                    "route_identity",
-                    "display_identity",
-                    "request_id",
-                    "status",
-                    "result",
-                ],
+                vec!["peer_id", "request_id", "status", "result"],
             ),
         );
         components.insert(
@@ -1547,6 +1545,7 @@ mod tests {
             .expect("rest OpenAPI should publish schema components");
         for expected in [
             "RestCreateSessionRequest",
+            "RestPeerResponseTerminalRequest",
             "WireRunResult",
             "WireError",
             "ConfigEnvelope",
@@ -1556,6 +1555,60 @@ mod tests {
                 "rest OpenAPI components missing {expected}"
             );
         }
+        let terminal_request = components
+            .get("RestPeerResponseTerminalRequest")
+            .expect("rest OpenAPI components missing RestPeerResponseTerminalRequest");
+        assert_eq!(
+            terminal_request.get("additionalProperties"),
+            Some(&serde_json::Value::Bool(false)),
+            "terminal peer-response request must be closed like RestPeerResponseTerminalBody"
+        );
+        assert_eq!(
+            terminal_request.pointer("/required"),
+            Some(&serde_json::json!([
+                "peer_id",
+                "request_id",
+                "status",
+                "result"
+            ])),
+            "terminal peer-response request must require canonical identity and correlation facts"
+        );
+        let terminal_properties = terminal_request
+            .pointer("/properties")
+            .and_then(serde_json::Value::as_object)
+            .expect("terminal peer-response request must expose object properties");
+        assert!(
+            terminal_properties.get("peer_name").is_none(),
+            "terminal peer-response request must not admit display names as identity"
+        );
+        assert_eq!(
+            terminal_properties
+                .get("peer_id")
+                .and_then(|schema| schema.pointer("/$ref"))
+                .and_then(serde_json::Value::as_str),
+            Some("#/components/schemas/PeerId")
+        );
+        assert_eq!(
+            terminal_properties
+                .get("display_name")
+                .and_then(|schema| schema.pointer("/$ref"))
+                .and_then(serde_json::Value::as_str),
+            Some("#/components/schemas/PeerName")
+        );
+        assert_eq!(
+            terminal_properties
+                .get("request_id")
+                .and_then(|schema| schema.pointer("/$ref"))
+                .and_then(serde_json::Value::as_str),
+            Some("#/components/schemas/PeerCorrelationId")
+        );
+        assert_eq!(
+            terminal_properties
+                .get("status")
+                .and_then(|schema| schema.pointer("/$ref"))
+                .and_then(serde_json::Value::as_str),
+            Some("#/components/schemas/PeerResponseTerminalStatusWire")
+        );
 
         let create_session = &rest_openapi["paths"]["/sessions"]["post"];
         assert_eq!(

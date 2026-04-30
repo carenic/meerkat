@@ -8,7 +8,7 @@ prefixed generated types which are now an internal implementation detail.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Literal, TypedDict, Union
+from typing import Any, Literal, NewType, TypedDict, Union
 
 from .generated.types import CONTRACT_VERSION as CONTRACT_VERSION  # re-export
 from .generated.types import (
@@ -112,6 +112,12 @@ from .generated.types import (
     WireToolAccessPolicy as WireToolAccessPolicy,
     WireToolFilter as WireToolFilter,
 )
+
+PeerId = NewType("PeerId", str)
+"""Canonical comms routing identity for a peer."""
+
+PeerCorrelationId = NewType("PeerCorrelationId", str)
+"""Canonical request/response correlation identity for peer interactions."""
 
 # Re-export Usage from events so there's a single canonical definition.
 from .events import Event, Usage as Usage  # noqa: F401

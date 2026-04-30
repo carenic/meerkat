@@ -383,14 +383,6 @@ pub type ResponseProgressPhase = PeerResponseProgressProjectionPhase;
 /// runtime-local duplicate.
 pub type ResponseTerminalStatus = PeerResponseTerminalProjectionStatus;
 
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-pub enum PeerResponseTerminalInputError {
-    #[error("request_id cannot be empty")]
-    EmptyRequestId,
-    #[error("request_id must be a UUID: {input}")]
-    InvalidRequestId { input: String },
-}
-
 pub fn response_terminal_status_from_wire(
     status: meerkat_contracts::PeerResponseTerminalStatusWire,
 ) -> ResponseTerminalStatus {
@@ -408,38 +400,31 @@ pub fn response_terminal_status_from_wire(
 }
 
 pub fn peer_response_terminal_input(
-    source: PeerResponseTerminalSource,
-    request_id: impl Into<String>,
+    peer_id: meerkat_core::comms::PeerId,
+    display_name: Option<meerkat_core::comms::PeerName>,
+    request_id: meerkat_core::PeerCorrelationId,
     status: meerkat_contracts::PeerResponseTerminalStatusWire,
     result: serde_json::Value,
-) -> Result<Input, PeerResponseTerminalInputError> {
-    let request_id = request_id.into();
-    if request_id.trim().is_empty() {
-        return Err(PeerResponseTerminalInputError::EmptyRequestId);
-    }
-    PeerResponseTerminalCorrelationId::parse(&request_id).map_err(|_| {
-        PeerResponseTerminalInputError::InvalidRequestId {
-            input: request_id.clone(),
-        }
-    })?;
+) -> Input {
+    let correlation_id = CorrelationId::from_uuid(request_id.as_uuid());
+    let request_id = request_id.to_string();
+    let peer_id = peer_id.to_string();
+    let display_identity = display_name.map_or_else(|| peer_id.clone(), |name| name.as_string());
 
-    Ok(Input::Peer(PeerInput {
+    Input::Peer(PeerInput {
         header: InputHeader {
             id: InputId::new(),
             timestamp: Utc::now(),
             source: InputOrigin::Peer {
-                peer_id: source.route_identity.as_str().to_string(),
-                display_identity: Some(source.display_identity.as_str().to_string()),
-                runtime_id: source
-                    .transport_identity
-                    .as_ref()
-                    .map(|identity| LogicalRuntimeId::new(identity.as_str().to_string())),
+                peer_id,
+                display_identity: Some(display_identity),
+                runtime_id: None,
             },
             durability: InputDurability::Durable,
             visibility: InputVisibility::default(),
             idempotency_key: None,
             supersession_key: None,
-            correlation_id: None,
+            correlation_id: Some(correlation_id),
         },
         convention: Some(PeerConvention::ResponseTerminal {
             request_id,
@@ -449,7 +434,7 @@ pub fn peer_response_terminal_input(
         payload: Some(result),
         blocks: None,
         handling_mode: None,
-    }))
+    })
 }
 
 /// Flow step input from mob orchestration.
@@ -797,14 +782,6 @@ mod tests {
             supersession_key: None,
             correlation_id: None,
         }
-    }
-
-    fn terminal_source(peer: &str) -> PeerResponseTerminalSource {
-        PeerResponseTerminalSource::new(
-            None,
-            PeerResponseTerminalRouteIdentity::parse(peer).unwrap(),
-            PeerResponseTerminalDisplayIdentity::parse(peer).unwrap(),
-        )
     }
 
     #[test]
@@ -1165,20 +1142,33 @@ mod tests {
 
     #[test]
     fn peer_response_terminal_input_owns_wire_status_mapping() {
+        let peer_id = meerkat_core::comms::PeerId::from_uuid(
+            uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000161").unwrap(),
+        );
+        let display_name = meerkat_core::comms::PeerName::new("analyst").unwrap();
+        let request_id = meerkat_core::PeerCorrelationId::from_uuid(
+            uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000162").unwrap(),
+        );
         let input = peer_response_terminal_input(
-            terminal_source("analyst"),
-            "018f6f79-7a82-7c4e-a552-a3b86f9630f1",
+            peer_id,
+            Some(display_name),
+            request_id,
             meerkat_contracts::PeerResponseTerminalStatusWire::Cancelled,
             serde_json::json!({"ok": false}),
-        )
-        .unwrap();
+        );
 
         match input {
             Input::Peer(PeerInput {
                 header:
                     InputHeader {
-                        source: InputOrigin::Peer { peer_id, .. },
+                        source:
+                            InputOrigin::Peer {
+                                peer_id,
+                                display_identity,
+                                runtime_id,
+                            },
                         durability: InputDurability::Durable,
+                        correlation_id,
                         ..
                     },
                 convention: Some(PeerConvention::ResponseTerminal { request_id, status }),
@@ -1186,44 +1176,21 @@ mod tests {
                 handling_mode: None,
                 ..
             }) => {
-                assert_eq!(peer_id, "analyst");
-                assert_eq!(request_id, "018f6f79-7a82-7c4e-a552-a3b86f9630f1");
+                assert_eq!(peer_id, "00000000-0000-4000-8000-000000000161");
+                assert_eq!(display_identity.as_deref(), Some("analyst"));
+                assert_eq!(runtime_id, None);
+                assert_eq!(request_id, "00000000-0000-4000-8000-000000000162");
+                assert_eq!(
+                    correlation_id,
+                    Some(CorrelationId::from_uuid(
+                        uuid::Uuid::parse_str("00000000-0000-4000-8000-000000000162").unwrap()
+                    ))
+                );
                 assert_eq!(status, ResponseTerminalStatus::Cancelled);
                 assert_eq!(payload["ok"], false);
             }
             other => panic!("expected terminal peer input, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn peer_response_terminal_input_rejects_empty_request_id() {
-        let err = peer_response_terminal_input(
-            terminal_source("analyst"),
-            " ",
-            meerkat_contracts::PeerResponseTerminalStatusWire::Completed,
-            serde_json::json!({}),
-        )
-        .unwrap_err();
-
-        assert_eq!(err, PeerResponseTerminalInputError::EmptyRequestId);
-    }
-
-    #[test]
-    fn peer_response_terminal_input_rejects_invalid_request_id() {
-        let err = peer_response_terminal_input(
-            terminal_source("analyst"),
-            "req-1",
-            meerkat_contracts::PeerResponseTerminalStatusWire::Completed,
-            serde_json::json!({}),
-        )
-        .unwrap_err();
-
-        assert_eq!(
-            err,
-            PeerResponseTerminalInputError::InvalidRequestId {
-                input: "req-1".to_string()
-            }
-        );
     }
 
     #[test]

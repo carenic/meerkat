@@ -24,13 +24,13 @@ pub struct ExternalEventParams {
 
 /// Parameters for `session/peer_response_terminal`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PeerResponseTerminalParams {
     pub session_id: String,
+    pub peer_id: meerkat_core::comms::PeerId,
     #[serde(default)]
-    pub transport_identity: Option<String>,
-    pub route_identity: String,
-    pub display_identity: String,
-    pub request_id: String,
+    pub display_name: Option<meerkat_core::comms::PeerName>,
+    pub request_id: meerkat_core::PeerCorrelationId,
     pub status: PeerResponseTerminalStatusWire,
     pub result: serde_json::Value,
 }
@@ -107,19 +107,11 @@ pub async fn handle_peer_response_terminal(
         Err(resp) => return resp,
     };
 
-    let source = match meerkat_core::PeerResponseTerminalSource::parse(
-        params.transport_identity,
-        params.route_identity,
-        params.display_identity,
-    ) {
-        Ok(source) => source,
-        Err(err) => return RpcResponse::error(id, crate::error::INVALID_PARAMS, err.to_string()),
-    };
-
     let outcome = runtime
         .accept_peer_response_terminal_via_runtime(
             &session_id,
-            source,
+            params.peer_id,
+            params.display_name,
             params.request_id,
             params.status,
             params.result,
@@ -236,24 +228,27 @@ mod tests {
 
     #[test]
     fn test_external_event_params_reject_variant_deserialization() {
-        let json = r#"{"session_id":"sid_123","kind":"peer_response_terminal","route_identity":"analyst-rt","display_identity":"Analyst","request_id":"req-1","status":"completed","result":{"token":"amber"}}"#;
+        let json = r#"{"session_id":"sid_123","kind":"peer_response_terminal","peer_id":"00000000-0000-4000-8000-000000000161","display_name":"analyst","request_id":"00000000-0000-4000-8000-000000000162","status":"completed","result":{"token":"amber"}}"#;
         let params: ExternalEventParams = serde_json::from_str(json).unwrap();
         assert!(matches!(
             params.event,
             SessionExternalEventEnvelope::PeerResponseTerminal { .. }
         ));
         if let SessionExternalEventEnvelope::PeerResponseTerminal {
-            route_identity,
-            display_identity,
+            peer_id,
+            display_name,
             request_id,
             status,
             result,
             ..
         } = params.event
         {
-            assert_eq!(route_identity, "analyst-rt");
-            assert_eq!(display_identity, "Analyst");
-            assert_eq!(request_id, "req-1");
+            assert_eq!(peer_id.to_string(), "00000000-0000-4000-8000-000000000161");
+            assert_eq!(display_name.unwrap().as_str(), "analyst");
+            assert_eq!(
+                request_id.to_string(),
+                "00000000-0000-4000-8000-000000000162"
+            );
             assert_eq!(status, PeerResponseTerminalStatusWire::Completed);
             let result_value: serde_json::Value =
                 serde_json::from_str(result.get()).expect("result parses");
@@ -263,13 +258,49 @@ mod tests {
 
     #[test]
     fn test_peer_response_terminal_params_deserialization() {
-        let json = r#"{"session_id":"sid_123","route_identity":"analyst-rt","display_identity":"Analyst","request_id":"req-1","status":"failed","result":null}"#;
+        let json = r#"{"session_id":"sid_123","peer_id":"00000000-0000-4000-8000-000000000161","display_name":"analyst","request_id":"00000000-0000-4000-8000-000000000162","status":"failed","result":null}"#;
         let params: PeerResponseTerminalParams = serde_json::from_str(json).unwrap();
         assert_eq!(params.session_id, "sid_123");
-        assert_eq!(params.route_identity, "analyst-rt");
-        assert_eq!(params.display_identity, "Analyst");
-        assert_eq!(params.request_id, "req-1");
+        assert_eq!(
+            params.peer_id.to_string(),
+            "00000000-0000-4000-8000-000000000161"
+        );
+        assert_eq!(params.display_name.unwrap().as_str(), "analyst");
+        assert_eq!(
+            params.request_id.to_string(),
+            "00000000-0000-4000-8000-000000000162"
+        );
         assert_eq!(params.status, PeerResponseTerminalStatusWire::Failed);
         assert_eq!(params.result, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn test_peer_response_terminal_params_reject_name_only_origin() {
+        let json = r#"{"session_id":"sid_123","peer_name":"analyst","request_id":"00000000-0000-4000-8000-000000000162","status":"failed","result":null}"#;
+        let err = serde_json::from_str::<PeerResponseTerminalParams>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("peer_id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_peer_response_terminal_params_rejects_mixed_peer_name_origin() {
+        let json = r#"{"session_id":"sid_123","peer_id":"00000000-0000-4000-8000-000000000161","peer_name":"analyst","request_id":"00000000-0000-4000-8000-000000000162","status":"failed","result":null}"#;
+        let err = serde_json::from_str::<PeerResponseTerminalParams>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("peer_name"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn test_peer_response_terminal_params_reject_stringly_request_id() {
+        let json = r#"{"session_id":"sid_123","peer_id":"00000000-0000-4000-8000-000000000161","request_id":"req-1","status":"failed","result":null}"#;
+        let err = serde_json::from_str::<PeerResponseTerminalParams>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("UUID") || err.to_string().contains("uuid"),
+            "unexpected error: {err}"
+        );
     }
 }

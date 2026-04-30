@@ -29,9 +29,10 @@ use uuid::Uuid;
 /// Wrapping it in a newtype prevents raw-`Uuid` confusion at every site that
 /// fires a DSL input, inserts into the subscriber registry, or closes out an
 /// inbound request.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
-pub struct PeerCorrelationId(pub Uuid);
+pub struct PeerCorrelationId(#[cfg_attr(feature = "schema", schemars(with = "String"))] pub Uuid);
 
 impl PeerCorrelationId {
     /// Create a fresh correlation id (UUID v4).

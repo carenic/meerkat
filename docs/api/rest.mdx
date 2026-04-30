@@ -591,6 +591,42 @@ instead of a surface-local injector path.
 | 401 | Missing or invalid webhook secret |
 | 503 | Event inbox is full |
 
+### POST /sessions/\{id\}/peer-response-terminal
+
+Admit a terminal peer response through the typed runtime ingress.
+
+```bash
+curl -X POST http://localhost:8080/sessions/sid_abc/peer-response-terminal \
+  -H "Content-Type: application/json" \
+  -d '{
+    "peer_id": "00000000-0000-4000-8000-000000000161",
+    "display_name": "analyst",
+    "request_id": "00000000-0000-4000-8000-000000000162",
+    "status": "completed",
+    "result": {"token": "silver harbor"}
+  }'
+```
+
+<ParamField body="peer_id" type="string" required>
+  Canonical peer routing ID. Display names are not accepted as routing identity.
+</ParamField>
+
+<ParamField body="display_name" type="string">
+  Optional presentation label.
+</ParamField>
+
+<ParamField body="request_id" type="string" required>
+  Peer correlation ID for the request this terminal response completes.
+</ParamField>
+
+<ParamField body="status" type="string" required>
+  Terminal response status: `"completed"`, `"failed"`, or `"cancelled"`.
+</ParamField>
+
+<ParamField body="result" type="any JSON" required>
+  Peer-returned terminal payload.
+</ParamField>
+
 ### GET /sessions/\{id\}
 
 Fetch session metadata and usage.

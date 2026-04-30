@@ -96,6 +96,8 @@ from .types import (
     ModelsCatalogResponse,
     MobEventsResult,
     MobProfile,
+    PeerCorrelationId,
+    PeerId,
     ScheduleListResult,
     ScheduleOccurrencesResult,
     ScheduleRecord,
@@ -771,25 +773,23 @@ class MeerkatClient:
     async def send_peer_response_terminal(
         self,
         session_id: str,
-        route_identity: str,
-        display_identity: str,
-        request_id: str,
+        peer_id: PeerId,
+        request_id: PeerCorrelationId,
         status: Literal["completed", "failed", "cancelled"],
         result: Any,
         *,
-        transport_identity: str | None = None,
+        display_name: str | None = None,
     ) -> ExternalEventOutcome:
         """Admit a correlated terminal peer response through the typed ingress."""
         params: dict[str, Any] = {
             "session_id": session_id,
-            "route_identity": route_identity,
-            "display_identity": display_identity,
-            "request_id": request_id,
+            "peer_id": str(peer_id),
+            "request_id": str(request_id),
             "status": status,
             "result": result,
         }
-        if transport_identity is not None:
-            params["transport_identity"] = transport_identity
+        if display_name is not None:
+            params["display_name"] = display_name
         return await self._request("session/peer_response_terminal", params)
 
 

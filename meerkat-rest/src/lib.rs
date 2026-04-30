@@ -2101,12 +2101,12 @@ enum RestSessionExternalEventEnvelope {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct RestPeerResponseTerminalBody {
+    peer_id: meerkat_core::comms::PeerId,
     #[serde(default)]
-    transport_identity: Option<String>,
-    route_identity: String,
-    display_identity: String,
-    request_id: String,
+    display_name: Option<meerkat_core::comms::PeerName>,
+    request_id: meerkat_core::PeerCorrelationId,
     status: meerkat_contracts::PeerResponseTerminalStatusWire,
     result: Value,
 }
@@ -2161,23 +2161,24 @@ async fn post_peer_response_terminal(
     webhook::verify_webhook(&headers, &state.webhook_auth)
         .map_err(|msg| ApiError::Unauthorized(msg.to_string()).into_response())?;
 
-    let source = meerkat_core::PeerResponseTerminalSource::parse(
-        body.transport_identity,
-        body.route_identity,
-        body.display_identity,
-    )
-    .map_err(|err| ApiError::BadRequest(err.to_string()).into_response())?;
-
     let session_id =
         resolve_session_id_for_state(&id, &state).map_err(IntoResponse::into_response)?;
 
+    let RestPeerResponseTerminalBody {
+        peer_id,
+        display_name,
+        request_id,
+        status,
+        result,
+    } = body;
+
     let input = meerkat_runtime::peer_response_terminal_input(
-        source,
-        body.request_id,
-        body.status,
-        body.result,
-    )
-    .map_err(|err| ApiError::BadRequest(err.to_string()).into_response())?;
+        peer_id,
+        display_name,
+        request_id,
+        status,
+        result,
+    );
 
     admit_runtime_input_via_webhook(&state, &session_id, input, WebhookAdmissionMode::Wakeful).await
 }
@@ -4509,6 +4510,82 @@ mod tests {
     use std::pin::Pin;
     use std::sync::Arc;
     use tempfile::TempDir;
+
+    #[test]
+    fn rest_peer_response_terminal_body_deserializes_typed_identity_and_correlation() {
+        let body: RestPeerResponseTerminalBody = serde_json::from_value(json!({
+            "peer_id": "00000000-0000-4000-8000-000000000161",
+            "display_name": "analyst",
+            "request_id": "00000000-0000-4000-8000-000000000162",
+            "status": "completed",
+            "result": {"ok": true},
+        }))
+        .unwrap();
+
+        assert_eq!(
+            body.peer_id.to_string(),
+            "00000000-0000-4000-8000-000000000161"
+        );
+        assert_eq!(body.display_name.unwrap().as_str(), "analyst");
+        assert_eq!(
+            body.request_id.to_string(),
+            "00000000-0000-4000-8000-000000000162"
+        );
+        assert_eq!(
+            body.status,
+            meerkat_contracts::PeerResponseTerminalStatusWire::Completed
+        );
+        assert_eq!(body.result["ok"], true);
+    }
+
+    #[test]
+    fn rest_peer_response_terminal_body_rejects_name_only_origin() {
+        let err = serde_json::from_value::<RestPeerResponseTerminalBody>(json!({
+            "peer_name": "analyst",
+            "request_id": "00000000-0000-4000-8000-000000000162",
+            "status": "completed",
+            "result": null,
+        }))
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("peer_id"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rest_peer_response_terminal_body_rejects_mixed_peer_name_origin() {
+        let err = serde_json::from_value::<RestPeerResponseTerminalBody>(json!({
+            "peer_id": "00000000-0000-4000-8000-000000000161",
+            "peer_name": "analyst",
+            "request_id": "00000000-0000-4000-8000-000000000162",
+            "status": "completed",
+            "result": null,
+        }))
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("peer_name"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn rest_peer_response_terminal_body_rejects_stringly_request_id() {
+        let err = serde_json::from_value::<RestPeerResponseTerminalBody>(json!({
+            "peer_id": "00000000-0000-4000-8000-000000000161",
+            "request_id": "req-1",
+            "status": "completed",
+            "result": null,
+        }))
+        .unwrap_err();
+
+        assert!(
+            err.to_string().contains("UUID") || err.to_string().contains("uuid"),
+            "unexpected error: {err}"
+        );
+    }
 
     async fn spawn_realtime_rpc_stub(
         expected_method: &'static str,
