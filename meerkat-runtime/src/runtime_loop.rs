@@ -11,6 +11,7 @@ use meerkat_core::lifecycle::run_primitive::{
     PeerResponseTerminalApplyIntent, RunApplyBoundary, RunPrimitive, StagedRunInput,
 };
 use meerkat_core::lifecycle::{InputId, RunId};
+use meerkat_core::turn_execution_authority::ContentShape as TurnContentShape;
 
 #[cfg(test)]
 use crate::input::input_prompt_text;
@@ -100,42 +101,37 @@ fn resolve_completion_waiters(
     }
 }
 
-fn primitive_admitted_content_shape(primitive: &RunPrimitive) -> String {
+fn primitive_admitted_content_shape(primitive: &RunPrimitive) -> TurnContentShape {
     match primitive {
-        RunPrimitive::StagedInput(staged) => {
-            match (staged.appends.is_empty(), staged.context_appends.is_empty()) {
-                (false, false) => "conversation+context",
-                (false, true) => "conversation",
-                (true, false) => "context",
-                (true, true) => "empty",
-            }
-        }
-        RunPrimitive::ImmediateAppend(_) => "immediate_append",
-        RunPrimitive::ImmediateContextAppend(_) => "immediate_context",
-        _ => "conversation",
+        RunPrimitive::StagedInput(staged) => TurnContentShape::from_staged_presence(
+            !staged.appends.is_empty(),
+            !staged.context_appends.is_empty(),
+        ),
+        RunPrimitive::ImmediateAppend(_) => TurnContentShape::ImmediateAppend,
+        RunPrimitive::ImmediateContextAppend(_) => TurnContentShape::ImmediateContext,
+        _ => TurnContentShape::Conversation,
     }
-    .to_string()
 }
 
 fn primitive_turn_start_input(
     run_id: &RunId,
     primitive: &RunPrimitive,
 ) -> Option<crate::meerkat_machine::dsl::MeerkatMachineInput> {
-    let admitted_content_shape = primitive_admitted_content_shape(primitive);
     match primitive {
         RunPrimitive::ImmediateAppend(_) => Some(
             crate::meerkat_machine::dsl::MeerkatMachineInput::StartImmediateAppend {
                 run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
-                admitted_content_shape,
             },
         ),
         RunPrimitive::ImmediateContextAppend(_) => Some(
             crate::meerkat_machine::dsl::MeerkatMachineInput::StartImmediateContext {
                 run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
-                admitted_content_shape,
             },
         ),
         RunPrimitive::StagedInput(_) if primitive.is_peer_response_terminal_context_and_run() => {
+            let admitted_content_shape = crate::meerkat_machine::dsl::ContentShape::from(
+                primitive_admitted_content_shape(primitive),
+            );
             Some(
                 crate::meerkat_machine::dsl::MeerkatMachineInput::StartConversationRun {
                     run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
@@ -151,30 +147,41 @@ fn primitive_turn_start_input(
         RunPrimitive::StagedInput(_) if primitive.is_context_only_apply_without_turn() => Some(
             crate::meerkat_machine::dsl::MeerkatMachineInput::StartImmediateContext {
                 run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
-                admitted_content_shape,
             },
         ),
         RunPrimitive::StagedInput(staged) if staged.appends.is_empty() => None,
-        RunPrimitive::StagedInput(_) => Some(
-            crate::meerkat_machine::dsl::MeerkatMachineInput::StartConversationRun {
-                run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
-                primitive_kind: crate::meerkat_machine::dsl::TurnPrimitiveKind::ConversationTurn,
-                admitted_content_shape,
-                vision_enabled: false,
-                image_tool_results_enabled: false,
-                max_extraction_retries: 0,
-            },
-        ),
-        _ => Some(
-            crate::meerkat_machine::dsl::MeerkatMachineInput::StartConversationRun {
-                run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
-                primitive_kind: crate::meerkat_machine::dsl::TurnPrimitiveKind::ConversationTurn,
-                admitted_content_shape,
-                vision_enabled: false,
-                image_tool_results_enabled: false,
-                max_extraction_retries: 0,
-            },
-        ),
+        RunPrimitive::StagedInput(_) => {
+            let admitted_content_shape = crate::meerkat_machine::dsl::ContentShape::from(
+                primitive_admitted_content_shape(primitive),
+            );
+            Some(
+                crate::meerkat_machine::dsl::MeerkatMachineInput::StartConversationRun {
+                    run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
+                    primitive_kind:
+                        crate::meerkat_machine::dsl::TurnPrimitiveKind::ConversationTurn,
+                    admitted_content_shape,
+                    vision_enabled: false,
+                    image_tool_results_enabled: false,
+                    max_extraction_retries: 0,
+                },
+            )
+        }
+        _ => {
+            let admitted_content_shape = crate::meerkat_machine::dsl::ContentShape::from(
+                primitive_admitted_content_shape(primitive),
+            );
+            Some(
+                crate::meerkat_machine::dsl::MeerkatMachineInput::StartConversationRun {
+                    run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
+                    primitive_kind:
+                        crate::meerkat_machine::dsl::TurnPrimitiveKind::ConversationTurn,
+                    admitted_content_shape,
+                    vision_enabled: false,
+                    image_tool_results_enabled: false,
+                    max_extraction_retries: 0,
+                },
+            )
+        }
     }
 }
 
@@ -1130,7 +1137,10 @@ mod tests {
                     primitive_kind,
                     crate::meerkat_machine::dsl::TurnPrimitiveKind::ConversationTurn
                 );
-                assert_eq!(admitted_content_shape, "conversation");
+                assert_eq!(
+                    admitted_content_shape,
+                    crate::meerkat_machine::dsl::ContentShape::Conversation
+                );
                 Ok(())
             }
             other => Err(format!("expected StartConversationRun, got {other:?}")),
@@ -1306,7 +1316,10 @@ mod tests {
                     primitive_kind,
                     crate::meerkat_machine::dsl::TurnPrimitiveKind::ConversationTurn
                 );
-                assert_eq!(admitted_content_shape, "context");
+                assert_eq!(
+                    admitted_content_shape,
+                    crate::meerkat_machine::dsl::ContentShape::Context
+                );
                 Ok(())
             }
             other => Err(format!("expected StartConversationRun, got {other:?}")),

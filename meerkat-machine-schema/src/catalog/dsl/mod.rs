@@ -189,6 +189,10 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
             NamedTypeBinding::string("CommsRuntimeId"),
             NamedTypeBinding::string("ConnectionRef"),
             NamedTypeBinding::string_enum(
+                meerkat_core::turn_execution_authority::ContentShape::SCHEMA_TYPE_NAME,
+                &meerkat_core::turn_execution_authority::ContentShape::SCHEMA_VARIANTS,
+            ),
+            NamedTypeBinding::string_enum(
                 "DrainExitReason",
                 &[
                     "IdleTimeout",

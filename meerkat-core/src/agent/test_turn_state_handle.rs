@@ -153,12 +153,14 @@ impl LocalState {
                 fields = LocalFields::init();
                 fields.active_run = Some(run_id.clone());
                 fields.primitive_kind = TurnPrimitiveKind::ImmediateAppend;
+                fields.admitted_content_shape = Some(ContentShape::ImmediateAppend);
                 ApplyingPrimitive
             }
             (Ready | Completed | Failed | Cancelled, StartImmediateContext { run_id }) => {
                 fields = LocalFields::init();
                 fields.active_run = Some(run_id.clone());
                 fields.primitive_kind = TurnPrimitiveKind::ImmediateContextAppend;
+                fields.admitted_content_shape = Some(ContentShape::ImmediateContext);
                 ApplyingPrimitive
             }
             (
@@ -173,7 +175,7 @@ impl LocalState {
                 if !self.guard_run_matches(run_id) {
                     return Err(invalid(phase, &input));
                 }
-                fields.admitted_content_shape = Some(admitted_content_shape.clone());
+                fields.admitted_content_shape = Some(*admitted_content_shape);
                 fields.vision_enabled = *vision_enabled;
                 fields.image_tool_results_enabled = *image_tool_results_enabled;
                 match fields.primitive_kind {
@@ -557,7 +559,7 @@ fn ensure_active_conversation_run(state: &mut LocalState) -> Result<(), DslTrans
         state
             .apply(TurnExecutionInput::PrimitiveApplied {
                 run_id,
-                admitted_content_shape: ContentShape("conversation".to_string()),
+                admitted_content_shape: ContentShape::Conversation,
                 vision_enabled: false,
                 image_tool_results_enabled: false,
             })
@@ -627,45 +629,31 @@ impl TurnStateHandle for TestTurnStateHandle {
         &self,
         run_id: RunId,
         primitive_kind: crate::turn_execution_authority::TurnPrimitiveKind,
-        _admitted_content_shape: String,
+        admitted_content_shape: ContentShape,
         _vision_enabled: bool,
         _image_tool_results_enabled: bool,
         _max_extraction_retries: u64,
     ) -> Result<(), DslTransitionError> {
         let mut guard = self.lock_state()?;
-        match primitive_kind {
-            TurnPrimitiveKind::ConversationTurn => {
-                guard.apply(TurnExecutionInput::StartConversationRun { run_id })
-            }
-            TurnPrimitiveKind::ImmediateAppend => {
-                guard.apply(TurnExecutionInput::StartImmediateAppend { run_id })
-            }
-            TurnPrimitiveKind::ImmediateContextAppend => {
-                guard.apply(TurnExecutionInput::StartImmediateContext { run_id })
-            }
-            TurnPrimitiveKind::None => Err(DslTransitionError::guard_rejected(
+        if primitive_kind != TurnPrimitiveKind::ConversationTurn {
+            return Err(DslTransitionError::guard_rejected(
                 "test-turn-state-handle",
-                "start_conversation_run with primitive_kind=None".to_string(),
-            )),
+                format!("start_conversation_run with primitive_kind={primitive_kind:?}"),
+            ));
         }
+        guard.apply(TurnExecutionInput::StartConversationRun { run_id })?;
+        guard.fields.admitted_content_shape = Some(admitted_content_shape);
+        Ok(())
     }
 
-    fn start_immediate_append(
-        &self,
-        run_id: RunId,
-        _admitted_content_shape: String,
-    ) -> Result<(), DslTransitionError> {
-        self.lock_state()?
-            .apply(TurnExecutionInput::StartImmediateAppend { run_id })
+    fn start_immediate_append(&self, run_id: RunId) -> Result<(), DslTransitionError> {
+        let mut guard = self.lock_state()?;
+        guard.apply(TurnExecutionInput::StartImmediateAppend { run_id })
     }
 
-    fn start_immediate_context(
-        &self,
-        run_id: RunId,
-        _admitted_content_shape: String,
-    ) -> Result<(), DslTransitionError> {
-        self.lock_state()?
-            .apply(TurnExecutionInput::StartImmediateContext { run_id })
+    fn start_immediate_context(&self, run_id: RunId) -> Result<(), DslTransitionError> {
+        let mut guard = self.lock_state()?;
+        guard.apply(TurnExecutionInput::StartImmediateContext { run_id })
     }
 
     fn primitive_applied(&self) -> Result<(), DslTransitionError> {
@@ -703,9 +691,13 @@ impl TurnStateHandle for TestTurnStateHandle {
                 })?;
         }
         let run_id = active_run_or_err(&guard, "primitive_applied")?;
+        let admitted_content_shape = guard
+            .fields
+            .admitted_content_shape
+            .unwrap_or(ContentShape::Conversation);
         guard.apply(TurnExecutionInput::PrimitiveApplied {
             run_id,
-            admitted_content_shape: ContentShape("conversation".to_string()),
+            admitted_content_shape,
             vision_enabled: false,
             image_tool_results_enabled: false,
         })
@@ -910,10 +902,7 @@ impl TurnStateHandle for TestTurnStateHandle {
                 TurnPrimitiveKind::None => None,
                 other => Some(other),
             },
-            admitted_content_shape: fields
-                .admitted_content_shape
-                .as_ref()
-                .map(|cs| cs.0.clone()),
+            admitted_content_shape: fields.admitted_content_shape,
             vision_enabled: fields.vision_enabled,
             image_tool_results_enabled: fields.image_tool_results_enabled,
             tool_calls_pending: u64::from(fields.tool_calls_pending),
@@ -977,7 +966,7 @@ mod tests {
             .start_conversation_run(
                 run_id,
                 TurnPrimitiveKind::ConversationTurn,
-                "conversation".to_string(),
+                ContentShape::Conversation,
                 false,
                 false,
                 2,
@@ -1007,5 +996,28 @@ mod tests {
                 .contains(&AsyncOpRef::barrier(barrier_id.clone()))
         );
         assert!(snapshot.barrier_operation_ids.contains(&barrier_id));
+    }
+
+    #[test]
+    fn test_turn_state_handle_preserves_supplied_content_shape() {
+        let handle = TestTurnStateHandle::new();
+
+        handle
+            .start_conversation_run(
+                RunId::new(),
+                TurnPrimitiveKind::ConversationTurn,
+                ContentShape::ConversationAndContext,
+                false,
+                false,
+                0,
+            )
+            .expect("start run");
+        handle.primitive_applied().expect("primitive applied");
+
+        let snapshot = handle.snapshot();
+        assert_eq!(
+            snapshot.admitted_content_shape,
+            Some(ContentShape::ConversationAndContext)
+        );
     }
 }

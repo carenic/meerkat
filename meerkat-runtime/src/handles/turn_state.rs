@@ -70,7 +70,7 @@ impl TurnStateHandle for RuntimeTurnStateHandle {
         &self,
         run_id: RunId,
         primitive_kind: TurnPrimitiveKind,
-        admitted_content_shape: String,
+        admitted_content_shape: meerkat_core::turn_execution_authority::ContentShape,
         vision_enabled: bool,
         image_tool_results_enabled: bool,
         max_extraction_retries: u64,
@@ -80,7 +80,7 @@ impl TurnStateHandle for RuntimeTurnStateHandle {
             mm_dsl::MeerkatMachineInput::StartConversationRun {
                 run_id: mm_dsl::RunId::from_domain(&run_id),
                 primitive_kind: mm_dsl::TurnPrimitiveKind::from(primitive_kind),
-                admitted_content_shape,
+                admitted_content_shape: mm_dsl::ContentShape::from(admitted_content_shape),
                 vision_enabled,
                 image_tool_results_enabled,
                 max_extraction_retries,
@@ -89,31 +89,21 @@ impl TurnStateHandle for RuntimeTurnStateHandle {
         )
     }
 
-    fn start_immediate_append(
-        &self,
-        run_id: RunId,
-        admitted_content_shape: String,
-    ) -> Result<(), DslTransitionError> {
+    fn start_immediate_append(&self, run_id: RunId) -> Result<(), DslTransitionError> {
         // intra-machine: no route; dispatcher not applicable (handle targets the meerkat DSL directly, not a CompositionDispatcher seam)
         self.dsl.apply_input(
             mm_dsl::MeerkatMachineInput::StartImmediateAppend {
                 run_id: mm_dsl::RunId::from_domain(&run_id),
-                admitted_content_shape,
             },
             "TurnStateHandle::start_immediate_append",
         )
     }
 
-    fn start_immediate_context(
-        &self,
-        run_id: RunId,
-        admitted_content_shape: String,
-    ) -> Result<(), DslTransitionError> {
+    fn start_immediate_context(&self, run_id: RunId) -> Result<(), DslTransitionError> {
         // intra-machine: no route; dispatcher not applicable (handle targets the meerkat DSL directly, not a CompositionDispatcher seam)
         self.dsl.apply_input(
             mm_dsl::MeerkatMachineInput::StartImmediateContext {
                 run_id: mm_dsl::RunId::from_domain(&run_id),
-                admitted_content_shape,
             },
             "TurnStateHandle::start_immediate_context",
         )
@@ -413,7 +403,7 @@ impl TurnStateHandle for RuntimeTurnStateHandle {
             loop_state: map_loop_state(state.turn_phase),
             turn_phase,
             primitive_kind: state.primitive_kind.map(TurnPrimitiveKind::from),
-            admitted_content_shape: state.admitted_content_shape.clone(),
+            admitted_content_shape: state.admitted_content_shape.map(Into::into),
             vision_enabled: state.vision_enabled,
             image_tool_results_enabled: state.image_tool_results_enabled,
             tool_calls_pending: state.tool_calls_pending,
@@ -516,7 +506,7 @@ mod tests {
             .start_conversation_run(
                 run_id.clone(),
                 TurnPrimitiveKind::ConversationTurn,
-                "conversation".into(),
+                meerkat_core::turn_execution_authority::ContentShape::Conversation,
                 true,
                 false,
                 2,
@@ -541,7 +531,7 @@ mod tests {
             .start_conversation_run(
                 run_id,
                 TurnPrimitiveKind::ConversationTurn,
-                "conversation".into(),
+                meerkat_core::turn_execution_authority::ContentShape::Conversation,
                 false,
                 false,
                 0,
@@ -557,6 +547,19 @@ mod tests {
     }
 
     #[test]
+    fn immediate_append_derives_content_shape() {
+        let handle = RuntimeTurnStateHandle::ephemeral();
+        let run_id = RunId(Uuid::from_u128(10));
+
+        handle.start_immediate_append(run_id).unwrap();
+
+        assert_eq!(
+            handle.snapshot().admitted_content_shape,
+            Some(meerkat_core::turn_execution_authority::ContentShape::ImmediateAppend)
+        );
+    }
+
+    #[test]
     fn retry_schedule_is_recorded_and_attempt_guarded() {
         let handle = RuntimeTurnStateHandle::ephemeral();
         let run_id = RunId(Uuid::from_u128(9));
@@ -565,7 +568,7 @@ mod tests {
             .start_conversation_run(
                 run_id,
                 TurnPrimitiveKind::ConversationTurn,
-                "conversation".into(),
+                meerkat_core::turn_execution_authority::ContentShape::Conversation,
                 false,
                 false,
                 0,
