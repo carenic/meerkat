@@ -199,9 +199,9 @@ impl CoreExecutor for PersistentRuntimeExecutor {
         primitive: RunPrimitive,
     ) -> Result<CoreApplyOutput, CoreExecutorError> {
         if let Some(reason) = primitive.peer_response_terminal_apply_intent_violation() {
-            return Err(CoreExecutorError::ApplyFailed {
-                reason: reason.to_string(),
-            });
+            return Err(CoreExecutorError::apply_failed_primitive_rejected(
+                reason.to_string(),
+            ));
         }
 
         if primitive.is_context_only_apply_without_turn() {
@@ -233,8 +233,8 @@ impl CoreExecutor for PersistentRuntimeExecutor {
                     pending_system_context_appends(&staged.context_appends),
                 )
                 .await
-                .map_err(|error| CoreExecutorError::ApplyFailed {
-                    reason: error.to_string(),
+                .map_err(|error| {
+                    CoreExecutorError::apply_failed_runtime_context(error.to_string())
                 })?;
         }
 
@@ -1048,9 +1048,9 @@ mod tests {
             .expect_err("malformed terminal peer-response intent must be rejected");
 
         match error {
-            CoreExecutorError::ApplyFailed { reason } => assert!(
-                reason.contains("requires RunStart boundary"),
-                "unexpected rejection reason: {reason}"
+            CoreExecutorError::ApplyFailed { cause } => assert!(
+                cause.message().contains("requires RunStart boundary"),
+                "unexpected rejection reason: {cause}"
             ),
             other => panic!("expected ApplyFailed, got {other:?}"),
         }
