@@ -198,6 +198,12 @@ impl CoreExecutor for PersistentRuntimeExecutor {
         run_id: meerkat_core::lifecycle::RunId,
         primitive: RunPrimitive,
     ) -> Result<CoreApplyOutput, CoreExecutorError> {
+        if let Some(reason) = primitive.peer_response_terminal_apply_intent_violation() {
+            return Err(CoreExecutorError::ApplyFailed {
+                reason: reason.to_string(),
+            });
+        }
+
         if primitive.is_context_only_apply_without_turn() {
             let RunPrimitive::StagedInput(staged) = &primitive else {
                 unreachable!("context-only apply without turn only matches staged primitives");
@@ -986,6 +992,76 @@ mod tests {
             system_context.contains("[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL] done"),
             "terminal peer response context must be applied before reaction turn: {system_context}"
         );
+
+        service
+            .discard_live_session(&result.session_id)
+            .await
+            .expect("discard live session");
+        adapter.unregister_session(&result.session_id).await;
+    }
+
+    #[tokio::test]
+    async fn persistent_runtime_executor_rejects_malformed_terminal_peer_response_intent() {
+        use meerkat_core::lifecycle::InputId;
+        use meerkat_core::lifecycle::RunId;
+        use meerkat_core::lifecycle::run_primitive::{
+            ConversationContextAppend, PeerResponseTerminalApplyIntent, RunApplyBoundary,
+            RuntimeExecutionKind, RuntimeTurnMetadata, StagedRunInput,
+        };
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let (service, adapter) = build_test_service(&temp).await;
+        let result = Box::pin(materialize_session(
+            &service,
+            &adapter,
+            Session::new(),
+            make_request(SessionBuildOptions::default()),
+            {
+                let service = Arc::clone(&service);
+                let adapter = Arc::clone(&adapter);
+                move |session_id| default_persistent_executor(service, adapter, session_id)
+            },
+        ))
+        .await
+        .expect("materialize session");
+
+        let mut executor = PersistentRuntimeExecutor::new(
+            Arc::clone(&service),
+            Arc::clone(&adapter),
+            result.session_id.clone(),
+        );
+        let error = executor
+            .apply(
+                RunId::new(),
+                RunPrimitive::StagedInput(StagedRunInput {
+                    boundary: RunApplyBoundary::Immediate,
+                    appends: Vec::new(),
+                    context_appends: vec![ConversationContextAppend {
+                        key: "peer_response_terminal:analyst-rt:req-invalid".to_string(),
+                        content: CoreRenderable::Text {
+                            text: "[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL] invalid".to_string(),
+                        },
+                    }],
+                    contributing_input_ids: vec![InputId::new()],
+                    turn_metadata: Some(RuntimeTurnMetadata {
+                        execution_kind: Some(RuntimeExecutionKind::ContentTurn),
+                        peer_response_terminal_apply_intent: Some(
+                            PeerResponseTerminalApplyIntent::AppendContextAndRun,
+                        ),
+                        ..Default::default()
+                    }),
+                }),
+            )
+            .await
+            .expect_err("malformed terminal peer-response intent must be rejected");
+
+        match error {
+            CoreExecutorError::ApplyFailed { reason } => assert!(
+                reason.contains("requires RunStart boundary"),
+                "unexpected rejection reason: {reason}"
+            ),
+            other => panic!("expected ApplyFailed, got {other:?}"),
+        }
 
         service
             .discard_live_session(&result.session_id)

@@ -478,6 +478,12 @@ async fn apply_runtime_turn(
     run_id: meerkat_core::lifecycle::RunId,
     primitive: &RunPrimitive,
 ) -> Result<CoreApplyOutput, SessionError> {
+    if let Some(reason) = primitive.peer_response_terminal_apply_intent_violation() {
+        return Err(SessionError::Agent(AgentError::InternalError(
+            reason.to_string(),
+        )));
+    }
+
     if primitive.is_context_only_apply_without_turn() {
         let RunPrimitive::StagedInput(staged) = primitive else {
             unreachable!("context-only apply helper only matches staged inputs");
@@ -653,5 +659,83 @@ impl CoreExecutor for McpSessionRuntimeExecutor {
             }
             _ => Ok(()),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use meerkat::surface::build_runtime_backed_service;
+    use meerkat::{AgentFactory, Config, PersistenceBundle};
+    use meerkat_client::TestClient;
+    use meerkat_core::lifecycle::run_primitive::{
+        PeerResponseTerminalApplyIntent, RunApplyBoundary, RuntimeExecutionKind,
+        RuntimeTurnMetadata, StagedRunInput,
+    };
+    use meerkat_core::lifecycle::{InputId, RunId};
+    use meerkat_core::{MemoryConfigStore, RealmId};
+    use meerkat_store::{JsonlStore, MemoryBlobStore};
+
+    async fn build_test_context(temp: &tempfile::TempDir) -> McpRuntimeIngressContext {
+        let session_store = Arc::new(JsonlStore::new(temp.path().join("sessions")));
+        session_store.init().await.expect("init jsonl store");
+        let session_store: Arc<dyn meerkat::SessionStore> = session_store;
+        let persistence =
+            PersistenceBundle::new(session_store, None, Arc::new(MemoryBlobStore::new()));
+
+        let factory = AgentFactory::new(temp.path().join("sessions"));
+        let mut builder = FactoryAgentBuilder::new(factory, Config::default());
+        builder.default_llm_client = Some(Arc::new(TestClient::default()));
+        let (service, runtime_adapter) = build_runtime_backed_service(builder, 4, persistence);
+        let config_store = Arc::new(MemoryConfigStore::new(Config::default()));
+
+        McpRuntimeIngressContext::new(McpRuntimeIngressResources {
+            service: Arc::new(service),
+            runtime_adapter,
+            config_runtime: Arc::new(ConfigRuntime::new(
+                config_store,
+                temp.path().join("config-state.json"),
+            )),
+            realm_id: RealmId::parse("mcp-runtime-test").expect("valid realm id"),
+            instance_id: None,
+            backend: "test".to_string(),
+            mcp_adapters: Arc::new(Mutex::new(HashMap::new())),
+            runtime_sessions: Arc::new(RwLock::new(HashMap::new())),
+        })
+    }
+
+    #[tokio::test]
+    async fn mcp_runtime_ingress_rejects_malformed_terminal_peer_response_intent() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let context = build_test_context(&temp).await;
+        let state = Arc::new(McpRuntimeSessionState::default());
+        let session_id = SessionId::new();
+        let primitive = RunPrimitive::StagedInput(StagedRunInput {
+            boundary: RunApplyBoundary::Immediate,
+            appends: Vec::new(),
+            context_appends: vec![ConversationContextAppend {
+                key: "peer_response_terminal:analyst-rt:req-invalid".to_string(),
+                content: CoreRenderable::Text {
+                    text: "[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL] invalid".to_string(),
+                },
+            }],
+            contributing_input_ids: vec![InputId::new()],
+            turn_metadata: Some(RuntimeTurnMetadata {
+                execution_kind: Some(RuntimeExecutionKind::ContentTurn),
+                peer_response_terminal_apply_intent: Some(
+                    PeerResponseTerminalApplyIntent::AppendContextAndRun,
+                ),
+                ..Default::default()
+            }),
+        });
+
+        let error = apply_runtime_turn(&context, &state, &session_id, RunId::new(), &primitive)
+            .await
+            .expect_err("malformed terminal peer-response intent must be rejected");
+
+        assert!(
+            error.to_string().contains("requires RunStart boundary"),
+            "unexpected rejection reason: {error}"
+        );
     }
 }

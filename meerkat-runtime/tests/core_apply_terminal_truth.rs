@@ -39,6 +39,26 @@ fn extract_braced_item<'a>(contents: &'a str, marker: &str) -> &'a str {
     panic!("unterminated braced item after `{marker}`");
 }
 
+fn assert_terminal_intent_validation_precedes_consumption(source: &str, owner: &str) {
+    let validation = source
+        .find("primitive.peer_response_terminal_apply_intent_violation()")
+        .unwrap_or_else(|| {
+            panic!("{owner} must reject malformed terminal peer-response intent before applying it")
+        });
+    for consumption in [
+        "primitive.is_context_only_apply_without_turn()",
+        "primitive.is_peer_response_terminal_context_and_run()",
+    ] {
+        let consumption = source
+            .find(consumption)
+            .unwrap_or_else(|| panic!("{owner} missing `{consumption}`"));
+        assert!(
+            validation < consumption,
+            "{owner} must validate terminal peer-response intent before `{consumption}`"
+        );
+    }
+}
+
 #[test]
 fn core_apply_terminal_truth_has_one_authority() {
     let root = workspace_root();
@@ -83,6 +103,10 @@ fn terminal_context_and_run_adapters_use_canonical_primitive_intent() {
         runtime_backed_apply.contains("primitive.is_context_only_apply_without_turn()"),
         "runtime-backed context shortcut must use the canonical primitive intent helper"
     );
+    assert_terminal_intent_validation_precedes_consumption(
+        runtime_backed_apply,
+        "runtime-backed apply",
+    );
 
     assert!(
         runtime_backed_apply.contains("primitive.is_peer_response_terminal_context_and_run()")
@@ -95,6 +119,10 @@ fn terminal_context_and_run_adapters_use_canonical_primitive_intent() {
     assert!(
         mcp_runtime_apply.contains("primitive.is_context_only_apply_without_turn()"),
         "MCP runtime ingress must not re-derive context-only terminal behavior from append shape"
+    );
+    assert_terminal_intent_validation_precedes_consumption(
+        mcp_runtime_apply,
+        "MCP runtime ingress apply",
     );
     assert!(
         mcp_runtime_apply.contains("primitive.is_peer_response_terminal_context_and_run()")
