@@ -514,7 +514,7 @@ impl MeerkatMachine {
                 Ok(MeerkatMachineCommandResult::DestroyReport(report))
             }
             MeerkatMachineCommand::RuntimeState { runtime_id } => {
-                let session_id = Self::resolve_session_id(&runtime_id)?;
+                let session_id = self.resolve_session_id(&runtime_id).await?;
                 let state = self
                     .existing_session_visible_runtime_state(&session_id)
                     .await
@@ -524,9 +524,7 @@ impl MeerkatMachine {
             MeerkatMachineCommand::RuntimeRealtimeAttachmentStatus { session_id } => {
                 let sessions = self.sessions.read().await;
                 let entry = sessions.get(&session_id).ok_or_else(|| {
-                    RuntimeControlPlaneError::NotFound(LogicalRuntimeId::new(
-                        session_id.to_string(),
-                    ))
+                    RuntimeControlPlaneError::NotFound(Self::logical_runtime_id(&session_id))
                 })?;
                 let authority = entry
                     .dsl_authority
@@ -540,9 +538,7 @@ impl MeerkatMachine {
             MeerkatMachineCommand::RuntimeRealtimeChannelStatus { session_id } => {
                 let sessions = self.sessions.read().await;
                 let entry = sessions.get(&session_id).ok_or_else(|| {
-                    RuntimeControlPlaneError::NotFound(LogicalRuntimeId::new(
-                        session_id.to_string(),
-                    ))
+                    RuntimeControlPlaneError::NotFound(Self::logical_runtime_id(&session_id))
                 })?;
                 let authority = entry
                     .dsl_authority
@@ -573,9 +569,7 @@ impl MeerkatMachine {
             MeerkatMachineCommand::SessionModelRoutingStatus { session_id } => {
                 let sessions = self.sessions.read().await;
                 let entry = sessions.get(&session_id).ok_or_else(|| {
-                    RuntimeControlPlaneError::NotFound(LogicalRuntimeId::new(
-                        session_id.to_string(),
-                    ))
+                    RuntimeControlPlaneError::NotFound(Self::logical_runtime_id(&session_id))
                 })?;
                 let authority = entry
                     .dsl_authority

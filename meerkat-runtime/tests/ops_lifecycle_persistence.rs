@@ -669,7 +669,7 @@ async fn cold_persistent_adapter_recovers_persisted_epoch() {
 
     let session_id = SessionId::new();
 
-    // Phase 1: Persist a snapshot manually.
+    // Phase 1: Persist a snapshot manually under the legacy raw UUID alias.
     let registry = meerkat_runtime::RuntimeOpsLifecycleRegistry::new();
     let cursor_state = Arc::new(EpochCursorState::new());
     let epoch_id = RuntimeEpochId::new();
@@ -683,7 +683,8 @@ async fn cold_persistent_adapter_recovers_persisted_epoch() {
         .unwrap();
 
     let snapshot = registry.capture_persistence_snapshot(epoch_id.clone(), &cursor_state);
-    let runtime_id = meerkat_runtime::identifiers::LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id =
+        meerkat_runtime::identifiers::LogicalRuntimeId::legacy_session_uuid_alias(&session_id);
     store
         .persist_ops_lifecycle(&runtime_id, &snapshot)
         .await
@@ -718,7 +719,7 @@ async fn cold_ensure_session_with_executor_recovers_persisted_epoch() {
 
     let session_id = SessionId::new();
 
-    // Persist a snapshot
+    // Persist a snapshot under the legacy raw UUID alias.
     let registry = meerkat_runtime::RuntimeOpsLifecycleRegistry::new();
     let cursor_state = Arc::new(EpochCursorState::new());
     let epoch_id = RuntimeEpochId::new();
@@ -732,7 +733,8 @@ async fn cold_ensure_session_with_executor_recovers_persisted_epoch() {
         .unwrap();
 
     let snapshot = registry.capture_persistence_snapshot(epoch_id.clone(), &cursor_state);
-    let runtime_id = meerkat_runtime::identifiers::LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id =
+        meerkat_runtime::identifiers::LogicalRuntimeId::legacy_session_uuid_alias(&session_id);
     store
         .persist_ops_lifecycle(&runtime_id, &snapshot)
         .await

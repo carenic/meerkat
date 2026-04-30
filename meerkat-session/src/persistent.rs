@@ -421,7 +421,21 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     }
 
     fn runtime_id_for_session(id: &SessionId) -> LogicalRuntimeId {
-        LogicalRuntimeId::new(id.to_string())
+        LogicalRuntimeId::for_session(id)
+    }
+
+    fn legacy_runtime_id_for_session(id: &SessionId) -> LogicalRuntimeId {
+        LogicalRuntimeId::legacy_session_uuid_alias(id)
+    }
+
+    fn runtime_id_candidates_for_session(id: &SessionId) -> Vec<LogicalRuntimeId> {
+        let canonical = Self::runtime_id_for_session(id);
+        let legacy = Self::legacy_runtime_id_for_session(id);
+        if canonical == legacy {
+            vec![canonical]
+        } else {
+            vec![canonical, legacy]
+        }
     }
 
     async fn runtime_input_updates(
@@ -434,15 +448,20 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         let Some(runtime_store) = self.runtime_store.as_ref() else {
             return Ok(Vec::new());
         };
-        let runtime_id = Self::runtime_id_for_session(id);
-        let stored_states = runtime_store
-            .load_input_states(&runtime_id)
-            .await
-            .map_err(|err| {
-                SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
-                    "failed to load runtime input states: {err}"
-                )))
-            })?;
+        let mut stored_states = Vec::new();
+        for runtime_id in Self::runtime_id_candidates_for_session(id) {
+            stored_states = runtime_store
+                .load_input_states(&runtime_id)
+                .await
+                .map_err(|err| {
+                    SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
+                        "failed to load runtime input states: {err}"
+                    )))
+                })?;
+            if !stored_states.is_empty() {
+                break;
+            }
+        }
 
         Ok(contributing_input_ids
             .iter()
@@ -577,8 +596,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         id: &SessionId,
     ) -> Result<Option<Session>, SessionError> {
         if let Some(runtime_store) = self.runtime_store.as_ref() {
-            let runtime_id = Self::runtime_id_for_session(id);
-            Self::load_runtime_session_snapshot(runtime_store, &runtime_id).await
+            Self::load_runtime_session_snapshot_for_session(runtime_store, id).await
         } else {
             self.store
                 .load(id)
@@ -611,6 +629,20 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             .transpose()
     }
 
+    async fn load_runtime_session_snapshot_for_session(
+        runtime_store: &Arc<dyn RuntimeStore>,
+        id: &SessionId,
+    ) -> Result<Option<Session>, SessionError> {
+        for runtime_id in Self::runtime_id_candidates_for_session(id) {
+            if let Some(session) =
+                Self::load_runtime_session_snapshot(runtime_store, &runtime_id).await?
+            {
+                return Ok(Some(session));
+            }
+        }
+        Ok(None)
+    }
+
     fn store_only_control_mutation_error(id: &SessionId, operation: &str) -> SessionError {
         SessionError::Unsupported(format!(
             "{operation} cannot mutate store-only compatibility projection for session {id}; runtime-backed control mutations require an authoritative runtime snapshot"
@@ -626,25 +658,8 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             return Ok(None);
         };
 
-        let runtime_id = Self::runtime_id_for_session(id);
-        if let Some(runtime) = runtime_store
-            .load_session_snapshot(&runtime_id)
-            .await
-            .map_err(|err| {
-                SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
-                    "failed to load runtime session snapshot: {err}"
-                )))
-            })?
-            .map(|bytes| {
-                meerkat_core::session_migrations::deserialize_session_migrating(&bytes).map_err(
-                    |err| {
-                        SessionError::Agent(meerkat_core::error::AgentError::InternalError(
-                            format!("failed to deserialize runtime session snapshot: {err}"),
-                        ))
-                    },
-                )
-            })
-            .transpose()?
+        if let Some(runtime) =
+            Self::load_runtime_session_snapshot_for_session(runtime_store, id).await?
         {
             return Ok(Some(runtime));
         }
@@ -709,9 +724,8 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         };
 
         let stored = if let Some(runtime_store) = self.runtime_store.as_ref() {
-            let runtime_id = Self::runtime_id_for_session(id);
             let Some(runtime) =
-                Self::load_runtime_session_snapshot(runtime_store, &runtime_id).await?
+                Self::load_runtime_session_snapshot_for_session(runtime_store, id).await?
             else {
                 return Ok(false);
             };
@@ -4882,6 +4896,59 @@ mod tests {
             raw_store_row.messages().len(),
             raw_projection.messages().len(),
             "compatibility projection should remain inert in the raw store"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_runtime_backed_authoritative_load_accepts_legacy_session_uuid_runtime_alias() {
+        let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+        let runtime_store = Arc::new(InMemoryRuntimeStore::new());
+        let service = PersistentSessionService::new(
+            DummyBuilder,
+            4,
+            Arc::clone(&store),
+            Some(runtime_store.clone()),
+            memory_blob_store(),
+        );
+
+        let mut legacy_runtime_session = Session::new();
+        legacy_runtime_session.push(Message::User(UserMessage::text(
+            "legacy runtime alias row".to_string(),
+        )));
+        let id = legacy_runtime_session.id().clone();
+        let snapshot =
+            serde_json::to_vec(&legacy_runtime_session).expect("legacy session should serialize");
+        let legacy_runtime_alias = LogicalRuntimeId::legacy_session_uuid_alias(&id);
+        let canonical_runtime_id =
+            PersistentSessionService::<DummyBuilder>::runtime_id_for_session(&id);
+        assert_ne!(
+            canonical_runtime_id, legacy_runtime_alias,
+            "canonical runtime id must be distinct from the legacy raw session UUID alias"
+        );
+
+        runtime_store
+            .commit_session_boundary(
+                &legacy_runtime_alias,
+                meerkat_runtime::store::SessionDelta {
+                    session_snapshot: snapshot,
+                },
+                RunId::new(),
+                RunApplyBoundary::Immediate,
+                vec![],
+                vec![],
+            )
+            .await
+            .expect("test should seed a legacy runtime alias snapshot");
+
+        let authoritative = service
+            .load_authoritative_session(&id)
+            .await
+            .expect("authoritative load should succeed")
+            .expect("legacy runtime alias should remain readable");
+        assert_eq!(
+            authoritative.messages().len(),
+            legacy_runtime_session.messages().len(),
+            "runtime-backed resume must preserve legacy raw alias snapshots"
         );
     }
 

@@ -36,6 +36,7 @@ use meerkat_contracts::wire::supervisor_bridge::{
 use crate::comms_bridge::classified_interaction_to_runtime_input;
 use crate::completion::CompletionOutcome;
 use crate::identifiers::IdempotencyKey;
+#[cfg(test)]
 use crate::identifiers::LogicalRuntimeId;
 use crate::input::{
     Input, InputDurability, InputHeader, InputOrigin, InputVisibility, PeerConvention, PeerInput,
@@ -62,7 +63,7 @@ pub fn spawn_comms_drain(
     idle_timeout: Option<Duration>,
 ) -> crate::tokio::task::JoinHandle<()> {
     let timeout_dur = idle_timeout.unwrap_or(DEFAULT_IDLE_TIMEOUT);
-    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+    let runtime_id = MeerkatMachine::logical_runtime_id(&session_id);
 
     crate::tokio::spawn(async move {
         if std::env::var_os("RKAT_TRACE_COMMS_DRAIN_BIND").is_some() {
@@ -542,7 +543,7 @@ fn peer_input_from_delivery_payload(
             source: InputOrigin::Peer {
                 peer_id: sender_peer_id.as_str(),
                 display_identity: Some(sender_peer_id.as_str()),
-                runtime_id: Some(LogicalRuntimeId::new(session_id.to_string())),
+                runtime_id: Some(MeerkatMachine::logical_runtime_id(session_id)),
             },
             durability: InputDurability::Durable,
             visibility: InputVisibility {
@@ -1593,7 +1594,7 @@ async fn try_handle_supervisor_bridge_command(
                 send_bridge_failure(comms_runtime, candidate, cause, reason).await;
                 return true;
             }
-            let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+            let runtime_id = MeerkatMachine::logical_runtime_id(session_id);
             match RuntimeControlPlane::destroy(adapter.as_ref(), &runtime_id).await {
                 Ok(report) => {
                     send_bridge_response(

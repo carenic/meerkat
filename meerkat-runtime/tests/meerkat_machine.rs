@@ -390,7 +390,7 @@ async fn lifecycle_commit_failure_restores_staged_session_dsl_state() {
     let adapter = Arc::new(MeerkatMachine::persistent(store, memory_blob_store()));
     let sid = SessionId::new();
     adapter.register_session(sid.clone()).await;
-    let runtime_id = LogicalRuntimeId::new(sid.to_string());
+    let runtime_id = LogicalRuntimeId::for_session(&sid);
 
     let input = make_prompt("retire rollback");
     let input_id = input.id().clone();
@@ -480,7 +480,7 @@ async fn cold_reregister_preserves_destroyed_runtime_state() {
         memory_blob_store(),
     ));
     adapter.register_session(sid.clone()).await;
-    let runtime_id = LogicalRuntimeId::new(sid.to_string());
+    let runtime_id = LogicalRuntimeId::for_session(&sid);
     meerkat_runtime::traits::RuntimeControlPlane::destroy(&*adapter, &runtime_id)
         .await
         .expect("destroy should succeed before adapter restart");
@@ -495,6 +495,28 @@ async fn cold_reregister_preserves_destroyed_runtime_state() {
         restarted.runtime_state(&sid).await.unwrap(),
         RuntimeState::Destroyed,
         "cold re-registration must preserve the stored destroyed phase",
+    );
+}
+
+#[tokio::test]
+async fn cold_reregister_recovers_legacy_session_uuid_runtime_state_alias() {
+    let store = Arc::new(meerkat_runtime::store::InMemoryRuntimeStore::new());
+    let sid = SessionId::new();
+    let legacy_runtime_alias = LogicalRuntimeId::legacy_session_uuid_alias(&sid);
+    store
+        .atomic_lifecycle_commit(&legacy_runtime_alias, RuntimeState::Destroyed, &[])
+        .await
+        .expect("seed legacy runtime state alias");
+
+    let adapter = Arc::new(MeerkatMachine::persistent(
+        Arc::clone(&store) as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
+    adapter.register_session(sid.clone()).await;
+    assert_eq!(
+        adapter.runtime_state(&sid).await.unwrap(),
+        RuntimeState::Destroyed,
+        "cold re-registration must recover terminal state stored under the legacy raw session UUID alias",
     );
 }
 
@@ -530,7 +552,7 @@ async fn recycle_preserves_ephemeral_queued_work() {
     adapter.accept_input(&sid, first).await.unwrap();
     adapter.accept_input(&sid, second).await.unwrap();
 
-    let runtime_id = LogicalRuntimeId::new(sid.to_string());
+    let runtime_id = LogicalRuntimeId::for_session(&sid);
     let report = meerkat_runtime::RuntimeControlPlane::recycle(&*adapter, &runtime_id)
         .await
         .unwrap();
@@ -573,7 +595,7 @@ async fn recycle_preserves_persistent_queued_work() {
     adapter.accept_input(&sid, first).await.unwrap();
     adapter.accept_input(&sid, second).await.unwrap();
 
-    let runtime_id = LogicalRuntimeId::new(sid.to_string());
+    let runtime_id = LogicalRuntimeId::for_session(&sid);
     let report = meerkat_runtime::RuntimeControlPlane::recycle(&*adapter, &runtime_id)
         .await
         .unwrap();
@@ -649,7 +671,7 @@ async fn recycle_keeps_waiters_for_preserved_pending_input() {
     assert!(outcome.is_accepted());
     let handle = handle.expect("accepted input should produce a completion handle");
 
-    let runtime_id = LogicalRuntimeId::new(sid.to_string());
+    let runtime_id = LogicalRuntimeId::for_session(&sid);
     let report = meerkat_runtime::RuntimeControlPlane::recycle(&*adapter, &runtime_id)
         .await
         .unwrap();
@@ -759,7 +781,7 @@ async fn recycle_attached_runtime_wakes_preserved_queued_work() {
     assert!(outcome.is_accepted());
     let handle = handle.expect("queued progress input should expose a completion handle");
 
-    let runtime_id = LogicalRuntimeId::new(sid.to_string());
+    let runtime_id = LogicalRuntimeId::for_session(&sid);
     let report = meerkat_runtime::RuntimeControlPlane::recycle(&*adapter, &runtime_id)
         .await
         .unwrap();

@@ -1450,15 +1450,24 @@ pub(crate) async fn machine_recover_persistent_driver(
     runtime_id: &LogicalRuntimeId,
     driver: &mut crate::driver::ephemeral::EphemeralRuntimeDriver,
 ) -> Result<RecoveryReport, RuntimeDriverError> {
-    let stored_states = store
-        .load_input_states(runtime_id)
-        .await
-        .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
+    let mut recovered_runtime_id = runtime_id.clone();
+    let mut stored_states = Vec::new();
+    for candidate in runtime_id.storage_alias_candidates() {
+        stored_states = store
+            .load_input_states(&candidate)
+            .await
+            .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
+        recovered_runtime_id = candidate;
+        if !stored_states.is_empty() {
+            break;
+        }
+    }
 
     let mut recovered_payloads = Vec::new();
 
     for bundle in stored_states {
-        let bundle = machine_normalize_recovered_input_state(store, runtime_id, bundle).await?;
+        let bundle =
+            machine_normalize_recovered_input_state(store, &recovered_runtime_id, bundle).await?;
 
         if driver.input_state(&bundle.state.input_id).is_none() {
             let Some(entry) = machine_build_recovered_ingress_entry(&bundle.state) else {
@@ -1503,11 +1512,17 @@ pub(crate) async fn machine_recover_persistent_driver(
         }
     }
 
-    if let Some(runtime_state) = store
-        .load_runtime_state(runtime_id)
-        .await
-        .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?
-    {
+    let mut recovered_runtime_state = None;
+    for candidate in runtime_id.storage_alias_candidates() {
+        recovered_runtime_state = store
+            .load_runtime_state(&candidate)
+            .await
+            .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
+        if recovered_runtime_state.is_some() {
+            break;
+        }
+    }
+    if let Some(runtime_state) = recovered_runtime_state {
         machine_realize_recovered_runtime_state(driver, runtime_state);
 
         if runtime_state.is_terminal() {
