@@ -4676,7 +4676,6 @@ async fn service_accept_input_interrupt_yielding_uses_live_control_handle() {
                 },
                 session_snapshot: None,
                 terminal: None,
-                run_result: None,
             })
         }
 
