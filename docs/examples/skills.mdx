@@ -97,6 +97,21 @@ View the full body and metadata of a specific skill by canonical key.
       --json
     ```
   </Tab>
+  <Tab title="MCP">
+    ```json
+    {
+      "name": "meerkat_skills",
+      "arguments": {
+        "action": "inspect",
+        "skill_key": {
+          "source_uuid": "00000000-0000-4b11-8111-000000000001",
+          "skill_name": "task-workflow"
+        },
+        "source": "00000000-0000-4b11-8111-000000000001"
+      }
+    }
+    ```
+  </Tab>
   <Tab title="Rust">
     ```rust
     let key = SkillKey::new(

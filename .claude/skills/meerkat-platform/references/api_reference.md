@@ -250,7 +250,7 @@ Core tools:
 - `meerkat_config` — get/set/patch config
 - `meerkat_capabilities` — list runtime capabilities
 - `meerkat_models_catalog` — curated model catalog with provider profiles
-- `meerkat_skills` — list skills (`action: "list"`)
+- `meerkat_skills` — list skills (`action: "list"`) or inspect one skill (`action: "inspect"`, typed `skill_key`, optional `source` UUID)
 - `meerkat_mcp_add` — stage live MCP server add
 - `meerkat_mcp_remove` — stage live MCP server remove
 - `meerkat_mcp_reload` — stage live MCP server reload
@@ -305,7 +305,7 @@ Client methods:
 - `list_mobs()` → `list[MobSummary]`
 - `get_config()` / `set_config(...)` / `patch_config(...)`
 - `mcp_add(params)` / `mcp_remove(params)` / `mcp_reload(params)`
-- `list_skills()` / `inspect_skill(id, source?)`
+- `list_skills()`
 - `capabilities` (property, populated during `connect()`)
 
 Session methods:
@@ -371,7 +371,7 @@ Client methods:
 - `listMobs()` → `MobSummary[]`
 - `getConfig()` / `setConfig(...)` / `patchConfig(...)`
 - `mcpAdd(params)` / `mcpRemove(params)` / `mcpReload(params)`
-- `listSkills()` / `inspectSkill(id, options?)`
+- `listSkills()`
 - `capabilities` (property, populated during `connect()`)
 
 Session methods:

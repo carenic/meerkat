@@ -637,7 +637,7 @@ Canonical skill identity is `SkillKey { source_uuid, skill_name }`. `preload_ski
 - CLI: `rkat skill list [--json]`, `rkat skill inspect <skill-name> --source-uuid <uuid> [--json]`
 - RPC: `skills/list`
 - REST: `GET /skills`
-- MCP: `meerkat_skills` tool (`action: "list"`)
+- MCP: `meerkat_skills` tool (`action: "list"` or `"inspect"` with typed `skill_key` and optional `source` UUID)
 - Rust SDK: `SkillRuntime::list_all_with_provenance()`, `SkillRuntime::load_from_source()`
 
 Introspection returns typed keys plus source provenance. Shadowing is by full `SkillKey`, not by `skill_name` alone. Agent-facing skill tools (`browse_skills`, `load_skill`, resource tools, function invocation) also use `source_uuid` + `skill_name`.

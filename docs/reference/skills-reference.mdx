@@ -83,7 +83,7 @@ Collection mode groups by `source_uuid` and instructs the agent to use `browse_s
 
 ## Public Introspection
 
-Current public introspection list surfaces:
+Current public introspection surfaces:
 
 | Surface | Operation |
 |---------|-----------|
@@ -91,9 +91,11 @@ Current public introspection list surfaces:
 | CLI inspect | `rkat skill inspect <skill-name> --source-uuid <uuid> [--json]` |
 | RPC | `skills/list` |
 | REST | `GET /skills` |
-| MCP | `meerkat_skills` with `action: "list"` |
+| MCP list | `meerkat_skills` with `action: "list"` |
+| MCP inspect | `meerkat_skills` with `action: "inspect"`, typed `skill_key`, and optional `source` UUID |
 
 List responses include `key`, `source`, `is_active`, and optional `shadowed_by` provenance.
+Inspect responses include the same typed identity and provenance plus `body`.
 
 ## See also
 
