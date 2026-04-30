@@ -17846,6 +17846,46 @@ async fn reset_from_running_surfaces_dsl_rejection() {
     );
 }
 
+#[tokio::test]
+async fn destroy_from_bound_initializing_is_backed_by_dsl_guard() {
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+
+    adapter
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("bindings should establish active runtime identity");
+
+    let driver = {
+        let sessions = adapter.sessions.read().await;
+        Arc::clone(
+            &sessions
+                .get(&session_id)
+                .expect("prepared session should exist")
+                .driver,
+        )
+    };
+    {
+        let mut entry = driver.lock().await;
+        let DriverEntry::Ephemeral(driver) = &mut *entry else {
+            panic!("test uses ephemeral driver");
+        };
+        driver.force_runtime_authority(RuntimeState::Initializing, None, None);
+        driver.sync_control_projection_from_dsl_authority();
+    }
+
+    let report = crate::traits::RuntimeControlPlane::destroy(adapter.as_ref(), &runtime_id)
+        .await
+        .expect("bound Initializing destroy should follow the DSL DestroyInitializing guard");
+    assert_eq!(report.inputs_abandoned, 0);
+
+    let state = crate::traits::RuntimeControlPlane::runtime_state(adapter.as_ref(), &runtime_id)
+        .await
+        .expect("runtime state should remain readable after destroy");
+    assert_eq!(state, RuntimeState::Destroyed);
+}
+
 /// Two concurrent Retire commands on the same session must serialize: the
 /// first stages the mutating DSL transition, and the second reaches the
 /// DSL-authoritative Retired self-loop and completes idempotently.
