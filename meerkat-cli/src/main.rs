@@ -4928,9 +4928,9 @@ impl meerkat_core::lifecycle::CoreExecutor for CliRuntimeExecutor {
                 )
                 .await
                 .map_err(|e| {
-                    meerkat_core::lifecycle::core_executor::CoreExecutorError::ApplyFailed {
-                        reason: e.to_string(),
-                    }
+                    meerkat_core::lifecycle::core_executor::CoreExecutorError::apply_failed_runtime_turn(
+                        e.to_string(),
+                    )
                 })?;
             return Ok(output);
         }
@@ -4941,9 +4941,9 @@ impl meerkat_core::lifecycle::CoreExecutor for CliRuntimeExecutor {
             .start_turn(&self.session_id, turn_req)
             .await
             .map_err(|e| {
-                meerkat_core::lifecycle::core_executor::CoreExecutorError::ApplyFailed {
-                    reason: e.to_string(),
-                }
+                meerkat_core::lifecycle::core_executor::CoreExecutorError::apply_failed_runtime_turn(
+                    e.to_string(),
+                )
             })?;
 
         Ok(
