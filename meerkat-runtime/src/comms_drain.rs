@@ -2437,6 +2437,7 @@ mod tests {
             from_peer_id: Some(typed_peer_id(PEER_ID_SUPERVISOR)),
             lifecycle_peer: None,
             source_peer_id: None,
+            response_terminality: None,
         };
 
         assert!(
