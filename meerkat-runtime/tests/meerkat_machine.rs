@@ -13,7 +13,9 @@ use std::time::Duration;
 
 use chrono::Utc;
 use meerkat_core::BlobStore;
-use meerkat_core::lifecycle::{InputId, RunId};
+use meerkat_core::lifecycle::{
+    InputId, RunBoundaryReceipt, RunId, run_primitive::RunApplyBoundary,
+};
 use meerkat_core::types::SessionId;
 use meerkat_runtime::input_state::StoredInputState;
 use meerkat_runtime::{
@@ -518,6 +520,93 @@ async fn cold_reregister_recovers_legacy_session_uuid_runtime_state_alias() {
         RuntimeState::Destroyed,
         "cold re-registration must recover terminal state stored under the legacy raw session UUID alias",
     );
+}
+
+#[tokio::test]
+async fn cold_reregister_prefers_terminal_legacy_runtime_state_over_canonical_idle_alias() {
+    let store = Arc::new(meerkat_runtime::store::InMemoryRuntimeStore::new());
+    let sid = SessionId::new();
+    let canonical_runtime_id = LogicalRuntimeId::for_session(&sid);
+    let legacy_runtime_alias = LogicalRuntimeId::legacy_session_uuid_alias(&sid);
+    store
+        .atomic_lifecycle_commit(&canonical_runtime_id, RuntimeState::Idle, &[])
+        .await
+        .expect("seed canonical runtime state alias");
+    store
+        .atomic_lifecycle_commit(&legacy_runtime_alias, RuntimeState::Destroyed, &[])
+        .await
+        .expect("seed legacy runtime state alias");
+
+    let adapter = Arc::new(MeerkatMachine::persistent(
+        Arc::clone(&store) as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
+    adapter.register_session(sid.clone()).await;
+    assert_eq!(
+        adapter.runtime_state(&sid).await.unwrap(),
+        RuntimeState::Destroyed,
+        "cold re-registration must not hide terminal legacy runtime state when both aliases exist",
+    );
+}
+
+#[tokio::test]
+async fn control_plane_receipt_lookup_uses_canonical_runtime_id_with_legacy_storage_fallback() {
+    let store = Arc::new(meerkat_runtime::store::InMemoryRuntimeStore::new());
+    let sid = SessionId::new();
+    let canonical_runtime_id = LogicalRuntimeId::for_session(&sid);
+    let legacy_runtime_alias = LogicalRuntimeId::legacy_session_uuid_alias(&sid);
+    let run_id = RunId::new();
+    let receipt = RunBoundaryReceipt {
+        run_id: run_id.clone(),
+        boundary: RunApplyBoundary::RunStart,
+        contributing_input_ids: Vec::new(),
+        conversation_digest: None,
+        message_count: 0,
+        sequence: 0,
+    };
+    store
+        .atomic_apply(
+            &legacy_runtime_alias,
+            None,
+            receipt.clone(),
+            Vec::new(),
+            None,
+        )
+        .await
+        .expect("seed legacy boundary receipt alias");
+
+    let adapter = Arc::new(MeerkatMachine::persistent(
+        Arc::clone(&store) as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
+    adapter.register_session(sid.clone()).await;
+
+    let loaded = meerkat_runtime::traits::RuntimeControlPlane::load_boundary_receipt(
+        adapter.as_ref(),
+        &canonical_runtime_id,
+        &run_id,
+        0,
+    )
+    .await
+    .expect("canonical runtime id should be accepted");
+    assert_eq!(
+        loaded.map(|loaded| loaded.run_id),
+        Some(run_id.clone()),
+        "canonical control-plane lookup should read legacy receipt storage"
+    );
+
+    let raw_alias_err = meerkat_runtime::traits::RuntimeControlPlane::load_boundary_receipt(
+        adapter.as_ref(),
+        &legacy_runtime_alias,
+        &run_id,
+        0,
+    )
+    .await
+    .expect_err("raw session UUID alias must not resolve as a runtime control-plane id");
+    assert!(matches!(
+        raw_alias_err,
+        meerkat_runtime::traits::RuntimeControlPlaneError::NotFound(_)
+    ));
 }
 
 #[tokio::test]

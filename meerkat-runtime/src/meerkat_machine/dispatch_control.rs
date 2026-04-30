@@ -898,11 +898,16 @@ impl MeerkatMachine {
                 run_id,
                 sequence,
             } => {
+                let _session_id = self.resolve_session_id(&runtime_id).await?;
                 let receipt = match &self.store {
-                    Some(store) => store
-                        .load_boundary_receipt(&runtime_id, &run_id, sequence)
-                        .await
-                        .map_err(|e| RuntimeControlPlaneError::StoreError(e.to_string()))?,
+                    Some(store) => super::driver::load_boundary_receipt_for_storage_aliases(
+                        store.as_ref(),
+                        &runtime_id,
+                        &run_id,
+                        sequence,
+                    )
+                    .await
+                    .map_err(|e| RuntimeControlPlaneError::StoreError(e.to_string()))?,
                     None => None,
                 };
                 Ok(MeerkatMachineCommandResult::BoundaryReceipt(receipt))

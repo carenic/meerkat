@@ -16,7 +16,8 @@ use meerkat_core::runtime_epoch::{EpochCursorState, RuntimeEpochId};
 use meerkat_core::types::SessionId;
 use meerkat_runtime::RuntimeStore; // needed for trait method calls
 use meerkat_runtime::{
-    OpsLifecyclePersistenceRequest, PersistedOpsSnapshot, RuntimeOpsLifecycleRegistry,
+    LogicalRuntimeId, OpsLifecyclePersistenceRequest, PersistedOpsSnapshot,
+    RuntimeOpsLifecycleRegistry,
 };
 
 fn bg_spec(name: &str) -> OperationSpec {
@@ -709,6 +710,58 @@ async fn cold_persistent_adapter_recovers_persisted_epoch() {
         1,
         "register_session must recover persisted completion entries"
     );
+    assert_eq!(batch.entries[0].operation_id, op_id);
+}
+
+#[tokio::test]
+async fn cold_persistent_adapter_prefers_more_advanced_legacy_ops_alias_snapshot() {
+    let store = Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let session_id = SessionId::new();
+    let canonical_epoch = RuntimeEpochId::new();
+    let canonical_registry = meerkat_runtime::RuntimeOpsLifecycleRegistry::new();
+    let canonical_snapshot =
+        canonical_registry.capture_persistence_snapshot(canonical_epoch, &EpochCursorState::new());
+    store
+        .persist_ops_lifecycle(
+            &LogicalRuntimeId::for_session(&session_id),
+            &canonical_snapshot,
+        )
+        .await
+        .unwrap();
+
+    let legacy_registry = meerkat_runtime::RuntimeOpsLifecycleRegistry::new();
+    let legacy_cursor_state = Arc::new(EpochCursorState::new());
+    let legacy_epoch = RuntimeEpochId::new();
+    let spec = bg_spec("legacy-advanced-recovery");
+    let op_id = spec.id.clone();
+    legacy_registry.register_operation(spec).unwrap();
+    legacy_registry.provisioning_succeeded(&op_id).unwrap();
+    legacy_registry
+        .complete_operation(&op_id, op_result(&op_id))
+        .unwrap();
+    let legacy_snapshot =
+        legacy_registry.capture_persistence_snapshot(legacy_epoch.clone(), &legacy_cursor_state);
+    store
+        .persist_ops_lifecycle(
+            &LogicalRuntimeId::legacy_session_uuid_alias(&session_id),
+            &legacy_snapshot,
+        )
+        .await
+        .unwrap();
+
+    let adapter = meerkat_runtime::MeerkatMachine::persistent_without_blobs(
+        Arc::clone(&store) as Arc<dyn RuntimeStore>
+    );
+    adapter.register_session(session_id.clone()).await;
+
+    let bindings = adapter.prepare_bindings(session_id.clone()).await.unwrap();
+    assert_eq!(
+        bindings.epoch_id, legacy_epoch,
+        "register_session must not hide a more advanced legacy ops lifecycle alias snapshot"
+    );
+    let feed = bindings.ops_lifecycle.completion_feed().unwrap();
+    let batch = feed.list_since(0);
+    assert_eq!(batch.entries.len(), 1);
     assert_eq!(batch.entries[0].operation_id, op_id);
 }
 

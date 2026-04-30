@@ -9,7 +9,7 @@ use meerkat_core::BlobStore;
 use meerkat_core::lifecycle::{
     InputId, RunId, run_primitive::RunApplyBoundary, run_receipt::RunBoundaryReceipt,
 };
-use meerkat_core::types::{ContentBlock, ImageData};
+use meerkat_core::types::{ContentBlock, ImageData, SessionId};
 use meerkat_runtime::input_state::{InputStateSeed, StoredInputState};
 use meerkat_runtime::store::RuntimeStoreError;
 use meerkat_runtime::{
@@ -362,6 +362,41 @@ async fn recover_from_store() {
     let (queued_id, queued_input) = dequeued.unwrap();
     assert_eq!(queued_id, input_id);
     assert_eq!(queued_input.id(), &input_id);
+}
+
+#[tokio::test]
+async fn recover_merges_canonical_and_legacy_session_alias_input_states() {
+    let store = Arc::new(InMemoryRuntimeStore::new());
+    let session_id = SessionId::new();
+    let canonical_rid = LogicalRuntimeId::for_session(&session_id);
+    let legacy_rid = LogicalRuntimeId::legacy_session_uuid_alias(&session_id);
+
+    let canonical_input = make_prompt("canonical input");
+    let canonical_input_id = canonical_input.id().clone();
+    let mut canonical_state = InputState::new_accepted(canonical_input_id.clone());
+    canonical_state.persisted_input = Some(canonical_input);
+    canonical_state.durability = Some(InputDurability::Durable);
+    store
+        .persist_input_state(&canonical_rid, &stored_accepted(canonical_state))
+        .await
+        .unwrap();
+
+    let legacy_input = make_prompt("legacy input");
+    let legacy_input_id = legacy_input.id().clone();
+    let mut legacy_state = InputState::new_accepted(legacy_input_id.clone());
+    legacy_state.persisted_input = Some(legacy_input);
+    legacy_state.durability = Some(InputDurability::Durable);
+    store
+        .persist_input_state(&legacy_rid, &stored_accepted(legacy_state))
+        .await
+        .unwrap();
+
+    let mut driver = PersistentRuntimeDriver::new(canonical_rid, store, memory_blob_store());
+    let report = driver.recover().await.unwrap();
+
+    assert_eq!(report.inputs_recovered, 2);
+    assert!(driver.input_state(&canonical_input_id).is_some());
+    assert!(driver.input_state(&legacy_input_id).is_some());
 }
 
 #[tokio::test]

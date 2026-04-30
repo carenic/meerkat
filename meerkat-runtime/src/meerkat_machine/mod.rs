@@ -118,6 +118,25 @@ type MeerkatMachineCommandFuture<'a> = Pin<
     Box<dyn Future<Output = Result<MeerkatMachineCommandResult, MeerkatMachineCommandError>> + 'a>,
 >;
 
+fn ops_snapshot_resume_rank(
+    snapshot: &crate::ops_lifecycle::PersistedOpsSnapshot,
+) -> (u64, u64, u64, u64, usize, usize) {
+    let completion_watermark = snapshot
+        .completion_entries
+        .iter()
+        .map(|entry| entry.seq)
+        .max()
+        .unwrap_or(0);
+    (
+        completion_watermark,
+        snapshot.cursors.agent_applied_cursor,
+        snapshot.cursors.runtime_observed_seq,
+        snapshot.cursors.runtime_last_injected_seq,
+        snapshot.completion_entries.len(),
+        snapshot.authority_state.operation_count(),
+    )
+}
+
 pub(crate) use driver::{
     DriverEntry, SharedCompletionRegistry, SharedDriver, commit_runtime_loop_run,
     fail_machine_run_without_runtime_apply_cause, fail_runtime_loop_run,
@@ -868,32 +887,19 @@ impl MeerkatMachine {
             } else {
                 vec![runtime_id.clone(), legacy_alias]
             };
+            let mut recovered: Option<(
+                LogicalRuntimeId,
+                crate::ops_lifecycle::PersistedOpsSnapshot,
+            )> = None;
             for candidate in candidates {
                 match store.load_ops_lifecycle(&candidate).await {
                     Ok(Some(snapshot)) => {
-                        let recovered_epoch = snapshot.epoch_id.clone();
-                        let recovered_cursors = meerkat_core::EpochCursorState::from_recovered(
-                            snapshot.cursors.agent_applied_cursor,
-                            snapshot.cursors.runtime_observed_seq,
-                            snapshot.cursors.runtime_last_injected_seq,
-                        );
-                        let recovered_ops_count = snapshot.completion_entries.len();
-                        let registry =
-                            crate::ops_lifecycle::RuntimeOpsLifecycleRegistry::from_recovered(
-                                snapshot,
-                            );
-                        tracing::info!(
-                            %session_id,
-                            %candidate,
-                            epoch_id = %recovered_epoch,
-                            recovered_ops = recovered_ops_count,
-                            "ops lifecycle recovered from durable store (same epoch)"
-                        );
-                        return (
-                            Arc::new(registry),
-                            recovered_epoch,
-                            Arc::new(recovered_cursors),
-                        );
+                        let replace = recovered.as_ref().is_none_or(|(_, existing)| {
+                            ops_snapshot_resume_rank(&snapshot) > ops_snapshot_resume_rank(existing)
+                        });
+                        if replace {
+                            recovered = Some((candidate, snapshot));
+                        }
                     }
                     Ok(None) => {}
                     Err(err) => {
@@ -910,6 +916,29 @@ impl MeerkatMachine {
                         );
                     }
                 }
+            }
+            if let Some((candidate, snapshot)) = recovered {
+                let recovered_epoch = snapshot.epoch_id.clone();
+                let recovered_cursors = meerkat_core::EpochCursorState::from_recovered(
+                    snapshot.cursors.agent_applied_cursor,
+                    snapshot.cursors.runtime_observed_seq,
+                    snapshot.cursors.runtime_last_injected_seq,
+                );
+                let recovered_ops_count = snapshot.completion_entries.len();
+                let registry =
+                    crate::ops_lifecycle::RuntimeOpsLifecycleRegistry::from_recovered(snapshot);
+                tracing::info!(
+                    %session_id,
+                    %candidate,
+                    epoch_id = %recovered_epoch,
+                    recovered_ops = recovered_ops_count,
+                    "ops lifecycle recovered from durable store (same epoch)"
+                );
+                return (
+                    Arc::new(registry),
+                    recovered_epoch,
+                    Arc::new(recovered_cursors),
+                );
             }
             tracing::debug!(%session_id, "no persisted ops lifecycle; fresh epoch");
             (

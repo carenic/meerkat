@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use meerkat_core::lifecycle::{CoreApplyFailureCause, InputId, RunId};
+use meerkat_core::lifecycle::{CoreApplyFailureCause, InputId, RunBoundaryReceipt, RunId};
 
 use crate::accept::{AcceptOutcome, ResolvedAdmission};
 use crate::driver::ephemeral::{EphemeralDriverRollbackSnapshot, EphemeralRuntimeDriver};
@@ -1117,11 +1117,12 @@ pub(crate) async fn machine_normalize_recovered_input_state(
                 bundle.seed.last_run_id.clone(),
                 bundle.seed.last_boundary_sequence,
             ) {
-                (Some(run_id), Some(sequence)) => store
-                    .load_boundary_receipt(runtime_id, &run_id, sequence)
-                    .await
-                    .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?
-                    .is_some(),
+                (Some(run_id), Some(sequence)) => {
+                    load_boundary_receipt_for_storage_aliases(store, runtime_id, &run_id, sequence)
+                        .await
+                        .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?
+                        .is_some()
+                }
                 _ => false,
             },
         )
@@ -1132,6 +1133,74 @@ pub(crate) async fn machine_normalize_recovered_input_state(
     let _ = machine_apply_recovered_input_normalization(&mut bundle, applied_boundary_committed);
 
     Ok(bundle)
+}
+
+pub(super) async fn load_boundary_receipt_for_storage_aliases(
+    store: &dyn crate::store::RuntimeStore,
+    runtime_id: &LogicalRuntimeId,
+    run_id: &RunId,
+    sequence: u64,
+) -> Result<Option<RunBoundaryReceipt>, crate::store::RuntimeStoreError> {
+    for candidate in runtime_id.storage_alias_candidates() {
+        if let Some(receipt) = store
+            .load_boundary_receipt(&candidate, run_id, sequence)
+            .await?
+        {
+            return Ok(Some(receipt));
+        }
+    }
+    Ok(None)
+}
+
+async fn load_input_states_for_storage_aliases(
+    store: &dyn crate::store::RuntimeStore,
+    runtime_id: &LogicalRuntimeId,
+) -> Result<Vec<(LogicalRuntimeId, StoredInputState)>, crate::store::RuntimeStoreError> {
+    let mut merged: Vec<(usize, LogicalRuntimeId, StoredInputState)> = Vec::new();
+
+    for (candidate_index, candidate) in runtime_id
+        .storage_alias_candidates()
+        .into_iter()
+        .enumerate()
+    {
+        for state in store.load_input_states(&candidate).await? {
+            let input_id = state.state.input_id.clone();
+            if let Some((existing_index, existing_runtime_id, existing_state)) = merged
+                .iter_mut()
+                .find(|(_, _, existing)| existing.state.input_id == input_id)
+            {
+                let candidate_updated_at = state.state.updated_at();
+                let existing_updated_at = existing_state.state.updated_at();
+                if candidate_updated_at > existing_updated_at
+                    || (candidate_updated_at == existing_updated_at
+                        && candidate_index < *existing_index)
+                {
+                    *existing_index = candidate_index;
+                    *existing_runtime_id = candidate.clone();
+                    *existing_state = state;
+                }
+            } else {
+                merged.push((candidate_index, candidate.clone(), state));
+            }
+        }
+    }
+
+    Ok(merged
+        .into_iter()
+        .map(|(_, runtime_id, state)| (runtime_id, state))
+        .collect())
+}
+
+fn runtime_state_resume_rank(state: RuntimeState) -> u8 {
+    match state {
+        RuntimeState::Initializing => 0,
+        RuntimeState::Idle => 1,
+        RuntimeState::Attached => 2,
+        RuntimeState::Running => 3,
+        RuntimeState::Retired => 4,
+        RuntimeState::Stopped => 5,
+        RuntimeState::Destroyed => 6,
+    }
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -1450,24 +1519,14 @@ pub(crate) async fn machine_recover_persistent_driver(
     runtime_id: &LogicalRuntimeId,
     driver: &mut crate::driver::ephemeral::EphemeralRuntimeDriver,
 ) -> Result<RecoveryReport, RuntimeDriverError> {
-    let mut recovered_runtime_id = runtime_id.clone();
-    let mut stored_states = Vec::new();
-    for candidate in runtime_id.storage_alias_candidates() {
-        stored_states = store
-            .load_input_states(&candidate)
-            .await
-            .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
-        recovered_runtime_id = candidate;
-        if !stored_states.is_empty() {
-            break;
-        }
-    }
-
     let mut recovered_payloads = Vec::new();
 
-    for bundle in stored_states {
+    for (stored_runtime_id, bundle) in load_input_states_for_storage_aliases(store, runtime_id)
+        .await
+        .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?
+    {
         let bundle =
-            machine_normalize_recovered_input_state(store, &recovered_runtime_id, bundle).await?;
+            machine_normalize_recovered_input_state(store, &stored_runtime_id, bundle).await?;
 
         if driver.input_state(&bundle.state.input_id).is_none() {
             let Some(entry) = machine_build_recovered_ingress_entry(&bundle.state) else {
@@ -1514,12 +1573,21 @@ pub(crate) async fn machine_recover_persistent_driver(
 
     let mut recovered_runtime_state = None;
     for candidate in runtime_id.storage_alias_candidates() {
-        recovered_runtime_state = store
+        let candidate_state = store
             .load_runtime_state(&candidate)
             .await
             .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?;
-        if recovered_runtime_state.is_some() {
-            break;
+        if let Some(candidate_state) = candidate_state {
+            recovered_runtime_state =
+                Some(recovered_runtime_state.map_or(candidate_state, |existing| {
+                    if runtime_state_resume_rank(candidate_state)
+                        > runtime_state_resume_rank(existing)
+                    {
+                        candidate_state
+                    } else {
+                        existing
+                    }
+                }));
         }
     }
     if let Some(runtime_state) = recovered_runtime_state {
