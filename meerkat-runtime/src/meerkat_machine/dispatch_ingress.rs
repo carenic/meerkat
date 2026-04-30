@@ -553,7 +553,9 @@ impl MeerkatMachine {
                     None => None,
                 };
 
-                if let Err(run_err) = fail_runtime_loop_run(&driver, run_id, error).await {
+                if let Err(run_err) =
+                    fail_machine_run_without_runtime_apply_cause(&driver, run_id, error).await
+                {
                     let should_unregister = run_err.should_unregister_session();
                     let run_err = run_err.into_driver_error();
                     if should_unregister {

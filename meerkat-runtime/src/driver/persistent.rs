@@ -675,14 +675,15 @@ impl PersistentRuntimeDriver {
         run_id: RunId,
         contributing_input_ids: Vec<InputId>,
         replay_plan: super::ephemeral::ReplayQueuedContributorsPlan,
-        error: String,
+        failure: meerkat_core::lifecycle::CoreApplyFailureCause,
         recoverable: bool,
     ) -> Result<(), RuntimeDriverError> {
         self.machine_realize_run_failed(
             &run_id,
             &contributing_input_ids,
             &replay_plan,
-            &error,
+            failure.message(),
+            Some(&failure),
             recoverable,
         )
         .await
@@ -693,16 +694,19 @@ impl PersistentRuntimeDriver {
         run_id: &RunId,
         contributing_input_ids: &[InputId],
         replay_plan: &super::ephemeral::ReplayQueuedContributorsPlan,
-        error: &str,
+        terminal_error: &str,
+        runtime_apply_failure: Option<&meerkat_core::lifecycle::CoreApplyFailureCause>,
         recoverable: bool,
     ) -> Result<(), RuntimeDriverError> {
         let checkpoint = self.inner.rollback_snapshot();
         self.inner
             .machine_realize_run_failed(run_id, contributing_input_ids, replay_plan)?;
+        let failure_cause = runtime_apply_failure.map(|failure| failure.kind);
         tracing::debug!(
             run_id = ?run_id,
             recoverable,
-            error,
+            error = terminal_error,
+            failure_cause = ?failure_cause,
             "persistent driver realized machine-owned failed-run replay"
         );
         let input_states = self.inner.stored_input_states_snapshot();
