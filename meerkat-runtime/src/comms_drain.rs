@@ -147,17 +147,11 @@ pub fn spawn_comms_drain(
                             "comms_drain: consumed silent peer lifecycle notice"
                         );
                     }
-                    PeerInputClass::Response => {
-                        // Distinguish progress responses from terminal responses
-                        // via the canonical classifier in meerkat-core. Raw
-                        // `ResponseStatus` matching here is forbidden — all
-                        // consumers must read `TerminalityClass` so "terminal"
-                        // stays lock-stepped across the codebase.
-                        //
-                        // W1-A also needs to route terminal status → the DSL
-                        // peer-interaction handle's `PeerTerminalDisposition`.
-                        // Compute both from the single classifier call so the
-                        // "terminal" and "disposition" facts never drift.
+                    PeerInputClass::ResponseProgress | PeerInputClass::ResponseTerminal => {
+                        // Terminal-vs-progress class is fixed at peer ingress
+                        // by `PeerIngressMachinePolicy`; the drain only maps a
+                        // terminal response's already-typed status into the
+                        // peer-interaction DSL disposition companion.
                         let terminal_status = match &candidate.interaction.content {
                             meerkat_core::interaction::InteractionContent::Response {
                                 status,
@@ -181,13 +175,15 @@ pub fn spawn_comms_drain(
                             },
                             _ => None,
                         };
-                        let is_terminal = terminal_status.is_some();
+                        let is_terminal =
+                            matches!(candidate.class, PeerInputClass::ResponseTerminal);
 
                         if is_terminal {
                             // Terminal response — single admission with
                             // completion tracking. The PeerInput already
                             // carries ResponseTerminal convention which the
-                            // policy table maps to WakeIfIdle/Steer as needed.
+                            // policy table maps to the machine-owned WakeIfIdle
+                            // terminal policy.
                             // No synthetic Continuation required.
                             let interaction_id = match &candidate.interaction.content {
                                 meerkat_core::interaction::InteractionContent::Response {
@@ -513,6 +509,7 @@ fn peer_input_from_delivery_payload(
             timestamp: chrono::Utc::now(),
             source: InputOrigin::Peer {
                 peer_id: sender_peer_id.as_str(),
+                display_identity: None,
                 runtime_id: Some(LogicalRuntimeId::new(session_id.to_string())),
             },
             durability: InputDurability::Durable,
@@ -549,6 +546,11 @@ fn bridge_delivery_rejection_cause(
         }
         crate::accept::RejectReason::PeerHandlingModeInvalid { detail } => {
             BridgeDeliveryRejectionCause::PeerHandlingModeInvalid {
+                detail: detail.clone(),
+            }
+        }
+        crate::accept::RejectReason::PeerResponseTerminalInvalid { detail } => {
+            BridgeDeliveryRejectionCause::Internal {
                 detail: detail.clone(),
             }
         }
@@ -1878,6 +1880,7 @@ mod tests {
         let candidate = PeerInputCandidate {
             interaction: InboxInteraction {
                 id: InteractionId(Uuid::new_v4()),
+                from_route: None,
                 from: sender_pubkey.to_pubkey_string(),
                 content: InteractionContent::Request {
                     intent: SUPERVISOR_BRIDGE_INTENT.to_string(),
@@ -2123,6 +2126,7 @@ mod tests {
         PeerInputCandidate {
             interaction: InboxInteraction {
                 id: InteractionId(Uuid::new_v4()),
+                from_route: None,
                 from: "test-mob/__mob_supervisor__".to_string(),
                 content: InteractionContent::Request {
                     intent: intent.to_string(),
@@ -3339,6 +3343,7 @@ mod tests {
         PeerInputCandidate {
             interaction: InboxInteraction {
                 id: InteractionId(Uuid::new_v4()),
+                from_route: None,
                 from: sender.to_string(),
                 content: InteractionContent::Request {
                     intent: SUPERVISOR_BRIDGE_INTENT.to_string(),

@@ -681,6 +681,7 @@ mod tests {
                 timestamp: Utc::now(),
                 source: InputOrigin::Peer {
                     peer_id: "p".into(),
+                    display_identity: None,
                     runtime_id: None,
                 },
                 durability: InputDurability::Durable,
@@ -744,7 +745,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // P2: Policy table refuses to honor handling_mode for response conventions
+    // P2: Policy table refuses to honor handling_mode for response progress
     // -----------------------------------------------------------------------
 
     #[test]

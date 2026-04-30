@@ -37,6 +37,7 @@ fn make_peer_terminal(body: &str) -> Input {
             timestamp: Utc::now(),
             source: InputOrigin::Peer {
                 peer_id: "peer-1".into(),
+                display_identity: Some("Peer 1".into()),
                 runtime_id: None,
             },
             durability: InputDurability::Durable,
@@ -46,7 +47,7 @@ fn make_peer_terminal(body: &str) -> Input {
             correlation_id: None,
         },
         convention: Some(PeerConvention::ResponseTerminal {
-            request_id: "req-1".into(),
+            request_id: "018f6f79-7a82-7c4e-a552-a3b86f9630f1".into(),
             status: ResponseTerminalStatus::Completed,
         }),
         body: body.into(),
@@ -63,6 +64,7 @@ fn make_peer_progress() -> Input {
             timestamp: Utc::now(),
             source: InputOrigin::Peer {
                 peer_id: "peer-1".into(),
+                display_identity: Some("Peer 1".into()),
                 runtime_id: None,
             },
             durability: InputDurability::Ephemeral,
@@ -786,6 +788,7 @@ async fn accept_peer_response_progress_with_handling_mode_returns_rejected() {
             timestamp: Utc::now(),
             source: InputOrigin::Peer {
                 peer_id: "peer-1".into(),
+                display_identity: Some("Peer 1".into()),
                 runtime_id: None,
             },
             durability: InputDurability::Durable,
@@ -819,6 +822,7 @@ async fn accept_peer_response_terminal_with_handling_mode_returns_accepted() {
             timestamp: Utc::now(),
             source: InputOrigin::Peer {
                 peer_id: "peer-1".into(),
+                display_identity: Some("Peer 1".into()),
                 runtime_id: None,
             },
             durability: InputDurability::Durable,
@@ -828,7 +832,7 @@ async fn accept_peer_response_terminal_with_handling_mode_returns_accepted() {
             correlation_id: None,
         },
         convention: Some(PeerConvention::ResponseTerminal {
-            request_id: "req-1".into(),
+            request_id: "018f6f79-7a82-7c4e-a552-a3b86f9630f1".into(),
             status: ResponseTerminalStatus::Completed,
         }),
         body: "done".into(),
@@ -844,6 +848,40 @@ async fn accept_peer_response_terminal_with_handling_mode_returns_accepted() {
 }
 
 #[tokio::test]
+async fn accept_peer_response_terminal_with_empty_request_id_returns_rejected() {
+    let mut driver = EphemeralRuntimeDriver::new(LogicalRuntimeId::new("test"));
+    let input = Input::Peer(PeerInput {
+        header: InputHeader {
+            id: InputId::new(),
+            timestamp: Utc::now(),
+            source: InputOrigin::Peer {
+                peer_id: "peer-1".into(),
+                display_identity: Some("Peer 1".into()),
+                runtime_id: None,
+            },
+            durability: InputDurability::Durable,
+            visibility: InputVisibility::default(),
+            idempotency_key: None,
+            supersession_key: None,
+            correlation_id: None,
+        },
+        convention: Some(PeerConvention::ResponseTerminal {
+            request_id: " ".into(),
+            status: ResponseTerminalStatus::Completed,
+        }),
+        body: "done".into(),
+        payload: Some(serde_json::json!({"ok": true})),
+        blocks: None,
+        handling_mode: None,
+    });
+    let outcome = driver.accept_input(input).await.unwrap();
+    assert!(
+        outcome.is_rejected(),
+        "ResponseTerminal with empty request_id must fail closed at admission"
+    );
+}
+
+#[tokio::test]
 async fn accept_peer_message_with_steer_handling_mode_returns_accepted() {
     let mut driver = EphemeralRuntimeDriver::new(LogicalRuntimeId::new("test"));
     let input = Input::Peer(PeerInput {
@@ -852,6 +890,7 @@ async fn accept_peer_message_with_steer_handling_mode_returns_accepted() {
             timestamp: Utc::now(),
             source: InputOrigin::Peer {
                 peer_id: "peer-1".into(),
+                display_identity: None,
                 runtime_id: None,
             },
             durability: InputDurability::Durable,
@@ -946,6 +985,7 @@ async fn post_admission_signal_steer_is_request_immediate() {
             timestamp: Utc::now(),
             source: InputOrigin::Peer {
                 peer_id: "p".into(),
+                display_identity: None,
                 runtime_id: None,
             },
             durability: InputDurability::Durable,
@@ -991,6 +1031,7 @@ async fn post_admission_signal_queue_peer_message_while_running_interrupts_yield
             timestamp: Utc::now(),
             source: InputOrigin::Peer {
                 peer_id: "p".into(),
+                display_identity: None,
                 runtime_id: None,
             },
             durability: InputDurability::Durable,

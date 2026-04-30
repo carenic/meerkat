@@ -225,6 +225,224 @@ impl PeerResponseTerminalProjectionStatus {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum PeerResponseTerminalFactError {
+    #[error("transport identity cannot be empty")]
+    EmptyTransportIdentity,
+    #[error("route identity cannot be empty")]
+    EmptyRouteIdentity,
+    #[error("route identity cannot contain control characters")]
+    InvalidRouteIdentity,
+    #[error("display identity is required")]
+    MissingDisplayIdentity,
+    #[error("display identity cannot be empty")]
+    EmptyDisplayIdentity,
+    #[error("display identity cannot contain control characters")]
+    InvalidDisplayIdentity,
+    #[error("correlation id cannot be empty")]
+    EmptyCorrelationId,
+    #[error("correlation id must be a UUID: {input}")]
+    InvalidCorrelationId { input: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerResponseTerminalTransportIdentity(String);
+
+impl PeerResponseTerminalTransportIdentity {
+    pub fn parse(raw: impl Into<String>) -> Result<Self, PeerResponseTerminalFactError> {
+        let raw = raw.into();
+        if raw.trim().is_empty() {
+            return Err(PeerResponseTerminalFactError::EmptyTransportIdentity);
+        }
+        Ok(Self(raw))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PeerResponseTerminalTransportIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerResponseTerminalRouteIdentity(String);
+
+impl PeerResponseTerminalRouteIdentity {
+    pub fn parse(raw: impl Into<String>) -> Result<Self, PeerResponseTerminalFactError> {
+        let raw = raw.into();
+        if raw.trim().is_empty() {
+            return Err(PeerResponseTerminalFactError::EmptyRouteIdentity);
+        }
+        if raw.chars().any(char::is_control) {
+            return Err(PeerResponseTerminalFactError::InvalidRouteIdentity);
+        }
+        Ok(Self(raw))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PeerResponseTerminalRouteIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerResponseTerminalDisplayIdentity(String);
+
+impl PeerResponseTerminalDisplayIdentity {
+    pub fn parse(raw: impl Into<String>) -> Result<Self, PeerResponseTerminalFactError> {
+        let raw = raw.into();
+        if raw.trim().is_empty() {
+            return Err(PeerResponseTerminalFactError::EmptyDisplayIdentity);
+        }
+        if raw.chars().any(char::is_control) {
+            return Err(PeerResponseTerminalFactError::InvalidDisplayIdentity);
+        }
+        Ok(Self(raw))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PeerResponseTerminalDisplayIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PeerResponseTerminalCorrelationId(PeerCorrelationId);
+
+impl PeerResponseTerminalCorrelationId {
+    pub fn parse(raw: impl AsRef<str>) -> Result<Self, PeerResponseTerminalFactError> {
+        let raw = raw.as_ref();
+        if raw.trim().is_empty() {
+            return Err(PeerResponseTerminalFactError::EmptyCorrelationId);
+        }
+        uuid::Uuid::parse_str(raw)
+            .map(|uuid| Self(PeerCorrelationId::from_uuid(uuid)))
+            .map_err(|_| PeerResponseTerminalFactError::InvalidCorrelationId {
+                input: raw.to_string(),
+            })
+    }
+
+    pub const fn from_peer_correlation_id(correlation_id: PeerCorrelationId) -> Self {
+        Self(correlation_id)
+    }
+
+    pub const fn as_peer_correlation_id(self) -> PeerCorrelationId {
+        self.0
+    }
+}
+
+impl std::fmt::Display for PeerResponseTerminalCorrelationId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(f)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeerResponseTerminalRenderPayload(Option<serde_json::Value>);
+
+impl PeerResponseTerminalRenderPayload {
+    pub fn new(payload: Option<serde_json::Value>) -> Self {
+        Self(payload)
+    }
+
+    pub fn as_ref(&self) -> Option<&serde_json::Value> {
+        self.0.as_ref()
+    }
+}
+
+impl From<Option<serde_json::Value>> for PeerResponseTerminalRenderPayload {
+    fn from(payload: Option<serde_json::Value>) -> Self {
+        Self::new(payload)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerResponseTerminalSource {
+    pub transport_identity: Option<PeerResponseTerminalTransportIdentity>,
+    pub route_identity: PeerResponseTerminalRouteIdentity,
+    pub display_identity: PeerResponseTerminalDisplayIdentity,
+}
+
+impl PeerResponseTerminalSource {
+    pub fn new(
+        transport_identity: Option<PeerResponseTerminalTransportIdentity>,
+        route_identity: PeerResponseTerminalRouteIdentity,
+        display_identity: PeerResponseTerminalDisplayIdentity,
+    ) -> Self {
+        Self {
+            transport_identity,
+            route_identity,
+            display_identity,
+        }
+    }
+
+    pub fn parse(
+        transport_identity: Option<impl Into<String>>,
+        route_identity: impl Into<String>,
+        display_identity: impl Into<String>,
+    ) -> Result<Self, PeerResponseTerminalFactError> {
+        Ok(Self::new(
+            transport_identity
+                .map(PeerResponseTerminalTransportIdentity::parse)
+                .transpose()?,
+            PeerResponseTerminalRouteIdentity::parse(route_identity)?,
+            PeerResponseTerminalDisplayIdentity::parse(display_identity)?,
+        ))
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PeerResponseTerminalFact {
+    pub source: PeerResponseTerminalSource,
+    pub correlation_id: PeerResponseTerminalCorrelationId,
+    pub status: PeerResponseTerminalProjectionStatus,
+    pub render_payload: PeerResponseTerminalRenderPayload,
+}
+
+impl PeerResponseTerminalFact {
+    pub fn new(
+        source: PeerResponseTerminalSource,
+        correlation_id: PeerResponseTerminalCorrelationId,
+        status: PeerResponseTerminalProjectionStatus,
+        render_payload: PeerResponseTerminalRenderPayload,
+    ) -> Self {
+        Self {
+            source,
+            correlation_id,
+            status,
+            render_payload,
+        }
+    }
+
+    pub fn prompt_text(&self) -> String {
+        format!(
+            "[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL] Correlated peer response from {}. Request ID: {}. Status: {}. Result: {}.",
+            self.source.display_identity,
+            self.correlation_id,
+            self.status.label(),
+            format_peer_projection_payload(self.render_payload.as_ref())
+        )
+    }
+
+    pub fn context_key(&self) -> String {
+        peer_response_terminal_context_key(&self.source.route_identity, self.correlation_id)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum PeerConversationProjection {
     Message {
@@ -244,14 +462,15 @@ pub enum PeerConversationProjection {
         payload: Option<serde_json::Value>,
     },
     ResponseTerminal {
-        peer_id: String,
-        request_id: String,
-        status: PeerResponseTerminalProjectionStatus,
-        payload: Option<serde_json::Value>,
+        fact: PeerResponseTerminalFact,
     },
 }
 
 impl PeerConversationProjection {
+    pub fn response_terminal(fact: PeerResponseTerminalFact) -> Self {
+        Self::ResponseTerminal { fact }
+    }
+
     pub fn block_prefix_text(&self) -> Option<String> {
         match self {
             Self::Message { peer_id } => Some(format!("[COMMS MESSAGE from {peer_id}]")),
@@ -298,33 +517,23 @@ impl PeerConversationProjection {
                 phase.label(),
                 format_peer_projection_payload(payload.as_ref())
             ),
-            Self::ResponseTerminal {
-                peer_id,
-                request_id,
-                status,
-                payload,
-            } => format!(
-                "[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL] Correlated peer response from {peer_id}. Request ID: {request_id}. Status: {}. Result: {}.",
-                status.label(),
-                format_peer_projection_payload(payload.as_ref())
-            ),
+            Self::ResponseTerminal { fact } => fact.prompt_text(),
         }
     }
 
     pub fn context_key(&self) -> Option<String> {
         match self {
-            Self::ResponseTerminal {
-                peer_id,
-                request_id,
-                ..
-            } => Some(peer_response_terminal_context_key(peer_id, request_id)),
+            Self::ResponseTerminal { fact } => Some(fact.context_key()),
             Self::Message { .. } | Self::Request { .. } | Self::ResponseProgress { .. } => None,
         }
     }
 }
 
-pub fn peer_response_terminal_context_key(peer_id: &str, request_id: &str) -> String {
-    format!("peer_response_terminal:{peer_id}:{request_id}")
+pub fn peer_response_terminal_context_key(
+    route_identity: &PeerResponseTerminalRouteIdentity,
+    correlation_id: PeerResponseTerminalCorrelationId,
+) -> String {
+    format!("peer_response_terminal:{route_identity}:{correlation_id}")
 }
 
 fn format_peer_projection_payload(payload: Option<&serde_json::Value>) -> String {
@@ -1579,28 +1788,47 @@ pub trait RealtimeProductTurnHandle: Send + Sync {
 mod tests {
     use super::{
         PeerConversationProjection, PeerResponseProgressProjectionPhase,
-        PeerResponseTerminalProjectionStatus, peer_response_terminal_context_key,
+        PeerResponseTerminalCorrelationId, PeerResponseTerminalDisplayIdentity,
+        PeerResponseTerminalFact, PeerResponseTerminalProjectionStatus,
+        PeerResponseTerminalRenderPayload, PeerResponseTerminalRouteIdentity,
+        PeerResponseTerminalSource, PeerResponseTerminalTransportIdentity,
+        peer_response_terminal_context_key,
     };
 
     #[test]
     fn peer_terminal_projection_owns_prompt_and_context_key() {
+        let route_identity =
+            PeerResponseTerminalRouteIdentity::parse("analyst-rt").expect("route identity");
+        let correlation_id =
+            PeerResponseTerminalCorrelationId::parse("018f6f79-7a82-7c4e-a552-a3b86f9630f1")
+                .expect("correlation id");
         let projection = PeerConversationProjection::ResponseTerminal {
-            peer_id: "analyst-rt".into(),
-            request_id: "req-123".into(),
-            status: PeerResponseTerminalProjectionStatus::Completed,
-            payload: Some(serde_json::json!({
-                "request_intent": "checksum_token",
-                "token": "birch seventeen"
-            })),
+            fact: PeerResponseTerminalFact::new(
+                PeerResponseTerminalSource::new(
+                    Some(
+                        PeerResponseTerminalTransportIdentity::parse("transport-runtime-1")
+                            .expect("transport identity"),
+                    ),
+                    route_identity.clone(),
+                    PeerResponseTerminalDisplayIdentity::parse("Analyst")
+                        .expect("display identity"),
+                ),
+                correlation_id,
+                PeerResponseTerminalProjectionStatus::Completed,
+                PeerResponseTerminalRenderPayload::new(Some(serde_json::json!({
+                    "request_intent": "checksum_token",
+                    "token": "birch seventeen"
+                }))),
+            ),
         };
 
         assert_eq!(
             projection.context_key().as_deref(),
-            Some("peer_response_terminal:analyst-rt:req-123")
+            Some("peer_response_terminal:analyst-rt:018f6f79-7a82-7c4e-a552-a3b86f9630f1")
         );
         assert_eq!(
             projection.prompt_text(),
-            "[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL] Correlated peer response from analyst-rt. Request ID: req-123. Status: completed. Result: {\n  \"request_intent\": \"checksum_token\",\n  \"token\": \"birch seventeen\"\n}."
+            "[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL] Correlated peer response from Analyst. Request ID: 018f6f79-7a82-7c4e-a552-a3b86f9630f1. Status: completed. Result: {\n  \"request_intent\": \"checksum_token\",\n  \"token\": \"birch seventeen\"\n}."
         );
     }
 
@@ -1622,9 +1850,14 @@ mod tests {
 
     #[test]
     fn peer_terminal_context_key_helper_stays_canonical() {
+        let route_identity =
+            PeerResponseTerminalRouteIdentity::parse("peer-a").expect("route identity");
+        let correlation_id =
+            PeerResponseTerminalCorrelationId::parse("018f6f79-7a82-7c4e-a552-a3b86f9630f1")
+                .expect("correlation id");
         assert_eq!(
-            peer_response_terminal_context_key("peer-a", "req-z"),
-            "peer_response_terminal:peer-a:req-z"
+            peer_response_terminal_context_key(&route_identity, correlation_id),
+            "peer_response_terminal:peer-a:018f6f79-7a82-7c4e-a552-a3b86f9630f1"
         );
     }
 }

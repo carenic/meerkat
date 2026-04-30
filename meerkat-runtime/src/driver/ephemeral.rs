@@ -1783,6 +1783,13 @@ impl EphemeralRuntimeDriver {
                 },
             });
         }
+        if let Err(e) = crate::input::validate_peer_response_terminal_fact(&input) {
+            return Ok(AcceptOutcome::Rejected {
+                reason: crate::accept::RejectReason::PeerResponseTerminalInvalid {
+                    detail: e.to_string(),
+                },
+            });
+        }
 
         let input_id = input.id().clone();
         let mut state = InputState::new_accepted(input_id.clone());
@@ -2187,6 +2194,7 @@ mod tests {
                 timestamp: Utc::now(),
                 source: InputOrigin::Peer {
                     peer_id: "peer-1".into(),
+                    display_identity: None,
                     runtime_id: None,
                 },
                 durability: InputDurability::Durable,

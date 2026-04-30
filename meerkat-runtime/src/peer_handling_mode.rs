@@ -16,7 +16,7 @@ pub enum PeerHandlingModeError {
     ForbiddenForResponseProgress,
 }
 
-/// Validate that a peer input does not carry handling_mode on response conventions.
+/// Validate that a peer input does not carry handling_mode on response progress.
 pub fn validate_peer_handling_mode(input: &Input) -> Result<(), PeerHandlingModeError> {
     let Input::Peer(peer) = input else {
         return Ok(());
@@ -47,6 +47,7 @@ mod tests {
             timestamp: Utc::now(),
             source: InputOrigin::Peer {
                 peer_id: "peer-1".into(),
+                display_identity: None,
                 runtime_id: None,
             },
             durability: InputDurability::Durable,

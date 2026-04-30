@@ -14,8 +14,11 @@ use meerkat_core::ops::{OpEvent, OperationId};
 use meerkat_core::types::HandlingMode;
 use meerkat_core::{
     BlobStore, BlobStoreError, MissingBlobBehavior, PeerConversationProjection,
-    PeerResponseProgressProjectionPhase, PeerResponseTerminalProjectionStatus,
-    externalize_content_blocks, hydrate_content_blocks,
+    PeerResponseProgressProjectionPhase, PeerResponseTerminalCorrelationId,
+    PeerResponseTerminalDisplayIdentity, PeerResponseTerminalFact, PeerResponseTerminalFactError,
+    PeerResponseTerminalProjectionStatus, PeerResponseTerminalRenderPayload,
+    PeerResponseTerminalRouteIdentity, PeerResponseTerminalSource,
+    PeerResponseTerminalTransportIdentity, externalize_content_blocks, hydrate_content_blocks,
 };
 use serde::{Deserialize, Serialize};
 
@@ -58,6 +61,8 @@ pub enum InputOrigin {
     /// Peer agent (comms).
     Peer {
         peer_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_identity: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         runtime_id: Option<LogicalRuntimeId>,
     },
@@ -382,6 +387,8 @@ pub type ResponseTerminalStatus = PeerResponseTerminalProjectionStatus;
 pub enum PeerResponseTerminalInputError {
     #[error("request_id cannot be empty")]
     EmptyRequestId,
+    #[error("request_id must be a UUID: {input}")]
+    InvalidRequestId { input: String },
 }
 
 pub fn response_terminal_status_from_wire(
@@ -401,7 +408,7 @@ pub fn response_terminal_status_from_wire(
 }
 
 pub fn peer_response_terminal_input(
-    peer_name: &meerkat_core::comms::PeerName,
+    source: PeerResponseTerminalSource,
     request_id: impl Into<String>,
     status: meerkat_contracts::PeerResponseTerminalStatusWire,
     result: serde_json::Value,
@@ -410,14 +417,23 @@ pub fn peer_response_terminal_input(
     if request_id.trim().is_empty() {
         return Err(PeerResponseTerminalInputError::EmptyRequestId);
     }
+    PeerResponseTerminalCorrelationId::parse(&request_id).map_err(|_| {
+        PeerResponseTerminalInputError::InvalidRequestId {
+            input: request_id.clone(),
+        }
+    })?;
 
     Ok(Input::Peer(PeerInput {
         header: InputHeader {
             id: InputId::new(),
             timestamp: Utc::now(),
             source: InputOrigin::Peer {
-                peer_id: peer_name.as_string(),
-                runtime_id: None,
+                peer_id: source.route_identity.as_str().to_string(),
+                display_identity: Some(source.display_identity.as_str().to_string()),
+                runtime_id: source
+                    .transport_identity
+                    .as_ref()
+                    .map(|identity| LogicalRuntimeId::new(identity.as_str().to_string())),
             },
             durability: InputDurability::Durable,
             visibility: InputVisibility::default(),
@@ -532,9 +548,8 @@ pub struct OperationInput {
 
 /// Build the core-owned peer conversation projection for a runtime peer input.
 ///
-/// The runtime loop consumes this classification but does not own the peer
-/// response semantic mapping. That mapping belongs at the input boundary,
-/// where typed peer convention/status fields are still present.
+/// The runtime loop consumes this typed projection instead of reconstructing
+/// peer-response terminal render/context semantics from strings.
 pub(crate) fn peer_projection_from_peer_input(
     peer: &PeerInput,
 ) -> Option<PeerConversationProjection> {
@@ -574,16 +589,59 @@ pub(crate) fn peer_projection_from_peer_input(
                 payload: peer.payload.clone(),
             })
         }
-        Some(PeerConvention::ResponseTerminal { request_id, status }) => {
-            Some(PeerConversationProjection::ResponseTerminal {
-                peer_id: peer_id.clone(),
-                request_id: request_id.clone(),
-                status: *status,
-                payload: peer.payload.clone(),
-            })
-        }
+        Some(PeerConvention::ResponseTerminal { .. }) => peer_response_terminal_fact(peer)
+            .ok()
+            .flatten()
+            .map(PeerConversationProjection::response_terminal),
         None => None,
     }
+}
+
+pub(crate) fn peer_response_terminal_fact(
+    peer: &PeerInput,
+) -> Result<Option<PeerResponseTerminalFact>, PeerResponseTerminalFactError> {
+    let InputOrigin::Peer {
+        peer_id,
+        display_identity,
+        runtime_id,
+    } = &peer.header.source
+    else {
+        return Ok(None);
+    };
+    let Some(PeerConvention::ResponseTerminal { request_id, status }) = &peer.convention else {
+        return Ok(None);
+    };
+
+    let transport_identity = runtime_id
+        .as_ref()
+        .map(ToString::to_string)
+        .map(PeerResponseTerminalTransportIdentity::parse)
+        .transpose()?;
+    let source = PeerResponseTerminalSource::new(
+        transport_identity,
+        PeerResponseTerminalRouteIdentity::parse(peer_id.clone())?,
+        PeerResponseTerminalDisplayIdentity::parse(
+            display_identity
+                .as_ref()
+                .ok_or(PeerResponseTerminalFactError::MissingDisplayIdentity)?
+                .clone(),
+        )?,
+    );
+    Ok(Some(PeerResponseTerminalFact::new(
+        source,
+        PeerResponseTerminalCorrelationId::parse(request_id)?,
+        *status,
+        PeerResponseTerminalRenderPayload::new(peer.payload.clone()),
+    )))
+}
+
+pub(crate) fn validate_peer_response_terminal_fact(
+    input: &Input,
+) -> Result<(), PeerResponseTerminalFactError> {
+    let Input::Peer(peer) = input else {
+        return Ok(());
+    };
+    peer_response_terminal_fact(peer).map(|_| ())
 }
 
 /// Lift an [`Input`] to its core peer projection when it is a peer input with a
@@ -739,6 +797,14 @@ mod tests {
             supersession_key: None,
             correlation_id: None,
         }
+    }
+
+    fn terminal_source(peer: &str) -> PeerResponseTerminalSource {
+        PeerResponseTerminalSource::new(
+            None,
+            PeerResponseTerminalRouteIdentity::parse(peer).unwrap(),
+            PeerResponseTerminalDisplayIdentity::parse(peer).unwrap(),
+        )
     }
 
     #[test]
@@ -1030,6 +1096,7 @@ mod tests {
             InputOrigin::Operator,
             InputOrigin::Peer {
                 peer_id: "p1".into(),
+                display_identity: None,
                 runtime_id: None,
             },
             InputOrigin::Flow {
@@ -1098,10 +1165,9 @@ mod tests {
 
     #[test]
     fn peer_response_terminal_input_owns_wire_status_mapping() {
-        let peer_name = meerkat_core::comms::PeerName::new("analyst").unwrap();
         let input = peer_response_terminal_input(
-            &peer_name,
-            "req-1",
+            terminal_source("analyst"),
+            "018f6f79-7a82-7c4e-a552-a3b86f9630f1",
             meerkat_contracts::PeerResponseTerminalStatusWire::Cancelled,
             serde_json::json!({"ok": false}),
         )
@@ -1121,7 +1187,7 @@ mod tests {
                 ..
             }) => {
                 assert_eq!(peer_id, "analyst");
-                assert_eq!(request_id, "req-1");
+                assert_eq!(request_id, "018f6f79-7a82-7c4e-a552-a3b86f9630f1");
                 assert_eq!(status, ResponseTerminalStatus::Cancelled);
                 assert_eq!(payload["ok"], false);
             }
@@ -1131,9 +1197,8 @@ mod tests {
 
     #[test]
     fn peer_response_terminal_input_rejects_empty_request_id() {
-        let peer_name = meerkat_core::comms::PeerName::new("analyst").unwrap();
         let err = peer_response_terminal_input(
-            &peer_name,
+            terminal_source("analyst"),
             " ",
             meerkat_contracts::PeerResponseTerminalStatusWire::Completed,
             serde_json::json!({}),
@@ -1141,6 +1206,24 @@ mod tests {
         .unwrap_err();
 
         assert_eq!(err, PeerResponseTerminalInputError::EmptyRequestId);
+    }
+
+    #[test]
+    fn peer_response_terminal_input_rejects_invalid_request_id() {
+        let err = peer_response_terminal_input(
+            terminal_source("analyst"),
+            "req-1",
+            meerkat_contracts::PeerResponseTerminalStatusWire::Completed,
+            serde_json::json!({}),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            err,
+            PeerResponseTerminalInputError::InvalidRequestId {
+                input: "req-1".to_string()
+            }
+        );
     }
 
     #[test]

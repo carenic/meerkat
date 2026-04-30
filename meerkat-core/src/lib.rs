@@ -166,9 +166,12 @@ pub use handles::{
     AuthLeasePhase, CommsDrainHandle, DrainExitReason, DrainMode, DslRejectionKind,
     DslTransitionError, ExternalToolSurfaceHandle, McpServerLifecycleHandle, PeerCommsHandle,
     PeerConversationProjection, PeerResponseProgressProjectionPhase,
-    PeerResponseTerminalProjectionStatus, RealtimeProductTurnHandle, RealtimeProductTurnPhase,
-    SessionAdmissionHandle, SurfaceDiagnosticSnapshot, SurfaceSnapshot, TurnStateHandle,
-    TurnStateSnapshot,
+    PeerResponseTerminalCorrelationId, PeerResponseTerminalDisplayIdentity,
+    PeerResponseTerminalFact, PeerResponseTerminalFactError, PeerResponseTerminalProjectionStatus,
+    PeerResponseTerminalRenderPayload, PeerResponseTerminalRouteIdentity,
+    PeerResponseTerminalSource, PeerResponseTerminalTransportIdentity, RealtimeProductTurnHandle,
+    RealtimeProductTurnPhase, SessionAdmissionHandle, SurfaceDiagnosticSnapshot, SurfaceSnapshot,
+    TurnStateHandle, TurnStateSnapshot,
 };
 pub use hooks::{
     HookCapability, HookDecision, HookEngine, HookEngineError, HookExecutionMode,

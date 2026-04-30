@@ -97,7 +97,10 @@ pub enum InteractionContent {
 pub struct InboxInteraction {
     /// Unique identifier for this interaction.
     pub id: InteractionId,
-    /// Who sent this interaction (peer name or source label).
+    /// Machine route identity for peer senders. Plain external events leave
+    /// this unset because they are source-labelled, not peer-routed.
+    pub from_route: Option<PeerId>,
+    /// Who sent this interaction (peer display name or source label).
     pub from: String,
     /// The interaction content.
     pub content: InteractionContent,
@@ -280,8 +283,10 @@ pub enum PeerInputClass {
     ActionableMessage,
     /// A peer request that should route through canonical runtime admission.
     ActionableRequest,
-    /// A response to a previous outbound request (non-interrupting context).
-    Response,
+    /// A non-terminal response to a previous outbound request.
+    ResponseProgress,
+    /// A terminal response to a previous outbound request.
+    ResponseTerminal,
     /// Peer added lifecycle event.
     PeerLifecycleAdded,
     /// Peer retired lifecycle event.
@@ -307,7 +312,8 @@ impl PeerInputClass {
             self,
             Self::ActionableMessage
                 | Self::ActionableRequest
-                | Self::Response
+                | Self::ResponseProgress
+                | Self::ResponseTerminal
                 | Self::PlainEvent
                 | Self::PeerLifecycleKickoffFailed
                 | Self::PeerLifecycleKickoffCancelled
@@ -448,8 +454,12 @@ impl PeerIngressMachinePolicy {
         PeerIngressClassification::lifecycle(kind)
     }
 
-    pub fn classify_response(&self, _status: ResponseStatus) -> PeerIngressClassification {
-        PeerIngressClassification::required(PeerInputClass::Response, PeerIngressKind::Response)
+    pub fn classify_response(&self, status: ResponseStatus) -> PeerIngressClassification {
+        let class = match classify_response_terminality(status) {
+            TerminalityClass::Progress => PeerInputClass::ResponseProgress,
+            TerminalityClass::Terminal { .. } => PeerInputClass::ResponseTerminal,
+        };
+        PeerIngressClassification::required(class, PeerIngressKind::Response)
     }
 
     pub fn classify_ack(&self) -> PeerIngressClassification {
@@ -749,6 +759,24 @@ mod tests {
     }
 
     #[test]
+    fn peer_ingress_policy_owns_response_terminal_classification() {
+        let policy = PeerIngressMachinePolicy::default();
+
+        assert_eq!(
+            policy.classify_response(ResponseStatus::Accepted).class,
+            PeerInputClass::ResponseProgress
+        );
+        assert_eq!(
+            policy.classify_response(ResponseStatus::Completed).class,
+            PeerInputClass::ResponseTerminal
+        );
+        assert_eq!(
+            policy.classify_response(ResponseStatus::Failed).class,
+            PeerInputClass::ResponseTerminal
+        );
+    }
+
+    #[test]
     fn peer_ingress_policy_auth_exempts_supervisor_bridge() {
         let policy = PeerIngressMachinePolicy::default();
         let classification = policy.classify_request_intent(crate::SUPERVISOR_BRIDGE_INTENT);
@@ -801,6 +829,7 @@ mod tests {
     fn inbox_interaction_preserves_runtime_hints() {
         let interaction = InboxInteraction {
             id: InteractionId(Uuid::new_v4()),
+            from_route: None,
             from: "event:webhook".into(),
             content: InteractionContent::Message {
                 body: "hello".into(),
