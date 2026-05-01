@@ -77,6 +77,7 @@ pub async fn handle(
             event_tx: None,
             skill_references: None,
             flow_tool_overlay: None,
+            pre_turn_context_appends: Vec::new(),
             turn_metadata: None,
         };
 
@@ -132,6 +133,7 @@ pub async fn handle(
         override_shell: meerkat_core::ToolCategoryOverride::from_override(input.shell),
         additional_instructions,
         runtime_build_mode: meerkat_core::RuntimeBuildMode::StandaloneEphemeral,
+        initial_turn_metadata: None,
         ..SessionBuildOptions::default()
     };
     build.provider_params = input.provider_params;

@@ -842,6 +842,22 @@ impl SessionRuntime {
         (!metadata.is_empty()).then_some(metadata)
     }
 
+    fn runtime_stamped_prompt_turn_metadata_from_overrides(
+        skill_references: Option<Vec<meerkat_core::skills::SkillKey>>,
+        flow_tool_overlay: Option<meerkat_core::service::TurnToolOverlay>,
+        additional_instructions: Option<Vec<String>>,
+        overrides: Option<&crate::handlers::turn::TurnOverrides>,
+        provider_hint: Option<&str>,
+    ) -> meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+        meerkat_runtime::runtime_stamped_prompt_turn_metadata(Self::turn_metadata_from_overrides(
+            skill_references,
+            flow_tool_overlay,
+            additional_instructions,
+            overrides,
+            provider_hint,
+        ))
+    }
+
     pub(crate) fn turn_overrides_from_metadata(
         metadata: Option<&meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata>,
     ) -> Option<crate::handlers::turn::TurnOverrides> {
@@ -1813,13 +1829,20 @@ impl SessionRuntime {
         session_id: &SessionId,
         run_id: meerkat_core::lifecycle::RunId,
         appends: Vec<meerkat_core::PendingSystemContextAppend>,
+        boundary: RunApplyBoundary,
         contributing_input_ids: Vec<meerkat_core::lifecycle::InputId>,
     ) -> Result<
         meerkat_core::lifecycle::core_executor::CoreApplyOutput,
         meerkat_core::service::SessionError,
     > {
         self.service
-            .apply_runtime_context_appends(session_id, run_id, appends, contributing_input_ids)
+            .apply_runtime_context_appends_with_boundary(
+                session_id,
+                run_id,
+                appends,
+                boundary,
+                contributing_input_ids,
+            )
             .await
     }
 
@@ -2431,28 +2454,25 @@ impl SessionRuntime {
             };
             return self
                 .service
-                .apply_runtime_context_appends(
+                .apply_runtime_context_appends_with_boundary(
                     session_id,
                     run_id,
                     pending_system_context_appends(&staged.context_appends),
+                    primitive.apply_boundary(),
                     staged.contributing_input_ids.clone(),
                 )
                 .await
                 .map_err(session_error_to_rpc);
         }
 
-        if primitive.is_peer_response_terminal_context_and_run() {
-            let RunPrimitive::StagedInput(staged) = primitive else {
-                unreachable!("terminal peer-response apply intent only matches staged primitives");
-            };
-            self.service
-                .apply_runtime_system_context_for_turn(
-                    session_id,
-                    pending_system_context_appends(&staged.context_appends),
-                )
-                .await
-                .map_err(session_error_to_rpc)?;
-        }
+        let pre_turn_context_appends = match primitive {
+            RunPrimitive::StagedInput(staged)
+                if primitive.is_peer_response_terminal_context_and_run() =>
+            {
+                pending_system_context_appends(&staged.context_appends)
+            }
+            _ => Vec::new(),
+        };
 
         let effective_identity = self
             .effective_llm_identity_for_turn(session_id, overrides.as_ref())
@@ -2526,6 +2546,7 @@ impl SessionRuntime {
 
                 skill_references: skill_references.clone(),
                 flow_tool_overlay: flow_tool_overlay.clone(),
+                pre_turn_context_appends: pre_turn_context_appends.clone(),
                 turn_metadata: primitive.turn_metadata().cloned(),
             };
 
@@ -2754,6 +2775,7 @@ impl SessionRuntime {
 
                         skill_references,
                         flow_tool_overlay,
+                        pre_turn_context_appends: pre_turn_context_appends.clone(),
                         turn_metadata: primitive.turn_metadata().cloned(),
                     },
                     match primitive {
@@ -2814,6 +2836,7 @@ impl SessionRuntime {
 
                     skill_references,
                     flow_tool_overlay,
+                    pre_turn_context_appends,
                     turn_metadata: primitive.turn_metadata().cloned(),
                 },
                 match primitive {
@@ -3111,6 +3134,18 @@ impl SessionRuntime {
             build.instance_id = build.instance_id.or_else(|| self.instance_id.clone());
             build.backend = build.backend.or_else(|| self.backend.clone());
             build.config_generation = build.config_generation.or(runtime_generation);
+            let initial_turn_provider_hint = build_config
+                .provider
+                .or_else(|| meerkat_core::Provider::infer_from_model(&build_config.model))
+                .map(|provider| provider.as_str());
+            build.initial_turn_metadata =
+                Some(Self::runtime_stamped_prompt_turn_metadata_from_overrides(
+                    skill_references.clone(),
+                    flow_tool_overlay.clone(),
+                    additional_instructions.clone(),
+                    overrides.as_ref(),
+                    initial_turn_provider_hint,
+                ));
 
             let event_tx = self
                 .pending_session_event_fanout_tx(session_id, event_tx)
@@ -3217,6 +3252,13 @@ impl SessionRuntime {
                 .and_then(|session| session.session_metadata().map(|meta| meta.keep_alive))
                 .unwrap_or(false),
         };
+        let turn_metadata = Some(Self::runtime_stamped_prompt_turn_metadata_from_overrides(
+            skill_references.clone(),
+            flow_tool_overlay.clone(),
+            additional_instructions.clone(),
+            overrides.as_ref(),
+            overrides.as_ref().and_then(|ov| ov.provider.as_deref()),
+        ));
 
         let req = StartTurnRequest {
             prompt: turn_prompt.clone(),
@@ -3226,7 +3268,8 @@ impl SessionRuntime {
             event_tx: Some(event_tx.clone()),
             skill_references: skill_references.clone(),
             flow_tool_overlay: flow_tool_overlay.clone(),
-            turn_metadata: None,
+            pre_turn_context_appends: Vec::new(),
+            turn_metadata,
         };
 
         if self.live_session_is_stale(session_id).await? {
@@ -4690,6 +4733,36 @@ mod tests {
     }
 
     #[test]
+    fn turn_metadata_from_overrides_does_not_stamp_execution_kind() {
+        let metadata = SessionRuntime::turn_metadata_from_overrides(
+            None,
+            None,
+            Some(vec!["runtime note".to_string()]),
+            None,
+            None,
+        )
+        .expect("additional instructions should produce metadata");
+
+        assert_eq!(metadata.execution_kind, None);
+    }
+
+    #[test]
+    fn runtime_prompt_metadata_helper_stamps_execution_kind() {
+        let metadata = SessionRuntime::runtime_stamped_prompt_turn_metadata_from_overrides(
+            None,
+            None,
+            Some(vec!["runtime note".to_string()]),
+            None,
+            None,
+        );
+
+        assert_eq!(
+            metadata.execution_kind,
+            Some(meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn)
+        );
+    }
+
+    #[test]
     fn realtime_open_config_context_comes_from_typed_system_context_state() {
         let mut state = SessionSystemContextState::default();
         state
@@ -4834,6 +4907,71 @@ mod tests {
             llm_client_override: Some(Arc::new(SlowMockLlmClient::new(delay_ms))),
             ..AgentBuildConfig::new("claude-sonnet-4-5")
         }
+    }
+
+    #[tokio::test]
+    async fn context_only_runtime_apply_preserves_run_checkpoint_boundary() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut runtime = make_runtime(temp_factory(&temp), 10);
+        runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
+
+        let session_id = runtime
+            .create_session(mock_build_config(), None, None)
+            .await
+            .expect("create_session");
+        let (initial_event_tx, _initial_event_rx) = mpsc::channel(100);
+        runtime
+            .start_turn(
+                &session_id,
+                "materialize runtime session".into(),
+                initial_event_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("start_turn");
+        let input_id = meerkat_core::lifecycle::InputId::new();
+        let primitive =
+            RunPrimitive::StagedInput(meerkat_core::lifecycle::run_primitive::StagedRunInput {
+                boundary: RunApplyBoundary::RunCheckpoint,
+                appends: Vec::new(),
+                context_appends: vec![ConversationContextAppend {
+                    key: "ctx-rpc-checkpoint-boundary".to_string(),
+                    content: CoreRenderable::Text {
+                        text: "checkpoint-only runtime context".to_string(),
+                    },
+                }],
+                contributing_input_ids: vec![input_id.clone()],
+                turn_metadata: Some(
+                    meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+                        execution_kind: Some(
+                            meerkat_core::lifecycle::RuntimeExecutionKind::ResumePending,
+                        ),
+                        ..Default::default()
+                    },
+                ),
+            });
+        let (event_tx, _event_rx) = mpsc::channel(100);
+
+        let output = runtime
+            .apply_runtime_turn(
+                &session_id,
+                RunId::new(),
+                &primitive,
+                ContentInput::Text(String::new()),
+                event_tx,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("context-only apply should succeed");
+
+        assert_eq!(output.receipt.boundary, RunApplyBoundary::RunCheckpoint);
+        assert_eq!(output.receipt.contributing_input_ids, vec![input_id]);
     }
 
     #[tokio::test]
@@ -5554,45 +5692,42 @@ mod tests {
             let _ = handle.wait().await;
         }
 
-        let started = tokio::time::timeout(std::time::Duration::from_secs(3), events.next())
-            .await
-            .expect("run_started timeout")
-            .expect("run_started event should exist");
-        match started.payload {
-            AgentEvent::RunStarted { prompt, .. } => {
-                let normalized = prompt.text_content().to_lowercase();
-                assert!(
-                    normalized.contains(
-                        "peer_response_terminal:analyst-rt:018f6f79-7a82-7c4e-a552-a3b86f9630f1"
-                    ),
-                    "run_started prompt should expose runtime system-context source: {normalized}"
-                );
-                assert!(
-                    normalized.contains("birch seventeen"),
-                    "run_started prompt should expose authoritative terminal peer payload: {normalized}"
-                );
+        let (result, usage) = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut saw_context_started = false;
+            while let Some(event) = events.next().await {
+                match event.payload {
+                    AgentEvent::RunStarted { prompt, .. } => {
+                        let normalized = prompt.text_content().to_lowercase();
+                        if normalized.contains(
+                            "peer_response_terminal:analyst-rt:018f6f79-7a82-7c4e-a552-a3b86f9630f1",
+                        ) {
+                            assert!(
+                                normalized.contains("birch seventeen"),
+                                "run_started prompt should expose authoritative terminal peer payload: {normalized}"
+                            );
+                            saw_context_started = true;
+                        }
+                    }
+                    AgentEvent::RunCompleted { result, usage, .. } if saw_context_started => {
+                        return (result, usage);
+                    }
+                    _ => {}
+                }
             }
-            other => panic!("expected run_started, got {other:?}"),
-        }
+            panic!("committed runtime context lifecycle events did not arrive");
+        })
+        .await
+        .expect("runtime context lifecycle timeout");
 
-        let completed = tokio::time::timeout(std::time::Duration::from_secs(3), events.next())
-            .await
-            .expect("run_completed timeout")
-            .expect("run_completed event should exist");
-        match completed.payload {
-            AgentEvent::RunCompleted { result, usage, .. } => {
-                assert!(
-                    result.is_empty(),
-                    "context-only runtime apply should not synthesize assistant output: {result:?}"
-                );
-                assert_eq!(
-                    usage,
-                    meerkat_core::types::Usage::default(),
-                    "context-only runtime apply should not report model usage"
-                );
-            }
-            other => panic!("expected run_completed, got {other:?}"),
-        }
+        assert!(
+            result.is_empty(),
+            "context-only runtime apply should not synthesize assistant output: {result:?}"
+        );
+        assert_eq!(
+            usage,
+            meerkat_core::types::Usage::default(),
+            "context-only runtime apply should not report model usage"
+        );
     }
 
     #[cfg(feature = "comms")]
@@ -5713,26 +5848,38 @@ mod tests {
         .await
         .expect("send terminal peer response");
 
-        let started = tokio::time::timeout(std::time::Duration::from_secs(5), events.next())
-            .await
-            .expect("run_started timeout")
-            .expect("run_started event should exist");
-        assert!(matches!(started.payload, AgentEvent::RunStarted { .. }));
-
-        let completed = tokio::time::timeout(std::time::Duration::from_secs(5), events.next())
-            .await
-            .expect("run_completed timeout")
-            .expect("run_completed event should exist");
-        match completed.payload {
-            AgentEvent::RunCompleted { result, usage, .. } => {
-                assert!(
-                    result.is_empty(),
-                    "context-only drain apply should not synthesize assistant output"
-                );
-                assert_eq!(usage, meerkat_core::types::Usage::default());
+        let (result, usage) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            let mut saw_context_started = false;
+            while let Some(event) = events.next().await {
+                match event.payload {
+                    AgentEvent::RunStarted { prompt, .. } => {
+                        let normalized = prompt.text_content().to_lowercase();
+                        if normalized.contains("peer_response_terminal:")
+                            && normalized.contains("birch seventeen")
+                        {
+                            assert!(
+                                normalized.contains("checksum_token"),
+                                "run_started prompt should expose authoritative terminal peer payload: {normalized}"
+                            );
+                            saw_context_started = true;
+                        }
+                    }
+                    AgentEvent::RunCompleted { result, usage, .. } if saw_context_started => {
+                        return (result, usage);
+                    }
+                    _ => {}
+                }
             }
-            other => panic!("expected run_completed, got {other:?}"),
-        }
+            panic!("committed drain context lifecycle events did not arrive");
+        })
+        .await
+        .expect("runtime context lifecycle timeout");
+
+        assert!(
+            result.is_empty(),
+            "context-only drain apply should not synthesize assistant output"
+        );
+        assert_eq!(usage, meerkat_core::types::Usage::default());
     }
 
     #[tokio::test]
