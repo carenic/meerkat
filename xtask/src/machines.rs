@@ -24,7 +24,9 @@ use meerkat_machine_schema::{
     canonical_composition_schemas, canonical_machine_coverage_manifests, canonical_machine_schemas,
 };
 use proc_macro2::TokenTree;
+use quote::ToTokens;
 use serde::Serialize;
+use syn::spanned::Spanned;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Phase1CarryForwardProductionBody {
@@ -713,30 +715,7 @@ pub fn collect_peer_response_terminal_projection_mismatches(root: &Path) -> Resu
             .split("\n#[cfg(test)]")
             .next()
             .unwrap_or(contents.as_str());
-        let core_banned = [
-            (
-                "transport_identity: Option<String>",
-                "transport identity string bus",
-            ),
-            ("route_identity: String", "route identity string bus"),
-            ("display_identity: String", "display identity string bus"),
-            ("correlation_id: String", "correlation id string bus"),
-            (
-                "peer_response_terminal_context_key(&self.source.route_identity, &self.correlation_id)",
-                "untyped terminal context key projection",
-            ),
-        ];
-
-        for (line_idx, line) in production.lines().enumerate() {
-            for (token, reason) in core_banned {
-                if line.contains(token) {
-                    mismatches.push(format!(
-                        "{rel}:{}: {reason} `{token}` must use distinct typed peer-response terminal facts",
-                        line_idx + 1
-                    ));
-                }
-            }
-        }
+        collect_peer_response_terminal_core_fact_mismatches(rel, production, &mut mismatches)?;
     }
 
     let shell_boundary_files = [
@@ -797,6 +776,216 @@ pub fn collect_peer_response_terminal_projection_mismatches(root: &Path) -> Resu
     }
 
     Ok(mismatches)
+}
+
+fn collect_peer_response_terminal_core_fact_mismatches(
+    rel: &str,
+    source: &str,
+    mismatches: &mut Vec<String>,
+) -> Result<()> {
+    let parsed = syn::parse_file(source)
+        .with_context(|| format!("parse peer-response terminal core fact owner {rel}"))?;
+
+    let Some(source_struct) = find_struct_item(&parsed, "PeerResponseTerminalSource") else {
+        mismatches.push(format!(
+            "{rel}: PeerResponseTerminalSource is missing; terminal peer responses must remain distinct typed facts"
+        ));
+        return Ok(());
+    };
+    require_struct_field_type(
+        rel,
+        source_struct,
+        "transport_identity",
+        "Option<PeerResponseTerminalTransportIdentity>",
+        |ty| type_is_option_of_named(ty, "PeerResponseTerminalTransportIdentity"),
+        mismatches,
+    );
+    require_struct_field_type(
+        rel,
+        source_struct,
+        "route_identity",
+        "PeerResponseTerminalRouteIdentity",
+        |ty| type_is_named(ty, "PeerResponseTerminalRouteIdentity"),
+        mismatches,
+    );
+    require_struct_field_type(
+        rel,
+        source_struct,
+        "display_identity",
+        "PeerResponseTerminalDisplayIdentity",
+        |ty| type_is_named(ty, "PeerResponseTerminalDisplayIdentity"),
+        mismatches,
+    );
+
+    let Some(fact_struct) = find_struct_item(&parsed, "PeerResponseTerminalFact") else {
+        mismatches.push(format!(
+            "{rel}: PeerResponseTerminalFact is missing; terminal peer responses must remain distinct typed facts"
+        ));
+        return Ok(());
+    };
+    require_struct_field_type(
+        rel,
+        fact_struct,
+        "source",
+        "PeerResponseTerminalSource",
+        |ty| type_is_named(ty, "PeerResponseTerminalSource"),
+        mismatches,
+    );
+    require_struct_field_type(
+        rel,
+        fact_struct,
+        "correlation_id",
+        "PeerResponseTerminalCorrelationId",
+        |ty| type_is_named(ty, "PeerResponseTerminalCorrelationId"),
+        mismatches,
+    );
+
+    let Some(context_key_fn) = find_fn_item(&parsed, "peer_response_terminal_context_key") else {
+        mismatches.push(format!(
+            "{rel}: peer_response_terminal_context_key is missing; terminal context keys must be built from typed route/correlation facts"
+        ));
+        return Ok(());
+    };
+    require_context_key_signature(rel, context_key_fn, mismatches);
+
+    Ok(())
+}
+
+fn find_struct_item<'a>(parsed: &'a syn::File, name: &str) -> Option<&'a syn::ItemStruct> {
+    parsed.items.iter().find_map(|item| match item {
+        syn::Item::Struct(item_struct) if item_struct.ident == name => Some(item_struct),
+        _ => None,
+    })
+}
+
+fn find_fn_item<'a>(parsed: &'a syn::File, name: &str) -> Option<&'a syn::ItemFn> {
+    parsed.items.iter().find_map(|item| match item {
+        syn::Item::Fn(item_fn) if item_fn.sig.ident == name => Some(item_fn),
+        _ => None,
+    })
+}
+
+fn require_struct_field_type(
+    rel: &str,
+    item_struct: &syn::ItemStruct,
+    field_name: &str,
+    expected: &str,
+    matches_expected: impl Fn(&syn::Type) -> bool,
+    mismatches: &mut Vec<String>,
+) {
+    let struct_name = item_struct.ident.to_string();
+    let Some(field) = named_struct_field(item_struct, field_name) else {
+        mismatches.push(format!(
+            "{rel}: {struct_name}.{field_name} is missing; terminal peer-response facts must fail closed on typed identities"
+        ));
+        return;
+    };
+
+    if !matches_expected(&field.ty) {
+        mismatches.push(format!(
+            "{rel}:{}: {struct_name}.{field_name} must use {expected}, found `{}`; terminal peer-response facts must not fall back to a string identity bus",
+            field.ident
+                .as_ref()
+                .map(|ident| ident.span().start().line)
+                .unwrap_or(1),
+            rust_type_tokens(&field.ty)
+        ));
+    }
+}
+
+fn named_struct_field<'a>(
+    item_struct: &'a syn::ItemStruct,
+    field_name: &str,
+) -> Option<&'a syn::Field> {
+    let syn::Fields::Named(fields) = &item_struct.fields else {
+        return None;
+    };
+    fields.named.iter().find(|field| {
+        field
+            .ident
+            .as_ref()
+            .is_some_and(|ident| ident == field_name)
+    })
+}
+
+fn require_context_key_signature(rel: &str, item_fn: &syn::ItemFn, mismatches: &mut Vec<String>) {
+    let typed_inputs = item_fn
+        .sig
+        .inputs
+        .iter()
+        .filter_map(|arg| match arg {
+            syn::FnArg::Typed(pat_type) => Some(pat_type),
+            syn::FnArg::Receiver(_) => None,
+        })
+        .collect::<Vec<_>>();
+
+    if typed_inputs.len() != 2 {
+        mismatches.push(format!(
+            "{rel}:{}: peer_response_terminal_context_key must take typed route/correlation facts, found {} parameter(s)",
+            item_fn.sig.ident.span().start().line,
+            typed_inputs.len()
+        ));
+        return;
+    }
+
+    if !type_is_ref_to_named(&typed_inputs[0].ty, "PeerResponseTerminalRouteIdentity") {
+        mismatches.push(format!(
+            "{rel}:{}: peer_response_terminal_context_key route_identity parameter must use &PeerResponseTerminalRouteIdentity, found `{}`",
+            typed_inputs[0].pat.span().start().line,
+            rust_type_tokens(&typed_inputs[0].ty)
+        ));
+    }
+    if !type_is_named(&typed_inputs[1].ty, "PeerResponseTerminalCorrelationId") {
+        mismatches.push(format!(
+            "{rel}:{}: peer_response_terminal_context_key correlation_id parameter must use PeerResponseTerminalCorrelationId, found `{}`",
+            typed_inputs[1].pat.span().start().line,
+            rust_type_tokens(&typed_inputs[1].ty)
+        ));
+    }
+}
+
+fn type_is_ref_to_named(ty: &syn::Type, expected: &str) -> bool {
+    matches!(ty, syn::Type::Reference(reference) if type_is_named(&reference.elem, expected))
+}
+
+fn type_is_option_of_named(ty: &syn::Type, expected_inner: &str) -> bool {
+    let syn::Type::Path(type_path) = ty else {
+        return false;
+    };
+    let Some(segment) = type_path.path.segments.last() else {
+        return false;
+    };
+    if segment.ident != "Option" {
+        return false;
+    }
+    let syn::PathArguments::AngleBracketed(args) = &segment.arguments else {
+        return false;
+    };
+    let mut args = args.args.iter();
+    let Some(syn::GenericArgument::Type(inner)) = args.next() else {
+        return false;
+    };
+    args.next().is_none() && type_is_named(inner, expected_inner)
+}
+
+fn type_is_named(ty: &syn::Type, expected: &str) -> bool {
+    let syn::Type::Path(type_path) = ty else {
+        return false;
+    };
+    type_path
+        .path
+        .segments
+        .last()
+        .is_some_and(|segment| segment.ident == expected && segment.arguments.is_empty())
+}
+
+fn rust_type_tokens(ty: &syn::Type) -> String {
+    ty.to_token_stream()
+        .to_string()
+        .replace(" :: ", "::")
+        .replace(" < ", "<")
+        .replace(" >", ">")
+        .replace(" , ", ", ")
 }
 
 pub fn collect_direct_flow_reducer_transition_mismatches(root: &Path) -> Result<Vec<String>> {
