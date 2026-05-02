@@ -971,9 +971,7 @@ fn persist_registry_snapshot(
             removed_browser,
             removed_device,
             now_millis,
-            policy.removal_mode,
-            policy.admission_capacity,
-            policy.admit_local_payloads,
+            policy,
         )?;
         serde_json::to_vec(&merged)
             .map_err(|err| crate::store::RuntimeStoreError::WriteFailed(err.to_string()))
@@ -1083,9 +1081,7 @@ fn merge_oauth_registry_snapshot(
     removed_browser: &[BrowserSnapshotKey],
     removed_device: &[DeviceSnapshotKey],
     now_millis: u64,
-    removal_mode: SnapshotRemovalMode,
-    admission_capacity: Option<usize>,
-    admit_local_payloads: bool,
+    policy: SnapshotPersistPolicy,
 ) -> Result<OAuthFlowRegistrySnapshot, crate::store::RuntimeStoreError> {
     let mut merged = match current {
         Some(bytes) => serde_json::from_slice::<OAuthFlowRegistrySnapshot>(bytes)
@@ -1094,7 +1090,7 @@ fn merge_oauth_registry_snapshot(
     };
     let removed_browser = removed_browser.iter().cloned().collect::<BTreeSet<_>>();
     let removed_device = removed_device.iter().cloned().collect::<BTreeSet<_>>();
-    if removal_mode == SnapshotRemovalMode::Claim {
+    if policy.removal_mode == SnapshotRemovalMode::Claim {
         ensure_removed_flows_are_active(&merged, &removed_browser, &removed_device, now_millis)?;
     }
     let current_browser = merged
@@ -1138,7 +1134,7 @@ fn merge_oauth_registry_snapshot(
                 let key = persisted_browser_snapshot_key(flow);
                 flow.expires_at_millis > now_millis
                     && !removed_browser.contains(&key)
-                    && (admit_local_payloads || current_browser.contains(&key))
+                    && (policy.admit_local_payloads || current_browser.contains(&key))
             })
             .cloned(),
     );
@@ -1150,13 +1146,13 @@ fn merge_oauth_registry_snapshot(
                 let key = persisted_device_snapshot_key(flow);
                 flow.expires_at_millis > now_millis
                     && !removed_device.contains(&key)
-                    && (admit_local_payloads || current_device.contains(&key))
+                    && (policy.admit_local_payloads || current_device.contains(&key))
             })
             .cloned(),
     );
     merged.browser.sort_by_key(persisted_browser_snapshot_key);
     merged.device.sort_by_key(persisted_device_snapshot_key);
-    if let Some(max_outstanding) = admission_capacity {
+    if let Some(max_outstanding) = policy.admission_capacity {
         ensure_merged_snapshot_within_capacity(&merged, max_outstanding)?;
     }
     Ok(merged)
