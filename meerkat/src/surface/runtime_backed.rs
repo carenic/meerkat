@@ -414,13 +414,11 @@ fn start_turn_request_from_primitive(
     Ok(meerkat_core::service::StartTurnRequest {
         prompt: primitive.extract_content_input(),
         system_prompt: None,
-        render_metadata: metadata.and_then(|metadata| metadata.render_metadata.clone()),
-        handling_mode: metadata
-            .and_then(|metadata| metadata.handling_mode)
-            .unwrap_or(HandlingMode::Queue),
+        render_metadata: None,
+        handling_mode: HandlingMode::Queue,
         event_tx: None,
-        skill_references: metadata.and_then(|metadata| metadata.skill_references.clone()),
-        flow_tool_overlay: metadata.and_then(|metadata| metadata.flow_tool_overlay.clone()),
+        skill_references: None,
+        flow_tool_overlay: None,
         pre_turn_context_appends,
         turn_metadata: metadata.cloned(),
     })
@@ -668,11 +666,24 @@ mod tests {
 
     #[test]
     fn run_primitive_carries_runtime_metadata_into_start_turn_request() {
+        let skill = meerkat_core::skills::SkillKey::builtin(
+            meerkat_core::skills::SkillName::parse("runtime-metadata").expect("valid skill"),
+        );
         let metadata = RuntimeTurnMetadata {
             execution_kind: Some(meerkat_core::lifecycle::RuntimeExecutionKind::ResumePending),
             model: Some(meerkat_core::lifecycle::run_primitive::ModelId::new(
                 "model-from-runtime",
             )),
+            handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
+            render_metadata: Some(meerkat_core::types::RenderMetadata {
+                class: meerkat_core::types::RenderClass::FlowStep,
+                salience: meerkat_core::types::RenderSalience::Important,
+            }),
+            skill_references: Some(vec![skill]),
+            flow_tool_overlay: Some(meerkat_core::service::TurnToolOverlay {
+                allowed_tools: Some(vec!["runtime_tool".to_string()]),
+                blocked_tools: None,
+            }),
             ..Default::default()
         };
         let primitive =
@@ -692,6 +703,10 @@ mod tests {
         let req = start_turn_request_from_primitive(&primitive)
             .expect("metadata should be carried, not rejected");
 
+        assert_eq!(req.render_metadata, None);
+        assert_eq!(req.handling_mode, meerkat_core::types::HandlingMode::Queue);
+        assert_eq!(req.skill_references, None);
+        assert_eq!(req.flow_tool_overlay, None);
         assert_eq!(req.turn_metadata, Some(metadata));
         assert_eq!(
             req.turn_metadata
