@@ -28,132 +28,49 @@ if [[ "${1:-}" == "--self-test" ]]; then
   tmpdir="$(mktemp -d)"
   trap 'rm -rf "$tmpdir"' EXIT
 
-  mkdir -p "$tmpdir/meerkat-runtime/src/meerkat_machine"
-  cat >"$tmpdir/meerkat-runtime/src/meerkat_machine/dispatch_ingress.rs" <<'EOF'
+  reset_fixture() {
+    rm -rf "$tmpdir"
+    tmpdir="$(mktemp -d)"
+  }
+
+  write_fixture() {
+    local path="$1"
+    local dir="${path%/*}"
+    [[ "$dir" != "$path" ]] && mkdir -p "$tmpdir/$dir"
+    cat >"$tmpdir/$path"
+  }
+
+  expect_audit_failure() {
+    local name="$1"
+    local path="$2"
+    reset_fixture
+    write_fixture "$path"
+    if "$self_script" "$tmpdir" >/dev/null 2>&1; then
+      echo "audit-effect-authority self-test failed: $name fixture passed" >&2
+      exit 1
+    fi
+  }
+
+  expect_audit_failure "peer hard-cancel" "meerkat-runtime/src/meerkat_machine/dispatch_ingress.rs" <<'EOF'
 fn bad(machine: &Machine) {
     let _ = machine.hard_cancel_current_run(&session_id, "bad");
 }
 EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: peer hard-cancel fixture passed" >&2
-    exit 1
-  fi
 
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-
-  mkdir -p "$tmpdir/meerkat-runtime/src/meerkat_machine"
-  cat >"$tmpdir/meerkat-runtime/src/meerkat_machine/dispatch_ingress.rs" <<'EOF'
-async fn bad(machine: &Machine) {
-    let _ = machine.interrupt_current_run_with_reason(&session_id, "bad".to_string()).await;
-}
-EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: peer interrupt alias fixture passed" >&2
-    exit 1
-  fi
-
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-
-  mkdir -p "$tmpdir/meerkat-runtime/src/meerkat_machine"
-  cat >"$tmpdir/meerkat-runtime/src/meerkat_machine/session_management.rs" <<'EOF'
+  expect_audit_failure "legacy interrupt_current_run definition" "meerkat-runtime/src/meerkat_machine/session_management.rs" <<'EOF'
 impl Machine {
     pub async fn interrupt_current_run(&self, session_id: &SessionId) {
         let _ = self.hard_cancel_current_run(session_id, "bad").await;
     }
 }
 EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: legacy interrupt_current_run definition fixture passed" >&2
-    exit 1
-  fi
 
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-
-  mkdir -p "$tmpdir/meerkat-runtime/src/meerkat_machine"
-  cat >"$tmpdir/meerkat-runtime/src/meerkat_machine/dispatch_ingress.rs" <<'EOF'
-async fn bad(machine: &Machine) {
-    let _ = machine.interrupt_current_run_inner(&session_id, "bad".to_string()).await;
-}
-EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: peer interrupt inner fixture passed" >&2
-    exit 1
-  fi
-
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-
-  mkdir -p "$tmpdir/meerkat-runtime/src/meerkat_machine"
-  cat >"$tmpdir/meerkat-runtime/src/meerkat_machine/dispatch_ingress.rs" <<'EOF'
-async fn bad(machine: &Machine) {
-    let _ = machine.dispatch_user_interrupt(&session_id, "bad".to_string()).await;
-}
-EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: peer dispatch_user_interrupt fixture passed" >&2
-    exit 1
-  fi
-
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-
-  mkdir -p "$tmpdir/meerkat-runtime/src/meerkat_machine"
-  cat >"$tmpdir/meerkat-runtime/src/meerkat_machine/dispatch_ingress.rs" <<'EOF'
-async fn bad(machine: &Machine) {
-    let _ = machine.apply_user_interrupt_live_cancel(&session_id, "bad".to_string()).await;
-}
-EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: peer apply_user_interrupt_live_cancel fixture passed" >&2
-    exit 1
-  fi
-
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-
-  mkdir -p "$tmpdir/meerkat-runtime/src/meerkat_machine"
-  cat >"$tmpdir/meerkat-runtime/src/meerkat_machine/mod.rs" <<'EOF'
+  expect_audit_failure "root user_interrupt module" "meerkat-runtime/src/meerkat_machine/mod.rs" <<'EOF'
 #[path = "../user_interrupt.rs"]
 pub(crate) mod user_interrupt;
 EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: root user_interrupt module fixture passed" >&2
-    exit 1
-  fi
 
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-
-  mkdir -p "$tmpdir/meerkat-runtime/src/meerkat_machine"
-  cat >"$tmpdir/meerkat-runtime/src/meerkat_machine/dispatch_ingress.rs" <<'EOF'
-fn bad(session_id: SessionId, reason: String) {
-    let _ = MeerkatMachineCommand::InterruptCurrentRun {
-        session_id,
-        reason,
-    };
-}
-EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: peer InterruptCurrentRun command fixture passed" >&2
-    exit 1
-  fi
-
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-
-  mkdir -p "$tmpdir/meerkat-runtime/src/driver"
-  cat >"$tmpdir/meerkat-runtime/src/driver/sneaky.rs" <<'EOF'
+  expect_audit_failure "split InterruptCurrentRun command" "meerkat-runtime/src/driver/sneaky.rs" <<'EOF'
 fn bad(session_id: SessionId, reason: String) {
     let _ = MeerkatMachineCommand::InterruptCurrentRun
     {
@@ -162,17 +79,8 @@ fn bad(session_id: SessionId, reason: String) {
     };
 }
 EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: non-peer split InterruptCurrentRun command fixture passed" >&2
-    exit 1
-  fi
 
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-
-  mkdir -p "$tmpdir/meerkat-runtime/src"
-  cat >"$tmpdir/meerkat-runtime/src/meerkat_machine_types.rs" <<'EOF'
+  expect_audit_failure "InterruptCurrentRun command variant" "meerkat-runtime/src/meerkat_machine_types.rs" <<'EOF'
 pub(crate) enum MeerkatMachineCommand {
     RegisterSession {
         session_id: SessionId,
@@ -186,60 +94,28 @@ pub(crate) enum MeerkatMachineCommand {
     },
 }
 EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: InterruptCurrentRun command variant fixture passed" >&2
-    exit 1
-  fi
 
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-  mkdir -p "$tmpdir/meerkat-runtime/src"
-  cat >"$tmpdir/meerkat-runtime/src/runtime_loop.rs" <<'EOF'
+  expect_audit_failure "direct RuntimeEffect constructor" "meerkat-runtime/src/runtime_loop.rs" <<'EOF'
 fn bad() {
     let _ = RuntimeEffect::cancel_after_boundary("bad");
 }
 EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: direct RuntimeEffect constructor fixture passed" >&2
-    exit 1
-  fi
 
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-  mkdir -p "$tmpdir/meerkat-runtime/src"
-  cat >"$tmpdir/meerkat-runtime/src/runtime_loop.rs" <<'EOF'
+  expect_audit_failure "direct runtime-loop executor stop" "meerkat-runtime/src/runtime_loop.rs" <<'EOF'
 async fn bad(executor: &mut dyn CoreExecutor) {
     let _ = executor
         .stop_runtime_executor("bad".to_string())
         .await;
 }
 EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: direct runtime-loop executor stop fixture passed" >&2
-    exit 1
-  fi
 
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-  mkdir -p "$tmpdir/meerkat-runtime/src"
-  cat >"$tmpdir/meerkat-runtime/src/runtime_loop.rs" <<'EOF'
+  expect_audit_failure "RuntimeEffect::from_fact" "meerkat-runtime/src/runtime_loop.rs" <<'EOF'
 fn bad(fact: RuntimeEffectFact) {
     let _ = RuntimeEffect::from_fact(fact);
 }
 EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: RuntimeEffect::from_fact fixture passed" >&2
-    exit 1
-  fi
 
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-  mkdir -p "$tmpdir/meerkat-runtime/src"
-  cat >"$tmpdir/meerkat-runtime/src/effect.rs" <<'EOF'
+  expect_audit_failure "visible RuntimeEffectFact/from_fact" "meerkat-runtime/src/effect.rs" <<'EOF'
 pub(crate) enum RuntimeEffectFact {
     CancelAfterBoundary { reason: String },
 }
@@ -250,30 +126,14 @@ impl RuntimeEffect {
     }
 }
 EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: visible RuntimeEffectFact/from_fact fixture passed" >&2
-    exit 1
-  fi
 
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-  mkdir -p "$tmpdir/meerkat-runtime/src"
-  cat >"$tmpdir/meerkat-runtime/src/runtime_loop.rs" <<'EOF'
+  expect_audit_failure "runtime-shell fact literal" "meerkat-runtime/src/runtime_loop.rs" <<'EOF'
 fn bad(reason: String) {
     let _ = RuntimeEffectFact::CancelAfterBoundary { reason };
 }
 EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: runtime-shell fact literal fixture passed" >&2
-    exit 1
-  fi
 
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-  mkdir -p "$tmpdir/meerkat-runtime/src"
-  cat >"$tmpdir/meerkat-runtime/src/runtime_loop.rs" <<'EOF'
+  expect_audit_failure "generated runtime-effect fact" "meerkat-runtime/src/runtime_loop.rs" <<'EOF'
 fn bad(reason: String) {
     let _ = MeerkatMachineEffect::RuntimeEffectFact {
         kind: RuntimeEffectKind::CancelAfterBoundary,
@@ -281,16 +141,8 @@ fn bad(reason: String) {
     };
 }
 EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: generated runtime-effect fact fixture passed" >&2
-    exit 1
-  fi
 
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-  mkdir -p "$tmpdir/meerkat-runtime/src"
-  cat >"$tmpdir/meerkat-runtime/src/user_interrupt.rs" <<'EOF'
+  expect_audit_failure "public hard-cancel authority" "meerkat-runtime/src/user_interrupt.rs" <<'EOF'
 impl Machine {
     pub async fn hard_cancel_current_run(&self) {
         let authority = UserInterruptAuthority::new();
@@ -298,16 +150,8 @@ impl Machine {
     }
 }
 EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: public hard-cancel authority fixture passed" >&2
-    exit 1
-  fi
 
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-  mkdir -p "$tmpdir/meerkat-runtime/src"
-  cat >"$tmpdir/meerkat-runtime/src/user_interrupt.rs" <<'EOF'
+  expect_audit_failure "visible UserInterruptAuthority constructor" "meerkat-runtime/src/user_interrupt.rs" <<'EOF'
 struct UserInterruptAuthority(());
 
 impl UserInterruptAuthority {
@@ -316,16 +160,8 @@ impl UserInterruptAuthority {
     }
 }
 EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: visible UserInterruptAuthority constructor fixture passed" >&2
-    exit 1
-  fi
 
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-  mkdir -p "$tmpdir/meerkat-runtime/src"
-  cat >"$tmpdir/meerkat-runtime/src/user_interrupt.rs" <<'EOF'
+  expect_audit_failure "public hard-cancel live-handle" "meerkat-runtime/src/user_interrupt.rs" <<'EOF'
 impl Machine {
     pub async fn hard_cancel_current_run(&self) {
         let handle = self.interrupt_handle_for(&session_id).await.unwrap();
@@ -340,48 +176,16 @@ impl Machine {
     async fn interrupt_handle_for(&self) {}
 }
 EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: public hard-cancel live-handle fixture passed" >&2
-    exit 1
-  fi
 
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-  mkdir -p "$tmpdir/meerkat-rpc/src"
-  cat >"$tmpdir/meerkat-rpc/src/session_runtime.rs" <<'EOF'
-impl SessionRuntime {
-    pub async fn interrupt(&self, session_id: &SessionId) {
-        let _ = self.service.interrupt(session_id).await;
-    }
-}
-EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: public session-runtime interrupt fixture passed" >&2
-    exit 1
-  fi
-
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-  mkdir -p "$tmpdir/meerkat-rpc/src"
-  cat >"$tmpdir/meerkat-rpc/src/session_executor.rs" <<'EOF'
+  expect_audit_failure "recursive RPC interrupt-handle" "meerkat-rpc/src/session_executor.rs" <<'EOF'
 impl CoreExecutorInterruptHandle for SessionRuntimeInterruptHandle {
     async fn hard_cancel_current_run(&self) {
         let _ = self.runtime.interrupt(&self.session_id).await;
     }
 }
 EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: recursive RPC interrupt-handle fixture passed" >&2
-    exit 1
-  fi
 
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-  mkdir -p "$tmpdir/meerkat-runtime/src"
-  cat >"$tmpdir/meerkat-runtime/src/comms_drain.rs" <<'EOF'
+  expect_audit_failure "bridge hard-cancel handler" "meerkat-runtime/src/comms_drain.rs" <<'EOF'
 async fn bad(adapter: Adapter, session_id: SessionId, command: BridgeCommand) {
     match command {
         BridgeCommand::HardCancelMember(payload) => {
@@ -393,98 +197,36 @@ async fn bad(adapter: Adapter, session_id: SessionId, command: BridgeCommand) {
     }
 }
 EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: bridge hard-cancel handler fixture passed" >&2
-    exit 1
-  fi
 
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-  mkdir -p "$tmpdir/meerkat-runtime/src"
-  cat >"$tmpdir/meerkat-runtime/src/comms_drain.rs" <<'EOF'
+  expect_audit_failure "comms-drain hard-cancel" "meerkat-runtime/src/comms_drain.rs" <<'EOF'
 async fn bad(machine: Machine, session_id: SessionId) {
     let _ = machine.hard_cancel_current_run(&session_id, "bad").await;
 }
 EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: comms-drain hard-cancel fixture passed" >&2
-    exit 1
-  fi
 
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-  mkdir -p "$tmpdir/meerkat-mob/src/runtime"
-  cat >"$tmpdir/meerkat-mob/src/runtime/local_bridge.rs" <<'EOF'
+  expect_audit_failure "local bridge hard-cancel" "meerkat-mob/src/runtime/local_bridge.rs" <<'EOF'
 async fn bad(machine: Machine, session_id: SessionId) {
     let _ = machine.hard_cancel_current_run(&session_id, "bad").await;
 }
 EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: local bridge hard-cancel fixture passed" >&2
-    exit 1
-  fi
 
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-  mkdir -p "$tmpdir/meerkat-rest/src"
-  cat >"$tmpdir/meerkat-rest/src/lib.rs" <<'EOF'
+  expect_audit_failure "public surface interrupt" "meerkat-rest/src/lib.rs" <<'EOF'
 async fn public_interrupt(service: Service, session_id: SessionId) {
     let _ = service.interrupt(&session_id).await;
 }
 EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: public surface interrupt fixture passed" >&2
-    exit 1
-  fi
 
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-  mkdir -p "$tmpdir/meerkat-rest/src"
-  cat >"$tmpdir/meerkat-rest/src/lib.rs" <<'EOF'
-async fn public_interrupt(service: Service, session_id: SessionId) {
-    let _ = service
-        .interrupt(&session_id)
-        .await;
-}
-EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: multiline public surface interrupt fixture passed" >&2
-    exit 1
-  fi
-
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-  mkdir -p "$tmpdir/meerkat-rpc/src"
-  cat >"$tmpdir/meerkat-rpc/src/realtime_ws.rs" <<'EOF'
+  expect_audit_failure "public interrupt_current_run" "meerkat-rpc/src/realtime_ws.rs" <<'EOF'
 async fn public_interrupt(adapter: Adapter, session_id: SessionId) {
     let _ = adapter.interrupt_current_run(&session_id).await;
 }
 EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: public interrupt_current_run fixture passed" >&2
-    exit 1
-  fi
 
-  rm -rf "$tmpdir"
-  tmpdir="$(mktemp -d)"
-  trap 'rm -rf "$tmpdir"' EXIT
-  mkdir -p "$tmpdir/examples/999-runtime-backed/src"
-  cat >"$tmpdir/examples/999-runtime-backed/src/main.rs" <<'EOF'
+  expect_audit_failure "example interrupt bypass" "examples/999-runtime-backed/src/main.rs" <<'EOF'
 async fn bad(service: Service, session_id: SessionId) {
-    let _ = service
-        .interrupt(&session_id)
-        .await;
+    let _ = service.interrupt(&session_id).await;
 }
 EOF
-  if "$self_script" "$tmpdir" >/dev/null 2>&1; then
-    echo "audit-effect-authority self-test failed: example interrupt bypass fixture passed" >&2
-    exit 1
-  fi
 
   (cd /tmp && "$self_script" >/dev/null 2>&1) || {
     echo "audit-effect-authority self-test failed: absolute script invocation outside repo failed" >&2
@@ -986,7 +728,6 @@ for surface_file in \
   "$root/meerkat-rpc/src/handlers/session.rs" \
   "$root/meerkat-rpc/src/handlers/turn.rs" \
   "$root/meerkat-rpc/src/realtime_ws.rs" \
-  "$root/meerkat-rpc/src/session_runtime.rs" \
   "$root/meerkat-cli/src/main.rs" \
   "$root/meerkat-openai/src/realtime_attachment.rs" \
   "$root/meerkat-mob/src/runtime/local_bridge.rs" \
@@ -995,7 +736,7 @@ do
   if [[ -f "$surface_file" ]]; then
     stripped_surface="$(strip_core_executor_interrupt_impls "$surface_file")"
     stripped_surface="$(printf '%s\n' "$stripped_surface" | strip_cfg_test_modules)"
-    found="$(filter_rg "$stripped_surface" -n '\b(runtime|service|svc|session_service|cancel_svc|self\.service|self\.session_service)\.interrupt\(|^[[:space:]]*\.interrupt\(|session_service\(\)\.interrupt\(|\.interrupt_current_run(_with_reason)?\(')"
+    found="$(filter_rg "$stripped_surface" -n '\b(service|svc|session_service|cancel_svc|self\.service|self\.session_service)\.interrupt\(|session_service\(\)\.interrupt\(|\.interrupt_current_run(_with_reason)?\(')"
     if [[ -n "$found" ]]; then
       public_interrupt_bypasses+="$surface_file"$'\n'"$found"$'\n'
     fi
@@ -1018,7 +759,7 @@ if [[ -d "$root/examples" ]]; then
     esac
     stripped_example="$(strip_core_executor_interrupt_impls "$root/$example_file")"
     stripped_example="$(printf '%s\n' "$stripped_example" | strip_cfg_test_modules)"
-    found="$(filter_rg "$stripped_example" -n '\b(runtime|service|svc|session_service|cancel_svc|self\.service|self\.session_service)\.interrupt\(|^[[:space:]]*\.interrupt\(|session_service\(\)\.interrupt\(|\.interrupt_current_run(_with_reason)?\(')"
+    found="$(filter_rg "$stripped_example" -n '\b(service|svc|session_service|cancel_svc|self\.service|self\.session_service)\.interrupt\(|session_service\(\)\.interrupt\(|\.interrupt_current_run(_with_reason)?\(')"
     if [[ -n "$found" ]]; then
       example_interrupt_bypasses+="$root/$example_file"$'\n'"$found"$'\n'
     fi
