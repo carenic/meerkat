@@ -220,7 +220,7 @@ fn peer_response_terminal_projection_ratchet_rejects_core_string_identity_bus() 
     fs::create_dir_all(&core).expect("create core dir");
     fs::write(
         core.join("handles.rs"),
-        r"
+        r#"
 pub struct PeerResponseTerminalSource {
     pub transport_identity: Option<String>,
     pub route_identity: String,
@@ -236,7 +236,11 @@ impl PeerResponseTerminalFact {
         peer_response_terminal_context_key(&self.source.route_identity, &self.correlation_id)
     }
 }
-",
+
+pub fn peer_response_terminal_context_key(route_identity: &String, correlation_id: &String) -> String {
+    format!("{route_identity}:{correlation_id}")
+}
+"#,
     )
     .expect("write core handles file");
 
@@ -265,6 +269,12 @@ impl PeerResponseTerminalFact {
             .iter()
             .any(|mismatch| mismatch.contains("correlation_id")),
         "expected correlation id string bus to be rejected, got {mismatches:#?}"
+    );
+    assert!(
+        mismatches
+            .iter()
+            .any(|mismatch| mismatch.contains("peer_response_terminal_context_key")),
+        "expected untyped context-key signature to be rejected, got {mismatches:#?}"
     );
 }
 
