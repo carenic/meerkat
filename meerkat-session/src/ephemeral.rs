@@ -1738,25 +1738,22 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             }
 
             let metadata = req.turn_metadata;
-            let render_metadata = req.render_metadata.or_else(|| {
-                metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.render_metadata.clone())
-            });
+            let render_metadata = metadata
+                .as_ref()
+                .and_then(|metadata| metadata.render_metadata.clone())
+                .or(req.render_metadata);
             let handling_mode = metadata
                 .as_ref()
                 .and_then(|metadata| metadata.handling_mode)
                 .unwrap_or(req.handling_mode);
-            let skill_references = req.skill_references.or_else(|| {
-                metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.skill_references.clone())
-            });
-            let flow_tool_overlay = req.flow_tool_overlay.or_else(|| {
-                metadata
-                    .as_ref()
-                    .and_then(|metadata| metadata.flow_tool_overlay.clone())
-            });
+            let skill_references = metadata
+                .as_ref()
+                .and_then(|metadata| metadata.skill_references.clone())
+                .or(req.skill_references);
+            let flow_tool_overlay = metadata
+                .as_ref()
+                .and_then(|metadata| metadata.flow_tool_overlay.clone())
+                .or(req.flow_tool_overlay);
             let pre_turn_context_appends = req.pre_turn_context_appends;
             let execution_kind = metadata
                 .as_ref()
@@ -2257,20 +2254,18 @@ impl<B: SessionAgentBuilder + 'static> SessionService for EphemeralSessionServic
             .as_ref()
             .and_then(|build| build.initial_turn_metadata.as_ref())
             .cloned();
-        let initial_render_metadata = req.render_metadata.or_else(|| {
-            initial_turn_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.render_metadata.clone())
-        });
+        let initial_render_metadata = initial_turn_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.render_metadata.clone())
+            .or(req.render_metadata);
         let initial_handling_mode = initial_turn_metadata
             .as_ref()
             .and_then(|metadata| metadata.handling_mode)
             .unwrap_or(meerkat_core::types::HandlingMode::Queue);
-        let initial_skill_references = req.skill_references.or_else(|| {
-            initial_turn_metadata
-                .as_ref()
-                .and_then(|metadata| metadata.skill_references.clone())
-        });
+        let initial_skill_references = initial_turn_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.skill_references.clone())
+            .or(req.skill_references);
         let initial_flow_tool_overlay = initial_turn_metadata
             .as_ref()
             .and_then(|metadata| metadata.flow_tool_overlay.clone());
@@ -3852,6 +3847,73 @@ mod runtime_turn_metadata_tests {
                 .expect("observed skill references lock poisoned"),
             vec![Some(vec![skill])],
             "eager first turn must forward the full runtime metadata carrier"
+        );
+    }
+
+    #[tokio::test]
+    async fn start_turn_runtime_metadata_prevents_stale_split_skill_replay() {
+        let observed_skill_references = Arc::new(Mutex::new(Vec::new()));
+        let observed_context_texts = Arc::new(Mutex::new(Vec::new()));
+        let run_context_counts = Arc::new(Mutex::new(Vec::new()));
+        let service = EphemeralSessionService::new(
+            MetadataProbeBuilder {
+                observed_skill_references: Arc::clone(&observed_skill_references),
+                observed_context_texts,
+                run_context_counts,
+                fail_flow_overlay_set: false,
+            },
+            1,
+        );
+        let stale_split =
+            SkillKey::builtin(SkillName::parse("stale-split-skill").expect("valid skill"));
+        let canonical =
+            SkillKey::builtin(SkillName::parse("runtime-canonical-skill").expect("valid skill"));
+
+        let result = service
+            .create_session(CreateSessionRequest {
+                model: "metadata-probe-model".to_string(),
+                prompt: ContentInput::Text("defer".to_string()),
+                render_metadata: None,
+                system_prompt: None,
+                max_tokens: None,
+                event_tx: None,
+                skill_references: None,
+                initial_turn: InitialTurnPolicy::Defer,
+                deferred_prompt_policy: DeferredPromptPolicy::Discard,
+                build: Some(SessionBuildOptions::default()),
+                labels: None,
+            })
+            .await
+            .expect("deferred session should create");
+
+        service
+            .start_turn(
+                &result.session_id,
+                StartTurnRequest {
+                    prompt: ContentInput::Text("go".to_string()),
+                    system_prompt: None,
+                    render_metadata: None,
+                    handling_mode: meerkat_core::types::HandlingMode::Queue,
+                    event_tx: None,
+                    skill_references: Some(vec![stale_split]),
+                    flow_tool_overlay: None,
+                    pre_turn_context_appends: Vec::new(),
+                    turn_metadata: Some(RuntimeTurnMetadata {
+                        execution_kind: Some(RuntimeExecutionKind::ContentTurn),
+                        skill_references: Some(vec![canonical.clone()]),
+                        ..Default::default()
+                    }),
+                },
+            )
+            .await
+            .expect("turn should run with canonical runtime metadata");
+
+        assert_eq!(
+            *observed_skill_references
+                .lock()
+                .expect("observed skill references lock poisoned"),
+            vec![Some(vec![canonical])],
+            "canonical RuntimeTurnMetadata must be the only skill carrier once present"
         );
     }
 
