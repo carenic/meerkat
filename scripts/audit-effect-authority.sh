@@ -216,6 +216,14 @@ async fn public_interrupt(service: Service, session_id: SessionId) {
 }
 EOF
 
+  expect_audit_failure "multiline public surface interrupt" "meerkat-rest/src/lib.rs" <<'EOF'
+async fn public_interrupt(service: Service, session_id: SessionId) {
+    let _ = service
+        .interrupt(&session_id)
+        .await;
+}
+EOF
+
   expect_audit_failure "public interrupt_current_run" "meerkat-rpc/src/realtime_ws.rs" <<'EOF'
 async fn public_interrupt(adapter: Adapter, session_id: SessionId) {
     let _ = adapter.interrupt_current_run(&session_id).await;
@@ -721,6 +729,7 @@ fi
 authority_mints="$(run_rg 'UserInterruptAuthority::new\(\)' --glob '!meerkat-runtime/src/user_interrupt.rs')"
 report_matches "UserInterruptAuthority may only be minted by the command-owned interrupt path" "$authority_mints"
 
+public_interrupt_bypass_pattern='\b(service|svc|session_service|cancel_svc|self\.service|self\.session_service)\.interrupt\(|^[[:space:]]*\.interrupt\(|session_service\(\)\.interrupt\(|\.interrupt_current_run(_with_reason)?\('
 public_interrupt_bypasses=""
 for surface_file in \
   "$root/meerkat-rest/src/lib.rs" \
@@ -736,7 +745,7 @@ do
   if [[ -f "$surface_file" ]]; then
     stripped_surface="$(strip_core_executor_interrupt_impls "$surface_file")"
     stripped_surface="$(printf '%s\n' "$stripped_surface" | strip_cfg_test_modules)"
-    found="$(filter_rg "$stripped_surface" -n '\b(service|svc|session_service|cancel_svc|self\.service|self\.session_service)\.interrupt\(|session_service\(\)\.interrupt\(|\.interrupt_current_run(_with_reason)?\(')"
+    found="$(filter_rg "$stripped_surface" -n "$public_interrupt_bypass_pattern")"
     if [[ -n "$found" ]]; then
       public_interrupt_bypasses+="$surface_file"$'\n'"$found"$'\n'
     fi
@@ -759,7 +768,7 @@ if [[ -d "$root/examples" ]]; then
     esac
     stripped_example="$(strip_core_executor_interrupt_impls "$root/$example_file")"
     stripped_example="$(printf '%s\n' "$stripped_example" | strip_cfg_test_modules)"
-    found="$(filter_rg "$stripped_example" -n '\b(service|svc|session_service|cancel_svc|self\.service|self\.session_service)\.interrupt\(|session_service\(\)\.interrupt\(|\.interrupt_current_run(_with_reason)?\(')"
+    found="$(filter_rg "$stripped_example" -n "$public_interrupt_bypass_pattern")"
     if [[ -n "$found" ]]; then
       example_interrupt_bypasses+="$root/$example_file"$'\n'"$found"$'\n'
     fi
