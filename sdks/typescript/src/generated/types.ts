@@ -1138,6 +1138,8 @@ export type RealtimeChannelRole = "primary" | "observer";
 
 export type RealtimeTurningMode = "provider_managed" | "explicit_commit";
 
+export type RealtimeProtocolVersion = "2";
+
 export type RealtimeInputKind = "text" | "audio" | "video";
 
 export type RealtimeOutputKind = "text" | "audio" | "video";
@@ -1162,7 +1164,7 @@ export interface RealtimeErrorDetailsToolCallTimeout {
 export interface RealtimeErrorDetailsUnsupportedProtocolVersion {
   kind: "unsupported_protocol_version";
   requested: string;
-  supported: string[];
+  supported: RealtimeProtocolVersion[];
 }
 
 export type RealtimeErrorDetails = RealtimeErrorDetailsAudioFormatMismatch | RealtimeErrorDetailsToolCallTimeout | RealtimeErrorDetailsUnsupportedProtocolVersion;
@@ -1294,7 +1296,7 @@ export type RealtimeEvent = RealtimeEventInputTranscriptPartial | RealtimeEventI
 
 export interface RealtimeClientFrameChannelOpen {
   open_token: string;
-  protocol_version: string;
+  protocol_version: RealtimeProtocolVersion;
   role: RealtimeChannelRole;
   turning_mode: RealtimeTurningMode;
   type: "channel.open";
@@ -1328,7 +1330,7 @@ export type RealtimeClientFrame = RealtimeClientFrameChannelOpen | RealtimeClien
 
 export interface RealtimeServerFrameChannelOpened {
   capabilities: RealtimeCapabilities;
-  protocol_version: string;
+  protocol_version: RealtimeProtocolVersion;
   role: RealtimeChannelRole;
   status: RealtimeChannelStatus;
   type: "channel.opened";
@@ -1575,10 +1577,10 @@ export interface RealtimeChannelStatus {
 
 export interface RealtimeOpenInfo {
   capabilities: RealtimeCapabilities;
-  default_protocol_version: string;
+  default_protocol_version: RealtimeProtocolVersion;
   expires_at: string;
   open_token: string;
-  supported_protocol_versions?: string[];
+  supported_protocol_versions?: RealtimeProtocolVersion[];
   target: RealtimeChannelTarget;
   ws_url: string;
 }
@@ -1630,7 +1632,7 @@ export interface ToolCallTimeoutContext {
 
 export interface RealtimeChannelOpenFrame {
   open_token: string;
-  protocol_version: string;
+  protocol_version: RealtimeProtocolVersion;
   role: RealtimeChannelRole;
   turning_mode: RealtimeTurningMode;
 }
@@ -1641,7 +1643,7 @@ export interface RealtimeChannelInputFrame {
 
 export interface RealtimeChannelOpenedFrame {
   capabilities: RealtimeCapabilities;
-  protocol_version: string;
+  protocol_version: RealtimeProtocolVersion;
   role: RealtimeChannelRole;
   status: RealtimeChannelStatus;
 }
