@@ -1016,7 +1016,10 @@ mod tests {
                 static_handler(RuntimeHookResponse {
                     decision: None,
                     patches: vec![HookPatch::ToolArgs {
-                        args: serde_json::json!({"x": 1}),
+                        args: meerkat_core::ToolCallArguments::from_value(serde_json::json!({
+                            "x": 1
+                        }))
+                        .expect("test tool args must be an object"),
                     }],
                 }),
             )
