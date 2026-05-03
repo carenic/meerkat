@@ -9,7 +9,9 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use futures::{SinkExt, StreamExt};
-use meerkat_contracts::{RealtimeChannelOpenFrame, RealtimeClientFrame, RealtimeServerFrame};
+use meerkat_contracts::{
+    RealtimeChannelOpenFrame, RealtimeClientFrame, RealtimeProtocolVersion, RealtimeServerFrame,
+};
 use serde_json::{Value, json};
 use std::process::Stdio;
 use std::time::Duration;
@@ -362,7 +364,11 @@ async fn tcp_e2e_realtime_ws_host_coexists_with_tcp_rpc() {
         &json!({
             "jsonrpc":"2.0",
             "method":"session/create",
-            "params":{"prompt":"realtime open-info e2e","initial_turn":"deferred"},
+            "params":{
+                "model":"gpt-realtime",
+                "prompt":"realtime open-info e2e",
+                "initial_turn":"deferred"
+            },
             "id":2
         }),
     )
@@ -396,10 +402,9 @@ async fn tcp_e2e_realtime_ws_host_coexists_with_tcp_rpc() {
         open_info["result"]["open_token"].as_str().is_some(),
         "open_info should return a token: {open_info}"
     );
-    let protocol_version = open_info["result"]["default_protocol_version"]
-        .as_str()
-        .expect("default protocol version")
-        .to_string();
+    let protocol_version: RealtimeProtocolVersion =
+        serde_json::from_value(open_info["result"]["default_protocol_version"].clone())
+            .expect("default protocol version");
     let open_token = open_info["result"]["open_token"]
         .as_str()
         .expect("open token")
@@ -466,7 +471,11 @@ async fn tcp_e2e_realtime_session_targets_accept_env_default_openai_credentials(
         &json!({
             "jsonrpc":"2.0",
             "method":"session/create",
-            "params":{"prompt":"realtime capabilities e2e","initial_turn":"deferred"},
+            "params":{
+                "model":"gpt-realtime",
+                "prompt":"realtime capabilities e2e",
+                "initial_turn":"deferred"
+            },
             "id":2
         }),
     )

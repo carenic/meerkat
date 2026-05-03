@@ -71,6 +71,37 @@ struct PendingOpenEntry {
     realm_id: Option<String>,
 }
 
+/// Machine-owned authorization to mint a realtime open token.
+///
+/// The eligibility value is constructed by the runtime after resolving the
+/// session's realtime-capable model state. `RealtimeWsHost::issue_open_info`
+/// requires this grant so callers cannot mint tokens from attachment-status
+/// availability alone.
+#[derive(Debug, Clone)]
+pub struct RealtimeOpenGrant {
+    capabilities: RealtimeCapabilities,
+}
+
+impl RealtimeOpenGrant {
+    #[must_use]
+    pub fn from_machine_eligibility(
+        _eligibility: meerkat_runtime::RealtimeBootstrapEligibility,
+        capabilities: RealtimeCapabilities,
+    ) -> Self {
+        Self { capabilities }
+    }
+
+    #[must_use]
+    pub fn capabilities(&self) -> &RealtimeCapabilities {
+        &self.capabilities
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_only_from_capabilities(capabilities: RealtimeCapabilities) -> Self {
+        Self { capabilities }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum RealtimeTargetKey {
     Session(String),
@@ -620,9 +651,10 @@ impl RealtimeWsHost {
     pub async fn issue_open_info(
         &self,
         request: RealtimeOpenRequest,
-        capabilities: RealtimeCapabilities,
+        grant: RealtimeOpenGrant,
         realm_id: Option<String>,
     ) -> RealtimeOpenInfo {
+        let capabilities = grant.capabilities;
         let open_token = Uuid::new_v4().to_string();
         let expires_at = Utc::now()
             + chrono::TimeDelta::from_std(self.token_ttl)
@@ -2596,6 +2628,7 @@ async fn bind_realtime_target(
                     message: format!("invalid session target: {err}"),
                     details: None,
                 })?;
+            require_realtime_bootstrap_eligibility(runtime, &session_id).await?;
             if matches!(
                 accepted.request.role,
                 meerkat_contracts::RealtimeChannelRole::Primary
@@ -2693,6 +2726,7 @@ async fn bind_realtime_target(
                     ),
                     details: None,
                 })?;
+            require_realtime_bootstrap_eligibility(runtime, &current_session_id).await?;
             let binding = RealtimeSocketBinding::MobMemberPrimary {
                 mob_id: dsl_mob_id,
                 agent_identity: dsl_agent_identity,
@@ -2734,6 +2768,28 @@ async fn bind_realtime_target(
             })
         }
     }
+}
+
+async fn require_realtime_bootstrap_eligibility(
+    runtime: &SessionRuntime,
+    session_id: &SessionId,
+) -> Result<meerkat_runtime::RealtimeBootstrapEligibility, RealtimeChannelErrorFrame> {
+    runtime
+        .runtime_adapter()
+        .realtime_bootstrap_eligibility(session_id)
+        .await
+        .map_err(|err| RealtimeChannelErrorFrame {
+            code: match &err {
+                RuntimeDriverError::NotReady { .. } => RealtimeErrorCode::RuntimeNotReady,
+                RuntimeDriverError::ValidationFailed { .. } => RealtimeErrorCode::InvalidTarget,
+                RuntimeDriverError::Destroyed | RuntimeDriverError::Internal(_) => {
+                    RealtimeErrorCode::RuntimeInternal
+                }
+                _ => RealtimeErrorCode::RuntimeInternal,
+            },
+            message: format!("realtime bootstrap eligibility denied: {err}"),
+            details: None,
+        })
 }
 
 /// Output of `bind_realtime_target` — grouped into a struct so the MobMember
@@ -4303,6 +4359,10 @@ mod tests {
         }
     }
 
+    fn test_open_grant() -> super::RealtimeOpenGrant {
+        super::RealtimeOpenGrant::test_only_from_capabilities(conservative_capabilities())
+    }
+
     fn test_session_runtime() -> crate::session_runtime::SessionRuntime {
         let store: Arc<dyn meerkat::SessionStore> = Arc::new(meerkat::MemoryStore::new());
         let blob_store: Arc<dyn meerkat_core::BlobStore> =
@@ -4321,8 +4381,13 @@ mod tests {
 
     async fn register_ready_realtime_session(
         runtime: &crate::session_runtime::SessionRuntime,
-        session_id: &SessionId,
-    ) {
+    ) -> SessionId {
+        let mut build_config = meerkat::AgentBuildConfig::new("gpt-realtime");
+        build_config.provider = Some(meerkat_core::Provider::OpenAI);
+        let session_id = runtime
+            .create_session(build_config, None, None)
+            .await
+            .expect("realtime-capable staged session should create");
         let adapter = runtime.runtime_adapter();
         adapter
             .register_session_with_executor(
@@ -4331,11 +4396,11 @@ mod tests {
             )
             .await;
         adapter
-            .project_realtime_attachment_intent(session_id, true)
+            .project_realtime_attachment_intent(&session_id, true)
             .await
             .expect("intent projection should succeed");
         let authority = adapter
-            .replace_realtime_attachment(session_id)
+            .replace_realtime_attachment(&session_id)
             .await
             .expect("replace should mint realtime authority");
         adapter
@@ -4345,6 +4410,7 @@ mod tests {
             )
             .await
             .expect("binding ready should be accepted");
+        session_id
     }
 
     fn accepted_session_open(
@@ -4526,7 +4592,7 @@ mod tests {
         };
 
         let info = host
-            .issue_open_info(request.clone(), conservative_capabilities(), None)
+            .issue_open_info(request.clone(), test_open_grant(), None)
             .await;
         assert_eq!(info.target, request.target);
         let accepted_result = host
@@ -4582,7 +4648,7 @@ mod tests {
                     reconnect_policy: None,
                     channel_config: None,
                 },
-                conservative_capabilities(),
+                test_open_grant(),
                 None,
             )
             .await;
@@ -4614,7 +4680,7 @@ mod tests {
             channel_config: None,
         };
         let info = host
-            .issue_open_info(request.clone(), conservative_capabilities(), None)
+            .issue_open_info(request.clone(), test_open_grant(), None)
             .await;
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         let expired_result = host
@@ -4636,9 +4702,7 @@ mod tests {
         assert_eq!(expired, RealtimeOpenError::OpenTokenExpired);
         assert_eq!(expired.code(), RealtimeErrorCode::OpenTokenExpired);
 
-        let fresh_info = host
-            .issue_open_info(request, conservative_capabilities(), None)
-            .await;
+        let fresh_info = host.issue_open_info(request, test_open_grant(), None).await;
         let role_error_result = host
             .accept_open_frame(&RealtimeChannelOpenFrame {
                 protocol_version: RealtimeProtocolVersion::CURRENT,
@@ -4671,7 +4735,7 @@ mod tests {
                     reconnect_policy: None,
                     channel_config: None,
                 },
-                conservative_capabilities(),
+                test_open_grant(),
                 None,
             )
             .await;
@@ -4720,7 +4784,7 @@ mod tests {
                     reconnect_policy: None,
                     channel_config: None,
                 },
-                conservative_capabilities(),
+                test_open_grant(),
                 None,
             )
             .await;
@@ -4759,7 +4823,7 @@ mod tests {
                     reconnect_policy: None,
                     channel_config: None,
                 },
-                conservative_capabilities(),
+                test_open_grant(),
                 None,
             )
             .await;
@@ -4799,7 +4863,7 @@ mod tests {
                     reconnect_policy: None,
                     channel_config: None,
                 },
-                conservative_capabilities(),
+                test_open_grant(),
                 None,
             )
             .await;
@@ -4838,7 +4902,7 @@ mod tests {
                     reconnect_policy: None,
                     channel_config: None,
                 },
-                conservative_capabilities(),
+                test_open_grant(),
                 None,
             )
             .await;
@@ -4881,7 +4945,7 @@ mod tests {
                     reconnect_policy: None,
                     channel_config: None,
                 },
-                conservative_capabilities(),
+                test_open_grant(),
                 None,
             )
             .await;
@@ -4973,8 +5037,7 @@ mod tests {
     #[tokio::test]
     async fn reconnect_open_status_for_observer_uses_machine_owned_attempts() {
         let runtime = test_session_runtime();
-        let session_id = SessionId::new();
-        register_ready_realtime_session(&runtime, &session_id).await;
+        let session_id = register_ready_realtime_session(&runtime).await;
         let adapter = runtime.runtime_adapter();
         adapter
             .require_realtime_attachment_reattach(&session_id)
@@ -5019,8 +5082,7 @@ mod tests {
     #[tokio::test]
     async fn reconnect_open_status_for_primary_without_factory_uses_machine_owned_exhaustion() {
         let runtime = test_session_runtime();
-        let session_id = SessionId::new();
-        register_ready_realtime_session(&runtime, &session_id).await;
+        let session_id = register_ready_realtime_session(&runtime).await;
         let adapter = runtime.runtime_adapter();
         adapter
             .require_realtime_attachment_reattach(&session_id)
@@ -5077,6 +5139,10 @@ mod tests {
             !bind_source.contains("realtime_attachment_status"),
             "ChannelOpened open-status paths must read machine-owned realtime_channel_status, not attachment-only projection"
         );
+        assert!(
+            bind_source.contains("realtime_bootstrap_eligibility"),
+            "channel.open must re-check machine-owned realtime bootstrap eligibility before binding"
+        );
     }
 
     fn realm_request(session_id: &str) -> RealtimeOpenRequest {
@@ -5110,7 +5176,7 @@ mod tests {
         let info_x = host
             .issue_open_info(
                 realm_request("11111111-2222-3333-4444-555555555555"),
-                conservative_capabilities(),
+                test_open_grant(),
                 Some("realm-x".to_string()),
             )
             .await;
@@ -5144,7 +5210,7 @@ mod tests {
         let info = host
             .issue_open_info(
                 realm_request("aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"),
-                conservative_capabilities(),
+                test_open_grant(),
                 Some("realm-x".to_string()),
             )
             .await;
@@ -5169,7 +5235,7 @@ mod tests {
         let info = host
             .issue_open_info(
                 realm_request("00000000-0000-0000-0000-000000000001"),
-                conservative_capabilities(),
+                test_open_grant(),
                 None,
             )
             .await;
@@ -5193,7 +5259,7 @@ mod tests {
         let info = host
             .issue_open_info(
                 realm_request("00000000-0000-0000-0000-000000000002"),
-                conservative_capabilities(),
+                test_open_grant(),
                 None,
             )
             .await;

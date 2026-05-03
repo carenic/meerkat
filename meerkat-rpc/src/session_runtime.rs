@@ -1625,6 +1625,7 @@ fn profile_to_capability_surface(
 #[derive(Clone)]
 struct SessionRuntimeLlmReconfigureHost {
     service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    staged_sessions: Arc<StagedSessionRegistry>,
     factory: AgentFactory,
     auth_lease: Arc<dyn meerkat_core::handles::AuthLeaseHandle>,
     default_llm_client: Arc<StdRwLock<Option<Arc<dyn LlmClient>>>>,
@@ -1632,6 +1633,51 @@ struct SessionRuntimeLlmReconfigureHost {
 }
 
 impl SessionRuntimeLlmReconfigureHost {
+    async fn capability_surface_for_identity(
+        &self,
+        identity: &SessionLlmIdentity,
+    ) -> Result<
+        (
+            Option<SessionLlmCapabilitySurface>,
+            SessionLlmCapabilitySurfaceStatus,
+        ),
+        RuntimeDriverError,
+    > {
+        let registry = self.model_registry().await?;
+        Ok(
+            match registry.profile_for_provider(identity.provider, &identity.model) {
+                Some(profile) => (
+                    Some(profile_to_capability_surface(&profile)),
+                    SessionLlmCapabilitySurfaceStatus::Resolved,
+                ),
+                None => (None, SessionLlmCapabilitySurfaceStatus::Unresolved),
+            },
+        )
+    }
+
+    async fn hydrate_staged_session_llm_state(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<HydratedSessionLlmState>, RuntimeDriverError> {
+        let Some(current_identity) = self
+            .staged_sessions
+            .effective_llm_identity(session_id)
+            .await
+        else {
+            return Ok(None);
+        };
+        let (current_capability_surface, capability_surface_status) = self
+            .capability_surface_for_identity(&current_identity)
+            .await?;
+        Ok(Some(HydratedSessionLlmState {
+            current_identity,
+            current_visibility_state: Default::default(),
+            current_capability_surface,
+            capability_surface_status,
+            base_tool_names: std::collections::BTreeSet::new(),
+        }))
+    }
+
     async fn model_registry(&self) -> Result<meerkat_core::ModelRegistry, RuntimeDriverError> {
         let config_runtime = self
             .config_runtime
@@ -1845,16 +1891,24 @@ impl SessionLlmReconfigureHost for SessionRuntimeLlmReconfigureHost {
         &self,
         session_id: &SessionId,
     ) -> Result<HydratedSessionLlmState, RuntimeDriverError> {
-        let current_identity = self
-            .service
-            .live_session_llm_identity(session_id)
-            .await
-            .map_err(session_error_to_runtime_driver)?;
-        let session = self
-            .service
-            .export_live_session(session_id)
-            .await
-            .map_err(session_error_to_runtime_driver)?;
+        let current_identity = match self.service.live_session_llm_identity(session_id).await {
+            Ok(identity) => identity,
+            Err(err) => {
+                if let Some(hydrated) = self.hydrate_staged_session_llm_state(session_id).await? {
+                    return Ok(hydrated);
+                }
+                return Err(session_error_to_runtime_driver(err));
+            }
+        };
+        let session = match self.service.export_live_session(session_id).await {
+            Ok(session) => session,
+            Err(err) => {
+                if let Some(hydrated) = self.hydrate_staged_session_llm_state(session_id).await? {
+                    return Ok(hydrated);
+                }
+                return Err(session_error_to_runtime_driver(err));
+            }
+        };
         let current_visibility_state = session
             .try_tool_visibility_state()
             .map_err(|err| {
@@ -1877,16 +1931,9 @@ impl SessionLlmReconfigureHost for SessionRuntimeLlmReconfigureHost {
             .into_iter()
             .collect();
 
-        let registry = self.model_registry().await?;
-        let (current_capability_surface, capability_surface_status) = match registry
-            .profile_for_provider(current_identity.provider, &current_identity.model)
-        {
-            Some(profile) => (
-                Some(profile_to_capability_surface(&profile)),
-                SessionLlmCapabilitySurfaceStatus::Resolved,
-            ),
-            None => (None, SessionLlmCapabilitySurfaceStatus::Unresolved),
-        };
+        let (current_capability_surface, capability_surface_status) = self
+            .capability_surface_for_identity(&current_identity)
+            .await?;
 
         Ok(HydratedSessionLlmState {
             current_identity,
@@ -2400,6 +2447,7 @@ impl SessionRuntime {
         let builder_schedule_tools_slot = Arc::clone(&builder.default_schedule_tools);
         let default_llm_client = Arc::new(StdRwLock::new(None));
         let config_runtime = Arc::new(StdRwLock::new(None));
+        let staged_sessions = Arc::new(StagedSessionRegistry::new());
         meerkat::surface::set_default_schedule_tools(
             &builder,
             Some(Arc::new(ScheduleToolDispatcher::new(
@@ -2419,6 +2467,7 @@ impl SessionRuntime {
         runtime_adapter.set_session_llm_reconfigure_host(Arc::new(
             SessionRuntimeLlmReconfigureHost {
                 service: Arc::clone(&service),
+                staged_sessions: Arc::clone(&staged_sessions),
                 factory: factory_clone.clone(),
                 auth_lease: reconfigure_auth_lease,
                 default_llm_client: Arc::clone(&default_llm_client),
@@ -2432,7 +2481,7 @@ impl SessionRuntime {
             schedule_service,
             artifact_store,
             schedule_host: Mutex::new(None),
-            staged_sessions: Arc::new(StagedSessionRegistry::new()),
+            staged_sessions,
             pending_session_event_streams: Arc::new(Mutex::new(HashMap::new())),
             staged_capacity_admissions: Arc::new(StdMutex::new(HashMap::new())),
             runtime_pre_admissions: Arc::new(StdMutex::new(HashMap::new())),
@@ -2494,6 +2543,7 @@ impl SessionRuntime {
         let builder_schedule_tools_slot = Arc::clone(&builder.default_schedule_tools);
         let default_llm_client = Arc::new(StdRwLock::new(None));
         let config_runtime = Arc::new(StdRwLock::new(None));
+        let staged_sessions = Arc::new(StagedSessionRegistry::new());
         meerkat::surface::set_default_schedule_tools(
             &builder,
             Some(Arc::new(ScheduleToolDispatcher::new(
@@ -2513,6 +2563,7 @@ impl SessionRuntime {
         runtime_adapter.set_session_llm_reconfigure_host(Arc::new(
             SessionRuntimeLlmReconfigureHost {
                 service: Arc::clone(&service),
+                staged_sessions: Arc::clone(&staged_sessions),
                 factory: factory_clone.clone(),
                 auth_lease: reconfigure_auth_lease,
                 default_llm_client: Arc::clone(&default_llm_client),
@@ -2526,7 +2577,7 @@ impl SessionRuntime {
             schedule_service,
             artifact_store,
             schedule_host: Mutex::new(None),
-            staged_sessions: Arc::new(StagedSessionRegistry::new()),
+            staged_sessions,
             pending_session_event_streams: Arc::new(Mutex::new(HashMap::new())),
             staged_capacity_admissions: Arc::new(StdMutex::new(HashMap::new())),
             runtime_pre_admissions: Arc::new(StdMutex::new(HashMap::new())),
@@ -4108,6 +4159,7 @@ impl SessionRuntime {
     fn llm_reconfigure_host(&self) -> SessionRuntimeLlmReconfigureHost {
         SessionRuntimeLlmReconfigureHost {
             service: Arc::clone(&self.service),
+            staged_sessions: Arc::clone(&self.staged_sessions),
             factory: self.factory.clone(),
             auth_lease: self.runtime_adapter.auth_lease_handle(),
             default_llm_client: Arc::clone(&self.default_llm_client),
