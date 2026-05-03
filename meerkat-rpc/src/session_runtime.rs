@@ -2844,6 +2844,7 @@ impl SessionRuntime {
             }
             meerkat_runtime::CompletionOutcome::Completed(_)
             | meerkat_runtime::CompletionOutcome::CompletedWithoutResult
+            | meerkat_runtime::CompletionOutcome::Cancelled
             | meerkat_runtime::CompletionOutcome::CallbackPending { .. } => false,
         }
     }
@@ -2856,6 +2857,7 @@ impl SessionRuntime {
             }
             meerkat_runtime::CompletionOutcome::Completed(_)
             | meerkat_runtime::CompletionOutcome::CompletedWithoutResult
+            | meerkat_runtime::CompletionOutcome::Cancelled
             | meerkat_runtime::CompletionOutcome::CallbackPending { .. } => false,
         }
     }
@@ -7736,6 +7738,7 @@ fn session_error_to_rpc(err: SessionError) -> RpcError {
             meerkat_core::AgentError::Llm { .. } => error::PROVIDER_ERROR,
             meerkat_core::AgentError::SessionNotFound(_) => error::SESSION_NOT_FOUND,
             meerkat_core::AgentError::BuildError(_) => error::PROVIDER_ERROR,
+            meerkat_core::AgentError::Cancelled => error::REQUEST_CANCELLED,
             meerkat_core::AgentError::InternalError(_) => error::INTERNAL_ERROR,
             _ => error::INTERNAL_ERROR,
         },
@@ -7782,6 +7785,11 @@ fn completion_outcome_to_rpc_result(
                 "tool_name": tool_name,
                 "args": args,
             })),
+        }),
+        CompletionOutcome::Cancelled => Err(RpcError {
+            code: error::REQUEST_CANCELLED,
+            message: "request cancelled".to_string(),
+            data: None,
         }),
         CompletionOutcome::Abandoned(reason) => Err(RpcError {
             code: error::INTERNAL_ERROR,
@@ -18688,6 +18696,27 @@ mod tests {
         assert_eq!(data["resumable"], true);
         assert_eq!(data["tool_name"], "external_mock");
         assert_eq!(data["args"], serde_json::json!({ "value": "browser" }));
+    }
+
+    #[test]
+    fn completion_outcome_to_rpc_result_surfaces_cancelled() {
+        let session_id = SessionId::new();
+        let err = completion_outcome_to_rpc_result(
+            meerkat_runtime::completion::CompletionOutcome::Cancelled,
+            &session_id,
+        )
+        .expect_err("cancelled completion should map to an RPC error");
+
+        assert_eq!(err.code, error::REQUEST_CANCELLED);
+        assert_eq!(err.message, "request cancelled");
+    }
+
+    #[test]
+    fn session_error_to_rpc_surfaces_cancelled_as_request_cancelled() {
+        let session_err = SessionError::Agent(meerkat_core::AgentError::Cancelled);
+        let rpc_err = session_error_to_rpc(session_err);
+
+        assert_eq!(rpc_err.code, error::REQUEST_CANCELLED);
     }
 
     // -- P2-6: Typed BuildError → PROVIDER_ERROR classification --
