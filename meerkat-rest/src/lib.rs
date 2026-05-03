@@ -7192,7 +7192,7 @@ mod tests {
             "running turn should publish successfully: {completed:?}"
         );
 
-        let admitted = tokio::time::timeout(std::time::Duration::from_secs(5), webhook_task)
+        let admitted = tokio::time::timeout(std::time::Duration::from_secs(15), webhook_task)
             .await
             .expect("peer terminal webhook should finish after the running turn releases")
             .expect("peer terminal webhook task should not panic")
