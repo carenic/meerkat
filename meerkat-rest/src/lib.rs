@@ -5746,25 +5746,15 @@ async fn mcp_add(
     Json(req): Json<meerkat_contracts::McpAddParams>,
 ) -> Result<Json<meerkat_contracts::McpLiveOpResponse>, ApiError> {
     let session_id = validate_session_id_consistency(&id, &req.session_id, &state)?;
-    if req.server_name.trim().is_empty() {
+    let server_name = req.server_config.name.clone();
+    if server_name.trim().is_empty() {
         return Err(ApiError::BadRequest(
             "server_name cannot be empty".to_string(),
         ));
     }
 
     let adapter = resolve_mcp_adapter(&state, &session_id).await?;
-
-    // Inject the server name into the config object.
-    let mut server_config = req.server_config;
-    if let Some(obj) = server_config.as_object_mut() {
-        obj.insert(
-            "name".to_string(),
-            serde_json::Value::String(req.server_name.clone()),
-        );
-    }
-
-    let config: meerkat_core::McpServerConfig = serde_json::from_value(server_config)
-        .map_err(|e| ApiError::BadRequest(format!("invalid server_config: {e}")))?;
+    let config = req.server_config;
 
     let rollback = if req.persisted {
         let authority = meerkat::surface::mcp_config_mutation_authority(
@@ -5790,7 +5780,7 @@ async fn mcp_add(
     Ok(Json(meerkat::surface::mcp_live_response(
         req.session_id,
         meerkat_contracts::McpLiveOperation::Add,
-        Some(req.server_name),
+        Some(server_name),
         rollback.is_some(),
     )))
 }
@@ -10651,8 +10641,7 @@ mod tests {
             let app = router(state);
             let body = serde_json::json!({
                 "session_id": fake_id.to_string(),
-                "server_name": "test-server",
-                "server_config": {"command": "echo", "args": ["hello"]}
+                "server_config": {"name": "test-server", "command": "echo", "args": ["hello"]}
             });
             let request = axum::http::Request::builder()
                 .method("POST")
@@ -10689,8 +10678,7 @@ mod tests {
             let app = router(state);
             let body = serde_json::json!({
                 "session_id": session_id.to_string(),
-                "server_name": "  ",
-                "server_config": {"command": "echo"}
+                "server_config": {"name": "  ", "command": "echo"}
             });
             let request = axum::http::Request::builder()
                 .method("POST")
@@ -10720,8 +10708,7 @@ mod tests {
             // POST to /sessions/X/mcp/add — route exists (will get 404 for missing session).
             let body = serde_json::json!({
                 "session_id": fake_id.to_string(),
-                "server_name": "srv",
-                "server_config": {"command": "echo"}
+                "server_config": {"name": "srv", "command": "echo"}
             });
             let request = axum::http::Request::builder()
                 .method("POST")
@@ -11135,8 +11122,7 @@ mod tests {
 
             let body = serde_json::json!({
                 "session_id": "fake",
-                "server_name": "srv",
-                "server_config": {"command": "echo"}
+                "server_config": {"name": "srv", "command": "echo"}
             });
             let request = axum::http::Request::builder()
                 .method("POST")
