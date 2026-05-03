@@ -16,6 +16,7 @@ use meerkat_contracts::{
     WireRunResult, WireSessionHistory, WireSessionInfo, WireSessionMessage, WireSessionSummary,
     WireUsage,
 };
+use meerkat_core::event::BackgroundJobTerminalStatus;
 use meerkat_core::{
     AgentErrorClass, AgentEvent, BudgetType, ContentBlock, ContentInput, HookId, HookPatch,
     HookPoint, HookReasonCode, RunResult, SessionId, SkillResolutionFailureReason, StopReason,
@@ -497,6 +498,12 @@ fn agent_event_all_variants_roundtrip() {
             )
             .with_applied_at_turn(Some(5)),
         },
+        AgentEvent::background_job_completed(
+            "j_123",
+            "sleep 2",
+            BackgroundJobTerminalStatus::Completed,
+            "exit_code: 0",
+        ),
     ];
 
     for event in &direct_variants {
@@ -576,7 +583,7 @@ fn agent_event_all_variants_roundtrip() {
         );
     }
 
-    // All 31 AgentEvent variants are covered: 28 direct + 3 from JSON.
+    // All 32 AgentEvent variants are covered: 29 direct + 3 from JSON.
     // If a new variant is added and not covered here, the exhaustive
     // agent_event_type() match in meerkat-core will fail to compile,
     // prompting addition here too.
@@ -759,6 +766,12 @@ fn documented_event_catalog_covers_core_agent_event_discriminators() {
             )
             .with_applied_at_turn(Some(1)),
         },
+        AgentEvent::background_job_completed(
+            "j_123",
+            "sleep 2",
+            BackgroundJobTerminalStatus::Completed,
+            "exit_code: 0",
+        ),
     ];
 
     for event in events {

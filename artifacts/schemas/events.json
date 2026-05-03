@@ -2213,17 +2213,14 @@
             "type": "string"
           },
           "status": {
-            "type": "string"
+            "description": "Legacy display mirror for consumers still rendering string status.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "terminal_status": {
-            "anyOf": [
-              {
-                "$ref": "#/$defs/BackgroundJobTerminalStatus"
-              },
-              {
-                "type": "null"
-              }
-            ]
+            "$ref": "#/$defs/BackgroundJobTerminalStatus"
           },
           "type": {
             "const": "background_job_completed",
@@ -2234,7 +2231,7 @@
           "type",
           "job_id",
           "display_name",
-          "status",
+          "terminal_status",
           "detail"
         ],
         "type": "object"
@@ -3433,17 +3430,14 @@
                 "type": "string"
               },
               "status": {
-                "type": "string"
+                "description": "Legacy display mirror for consumers still rendering string status.",
+                "type": [
+                  "string",
+                  "null"
+                ]
               },
               "terminal_status": {
-                "anyOf": [
-                  {
-                    "$ref": "#/$defs/BackgroundJobTerminalStatus"
-                  },
-                  {
-                    "type": "null"
-                  }
-                ]
+                "$ref": "#/$defs/BackgroundJobTerminalStatus"
               },
               "type": {
                 "const": "background_job_completed",
@@ -3454,7 +3448,7 @@
               "type",
               "job_id",
               "display_name",
-              "status",
+              "terminal_status",
               "detail"
             ],
             "type": "object"
@@ -4582,9 +4576,11 @@
       "skills_resolved",
       "skill_resolution_failed",
       "interaction_complete",
+      "interaction_callback_pending",
       "interaction_failed",
       "stream_truncated",
-      "tool_config_changed"
+      "tool_config_changed",
+      "background_job_completed"
     ],
     "known_payloads": {
       "tool_config_changed": {
