@@ -25,6 +25,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `boundary_count`: `u64`
 - `cancel_after_boundary`: `Bool`
 - `terminal_outcome`: `Option<TurnTerminalOutcome>`
+- `terminal_cause_kind`: `Option<TurnTerminalCauseKind>`
 - `last_runtime_apply_failure_cause`: `Option<RuntimeApplyFailureCause>`
 - `last_runtime_apply_failure_message`: `Option<String>`
 - `extraction_attempts`: `u64`
@@ -203,6 +204,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `Prepare`(session_id: SessionId, run_id: RunId)
 - `Commit`(input_id: InputId, run_id: RunId)
 - `Fail`(run_id: RunId)
+- `RollbackRun`(run_id: RunId)
 - `Recycle`
 - `StartConversationRun`(run_id: RunId, primitive_kind: TurnPrimitiveKind, admitted_content_shape: ContentShape, vision_enabled: Bool, image_tool_results_enabled: Bool, max_extraction_retries: u64)
 - `StartImmediateAppend`(run_id: RunId)
@@ -220,7 +222,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `ExtractionValidationPassed`
 - `ExtractionValidationFailed`(error: String)
 - `RecoverableFailure`(failure_kind: LlmRetryFailureKind, retry_attempt: u64, max_retries: u64, selected_delay_ms: u64, error: String)
-- `FatalFailure`(error: String)
+- `FatalFailure`(terminal_cause_kind: TurnTerminalCauseKind, error: String)
 - `RetryRequested`(retry_attempt: u64)
 - `CancelNow`
 - `RequestCancelAfterBoundary`
@@ -231,7 +233,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `TimeBudgetExceeded`
 - `ForceCancelNoRun`
 - `RunCompleted`(run_id: RunId)
-- `RunFailed`(run_id: RunId, runtime_apply_failure_cause: Option<RuntimeApplyFailureCause>, runtime_apply_failure_message: Option<String>, error: String)
+- `RunFailed`(run_id: RunId, runtime_apply_failure_cause: Option<RuntimeApplyFailureCause>, runtime_apply_failure_message: Option<String>, terminal_cause_kind: TurnTerminalCauseKind, error: String)
 - `RunCancelled`(run_id: RunId)
 - `RecoverInputLifecycle`(input_id: String, phase: InputPhase, terminal_kind: Option<InputTerminalKind>, superseded_by: Option<String>, aggregate_id: Option<String>, abandon_reason: Option<InputAbandonReason>, abandon_attempt_count: u64, attempt_count: u64, run_id: Option<String>, boundary_sequence: Option<u64>, lane: Option<InputLane>)
 - `QueueAccepted`(input_id: String)
@@ -373,7 +375,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `TurnRunStarted`(run_id: RunId)
 - `TurnBoundaryApplied`(run_id: RunId, boundary_sequence: u64)
 - `TurnRunCompleted`(run_id: RunId, outcome: TurnTerminalOutcome)
-- `TurnRunFailed`(run_id: RunId, error: String)
+- `TurnRunFailed`(run_id: RunId, terminal_cause_kind: TurnTerminalCauseKind, error: String)
 - `TurnRunCancelled`(run_id: RunId, reason: TurnCancellationReason)
 - `TurnCheckCompaction`
 - `RequestCancellationAtBoundary`
@@ -2423,9 +2425,10 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `FatalFailure`
 - From: `Running`
-- On: `FatalFailure`(error)
+- On: `FatalFailure`(terminal_cause_kind, error)
 - Guards:
   - `turn_not_terminal`
+  - `terminal_cause_known`
 - Emits: `TurnRunFailed`
 - To: `Running`
 
@@ -2508,9 +2511,10 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `RunFailed`
 - From: `Running`
-- On: `RunFailed`(run_id, runtime_apply_failure_cause, runtime_apply_failure_message, error)
+- On: `RunFailed`(run_id, runtime_apply_failure_cause, runtime_apply_failure_message, terminal_cause_kind, error)
 - Guards:
   - `run_matches_binding`
+  - `terminal_cause_known`
 - To: `Running`
 
 ### `RunCancelled`
@@ -2874,6 +2878,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `pre_run_phase_matches_idle`
   - `current_run_id_matches_binding`
+  - `turn_failed_with_cause`
 - Emits: `RecordTerminalOutcome`
 - To: `Idle`
 
@@ -2883,6 +2888,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `pre_run_phase_matches_attached`
   - `current_run_id_matches_binding`
+  - `turn_failed_with_cause`
 - Emits: `RecordTerminalOutcome`
 - To: `Attached`
 
@@ -2892,7 +2898,32 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `pre_run_phase_matches_retired`
   - `current_run_id_matches_binding`
+  - `turn_failed_with_cause`
 - Emits: `RecordTerminalOutcome`
+- To: `Retired`
+
+### `RollbackRunRunningToIdle`
+- From: `Running`
+- On: `RollbackRun`(run_id)
+- Guards:
+  - `pre_run_phase_matches_idle`
+  - `current_run_id_matches_binding`
+- To: `Idle`
+
+### `RollbackRunRunningToAttached`
+- From: `Running`
+- On: `RollbackRun`(run_id)
+- Guards:
+  - `pre_run_phase_matches_attached`
+  - `current_run_id_matches_binding`
+- To: `Attached`
+
+### `RollbackRunRunningToRetired`
+- From: `Running`
+- On: `RollbackRun`(run_id)
+- Guards:
+  - `pre_run_phase_matches_retired`
+  - `current_run_id_matches_binding`
 - To: `Retired`
 
 ### `RecycleFromIdleOrRetired`

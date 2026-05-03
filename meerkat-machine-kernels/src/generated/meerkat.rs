@@ -3783,6 +3783,92 @@ impl std::fmt::Display for TurnPrimitiveKind {
     serde::Serialize,
     serde::Deserialize,
 )]
+pub enum TurnTerminalCauseKind {
+    #[default]
+    #[serde(rename = "Unknown")]
+    Unknown,
+    #[serde(rename = "HookDenied")]
+    HookDenied,
+    #[serde(rename = "HookFailure")]
+    HookFailure,
+    #[serde(rename = "LlmFailure")]
+    LlmFailure,
+    #[serde(rename = "ToolFailure")]
+    ToolFailure,
+    #[serde(rename = "StructuredOutputValidationFailed")]
+    StructuredOutputValidationFailed,
+    #[serde(rename = "BudgetExhausted")]
+    BudgetExhausted,
+    #[serde(rename = "TimeBudgetExceeded")]
+    TimeBudgetExceeded,
+    #[serde(rename = "TurnLimitReached")]
+    TurnLimitReached,
+    #[serde(rename = "RuntimeApplyFailure")]
+    RuntimeApplyFailure,
+    #[serde(rename = "FatalFailure")]
+    FatalFailure,
+}
+impl TurnTerminalCauseKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unknown => "Unknown",
+            Self::HookDenied => "HookDenied",
+            Self::HookFailure => "HookFailure",
+            Self::LlmFailure => "LlmFailure",
+            Self::ToolFailure => "ToolFailure",
+            Self::StructuredOutputValidationFailed => "StructuredOutputValidationFailed",
+            Self::BudgetExhausted => "BudgetExhausted",
+            Self::TimeBudgetExceeded => "TimeBudgetExceeded",
+            Self::TurnLimitReached => "TurnLimitReached",
+            Self::RuntimeApplyFailure => "RuntimeApplyFailure",
+            Self::FatalFailure => "FatalFailure",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for TurnTerminalCauseKind {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "Unknown" => Ok(Self::Unknown),
+            "HookDenied" => Ok(Self::HookDenied),
+            "HookFailure" => Ok(Self::HookFailure),
+            "LlmFailure" => Ok(Self::LlmFailure),
+            "ToolFailure" => Ok(Self::ToolFailure),
+            "StructuredOutputValidationFailed" => Ok(Self::StructuredOutputValidationFailed),
+            "BudgetExhausted" => Ok(Self::BudgetExhausted),
+            "TimeBudgetExceeded" => Ok(Self::TimeBudgetExceeded),
+            "TurnLimitReached" => Ok(Self::TurnLimitReached),
+            "RuntimeApplyFailure" => Ok(Self::RuntimeApplyFailure),
+            "FatalFailure" => Ok(Self::FatalFailure),
+            other => Err(format!("invalid TurnTerminalCauseKind value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for TurnTerminalCauseKind {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for TurnTerminalCauseKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum TurnTerminalOutcome {
     #[default]
     #[serde(rename = "None")]
@@ -3987,6 +4073,7 @@ pub struct State {
     pub boundary_count: u64,
     pub cancel_after_boundary: bool,
     pub terminal_outcome: Option<TurnTerminalOutcome>,
+    pub terminal_cause_kind: Option<TurnTerminalCauseKind>,
     pub last_runtime_apply_failure_cause: Option<RuntimeApplyFailureCause>,
     pub last_runtime_apply_failure_message: Option<String>,
     pub extraction_attempts: u64,
@@ -4368,6 +4455,10 @@ pub mod inputs {
         pub run_id: RunId,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RollbackRun {
+        pub run_id: RunId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct Recycle {}
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct StartConversationRun {
@@ -4431,6 +4522,7 @@ pub mod inputs {
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct FatalFailure {
+        pub terminal_cause_kind: TurnTerminalCauseKind,
         pub error: String,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -4464,6 +4556,7 @@ pub mod inputs {
         pub run_id: RunId,
         pub runtime_apply_failure_cause: Option<RuntimeApplyFailureCause>,
         pub runtime_apply_failure_message: Option<String>,
+        pub terminal_cause_kind: TurnTerminalCauseKind,
         pub error: String,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -4987,6 +5080,7 @@ pub enum Input {
     Prepare(inputs::Prepare),
     Commit(inputs::Commit),
     Fail(inputs::Fail),
+    RollbackRun(inputs::RollbackRun),
     Recycle(inputs::Recycle),
     StartConversationRun(inputs::StartConversationRun),
     StartImmediateAppend(inputs::StartImmediateAppend),
@@ -5183,6 +5277,7 @@ impl Input {
             Self::Prepare(_) => InputKind::Prepare,
             Self::Commit(_) => InputKind::Commit,
             Self::Fail(_) => InputKind::Fail,
+            Self::RollbackRun(_) => InputKind::RollbackRun,
             Self::Recycle(_) => InputKind::Recycle,
             Self::StartConversationRun(_) => InputKind::StartConversationRun,
             Self::StartImmediateAppend(_) => InputKind::StartImmediateAppend,
@@ -5386,6 +5481,7 @@ pub enum InputKind {
     Prepare,
     Commit,
     Fail,
+    RollbackRun,
     Recycle,
     StartConversationRun,
     StartImmediateAppend,
@@ -5628,6 +5724,7 @@ pub mod effects {
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct TurnRunFailed {
         pub run_id: RunId,
+        pub terminal_cause_kind: TurnTerminalCauseKind,
         pub error: String,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -6359,6 +6456,9 @@ pub enum TransitionId {
     FailRunningToIdle,
     FailRunningToAttached,
     FailRunningToRetired,
+    RollbackRunRunningToIdle,
+    RollbackRunRunningToAttached,
+    RollbackRunRunningToRetired,
     RecycleFromIdleOrRetired,
     RecycleFromAttached,
     RecoverInputLifecycleIdle,
@@ -6977,6 +7077,7 @@ pub fn initial_state() -> State {
         boundary_count: 0,
         cancel_after_boundary: false,
         terminal_outcome: None,
+        terminal_cause_kind: None,
         last_runtime_apply_failure_cause: None,
         last_runtime_apply_failure_message: None,
         extraction_attempts: 0,

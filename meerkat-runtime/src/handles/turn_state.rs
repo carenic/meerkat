@@ -243,7 +243,8 @@ impl TurnStateHandle for RuntimeTurnStateHandle {
         // intra-machine: no route; dispatcher not applicable (handle targets the meerkat DSL directly, not a CompositionDispatcher seam)
         self.dsl.apply_input(
             mm_dsl::MeerkatMachineInput::FatalFailure {
-                error: reason.to_dsl_error(),
+                terminal_cause_kind: mm_dsl::TurnTerminalCauseKind::from(reason.cause_kind),
+                error: reason.message,
             },
             "TurnStateHandle::fatal_failure",
         )
@@ -347,7 +348,8 @@ impl TurnStateHandle for RuntimeTurnStateHandle {
                 run_id: mm_dsl::RunId::from_domain(&run_id),
                 runtime_apply_failure_cause: None,
                 runtime_apply_failure_message: None,
-                error: reason.to_dsl_error(),
+                terminal_cause_kind: mm_dsl::TurnTerminalCauseKind::from(reason.cause_kind),
+                error: reason.message,
             },
             "TurnStateHandle::run_failed",
         )?;
@@ -414,6 +416,7 @@ impl TurnStateHandle for RuntimeTurnStateHandle {
             boundary_count: state.boundary_count,
             cancel_after_boundary: state.cancel_after_boundary,
             terminal_outcome: state.terminal_outcome.map(TurnTerminalOutcome::from),
+            terminal_cause_kind: state.terminal_cause_kind.map(Into::into),
             extraction_attempts: state.extraction_attempts,
             max_extraction_retries: state.max_extraction_retries,
             llm_retry_attempt: u32::try_from(state.llm_retry_attempt).unwrap_or(u32::MAX),
@@ -497,6 +500,21 @@ mod tests {
         }
     }
 
+    fn unknown_terminal_cause_reason(message: &'static str) -> TurnFailureReason {
+        TurnFailureReason::with_cause(
+            meerkat_core::TurnTerminalCauseKind::Unknown,
+            meerkat_core::event::AgentErrorClass::Internal,
+            message,
+        )
+    }
+
+    fn specific_terminal_cause_reason(
+        cause_kind: meerkat_core::TurnTerminalCauseKind,
+        message: &'static str,
+    ) -> TurnFailureReason {
+        TurnFailureReason::with_cause(cause_kind, cause_kind.agent_error_class(), message)
+    }
+
     #[test]
     fn snapshot_carries_active_run_id_for_runtime_backed_turns() {
         let handle = RuntimeTurnStateHandle::ephemeral();
@@ -514,7 +532,7 @@ mod tests {
             .unwrap();
 
         let snapshot = handle.snapshot();
-        assert_eq!(snapshot.active_run_id, Some(run_id));
+        assert_eq!(snapshot.active_run_id, Some(run_id.clone()));
         assert_eq!(snapshot.turn_phase, TurnPhase::ApplyingPrimitive);
         assert_eq!(
             snapshot.primitive_kind,
@@ -587,5 +605,88 @@ mod tests {
         assert!(handle.retry_requested(1).is_err());
         handle.retry_requested(2).unwrap();
         assert_eq!(handle.snapshot().turn_phase, TurnPhase::CallingLlm);
+    }
+
+    #[test]
+    fn fatal_failure_unknown_terminal_cause_rejects_before_machine_apply() {
+        let handle = RuntimeTurnStateHandle::ephemeral();
+        let run_id = RunId(Uuid::from_u128(11));
+
+        handle
+            .start_conversation_run(
+                run_id,
+                TurnPrimitiveKind::ConversationTurn,
+                meerkat_core::turn_execution_authority::ContentShape::Conversation,
+                false,
+                false,
+                0,
+            )
+            .unwrap();
+
+        let err = handle
+            .fatal_failure(unknown_terminal_cause_reason(
+                "display text must not classify fatal failure",
+            ))
+            .expect_err("Unknown fatal cause should reject before state mutation");
+
+        assert!(err.is_guard_rejected(), "expected guard rejection: {err:?}");
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.turn_phase, TurnPhase::ApplyingPrimitive);
+        assert_eq!(snapshot.terminal_cause_kind, None);
+
+        handle
+            .fatal_failure(specific_terminal_cause_reason(
+                meerkat_core::TurnTerminalCauseKind::FatalFailure,
+                "explicit fatal failure",
+            ))
+            .expect("specific fatal cause should remain accepted");
+        assert_eq!(
+            handle.snapshot().terminal_cause_kind,
+            Some(meerkat_core::TurnTerminalCauseKind::FatalFailure)
+        );
+    }
+
+    #[test]
+    fn run_failed_unknown_terminal_cause_rejects_before_machine_apply() {
+        let handle = RuntimeTurnStateHandle::ephemeral();
+        let run_id = RunId(Uuid::from_u128(12));
+
+        handle
+            .start_conversation_run(
+                run_id.clone(),
+                TurnPrimitiveKind::ConversationTurn,
+                meerkat_core::turn_execution_authority::ContentShape::Conversation,
+                false,
+                false,
+                0,
+            )
+            .unwrap();
+
+        let err = handle
+            .run_failed(
+                run_id.clone(),
+                unknown_terminal_cause_reason("display text must not classify run failure"),
+            )
+            .expect_err("Unknown run failure cause should reject before state mutation");
+
+        assert!(err.is_guard_rejected(), "expected guard rejection: {err:?}");
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.active_run_id, Some(run_id.clone()));
+        assert_eq!(snapshot.turn_phase, TurnPhase::ApplyingPrimitive);
+        assert_eq!(snapshot.terminal_cause_kind, None);
+
+        handle
+            .run_failed(
+                run_id,
+                specific_terminal_cause_reason(
+                    meerkat_core::TurnTerminalCauseKind::FatalFailure,
+                    "explicit run failure",
+                ),
+            )
+            .expect("specific run failure cause should remain accepted");
+        assert_eq!(
+            handle.snapshot().terminal_cause_kind,
+            Some(meerkat_core::TurnTerminalCauseKind::FatalFailure)
+        );
     }
 }

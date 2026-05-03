@@ -80,19 +80,6 @@ export type HookId = string;
 /** Machine-readable agent error class. */
 export type AgentErrorClass = string;
 
-/** Structured agent error reason payload. */
-export type AgentErrorReason = Record<string, unknown> & {
-  readonly reason_type: string;
-  readonly hook_id?: HookId | null;
-};
-
-/** Structured terminal error report emitted with failed runs. */
-export interface AgentErrorReport {
-  readonly class: AgentErrorClass;
-  readonly message: string;
-  readonly reason?: AgentErrorReason | null;
-}
-
 // ---------------------------------------------------------------------------
 // Scoped streaming attribution
 // ---------------------------------------------------------------------------
@@ -130,6 +117,56 @@ export interface RunCompletedEvent {
   readonly sessionId: string;
   readonly result: string;
   readonly usage: Usage;
+}
+
+export type TurnTerminalOutcome =
+  | "none"
+  | "completed"
+  | "failed"
+  | "cancelled"
+  | "budget_exhausted"
+  | "time_budget_exceeded"
+  | "structured_output_validation_failed";
+
+export type TurnTerminalCauseKind =
+  | "unknown"
+  | "hook_denied"
+  | "hook_failure"
+  | "llm_failure"
+  | "tool_failure"
+  | "structured_output_validation_failed"
+  | "budget_exhausted"
+  | "time_budget_exceeded"
+  | "turn_limit_reached"
+  | "runtime_apply_failure"
+  | "fatal_failure";
+
+export interface TurnTerminalCauseReason {
+  readonly reasonType: "turn_terminal_cause";
+  readonly outcome: TurnTerminalOutcome;
+  readonly causeKind: TurnTerminalCauseKind;
+}
+
+export interface UnknownAgentErrorReason {
+  readonly reasonType: "unknown";
+  readonly rawReasonType?: string;
+  readonly raw: Readonly<Record<string, unknown>>;
+}
+
+export type HookAgentErrorReason = Record<string, unknown> & {
+  readonly reason_type: string;
+  readonly hook_id?: HookId | null;
+};
+
+export type AgentErrorReason =
+  | TurnTerminalCauseReason
+  | UnknownAgentErrorReason
+  | HookAgentErrorReason;
+
+export interface AgentErrorReport {
+  readonly class: AgentErrorClass;
+  readonly message: string;
+  readonly reason?: AgentErrorReason | null;
 }
 
 export interface RunFailedEvent {
@@ -607,9 +644,31 @@ function parseAgentErrorReason(raw: unknown): AgentErrorReason | null | undefine
     throw new Error("error_report.reason must be object");
   }
 
-  const reasonType = requireStringField(raw, "reason_type");
+  const reasonType = parseWireString(raw.reason_type ?? raw.reasonType);
+  if (reasonType === undefined) {
+    throw new Error("error_report.reason.reason_type must be string");
+  }
+
+  if (reasonType === "turn_terminal_cause") {
+    const outcome = parseWireString(raw.outcome);
+    const causeKind = parseWireString(raw.cause_kind ?? raw.causeKind);
+    if (
+      outcome !== undefined &&
+      causeKind !== undefined &&
+      TURN_TERMINAL_OUTCOMES.has(outcome as TurnTerminalOutcome) &&
+      TURN_TERMINAL_CAUSE_KINDS.has(causeKind as TurnTerminalCauseKind)
+    ) {
+      return {
+        reasonType,
+        outcome: outcome as TurnTerminalOutcome,
+        causeKind: causeKind as TurnTerminalCauseKind,
+      };
+    }
+    return undefined;
+  }
+
   if (!["hook_denied", "hook_timeout", "hook_execution_failed"].includes(reasonType)) {
-    return { ...raw, reason_type: reasonType } as AgentErrorReason;
+    return { reasonType: "unknown", rawReasonType: reasonType, raw };
   }
 
   const reason: Record<string, unknown> = {};
@@ -642,7 +701,7 @@ function parseAgentErrorReason(raw: unknown): AgentErrorReason | null | undefine
     reason.hook_id = hookId;
   }
 
-  return reason as AgentErrorReason;
+  return reason as HookAgentErrorReason;
 }
 
 function parseAgentErrorReport(raw: unknown): AgentErrorReport | null | undefined {
@@ -656,12 +715,14 @@ function parseAgentErrorReport(raw: unknown): AgentErrorReport | null | undefine
     throw new Error("error_report must be object");
   }
 
-  const report: AgentErrorReport = {
+  const reason = hasOwn(raw, "reason")
+    ? parseAgentErrorReason(raw.reason)
+    : undefined;
+  return {
     class: requireStringField(raw, "class"),
     message: requireStringField(raw, "message"),
-    ...(hasOwn(raw, "reason") ? { reason: parseAgentErrorReason(raw.reason) ?? null } : {}),
+    ...(reason !== undefined ? { reason } : {}),
   };
-  return report;
 }
 
 function parseContentInput(raw: unknown): ContentInput {
@@ -784,6 +845,30 @@ function parseWireString(raw: unknown): string | undefined {
 function parseWireBoolean(raw: unknown): boolean | undefined {
   return typeof raw === "boolean" ? raw : undefined;
 }
+
+const TURN_TERMINAL_OUTCOMES = new Set<TurnTerminalOutcome>([
+  "none",
+  "completed",
+  "failed",
+  "cancelled",
+  "budget_exhausted",
+  "time_budget_exceeded",
+  "structured_output_validation_failed",
+]);
+
+const TURN_TERMINAL_CAUSE_KINDS = new Set<TurnTerminalCauseKind>([
+  "unknown",
+  "hook_denied",
+  "hook_failure",
+  "llm_failure",
+  "tool_failure",
+  "structured_output_validation_failed",
+  "budget_exhausted",
+  "time_budget_exceeded",
+  "turn_limit_reached",
+  "runtime_apply_failure",
+  "fatal_failure",
+]);
 
 function parseSkillResolutionFailureReason(
   raw: unknown,

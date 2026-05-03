@@ -42,7 +42,8 @@ use crate::tool_scope::{
     ExternalToolSurfaceStagedOp,
 };
 use crate::turn_execution_authority::{
-    ContentShape, TurnFailureReason, TurnPhase, TurnPrimitiveKind, TurnTerminalOutcome,
+    ContentShape, TurnFailureReason, TurnPhase, TurnPrimitiveKind, TurnTerminalCauseKind,
+    TurnTerminalOutcome,
 };
 use crate::types::SessionId;
 
@@ -574,6 +575,9 @@ pub struct TurnStateSnapshot {
     /// Typed terminal outcome recorded by the DSL (dogma #5, #19 — no stringly
     /// discriminants). `None` means the turn has not reached a terminal phase.
     pub terminal_outcome: Option<TurnTerminalOutcome>,
+    /// Typed terminal cause recorded by the DSL. `None` means no failure cause
+    /// has been selected for the current turn.
+    pub terminal_cause_kind: Option<TurnTerminalCauseKind>,
     pub extraction_attempts: u64,
     pub max_extraction_retries: u64,
     pub llm_retry_attempt: u32,
@@ -916,7 +920,8 @@ pub trait PeerCommsHandle: Send + Sync {
 ///
 /// Covers the admission-adjacent inputs on the MeerkatMachine DSL: ingest an
 /// input into the session, accept it (with or without wake), prepare a run,
-/// and commit or fail the run. These inputs manage the input-lifecycle
+/// and commit the run. Failed run return is owned by the runtime turn-state
+/// path after a typed terminal cause is recorded. These inputs manage the input-lifecycle
 /// substate maps (`input_phases`, `input_run_associations`, etc.) and the
 /// top-level `current_run_id` / `pre_run_phase` fields.
 pub trait SessionAdmissionHandle: Send + Sync {
@@ -959,9 +964,6 @@ pub trait SessionAdmissionHandle: Send + Sync {
 
     /// Fire the `Commit { input_id, run_id }` input.
     fn commit(&self, input_id: &InputId, run_id: &RunId) -> Result<(), DslTransitionError>;
-
-    /// Fire the `Fail { run_id }` input.
-    fn fail(&self, run_id: &RunId) -> Result<(), DslTransitionError>;
 
     /// Fire the `Recycle` input — session transitions into the recycle path.
     fn recycle(&self) -> Result<(), DslTransitionError>;

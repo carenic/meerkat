@@ -9,6 +9,7 @@ use super::run_primitive::RunPrimitive;
 use super::run_receipt::RunBoundaryReceipt;
 use crate::error::AgentError;
 use crate::service::SessionError;
+use crate::turn_execution_authority::{TurnTerminalCauseKind, TurnTerminalOutcome};
 use crate::types::RunResult;
 use serde_json::Value;
 use std::sync::Arc;
@@ -192,6 +193,16 @@ pub enum CoreExecutorError {
     #[error("Apply failed: {cause}")]
     ApplyFailed { cause: CoreApplyFailureCause },
 
+    /// The core executor observed a machine-owned terminal turn failure while
+    /// applying a runtime turn. The runtime loop must preserve this typed
+    /// terminal cause instead of reclassifying it as a runtime apply failure.
+    #[error("Terminal failure: {outcome:?} ({cause_kind:?}): {message}")]
+    TerminalFailure {
+        outcome: TurnTerminalOutcome,
+        cause_kind: TurnTerminalCauseKind,
+        message: String,
+    },
+
     /// The control command could not be executed.
     #[error("Control failed: {cause}")]
     ControlFailed { cause: CoreControlFailureCause },
@@ -226,9 +237,31 @@ impl CoreExecutorError {
         Self::apply_failed(CoreApplyFailureCause::runtime_turn(message))
     }
 
+    pub fn terminal_failure(
+        outcome: TurnTerminalOutcome,
+        cause_kind: TurnTerminalCauseKind,
+        message: impl Into<String>,
+    ) -> Self {
+        Self::TerminalFailure {
+            outcome,
+            cause_kind,
+            message: message.into(),
+        }
+    }
+
     pub fn apply_failed_from_session_error(error: SessionError) -> Self {
         match error {
             SessionError::Agent(AgentError::Cancelled) => Self::Cancelled,
+            SessionError::Agent(AgentError::TerminalFailure {
+                outcome,
+                cause_kind,
+                message,
+            }) if cause_kind.is_specific_failure_cause() => {
+                Self::terminal_failure(outcome, cause_kind, message)
+            }
+            SessionError::Agent(AgentError::TerminalFailure { cause_kind, .. }) => Self::Internal(
+                format!("runtime turn returned unknown machine terminal cause: {cause_kind:?}"),
+            ),
             error => Self::apply_failed(CoreApplyFailureCause::from_session_error(&error)),
         }
     }
@@ -256,6 +289,11 @@ impl CoreExecutorError {
     pub fn apply_failure_cause(&self) -> CoreApplyFailureCause {
         match self {
             Self::ApplyFailed { cause } => cause.clone(),
+            Self::TerminalFailure { cause_kind, .. } => {
+                CoreApplyFailureCause::executor_internal(format!(
+                    "typed machine terminal failure escaped runtime-loop handling: {cause_kind:?}"
+                ))
+            }
             Self::ControlFailed { cause } => {
                 CoreApplyFailureCause::executor_control_failed(cause.message.clone())
             }

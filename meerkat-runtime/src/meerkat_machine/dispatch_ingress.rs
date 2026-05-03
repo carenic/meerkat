@@ -446,7 +446,7 @@ impl MeerkatMachine {
                         if let Err(rollback_err) = machine_apply_run_return_projection(
                             &mut driver,
                             &run_id,
-                            crate::meerkat_machine::driver::RunReturnDisposition::Fail,
+                            crate::meerkat_machine::driver::RunReturnDisposition::Rollback,
                             next_phase,
                         ) {
                             return Err(RuntimeDriverError::Internal(format!(
@@ -497,7 +497,7 @@ impl MeerkatMachine {
                             if let Err(rollback_err) = machine_apply_run_return_projection(
                                 &mut driver,
                                 &run_id,
-                                crate::meerkat_machine::driver::RunReturnDisposition::Fail,
+                                crate::meerkat_machine::driver::RunReturnDisposition::Rollback,
                                 next_phase,
                             ) {
                                 return Err(RuntimeDriverError::Internal(format!(
@@ -566,7 +566,7 @@ impl MeerkatMachine {
             MeerkatMachineCommand::Fail {
                 session_id,
                 run_id,
-                error,
+                failure,
             } => {
                 let driver = {
                     let sessions = self.sessions.read().await;
@@ -585,9 +585,7 @@ impl MeerkatMachine {
                     None => None,
                 };
 
-                if let Err(run_err) =
-                    fail_machine_run_without_runtime_apply_cause(&driver, run_id, error).await
-                {
+                if let Err(run_err) = fail_machine_run(&driver, run_id, failure).await {
                     let should_unregister = run_err.should_unregister_session();
                     let run_err = run_err.into_driver_error();
                     if should_unregister {

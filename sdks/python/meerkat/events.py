@@ -44,8 +44,6 @@ BackgroundJobTerminalStatus = Literal[
 ]
 HookId = str
 AgentErrorClass = str
-AgentErrorReason = dict[str, Any]
-AgentErrorReport = dict[str, Any]
 
 
 # ---------------------------------------------------------------------------
@@ -94,6 +92,85 @@ class RunCompleted(Event):
     session_id: str = ""
     result: str = ""
     usage: Usage = field(default_factory=Usage)
+
+
+TurnTerminalOutcome = Literal[
+    "none",
+    "completed",
+    "failed",
+    "cancelled",
+    "budget_exhausted",
+    "time_budget_exceeded",
+    "structured_output_validation_failed",
+]
+
+TurnTerminalCauseKind = Literal[
+    "unknown",
+    "hook_denied",
+    "hook_failure",
+    "llm_failure",
+    "tool_failure",
+    "structured_output_validation_failed",
+    "budget_exhausted",
+    "time_budget_exceeded",
+    "turn_limit_reached",
+    "runtime_apply_failure",
+    "fatal_failure",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class AgentErrorReason:
+    """Structured machine-owned reason for an agent failure."""
+
+    reason_type: str = "unknown"
+    outcome: str | None = None
+    cause_kind: str | None = None
+    raw_reason_type: str | None = None
+    raw: dict[str, Any] = field(default_factory=dict)
+
+    def __getitem__(self, key: str) -> Any:
+        if key == "reason_type":
+            return self.reason_type
+        if key == "outcome":
+            return self.outcome
+        if key == "cause_kind":
+            return self.cause_kind
+        if key == "raw_reason_type":
+            return self.raw_reason_type
+        if key == "raw":
+            return self.raw
+        return self.raw[key]
+
+    def __contains__(self, key: object) -> bool:
+        return key in {
+            "reason_type",
+            "outcome",
+            "cause_kind",
+            "raw_reason_type",
+            "raw",
+        } or key in self.raw
+
+
+@dataclass(frozen=True, slots=True)
+class AgentErrorReport:
+    """Structured agent failure report carried by run_failed events."""
+
+    class_: str = ""
+    message: str = ""
+    reason: AgentErrorReason | None = None
+
+    def __getitem__(self, key: str) -> Any:
+        if key == "class":
+            return self.class_
+        if key == "message":
+            return self.message
+        if key == "reason":
+            return self.reason
+        raise KeyError(key)
+
+    def __contains__(self, key: object) -> bool:
+        return key in {"class", "message", "reason"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -581,18 +658,36 @@ def _parse_agent_error_reason(raw: Any) -> AgentErrorReason | None:
     if not isinstance(raw, dict):
         raise ValueError("error_report.reason must be object")
 
-    reason_type = raw.get("reason_type")
+    reason_type = raw.get("reason_type", raw.get("reasonType"))
     if not isinstance(reason_type, str):
         raise ValueError("error_report.reason.reason_type must be string")
+
+    if reason_type == "turn_terminal_cause":
+        outcome = raw.get("outcome")
+        cause_kind = raw.get("cause_kind", raw.get("causeKind"))
+        if (
+            isinstance(outcome, str)
+            and isinstance(cause_kind, str)
+            and outcome in _TURN_TERMINAL_OUTCOMES
+            and cause_kind in _TURN_TERMINAL_CAUSE_KINDS
+        ):
+            return AgentErrorReason(
+                reason_type=reason_type,
+                outcome=outcome,
+                cause_kind=cause_kind,
+            )
+        return None
 
     if reason_type not in {
         "hook_denied",
         "hook_timeout",
         "hook_execution_failed",
     }:
-        reason = dict(raw)
-        reason["reason_type"] = reason_type
-        return reason
+        return AgentErrorReason(
+            reason_type="unknown",
+            raw_reason_type=reason_type,
+            raw=dict(raw),
+        )
 
     reason = {
         key: value
@@ -632,7 +727,7 @@ def _parse_agent_error_reason(raw: Any) -> AgentErrorReason | None:
             raise ValueError("error_report.reason.reason must be string")
         reason["reason"] = reason_text
 
-    return reason
+    return AgentErrorReason(reason_type=reason_type, raw=reason)
 
 
 def _parse_agent_error_report(raw: Any) -> AgentErrorReport | None:
@@ -648,13 +743,10 @@ def _parse_agent_error_report(raw: Any) -> AgentErrorReport | None:
     if not isinstance(message, str):
         raise ValueError("error_report.message must be string")
 
-    report: AgentErrorReport = {
-        "class": error_class,
-        "message": message,
-    }
+    reason = None
     if "reason" in raw:
-        report["reason"] = _parse_agent_error_reason(raw.get("reason"))
-    return report
+        reason = _parse_agent_error_reason(raw.get("reason"))
+    return AgentErrorReport(class_=error_class, message=message, reason=reason)
 
 
 def _parse_tool_config_change_status(raw: Any) -> ToolConfigChangeStatus | None:
@@ -743,6 +835,30 @@ def _parse_stop_reason(raw: Any) -> str | None:
 def _parse_tool_config_operation(raw: Any) -> str | None:
     return raw if isinstance(raw, str) and raw in _TOOL_CONFIG_OPERATIONS else None
 
+
+_TURN_TERMINAL_OUTCOMES = {
+    "none",
+    "completed",
+    "failed",
+    "cancelled",
+    "budget_exhausted",
+    "time_budget_exceeded",
+    "structured_output_validation_failed",
+}
+
+_TURN_TERMINAL_CAUSE_KINDS = {
+    "unknown",
+    "hook_denied",
+    "hook_failure",
+    "llm_failure",
+    "tool_failure",
+    "structured_output_validation_failed",
+    "budget_exhausted",
+    "time_budget_exceeded",
+    "turn_limit_reached",
+    "runtime_apply_failure",
+    "fatal_failure",
+}
 
 def _parse_skill_resolution_failure_reason(
     raw: Any,
@@ -1017,6 +1133,8 @@ def parse_event(raw: dict[str, Any]) -> Event:
                 kwargs["is_error"] = _parse_optional_bool(raw.get("is_error"))
             elif f == "duration_ms" and cls is ToolExecutionCompleted:
                 kwargs["duration_ms"] = _parse_optional_int(raw.get("duration_ms"))
+            elif f == "error_report" and cls is RunFailed:
+                kwargs["error_report"] = _parse_agent_error_report(raw.get("error_report"))
             elif f == "skills" and cls is SkillsResolved:
                 kwargs["skills"] = _parse_skill_key_list(raw.get("skills"))
             elif f == "skill_key" and cls is SkillResolutionFailed:
@@ -1026,11 +1144,6 @@ def parse_event(raw: dict[str, Any]) -> Event:
                     raw.get("reason"),
                     raw["error"],
                 )
-            elif f == "error_report" and cls is RunFailed:
-                if "error_report" in raw:
-                    kwargs["error_report"] = _parse_agent_error_report(
-                        raw.get("error_report")
-                    )
             elif f == "payload" and cls is ToolConfigChanged:
                 payload_raw = raw["payload"]
                 assert isinstance(payload_raw, dict)

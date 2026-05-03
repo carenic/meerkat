@@ -32,16 +32,17 @@
 use std::collections::{BTreeSet, HashSet};
 use std::sync::{
     Mutex, MutexGuard,
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
+use crate::BudgetDimension;
 use crate::handles::{DslTransitionError, TurnStateHandle, TurnStateSnapshot};
 use crate::lifecycle::RunId;
 use crate::ops::OperationId;
 use crate::retry::LlmRetrySchedule;
 use crate::turn_execution_authority::{
     ContentShape, TurnExecutionInput, TurnFailureReason, TurnPhase, TurnPrimitiveKind,
-    TurnTerminalOutcome, terminal_outcome_for_budget_exceeded,
+    TurnTerminalCauseKind, TurnTerminalOutcome, terminal_outcome_for_budget_exceeded,
 };
 
 #[derive(Debug, Clone)]
@@ -65,11 +66,35 @@ struct LocalFields {
     boundary_count: u32,
     cancel_after_boundary: bool,
     terminal_outcome: TurnTerminalOutcome,
+    terminal_cause_kind: Option<TurnTerminalCauseKind>,
     extraction_attempts: u32,
     max_extraction_retries: u32,
     llm_retry_attempt: u32,
     llm_retry_max_retries: u32,
     llm_retry_selected_delay_ms: u64,
+    force_next_llm_terminal_failed_cause_kind: Option<ForcedTerminalCauseKind>,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ForcedTerminalCauseKind {
+    Present(TurnTerminalCauseKind),
+    Missing,
+}
+
+impl ForcedTerminalCauseKind {
+    fn from_optional(cause_kind: Option<TurnTerminalCauseKind>) -> Self {
+        match cause_kind {
+            Some(cause_kind) => Self::Present(cause_kind),
+            None => Self::Missing,
+        }
+    }
+
+    fn into_optional(self) -> Option<TurnTerminalCauseKind> {
+        match self {
+            Self::Present(cause_kind) => Some(cause_kind),
+            Self::Missing => None,
+        }
+    }
 }
 
 impl LocalFields {
@@ -88,11 +113,13 @@ impl LocalFields {
             boundary_count: 0,
             cancel_after_boundary: false,
             terminal_outcome: TurnTerminalOutcome::None,
+            terminal_cause_kind: None,
             extraction_attempts: 0,
             max_extraction_retries: 0,
             llm_retry_attempt: 0,
             llm_retry_max_retries: 0,
             llm_retry_selected_delay_ms: 0,
+            force_next_llm_terminal_failed_cause_kind: None,
         }
     }
 
@@ -211,7 +238,13 @@ impl LocalState {
                     return Err(invalid(phase, &input));
                 }
                 fields.boundary_count += 1;
-                DrainingBoundary
+                if let Some(cause_kind) = fields.force_next_llm_terminal_failed_cause_kind.take() {
+                    fields.terminal_outcome = TurnTerminalOutcome::Failed;
+                    fields.terminal_cause_kind = cause_kind.into_optional();
+                    Failed
+                } else {
+                    DrainingBoundary
+                }
             }
             (
                 WaitingForOps,
@@ -325,6 +358,8 @@ impl LocalState {
                     CallingLlm
                 } else {
                     fields.terminal_outcome = TurnTerminalOutcome::StructuredOutputValidationFailed;
+                    fields.terminal_cause_kind =
+                        Some(TurnTerminalCauseKind::StructuredOutputValidationFailed);
                     Failed
                 }
             }
@@ -361,7 +396,7 @@ impl LocalState {
             (
                 ApplyingPrimitive | CallingLlm | WaitingForOps | DrainingBoundary | Extracting
                 | ErrorRecovery,
-                FatalFailure { run_id, .. },
+                FatalFailure { run_id, reason },
             ) => {
                 if !self.guard_run_matches(run_id) {
                     return Err(invalid(phase, &input));
@@ -373,6 +408,7 @@ impl LocalState {
                     fields.barrier_satisfied = true;
                 }
                 fields.terminal_outcome = TurnTerminalOutcome::Failed;
+                fields.terminal_cause_kind = Some(reason.cause_kind);
                 Failed
             }
             (
@@ -425,8 +461,9 @@ impl LocalState {
                     fields.barrier_satisfied = true;
                 }
                 fields.boundary_count += 1;
-                fields.terminal_outcome = TurnTerminalOutcome::Completed;
-                Completed
+                fields.terminal_outcome = TurnTerminalOutcome::Failed;
+                fields.terminal_cause_kind = Some(TurnTerminalCauseKind::TurnLimitReached);
+                Failed
             }
             (
                 ApplyingPrimitive | CallingLlm | WaitingForOps | DrainingBoundary | Extracting
@@ -444,6 +481,7 @@ impl LocalState {
                 }
                 fields.boundary_count += 1;
                 fields.terminal_outcome = TurnTerminalOutcome::BudgetExhausted;
+                fields.terminal_cause_kind = Some(TurnTerminalCauseKind::BudgetExhausted);
                 Completed
             }
             (
@@ -462,6 +500,7 @@ impl LocalState {
                 }
                 fields.boundary_count += 1;
                 fields.terminal_outcome = TurnTerminalOutcome::TimeBudgetExceeded;
+                fields.terminal_cause_kind = Some(TurnTerminalCauseKind::TimeBudgetExceeded);
                 Completed
             }
             (
@@ -480,6 +519,12 @@ impl LocalState {
                 }
                 fields.boundary_count += 1;
                 fields.terminal_outcome = terminal_outcome_for_budget_exceeded(*exceeded);
+                fields.terminal_cause_kind = Some(match exceeded.dimension {
+                    BudgetDimension::Time => TurnTerminalCauseKind::TimeBudgetExceeded,
+                    BudgetDimension::Tokens | BudgetDimension::ToolCalls => {
+                        TurnTerminalCauseKind::BudgetExhausted
+                    }
+                });
                 Completed
             }
             (
@@ -589,6 +634,7 @@ pub struct TestTurnStateHandle {
     state: Mutex<LocalState>,
     run_completed_effects: AtomicUsize,
     run_failed_effects: AtomicUsize,
+    suppress_terminal_cause_snapshots: AtomicBool,
 }
 
 impl TestTurnStateHandle {
@@ -597,6 +643,7 @@ impl TestTurnStateHandle {
             state: Mutex::new(LocalState::new()),
             run_completed_effects: AtomicUsize::new(0),
             run_failed_effects: AtomicUsize::new(0),
+            suppress_terminal_cause_snapshots: AtomicBool::new(false),
         }
     }
 
@@ -615,6 +662,21 @@ impl TestTurnStateHandle {
 
     pub fn run_failed_effect_count(&self) -> usize {
         self.run_failed_effects.load(Ordering::SeqCst)
+    }
+
+    pub fn suppress_terminal_cause_snapshots_for_test(&self) {
+        self.suppress_terminal_cause_snapshots
+            .store(true, Ordering::SeqCst);
+    }
+
+    pub fn force_next_llm_terminal_failed_for_test(
+        &self,
+        cause_kind: Option<TurnTerminalCauseKind>,
+    ) -> Result<(), DslTransitionError> {
+        let mut guard = self.lock_state()?;
+        guard.fields.force_next_llm_terminal_failed_cause_kind =
+            Some(ForcedTerminalCauseKind::from_optional(cause_kind));
+        Ok(())
     }
 }
 
@@ -925,6 +987,14 @@ impl TurnStateHandle for TestTurnStateHandle {
             terminal_outcome: match fields.terminal_outcome {
                 TurnTerminalOutcome::None => None,
                 other => Some(other),
+            },
+            terminal_cause_kind: if self
+                .suppress_terminal_cause_snapshots
+                .load(Ordering::SeqCst)
+            {
+                None
+            } else {
+                fields.terminal_cause_kind
             },
             extraction_attempts: u64::from(fields.extraction_attempts),
             max_extraction_retries: u64::from(fields.max_extraction_retries),

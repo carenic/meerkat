@@ -11,6 +11,7 @@ use crate::ops_lifecycle::{OperationStatus, OperationTerminalOutcome};
 use crate::retry::LlmRetrySchedule;
 use crate::skills::{CapabilityId, SkillError, SkillKey};
 use crate::time_compat::SystemTime;
+use crate::turn_execution_authority::{TurnTerminalCauseKind, TurnTerminalOutcome};
 use crate::types::{ContentBlock, ContentInput, SessionId, StopReason, Usage};
 use serde::de::{self, DeserializeOwned};
 use serde::ser::SerializeStruct;
@@ -353,6 +354,10 @@ pub enum AgentErrorReason {
         tool_name: String,
         args: Value,
     },
+    TurnTerminalCause {
+        outcome: TurnTerminalOutcome,
+        cause_kind: TurnTerminalCauseKind,
+    },
 }
 
 impl AgentErrorReason {
@@ -434,6 +439,16 @@ impl AgentErrorReason {
                 tool_name: tool_name.clone(),
                 args: args.clone(),
             }),
+            AgentError::TerminalFailure {
+                outcome,
+                cause_kind,
+                ..
+            } => cause_kind
+                .is_specific_failure_cause()
+                .then_some(Self::TurnTerminalCause {
+                    outcome: *outcome,
+                    cause_kind: *cause_kind,
+                }),
             _ => None,
         }
     }
@@ -470,7 +485,13 @@ impl From<&AgentError> for AgentErrorClass {
             | AgentError::HookTimeout { .. }
             | AgentError::HookExecutionFailed { .. }
             | AgentError::HookConfigInvalid { .. } => Self::Hook,
-            AgentError::TerminalFailure { .. } => Self::Terminal,
+            AgentError::TerminalFailure { cause_kind, .. } => {
+                if cause_kind.is_specific_failure_cause() {
+                    cause_kind.agent_error_class()
+                } else {
+                    Self::Internal
+                }
+            }
             AgentError::NoPendingBoundary => Self::NoPendingBoundary,
         }
     }
@@ -2707,6 +2728,21 @@ mod tests {
                 }),
             })
         );
+    }
+
+    #[test]
+    fn agent_error_report_fails_closed_for_unknown_terminal_cause() {
+        let error = crate::error::AgentError::TerminalFailure {
+            outcome: TurnTerminalOutcome::Failed,
+            cause_kind: TurnTerminalCauseKind::Unknown,
+            message: "display text must not publish terminal cause".to_string(),
+        };
+
+        let report = AgentErrorReport::from_agent_error(&error);
+
+        assert_eq!(report.class, AgentErrorClass::Internal);
+        assert_eq!(report.reason, None);
+        assert_eq!(report.message, error.to_string());
     }
 
     #[test]
