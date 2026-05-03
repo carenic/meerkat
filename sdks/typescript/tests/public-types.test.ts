@@ -26,6 +26,7 @@ import type {
   MobReconcileParams,
   MobSpawnManyParams,
   MobSpawnManyFailedResult,
+  MobSpawnManyFailureCause,
   MobSpawnManyResult,
   MobSpawnManyResultEntry,
   MobSpawnManyResultPayload,
@@ -440,7 +441,9 @@ const generatedMobSpawnManyResult: MobSpawnManyResult = {
 };
 
 const generatedMobSpawnManyStatus: MobSpawnManyResultStatus = "failed";
+const generatedMobSpawnManyFailureCause: MobSpawnManyFailureCause = "profile_not_found";
 const generatedMobSpawnManyFailure: MobSpawnManyFailedResult = {
+  cause: generatedMobSpawnManyFailureCause,
   message: "profile missing",
 };
 const generatedMobSpawnManyPayload: MobSpawnManyResultPayload = generatedMobSpawnManyFailure;

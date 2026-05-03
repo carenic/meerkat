@@ -161,6 +161,7 @@ export type {
   MobReconcileResult,
   MobSpawnManyParams,
   MobSpawnManyFailedResult,
+  MobSpawnManyFailureCause,
   MobSpawnManyResult,
   MobSpawnManyResultEntry,
   MobSpawnManyResultPayload,

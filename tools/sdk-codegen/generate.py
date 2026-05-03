@@ -146,6 +146,7 @@ MOB_RPC_CONTRACT_ALIAS_TYPES = [
     "WireMemberState",
     "WireMobMemberStatus",
     "WireMobRuntimeMode",
+    "MobSpawnManyFailureCause",
     "MobSpawnManyResultStatus",
     "MobSpawnManyResultPayload",
     "MobCollectionPolicyInput",

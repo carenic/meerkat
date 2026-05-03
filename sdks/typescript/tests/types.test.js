@@ -1668,6 +1668,12 @@ describe("Parity wrappers", () => {
               agent_identity: "worker-1",
               member_ref: makeMemberRef(params.mob_id, "worker-1"),
             },
+          }, {
+            status: "failed",
+            result: {
+              cause: "profile_not_found",
+              message: "profile missing",
+            },
           }],
         };
       }
@@ -1764,6 +1770,9 @@ describe("Parity wrappers", () => {
     assert.equal(spawned[0].status, "spawned");
     assert.equal(spawned[0].result.agent_identity, "worker-1");
     assert.equal(spawned[0].result.member_ref, makeMemberRef("mob-1", "worker-1"));
+    assert.equal(spawned[1].status, "failed");
+    assert.equal(spawned[1].result.cause, "profile_not_found");
+    assert.equal(spawned[1].result.message, "profile missing");
     assert.equal(append.agent_identity, "worker-1");
     assert.equal(events.events.length, 1);
     assert.equal(created.notFound, false);
@@ -1851,6 +1860,13 @@ describe("Parity wrappers", () => {
         ],
       },
       { results: [{ status: "spawned", result: { agent_identity: "worker-1" } }] },
+      { results: [{ status: "failed", result: { message: "profile missing" } }] },
+      {
+        results: [{
+          status: "failed",
+          result: { cause: "future_failure", message: "profile missing" },
+        }],
+      },
       { results: [{ status: "failed", result: { message: "" } }] },
       {
         results: [{
@@ -1862,7 +1878,7 @@ describe("Parity wrappers", () => {
       {
         results: [{
           status: "failed",
-          result: { message: "profile missing" },
+          result: { cause: "profile_not_found", message: "profile missing" },
           error: "legacy profile missing",
         }],
       },
@@ -1875,7 +1891,11 @@ describe("Parity wrappers", () => {
       {
         results: [{
           status: "failed",
-          result: { message: "profile missing", error: "legacy profile missing" },
+          result: {
+            cause: "profile_not_found",
+            message: "profile missing",
+            error: "legacy profile missing",
+          },
         }],
       },
       {},
