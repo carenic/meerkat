@@ -4696,6 +4696,7 @@ mod tests {
         let visibility_state = agent
             .session()
             .tool_visibility_state()
+            .expect("session visibility state should decode")
             .expect("session effects should publish canonical visibility state");
         assert!(
             visibility_state
@@ -5312,6 +5313,7 @@ mod tests {
         let visibility_state = agent
             .session()
             .tool_visibility_state()
+            .expect("boundary visibility state should decode")
             .expect("boundary visibility apply should persist committed state");
         let expected_filter = crate::ToolFilter::Deny(["secret".to_string()].into_iter().collect());
         assert_eq!(visibility_state.active_filter, expected_filter);
@@ -5439,6 +5441,7 @@ mod tests {
         let visibility_state = agent
             .session()
             .tool_visibility_state()
+            .expect("canonical visibility state should decode")
             .expect("canonical visibility state should be present after restore");
         assert_eq!(
             visibility_state.active_filter,

@@ -263,7 +263,10 @@ fn realtime_projection_runtime_system_context(
 
 #[cfg(test)]
 fn exported_tool_visibility_state(session: &Session) -> meerkat_core::SessionToolVisibilityState {
-    session.tool_visibility_state().unwrap_or_default()
+    session
+        .tool_visibility_state()
+        .expect("exported visibility state should decode")
+        .unwrap_or_default()
 }
 
 struct RuntimePreAdmissionGuard {
@@ -1828,7 +1831,14 @@ impl SessionLlmReconfigureHost for SessionRuntimeLlmReconfigureHost {
             .export_live_session(session_id)
             .await
             .map_err(session_error_to_runtime_driver)?;
-        let current_visibility_state = session.tool_visibility_state().unwrap_or_default();
+        let current_visibility_state = session
+            .tool_visibility_state()
+            .map_err(|err| {
+                RuntimeDriverError::Internal(format!(
+                    "failed to decode live session tool visibility state: {err}"
+                ))
+            })?
+            .unwrap_or_default();
         let base_tool_names = self
             .service
             .tool_scope_snapshot(session_id)
