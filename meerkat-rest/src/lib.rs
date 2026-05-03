@@ -6250,7 +6250,7 @@ mod tests {
 
     struct BlockingMockLlmClient {
         calls: Arc<AtomicUsize>,
-        release: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Semaphore>,
     }
 
     struct ErrorLlmClient;
@@ -6293,7 +6293,11 @@ mod tests {
             let release = Arc::clone(&self.release);
             Box::pin(async_stream::stream! {
                 calls.fetch_add(1, AtomicOrdering::SeqCst);
-                release.notified().await;
+                let permit = release
+                    .acquire()
+                    .await
+                    .expect("blocking mock release semaphore should stay open");
+                drop(permit);
                 yield Ok(LlmEvent::TextDelta {
                     delta: "ok".to_string(),
                     meta: None,
@@ -6970,7 +6974,7 @@ mod tests {
             .await
             .unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
-        let release = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
         state.llm_client_override = Some(Arc::new(BlockingMockLlmClient {
             calls: Arc::clone(&calls),
             release: Arc::clone(&release),
@@ -7043,7 +7047,7 @@ mod tests {
         });
         wait_for_rest_runtime_pre_admission(&state, &target_session_id).await;
 
-        release.notify_waiters();
+        release.add_permits(1);
         let completed = tokio::time::timeout(std::time::Duration::from_secs(5), running_turn)
             .await
             .expect("running turn should complete after releasing mock LLM")
@@ -7062,7 +7066,7 @@ mod tests {
             );
         assert_eq!(admitted.0, StatusCode::ACCEPTED);
 
-        release.notify_waiters();
+        release.add_permits(1);
     }
 
     #[tokio::test]
@@ -7231,7 +7235,7 @@ mod tests {
         let temp = TempDir::new().unwrap();
         let mut state = load_rest_state_with_capacity(&temp, 1).await;
         let calls = Arc::new(AtomicUsize::new(0));
-        let release = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
         state.llm_client_override = Some(Arc::new(BlockingMockLlmClient {
             calls: Arc::clone(&calls),
             release: Arc::clone(&release),
@@ -7274,7 +7278,7 @@ mod tests {
             .expect_err("aborted REST continue task should report cancellation");
         assert!(aborted.is_cancelled());
 
-        release.notify_waiters();
+        release.add_permits(1);
         let replacement = tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 if state
@@ -7414,7 +7418,7 @@ mod tests {
         );
 
         let calls = Arc::new(AtomicUsize::new(0));
-        let release = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
         state.llm_client_override = Some(Arc::new(BlockingMockLlmClient {
             calls: Arc::clone(&calls),
             release: Arc::clone(&release),
@@ -7476,7 +7480,7 @@ mod tests {
         let mut continue_task = continue_task;
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                release.notify_waiters();
+                release.add_permits(1);
                 tokio::select! {
                     result = &mut continue_task => break result,
                     () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}

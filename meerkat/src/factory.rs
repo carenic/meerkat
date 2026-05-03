@@ -50,7 +50,7 @@ use meerkat_core::{
     Agent, AgentBuilder, AgentEvent, AgentLlmClient, AgentSessionStore, AgentToolDispatcher,
     BlobStore, BudgetLimits, Config, ConnectionRef, HookRunOverrides, ModelRegistry, OutputSchema,
     Provider, RealmConnectionSet, RealmId, Session, SessionLlmIdentity, SessionMetadata,
-    SessionTooling, ToolCategoryOverride,
+    SessionToolVisibilityState, SessionTooling, ToolCategoryOverride,
 };
 use meerkat_runtime::{RuntimeOpsLifecycleRegistry, RuntimeTurnStateHandle};
 #[cfg(feature = "jsonl-store")]
@@ -399,8 +399,9 @@ pub struct AgentBuildConfig {
     ///
     /// These are set on the session's internal metadata map before the core
     /// `AgentBuilder` factory-policy seam runs, so they are available for
-    /// early-stage recovery (e.g. inherited tool filter).
-    /// Entries here take precedence over any resumed session metadata for the same key.
+    /// early-stage recovery (e.g. canonical inherited visibility state).
+    /// On resumed sessions, canonical tool visibility metadata is merged into
+    /// the durable visibility state instead of replacing it.
     pub initial_metadata_entries: std::collections::BTreeMap<String, serde_json::Value>,
 }
 
@@ -1825,6 +1826,69 @@ impl AgentFactory {
         Some(metadata)
     }
 
+    fn apply_initial_metadata_entries(
+        session: &mut Session,
+        entries: &BTreeMap<String, serde_json::Value>,
+        is_resumed: bool,
+    ) -> Result<(), BuildAgentError> {
+        for (key, value) in entries {
+            if is_resumed && key == meerkat_core::SESSION_TOOL_VISIBILITY_STATE_KEY {
+                Self::merge_resumed_initial_visibility_state(session, value)?;
+            } else {
+                session.set_metadata(key, value.clone());
+            }
+        }
+        Ok(())
+    }
+
+    fn merge_resumed_initial_visibility_state(
+        session: &mut Session,
+        value: &serde_json::Value,
+    ) -> Result<(), BuildAgentError> {
+        let incoming = serde_json::from_value::<SessionToolVisibilityState>(value.clone())
+            .map_err(|err| {
+                BuildAgentError::Config(format!(
+                    "invalid initial canonical tool visibility state: {err}"
+                ))
+            })?;
+        let inherited_base_filter = incoming.inherited_base_filter.clone();
+        let inherited_filter_witnesses = incoming.filter_witnesses.clone();
+        let inherited_only = SessionToolVisibilityState {
+            inherited_base_filter: inherited_base_filter.clone(),
+            filter_witnesses: inherited_filter_witnesses.clone(),
+            ..Default::default()
+        };
+        if incoming != inherited_only {
+            return Err(BuildAgentError::Config(
+                "resumed initial canonical tool visibility state may only carry inherited_base_filter and filter_witnesses"
+                    .to_string(),
+            ));
+        }
+        meerkat_core::tool_scope::validate_witnessed_filter_authority(
+            &inherited_base_filter,
+            &inherited_filter_witnesses,
+        )
+        .map_err(|err| {
+            BuildAgentError::Config(format!(
+                "invalid initial inherited tool visibility authority: {err}"
+            ))
+        })?;
+
+        let mut existing = session
+            .try_tool_visibility_state()
+            .map_err(|err| {
+                BuildAgentError::Config(format!(
+                    "invalid existing canonical tool visibility state: {err}"
+                ))
+            })?
+            .unwrap_or_default();
+        existing.inherited_base_filter = inherited_base_filter;
+        existing.filter_witnesses.extend(inherited_filter_witnesses);
+        session
+            .set_tool_visibility_state(existing)
+            .map_err(|err| BuildAgentError::Config(err.to_string()))
+    }
+
     /// Build an LLM adapter for the provided client/model.
     pub async fn build_llm_adapter(
         &self,
@@ -3078,11 +3142,13 @@ impl AgentFactory {
         #[allow(unused_variables)] // only consumed by non-wasm32 tool dispatcher
         let effective_shell = build_config.override_shell.resolve(self.enable_shell);
         let mut session = build_config.resume_session.clone().unwrap_or_default();
-        // Inject pre-resolved metadata entries (e.g. inherited tool filter from
-        // spawn tooling) before the builder reads metadata for early-stage recovery.
-        for (key, value) in &build_config.initial_metadata_entries {
-            session.set_metadata(key, value.clone());
-        }
+        // Inject pre-resolved metadata entries before the builder reads metadata
+        // for early-stage recovery, such as canonical inherited visibility state.
+        Self::apply_initial_metadata_entries(
+            &mut session,
+            &build_config.initial_metadata_entries,
+            build_config.resume_session.is_some(),
+        )?;
         let _session_id = session.id().to_string();
         use meerkat_core::runtime_epoch::RuntimeBuildMode;
 
@@ -3226,10 +3292,10 @@ impl AgentFactory {
                     profile.image_tool_results,
                 );
             let mut visibility_state = session
-                .tool_visibility_state()
+                .try_tool_visibility_state()
                 .map_err(|err| {
                     BuildAgentError::Config(format!(
-                        "failed to decode canonical tool visibility state: {err}"
+                        "invalid canonical tool visibility state: {err}"
                     ))
                 })?
                 .unwrap_or_default();
@@ -5591,6 +5657,272 @@ mod tests {
         assert_eq!(snapshot.phase, None);
         assert!(!snapshot.credential_present);
         assert_eq!(snapshot.generation, 0);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn factory_capability_filter_rejects_malformed_canonical_visibility_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = AgentFactory::new(temp.path().join("sessions")).builtins(false);
+        let mut session = Session::new();
+        session.set_metadata(
+            meerkat_core::SESSION_TOOL_VISIBILITY_STATE_KEY,
+            serde_json::json!("not-a-visibility-state"),
+        );
+        let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+        let bindings = runtime
+            .prepare_bindings(session.id().clone())
+            .await
+            .expect("session runtime bindings");
+        let mut build = AgentBuildConfig::new("claude-sonnet-4-5");
+        build.provider = Some(Provider::Anthropic);
+        build.llm_client_override = Some(Arc::new(meerkat_client::TestClient::default()));
+        build.resume_session = Some(session);
+        build.runtime_build_mode = meerkat_core::RuntimeBuildMode::SessionOwned(bindings.clone());
+        build.override_builtins = ToolCategoryOverride::Disable;
+
+        let err = match factory.build_agent(build, &Config::default()).await {
+            Ok(_) => panic!("malformed canonical visibility metadata must fail closed"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("invalid canonical tool visibility state"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            bindings.tool_visibility_owner().visibility_state().unwrap(),
+            meerkat_core::SessionToolVisibilityState::default(),
+            "factory failure must not install default visibility through the machine owner"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn factory_resumed_initial_visibility_merge_preserves_canonical_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = AgentFactory::new(temp.path().join("sessions")).builtins(false);
+        let mut session = Session::new();
+        let original_state = SessionToolVisibilityState {
+            inherited_base_filter: meerkat_core::tool_scope::ToolFilter::Deny(
+                ["old_parent".to_string()].into_iter().collect(),
+            ),
+            active_filter: meerkat_core::tool_scope::ToolFilter::Deny(
+                ["active_secret".to_string()].into_iter().collect(),
+            ),
+            staged_filter: meerkat_core::tool_scope::ToolFilter::Allow(
+                ["staged_visible".to_string()].into_iter().collect(),
+            ),
+            active_revision: 11,
+            staged_revision: 13,
+            requested_witnesses: [(
+                "deferred_existing".to_string(),
+                meerkat_core::ToolVisibilityWitness {
+                    stable_owner_key: Some("owner:deferred_existing".to_string()),
+                    last_seen_provenance: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+            filter_witnesses: [
+                (
+                    "active_secret".to_string(),
+                    meerkat_core::ToolVisibilityWitness {
+                        stable_owner_key: Some("owner:active_secret".to_string()),
+                        last_seen_provenance: None,
+                    },
+                ),
+                (
+                    "staged_visible".to_string(),
+                    meerkat_core::ToolVisibilityWitness {
+                        stable_owner_key: Some("owner:staged_visible".to_string()),
+                        last_seen_provenance: None,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        };
+        session
+            .set_tool_visibility_state(original_state.clone())
+            .expect("visibility state");
+        let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+        let bindings = runtime
+            .prepare_bindings(session.id().clone())
+            .await
+            .expect("session runtime bindings");
+        let inherited_filter = meerkat_core::tool_scope::ToolFilter::Deny(
+            ["parent_shell".to_string()].into_iter().collect(),
+        );
+        let inherited_filter_witnesses = [(
+            "parent_shell".to_string(),
+            meerkat_core::ToolVisibilityWitness {
+                stable_owner_key: Some("test-owner:parent_shell".to_string()),
+                last_seen_provenance: None,
+            },
+        )]
+        .into_iter()
+        .collect::<BTreeMap<_, _>>();
+        let mut build = AgentBuildConfig::new("claude-sonnet-4-5");
+        build.provider = Some(Provider::Anthropic);
+        build.llm_client_override = Some(Arc::new(meerkat_client::TestClient::default()));
+        build.resume_session = Some(session);
+        build.runtime_build_mode = meerkat_core::RuntimeBuildMode::SessionOwned(bindings.clone());
+        build.override_builtins = ToolCategoryOverride::Disable;
+        build.initial_metadata_entries.insert(
+            meerkat_core::SESSION_TOOL_VISIBILITY_STATE_KEY.to_string(),
+            serde_json::to_value(SessionToolVisibilityState {
+                inherited_base_filter: inherited_filter.clone(),
+                filter_witnesses: inherited_filter_witnesses.clone(),
+                ..Default::default()
+            })
+            .expect("initial visibility value"),
+        );
+
+        let agent = factory
+            .build_agent(build, &Config::default())
+            .await
+            .unwrap();
+
+        let visibility_state = agent
+            .session()
+            .try_tool_visibility_state()
+            .expect("parse visibility")
+            .expect("visibility state");
+        assert_eq!(visibility_state.inherited_base_filter, inherited_filter);
+        assert_eq!(visibility_state.active_filter, original_state.active_filter);
+        assert_eq!(visibility_state.staged_filter, original_state.staged_filter);
+        assert_eq!(
+            visibility_state.active_revision,
+            original_state.active_revision
+        );
+        assert_eq!(
+            visibility_state.staged_revision,
+            original_state.staged_revision
+        );
+        assert_eq!(
+            visibility_state.requested_witnesses,
+            original_state.requested_witnesses
+        );
+        let mut expected_filter_witnesses = original_state.filter_witnesses.clone();
+        expected_filter_witnesses.extend(inherited_filter_witnesses);
+        assert_eq!(visibility_state.filter_witnesses, expected_filter_witnesses);
+        let owner_state = bindings.tool_visibility_owner().visibility_state().unwrap();
+        assert_eq!(owner_state.active_filter, original_state.active_filter);
+        assert_eq!(owner_state.staged_filter, original_state.staged_filter);
+        assert_eq!(owner_state.active_revision, original_state.active_revision);
+        assert_eq!(owner_state.staged_revision, original_state.staged_revision);
+        assert_eq!(
+            owner_state.requested_witnesses,
+            original_state.requested_witnesses
+        );
+        assert_eq!(owner_state.filter_witnesses, expected_filter_witnesses);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn factory_resumed_initial_visibility_rejects_malformed_canonical_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = AgentFactory::new(temp.path().join("sessions")).builtins(false);
+        let mut session = Session::new();
+        session.set_metadata(
+            meerkat_core::SESSION_TOOL_VISIBILITY_STATE_KEY,
+            serde_json::json!("not-a-visibility-state"),
+        );
+        let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+        let bindings = runtime
+            .prepare_bindings(session.id().clone())
+            .await
+            .expect("session runtime bindings");
+        let mut build = AgentBuildConfig::new("claude-sonnet-4-5");
+        build.provider = Some(Provider::Anthropic);
+        build.llm_client_override = Some(Arc::new(meerkat_client::TestClient::default()));
+        build.resume_session = Some(session);
+        build.runtime_build_mode = meerkat_core::RuntimeBuildMode::SessionOwned(bindings.clone());
+        build.override_builtins = ToolCategoryOverride::Disable;
+        build.initial_metadata_entries.insert(
+            meerkat_core::SESSION_TOOL_VISIBILITY_STATE_KEY.to_string(),
+            serde_json::to_value(SessionToolVisibilityState {
+                inherited_base_filter: meerkat_core::tool_scope::ToolFilter::Deny(
+                    ["parent_shell".to_string()].into_iter().collect(),
+                ),
+                filter_witnesses: [(
+                    "parent_shell".to_string(),
+                    meerkat_core::ToolVisibilityWitness {
+                        stable_owner_key: Some("test-owner:parent_shell".to_string()),
+                        last_seen_provenance: None,
+                    },
+                )]
+                .into_iter()
+                .collect(),
+                ..Default::default()
+            })
+            .expect("initial visibility value"),
+        );
+
+        let err = match factory.build_agent(build, &Config::default()).await {
+            Ok(_) => panic!("malformed resumed canonical visibility must fail closed"),
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("invalid existing canonical tool visibility state"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            bindings.tool_visibility_owner().visibility_state().unwrap(),
+            SessionToolVisibilityState::default(),
+            "factory failure must not overwrite malformed state and install default visibility"
+        );
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn factory_resumed_initial_visibility_rejects_non_inherited_authority_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = AgentFactory::new(temp.path().join("sessions")).builtins(false);
+        let session = Session::new();
+        let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+        let bindings = runtime
+            .prepare_bindings(session.id().clone())
+            .await
+            .expect("session runtime bindings");
+        let mut build = AgentBuildConfig::new("claude-sonnet-4-5");
+        build.provider = Some(Provider::Anthropic);
+        build.llm_client_override = Some(Arc::new(meerkat_client::TestClient::default()));
+        build.resume_session = Some(session);
+        build.runtime_build_mode = meerkat_core::RuntimeBuildMode::SessionOwned(bindings.clone());
+        build.override_builtins = ToolCategoryOverride::Disable;
+        build.initial_metadata_entries.insert(
+            meerkat_core::SESSION_TOOL_VISIBILITY_STATE_KEY.to_string(),
+            serde_json::to_value(SessionToolVisibilityState {
+                active_filter: meerkat_core::tool_scope::ToolFilter::Deny(
+                    ["active_secret".to_string()].into_iter().collect(),
+                ),
+                ..Default::default()
+            })
+            .expect("initial visibility value"),
+        );
+
+        let err = match factory.build_agent(build, &Config::default()).await {
+            Ok(_) => {
+                panic!("resumed initial metadata must not install active visibility authority")
+            }
+            Err(err) => err,
+        };
+
+        assert!(
+            err.to_string()
+                .contains("may only carry inherited_base_filter"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(
+            bindings.tool_visibility_owner().visibility_state().unwrap(),
+            SessionToolVisibilityState::default()
+        );
     }
 
     #[cfg(all(feature = "openai", not(target_arch = "wasm32")))]
