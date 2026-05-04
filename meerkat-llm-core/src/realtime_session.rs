@@ -8,7 +8,7 @@ use meerkat_contracts::{
     RealtimeAudioChunk, RealtimeCapabilities, RealtimeEvent, RealtimeInputChunk,
     RealtimeTurningMode, RealtimeVideoChunk,
 };
-use meerkat_core::{PendingSystemContextAppend, ToolResult};
+use meerkat_core::{PendingSystemContextAppend, RealtimeTranscriptEvent, ToolResult};
 use meerkat_core::{SessionLlmIdentity, StopReason, ToolDef, types::Message, types::Usage};
 use serde_json::Value;
 
@@ -44,13 +44,28 @@ pub enum RealtimeSessionEvent {
     InputTranscriptFinal {
         text: String,
     },
+    InputTranscriptFinalForItem {
+        item_id: String,
+        previous_item_id: Option<String>,
+        content_index: u32,
+        text: String,
+    },
     TurnStarted,
     TurnCommitted,
     TurnCompleted {
+        response_id: String,
         stop_reason: StopReason,
         usage: Usage,
     },
     OutputTextDelta {
+        delta: String,
+    },
+    OutputTextDeltaForItem {
+        response_id: String,
+        delta_id: String,
+        item_id: String,
+        previous_item_id: Option<String>,
+        content_index: u32,
         delta: String,
     },
     OutputAudioChunk {
@@ -59,7 +74,9 @@ pub enum RealtimeSessionEvent {
     OutputVideoChunk {
         chunk: RealtimeVideoChunk,
     },
-    Interrupted,
+    Interrupted {
+        response_id: Option<String>,
+    },
     ToolCallRequested {
         call_id: String,
         tool_name: String,
@@ -69,17 +86,23 @@ pub enum RealtimeSessionEvent {
     /// `audio_played_ms` because the user barged in. `truncated_text` is the
     /// heard prefix, or `None` if the provider has not yet re-projected it.
     AssistantTranscriptTruncated {
+        response_id: Option<String>,
         item_id: String,
         audio_played_ms: u64,
         truncated_text: Option<String>,
+    },
+    /// Identity-bearing transcript event for providers that need to expose an
+    /// ordering/append fact without an otherwise public channel event.
+    RealtimeTranscript {
+        event: RealtimeTranscriptEvent,
     },
 }
 
 impl RealtimeSessionEvent {
     /// Project an internal provider event into the public channel event shape.
     #[must_use]
-    pub fn to_public_event(&self) -> RealtimeEvent {
-        match self {
+    pub fn to_public_event(&self) -> Option<RealtimeEvent> {
+        Some(match self {
             Self::InputTranscriptPartial { text } => {
                 RealtimeEvent::InputTranscriptPartial { text: text.clone() }
             }
@@ -91,10 +114,17 @@ impl RealtimeSessionEvent {
                 // this field before emitting the public event.
                 prosody_hint: None,
             },
+            Self::InputTranscriptFinalForItem { text, .. } => RealtimeEvent::InputTranscriptFinal {
+                text: text.clone(),
+                prosody_hint: None,
+            },
             Self::TurnStarted => RealtimeEvent::TurnStarted,
             Self::TurnCommitted => RealtimeEvent::TurnCommitted,
             Self::TurnCompleted { .. } => RealtimeEvent::TurnCompleted,
             Self::OutputTextDelta { delta } => RealtimeEvent::OutputTextDelta {
+                delta: delta.clone(),
+            },
+            Self::OutputTextDeltaForItem { delta, .. } => RealtimeEvent::OutputTextDelta {
                 delta: delta.clone(),
             },
             Self::OutputAudioChunk { chunk } => RealtimeEvent::OutputAudioChunk {
@@ -103,7 +133,7 @@ impl RealtimeSessionEvent {
             Self::OutputVideoChunk { chunk } => RealtimeEvent::OutputVideoChunk {
                 chunk: chunk.clone(),
             },
-            Self::Interrupted => RealtimeEvent::Interrupted,
+            Self::Interrupted { .. } => RealtimeEvent::Interrupted,
             Self::ToolCallRequested {
                 call_id, tool_name, ..
             } => RealtimeEvent::ToolCallRequested {
@@ -111,6 +141,7 @@ impl RealtimeSessionEvent {
                 tool_name: tool_name.clone(),
             },
             Self::AssistantTranscriptTruncated {
+                response_id: _,
                 item_id,
                 audio_played_ms,
                 truncated_text,
@@ -119,7 +150,8 @@ impl RealtimeSessionEvent {
                 audio_played_ms: *audio_played_ms,
                 truncated_text: truncated_text.clone(),
             },
-        }
+            Self::RealtimeTranscript { .. } => return None,
+        })
     }
 }
 
@@ -297,10 +329,10 @@ mod tests {
 
         assert_eq!(
             public,
-            RealtimeEvent::ToolCallRequested {
+            Some(RealtimeEvent::ToolCallRequested {
                 call_id: "call_1".to_string(),
                 tool_name: "lookup".to_string(),
-            }
+            })
         );
     }
 }
