@@ -211,15 +211,6 @@ make verify-schema-freshness
 make release-preflight
 ```
 
-BuildBuddy is opt-in for local development:
-
-```bash
-MEERKAT_BUILDBUDDY=1 make test
-MEERKAT_BUILDBUDDY=1 make agent-gate
-```
-
-Run `make buildbuddy-doctor` if remote build setup looks suspicious.
-
 ## Capabilities
 
 **Providers and streaming.** Anthropic, OpenAI, Gemini, and self-hosted models share one streaming interface. The model catalog carries defaults, capability gates, parameter schemas, provider-native web-search behavior, image defaults, and provider/model mismatch checks.
@@ -538,8 +529,6 @@ make lint                           # Clippy and static checks
 make test                           # Fast tests (unit + integration-fast)
 make agent-gate                     # Scoped local gate for changed files
 ```
-
-Use `MEERKAT_BUILDBUDDY=1` with broad Make lanes when you have BuildBuddy access. Use `make buildbuddy-doctor` to verify API key, generated Bazel files, selector behavior, and lane isolation.
 
 Run `make verify-version-parity` and `make verify-schema-freshness` when touching generated contracts, SDK wrappers, package metadata, or release-facing schemas.
 
