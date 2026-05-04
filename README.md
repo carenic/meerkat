@@ -33,6 +33,10 @@ It is designed to be **stable** (typed session events, explicit terminal results
 
 The library still comes first; surfaces come second. Pick the entry point that fits your architecture: embed the crates directly, run a CLI task, host REST or JSON-RPC, expose MCP tools, script from Python or TypeScript, or ship a browser-delivered agent with `@rkat/web`.
 
+<p align="center">
+  <img src=".github/meerkat-architecture.png" alt="Meerkat architecture" width="100%">
+</p>
+
 ### How it compares
 
 | | Meerkat | Claude Code / Codex CLI / Gemini CLI |
