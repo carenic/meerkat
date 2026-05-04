@@ -184,15 +184,15 @@ pub struct SessionLlmReconfigureRequest {
     pub clear_provider_params: bool,
     /// Optional realm-scoped connection override. When present, the
     /// hot-swap uses this binding to resolve credentials; when absent,
-    /// the session's existing `SessionLlmIdentity.connection_ref` is preserved
-    /// unless `clear_connection_ref` is true.
+    /// the session's existing `SessionLlmIdentity.auth_binding` is preserved
+    /// unless `clear_auth_binding` is true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub connection_ref: Option<meerkat_core::ConnectionRef>,
-    /// Explicitly clear the session's durable connection reference. This is
-    /// distinct from omitting `connection_ref`, which inherits the current
+    pub auth_binding: Option<meerkat_core::AuthBindingRef>,
+    /// Explicitly clear the session's durable auth binding reference. This is
+    /// distinct from omitting `auth_binding`, which inherits the current
     /// binding for compatibility.
     #[serde(default, skip_serializing_if = "is_false")]
-    pub clear_connection_ref: bool,
+    pub clear_auth_binding: bool,
 }
 
 fn is_false(value: &bool) -> bool {

@@ -37,7 +37,7 @@ pub struct CoreCreateParams {
     /// is built through the realm connection set; when omitted, the
     /// legacy flat `provider + api_key` path is used.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub connection_ref: Option<super::connection::WireConnectionRef>,
+    pub auth_binding: Option<super::connection::WireAuthBindingRef>,
 }
 
 impl CoreCreateParams {
@@ -229,7 +229,7 @@ mod tests {
             ]),
             app_context: Some(serde_json::json!({"org_id": "acme", "tier": "premium"})),
             shell_env: None,
-            connection_ref: None,
+            auth_binding: None,
         };
         let json = serde_json::to_string(&params)?;
         let parsed: CoreCreateParams = serde_json::from_str(&json)?;
@@ -273,7 +273,7 @@ mod tests {
             additional_instructions: None,
             app_context: None,
             shell_env: None,
-            connection_ref: None,
+            auth_binding: None,
         };
 
         assert!(params.validate_public_surface_metadata().is_err());
@@ -303,20 +303,20 @@ mod tests {
             additional_instructions: None,
             app_context: None,
             shell_env: None,
-            connection_ref: None,
+            auth_binding: None,
         };
         let json = serde_json::to_string(&params)?;
         assert!(!json.contains("\"labels\""));
         assert!(!json.contains("\"additional_instructions\""));
         assert!(!json.contains("\"app_context\""));
         assert!(!json.contains("\"shell_env\""));
-        assert!(!json.contains("\"connection_ref\""));
+        assert!(!json.contains("\"auth_binding\""));
         Ok(())
     }
 
     #[test]
-    fn test_core_create_params_with_connection_ref() -> Result<(), Box<dyn std::error::Error>> {
-        use crate::wire::WireConnectionRef;
+    fn test_core_create_params_with_auth_binding() -> Result<(), Box<dyn std::error::Error>> {
+        use crate::wire::WireAuthBindingRef;
         let params = CoreCreateParams {
             prompt: "hello".to_string(),
             model: None,
@@ -327,18 +327,18 @@ mod tests {
             additional_instructions: None,
             app_context: None,
             shell_env: None,
-            connection_ref: Some(WireConnectionRef {
+            auth_binding: Some(WireAuthBindingRef {
                 realm: meerkat_core::connection::RealmId::parse("dev")?,
                 binding: meerkat_core::connection::BindingId::parse("default_openai")?,
                 profile: None,
             }),
         };
         let json = serde_json::to_string(&params)?;
-        assert!(json.contains("\"connection_ref\""));
+        assert!(json.contains("\"auth_binding\""));
         assert!(json.contains("\"realm\":\"dev\""));
         let parsed: CoreCreateParams = serde_json::from_str(&json)?;
         assert_eq!(
-            parsed.connection_ref.map(|r| r.binding.as_str().to_owned()),
+            parsed.auth_binding.map(|r| r.binding.as_str().to_owned()),
             Some("default_openai".to_string())
         );
         Ok(())
