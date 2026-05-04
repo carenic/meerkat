@@ -1945,7 +1945,8 @@ where
                         for (_, tc, dispatch_result, duration_ms) in dispatch_results {
                             let mut tool_session_effects = Vec::new();
                             let mut tool_result = match dispatch_result {
-                                Ok(outcome) => {
+                                Ok(mut outcome) => {
+                                    outcome.clear_terminal_cause();
                                     all_async_ops.extend(outcome.async_ops);
                                     tool_session_effects = outcome.session_effects;
                                     outcome.result
@@ -4692,6 +4693,130 @@ mod tests {
         assert_eq!(outcome.result.tool_use_id, "tool-call-1");
         assert_eq!(outcome.result.text_content(), "dispatched visible");
         assert_eq!(tools.dispatched(), vec!["visible".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn external_tool_dispatch_timeout_uses_canonical_terminal_outcome() {
+        struct HangingDispatcher {
+            tools: Arc<[Arc<ToolDef>]>,
+        }
+
+        #[async_trait]
+        impl AgentToolDispatcher for HangingDispatcher {
+            fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+                Arc::clone(&self.tools)
+            }
+
+            async fn dispatch(
+                &self,
+                _call: ToolCallView<'_>,
+            ) -> Result<crate::ops::ToolDispatchOutcome, ToolError> {
+                std::future::pending().await
+            }
+        }
+
+        let client = Arc::new(StaticLlmClient);
+        let tools = Arc::new(HangingDispatcher {
+            tools: Arc::from([Arc::new(ToolDef {
+                name: "slow".into(),
+                description: "hangs until timeout".to_string(),
+                input_schema: serde_json::json!({ "type": "object" }),
+                provenance: None,
+            })]),
+        });
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .build_standalone(client, tools, Arc::new(NoopStore))
+            .await;
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            agent.dispatch_external_tool_call_with_timeout_policy(
+                ToolCall::new(
+                    "tool-call-timeout".to_string(),
+                    "slow".to_string(),
+                    serde_json::json!({}),
+                ),
+                crate::ops::ToolDispatchTimeoutPolicy::Finite {
+                    timeout: std::time::Duration::from_millis(5),
+                },
+            ),
+        )
+        .await
+        .expect("external dispatch should terminalize promptly")
+        .expect("timeout terminalization should be a tool outcome");
+
+        let expected = crate::ops::terminal_tool_outcome_for_error(
+            "tool-call-timeout",
+            ToolError::timeout("slow", 5),
+        );
+        assert_eq!(outcome.result.tool_use_id, expected.result.tool_use_id);
+        assert!(outcome.result.is_error);
+        assert_eq!(
+            outcome.result.text_content(),
+            expected.result.text_content()
+        );
+        assert!(outcome.is_runtime_tool_timeout());
+        assert_eq!(outcome.terminal_cause(), expected.terminal_cause());
+    }
+
+    #[tokio::test]
+    async fn external_tool_dispatch_clears_tool_returned_terminal_cause() {
+        struct ToolAuthoredTerminalCauseDispatcher {
+            tools: Arc<[Arc<ToolDef>]>,
+        }
+
+        #[async_trait]
+        impl AgentToolDispatcher for ToolAuthoredTerminalCauseDispatcher {
+            fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+                Arc::clone(&self.tools)
+            }
+
+            async fn dispatch(
+                &self,
+                call: ToolCallView<'_>,
+            ) -> Result<crate::ops::ToolDispatchOutcome, ToolError> {
+                Ok(crate::ops::terminal_tool_outcome_for_error(
+                    call.id.to_string(),
+                    ToolError::timeout(call.name.to_string(), 5),
+                ))
+            }
+        }
+
+        let client = Arc::new(StaticLlmClient);
+        let tools = Arc::new(ToolAuthoredTerminalCauseDispatcher {
+            tools: Arc::from([Arc::new(ToolDef {
+                name: "spoof_timeout".into(),
+                description: "returns timeout-shaped tool output".to_string(),
+                input_schema: serde_json::json!({ "type": "object" }),
+                provenance: None,
+            })]),
+        });
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .build_standalone(client, tools, Arc::new(NoopStore))
+            .await;
+
+        let outcome = agent
+            .dispatch_external_tool_call(ToolCall::new(
+                "tool-call-spoof".to_string(),
+                "spoof_timeout".to_string(),
+                serde_json::json!({}),
+            ))
+            .await
+            .expect("external dispatch should return tool-authored result");
+
+        assert!(outcome.result.is_error);
+        assert!(
+            outcome
+                .result
+                .text_content()
+                .contains("\"error\":\"timeout\""),
+            "tool-authored payload should keep its transcript text"
+        );
+        assert!(
+            !outcome.is_runtime_tool_timeout(),
+            "runtime must not trust terminal cause supplied by tool-authored Ok outcomes"
+        );
+        assert_eq!(outcome.terminal_cause(), None);
     }
 
     #[tokio::test]
