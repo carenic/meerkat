@@ -10874,6 +10874,28 @@ mod tests {
     }
 
     #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
+    #[test]
+    fn test_cli_interactive_login_synthesized_oauth_config_is_toml_serializable() {
+        let mut config = Config::default();
+
+        assert!(ensure_cli_interactive_oauth_config(
+            LoginProvider::OpenAi,
+            &mut config
+        ));
+        let rendered = toml::to_string_pretty(&config)
+            .expect("first-time interactive OAuth config must serialize as TOML");
+        let reparsed: Config =
+            toml::from_str(&rendered).expect("serialized OAuth config must parse back");
+        let target =
+            resolve_configured_cli_interactive_oauth_target(LoginProvider::OpenAi, &reparsed)
+                .expect("reparsed OAuth login target must remain valid");
+
+        assert_eq!(target.connection_ref.realm.as_str(), "dev");
+        assert_eq!(target.connection_ref.binding.as_str(), "openai_oauth");
+        assert_eq!(target.auth_profile.auth_method, "managed_chatgpt_oauth");
+    }
+
+    #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
     fn openai_oauth_login_config(
         auth_method: &str,
         source: meerkat_core::CredentialSourceSpec,

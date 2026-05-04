@@ -863,7 +863,7 @@ pub struct BackendProfileConfig {
     pub backend_kind: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "serde_json::Value::is_null")]
     pub options: serde_json::Value,
 }
 

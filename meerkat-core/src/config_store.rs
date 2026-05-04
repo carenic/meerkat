@@ -235,3 +235,67 @@ pub(crate) fn merge_patch(base: &mut Value, patch: Value) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn file_config_store_set_skips_null_backend_options() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join(".rkat").join("config.toml");
+        let store = FileConfigStore::new(path.clone());
+        let mut config = Config::default();
+        let mut section = crate::RealmConfigSection::default();
+        section.backend.insert(
+            "openai_chatgpt".to_string(),
+            crate::BackendProfileConfig {
+                provider: "openai".to_string(),
+                backend_kind: "chatgpt_backend".to_string(),
+                base_url: None,
+                options: serde_json::Value::Null,
+            },
+        );
+        section.auth.insert(
+            "openai_oauth".to_string(),
+            crate::AuthProfileConfig {
+                provider: "openai".to_string(),
+                auth_method: "managed_chatgpt_oauth".to_string(),
+                source: crate::CredentialSourceSpec::ManagedStore,
+                constraints: Default::default(),
+                metadata_defaults: Default::default(),
+            },
+        );
+        section.binding.insert(
+            "openai_oauth".to_string(),
+            crate::ProviderBindingConfig {
+                backend_profile: "openai_chatgpt".to_string(),
+                auth_profile: "openai_oauth".to_string(),
+                default_model: Some("gpt-5.4".to_string()),
+                policy: Default::default(),
+            },
+        );
+        config.realm.insert("dev".to_string(), section);
+
+        store
+            .set(config)
+            .await
+            .expect("file config writes must not serialize JSON null as TOML unit");
+        let rendered = tokio::fs::read_to_string(&path)
+            .await
+            .expect("config file should be written");
+        assert!(
+            !rendered.contains("options"),
+            "null backend options should be omitted from TOML, not rendered"
+        );
+        let loaded = store.get().await.expect("written config should parse back");
+        assert!(
+            loaded
+                .realm
+                .get("dev")
+                .and_then(|section| section.backend.get("openai_chatgpt"))
+                .is_some(),
+            "backend profile should survive round trip"
+        );
+    }
+}
