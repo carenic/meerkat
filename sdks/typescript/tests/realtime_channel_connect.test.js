@@ -80,7 +80,7 @@ describe("RealtimeChannel websocket client", () => {
     });
 
     const channel = RealtimeChannel.session(client, "session-1");
-    const connection = await channel.connect();
+    const connection = await channel.connect({ waitForAttachment: false });
     await connection.sendInput({ kind: "text_chunk", text: "hello" });
     const frame = await connection.nextFrame();
     assert.equal(frame.type, "channel.event");
