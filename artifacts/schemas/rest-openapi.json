@@ -2176,6 +2176,143 @@
         ],
         "type": "string"
       },
+      "HelpExecutionMode": {
+        "description": "Execution posture requested by a help caller.\n\nToday all help surfaces are advisory. `plan_execution` is a forward-compatible\nhook for callers that want an executable plan without permitting Meerkat to\nperform the execution yet.",
+        "enum": [
+          "explain_only",
+          "plan_execution"
+        ],
+        "title": "HelpExecutionMode",
+        "type": "string"
+      },
+      "HelpRequest": {
+        "description": "Request body for dedicated help surfaces.",
+        "properties": {
+          "execution_mode": {
+            "$ref": "#/components/schemas/HelpExecutionMode",
+            "default": "explain_only",
+            "description": "Advisory execution posture. Defaults to explanation only."
+          },
+          "max_tokens": {
+            "description": "Optional max-token override for the help session.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "model": {
+            "description": "Optional model override for the help session.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "prompt": {
+            "description": "Optional inert prompt payload for future execution-oriented help.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider": {
+            "description": "Optional provider override for the help session (`anthropic`, `openai`,\n`gemini`, or `self_hosted`).",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "question": {
+            "description": "The user question about Meerkat usage.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "question"
+        ],
+        "title": "HelpRequest",
+        "type": "object"
+      },
+      "HelpResponse": {
+        "description": "Canonical run result for wire protocol.",
+        "properties": {
+          "extraction_error": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExtractionError"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "schema_warnings": {
+            "items": {
+              "$ref": "#/components/schemas/SchemaWarning"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "session_id": {
+            "$ref": "#/components/schemas/SessionId"
+          },
+          "session_ref": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "skill_diagnostics": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SkillRuntimeDiagnostics"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "structured_output": true,
+          "terminal_cause_kind": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TurnTerminalCauseKind"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "text": {
+            "type": "string"
+          },
+          "tool_calls": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "turns": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "usage": {
+            "$ref": "#/components/schemas/WireUsage"
+          }
+        },
+        "required": [
+          "session_id",
+          "text",
+          "turns",
+          "tool_calls",
+          "usage"
+        ],
+        "title": "WireRunResult",
+        "type": "object"
+      },
       "HelperOptionsSpec": {
         "additionalProperties": false,
         "properties": {
@@ -7846,6 +7983,44 @@
           }
         },
         "summary": "Health check"
+      }
+    },
+    "/help": {
+      "post": {
+        "operationId": "post_help",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/HelpRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HelpResponse"
+                }
+              }
+            },
+            "description": "Successful response"
+          },
+          "default": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WireError"
+                }
+              }
+            },
+            "description": "Error response"
+          }
+        },
+        "summary": "Ask Meerkat usage help"
       }
     },
     "/mob/{id}/events": {

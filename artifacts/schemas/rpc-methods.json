@@ -184,6 +184,12 @@
       "result_type": "WireRealmConnectionSet"
     },
     {
+      "description": "Ask Meerkat usage help with the embedded platform skill",
+      "name": "help/ask",
+      "params_type": "HelpRequest",
+      "result_type": "HelpResponse"
+    },
+    {
       "description": "Fetch raw blob payload metadata and bytes by blob id",
       "name": "blob/get",
       "params_type": "BlobGetParams",

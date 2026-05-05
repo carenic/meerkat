@@ -8089,6 +8089,409 @@
     "title": "ExecutionPlacementIdentity",
     "type": "object"
   },
+  "HelpExecutionMode": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Execution posture requested by a help caller.\n\nToday all help surfaces are advisory. `plan_execution` is a forward-compatible\nhook for callers that want an executable plan without permitting Meerkat to\nperform the execution yet.",
+    "enum": [
+      "explain_only",
+      "plan_execution"
+    ],
+    "title": "HelpExecutionMode",
+    "type": "string"
+  },
+  "HelpRequest": {
+    "$defs": {
+      "HelpExecutionMode": {
+        "description": "Execution posture requested by a help caller.\n\nToday all help surfaces are advisory. `plan_execution` is a forward-compatible\nhook for callers that want an executable plan without permitting Meerkat to\nperform the execution yet.",
+        "enum": [
+          "explain_only",
+          "plan_execution"
+        ],
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Request body for dedicated help surfaces.",
+    "properties": {
+      "execution_mode": {
+        "$ref": "#/$defs/HelpExecutionMode",
+        "default": "explain_only",
+        "description": "Advisory execution posture. Defaults to explanation only."
+      },
+      "max_tokens": {
+        "description": "Optional max-token override for the help session.",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "model": {
+        "description": "Optional model override for the help session.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "prompt": {
+        "description": "Optional inert prompt payload for future execution-oriented help.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "provider": {
+        "description": "Optional provider override for the help session (`anthropic`, `openai`,\n`gemini`, or `self_hosted`).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "question": {
+        "description": "The user question about Meerkat usage.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "question"
+    ],
+    "title": "HelpRequest",
+    "type": "object"
+  },
+  "HelpResponse": {
+    "$defs": {
+      "ExtractionError": {
+        "description": "Structured-output extraction failure details for a run whose main agentic\nturn completed successfully.",
+        "properties": {
+          "attempts": {
+            "description": "Number of extraction attempts made before the failure was reported.\n\nFor validation exhaustion this is the number of failed validation\nattempts. Other extraction failures may report the attempts completed\nbefore the failing extraction step.",
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "last_output": {
+            "description": "The committed main-turn assistant output that extraction attempted to\ntransform.",
+            "type": "string"
+          },
+          "reason": {
+            "description": "Human-readable extraction failure reason.",
+            "type": "string"
+          }
+        },
+        "required": [
+          "last_output",
+          "attempts",
+          "reason"
+        ],
+        "type": "object"
+      },
+      "Provider": {
+        "description": "Supported LLM providers.",
+        "enum": [
+          "anthropic",
+          "open_a_i",
+          "gemini",
+          "self_hosted",
+          "other"
+        ],
+        "type": "string"
+      },
+      "SchemaWarning": {
+        "description": "Warnings emitted during schema lowering.",
+        "properties": {
+          "message": {
+            "type": "string"
+          },
+          "path": {
+            "type": "string"
+          },
+          "provider": {
+            "$ref": "#/$defs/Provider"
+          }
+        },
+        "required": [
+          "provider",
+          "path",
+          "message"
+        ],
+        "type": "object"
+      },
+      "SessionId": {
+        "description": "Unique identifier for a session (UUID v7 for time-ordering)",
+        "type": "string"
+      },
+      "SkillKey": {
+        "description": "Canonical runtime identity for a skill.\n\nThis is the single identity carried across every surface — the wire parses\ndirectly into this struct, tools receive this struct, the registry stores\nthis struct. There is no slash-delimited string path form.",
+        "properties": {
+          "skill_name": {
+            "$ref": "#/$defs/SkillName"
+          },
+          "source_uuid": {
+            "$ref": "#/$defs/SourceUuid"
+          }
+        },
+        "required": [
+          "source_uuid",
+          "skill_name"
+        ],
+        "type": "object"
+      },
+      "SkillName": {
+        "description": "Canonical skill slug (lowercase, dash-separated).",
+        "type": "string"
+      },
+      "SkillQuarantineDiagnostic": {
+        "description": "Per-skill quarantine diagnostic.",
+        "properties": {
+          "error_class": {
+            "type": "string"
+          },
+          "error_code": {
+            "type": "string"
+          },
+          "first_seen_unix_secs": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "key": {
+            "$ref": "#/$defs/SkillKey"
+          },
+          "last_seen_unix_secs": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "location": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "key",
+          "location",
+          "error_code",
+          "error_class",
+          "message",
+          "first_seen_unix_secs",
+          "last_seen_unix_secs"
+        ],
+        "type": "object"
+      },
+      "SkillRuntimeDiagnostics": {
+        "description": "Runtime-visible diagnostics for skill health and quarantined entries.",
+        "properties": {
+          "quarantined": {
+            "items": {
+              "$ref": "#/$defs/SkillQuarantineDiagnostic"
+            },
+            "type": "array"
+          },
+          "source_health": {
+            "$ref": "#/$defs/SourceHealthSnapshot"
+          }
+        },
+        "required": [
+          "source_health",
+          "quarantined"
+        ],
+        "type": "object"
+      },
+      "SourceHealthSnapshot": {
+        "description": "Source health snapshot reported by sources.",
+        "properties": {
+          "failure_streak": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "handshake_failed": {
+            "type": "boolean"
+          },
+          "invalid_count": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "invalid_ratio": {
+            "format": "float",
+            "type": "number"
+          },
+          "state": {
+            "$ref": "#/$defs/SourceHealthState"
+          },
+          "total_count": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "state",
+          "invalid_ratio",
+          "invalid_count",
+          "total_count",
+          "failure_streak",
+          "handshake_failed"
+        ],
+        "type": "object"
+      },
+      "SourceHealthState": {
+        "description": "Source health state.",
+        "enum": [
+          "healthy",
+          "degraded",
+          "unhealthy"
+        ],
+        "type": "string"
+      },
+      "SourceUuid": {
+        "description": "Canonical source identifier.",
+        "type": "string"
+      },
+      "TurnTerminalCauseKind": {
+        "description": "Closed machine-owned classifier for why a turn reached a terminal failure.",
+        "enum": [
+          "unknown",
+          "hook_denied",
+          "hook_failure",
+          "llm_failure",
+          "tool_failure",
+          "structured_output_validation_failed",
+          "budget_exhausted",
+          "time_budget_exceeded",
+          "retry_exhausted",
+          "turn_limit_reached",
+          "runtime_apply_failure",
+          "fatal_failure"
+        ],
+        "type": "string"
+      },
+      "WireUsage": {
+        "description": "Canonical token usage for wire protocol.",
+        "properties": {
+          "cache_creation_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cache_read_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "input_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "total_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "input_tokens",
+          "output_tokens",
+          "total_tokens"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Canonical run result for wire protocol.",
+    "properties": {
+      "extraction_error": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/ExtractionError"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "schema_warnings": {
+        "items": {
+          "$ref": "#/$defs/SchemaWarning"
+        },
+        "type": [
+          "array",
+          "null"
+        ]
+      },
+      "session_id": {
+        "$ref": "#/$defs/SessionId"
+      },
+      "session_ref": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "skill_diagnostics": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/SkillRuntimeDiagnostics"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "structured_output": true,
+      "terminal_cause_kind": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/TurnTerminalCauseKind"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "text": {
+        "type": "string"
+      },
+      "tool_calls": {
+        "format": "uint32",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "turns": {
+        "format": "uint32",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "usage": {
+        "$ref": "#/$defs/WireUsage"
+      }
+    },
+    "required": [
+      "session_id",
+      "text",
+      "turns",
+      "tool_calls",
+      "usage"
+    ],
+    "title": "WireRunResult",
+    "type": "object"
+  },
   "McpLiveOpResponse": {
     "$defs": {
       "McpLiveOpStatus": {

@@ -1769,6 +1769,66 @@
     "title": "DeviceStartParams",
     "type": "object"
   },
+  "HelpRequest": {
+    "$defs": {
+      "HelpExecutionMode": {
+        "description": "Execution posture requested by a help caller.\n\nToday all help surfaces are advisory. `plan_execution` is a forward-compatible\nhook for callers that want an executable plan without permitting Meerkat to\nperform the execution yet.",
+        "enum": [
+          "explain_only",
+          "plan_execution"
+        ],
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Request body for dedicated help surfaces.",
+    "properties": {
+      "execution_mode": {
+        "$ref": "#/$defs/HelpExecutionMode",
+        "default": "explain_only",
+        "description": "Advisory execution posture. Defaults to explanation only."
+      },
+      "max_tokens": {
+        "description": "Optional max-token override for the help session.",
+        "format": "uint32",
+        "minimum": 0,
+        "type": [
+          "integer",
+          "null"
+        ]
+      },
+      "model": {
+        "description": "Optional model override for the help session.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "prompt": {
+        "description": "Optional inert prompt payload for future execution-oriented help.",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "provider": {
+        "description": "Optional provider override for the help session (`anthropic`, `openai`,\n`gemini`, or `self_hosted`).",
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "question": {
+        "description": "The user question about Meerkat usage.",
+        "type": "string"
+      }
+    },
+    "required": [
+      "question"
+    ],
+    "title": "HelpRequest",
+    "type": "object"
+  },
   "ListSchedulesParams": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "properties": {
