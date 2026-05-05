@@ -1667,6 +1667,7 @@ impl MobBuilder {
         // call before any DSL transition returns the right answer.
         let (phase_watch_tx_actor, phase_watch_rx) =
             tokio::sync::watch::channel(wiring_public_phase);
+        let pending_supervisor_rotation_fallback = Arc::new(tokio::sync::RwLock::new(None));
         let handle = MobHandle {
             command_tx: command_tx.clone(),
             roster: roster.clone(),
@@ -1692,6 +1693,7 @@ impl MobBuilder {
                 definition.id.clone(),
                 runtime_metadata.clone(),
                 roster.clone(),
+                pending_supervisor_rotation_fallback.clone(),
             ),
         );
         let max_orphaned_turns = definition
@@ -1780,6 +1782,7 @@ impl MobBuilder {
             restore_diagnostics,
             runtime_metadata,
             supervisor_bridge,
+            pending_supervisor_rotation_fallback,
             task_board_service,
             spawn_policy,
             dsl_authority: *dsl_authority,

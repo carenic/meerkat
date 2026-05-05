@@ -136,6 +136,24 @@ pub struct SupervisorAuthorityRecord {
     pub epoch: u64,
     /// Protocol version carried on supervisor commands.
     pub protocol_version: BridgeProtocolVersion,
+    /// Explicit pending rotation retained after a partial remote rotation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_rotation: Option<SupervisorPendingRotationRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SupervisorPendingRotationRecord {
+    /// Raw secret bytes for reconstructing the attempted supervisor keypair.
+    pub secret_key: [u8; 32],
+    /// Canonical peer id string for the attempted supervisor public key.
+    pub public_peer_id: String,
+    /// Attempted supervisor epoch.
+    pub epoch: u64,
+    /// Protocol version carried on supervisor commands.
+    pub protocol_version: BridgeProtocolVersion,
+    /// Remote peer ids that already accepted this attempted authority.
+    #[serde(default)]
+    pub accepted_peer_ids: Vec<String>,
 }
 
 impl SupervisorAuthorityRecord {
@@ -147,12 +165,106 @@ impl SupervisorAuthorityRecord {
             public_peer_id: keypair.public_key().to_peer_id().as_str(),
             epoch: 0,
             protocol_version,
+            pending_rotation: None,
         }
     }
 
     /// Reconstruct the signing keypair for runtime use.
     pub fn keypair(&self) -> meerkat_comms::Keypair {
         meerkat_comms::Keypair::from_secret(self.secret_key)
+    }
+
+    pub fn without_pending_rotation(&self) -> Self {
+        let mut record = self.clone();
+        record.pending_rotation = None;
+        record
+    }
+
+    pub fn apply_process_local_pending_rotation(
+        &mut self,
+        pending: SupervisorPendingRotationRecord,
+    ) -> bool {
+        if !pending.accepted_peer_ids.is_empty()
+            && pending.epoch <= self.epoch
+            && pending.public_peer_id != self.public_peer_id
+        {
+            return match self.pending_rotation.as_ref() {
+                Some(durable) if durable.same_attempted_authority(&pending) => {
+                    self.pending_rotation = Some(pending);
+                    true
+                }
+                None => {
+                    self.pending_rotation = Some(pending);
+                    true
+                }
+                Some(_) => false,
+            };
+        }
+        if self.epoch.checked_add(1) != Some(pending.epoch) {
+            return false;
+        }
+        if pending.accepted_peer_ids.is_empty() {
+            return match self.pending_rotation.as_ref() {
+                Some(durable) if durable.same_attempted_authority(&pending) => {
+                    self.pending_rotation = None;
+                    true
+                }
+                None => false,
+                Some(_) => false,
+            };
+        }
+        match self.pending_rotation.as_ref() {
+            Some(durable) if durable.same_attempted_authority(&pending) => {
+                self.pending_rotation = Some(pending);
+                true
+            }
+            None => {
+                self.pending_rotation = Some(pending);
+                true
+            }
+            Some(_) => false,
+        }
+    }
+}
+
+impl SupervisorPendingRotationRecord {
+    pub fn from_authority(
+        authority: &SupervisorAuthorityRecord,
+        accepted_peer_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            secret_key: authority.secret_key,
+            public_peer_id: authority.public_peer_id.clone(),
+            epoch: authority.epoch,
+            protocol_version: authority.protocol_version,
+            accepted_peer_ids,
+        }
+    }
+
+    pub fn authority_record(&self) -> SupervisorAuthorityRecord {
+        SupervisorAuthorityRecord {
+            secret_key: self.secret_key,
+            public_peer_id: self.public_peer_id.clone(),
+            epoch: self.epoch,
+            protocol_version: self.protocol_version,
+            pending_rotation: None,
+        }
+    }
+
+    pub fn same_attempted_authority(&self, other: &Self) -> bool {
+        self.secret_key == other.secret_key
+            && self.public_peer_id == other.public_peer_id
+            && self.epoch == other.epoch
+            && self
+                .protocol_version
+                .same_protocol_as(other.protocol_version)
+    }
+
+    pub fn remove_accepted_peer_ids(&mut self, peer_ids: &[String]) -> bool {
+        let original_len = self.accepted_peer_ids.len();
+        self.accepted_peer_ids
+            .retain(|peer_id| !peer_ids.iter().any(|candidate| candidate == peer_id));
+        self.accepted_peer_ids.len() != original_len
     }
 }
 
@@ -254,6 +366,18 @@ pub trait MobRuntimeMetadataStore: Send + Sync {
         mob_id: &MobId,
         record: &SupervisorAuthorityRecord,
     ) -> Result<(), MobStoreError>;
+
+    /// Compare-and-put the mob-owned supervisor authority record.
+    ///
+    /// Returns `true` when the persisted record exactly matched `expected`
+    /// and was replaced by `record`, `false` when another writer changed or
+    /// removed the record first.
+    async fn compare_and_put_supervisor_authority(
+        &self,
+        mob_id: &MobId,
+        expected: &SupervisorAuthorityRecord,
+        record: &SupervisorAuthorityRecord,
+    ) -> Result<bool, MobStoreError>;
 
     /// Insert the mob-owned supervisor authority record if it is missing.
     ///

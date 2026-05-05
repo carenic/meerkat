@@ -14,16 +14,16 @@ use crate::session_runtime::SessionRuntime;
 use meerkat::surface::RequestContext;
 use meerkat_contracts::wire::WireMobProfile;
 use meerkat_contracts::{
-    MobCreateParams, MobCreateResult, MobMemberListEntryWire, MobSpawnManyResult,
-    MobSpawnManyResultEntry, WireMemberState, WireMobBackendKind, WireMobMemberStatus,
-    WireMobRuntimeMode,
+    ErrorCode, MobCreateParams, MobCreateResult, MobMemberListEntryWire, MobRotateSupervisorResult,
+    MobSpawnManyResult, MobSpawnManyResultEntry, SupervisorRotationReportWire, WireMemberState,
+    WireMobBackendKind, WireMobMemberStatus, WireMobRuntimeMode,
 };
 use meerkat_core::service::{AppendSystemContextRequest, TurnToolOverlay};
 use meerkat_core::skills::SkillRef;
 use meerkat_core::types::ContentInput;
 use meerkat_mob::runtime::MobMemberSnapshot;
 use meerkat_mob::{
-    AgentIdentity, FlowId, MemberRespawnReceipt, MemberState, MobBackendKind, MobId,
+    AgentIdentity, FlowId, MemberRespawnReceipt, MemberState, MobBackendKind, MobError, MobId,
     MobMemberStatus, MobRespawnError, MobRuntimeMode, Profile, RunId, SpawnMemberSpec, SpawnResult,
     ToolConfig,
 };
@@ -34,6 +34,61 @@ use std::sync::Arc;
 
 fn invalid_params(id: Option<RpcId>, message: impl Into<String>) -> RpcResponse {
     RpcResponse::error(id, error::INVALID_PARAMS, message.into())
+}
+
+fn mob_rotate_supervisor_error(id: Option<RpcId>, err: &MobError) -> RpcResponse {
+    match err {
+        MobError::SupervisorRotationIncomplete {
+            previous_epoch,
+            attempted_epoch,
+            attempted_public_peer_id,
+            rotated_peer_count,
+            rollback_succeeded,
+            pending_authority_recorded,
+            pending_authority_process_local,
+            rollback_error,
+            ..
+        } => {
+            let code = ErrorCode::SupervisorRotationIncomplete;
+            let message = err.to_string();
+            let details = serde_json::json!({
+                "kind": "supervisor_rotation_incomplete",
+                "previous_epoch": previous_epoch,
+                "attempted_epoch": attempted_epoch,
+                "attempted_public_peer_id": attempted_public_peer_id,
+                "rotated_peer_count": rotated_peer_count,
+                "rollback_succeeded": rollback_succeeded,
+                "pending_authority_recorded": pending_authority_recorded,
+                "pending_authority_process_local": pending_authority_process_local,
+                "rollback_error": rollback_error,
+                "retry_authority": if *pending_authority_recorded {
+                    "pending_rotation"
+                } else if *pending_authority_process_local {
+                    "process_local_pending_rotation"
+                } else {
+                    "pre_rotation"
+                },
+                "retry_scope": if *pending_authority_recorded {
+                    "durable"
+                } else if *pending_authority_process_local {
+                    "same_process"
+                } else {
+                    "pre_rotation"
+                },
+            });
+            RpcResponse::error_with_data(
+                id,
+                code.jsonrpc_code(),
+                message.clone(),
+                serde_json::json!({
+                    "code": code.to_string(),
+                    "message": message,
+                    "details": details,
+                }),
+            )
+        }
+        _ => invalid_params(id, err.to_string()),
+    }
 }
 
 fn destroy_incomplete_response(
@@ -1370,25 +1425,27 @@ pub async fn handle_rotate_supervisor(
     };
     match state.mob_rotate_supervisor(&mob_id).await {
         Ok(report) => {
-            let report_value = match serde_json::to_value(&report) {
+            let result = MobRotateSupervisorResult {
+                mob_id: mob_id.to_string(),
+                ok: true,
+                report: SupervisorRotationReportWire {
+                    previous_epoch: report.previous_epoch,
+                    current_epoch: report.current_epoch,
+                    public_peer_id: report.public_peer_id,
+                },
+            };
+            let result_value = match serde_json::to_value(result) {
                 Ok(v) => v,
                 Err(err) => {
                     return invalid_params(
                         id,
-                        format!("failed to serialize SupervisorRotationReport: {err}"),
+                        format!("failed to serialize MobRotateSupervisorResult: {err}"),
                     );
                 }
             };
-            RpcResponse::success(
-                id,
-                serde_json::json!({
-                    "mob_id": mob_id,
-                    "ok": true,
-                    "report": report_value,
-                }),
-            )
+            RpcResponse::success(id, result_value)
         }
-        Err(err) => invalid_params(id, err.to_string()),
+        Err(err) => mob_rotate_supervisor_error(id, &err),
     }
 }
 
@@ -2381,6 +2438,37 @@ mod tests {
             value["failed_peer_ids"],
             serde_json::json!(["peer-a", "peer-b"])
         );
+        Ok(())
+    }
+
+    #[test]
+    fn rotate_supervisor_incomplete_uses_typed_retryable_error_envelope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let response = mob_rotate_supervisor_error(
+            Some(RpcId::Num(7)),
+            &MobError::SupervisorRotationIncomplete {
+                previous_epoch: 1,
+                attempted_epoch: 2,
+                attempted_public_peer_id: "peer-next".to_string(),
+                rotated_peer_count: 1,
+                rollback_succeeded: false,
+                pending_authority_recorded: true,
+                pending_authority_process_local: false,
+                rollback_error: Some("rollback failed".to_string()),
+                reason: "remote peer rejected rotation".to_string(),
+            },
+        );
+
+        let error = response.error.expect("typed error response");
+        assert_eq!(
+            error.code,
+            ErrorCode::SupervisorRotationIncomplete.jsonrpc_code()
+        );
+        let data = error.data.expect("typed error data");
+        assert_eq!(data["code"], "SUPERVISOR_ROTATION_INCOMPLETE");
+        assert_eq!(data["details"]["kind"], "supervisor_rotation_incomplete");
+        assert_eq!(data["details"]["retry_authority"], "pending_rotation");
+        assert_eq!(data["details"]["retry_scope"], "durable");
         Ok(())
     }
 

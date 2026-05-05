@@ -62,7 +62,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 use tempfile::NamedTempFile;
 use uuid::Uuid;
@@ -180,6 +180,8 @@ async fn install_machine_peer_request_response_authority(
 struct MockCommsBehavior {
     missing_public_key: bool,
     fail_add_trust: bool,
+    fail_private_add_after_insert: bool,
+    reject_private_publish_ack_after_insert: bool,
     fail_remove_trust: bool,
     fail_remove_trust_once: bool,
     fail_send_peer_added: bool,
@@ -188,6 +190,8 @@ struct MockCommsBehavior {
 }
 
 struct MockCommsRuntime {
+    session_id: SessionId,
+    runtime_adapter: Option<Arc<meerkat_runtime::MeerkatMachine>>,
     default_peer_id: PeerId,
     default_public_key: String,
     default_public_key_bytes: [u8; 32],
@@ -200,7 +204,12 @@ struct MockCommsRuntime {
 }
 
 impl MockCommsRuntime {
-    fn new(name: &str, behavior: MockCommsBehavior) -> Self {
+    fn new(
+        name: &str,
+        behavior: MockCommsBehavior,
+        session_id: SessionId,
+        runtime_adapter: Option<Arc<meerkat_runtime::MeerkatMachine>>,
+    ) -> Self {
         let mut key_bytes = [0u8; 32];
         for (index, byte) in name.as_bytes().iter().copied().enumerate() {
             let slot = index % key_bytes.len();
@@ -213,6 +222,8 @@ impl MockCommsRuntime {
         }
         let public_key = meerkat_comms::PubKey::new(key_bytes);
         Self {
+            session_id,
+            runtime_adapter,
             default_peer_id: public_key.to_peer_id(),
             default_public_key: public_key.to_pubkey_string(),
             default_public_key_bytes: key_bytes,
@@ -349,7 +360,33 @@ impl CoreCommsRuntime for MockCommsRuntime {
     }
 
     async fn add_private_trusted_peer(&self, peer: TrustedPeerDescriptor) -> Result<(), SendError> {
-        self.add_trusted_peer(peer).await
+        self.add_trusted_peer(peer).await?;
+        let behavior = *self
+            .behavior
+            .read()
+            .expect("poisoned behavior lock in mock runtime");
+        if behavior.reject_private_publish_ack_after_insert
+            && let Some(adapter) = self.runtime_adapter.as_ref()
+            && let meerkat_runtime::meerkat_machine::SupervisorBinding::Bound { epoch, .. } =
+                adapter.supervisor_binding(&self.session_id).await
+        {
+            adapter
+                .stage_supervisor_authorize(
+                    &self.session_id,
+                    "ack-reject-supervisor".to_string(),
+                    "ed25519:ack-reject-supervisor".to_string(),
+                    "inproc://ack-reject-supervisor".to_string(),
+                    epoch + 1,
+                )
+                .await
+                .expect("mock should be able to advance supervisor binding before ack");
+        }
+        if behavior.fail_private_add_after_insert {
+            return Err(SendError::Unsupported(
+                "mock add_private_trusted_peer failure after insert".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     async fn remove_trusted_peer(&self, peer_id: &str) -> Result<bool, SendError> {
@@ -1045,7 +1082,17 @@ impl SessionService for MockSessionService {
             .get(&comms_name)
             .copied()
             .unwrap_or_default();
-        let comms = Arc::new(MockCommsRuntime::new(&comms_name, behavior));
+        let runtime_adapter = self
+            .runtime_adapter
+            .lock()
+            .expect("runtime_adapter mutex")
+            .clone();
+        let comms = Arc::new(MockCommsRuntime::new(
+            &comms_name,
+            behavior,
+            session_id.clone(),
+            runtime_adapter,
+        ));
         self.sessions
             .write()
             .await
@@ -2448,7 +2495,10 @@ impl MobRunStore for RecordingRunStore {
 struct FaultInjectedRuntimeMetadataStore {
     inner: InMemoryMobRuntimeMetadataStore,
     fail_load_supervisor: AtomicBool,
+    fail_put_supervisor_countdown: AtomicUsize,
+    conflict_compare_supervisor_countdown: AtomicUsize,
     fail_list_overlays: AtomicBool,
+    fail_upsert_overlay: AtomicBool,
 }
 
 impl FaultInjectedRuntimeMetadataStore {
@@ -2456,12 +2506,80 @@ impl FaultInjectedRuntimeMetadataStore {
         Self {
             inner: InMemoryMobRuntimeMetadataStore::new(),
             fail_load_supervisor: AtomicBool::new(false),
+            fail_put_supervisor_countdown: AtomicUsize::new(0),
+            conflict_compare_supervisor_countdown: AtomicUsize::new(0),
             fail_list_overlays: AtomicBool::new(false),
+            fail_upsert_overlay: AtomicBool::new(false),
         }
     }
 
     fn set_fail_load_supervisor(&self, fail: bool) {
         self.fail_load_supervisor.store(fail, Ordering::Relaxed);
+    }
+
+    fn fail_next_put_supervisor(&self) {
+        self.fail_nth_put_supervisor(1);
+    }
+
+    fn fail_nth_put_supervisor(&self, n: usize) {
+        assert!(n > 0, "failure countdown must target a future write");
+        self.fail_put_supervisor_countdown
+            .store(n, Ordering::Relaxed);
+    }
+
+    fn conflict_next_compare_supervisor(&self) {
+        self.conflict_nth_compare_supervisor(1);
+    }
+
+    fn conflict_nth_compare_supervisor(&self, n: usize) {
+        assert!(n > 0, "conflict countdown must target a future compare");
+        self.conflict_compare_supervisor_countdown
+            .store(n, Ordering::Relaxed);
+    }
+
+    fn fail_next_upsert_overlay(&self) {
+        self.fail_upsert_overlay.store(true, Ordering::Relaxed);
+    }
+
+    fn maybe_fail_supervisor_write(&self) -> Result<(), MobStoreError> {
+        let mut remaining = self.fail_put_supervisor_countdown.load(Ordering::Relaxed);
+        while remaining > 0 {
+            match self.fail_put_supervisor_countdown.compare_exchange(
+                remaining,
+                remaining - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => {
+                    if remaining == 1 {
+                        return Err(MobStoreError::WriteFailed(
+                            "fault-injected runtime metadata supervisor write failure".to_string(),
+                        ));
+                    }
+                    break;
+                }
+                Err(actual) => remaining = actual,
+            }
+        }
+        Ok(())
+    }
+
+    fn maybe_conflict_supervisor_compare(&self) -> bool {
+        let mut remaining = self
+            .conflict_compare_supervisor_countdown
+            .load(Ordering::Relaxed);
+        while remaining > 0 {
+            match self.conflict_compare_supervisor_countdown.compare_exchange(
+                remaining,
+                remaining - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return remaining == 1,
+                Err(actual) => remaining = actual,
+            }
+        }
+        false
     }
 }
 
@@ -2484,7 +2602,28 @@ impl MobRuntimeMetadataStore for FaultInjectedRuntimeMetadataStore {
         mob_id: &MobId,
         record: &SupervisorAuthorityRecord,
     ) -> Result<(), MobStoreError> {
+        self.maybe_fail_supervisor_write()?;
         self.inner.put_supervisor_authority(mob_id, record).await
+    }
+
+    async fn compare_and_put_supervisor_authority(
+        &self,
+        mob_id: &MobId,
+        expected: &SupervisorAuthorityRecord,
+        record: &SupervisorAuthorityRecord,
+    ) -> Result<bool, MobStoreError> {
+        self.maybe_fail_supervisor_write()?;
+        if self.maybe_conflict_supervisor_compare() {
+            let mut competing = SupervisorAuthorityRecord::generate(expected.protocol_version);
+            competing.epoch = expected.epoch + 1;
+            self.inner
+                .put_supervisor_authority(mob_id, &competing)
+                .await?;
+            return Ok(false);
+        }
+        self.inner
+            .compare_and_put_supervisor_authority(mob_id, expected, record)
+            .await
     }
 
     async fn put_supervisor_authority_if_absent(
@@ -2528,6 +2667,11 @@ impl MobRuntimeMetadataStore for FaultInjectedRuntimeMetadataStore {
         mob_id: &MobId,
         record: &ExternalBindingOverlayRecord,
     ) -> Result<(), MobStoreError> {
+        if self.fail_upsert_overlay.swap(false, Ordering::Relaxed) {
+            return Err(MobStoreError::WriteFailed(
+                "fault-injected runtime overlay upsert failure".to_string(),
+            ));
+        }
         self.inner
             .upsert_external_binding_overlay(mob_id, record)
             .await
@@ -3134,7 +3278,7 @@ struct LiveExternalPeerHarness {
     received_intents: Arc<RwLock<Vec<String>>>,
     supervisor_state: Arc<RwLock<Option<HarnessSupervisorState>>>,
     bind_peer_id_override: Arc<RwLock<Option<String>>>,
-    fail_next_authorize: Arc<AtomicBool>,
+    fail_authorize_countdown: Arc<AtomicUsize>,
     fail_next_bind: Arc<AtomicBool>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -3207,7 +3351,15 @@ impl LiveExternalPeerHarness {
     }
 
     fn fail_next_authorize(&self) {
-        self.fail_next_authorize.store(true, Ordering::Relaxed);
+        self.fail_nth_authorize(1);
+    }
+
+    fn fail_nth_authorize(&self, n: usize) {
+        assert!(
+            n > 0,
+            "authorize failure countdown must target a future command"
+        );
+        self.fail_authorize_countdown.store(n, Ordering::Relaxed);
     }
 
     fn fail_next_bind(&self) {
@@ -3217,6 +3369,22 @@ impl LiveExternalPeerHarness {
     async fn override_next_bind_peer_id(&self, peer_id: String) {
         *self.bind_peer_id_override.write().await = Some(peer_id);
     }
+}
+
+fn consume_countdown_failure(countdown: &AtomicUsize) -> bool {
+    let mut remaining = countdown.load(Ordering::Relaxed);
+    while remaining > 0 {
+        match countdown.compare_exchange(
+            remaining,
+            remaining - 1,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => return remaining == 1,
+            Err(actual) => remaining = actual,
+        }
+    }
+    false
 }
 
 impl Drop for LiveExternalPeerHarness {
@@ -3262,8 +3430,8 @@ async fn spawn_live_external_peer(peer_name: &str) -> LiveExternalPeerHarness {
     let responder_supervisor_state = supervisor_state.clone();
     let bind_peer_id_override: Arc<RwLock<Option<String>>> = Arc::new(RwLock::new(None));
     let responder_bind_peer_id_override = bind_peer_id_override.clone();
-    let fail_next_authorize = Arc::new(AtomicBool::new(false));
-    let responder_fail_next_authorize = fail_next_authorize.clone();
+    let fail_authorize_countdown = Arc::new(AtomicUsize::new(0));
+    let responder_fail_authorize_countdown = fail_authorize_countdown.clone();
     let fail_next_bind = Arc::new(AtomicBool::new(false));
     let responder_fail_next_bind = fail_next_bind.clone();
     let task = tokio::spawn(async move {
@@ -3327,11 +3495,37 @@ async fn spawn_live_external_peer(peer_name: &str) -> LiveExternalPeerHarness {
                                         // epoch from the same sender. Anything else is a typed
                                         // rejection — mob-level tests must see the same rejection
                                         // vocabulary as production or the gate is invisible.
-                                        let sender = candidate.interaction.from.clone();
+                                        let sender_label = candidate.interaction.from.clone();
+                                        let sender_peer_id = candidate
+                                            .ingress
+                                            .route
+                                            .as_ref()
+                                            .map(|route| route.peer_id.to_string())
+                                            .or_else(|| {
+                                                candidate
+                                                    .interaction
+                                                    .from_route
+                                                    .as_ref()
+                                                    .map(std::string::ToString::to_string)
+                                            });
                                         let mut state_guard =
                                             responder_supervisor_state.write().await;
                                         let gate_result: Result<bool, (super::bridge_protocol::BridgeRejectionCause, String)> = match state_guard.as_ref() {
-                                            None => Ok(true), // bootstrap: bind fresh
+                                            None => {
+                                                if sender_peer_id.as_deref()
+                                                    != Some(payload.supervisor.peer_id.as_str())
+                                                {
+                                                    Err((
+                                                        super::bridge_protocol::BridgeRejectionCause::SenderMismatch,
+                                                        format!(
+                                                            "bind member failed: request sender '{sender_label}' does not match supervisor '{}'",
+                                                            payload.supervisor.peer_id
+                                                        ),
+                                                    ))
+                                                } else {
+                                                    Ok(true) // bootstrap: bind fresh
+                                                }
+                                            }
                                             Some(current) => {
                                                 if payload.supervisor.peer_id
                                                     != current.supervisor.peer_id.to_string()
@@ -3351,18 +3545,22 @@ async fn spawn_live_external_peer(peer_name: &str) -> LiveExternalPeerHarness {
                                                             payload.epoch, current.epoch
                                                         ),
                                                     ))
-                                                } else if sender != current.supervisor.name.as_str()
-                                                    && sender != current.supervisor.peer_id.to_string()
-                                                {
-                                                    Err((
-                                                        super::bridge_protocol::BridgeRejectionCause::SenderMismatch,
-                                                        format!(
-                                                            "bind member failed: request sender '{sender}' does not match authorized supervisor '{}'",
-                                                            current.supervisor.peer_id
-                                                        ),
-                                                    ))
                                                 } else {
-                                                    Ok(false) // idempotent ack, no mutation
+                                                    let current_peer_id =
+                                                        current.supervisor.peer_id.to_string();
+                                                    if sender_peer_id.as_deref()
+                                                        != Some(current_peer_id.as_str())
+                                                    {
+                                                        Err((
+                                                            super::bridge_protocol::BridgeRejectionCause::SenderMismatch,
+                                                            format!(
+                                                                "bind member failed: request sender '{sender_label}' does not match authorized supervisor '{}'",
+                                                                current.supervisor.peer_id
+                                                            ),
+                                                        ))
+                                                    } else {
+                                                        Ok(false) // idempotent ack, no mutation
+                                                    }
                                                 }
                                             }
                                         };
@@ -3431,9 +3629,22 @@ async fn spawn_live_external_peer(peer_name: &str) -> LiveExternalPeerHarness {
                                 super::bridge_protocol::BridgeCommand::AuthorizeSupervisor(
                                     payload,
                                 ) => {
-                                    if responder_fail_next_authorize
-                                        .swap(false, Ordering::Relaxed)
-                                    {
+                                    let sender_label = candidate.interaction.from.clone();
+                                    let sender_peer_id = candidate
+                                        .ingress
+                                        .route
+                                        .as_ref()
+                                        .map(|route| route.peer_id.to_string())
+                                        .or_else(|| {
+                                            candidate
+                                                .interaction
+                                                .from_route
+                                                .as_ref()
+                                                .map(std::string::ToString::to_string)
+                                        });
+                                    if consume_countdown_failure(
+                                        &responder_fail_authorize_countdown,
+                                    ) {
                                         let supervisor_spec =
                                             meerkat_core::comms::TrustedPeerDescriptor::try_from(
                                                 payload.supervisor.clone(),
@@ -3453,41 +3664,67 @@ async fn spawn_live_external_peer(peer_name: &str) -> LiveExternalPeerHarness {
                                     } else {
                                         let mut guard = responder_supervisor_state.write().await;
                                         if let Some(current) = guard.as_ref() {
-                                            assert!(
-                                                payload.epoch >= current.epoch,
-                                                "authorize payload must not go backwards in epoch"
-                                            );
-                                            if payload.epoch > current.epoch
+                                            if payload.epoch < current.epoch {
+                                                serde_json::to_value(
+                                                    super::bridge_protocol::BridgeReply::Rejected {
+                                                        cause: super::bridge_protocol::BridgeRejectionCause::StaleSupervisor,
+                                                        reason: format!(
+                                                            "authorize supervisor failed: stale supervisor epoch {} (current {})",
+                                                            payload.epoch, current.epoch
+                                                        ),
+                                                    },
+                                                )
+                                                .expect("authorize stale rejection")
+                                            } else {
+                                                let current_peer_id =
+                                                    current.supervisor.peer_id.to_string();
+                                                if sender_peer_id.as_deref()
+                                                    != Some(current_peer_id.as_str())
+                                                {
+                                                serde_json::to_value(
+                                                    super::bridge_protocol::BridgeReply::Rejected {
+                                                        cause: super::bridge_protocol::BridgeRejectionCause::SenderMismatch,
+                                                        reason: format!(
+                                                            "authorize supervisor failed: request sender '{sender_label}' does not match authorized supervisor '{}'",
+                                                            current.supervisor.peer_id
+                                                        ),
+                                                    },
+                                                )
+                                                .expect("authorize sender mismatch rejection")
+                                            } else {
+                                                if payload.epoch > current.epoch
                                                 || payload.supervisor.peer_id
                                                     != current.supervisor.peer_id.to_string()
-                                            {
-                                                remove_supervisors_after_response.push(
-                                                    meerkat_comms::PubKey::new(
-                                                        current.supervisor.pubkey,
-                                                    ),
-                                                );
-                                            }
-                                            let supervisor_spec =
-                                                meerkat_core::comms::TrustedPeerDescriptor::try_from(
-                                                    payload.supervisor.clone(),
-                                                )
-                                                .expect("valid supervisor spec");
-                                            responder_runtime
-                                                .add_trusted_peer(supervisor_spec)
-                                                .await
-                                                .expect("authorize supervisor");
-                                            *guard = Some(HarnessSupervisorState {
-                                                supervisor:
+                                                {
+                                                    remove_supervisors_after_response.push(
+                                                        meerkat_comms::PubKey::new(
+                                                            current.supervisor.pubkey,
+                                                        ),
+                                                    );
+                                                }
+                                                let supervisor_spec =
                                                     meerkat_core::comms::TrustedPeerDescriptor::try_from(
-                                                        payload.supervisor,
+                                                        payload.supervisor.clone(),
                                                     )
-                                                    .expect("valid supervisor spec"),
-                                                epoch: payload.epoch,
-                                            });
-                                            serde_json::to_value(
-                                                super::bridge_protocol::BridgeAck { ok: true },
-                                            )
-                                            .expect("authorize ack")
+                                                    .expect("valid supervisor spec");
+                                                responder_runtime
+                                                    .add_trusted_peer(supervisor_spec)
+                                                    .await
+                                                    .expect("authorize supervisor");
+                                                *guard = Some(HarnessSupervisorState {
+                                                    supervisor:
+                                                        meerkat_core::comms::TrustedPeerDescriptor::try_from(
+                                                            payload.supervisor,
+                                                        )
+                                                        .expect("valid supervisor spec"),
+                                                    epoch: payload.epoch,
+                                                });
+                                                serde_json::to_value(
+                                                    super::bridge_protocol::BridgeAck { ok: true },
+                                                )
+                                                .expect("authorize ack")
+                                            }
+                                            }
                                         } else {
                                             let supervisor_spec =
                                                 meerkat_core::comms::TrustedPeerDescriptor::try_from(
@@ -3762,7 +3999,7 @@ async fn spawn_live_external_peer(peer_name: &str) -> LiveExternalPeerHarness {
         received_intents,
         supervisor_state,
         bind_peer_id_override,
-        fail_next_authorize,
+        fail_authorize_countdown,
         fail_next_bind,
         task,
     }
@@ -6267,7 +6504,7 @@ async fn test_rotate_supervisor_reauthorizes_live_remote_members_and_rejects_sta
     let service = Arc::new(MockSessionService::new());
     let _ = service.enable_runtime_adapter();
     let handle = MobBuilder::new(definition, storage)
-        .with_session_service(service)
+        .with_session_service(service.clone())
         .create()
         .await
         .expect("create mob");
@@ -6384,7 +6621,7 @@ async fn test_rotate_supervisor_bind_fallback_binds_next_authority() {
     let service = Arc::new(MockSessionService::new());
     let _ = service.enable_runtime_adapter();
     let handle = MobBuilder::new(definition, storage)
-        .with_session_service(service)
+        .with_session_service(service.clone())
         .create()
         .await
         .expect("create mob");
@@ -6415,21 +6652,163 @@ async fn test_rotate_supervisor_bind_fallback_binds_next_authority() {
     );
 }
 
-// `test_rotate_supervisor_rolls_back_remote_authorization_on_partial_failure`
-// was removed in the c8 commit of the bridge review fixes. The test asserted
-// that on a partial-authorize failure during rotation the mob would roll the
-// LOCAL authority back to the pre-rotation supervisor. That expectation is
-// incompatible with the strict `BindMember` gate introduced in the same
-// review: once any remote has rotated forward, a rollback is rejected with
-// `BridgeRejectionCause::AlreadyBound` and the documented recovery is to
-// advance local authority to match the partially-applied remote state —
-// which is exactly what the following test
-// `test_rotate_supervisor_advances_local_authority_when_rollback_fails`
-// verifies. See `CLAUDE.md` > "Mob Orchestration" and
-// `MobActor::handle_rotate_supervisor` for the authoritative behavior.
+#[tokio::test]
+async fn test_rotate_supervisor_restores_live_authority_when_initial_bind_fallback_fails() {
+    let _serial = REAL_COMMS_TEST_LOCK.lock().expect("real-comms test lock");
+    let definition = with_unique_mob_id(
+        sample_definition_with_external_backend(),
+        "rotate-supervisor-bind-fallback-failure",
+    );
+    let mob_id = definition.id.clone();
+    let storage = MobStorage::in_memory();
+    let runtime_metadata = storage.runtime_metadata.clone();
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service)
+        .create()
+        .await
+        .expect("create mob");
+    let external = spawn_live_external_peer(&test_comms_name_for(&mob_id, "worker", "w-ext")).await;
+    handle
+        .spawn_with_binding(
+            ProfileName::from("worker"),
+            MeerkatId::from("w-ext"),
+            None,
+            external.binding(),
+        )
+        .await
+        .expect("spawn live external worker");
+
+    let original = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load original authority")
+        .expect("original authority record");
+    external.forget_supervisor().await;
+    external.fail_next_bind();
+
+    let error = handle
+        .rotate_supervisor()
+        .await
+        .expect_err("failed initial bind fallback should abort rotation");
+    assert!(
+        error
+            .to_string()
+            .contains("failed to rotate supervisor authority"),
+        "initial bind fallback failure should return a non-partial rotation error, got: {error}"
+    );
+
+    let current = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load authority after failed bind fallback")
+        .expect("authority after failed bind fallback");
+    assert_eq!(
+        current.epoch, original.epoch,
+        "local supervisor authority must not advance when no remote accepted the attempt"
+    );
+    assert_eq!(
+        current.public_peer_id, original.public_peer_id,
+        "local supervisor authority must remain the original peer"
+    );
+    assert!(
+        current.pending_rotation.is_none(),
+        "non-partial failure should not record pending rotation metadata"
+    );
+
+    handle
+        .internal_turn(
+            AgentIdentity::from("w-ext"),
+            ContentInput::from("recover-after-bind-fallback-failure".to_string()),
+        )
+        .await
+        .expect("live supervisor bridge should be restored to current authority after failure");
+    assert_eq!(
+        external.authorized_supervisor_peer_id().await.as_deref(),
+        Some(original.public_peer_id.as_str()),
+        "recovery bind should use the persisted current supervisor, not the abandoned attempt"
+    );
+}
 
 #[tokio::test]
-async fn test_rotate_supervisor_advances_local_authority_when_rollback_fails() {
+async fn test_rotate_supervisor_does_not_advance_when_current_bind_fallback_persistence_fails() {
+    let _serial = REAL_COMMS_TEST_LOCK.lock().expect("real-comms test lock");
+    let definition = with_unique_mob_id(
+        sample_definition_with_external_backend(),
+        "rotate-supervisor-bind-fallback-persist-failure",
+    );
+    let mob_id = definition.id.clone();
+    let runtime_metadata = Arc::new(FaultInjectedRuntimeMetadataStore::new());
+    let storage = MobStorage::with_events_and_runtime_metadata(
+        Arc::new(InMemoryMobEventStore::new()),
+        runtime_metadata.clone(),
+    );
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service)
+        .create()
+        .await
+        .expect("create mob");
+    let external = spawn_live_external_peer(&test_comms_name_for(&mob_id, "worker", "w-ext")).await;
+    handle
+        .spawn_with_binding(
+            ProfileName::from("worker"),
+            MeerkatId::from("w-ext"),
+            None,
+            external.binding(),
+        )
+        .await
+        .expect("spawn live external worker");
+
+    let original = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load original authority")
+        .expect("original authority record");
+    external.forget_supervisor().await;
+    runtime_metadata.fail_next_upsert_overlay();
+
+    let error = handle
+        .rotate_supervisor()
+        .await
+        .expect_err("current bind fallback persistence failure should abort rotation");
+    assert!(
+        error
+            .to_string()
+            .contains("failed to persist rebound binding metadata"),
+        "local persistence failure should be visible, got: {error}"
+    );
+
+    let current = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load authority after rebound persistence failure")
+        .expect("authority after rebound persistence failure");
+    assert_eq!(current.epoch, original.epoch);
+    assert_eq!(current.public_peer_id, original.public_peer_id);
+    assert!(
+        current.pending_rotation.is_none(),
+        "current bind fallback failed before any remote accepted next authority"
+    );
+    assert_eq!(
+        external.authorized_supervisor_peer_id().await.as_deref(),
+        Some(original.public_peer_id.as_str()),
+        "remote should only be restored to current authority before local persistence failed"
+    );
+
+    handle
+        .internal_turn(
+            AgentIdentity::from("w-ext"),
+            ContentInput::from("recover-after-current-bind-persistence-failure".to_string()),
+        )
+        .await
+        .expect("current authority should remain usable after local persistence failure");
+}
+
+#[tokio::test]
+async fn test_rotate_supervisor_fails_closed_when_remote_rollback_fails() {
     let _serial = REAL_COMMS_TEST_LOCK.lock().expect("real-comms test lock");
     let definition = with_unique_mob_id(
         sample_definition_with_external_backend(),
@@ -6437,7 +6816,1695 @@ async fn test_rotate_supervisor_advances_local_authority_when_rollback_fails() {
     );
     let mob_id = definition.id.clone();
     let storage = MobStorage::in_memory();
+    let events = storage.events.clone();
     let runtime_metadata = storage.runtime_metadata.clone();
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let external_a = spawn_live_external_peer(&test_comms_name_for(&mob_id, "worker", "w-a")).await;
+    let external_b = spawn_live_external_peer(&test_comms_name_for(&mob_id, "worker", "w-b")).await;
+    handle
+        .spawn_with_binding(
+            ProfileName::from("worker"),
+            MeerkatId::from("w-a"),
+            None,
+            external_a.binding(),
+        )
+        .await
+        .expect("spawn first live external worker");
+    handle
+        .spawn_with_binding(
+            ProfileName::from("worker"),
+            MeerkatId::from("w-b"),
+            None,
+            external_b.binding(),
+        )
+        .await
+        .expect("spawn second live external worker");
+
+    let original = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load original authority")
+        .expect("original authority record");
+    external_b.fail_next_authorize();
+
+    let error = handle
+        .rotate_supervisor()
+        .await
+        .expect_err("rollback bind failure should abort rotation");
+    let (
+        attempted_epoch,
+        attempted_public_peer_id,
+        rotated_peer_count,
+        rollback_succeeded,
+        pending_authority_recorded,
+        pending_authority_process_local,
+        rollback_error,
+    ) = match error {
+        MobError::SupervisorRotationIncomplete {
+            previous_epoch,
+            attempted_epoch,
+            attempted_public_peer_id,
+            rotated_peer_count,
+            rollback_succeeded,
+            pending_authority_recorded,
+            pending_authority_process_local,
+            rollback_error,
+            reason,
+        } => {
+            assert_eq!(previous_epoch, original.epoch);
+            assert_eq!(attempted_epoch, original.epoch + 1);
+            assert!(
+                reason.contains("authorize supervisor failed: injected test failure"),
+                "typed incomplete rotation should preserve the remote failure, got: {reason}",
+            );
+            (
+                attempted_epoch,
+                attempted_public_peer_id,
+                rotated_peer_count,
+                rollback_succeeded,
+                pending_authority_recorded,
+                pending_authority_process_local,
+                rollback_error,
+            )
+        }
+        other => panic!("expected typed incomplete supervisor rotation, got: {other:?}"),
+    };
+    assert_eq!(rotated_peer_count, 1);
+    assert!(!rollback_succeeded);
+    assert!(
+        pending_authority_recorded,
+        "failed rollback must leave the attempted authority recorded for retry"
+    );
+    assert!(
+        !pending_authority_process_local,
+        "normal pending rotation metadata should be durable"
+    );
+    assert!(
+        rollback_error
+            .as_deref()
+            .is_some_and(|message| message.contains("supervisor already bound")),
+        "typed incomplete rotation should preserve rollback failure, got: {rollback_error:?}",
+    );
+
+    let current = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load authority after incomplete rotation")
+        .expect("authority after incomplete rotation");
+    assert_eq!(
+        current.epoch, original.epoch,
+        "local supervisor authority must remain at the pre-rotation epoch"
+    );
+    assert_eq!(
+        current.public_peer_id, original.public_peer_id,
+        "local supervisor authority must remain the original peer after incomplete rotation"
+    );
+    let pending = current
+        .pending_rotation
+        .as_ref()
+        .expect("incomplete rotation should persist the attempted authority as pending");
+    assert_eq!(pending.epoch, attempted_epoch);
+    assert_eq!(pending.public_peer_id, attempted_public_peer_id);
+    let crate::RuntimeBinding::External {
+        peer_id: external_a_peer_id,
+        ..
+    } = external_a.binding()
+    else {
+        panic!("live external peer should use an external binding");
+    };
+    assert_eq!(
+        pending.accepted_peer_ids,
+        vec![external_a_peer_id],
+        "pending rotation must record the remote that already accepted it"
+    );
+    assert_eq!(
+        attempted_epoch,
+        original.epoch + 1,
+        "the attempted authority should still be reported for reconciliation"
+    );
+    assert_eq!(
+        external_a.authorized_supervisor_peer_id().await.as_deref(),
+        Some(attempted_public_peer_id.as_str()),
+        "first remote accepted the attempted authority before the second remote failed"
+    );
+    assert_eq!(
+        external_b.authorized_supervisor_peer_id().await.as_deref(),
+        Some(original.public_peer_id.as_str()),
+        "second remote must remain on the original authority after rejecting the attempt"
+    );
+
+    handle
+        .internal_turn(
+            AgentIdentity::from("w-b"),
+            ContentInput::from("pre-retry-current-authority-check".to_string()),
+        )
+        .await
+        .expect("peer that stayed on current authority should remain controllable before retry");
+    assert_eq!(
+        external_b.authorized_supervisor_peer_id().await.as_deref(),
+        Some(original.public_peer_id.as_str()),
+        "pre-retry command must not advance the current-authority peer"
+    );
+
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown original actor before restart-style retry");
+    let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+        events,
+        runtime_metadata.clone(),
+    ))
+    .with_session_service(service)
+    .resume()
+    .await
+    .expect("resume mob with persisted pending supervisor rotation");
+
+    let retry_report = resumed
+        .rotate_supervisor()
+        .await
+        .expect("restart-style retry should reconcile remotes and commit a confirmed rotation");
+    assert_eq!(retry_report.previous_epoch, original.epoch);
+    assert_eq!(retry_report.current_epoch, original.epoch + 1);
+    let retried = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load authority after retry")
+        .expect("authority after retry");
+    assert_eq!(retried.public_peer_id, retry_report.public_peer_id);
+    assert!(
+        retried.pending_rotation.is_none(),
+        "successful retry must clear pending rotation metadata"
+    );
+    assert_eq!(
+        external_a.authorized_supervisor_peer_id().await.as_deref(),
+        Some(retried.public_peer_id.as_str()),
+        "retry should reconcile the partially rotated peer onto the committed authority"
+    );
+    assert_eq!(
+        external_b.authorized_supervisor_peer_id().await.as_deref(),
+        Some(retried.public_peer_id.as_str()),
+        "retry should rotate the peer that rejected the first attempt"
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_supervisor_clears_pending_acceptance_after_current_rebind() {
+    let _serial = REAL_COMMS_TEST_LOCK.lock().expect("real-comms test lock");
+    let definition = with_unique_mob_id(
+        sample_definition_with_external_backend(),
+        "rotate-supervisor-pending-drift-current",
+    );
+    let mob_id = definition.id.clone();
+    let storage = MobStorage::in_memory();
+    let events = storage.events.clone();
+    let runtime_metadata = storage.runtime_metadata.clone();
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let external_a = spawn_live_external_peer(&test_comms_name_for(&mob_id, "worker", "w-a")).await;
+    let external_b = spawn_live_external_peer(&test_comms_name_for(&mob_id, "worker", "w-b")).await;
+    handle
+        .spawn_with_binding(
+            ProfileName::from("worker"),
+            MeerkatId::from("w-a"),
+            None,
+            external_a.binding(),
+        )
+        .await
+        .expect("spawn first live external worker");
+    handle
+        .spawn_with_binding(
+            ProfileName::from("worker"),
+            MeerkatId::from("w-b"),
+            None,
+            external_b.binding(),
+        )
+        .await
+        .expect("spawn second live external worker");
+
+    let original = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load original authority")
+        .expect("original authority record");
+    external_b.fail_next_authorize();
+    let error = handle
+        .rotate_supervisor()
+        .await
+        .expect_err("first rotation should leave a pending accepted peer");
+    let attempted_public_peer_id = match error {
+        MobError::SupervisorRotationIncomplete {
+            attempted_public_peer_id,
+            ..
+        } => attempted_public_peer_id,
+        other => panic!("expected typed incomplete supervisor rotation, got: {other:?}"),
+    };
+    let pending = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load authority after incomplete rotation")
+        .expect("authority after incomplete rotation")
+        .pending_rotation
+        .expect("incomplete rotation should persist pending accepted peer");
+    let crate::RuntimeBinding::External {
+        peer_id: external_a_peer_id,
+        ..
+    } = external_a.binding()
+    else {
+        panic!("live external peer should use an external binding");
+    };
+    assert_eq!(pending.accepted_peer_ids, vec![external_a_peer_id]);
+
+    external_a.forget_supervisor().await;
+    handle
+        .internal_turn(
+            AgentIdentity::from("w-a"),
+            ContentInput::from("current-authority-rebind-clears-pending".to_string()),
+        )
+        .await
+        .expect("current authority should rebind a peer that lost supervisor state");
+    assert_eq!(
+        external_a.authorized_supervisor_peer_id().await.as_deref(),
+        Some(original.public_peer_id.as_str()),
+        "current-authority rebind should move the accepted peer back to pre-rotation authority"
+    );
+    let after_rebind = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load authority after current rebind")
+        .expect("authority after current rebind");
+    assert_eq!(after_rebind.public_peer_id, original.public_peer_id);
+    assert!(
+        after_rebind.pending_rotation.is_none(),
+        "successful current-authority rebind must clear stale accepted pending membership"
+    );
+
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown original actor before restart-style retry");
+    let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+        events,
+        runtime_metadata.clone(),
+    ))
+    .with_session_service(service)
+    .resume()
+    .await
+    .expect("resume mob after pending accepted peer rebounded to current");
+
+    let retry_report = resumed
+        .rotate_supervisor()
+        .await
+        .expect("retry should start a fresh confirmed rotation after stale pending was cleared");
+    assert_eq!(retry_report.previous_epoch, original.epoch);
+    assert_eq!(retry_report.current_epoch, original.epoch + 1);
+    assert_ne!(
+        retry_report.public_peer_id, attempted_public_peer_id,
+        "retry should not commit an abandoned attempted authority after its accepted peer rebounded"
+    );
+    let retried = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load authority after retry")
+        .expect("authority after retry");
+    assert!(retried.pending_rotation.is_none());
+    assert_eq!(
+        external_a.authorized_supervisor_peer_id().await.as_deref(),
+        Some(retried.public_peer_id.as_str()),
+        "fresh retry should rotate the rebounded peer"
+    );
+    assert_eq!(
+        external_b.authorized_supervisor_peer_id().await.as_deref(),
+        Some(retried.public_peer_id.as_str()),
+        "fresh retry should rotate the peer that rejected the first attempt"
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_supervisor_validates_stale_durable_pending_after_clear_failure_restart() {
+    let _serial = REAL_COMMS_TEST_LOCK.lock().expect("real-comms test lock");
+    let definition = with_unique_mob_id(
+        sample_definition_with_external_backend(),
+        "rotate-supervisor-pending-clear-failure-restart",
+    );
+    let mob_id = definition.id.clone();
+    let events: Arc<dyn MobEventStore> = Arc::new(InMemoryMobEventStore::new());
+    let runtime_metadata = Arc::new(FaultInjectedRuntimeMetadataStore::new());
+    let storage =
+        MobStorage::with_events_and_runtime_metadata(events.clone(), runtime_metadata.clone());
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let external_a = spawn_live_external_peer(&test_comms_name_for(&mob_id, "worker", "w-a")).await;
+    let external_b = spawn_live_external_peer(&test_comms_name_for(&mob_id, "worker", "w-b")).await;
+    handle
+        .spawn_with_binding(
+            ProfileName::from("worker"),
+            MeerkatId::from("w-a"),
+            None,
+            external_a.binding(),
+        )
+        .await
+        .expect("spawn first live external worker");
+    handle
+        .spawn_with_binding(
+            ProfileName::from("worker"),
+            MeerkatId::from("w-b"),
+            None,
+            external_b.binding(),
+        )
+        .await
+        .expect("spawn second live external worker");
+
+    let original = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load original authority")
+        .expect("original authority record");
+    external_b.fail_next_authorize();
+    let error = handle
+        .rotate_supervisor()
+        .await
+        .expect_err("first rotation should persist one accepted peer");
+    let attempted_public_peer_id = match error {
+        MobError::SupervisorRotationIncomplete {
+            attempted_public_peer_id,
+            ..
+        } => attempted_public_peer_id,
+        other => panic!("expected typed incomplete supervisor rotation, got: {other:?}"),
+    };
+    let crate::RuntimeBinding::External {
+        peer_id: external_a_peer_id,
+        ..
+    } = external_a.binding()
+    else {
+        panic!("live external peer should use an external binding");
+    };
+    let pending = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load pending authority")
+        .expect("pending authority")
+        .pending_rotation
+        .expect("pending authority should be durable");
+    assert_eq!(pending.accepted_peer_ids, vec![external_a_peer_id.clone()]);
+
+    external_a.forget_supervisor().await;
+    runtime_metadata.fail_next_put_supervisor();
+    let rebind_error = handle
+        .internal_turn(
+            AgentIdentity::from("w-a"),
+            ContentInput::from("current-rebind-clear-persistence-fails".to_string()),
+        )
+        .await
+        .expect_err("pending accepted clear persistence failure should be visible");
+    assert!(
+        rebind_error
+            .to_string()
+            .contains("fault-injected runtime metadata supervisor write failure"),
+        "clear failure should surface the metadata write error, got: {rebind_error}"
+    );
+    assert_eq!(
+        external_a.authorized_supervisor_peer_id().await.as_deref(),
+        Some(original.public_peer_id.as_str()),
+        "peer should already be rebound to current authority before pending-clear persistence fails"
+    );
+    let stale_durable = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load stale durable pending")
+        .expect("stale durable pending")
+        .pending_rotation
+        .expect("durable pending should still exist after injected clear failure");
+    assert_eq!(
+        stale_durable.accepted_peer_ids,
+        vec![external_a_peer_id],
+        "durable pending should still contain the stale accepted peer after clear write failure"
+    );
+
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown original actor before restart-style retry");
+    let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+        events,
+        runtime_metadata.clone(),
+    ))
+    .with_session_service(service)
+    .resume()
+    .await
+    .expect("resume mob with stale durable pending metadata only");
+
+    let retry_report = resumed
+        .rotate_supervisor()
+        .await
+        .expect("retry should validate stale durable accepted peers before commit");
+    assert_eq!(retry_report.previous_epoch, original.epoch);
+    assert_eq!(retry_report.current_epoch, original.epoch + 1);
+    assert_eq!(
+        retry_report.public_peer_id, attempted_public_peer_id,
+        "retry should still commit the attempted authority after re-rotating the stale accepted peer"
+    );
+    let retried = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load authority after retry")
+        .expect("authority after retry");
+    assert!(retried.pending_rotation.is_none());
+    assert_eq!(
+        external_a.authorized_supervisor_peer_id().await.as_deref(),
+        Some(retried.public_peer_id.as_str()),
+        "retry must not skip a durable-pending peer that drifted back to current before restart"
+    );
+    assert_eq!(
+        external_b.authorized_supervisor_peer_id().await.as_deref(),
+        Some(retried.public_peer_id.as_str()),
+        "retry should rotate the peer that rejected the first attempt"
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_supervisor_final_commit_conflict_preserves_newer_authority() {
+    let definition = with_unique_mob_id(
+        sample_definition_with_external_backend(),
+        "rotate-supervisor-final-commit-conflict",
+    );
+    let mob_id = definition.id.clone();
+    let runtime_metadata = Arc::new(FaultInjectedRuntimeMetadataStore::new());
+    let storage = MobStorage::with_events_and_runtime_metadata(
+        Arc::new(InMemoryMobEventStore::new()),
+        runtime_metadata.clone(),
+    );
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service)
+        .create()
+        .await
+        .expect("create mob");
+    let original = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load original authority")
+        .expect("original authority record");
+    runtime_metadata.conflict_next_compare_supervisor();
+
+    let error = handle
+        .rotate_supervisor()
+        .await
+        .expect_err("stale final commit should fail closed");
+    let attempted_public_peer_id = match error {
+        MobError::SupervisorRotationIncomplete {
+            previous_epoch,
+            attempted_epoch,
+            attempted_public_peer_id,
+            rotated_peer_count,
+            rollback_succeeded,
+            pending_authority_recorded,
+            pending_authority_process_local,
+            reason,
+            ..
+        } => {
+            assert_eq!(previous_epoch, original.epoch);
+            assert_eq!(attempted_epoch, original.epoch + 1);
+            assert_eq!(rotated_peer_count, 0);
+            assert!(rollback_succeeded);
+            assert!(!pending_authority_recorded);
+            assert!(!pending_authority_process_local);
+            assert!(
+                reason.contains("supervisor authority changed before final commit"),
+                "CAS conflict should be visible, got: {reason}"
+            );
+            attempted_public_peer_id
+        }
+        other => panic!("expected typed incomplete supervisor rotation, got: {other:?}"),
+    };
+    let after_conflict = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load authority after conflict")
+        .expect("authority after conflict");
+    assert_eq!(after_conflict.epoch, original.epoch + 1);
+    assert_ne!(
+        after_conflict.public_peer_id, attempted_public_peer_id,
+        "stale actor must not overwrite the newer committed authority"
+    );
+    assert!(after_conflict.pending_rotation.is_none());
+
+    let retry_report = handle
+        .rotate_supervisor()
+        .await
+        .expect("retry should rotate from the newer committed authority");
+    assert_eq!(retry_report.previous_epoch, after_conflict.epoch);
+    assert_eq!(retry_report.current_epoch, after_conflict.epoch + 1);
+}
+
+#[tokio::test]
+async fn test_rotate_supervisor_pending_commit_conflict_reconciles_accepted_remote_to_newer_authority()
+ {
+    let _serial = REAL_COMMS_TEST_LOCK.lock().expect("real-comms test lock");
+    let definition = with_unique_mob_id(
+        sample_definition_with_external_backend(),
+        "rotate-supervisor-pending-cas-conflict-reconcile",
+    );
+    let mob_id = definition.id.clone();
+    let runtime_metadata = Arc::new(FaultInjectedRuntimeMetadataStore::new());
+    let storage = MobStorage::with_events_and_runtime_metadata(
+        Arc::new(InMemoryMobEventStore::new()),
+        runtime_metadata.clone(),
+    );
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service)
+        .create()
+        .await
+        .expect("create mob");
+    let external = spawn_live_external_peer(&test_comms_name_for(&mob_id, "worker", "w-ext")).await;
+    handle
+        .spawn_with_binding(
+            ProfileName::from("worker"),
+            MeerkatId::from("w-ext"),
+            None,
+            external.binding(),
+        )
+        .await
+        .expect("spawn live external worker");
+
+    let original = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load original authority")
+        .expect("original authority record");
+    runtime_metadata.conflict_next_compare_supervisor();
+
+    let error = handle
+        .rotate_supervisor()
+        .await
+        .expect_err("pending CAS conflict after remote acceptance should fail closed");
+    let attempted_public_peer_id = match error {
+        MobError::SupervisorRotationIncomplete {
+            previous_epoch,
+            attempted_epoch,
+            attempted_public_peer_id,
+            rotated_peer_count,
+            rollback_succeeded,
+            pending_authority_recorded,
+            pending_authority_process_local,
+            reason,
+            ..
+        } => {
+            assert_eq!(previous_epoch, original.epoch);
+            assert_eq!(attempted_epoch, original.epoch + 1);
+            assert_eq!(rotated_peer_count, 1);
+            assert!(rollback_succeeded);
+            assert!(!pending_authority_recorded);
+            assert!(!pending_authority_process_local);
+            assert!(
+                reason.contains("failed to persist pending supervisor rotation"),
+                "pending CAS conflict should be visible, got: {reason}"
+            );
+            attempted_public_peer_id
+        }
+        other => panic!("expected typed incomplete supervisor rotation, got: {other:?}"),
+    };
+    let after_conflict = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load authority after conflict")
+        .expect("authority after conflict");
+    assert_eq!(after_conflict.epoch, original.epoch + 1);
+    assert_ne!(after_conflict.public_peer_id, attempted_public_peer_id);
+    assert!(after_conflict.pending_rotation.is_none());
+    assert_eq!(
+        external.authorized_supervisor_peer_id().await.as_deref(),
+        Some(after_conflict.public_peer_id.as_str()),
+        "accepted remote must be reconciled to the newer durable authority when pending CAS loses"
+    );
+
+    let retry_report = handle
+        .rotate_supervisor()
+        .await
+        .expect("retry should rotate from the newer durable authority");
+    assert_eq!(retry_report.previous_epoch, after_conflict.epoch);
+    assert_eq!(retry_report.current_epoch, after_conflict.epoch + 1);
+}
+
+#[tokio::test]
+async fn test_rotate_supervisor_pending_commit_conflict_failed_reconciliation_keeps_process_local_retry()
+ {
+    let _serial = REAL_COMMS_TEST_LOCK.lock().expect("real-comms test lock");
+    let definition = with_unique_mob_id(
+        sample_definition_with_external_backend(),
+        "rotate-supervisor-pending-cas-conflict-reconcile-fails",
+    );
+    let mob_id = definition.id.clone();
+    let runtime_metadata = Arc::new(FaultInjectedRuntimeMetadataStore::new());
+    let storage = MobStorage::with_events_and_runtime_metadata(
+        Arc::new(InMemoryMobEventStore::new()),
+        runtime_metadata.clone(),
+    );
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service)
+        .create()
+        .await
+        .expect("create mob");
+    let external = spawn_live_external_peer(&test_comms_name_for(&mob_id, "worker", "w-ext")).await;
+    handle
+        .spawn_with_binding(
+            ProfileName::from("worker"),
+            MeerkatId::from("w-ext"),
+            None,
+            external.binding(),
+        )
+        .await
+        .expect("spawn live external worker");
+
+    let original = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load original authority")
+        .expect("original authority record");
+    runtime_metadata.conflict_next_compare_supervisor();
+    external.fail_nth_authorize(2);
+    external.fail_next_bind();
+
+    let error = handle
+        .rotate_supervisor()
+        .await
+        .expect_err("failed CAS reconciliation should retain same-process pending retry state");
+    let attempted_public_peer_id = match error {
+        MobError::SupervisorRotationIncomplete {
+            previous_epoch,
+            attempted_epoch,
+            attempted_public_peer_id,
+            rotated_peer_count,
+            rollback_succeeded,
+            pending_authority_recorded,
+            pending_authority_process_local,
+            rollback_error,
+            reason,
+        } => {
+            assert_eq!(previous_epoch, original.epoch);
+            assert_eq!(attempted_epoch, original.epoch + 1);
+            assert_eq!(rotated_peer_count, 1);
+            assert!(!rollback_succeeded);
+            assert!(!pending_authority_recorded);
+            assert!(
+                pending_authority_process_local,
+                "unreconciled accepted peer must be retained as process-local pending retry state"
+            );
+            assert!(
+                rollback_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("supervisor peer reconciliation failed")),
+                "reconciliation failure should be reported as rollback failure, got: {rollback_error:?}"
+            );
+            assert!(
+                reason.contains("failed to persist pending supervisor rotation"),
+                "pending CAS conflict should remain visible, got: {reason}"
+            );
+            attempted_public_peer_id
+        }
+        other => panic!("expected typed incomplete supervisor rotation, got: {other:?}"),
+    };
+
+    let after_conflict = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load authority after conflict")
+        .expect("authority after conflict");
+    assert_eq!(after_conflict.epoch, original.epoch + 1);
+    assert_ne!(after_conflict.public_peer_id, attempted_public_peer_id);
+    assert!(after_conflict.pending_rotation.is_none());
+    assert_ne!(
+        external.authorized_supervisor_peer_id().await.as_deref(),
+        Some(attempted_public_peer_id.as_str()),
+        "failed recovery must not leave the remote reporting the abandoned attempted authority"
+    );
+
+    let retry_report = handle
+        .rotate_supervisor()
+        .await
+        .expect("process-local stale pending state should repair before starting a fresh retry");
+    assert_eq!(retry_report.previous_epoch, after_conflict.epoch);
+    assert_eq!(retry_report.current_epoch, after_conflict.epoch + 1);
+    assert_ne!(retry_report.public_peer_id, attempted_public_peer_id);
+    assert_eq!(
+        external.authorized_supervisor_peer_id().await.as_deref(),
+        Some(retry_report.public_peer_id.as_str()),
+        "retry should leave the external peer on the newly committed authority"
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_supervisor_pending_verification_conflict_reconciles_accepted_remote() {
+    let _serial = REAL_COMMS_TEST_LOCK.lock().expect("real-comms test lock");
+    let definition = with_unique_mob_id(
+        sample_definition_with_external_backend(),
+        "rotate-supervisor-pending-verify-cas-conflict",
+    );
+    let mob_id = definition.id.clone();
+    let runtime_metadata = Arc::new(FaultInjectedRuntimeMetadataStore::new());
+    let storage = MobStorage::with_events_and_runtime_metadata(
+        Arc::new(InMemoryMobEventStore::new()),
+        runtime_metadata.clone(),
+    );
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service)
+        .create()
+        .await
+        .expect("create mob");
+    let external = spawn_live_external_peer(&test_comms_name_for(&mob_id, "worker", "w-ext")).await;
+    let crate::RuntimeBinding::External {
+        peer_id: external_peer_id,
+        ..
+    } = external.binding()
+    else {
+        panic!("live external peer should use an external binding");
+    };
+    handle
+        .spawn_with_binding(
+            ProfileName::from("worker"),
+            MeerkatId::from("w-ext"),
+            None,
+            external.binding(),
+        )
+        .await
+        .expect("spawn live external worker");
+
+    let original = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load original authority")
+        .expect("original authority record");
+    runtime_metadata.fail_nth_put_supervisor(2);
+    let first_error = handle
+        .rotate_supervisor()
+        .await
+        .expect_err("final commit failure should leave a durable pending rotation");
+    let attempted_public_peer_id = match first_error {
+        MobError::SupervisorRotationIncomplete {
+            attempted_public_peer_id,
+            pending_authority_recorded,
+            pending_authority_process_local,
+            ..
+        } => {
+            assert!(pending_authority_recorded);
+            assert!(!pending_authority_process_local);
+            attempted_public_peer_id
+        }
+        other => panic!("expected typed incomplete supervisor rotation, got: {other:?}"),
+    };
+    let durable_pending = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load durable pending authority")
+        .expect("durable pending authority")
+        .pending_rotation
+        .expect("first failure should persist pending rotation");
+    assert_eq!(durable_pending.accepted_peer_ids, vec![external_peer_id]);
+
+    external.fail_next_authorize();
+    runtime_metadata.conflict_next_compare_supervisor();
+    let error = handle
+        .rotate_supervisor()
+        .await
+        .expect_err("pending verification failure with CAS conflict should be typed incomplete");
+    match error {
+        MobError::SupervisorRotationIncomplete {
+            previous_epoch,
+            attempted_epoch,
+            rotated_peer_count,
+            rollback_succeeded,
+            pending_authority_recorded,
+            pending_authority_process_local,
+            reason,
+            ..
+        } => {
+            assert_eq!(previous_epoch, original.epoch);
+            assert_eq!(attempted_epoch, original.epoch + 1);
+            assert_eq!(rotated_peer_count, 1);
+            assert!(rollback_succeeded);
+            assert!(!pending_authority_recorded);
+            assert!(!pending_authority_process_local);
+            assert!(
+                reason.contains("failed to verify pending supervisor authority"),
+                "pending verification failure should remain visible, got: {reason}"
+            );
+        }
+        other => panic!("expected typed incomplete supervisor rotation, got: {other:?}"),
+    }
+
+    let after_conflict = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load authority after verification conflict")
+        .expect("authority after verification conflict");
+    assert_eq!(after_conflict.epoch, original.epoch + 1);
+    assert_ne!(after_conflict.public_peer_id, attempted_public_peer_id);
+    assert!(after_conflict.pending_rotation.is_none());
+    assert_eq!(
+        external.authorized_supervisor_peer_id().await.as_deref(),
+        Some(after_conflict.public_peer_id.as_str()),
+        "accepted pending peer must reconcile to the newer durable authority when pending verification loses CAS"
+    );
+
+    let retry_report = handle
+        .rotate_supervisor()
+        .await
+        .expect("retry should rotate from the reconciled durable authority");
+    assert_eq!(retry_report.previous_epoch, after_conflict.epoch);
+    assert_eq!(retry_report.current_epoch, after_conflict.epoch + 1);
+}
+
+#[tokio::test]
+async fn test_rotate_supervisor_final_commit_conflict_reconciles_accepted_remote_to_newer_authority()
+ {
+    let _serial = REAL_COMMS_TEST_LOCK.lock().expect("real-comms test lock");
+    let definition = with_unique_mob_id(
+        sample_definition_with_external_backend(),
+        "rotate-supervisor-final-cas-conflict-reconcile",
+    );
+    let mob_id = definition.id.clone();
+    let runtime_metadata = Arc::new(FaultInjectedRuntimeMetadataStore::new());
+    let storage = MobStorage::with_events_and_runtime_metadata(
+        Arc::new(InMemoryMobEventStore::new()),
+        runtime_metadata.clone(),
+    );
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service)
+        .create()
+        .await
+        .expect("create mob");
+    let external = spawn_live_external_peer(&test_comms_name_for(&mob_id, "worker", "w-ext")).await;
+    handle
+        .spawn_with_binding(
+            ProfileName::from("worker"),
+            MeerkatId::from("w-ext"),
+            None,
+            external.binding(),
+        )
+        .await
+        .expect("spawn live external worker");
+
+    let original = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load original authority")
+        .expect("original authority record");
+    runtime_metadata.conflict_nth_compare_supervisor(2);
+
+    let error = handle
+        .rotate_supervisor()
+        .await
+        .expect_err("final CAS conflict should fail closed");
+    let attempted_public_peer_id = match error {
+        MobError::SupervisorRotationIncomplete {
+            previous_epoch,
+            attempted_epoch,
+            attempted_public_peer_id,
+            rotated_peer_count,
+            rollback_succeeded,
+            pending_authority_recorded,
+            pending_authority_process_local,
+            reason,
+            ..
+        } => {
+            assert_eq!(previous_epoch, original.epoch);
+            assert_eq!(attempted_epoch, original.epoch + 1);
+            assert_eq!(rotated_peer_count, 1);
+            assert!(rollback_succeeded);
+            assert!(!pending_authority_recorded);
+            assert!(!pending_authority_process_local);
+            assert!(
+                reason.contains("failed to commit confirmed supervisor authority"),
+                "final CAS conflict should be visible, got: {reason}"
+            );
+            attempted_public_peer_id
+        }
+        other => panic!("expected typed incomplete supervisor rotation, got: {other:?}"),
+    };
+    let after_conflict = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load authority after conflict")
+        .expect("authority after conflict");
+    assert_eq!(after_conflict.epoch, original.epoch + 1);
+    assert_ne!(after_conflict.public_peer_id, attempted_public_peer_id);
+    assert!(after_conflict.pending_rotation.is_none());
+    assert_eq!(
+        external.authorized_supervisor_peer_id().await.as_deref(),
+        Some(after_conflict.public_peer_id.as_str()),
+        "accepted remote must be reconciled to the newer durable authority when final CAS loses"
+    );
+
+    let retry_report = handle
+        .rotate_supervisor()
+        .await
+        .expect("retry should rotate from the newer durable authority");
+    assert_eq!(retry_report.previous_epoch, after_conflict.epoch);
+    assert_eq!(retry_report.current_epoch, after_conflict.epoch + 1);
+}
+
+#[tokio::test]
+async fn test_rotate_supervisor_final_commit_failure_preserves_attempted_authority_for_retry() {
+    let _serial = REAL_COMMS_TEST_LOCK.lock().expect("real-comms test lock");
+    let definition = with_unique_mob_id(
+        sample_definition_with_external_backend(),
+        "rotate-supervisor-final-commit-failure",
+    );
+    let mob_id = definition.id.clone();
+    let events: Arc<dyn MobEventStore> = Arc::new(InMemoryMobEventStore::new());
+    let runtime_metadata = Arc::new(FaultInjectedRuntimeMetadataStore::new());
+    let storage =
+        MobStorage::with_events_and_runtime_metadata(events.clone(), runtime_metadata.clone());
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let external_a = spawn_live_external_peer(&test_comms_name_for(&mob_id, "worker", "w-a")).await;
+    let external_b = spawn_live_external_peer(&test_comms_name_for(&mob_id, "worker", "w-b")).await;
+    handle
+        .spawn_with_binding(
+            ProfileName::from("worker"),
+            MeerkatId::from("w-a"),
+            None,
+            external_a.binding(),
+        )
+        .await
+        .expect("spawn first live external worker");
+    handle
+        .spawn_with_binding(
+            ProfileName::from("worker"),
+            MeerkatId::from("w-b"),
+            None,
+            external_b.binding(),
+        )
+        .await
+        .expect("spawn second live external worker");
+
+    let original = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load original authority")
+        .expect("original authority record");
+    let crate::RuntimeBinding::External {
+        peer_id: external_a_peer_id,
+        ..
+    } = external_a.binding()
+    else {
+        panic!("live external peer should use an external binding");
+    };
+    let crate::RuntimeBinding::External {
+        peer_id: external_b_peer_id,
+        ..
+    } = external_b.binding()
+    else {
+        panic!("live external peer should use an external binding");
+    };
+    runtime_metadata.fail_nth_put_supervisor(3);
+
+    let error = handle
+        .rotate_supervisor()
+        .await
+        .expect_err("final commit write failure should surface typed incomplete rotation");
+    let attempted_public_peer_id = match error {
+        MobError::SupervisorRotationIncomplete {
+            previous_epoch,
+            attempted_epoch,
+            attempted_public_peer_id,
+            rotated_peer_count,
+            rollback_succeeded,
+            pending_authority_recorded,
+            pending_authority_process_local,
+            reason,
+            ..
+        } => {
+            assert_eq!(previous_epoch, original.epoch);
+            assert_eq!(attempted_epoch, original.epoch + 1);
+            assert_eq!(rotated_peer_count, 2);
+            assert!(!rollback_succeeded);
+            assert!(
+                pending_authority_recorded,
+                "accepted attempted authority must remain durable after final commit failure"
+            );
+            assert!(
+                !pending_authority_process_local,
+                "final commit failure should not need process-local-only retry state"
+            );
+            assert!(
+                reason.contains("failed to commit confirmed supervisor authority"),
+                "commit failure should be visible, got: {reason}"
+            );
+            attempted_public_peer_id
+        }
+        other => panic!("expected typed incomplete supervisor rotation, got: {other:?}"),
+    };
+    let pending = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load pending authority after final commit failure")
+        .expect("pending authority after final commit failure");
+    assert_eq!(pending.epoch, original.epoch);
+    assert_eq!(pending.public_peer_id, original.public_peer_id);
+    let pending_rotation = pending
+        .pending_rotation
+        .expect("final commit failure should retain pending attempted authority");
+    assert_eq!(pending_rotation.public_peer_id, attempted_public_peer_id);
+    assert_eq!(
+        pending_rotation
+            .accepted_peer_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        [external_a_peer_id, external_b_peer_id]
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        "durable pending metadata should identify every remote that accepted the attempted authority"
+    );
+    assert_eq!(
+        external_a.authorized_supervisor_peer_id().await.as_deref(),
+        Some(attempted_public_peer_id.as_str())
+    );
+    assert_eq!(
+        external_b.authorized_supervisor_peer_id().await.as_deref(),
+        Some(attempted_public_peer_id.as_str())
+    );
+
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown original actor before restart-style retry");
+    let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+        events,
+        runtime_metadata.clone(),
+    ))
+    .with_session_service(service)
+    .resume()
+    .await
+    .expect("resume mob with pending final-commit attempt");
+    let retry_report = resumed
+        .rotate_supervisor()
+        .await
+        .expect("restart-style retry should commit the already accepted attempted authority");
+    assert_eq!(retry_report.previous_epoch, original.epoch);
+    assert_eq!(retry_report.current_epoch, original.epoch + 1);
+    assert_eq!(retry_report.public_peer_id, attempted_public_peer_id);
+    let retried = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load retried authority")
+        .expect("retried authority");
+    assert!(retried.pending_rotation.is_none());
+    assert_eq!(retried.public_peer_id, attempted_public_peer_id);
+}
+
+#[tokio::test]
+async fn test_rotate_supervisor_private_trust_failure_preserves_current_authority() {
+    let definition = with_unique_mob_id(
+        sample_definition(),
+        "rotate-supervisor-private-trust-activation-failure",
+    );
+    let mob_id = definition.id.clone();
+    let runtime_metadata = Arc::new(FaultInjectedRuntimeMetadataStore::new());
+    let storage = MobStorage::with_events_and_runtime_metadata(
+        Arc::new(InMemoryMobEventStore::new()),
+        runtime_metadata.clone(),
+    );
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let agent_identity = MeerkatId::from("w-activation-fail");
+    let receipt = handle
+        .spawn(ProfileName::from("worker"), agent_identity.clone(), None)
+        .await
+        .expect("spawn session-backed member");
+    let session_id = receipt
+        .bridge_session_id()
+        .cloned()
+        .expect("session-backed member has bridge session id");
+    let comms_name = test_comms_name_for(&mob_id, "worker", agent_identity.as_str());
+    let member_comms = {
+        let sessions = service.sessions.read().await;
+        sessions
+            .get(&session_id)
+            .cloned()
+            .expect("member comms runtime")
+    };
+    let original = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load original authority")
+        .expect("original authority record");
+    service
+        .set_comms_behavior(
+            &comms_name,
+            MockCommsBehavior {
+                fail_remove_trust_once: true,
+                ..MockCommsBehavior::default()
+            },
+        )
+        .await;
+
+    let error = handle
+        .rotate_supervisor()
+        .await
+        .expect_err("private trust activation failure should be typed incomplete");
+    let attempted_public_peer_id = match error {
+        MobError::SupervisorRotationIncomplete {
+            previous_epoch,
+            attempted_epoch,
+            attempted_public_peer_id,
+            rotated_peer_count,
+            rollback_succeeded,
+            pending_authority_recorded,
+            pending_authority_process_local,
+            reason,
+            ..
+        } => {
+            assert_eq!(previous_epoch, original.epoch);
+            assert_eq!(attempted_epoch, original.epoch + 1);
+            assert_eq!(rotated_peer_count, 0);
+            assert!(rollback_succeeded);
+            assert!(!pending_authority_recorded);
+            assert!(!pending_authority_process_local);
+            assert!(
+                reason.contains("failed to commit confirmed supervisor authority")
+                    && reason.contains("previous supervisor private trust removal failed"),
+                "local activation failure should be visible, got: {reason}"
+            );
+            attempted_public_peer_id
+        }
+        other => panic!("expected typed incomplete supervisor rotation, got: {other:?}"),
+    };
+    let after_failure = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load authority after failed activation")
+        .expect("authority after failed activation");
+    assert_eq!(after_failure.epoch, original.epoch);
+    assert_eq!(after_failure.public_peer_id, original.public_peer_id);
+    assert!(
+        after_failure.pending_rotation.is_none(),
+        "session-only local activation failure should not create remote pending state"
+    );
+    let trusted = member_comms.trusted_peers.read().await;
+    assert!(
+        trusted.contains_key(&original.public_peer_id),
+        "rollback should leave the session trusting the original supervisor"
+    );
+    assert!(
+        !trusted.contains_key(&attempted_public_peer_id),
+        "rollback should not leave attempted supervisor trust installed"
+    );
+    drop(trusted);
+
+    let retry_report = handle
+        .rotate_supervisor()
+        .await
+        .expect("retry after local activation rollback should succeed");
+    assert_eq!(retry_report.previous_epoch, original.epoch);
+    assert_eq!(retry_report.current_epoch, original.epoch + 1);
+}
+
+#[tokio::test]
+async fn test_rotate_supervisor_private_trust_partial_publish_cleans_attempted_authority() {
+    let _serial = REAL_COMMS_TEST_LOCK.lock().expect("real-comms test lock");
+    let definition = with_unique_mob_id(
+        sample_definition_with_external_backend(),
+        "rotate-supervisor-private-trust-partial-publish",
+    );
+    let mob_id = definition.id.clone();
+    let runtime_metadata = Arc::new(FaultInjectedRuntimeMetadataStore::new());
+    let storage = MobStorage::with_events_and_runtime_metadata(
+        Arc::new(InMemoryMobEventStore::new()),
+        runtime_metadata.clone(),
+    );
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let receipt = handle
+        .spawn(
+            ProfileName::from("worker"),
+            MeerkatId::from("w-private"),
+            None,
+        )
+        .await
+        .expect("spawn session-backed member");
+    let session_id = receipt
+        .bridge_session_id()
+        .cloned()
+        .expect("session-backed member has bridge session id");
+    let comms_name = test_comms_name_for(&mob_id, "worker", "w-private");
+    let member_comms = {
+        let sessions = service.sessions.read().await;
+        sessions
+            .get(&session_id)
+            .cloned()
+            .expect("member comms runtime")
+    };
+    let original = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load original authority")
+        .expect("original authority record");
+    service
+        .set_comms_behavior(
+            &comms_name,
+            MockCommsBehavior {
+                fail_private_add_after_insert: true,
+                ..MockCommsBehavior::default()
+            },
+        )
+        .await;
+
+    let error = handle
+        .rotate_supervisor()
+        .await
+        .expect_err("partial private trust publication should be typed incomplete");
+    let attempted_public_peer_id = match error {
+        MobError::SupervisorRotationIncomplete {
+            previous_epoch,
+            attempted_epoch,
+            attempted_public_peer_id,
+            rotated_peer_count,
+            rollback_succeeded,
+            pending_authority_recorded,
+            pending_authority_process_local,
+            reason,
+            ..
+        } => {
+            assert_eq!(previous_epoch, original.epoch);
+            assert_eq!(attempted_epoch, original.epoch + 1);
+            assert_eq!(rotated_peer_count, 0);
+            assert!(rollback_succeeded);
+            assert!(!pending_authority_recorded);
+            assert!(!pending_authority_process_local);
+            assert!(
+                reason.contains("supervisor private trust publication failed"),
+                "partial publish failure should be visible, got: {reason}"
+            );
+            attempted_public_peer_id
+        }
+        other => panic!("expected typed incomplete supervisor rotation, got: {other:?}"),
+    };
+
+    let after_failure = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load authority after failed activation")
+        .expect("authority after failed activation");
+    assert_eq!(after_failure.epoch, original.epoch);
+    assert_eq!(after_failure.public_peer_id, original.public_peer_id);
+    assert!(after_failure.pending_rotation.is_none());
+    let trusted = member_comms.trusted_peers.read().await;
+    assert!(trusted.contains_key(&original.public_peer_id));
+    assert!(
+        !trusted.contains_key(&attempted_public_peer_id),
+        "partial publish cleanup must remove attempted supervisor trust"
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_supervisor_private_trust_partial_publish_cleanup_failure_is_typed_rollback_failure()
+ {
+    let definition = with_unique_mob_id(
+        sample_definition(),
+        "rotate-supervisor-private-trust-partial-publish-cleanup-fails",
+    );
+    let mob_id = definition.id.clone();
+    let runtime_metadata = Arc::new(FaultInjectedRuntimeMetadataStore::new());
+    let storage = MobStorage::with_events_and_runtime_metadata(
+        Arc::new(InMemoryMobEventStore::new()),
+        runtime_metadata.clone(),
+    );
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let receipt = handle
+        .spawn(
+            ProfileName::from("worker"),
+            MeerkatId::from("w-private"),
+            None,
+        )
+        .await
+        .expect("spawn session-backed member");
+    let session_id = receipt
+        .bridge_session_id()
+        .cloned()
+        .expect("session-backed member has bridge session id");
+    let comms_name = test_comms_name_for(&mob_id, "worker", "w-private");
+    let member_comms = {
+        let sessions = service.sessions.read().await;
+        sessions
+            .get(&session_id)
+            .cloned()
+            .expect("member comms runtime")
+    };
+    let original = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load original authority")
+        .expect("original authority record");
+    service
+        .set_comms_behavior(
+            &comms_name,
+            MockCommsBehavior {
+                fail_private_add_after_insert: true,
+                fail_remove_trust_once: true,
+                ..MockCommsBehavior::default()
+            },
+        )
+        .await;
+
+    let error = handle
+        .rotate_supervisor()
+        .await
+        .expect_err("partial private trust cleanup failure should be typed incomplete");
+    let attempted_public_peer_id = match error {
+        MobError::SupervisorRotationIncomplete {
+            previous_epoch,
+            attempted_epoch,
+            attempted_public_peer_id,
+            rotated_peer_count,
+            rollback_succeeded,
+            pending_authority_recorded,
+            pending_authority_process_local,
+            rollback_error,
+            reason,
+        } => {
+            assert_eq!(previous_epoch, original.epoch);
+            assert_eq!(attempted_epoch, original.epoch + 1);
+            assert_eq!(rotated_peer_count, 0);
+            assert!(!rollback_succeeded);
+            assert!(!pending_authority_recorded);
+            assert!(!pending_authority_process_local);
+            assert!(
+                rollback_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("supervisor private trust cleanup failed")),
+                "cleanup failure must be represented as rollback failure, got: {rollback_error:?}"
+            );
+            assert!(
+                reason.contains("cleanup failed while removing new supervisor trust"),
+                "cleanup failure should be visible, got: {reason}"
+            );
+            attempted_public_peer_id
+        }
+        other => panic!("expected typed incomplete supervisor rotation, got: {other:?}"),
+    };
+
+    let after_failure = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load authority after failed activation")
+        .expect("authority after failed activation");
+    assert_eq!(after_failure.epoch, original.epoch);
+    assert_eq!(after_failure.public_peer_id, original.public_peer_id);
+    assert!(after_failure.pending_rotation.is_none());
+    let trusted = member_comms.trusted_peers.read().await;
+    assert!(trusted.contains_key(&original.public_peer_id));
+    assert!(
+        trusted.contains_key(&attempted_public_peer_id),
+        "failed cleanup should be explicit because attempted trust remains installed"
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_supervisor_private_trust_ack_rejection_cleans_attempted_authority() {
+    let definition = with_unique_mob_id(
+        sample_definition(),
+        "rotate-supervisor-private-trust-ack-rejection",
+    );
+    let mob_id = definition.id.clone();
+    let runtime_metadata = Arc::new(FaultInjectedRuntimeMetadataStore::new());
+    let storage = MobStorage::with_events_and_runtime_metadata(
+        Arc::new(InMemoryMobEventStore::new()),
+        runtime_metadata.clone(),
+    );
+    let service = Arc::new(MockSessionService::new());
+    let adapter = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let receipt = handle
+        .spawn(
+            ProfileName::from("worker"),
+            MeerkatId::from("w-private"),
+            None,
+        )
+        .await
+        .expect("spawn session-backed member");
+    let session_id = receipt
+        .bridge_session_id()
+        .cloned()
+        .expect("session-backed member has bridge session id");
+    let comms_name = test_comms_name_for(&mob_id, "worker", "w-private");
+    let member_comms = {
+        let sessions = service.sessions.read().await;
+        sessions
+            .get(&session_id)
+            .cloned()
+            .expect("member comms runtime")
+    };
+    let original = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load original authority")
+        .expect("original authority record");
+    service
+        .set_comms_behavior(
+            &comms_name,
+            MockCommsBehavior {
+                reject_private_publish_ack_after_insert: true,
+                ..MockCommsBehavior::default()
+            },
+        )
+        .await;
+
+    let error = handle
+        .rotate_supervisor()
+        .await
+        .expect_err("rejected private trust ack should be typed incomplete");
+    let attempted_public_peer_id = match error {
+        MobError::SupervisorRotationIncomplete {
+            previous_epoch,
+            attempted_epoch,
+            attempted_public_peer_id,
+            rotated_peer_count,
+            rollback_succeeded,
+            pending_authority_recorded,
+            pending_authority_process_local,
+            reason,
+            ..
+        } => {
+            assert_eq!(previous_epoch, original.epoch);
+            assert_eq!(attempted_epoch, original.epoch + 1);
+            assert_eq!(rotated_peer_count, 0);
+            assert!(rollback_succeeded);
+            assert!(!pending_authority_recorded);
+            assert!(!pending_authority_process_local);
+            assert!(
+                reason.contains("supervisor private trust publication ack rejected"),
+                "ack rejection should be visible, got: {reason}"
+            );
+            attempted_public_peer_id
+        }
+        other => panic!("expected typed incomplete supervisor rotation, got: {other:?}"),
+    };
+
+    let after_failure = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load authority after failed activation")
+        .expect("authority after failed activation");
+    assert_eq!(after_failure.epoch, original.epoch);
+    assert_eq!(after_failure.public_peer_id, original.public_peer_id);
+    assert!(after_failure.pending_rotation.is_none());
+    let trusted = member_comms.trusted_peers.read().await;
+    assert!(trusted.contains_key(&original.public_peer_id));
+    assert!(
+        !trusted.contains_key(&attempted_public_peer_id),
+        "ack rejection cleanup must remove attempted supervisor trust"
+    );
+    drop(trusted);
+    match adapter.supervisor_binding(&session_id).await {
+        meerkat_runtime::meerkat_machine::SupervisorBinding::Bound { peer_id, epoch, .. } => {
+            assert_eq!(peer_id, original.public_peer_id);
+            assert_eq!(epoch, original.epoch);
+        }
+        other => panic!("ack rejection rollback should restore original binding, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_rotate_supervisor_private_trust_ack_rejection_cleanup_failure_is_typed_rollback_failure()
+ {
+    let definition = with_unique_mob_id(
+        sample_definition(),
+        "rotate-supervisor-private-trust-ack-cleanup-fails",
+    );
+    let mob_id = definition.id.clone();
+    let runtime_metadata = Arc::new(FaultInjectedRuntimeMetadataStore::new());
+    let storage = MobStorage::with_events_and_runtime_metadata(
+        Arc::new(InMemoryMobEventStore::new()),
+        runtime_metadata.clone(),
+    );
+    let service = Arc::new(MockSessionService::new());
+    let adapter = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let receipt = handle
+        .spawn(
+            ProfileName::from("worker"),
+            MeerkatId::from("w-private"),
+            None,
+        )
+        .await
+        .expect("spawn session-backed member");
+    let session_id = receipt
+        .bridge_session_id()
+        .cloned()
+        .expect("session-backed member has bridge session id");
+    let comms_name = test_comms_name_for(&mob_id, "worker", "w-private");
+    let member_comms = {
+        let sessions = service.sessions.read().await;
+        sessions
+            .get(&session_id)
+            .cloned()
+            .expect("member comms runtime")
+    };
+    let original = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load original authority")
+        .expect("original authority record");
+    service
+        .set_comms_behavior(
+            &comms_name,
+            MockCommsBehavior {
+                reject_private_publish_ack_after_insert: true,
+                fail_remove_trust_once: true,
+                ..MockCommsBehavior::default()
+            },
+        )
+        .await;
+
+    let error = handle
+        .rotate_supervisor()
+        .await
+        .expect_err("private trust ack cleanup failure should be typed incomplete");
+    let attempted_public_peer_id = match error {
+        MobError::SupervisorRotationIncomplete {
+            previous_epoch,
+            attempted_epoch,
+            attempted_public_peer_id,
+            rotated_peer_count,
+            rollback_succeeded,
+            pending_authority_recorded,
+            pending_authority_process_local,
+            rollback_error,
+            reason,
+        } => {
+            assert_eq!(previous_epoch, original.epoch);
+            assert_eq!(attempted_epoch, original.epoch + 1);
+            assert_eq!(rotated_peer_count, 0);
+            assert!(!rollback_succeeded);
+            assert!(!pending_authority_recorded);
+            assert!(!pending_authority_process_local);
+            assert!(
+                rollback_error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("supervisor private trust cleanup failed")),
+                "cleanup failure must be represented as rollback failure, got: {rollback_error:?}"
+            );
+            assert!(
+                reason.contains("cleanup failed while removing new supervisor trust"),
+                "cleanup failure should be visible, got: {reason}"
+            );
+            attempted_public_peer_id
+        }
+        other => panic!("expected typed incomplete supervisor rotation, got: {other:?}"),
+    };
+
+    let after_failure = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load authority after failed activation")
+        .expect("authority after failed activation");
+    assert_eq!(after_failure.epoch, original.epoch);
+    assert_eq!(after_failure.public_peer_id, original.public_peer_id);
+    assert!(after_failure.pending_rotation.is_none());
+    let trusted = member_comms.trusted_peers.read().await;
+    assert!(trusted.contains_key(&original.public_peer_id));
+    assert!(
+        trusted.contains_key(&attempted_public_peer_id),
+        "failed cleanup should be explicit because attempted trust remains installed"
+    );
+    drop(trusted);
+    match adapter.supervisor_binding(&session_id).await {
+        meerkat_runtime::meerkat_machine::SupervisorBinding::Bound { peer_id, epoch, .. } => {
+            assert_eq!(peer_id, original.public_peer_id);
+            assert_eq!(epoch, original.epoch);
+        }
+        other => panic!("ack rejection rollback should restore original binding, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn test_rotate_supervisor_clear_failure_process_local_empty_pending_starts_fresh_retry() {
+    let _serial = REAL_COMMS_TEST_LOCK.lock().expect("real-comms test lock");
+    let definition = with_unique_mob_id(
+        sample_definition_with_external_backend(),
+        "rotate-supervisor-pending-clear-failure-same-process",
+    );
+    let mob_id = definition.id.clone();
+    let runtime_metadata = Arc::new(FaultInjectedRuntimeMetadataStore::new());
+    let storage = MobStorage::with_events_and_runtime_metadata(
+        Arc::new(InMemoryMobEventStore::new()),
+        runtime_metadata.clone(),
+    );
     let service = Arc::new(MockSessionService::new());
     let _ = service.enable_runtime_adapter();
     let handle = MobBuilder::new(definition, storage)
@@ -6471,49 +8538,371 @@ async fn test_rotate_supervisor_advances_local_authority_when_rollback_fails() {
         .await
         .expect("load original authority")
         .expect("original authority record");
-    external_a.fail_next_bind();
     external_b.fail_next_authorize();
+    let first_error = handle
+        .rotate_supervisor()
+        .await
+        .expect_err("first rotation should persist one accepted peer");
+    let attempted_public_peer_id = match first_error {
+        MobError::SupervisorRotationIncomplete {
+            attempted_public_peer_id,
+            ..
+        } => attempted_public_peer_id,
+        other => panic!("expected typed incomplete supervisor rotation, got: {other:?}"),
+    };
+
+    external_a.forget_supervisor().await;
+    runtime_metadata.fail_next_put_supervisor();
+    handle
+        .internal_turn(
+            AgentIdentity::from("w-a"),
+            ContentInput::from("current-rebind-clear-persistence-fails-same-process".to_string()),
+        )
+        .await
+        .expect_err("pending accepted clear persistence failure should be visible");
+    assert_eq!(
+        external_a.authorized_supervisor_peer_id().await.as_deref(),
+        Some(original.public_peer_id.as_str()),
+        "peer should be rebound to current authority before pending-clear persistence fails"
+    );
+
+    let retry_report = handle
+        .rotate_supervisor()
+        .await
+        .expect("same-process retry should start a fresh rotation after empty pending clear");
+    assert_eq!(retry_report.previous_epoch, original.epoch);
+    assert_eq!(retry_report.current_epoch, original.epoch + 1);
+    assert_ne!(
+        retry_report.public_peer_id, attempted_public_peer_id,
+        "empty process-local pending must clear the abandoned attempted authority"
+    );
+    assert_eq!(
+        external_a.authorized_supervisor_peer_id().await.as_deref(),
+        Some(retry_report.public_peer_id.as_str())
+    );
+    assert_eq!(
+        external_b.authorized_supervisor_peer_id().await.as_deref(),
+        Some(retry_report.public_peer_id.as_str())
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_supervisor_uses_process_local_pending_over_stale_durable_pending() {
+    let _serial = REAL_COMMS_TEST_LOCK.lock().expect("real-comms test lock");
+    let definition = with_unique_mob_id(
+        sample_definition_with_external_backend(),
+        "rotate-supervisor-stale-durable-pending",
+    );
+    let mob_id = definition.id.clone();
+    let runtime_metadata = Arc::new(FaultInjectedRuntimeMetadataStore::new());
+    let storage = MobStorage::with_events_and_runtime_metadata(
+        Arc::new(InMemoryMobEventStore::new()),
+        runtime_metadata.clone(),
+    );
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service)
+        .create()
+        .await
+        .expect("create mob");
+    let external_a = spawn_live_external_peer(&test_comms_name_for(&mob_id, "worker", "w-a")).await;
+    let external_b = spawn_live_external_peer(&test_comms_name_for(&mob_id, "worker", "w-b")).await;
+    let external_c = spawn_live_external_peer(&test_comms_name_for(&mob_id, "worker", "w-c")).await;
+    handle
+        .spawn_with_binding(
+            ProfileName::from("worker"),
+            MeerkatId::from("w-a"),
+            None,
+            external_a.binding(),
+        )
+        .await
+        .expect("spawn first live external worker");
+    handle
+        .spawn_with_binding(
+            ProfileName::from("worker"),
+            MeerkatId::from("w-b"),
+            None,
+            external_b.binding(),
+        )
+        .await
+        .expect("spawn second live external worker");
+    handle
+        .spawn_with_binding(
+            ProfileName::from("worker"),
+            MeerkatId::from("w-c"),
+            None,
+            external_c.binding(),
+        )
+        .await
+        .expect("spawn third live external worker");
+
+    let original = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load original authority")
+        .expect("original authority record");
+    let crate::RuntimeBinding::External {
+        peer_id: external_a_peer_id,
+        ..
+    } = external_a.binding()
+    else {
+        panic!("live external peer should use an external binding");
+    };
+    let crate::RuntimeBinding::External {
+        peer_id: external_b_peer_id,
+        ..
+    } = external_b.binding()
+    else {
+        panic!("live external peer should use an external binding");
+    };
+
+    external_b.fail_next_authorize();
+    let first_error = handle
+        .rotate_supervisor()
+        .await
+        .expect_err("first rotation should persist one accepted peer");
+    let attempted_public_peer_id = match first_error {
+        MobError::SupervisorRotationIncomplete {
+            attempted_public_peer_id,
+            ..
+        } => attempted_public_peer_id,
+        other => panic!("expected typed incomplete supervisor rotation, got: {other:?}"),
+    };
+    let first_pending = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load first pending authority")
+        .expect("first pending authority")
+        .pending_rotation
+        .expect("first incomplete rotation should persist pending authority");
+    assert_eq!(
+        first_pending.accepted_peer_ids,
+        vec![external_a_peer_id.clone()]
+    );
+
+    runtime_metadata.fail_next_put_supervisor();
+    let second_error = handle
+        .rotate_supervisor()
+        .await
+        .expect_err("second retry should retain expanded pending set process-locally");
+    match second_error {
+        MobError::SupervisorRotationIncomplete {
+            rotated_peer_count,
+            pending_authority_recorded,
+            pending_authority_process_local,
+            ..
+        } => {
+            assert_eq!(rotated_peer_count, 2);
+            assert!(
+                !pending_authority_recorded,
+                "fault-injected write should leave durable pending metadata stale"
+            );
+            assert!(
+                pending_authority_process_local,
+                "expanded pending accepted set should be retained process-locally"
+            );
+        }
+        other => panic!("expected typed incomplete supervisor rotation, got: {other:?}"),
+    }
+    let stale_durable = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load stale durable pending")
+        .expect("stale durable pending")
+        .pending_rotation
+        .expect("durable pending should still exist");
+    assert_eq!(
+        stale_durable.accepted_peer_ids,
+        vec![external_a_peer_id],
+        "durable pending metadata should still have the stale accepted set after injected write failure"
+    );
+    assert_eq!(
+        external_b.authorized_supervisor_peer_id().await.as_deref(),
+        Some(attempted_public_peer_id.as_str()),
+        "second retry should leave the newly accepted peer on the attempted authority"
+    );
+
+    let retry_report = handle
+        .rotate_supervisor()
+        .await
+        .expect("same-process retry should use process-local pending over stale durable metadata");
+    assert_eq!(retry_report.previous_epoch, original.epoch);
+    assert_eq!(retry_report.current_epoch, original.epoch + 1);
+    assert_eq!(retry_report.public_peer_id, attempted_public_peer_id);
+    let retried = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load retried authority")
+        .expect("retried authority");
+    assert!(retried.pending_rotation.is_none());
+    assert_eq!(
+        external_a.authorized_supervisor_peer_id().await.as_deref(),
+        Some(retried.public_peer_id.as_str()),
+        "retry should keep the first accepted peer on the committed authority"
+    );
+    assert_eq!(
+        external_b.authorized_supervisor_peer_id().await.as_deref(),
+        Some(retried.public_peer_id.as_str()),
+        "retry should not lose the process-local newly accepted peer"
+    );
+    assert_eq!(
+        external_c.authorized_supervisor_peer_id().await.as_deref(),
+        Some(retried.public_peer_id.as_str()),
+        "retry should rotate the remaining peer before commit"
+    );
+}
+
+#[tokio::test]
+async fn test_rotate_supervisor_restores_live_authority_when_pending_record_write_fails() {
+    let _serial = REAL_COMMS_TEST_LOCK.lock().expect("real-comms test lock");
+    let definition = with_unique_mob_id(
+        sample_definition_with_external_backend(),
+        "rotate-supervisor-pending-write-failure",
+    );
+    let mob_id = definition.id.clone();
+    let runtime_metadata = Arc::new(FaultInjectedRuntimeMetadataStore::new());
+    let storage = MobStorage::with_events_and_runtime_metadata(
+        Arc::new(InMemoryMobEventStore::new()),
+        runtime_metadata.clone(),
+    );
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service)
+        .create()
+        .await
+        .expect("create mob");
+    let external_a = spawn_live_external_peer(&test_comms_name_for(&mob_id, "worker", "w-a")).await;
+    let external_b = spawn_live_external_peer(&test_comms_name_for(&mob_id, "worker", "w-b")).await;
+    handle
+        .spawn_with_binding(
+            ProfileName::from("worker"),
+            MeerkatId::from("w-a"),
+            None,
+            external_a.binding(),
+        )
+        .await
+        .expect("spawn first live external worker");
+    handle
+        .spawn_with_binding(
+            ProfileName::from("worker"),
+            MeerkatId::from("w-b"),
+            None,
+            external_b.binding(),
+        )
+        .await
+        .expect("spawn second live external worker");
+
+    let original = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load original authority")
+        .expect("original authority record");
+    runtime_metadata.fail_next_put_supervisor();
 
     let error = handle
         .rotate_supervisor()
         .await
-        .expect_err("rollback bind failure should abort rotation");
-    assert!(
-        error
-            .to_string()
-            .contains("local supervisor authority advanced"),
-        "rollback failure should explain the local authority cutover, got: {error}"
-    );
+        .expect_err("pending rotation write failure should abort rotation");
+    let (attempted_epoch, attempted_public_peer_id) = match error {
+        MobError::SupervisorRotationIncomplete {
+            previous_epoch,
+            attempted_epoch,
+            attempted_public_peer_id,
+            rotated_peer_count,
+            rollback_succeeded,
+            pending_authority_recorded,
+            pending_authority_process_local,
+            reason,
+            ..
+        } => {
+            assert_eq!(previous_epoch, original.epoch);
+            assert_eq!(attempted_epoch, original.epoch + 1);
+            assert_eq!(rotated_peer_count, 1);
+            assert!(!rollback_succeeded);
+            assert!(
+                !pending_authority_recorded,
+                "fault-injected pending write should not report durable pending metadata"
+            );
+            assert!(
+                pending_authority_process_local,
+                "process-local pending authority should be retained when persistence fails"
+            );
+            assert!(
+                reason.contains("failed to persist pending supervisor rotation"),
+                "pending persistence failure should remain visible, got: {reason}"
+            );
+            (attempted_epoch, attempted_public_peer_id)
+        }
+        other => {
+            panic!("expected typed incomplete rotation after pending write failure, got: {other:?}")
+        }
+    };
 
     let current = runtime_metadata
         .load_supervisor_authority(&mob_id)
         .await
-        .expect("load authority after failed rollback")
-        .expect("authority after failed rollback");
+        .expect("load authority after pending write failure")
+        .expect("authority after pending write failure");
     assert_eq!(
-        current.epoch,
-        original.epoch + 1,
-        "mob should advance to the already-applied next authority when rollback fails"
+        current.epoch, original.epoch,
+        "persisted current authority must remain pre-rotation after pending write failure"
     );
-    assert_ne!(
+    assert_eq!(
         current.public_peer_id, original.public_peer_id,
-        "failed rollback should keep the deterministic next supervisor active locally"
+        "persisted current authority must remain the original peer"
+    );
+    assert!(
+        current.pending_rotation.is_none(),
+        "fault-injected write should leave no persisted pending metadata"
+    );
+    assert_eq!(
+        external_a.authorized_supervisor_peer_id().await.as_deref(),
+        Some(attempted_public_peer_id.as_str()),
+        "first remote accepted the attempted authority before pending persistence failed"
     );
 
     handle
         .internal_turn(
-            AgentIdentity::from("w-a"),
-            ContentInput::from("after-rollback-failure".to_string()),
-        )
-        .await
-        .expect("partially rotated peer should remain controllable");
-    handle
-        .internal_turn(
             AgentIdentity::from("w-b"),
-            ContentInput::from("recover-old-peer".to_string()),
+            ContentInput::from("recover-after-pending-write-failure".to_string()),
         )
         .await
-        .expect("old peer should recover via bind fallback under the advanced supervisor");
+        .expect("live supervisor bridge should be restored before surfacing write failure");
+    assert_eq!(
+        external_b.authorized_supervisor_peer_id().await.as_deref(),
+        Some(original.public_peer_id.as_str()),
+        "current-authority peer should remain controllable after pending write failure"
+    );
+
+    let retry_report = handle
+        .rotate_supervisor()
+        .await
+        .expect("process-local pending authority should allow retry reconciliation");
+    assert_eq!(retry_report.previous_epoch, original.epoch);
+    assert_eq!(retry_report.current_epoch, attempted_epoch);
+    assert_eq!(retry_report.public_peer_id, attempted_public_peer_id);
+    let retried = runtime_metadata
+        .load_supervisor_authority(&mob_id)
+        .await
+        .expect("load retried authority")
+        .expect("retried authority");
+    assert_eq!(retried.public_peer_id, attempted_public_peer_id);
+    assert!(
+        retried.pending_rotation.is_none(),
+        "successful retry should clear process-local pending authority and persist committed authority"
+    );
+    assert_eq!(
+        external_a.authorized_supervisor_peer_id().await.as_deref(),
+        Some(attempted_public_peer_id.as_str()),
+        "retry should keep the already-rotated peer on the committed authority"
+    );
+    assert_eq!(
+        external_b.authorized_supervisor_peer_id().await.as_deref(),
+        Some(attempted_public_peer_id.as_str()),
+        "retry should rotate the peer that rejected the first attempt"
+    );
 }
 
 #[tokio::test]
@@ -18631,6 +21020,12 @@ fn test_supervisor_private_trust_realizes_generated_publish_obligation() {
         ),
         "publish feedback must use the generated obligation fields, not locally reconstructed peer/epoch atoms"
     );
+    assert!(
+        body.contains("supervisor private trust publication ack rejected")
+            && body
+                .contains("cleanup failed while removing new supervisor trust after rejected ack"),
+        "rejected supervisor_trust_publish ack must clean up any attempted private trust before returning"
+    );
 }
 
 #[tokio::test]
@@ -27425,6 +29820,9 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
             format!("invalid_transition:{}->{}", from.as_str(), to.as_str())
         }
         MobError::WiringError(_) => "wiring_error".to_string(),
+        MobError::SupervisorRotationIncomplete { .. } => {
+            "supervisor_rotation_incomplete".to_string()
+        }
         MobError::BridgeCommandRejected { cause, .. } => {
             format!("bridge_command_rejected:{cause:?}")
         }
