@@ -674,6 +674,10 @@ impl RuntimeLoopRunCommitError {
         )
     }
 
+    pub(crate) fn is_boundary_commit(&self) -> bool {
+        matches!(self, Self::BoundaryCommit(_))
+    }
+
     pub(crate) fn into_driver_error(self) -> RuntimeDriverError {
         match self {
             Self::Rejected(err)
@@ -788,6 +792,41 @@ pub(crate) fn machine_apply_run_return_projection(
     // this projection must stay mechanical.
     driver.set_control_projection(next_phase, None, None);
     Ok(())
+}
+
+fn machine_rollback_active_run_after_boundary_commit_failure(
+    driver: &mut DriverEntry,
+    run_id: &RunId,
+    input_ids: &[InputId],
+    next_phase: RuntimeState,
+) -> Result<(), RuntimeDriverError> {
+    driver.rollback_staged(input_ids).map_err(|err| {
+        RuntimeDriverError::Internal(format!(
+            "failed to roll back staged inputs after boundary commit failure: {err}"
+        ))
+    })?;
+    machine_apply_run_return_projection(driver, run_id, RunReturnDisposition::Rollback, next_phase)
+        .map_err(|err| {
+            RuntimeDriverError::Internal(format!(
+                "failed to roll back runtime run after boundary commit failure: {err}"
+            ))
+        })
+}
+
+pub(crate) async fn rollback_runtime_loop_run_after_boundary_commit_failure(
+    driver: &SharedDriver,
+    run_id: &RunId,
+    input_ids: &[InputId],
+) -> Result<(), RuntimeDriverError> {
+    let mut driver = driver.lock().await;
+    let next_phase =
+        crate::runtime_state::run_return_phase_from_pre_run_phase(driver.pre_run_phase());
+    machine_rollback_active_run_after_boundary_commit_failure(
+        &mut driver,
+        run_id,
+        input_ids,
+        next_phase,
+    )
 }
 
 fn machine_apply_turn_run_completed(

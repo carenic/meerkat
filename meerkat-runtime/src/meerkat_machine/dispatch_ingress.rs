@@ -544,21 +544,37 @@ impl MeerkatMachine {
 
                 if let Err(err) = commit_runtime_loop_run(
                     &driver,
-                    run_id,
-                    vec![input_id],
+                    run_id.clone(),
+                    vec![input_id.clone()],
                     output.receipt,
                     output.session_snapshot,
                 )
                 .await
                 {
                     let should_unregister = err.should_unregister_session();
+                    let should_unwind_active_run = err.is_boundary_commit();
                     let err = err.into_driver_error();
+                    let rollback_err = if should_unwind_active_run {
+                        crate::meerkat_machine::rollback_runtime_loop_run_after_boundary_commit_failure(
+                            &driver,
+                            &run_id,
+                            std::slice::from_ref(&input_id),
+                        )
+                        .await
+                        .err()
+                    } else {
+                        None
+                    };
                     if should_unregister {
                         self.unregister_session_inner(&session_id).await;
                     }
-                    return Err(RuntimeDriverError::Internal(format!(
-                        "runtime commit failed: {err}"
-                    )));
+                    let message = match rollback_err {
+                        Some(rollback_err) => format!(
+                            "runtime commit failed: {err}; additionally failed to unwind active run: {rollback_err}"
+                        ),
+                        None => format!("runtime commit failed: {err}"),
+                    };
+                    return Err(RuntimeDriverError::Internal(message));
                 }
 
                 Ok(MeerkatMachineCommandResult::Unit)

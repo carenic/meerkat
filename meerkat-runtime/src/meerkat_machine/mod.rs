@@ -297,6 +297,7 @@ pub(crate) use driver::{
     machine_recover_persistent_driver, machine_recycle_preserving_work, machine_reset,
     machine_retire, machine_select_runtime_loop_batch, machine_stop_runtime,
     machine_unregister_session_projection, prepare_runtime_loop_batch_start,
+    rollback_runtime_loop_run_after_boundary_commit_failure,
 };
 
 pub(crate) mod driver;

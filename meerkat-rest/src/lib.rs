@@ -7328,9 +7328,7 @@ mod tests {
     #[tokio::test]
     async fn rest_peer_terminal_webhook_allows_running_target_when_capacity_full() {
         let temp = TempDir::new().unwrap();
-        let mut state = AppState::load_from(temp.path().to_path_buf())
-            .await
-            .unwrap();
+        let mut state = load_rest_state_with_capacity(&temp, 2).await;
         let calls = Arc::new(AtomicUsize::new(0));
         let release = Arc::new(tokio::sync::Semaphore::new(0));
         state.llm_client_override = Some(Arc::new(BlockingMockLlmClient {
@@ -7430,9 +7428,7 @@ mod tests {
     #[tokio::test]
     async fn rest_peer_terminal_webhook_capacity_full_rejects_before_input_accept() {
         let temp = TempDir::new().unwrap();
-        let mut state = AppState::load_from(temp.path().to_path_buf())
-            .await
-            .unwrap();
+        let mut state = load_rest_state_with_capacity(&temp, 1).await;
         state.llm_client_override = Some(Arc::new(MockLlmClient));
 
         let target_session_id = create_completed_rest_runtime_session(&state).await;
