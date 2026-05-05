@@ -278,6 +278,18 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
         ),
     ];
 
+    if options.runtime_available {
+        methods.push(
+            RpcMethodDescriptor::typed(
+                "help/ask",
+                "Ask Meerkat usage help with the embedded platform skill",
+                "HelpRequest",
+                "HelpResponse",
+            )
+            .with_request_lifecycle(RpcRequestLifecycleRule::LONG_RUNNING_PUBLISH_ON_SUCCESS),
+        );
+    }
+
     if options.blob_enabled {
         methods.extend([
             RpcMethodDescriptor::typed(
@@ -833,6 +845,7 @@ mod tests {
     #[test]
     fn documented_surface_keeps_live_runtime_and_mob_methods() {
         let methods = rpc_method_names(RpcMethodCatalogOptions::documented_surface());
+        assert!(methods.iter().any(|m| m == "help/ask"));
         assert!(methods.iter().any(|m| m == "session/inject_context"));
         assert!(methods.iter().any(|m| m == "runtime/host_info"));
         assert!(methods.iter().any(|m| m == "runtime/capabilities"));
@@ -859,6 +872,12 @@ mod tests {
     }
 
     #[test]
+    fn mini_surface_excludes_runtime_help_method() {
+        let methods = rpc_method_names(RpcMethodCatalogOptions::mini_surface());
+        assert!(!methods.iter().any(|m| m == "help/ask"));
+    }
+
+    #[test]
     fn documented_surface_keeps_live_stream_notifications() {
         let notifications = rpc_notification_names(RpcMethodCatalogOptions::documented_surface());
         assert!(notifications.iter().any(|n| n == "cancel"));
@@ -878,6 +897,10 @@ mod tests {
                 .unwrap_or_else(|| panic!("missing descriptor for {name}"))
         };
 
+        assert_eq!(
+            descriptor("help/ask").request_lifecycle.resolve(None),
+            RequestLifecycle::LongRunningPublishOnSuccess
+        );
         assert_eq!(
             descriptor("turn/start").request_lifecycle.resolve(None),
             RequestLifecycle::LongRunningPublishOnSuccess
@@ -907,6 +930,10 @@ mod tests {
 
     #[test]
     fn mcp_tool_catalog_owns_request_lifecycle_rules() {
+        assert_eq!(
+            mcp_tool_request_lifecycle("meerkat_help"),
+            RequestLifecycle::LongRunningPublishOnSuccess
+        );
         assert_eq!(
             mcp_tool_request_lifecycle("meerkat_run"),
             RequestLifecycle::LongRunningPublishOnSuccess
