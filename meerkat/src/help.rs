@@ -9,15 +9,15 @@ pub use meerkat_contracts::{HelpExecutionMode, HelpRequest, HelpResponse};
 pub const MEERKAT_PLATFORM_SKILL_NAME: &str = "meerkat-platform";
 pub const MEERKAT_CLI_REFERENCE_SKILL_NAME: &str = "meerkat-cli-reference";
 pub const MEERKAT_PLATFORM_SKILL_BODY: &str =
-    include_str!("../../.claude/skills/meerkat-platform/SKILL.md");
+    include_str!("help_content/platform_skill.md");
 pub const MEERKAT_CLI_REFERENCE_SKILL_BODY: &str =
-    include_str!("../../.claude/skills/meerkat-cli-reference/SKILL.md");
+    include_str!("help_content/cli_reference_skill.md");
 pub const MEERKAT_PLATFORM_API_REFERENCE: &str =
-    include_str!("../../.claude/skills/meerkat-platform/references/api_reference.md");
+    include_str!("help_content/api_reference.md");
 pub const MEERKAT_PLATFORM_MOBS_REFERENCE: &str =
-    include_str!("../../.claude/skills/meerkat-platform/references/mobs.md");
+    include_str!("help_content/mobs.md");
 pub const MEERKAT_PLATFORM_MIGRATION_REFERENCE: &str =
-    include_str!("../../.claude/skills/meerkat-platform/references/migration_0_5.md");
+    include_str!("help_content/migration_0_5.md");
 
 pub const MEERKAT_PLATFORM_SKILL_EXTENSIONS: &[(&str, &str)] = &[
     (
