@@ -870,6 +870,7 @@ pub fn agent_event_type(event: &AgentEvent) -> &'static str {
         AgentEvent::ReasoningComplete { .. } => "reasoning_complete",
         AgentEvent::TextDelta { .. } => "text_delta",
         AgentEvent::TextComplete { .. } => "text_complete",
+        AgentEvent::ServerToolContent { .. } => "server_tool_content",
         AgentEvent::ToolCallRequested { .. } => "tool_call_requested",
         AgentEvent::ToolResultReceived { .. } => "tool_result_received",
         AgentEvent::TurnCompleted { .. } => "turn_completed",
@@ -1391,6 +1392,14 @@ pub enum AgentEvent {
 
     /// Text generation complete for this turn
     TextComplete { content: String },
+
+    /// Provider-executed tool content surfaced during a model turn.
+    ServerToolContent {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        name: String,
+        content: Value,
+    },
 
     /// Model requested a tool call
     ToolCallRequested {
