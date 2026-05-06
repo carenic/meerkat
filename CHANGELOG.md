@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-05-06
+
+Meerkat 0.6.1 is a focused patch release for provider-native tool visibility. It restores provider web search plumbing across request injection and response capture, and adds a typed profile visibility seam for image generation in mob/session tooling.
+
+### Added
+
+- **Provider-native search evidence** (#637) — server-executed search output now flows through typed `ServerToolContent` blocks across LLM events, assistant blocks, agent events, and wire projections. Anthropic, OpenAI, and Gemini search/grounding metadata are captured instead of being dropped as unknown content.
+- **Image-generation profile visibility** (#638) — `tools.image_generation` now maps through `ToolCategoryOverride` into session build config and persisted session tooling, so mob profiles can explicitly expose or hide `generate_image` without conflating visibility with substrate availability.
+
+### Fixed
+
+- **Provider web search defaults** (#637) — provider-native web search defaults are no longer suppressed by Meerkat tool category overrides when the selected model supports web search.
+- **Image-generation dispatcher rebinding** (#638) — image-generation visibility overrides are preserved when dispatcher state is rebound, keeping resumed/recovered sessions aligned with the profile contract.
+
 ## [0.6.0] - 2026-05-05
 
 Meerkat 0.6.0 is the machine-authority release. It converges the runtime onto **five canonical machines** generated from a single DSL source of truth, lands **identity-first live voice** so realtime attachment is keyed on stable `AgentIdentity` rather than per-runtime bindings, completes the AuthMachine OAuth freshness model under scoped leases, types every major runtime contract that previously rode on strings or `serde_json::Value`, hardens fail-closed semantics across the runtime/REST/RPC/WASM surfaces, makes durable event storage sequence-authoritative, retires the last legacy compatibility paths from peer ingress and runtime visibility, and ships a realtime audio example plus a documentation refresh for every shipping surface.

@@ -374,6 +374,7 @@ class WireMobToolConfig:
     """Tool configuration embedded in a wire mob profile override."""
     builtins: Optional[bool] = None
     comms: Optional[bool] = None
+    image_generation: Optional[bool] = None
     mcp: Optional[list[str]] = None
     memory: Optional[bool] = None
     mob: Optional[bool] = None
@@ -983,6 +984,7 @@ class MobToolConfigInput:
     """Request payload for MobToolConfigInput."""
     builtins: Optional[bool] = None
     comms: Optional[bool] = None
+    image_generation: Optional[bool] = None
     mcp: Optional[list[str]] = None
     memory: Optional[bool] = None
     mob: Optional[bool] = None

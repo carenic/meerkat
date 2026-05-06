@@ -2925,6 +2925,7 @@
             "default": {
               "builtins": false,
               "comms": false,
+              "image_generation": false,
               "memory": false,
               "mob": false,
               "mob_tasks": false,
@@ -3058,6 +3059,10 @@
             "type": "boolean"
           },
           "comms": {
+            "default": false,
+            "type": "boolean"
+          },
+          "image_generation": {
             "default": false,
             "type": "boolean"
           },
@@ -5215,6 +5220,7 @@
             "default": {
               "builtins": false,
               "comms": false,
+              "image_generation": false,
               "memory": false,
               "mob": false,
               "mob_tasks": false,
@@ -5236,6 +5242,10 @@
             "type": "boolean"
           },
           "comms": {
+            "default": false,
+            "type": "boolean"
+          },
+          "image_generation": {
             "default": false,
             "type": "boolean"
           },
@@ -5977,6 +5987,7 @@
             "default": {
               "builtins": false,
               "comms": false,
+              "image_generation": false,
               "memory": false,
               "mob": false,
               "mob_tasks": false,
@@ -5998,6 +6009,10 @@
             "type": "boolean"
           },
           "comms": {
+            "default": false,
+            "type": "boolean"
+          },
+          "image_generation": {
             "default": false,
             "type": "boolean"
           },
@@ -7906,6 +7921,7 @@
             "default": {
               "builtins": false,
               "comms": false,
+              "image_generation": false,
               "mcp": [],
               "memory": false,
               "mob": false,
@@ -7936,6 +7952,10 @@
             "type": "boolean"
           },
           "comms": {
+            "default": false,
+            "type": "boolean"
+          },
+          "image_generation": {
             "default": false,
             "type": "boolean"
           },

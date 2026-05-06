@@ -267,6 +267,7 @@ export interface MobMemberListEntryWire {
 export interface WireMobToolConfig {
   builtins?: boolean;
   comms?: boolean;
+  image_generation?: boolean;
   mcp?: string[];
   memory?: boolean;
   mob?: boolean;
@@ -720,6 +721,7 @@ export interface MobSupervisorSpecInput {
 export interface MobToolConfigInput {
   builtins?: boolean;
   comms?: boolean;
+  image_generation?: boolean;
   mcp?: string[];
   memory?: boolean;
   mob?: boolean;
