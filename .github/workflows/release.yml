@@ -31,6 +31,14 @@ on:
         required: false
         default: ""
         type: string
+      release_binary_backend:
+        description: "Binary builder for manual release-asset recovery"
+        required: false
+        default: github-hosted
+        type: choice
+        options:
+          - github-hosted
+          - buildbuddy
 
 permissions:
   contents: write
@@ -44,6 +52,7 @@ env:
 #   CARGO_REGISTRY_TOKEN  - crates.io API token
 #   PYPI_API_TOKEN        - PyPI API token (scoped to meerkat-sdk package)
 #   NPM_TOKEN             - npm access token (scoped to @meerkat org or publish)
+#   BUILDBUDDY_API_KEY    - optional owner-only BuildBuddy binary recovery path
 
 jobs:
   release_validate:
@@ -110,9 +119,11 @@ jobs:
   build_binaries:
     name: Build and package surface binaries
     if: >-
-      startsWith(github.ref, 'refs/tags/v') ||
-      (github.event_name == 'workflow_dispatch' &&
-       github.event.inputs.publish_release_assets_only == 'true')
+      (startsWith(github.ref, 'refs/tags/v') ||
+       (github.event_name == 'workflow_dispatch' &&
+        github.event.inputs.publish_release_assets_only == 'true')) &&
+      !(github.event_name == 'workflow_dispatch' &&
+        github.event.inputs.release_binary_backend == 'buildbuddy')
     needs: [release_validate]
     runs-on: ${{ matrix.runs-on }}
     strategy:
@@ -219,13 +230,116 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  build_binaries_buildbuddy:
+    name: Build and package surface binaries via BuildBuddy
+    if: >-
+      github.event_name == 'workflow_dispatch' &&
+      github.event.inputs.publish_release_assets_only == 'true' &&
+      github.event.inputs.release_binary_backend == 'buildbuddy'
+    runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
+    env:
+      BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - bb_command: release-build-linux-x86
+            target: x86_64-unknown-linux-gnu
+            archive_ext: tar.gz
+          - bb_command: release-build-linux-arm64
+            target: aarch64-unknown-linux-gnu
+            archive_ext: tar.gz
+          - bb_command: release-build-macos-arm64
+            target: aarch64-apple-darwin
+            archive_ext: tar.gz
+          - bb_command: release-build-macos-x86
+            target: x86_64-apple-darwin
+            archive_ext: tar.gz
+          - bb_command: release-build-windows-x86
+            target: x86_64-pc-windows-msvc
+            archive_ext: zip
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-buildbuddy-ci
+        with:
+          profile: native
+
+      - name: Build release binaries via BuildBuddy
+        shell: bash
+        env:
+          BUILDBUDDY_BAZEL_COMMAND: ${{ matrix.bb_command }}
+          BUILDBUDDY_OUTPUT_LANE: release-build-${{ matrix.target }}
+          MEERKAT_BUILDBUDDY_OUTPUT_ROOT: ${{ runner.temp }}/bb-release
+        run: scripts/buildbuddy-bazel-poc --jobs=512
+
+      - name: Package artifacts
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
+          ARCHIVE_EXT: ${{ matrix.archive_ext }}
+          BB_OUTPUT_BASE: ${{ runner.temp }}/bb-release-${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          VERSION="${VERSION#v}"
+          VERSION="${VERSION//\//-}"
+          BAZEL_BIN="${BB_OUTPUT_BASE}/execroot/_main/bazel-out"
+
+          declare -A BIN_PATHS=(
+            [rkat]="meerkat-cli/rkat"
+            [rkat-mini]="meerkat-cli/rkat_mini_bin"
+            [rkat-rpc]="meerkat-rpc/rkat_rpc_bin"
+            [rkat-rpc-mini]="meerkat-rpc/rkat_rpc_mini_bin"
+            [rkat-rest]="meerkat-rest/rkat_rest_bin"
+            [rkat-mcp]="meerkat-mcp-server/rkat_mcp_bin"
+          )
+
+          for bin in rkat rkat-mini rkat-rpc rkat-rpc-mini rkat-rest rkat-mcp; do
+            rel_path="${BIN_PATHS[$bin]}"
+            src="$(find "${BAZEL_BIN}" -path "*/${rel_path}" -type f 2>/dev/null | head -1)"
+            artifact_name="${bin}-${VERSION}-${TARGET}.${ARCHIVE_EXT}"
+
+            if [[ -z "$src" ]]; then
+              echo "Missing binary for ${bin} (expected under ${BAZEL_BIN}/*/${rel_path})" >&2
+              find "${BAZEL_BIN}" -type f -name "${bin}*" 2>/dev/null || true
+              exit 1
+            fi
+
+            if [[ "$ARCHIVE_EXT" == "zip" ]]; then
+              7z a -tzip "dist/${artifact_name}" "$src"
+            else
+              tar -czf "dist/${artifact_name}" -C "$(dirname "$src")" "$(basename "$src")"
+            fi
+            echo "packaged=${bin} -> dist/${artifact_name}"
+          done
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: meerkat-${{ matrix.target }}-buildbuddy
+          path: dist/*
+          if-no-files-found: error
+
   publish_github_release:
     name: Publish GitHub release assets
     if: >-
-      startsWith(github.ref, 'refs/tags/v') ||
-      (github.event_name == 'workflow_dispatch' &&
-       github.event.inputs.publish_release_assets_only == 'true')
-    needs: [build_binaries]
+      always() &&
+      (startsWith(github.ref, 'refs/tags/v') ||
+       (github.event_name == 'workflow_dispatch' &&
+        github.event.inputs.publish_release_assets_only == 'true')) &&
+      needs.release_validate.result == 'success' &&
+      (needs.build_binaries.result == 'success' ||
+       needs.build_binaries_buildbuddy.result == 'success')
+    needs: [release_validate, build_binaries, build_binaries_buildbuddy]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
