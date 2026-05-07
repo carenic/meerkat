@@ -158,7 +158,7 @@ pub use event::{
     AgentErrorClass, AgentErrorReport, AgentEvent, AssistantImageEvent, BudgetType, EventEnvelope,
     EventSourceIdentity, ExternalToolDelta, ExternalToolDeltaPhase, ScopedAgentEvent,
     SkillResolutionFailureReason, StreamScopeFrame, ToolCallArguments, ToolCallArgumentsError,
-    ToolConfigChangeOperation, ToolConfigChangeStatus, ToolConfigChangedPayload,
+    ToolConfigChangeOperation, ToolConfigChangeStatus, ToolConfigChangedPayload, TurnErrorMetadata,
     VerboseEventConfig, agent_event_type, compare_event_envelopes, format_verbose_event,
     format_verbose_event_with_config,
 };
