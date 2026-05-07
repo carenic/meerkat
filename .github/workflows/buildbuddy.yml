@@ -85,14 +85,25 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 env:
   CARGO_HOME: /tmp/meerkat-cargo-home
   MEERKAT_BUILDBUDDY: ${{ vars.MEERKAT_BUILDBUDDY || 'false' }}
   MEERKAT_BAZEL_BACKEND: ${{ inputs.backend || 'buildbuddy-hosted' }}
-  BUILDBUDDY_BAZEL_CONFIG: ${{ (inputs.backend || '') == 'gcp-local' && 'gcp-linux' || (inputs.backend || '') == 'gcp-buildbuddy' && 'buildbuddy-linux-rbe' || '' }}
+  BUILDBUDDY_BAZEL_CONFIG: ${{ (inputs.backend || '') == 'gcp-local' && 'gcp-linux' || (inputs.backend || '') == 'gcp-buildbuddy' && 'buildbuddy-linux-gcp-ci-rbe' || '' }}
   BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
   BUILDBUDDY_ENDPOINT: ${{ secrets.BUILDBUDDY_ENDPOINT }}
+  MEERKAT_GCP_PROJECT_ID: ${{ vars.MEERKAT_GCP_PROJECT_ID || 'king-dnn-training-dev' }}
+  MEERKAT_GCP_REGION: ${{ vars.MEERKAT_GCP_REGION || 'europe-west1' }}
+  MEERKAT_GCP_ZONE: ${{ vars.MEERKAT_GCP_ZONE || 'europe-west1-b' }}
+  MEERKAT_GCP_BUILDBUDDY_MIG: ${{ vars.MEERKAT_GCP_BUILDBUDDY_MIG || 'meerkat-bb-exec' }}
+  MEERKAT_GCP_BUILDBUDDY_TARGET_SIZE: ${{ vars.MEERKAT_GCP_BUILDBUDDY_TARGET_SIZE || '12' }}
+  MEERKAT_GCP_BUILDBUDDY_MACHINE_TYPE: ${{ vars.MEERKAT_GCP_BUILDBUDDY_MACHINE_TYPE || 'c3d-standard-30' }}
+  MEERKAT_GCP_BUILDBUDDY_BOOT_DISK_GB: ${{ vars.MEERKAT_GCP_BUILDBUDDY_BOOT_DISK_GB || '1000' }}
+  MEERKAT_BUILDBUDDY_EXECUTOR_POOL: ${{ vars.MEERKAT_BUILDBUDDY_EXECUTOR_POOL || 'meerkat-ci' }}
+  MEERKAT_BUILDBUDDY_CI_IMAGE: ${{ vars.MEERKAT_BUILDBUDDY_CI_IMAGE || 'europe-west1-docker.pkg.dev/king-dnn-training-dev/meerkat-ci/meerkat-ci-rust:1.94.0' }}
+  MEERKAT_HOST_CARGO_HOME: /usr/local/cargo
   ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
   RKAT_ANTHROPIC_API_KEY: ${{ secrets.RKAT_ANTHROPIC_API_KEY }}
   OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -109,9 +120,51 @@ env:
   MEERKAT_BUILDBUDDY_CI_JOBS: ${{ vars.MEERKAT_BUILDBUDDY_CI_JOBS || '8' }}
 
 jobs:
+  gcp-executors-up:
+    name: GCP BuildBuddy executors up
+    if: ${{ (inputs.backend || 'buildbuddy-hosted') == 'gcp-buildbuddy' && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+      - name: Authenticate to GCP with Workload Identity
+        if: ${{ vars.MEERKAT_GCP_WORKLOAD_IDENTITY_PROVIDER != '' && vars.MEERKAT_GCP_SERVICE_ACCOUNT != '' }}
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.MEERKAT_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.MEERKAT_GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ env.MEERKAT_GCP_PROJECT_ID }}
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v3
+      - name: Authenticate to GCP with JSON fallback
+        shell: bash
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
+        run: |
+          if gcloud auth list --filter=status:ACTIVE --format='value(account)' | grep -q .; then
+            exit 0
+          fi
+          if [[ -z "${GOOGLE_APPLICATION_CREDENTIALS_JSON}" ]]; then
+            echo "GCP auth is required for gcp-buildbuddy CI. Configure Workload Identity variables or GOOGLE_APPLICATION_CREDENTIALS_JSON." >&2
+            exit 1
+          fi
+          key_file="${RUNNER_TEMP}/gcp-key.json"
+          printf '%s' "${GOOGLE_APPLICATION_CREDENTIALS_JSON}" > "${key_file}"
+          gcloud auth activate-service-account --key-file "${key_file}"
+          rm -f "${key_file}"
+      - name: Sync BuildBuddy executor secrets
+        shell: bash
+        run: scripts/gcp-buildbuddy-executor-pool sync-secrets
+      - name: Scale up BuildBuddy executors
+        shell: bash
+        run: scripts/gcp-buildbuddy-executor-pool up
+
   gcp-native-submit:
     name: GCP BuildBuddy native submitter
     if: ${{ (inputs.backend || 'buildbuddy-hosted') == 'gcp-buildbuddy' && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
+    needs: [gcp-executors-up]
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
     steps:
       - name: Checkout
@@ -131,6 +184,7 @@ jobs:
   gcp-governance-submit:
     name: GCP BuildBuddy governance submitter
     if: ${{ (inputs.backend || 'buildbuddy-hosted') == 'gcp-buildbuddy' && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
+    needs: [gcp-executors-up]
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
     steps:
       - name: Checkout
@@ -185,6 +239,7 @@ jobs:
   gcp-wasm-feature-submit:
     name: GCP BuildBuddy wasm and feature submitter
     if: ${{ (inputs.backend || 'buildbuddy-hosted') == 'gcp-buildbuddy' && !startsWith(inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh', 'workspace-') && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
+    needs: [gcp-executors-up]
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
     steps:
       - name: Checkout
@@ -204,6 +259,48 @@ jobs:
             test-feature-matrix-lib
             test-feature-matrix-surface-checks
             audit
+
+  gcp-executors-down:
+    name: GCP BuildBuddy executors down
+    if: ${{ always() && (inputs.backend || 'buildbuddy-hosted') == 'gcp-buildbuddy' && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
+    needs:
+      - gcp-native-submit
+      - gcp-governance-submit
+      - gcp-wasm-feature-submit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+      - name: Authenticate to GCP with Workload Identity
+        if: ${{ vars.MEERKAT_GCP_WORKLOAD_IDENTITY_PROVIDER != '' && vars.MEERKAT_GCP_SERVICE_ACCOUNT != '' }}
+        uses: google-github-actions/auth@v3
+        with:
+          workload_identity_provider: ${{ vars.MEERKAT_GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ vars.MEERKAT_GCP_SERVICE_ACCOUNT }}
+          project_id: ${{ env.MEERKAT_GCP_PROJECT_ID }}
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v3
+      - name: Authenticate to GCP with JSON fallback
+        shell: bash
+        env:
+          GOOGLE_APPLICATION_CREDENTIALS_JSON: ${{ secrets.GOOGLE_APPLICATION_CREDENTIALS_JSON }}
+        run: |
+          if gcloud auth list --filter=status:ACTIVE --format='value(account)' | grep -q .; then
+            exit 0
+          fi
+          if [[ -z "${GOOGLE_APPLICATION_CREDENTIALS_JSON}" ]]; then
+            echo "GCP auth is required to scale down gcp-buildbuddy executors." >&2
+            exit 1
+          fi
+          key_file="${RUNNER_TEMP}/gcp-key.json"
+          printf '%s' "${GOOGLE_APPLICATION_CREDENTIALS_JSON}" > "${key_file}"
+          gcloud auth activate-service-account --key-file "${key_file}"
+          rm -f "${key_file}"
+      - name: Scale down BuildBuddy executors
+        shell: bash
+        run: scripts/gcp-buildbuddy-executor-pool down
 
   doctor:
     name: BuildBuddy doctor
@@ -480,9 +577,11 @@ jobs:
   gate:
     name: BuildBuddy CI gate
     needs:
+      - gcp-executors-up
       - gcp-native-submit
       - gcp-governance-submit
       - gcp-wasm-feature-submit
+      - gcp-executors-down
       - doctor
       - fmt-lint
       - sdk-suites

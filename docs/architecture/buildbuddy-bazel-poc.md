@@ -240,6 +240,74 @@ Path selectors cache `cargo metadata` under
 small first-populator lock, so simultaneous agents do not serialize on Cargo
 metadata after the cache is warm.
 
+## GCP CI Shape
+
+Normal GitHub CI now calls this workflow with `backend: gcp-buildbuddy`. In that
+mode GitHub Actions is only the submitter/coordinator:
+
+1. `gcp-control-plane-up` authenticates to GCP, ensures the always-on
+   self-hosted BuildBuddy control plane/cache VM is running, and publishes its
+   HTTP and gRPC endpoints to downstream jobs.
+2. `gcp-executors-up` syncs the self-hosted BuildBuddy gRPC URL/API key into
+   Secret Manager for the executors, creates the executor managed instance group
+   if it is missing, and scales it to
+   `MEERKAT_GCP_BUILDBUDDY_TARGET_SIZE` (default `12`).
+3. Three thin submitter jobs batch the Bazel lanes:
+   - native: `fmt-lint`, `test-unit`, `integration-fast`
+   - governance: `seam-inventory`, `rmat-audit`, and path-aware
+     `machine-authority`
+   - wasm/feature: `sdk-suites`, `wasm-contract-tests`, `wasm-check`,
+     `test-minimal`, `test-feature-matrix-lib`,
+     `test-feature-matrix-surface-checks`, `audit`
+4. Bazel uses `--config=buildbuddy-linux-gcp-ci-rbe`, which selects
+   `//platforms:linux_x86_64_gcp_ci`. That platform routes actions to
+   BuildBuddy pool `meerkat-ci`, enables external network, and runs actions in
+   the pre-baked Artifact Registry image
+   `europe-west1-docker.pkg.dev/king-dnn-training-dev/meerkat-ci/meerkat-ci-rust:1.94.0`.
+5. `gcp-executors-down` always scales the managed instance group back to zero
+   after the submitters finish.
+
+The intended steady-state cost shape is one small always-on BuildBuddy
+backend/cache plus zero idle executor VMs. A CI run bursts the executor MIG to
+the configured size, then parks it again. BuildBuddy CAS/action cache is the
+shared cache across the fleet; the executor VMs get large local SSD-backed boot
+disks for per-VM action/container/cache locality.
+
+The control-plane and executor-pool scripts are intentionally idempotent and
+secret-safe:
+
+```bash
+scripts/gcp-buildbuddy-control-plane status
+scripts/gcp-buildbuddy-control-plane ensure
+scripts/gcp-buildbuddy-control-plane endpoint
+scripts/gcp-buildbuddy-executor-pool status
+scripts/gcp-buildbuddy-executor-pool sync-secrets
+scripts/gcp-buildbuddy-executor-pool up
+scripts/gcp-buildbuddy-executor-pool down
+```
+
+The GCP CI backend refuses hosted `*.buildbuddy.io` endpoints. Hosted
+BuildBuddy remains available to release-specific lanes through the existing
+`buildbuddy-hosted` backend; `gcp-buildbuddy` is reserved for the GCP-owned
+control plane and burst executor fleet. The GCP platform intentionally does not
+set BuildBuddy Cloud's `use-self-hosted-executors` execution property; on the
+self-hosted control plane the GCP executors are the native scheduler pool.
+
+The image bake is explicit and separate from per-PR CI. Rebuild it when
+`Cargo.lock`, crate manifests, Rust toolchain, Node/Python versions, or CI tool
+versions change:
+
+```bash
+scripts/gcp-buildbuddy-ci-image build
+```
+
+`scripts/gcp-buildbuddy-ci-image` creates a manifest-only Docker context,
+fetches the locked Rust dependency graph for Linux and wasm targets into
+`/usr/local/cargo`, and removes the temporary source context from the final
+image. The Bazel cargo-equivalent lanes receive
+`MEERKAT_HOST_CARGO_HOME=/usr/local/cargo` so nested Cargo checks use the baked
+registry instead of starting from an empty test sandbox.
+
 `oai-rt-rs` resolves from crates.io, so the lockfile no longer carries a
 worktree-local vendored path or a generated vendored BUILD file. The wrapper
 still snapshots and restores `MODULE.bazel.lock` around the invocation as a

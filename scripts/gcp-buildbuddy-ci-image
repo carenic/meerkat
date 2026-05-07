@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: gcp-buildbuddy-ci-image [build|context|image]
+
+Builds the pre-baked Linux action image used by GCP BuildBuddy executors. The
+image contains the Rust toolchain, Node, Python, CI tools, and a Cargo registry
+cache fetched from the checked-in manifests and Cargo.lock. It intentionally
+does not keep the latest source tree in the final image.
+
+Environment:
+  MEERKAT_GCP_PROJECT_ID       GCP project (default: king-dnn-training-dev)
+  MEERKAT_GCP_REGION           Artifact Registry region (default: europe-west1)
+  MEERKAT_CI_IMAGE_REPOSITORY  Artifact Registry repo (default: meerkat-ci)
+  MEERKAT_CI_IMAGE_NAME        Image name (default: meerkat-ci-rust)
+  MEERKAT_RUST_TOOLCHAIN       Rust/image tag (default: rust-toolchain.toml channel)
+  MEERKAT_CI_BASE_IMAGE        Base image to extend (default: current target tag)
+EOF
+}
+
+workspace_root="$(git rev-parse --show-toplevel)"
+cd "${workspace_root}"
+
+project="${MEERKAT_GCP_PROJECT_ID:-king-dnn-training-dev}"
+region="${MEERKAT_GCP_REGION:-europe-west1}"
+repository="${MEERKAT_CI_IMAGE_REPOSITORY:-meerkat-ci}"
+image_name="${MEERKAT_CI_IMAGE_NAME:-meerkat-ci-rust}"
+rust_toolchain="${MEERKAT_RUST_TOOLCHAIN:-$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml | head -1)}"
+if [[ -z "${rust_toolchain}" ]]; then
+  echo "error: could not determine Rust toolchain" >&2
+  exit 1
+fi
+
+image="${MEERKAT_CI_IMAGE:-${region}-docker.pkg.dev/${project}/${repository}/${image_name}:${rust_toolchain}}"
+base_image="${MEERKAT_CI_BASE_IMAGE:-${image}}"
+
+make_context() {
+  local context_dir="$1"
+  mkdir -p "${context_dir}"
+
+  git ls-files '*Cargo.toml' 'Cargo.lock' 'rust-toolchain.toml' '.cargo/*' |
+    while IFS= read -r repo_path; do
+      mkdir -p "${context_dir}/$(dirname "${repo_path}")"
+      cp "${repo_path}" "${context_dir}/${repo_path}"
+    done
+
+  python3 - "${context_dir}" <<'PY'
+import pathlib
+import sys
+import tomllib
+
+root = pathlib.Path(sys.argv[1])
+
+def touch(path: pathlib.Path, body: str = "") -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if not path.exists():
+        path.write_text(body, encoding="utf-8")
+
+for manifest in root.rglob("Cargo.toml"):
+    try:
+        data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+    except tomllib.TOMLDecodeError as exc:
+        raise SystemExit(f"failed to parse {manifest}: {exc}") from exc
+
+    crate_dir = manifest.parent
+    package = data.get("package", {})
+    lib = data.get("lib")
+    if isinstance(lib, dict):
+        touch(crate_dir / lib.get("path", "src/lib.rs"), "pub fn __ci_image_dummy() {}\n")
+    elif package:
+        touch(crate_dir / "src/lib.rs", "pub fn __ci_image_dummy() {}\n")
+
+    bins = data.get("bin", [])
+    if isinstance(bins, list):
+        for index, item in enumerate(bins):
+            if isinstance(item, dict):
+                default = f"src/bin/{item.get('name', f'dummy_{index}')}.rs"
+                touch(crate_dir / item.get("path", default), "fn main() {}\n")
+    elif package:
+        touch(crate_dir / "src/main.rs", "fn main() {}\n")
+
+    defaults = {
+        "test": "tests",
+        "bench": "benches",
+        "example": "examples",
+    }
+    for key, directory in defaults.items():
+        entries = data.get(key, [])
+        if not isinstance(entries, list):
+            continue
+        for index, item in enumerate(entries):
+            if isinstance(item, dict):
+                default = f"{directory}/{item.get('name', f'dummy_{index}')}.rs"
+                touch(crate_dir / item.get("path", default), "fn main() {}\n")
+
+    if package:
+        touch(crate_dir / "build.rs", "fn main() {}\n")
+PY
+
+  cat >"${context_dir}/Dockerfile" <<EOF
+FROM ${base_image}
+
+ENV CARGO_HOME=/usr/local/cargo \\
+    RUSTUP_HOME=/usr/local/rustup \\
+    PATH=/usr/local/cargo/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+
+WORKDIR /workspace
+COPY . /workspace
+
+RUN /usr/local/cargo/bin/rustup target add wasm32-unknown-unknown --toolchain ${rust_toolchain} && \\
+    /usr/local/cargo/bin/cargo fetch --locked --target x86_64-unknown-linux-gnu --target wasm32-unknown-unknown && \\
+    chmod -R a+rwX /usr/local/cargo && \\
+    rm -rf /workspace
+
+WORKDIR /workspace
+EOF
+}
+
+command="${1:-build}"
+case "${command}" in
+  image)
+    printf '%s\n' "${image}"
+    ;;
+  context)
+    out="${2:-}"
+    if [[ -z "${out}" ]]; then
+      echo "error: context requires an output directory" >&2
+      usage >&2
+      exit 2
+    fi
+    make_context "${out}"
+    ;;
+  build)
+    tmpdir="$(mktemp -d)"
+    trap 'rm -rf "${tmpdir}"' EXIT
+    context_dir="${tmpdir}/context"
+    make_context "${context_dir}"
+    gcloud builds submit "${context_dir}" \
+      --project "${project}" \
+      --region "${region}" \
+      --tag "${image}" \
+      --machine-type=e2-highcpu-32 \
+      --quiet
+    ;;
+  -h|--help)
+    usage
+    ;;
+  *)
+    echo "unknown command: ${command}" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

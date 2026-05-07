@@ -137,6 +137,15 @@ e2e_test_env=(
   --test_env=MEERKAT_CLEAN_E2E_SCENARIO_TARGETS
   --test_env=MEERKAT_STRICT_E2E_PREREQS=1
 )
+gcp_buildbuddy_test_env=()
+if [[ "${meerkat_bazel_backend}" == "gcp-buildbuddy" ]]; then
+  gcp_cargo_home="${MEERKAT_HOST_CARGO_HOME:-/usr/local/cargo}"
+  gcp_buildbuddy_test_env+=(
+    --test_env="CARGO_HOME=${gcp_cargo_home}"
+    --test_env="MEERKAT_HOST_CARGO_HOME=${gcp_cargo_home}"
+    --test_env=CARGO_NET_GIT_FETCH_WITH_CLI=true
+  )
+fi
 case "${command}" in
   workspace-test)
     command="test"
@@ -821,6 +830,9 @@ if [[ "${meerkat_bazel_backend}" != "gcp-local" && -n "${BUILDBUDDY_ENDPOINT:-}"
 fi
 if [[ "${#apple_platform_args[@]}" -gt 0 ]]; then
   bb_args+=("${apple_platform_args[@]}")
+fi
+if [[ "${#gcp_buildbuddy_test_env[@]}" -gt 0 ]]; then
+  bb_args+=("${gcp_buildbuddy_test_env[@]}")
 fi
 if [[ "${#extra_args[@]}" -gt 0 ]]; then
   bb_args+=("${extra_args[@]}")

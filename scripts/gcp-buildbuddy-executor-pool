@@ -1,0 +1,374 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: gcp-buildbuddy-executor-pool <status|ensure|up|down|sync-secrets|wait>
+
+Manages the burst GCP BuildBuddy executor pool used by CI. GitHub Actions is a
+thin submitter; this script owns the GCP managed instance group that runs the
+actual BuildBuddy executors.
+
+Environment:
+  MEERKAT_GCP_PROJECT_ID                 GCP project (default: king-dnn-training-dev)
+  MEERKAT_GCP_REGION                     GCP region (default: europe-west1)
+  MEERKAT_GCP_ZONE                       GCP zone (default: europe-west1-b)
+  MEERKAT_GCP_BUILDBUDDY_MIG             MIG name (default: meerkat-bb-exec)
+  MEERKAT_GCP_BUILDBUDDY_TEMPLATE        Instance template name
+  MEERKAT_GCP_BUILDBUDDY_TARGET_SIZE     Executor VM count for up (default: 12)
+  MEERKAT_GCP_BUILDBUDDY_MACHINE_TYPE    Executor machine (default: c3d-standard-30)
+  MEERKAT_GCP_BUILDBUDDY_BOOT_DISK_GB    Boot/cache disk size (default: 1000)
+  MEERKAT_BUILDBUDDY_EXECUTOR_POOL       BuildBuddy pool name (default: meerkat-ci)
+  MEERKAT_BUILDBUDDY_EXECUTOR_IMAGE      BuildBuddy executor image
+  MEERKAT_BUILDBUDDY_CI_IMAGE            Bazel action container image
+  BUILDBUDDY_ENDPOINT                    Endpoint to sync to Secret Manager
+  BUILDBUDDY_API_KEY                     API key to sync to Secret Manager
+EOF
+}
+
+project="${MEERKAT_GCP_PROJECT_ID:-${GCP_PROJECT_ID:-king-dnn-training-dev}}"
+region="${MEERKAT_GCP_REGION:-europe-west1}"
+zone="${MEERKAT_GCP_ZONE:-europe-west1-b}"
+mig="${MEERKAT_GCP_BUILDBUDDY_MIG:-meerkat-bb-exec}"
+template="${MEERKAT_GCP_BUILDBUDDY_TEMPLATE:-${mig}-template-v1}"
+target_size="${MEERKAT_GCP_BUILDBUDDY_TARGET_SIZE:-12}"
+machine_type="${MEERKAT_GCP_BUILDBUDDY_MACHINE_TYPE:-c3d-standard-30}"
+boot_disk_gb="${MEERKAT_GCP_BUILDBUDDY_BOOT_DISK_GB:-1000}"
+pool="${MEERKAT_BUILDBUDDY_EXECUTOR_POOL:-meerkat-ci}"
+executor_image="${MEERKAT_BUILDBUDDY_EXECUTOR_IMAGE:-buildbuddy.bbcr.io/public/buildbuddy-executor-enterprise:enterprise-v2.265.0}"
+ci_image="${MEERKAT_BUILDBUDDY_CI_IMAGE:-europe-west1-docker.pkg.dev/king-dnn-training-dev/meerkat-ci/meerkat-ci-rust:1.94.0}"
+api_key_secret="${MEERKAT_BUILDBUDDY_API_KEY_SECRET:-buildbuddy-api-key}"
+endpoint_secret="${MEERKAT_BUILDBUDDY_ENDPOINT_SECRET:-buildbuddy-endpoint}"
+service_account_name="${MEERKAT_GCP_BUILDBUDDY_SERVICE_ACCOUNT_NAME:-meerkat-bb-executor}"
+service_account="${MEERKAT_GCP_BUILDBUDDY_SERVICE_ACCOUNT:-${service_account_name}@${project}.iam.gserviceaccount.com}"
+labels="purpose=buildbuddy-executor,repo=meerkat,pool=${pool}"
+
+require_gcloud() {
+  if ! command -v gcloud >/dev/null 2>&1; then
+    echo "error: gcloud is required" >&2
+    exit 1
+  fi
+}
+
+normalize_endpoint() {
+  local endpoint="$1"
+  endpoint="${endpoint#http://}"
+  endpoint="${endpoint#https://}"
+  endpoint="${endpoint#grpc://}"
+  endpoint="${endpoint#grpcs://}"
+  endpoint="${endpoint%/}"
+  printf '%s\n' "${endpoint}"
+}
+
+ensure_not_hosted_endpoint() {
+  local endpoint
+  endpoint="$(normalize_endpoint "$1")"
+  if [[ "${endpoint}" == "remote.buildbuddy.io" || "${endpoint}" == "app.buildbuddy.io" ]]; then
+    echo "error: refusing to configure hosted BuildBuddy endpoint for GCP CI" >&2
+    exit 1
+  fi
+}
+
+secret_exists() {
+  gcloud secrets describe "$1" --project "${project}" >/dev/null 2>&1
+}
+
+secret_latest() {
+  gcloud secrets versions access latest --secret "$1" --project "${project}" 2>/dev/null || true
+}
+
+sync_secret_value() {
+  local name="$1"
+  local value="$2"
+  if [[ -z "${value}" ]]; then
+    echo "error: ${name} value is empty" >&2
+    exit 1
+  fi
+  if ! secret_exists "${name}"; then
+    gcloud secrets create "${name}" \
+      --project "${project}" \
+      --replication-policy=automatic \
+      --quiet >/dev/null
+  fi
+  if [[ "$(secret_latest "${name}")" == "${value}" ]]; then
+    echo "secret ${name}: already current"
+    return
+  fi
+  printf '%s' "${value}" |
+    gcloud secrets versions add "${name}" \
+      --project "${project}" \
+      --data-file=- \
+      --quiet >/dev/null
+  echo "secret ${name}: updated"
+}
+
+sync_secrets() {
+  require_gcloud
+  if [[ -z "${BUILDBUDDY_ENDPOINT:-}" ]]; then
+    echo "error: BUILDBUDDY_ENDPOINT is required to sync executor secrets" >&2
+    exit 1
+  fi
+  if [[ -z "${BUILDBUDDY_API_KEY:-}" ]]; then
+    echo "error: BUILDBUDDY_API_KEY is required to sync executor secrets" >&2
+    exit 1
+  fi
+  ensure_not_hosted_endpoint "${BUILDBUDDY_ENDPOINT}"
+  sync_secret_value "${endpoint_secret}" "$(normalize_endpoint "${BUILDBUDDY_ENDPOINT}")"
+  sync_secret_value "${api_key_secret}" "${BUILDBUDDY_API_KEY}"
+}
+
+ensure_service_account() {
+  require_gcloud
+  if ! gcloud iam service-accounts describe "${service_account}" --project "${project}" >/dev/null 2>&1; then
+    gcloud iam service-accounts create "${service_account_name}" \
+      --project "${project}" \
+      --display-name "Meerkat BuildBuddy executor" \
+      --quiet
+  fi
+
+  local role
+  for role in \
+    roles/artifactregistry.reader \
+    roles/logging.logWriter \
+    roles/monitoring.metricWriter \
+    roles/secretmanager.secretAccessor; do
+    gcloud projects add-iam-policy-binding "${project}" \
+      --member "serviceAccount:${service_account}" \
+      --role "${role}" \
+      --condition=None \
+      --quiet >/dev/null
+  done
+}
+
+write_startup_script() {
+  local path="$1"
+  cat >"${path}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec > >(tee -a /var/log/meerkat-buildbuddy-executor-startup.log | logger -t meerkat-bb-exec-startup -s 2>/dev/console) 2>&1
+
+PROJECT="${project}"
+POOL="${pool}"
+API_KEY_SECRET="${api_key_secret}"
+ENDPOINT_SECRET="${endpoint_secret}"
+EXECUTOR_IMAGE="${executor_image}"
+CI_IMAGE="${ci_image}"
+LOCAL_CACHE_SIZE_BYTES="${MEERKAT_GCP_BUILDBUDDY_LOCAL_CACHE_BYTES:-700000000000}"
+
+apt-get update -y
+DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl docker.io python3
+systemctl enable --now docker
+
+metadata() {
+  curl -fsS -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/\$1"
+}
+
+access_token() {
+  metadata "instance/service-accounts/default/token" |
+    python3 -c 'import json,sys; print(json.load(sys.stdin)["access_token"])'
+}
+
+secret_value() {
+  local secret="\$1"
+  local token
+  token="\$(access_token)"
+  curl -fsS -H "Authorization: Bearer \${token}" \
+    "https://secretmanager.googleapis.com/v1/projects/\${PROJECT}/secrets/\${secret}/versions/latest:access" |
+    python3 -c 'import base64,json,sys; print(base64.b64decode(json.load(sys.stdin)["payload"]["data"]).decode(), end="")'
+}
+
+endpoint="\$(secret_value "\${ENDPOINT_SECRET}")"
+api_key="\$(secret_value "\${API_KEY_SECRET}")"
+endpoint="\${endpoint#http://}"
+endpoint="\${endpoint#https://}"
+endpoint="\${endpoint#grpc://}"
+endpoint="\${endpoint#grpcs://}"
+endpoint="\${endpoint%/}"
+
+if [[ "\${endpoint}" == "remote.buildbuddy.io" || "\${endpoint}" == "app.buildbuddy.io" ]]; then
+  echo "Refusing hosted BuildBuddy endpoint for self-hosted GCP executor" >&2
+  exit 1
+fi
+
+registry_host="\${CI_IMAGE#docker://}"
+registry_host="\${registry_host%%/*}"
+registry_token="\$(access_token)"
+printf '%s' "\${registry_token}" |
+  docker login "https://\${registry_host}" \
+    --username oauth2accesstoken \
+    --password-stdin
+
+mkdir -p /etc/buildbuddy /buildbuddy/remotebuilds /buildbuddy/filecache
+chmod -R a+rwX /buildbuddy
+
+cat >/etc/buildbuddy/config.yaml <<CONFIG
+executor:
+  api_key: "\${api_key}"
+  app_target: "grpcs://\${endpoint}"
+  root_directory: "/buildbuddy/remotebuilds/"
+  local_cache_directory: "/buildbuddy/filecache/"
+  local_cache_size_bytes: \${LOCAL_CACHE_SIZE_BYTES}
+  enable_oci: true
+  default_isolation_type: "oci"
+  default_image: "\${CI_IMAGE#docker://}"
+  container_registries:
+    - hostnames:
+        - "\${registry_host}"
+      username: "oauth2accesstoken"
+      password: "\${registry_token}"
+CONFIG
+
+docker pull "\${EXECUTOR_IMAGE}"
+docker pull "\${CI_IMAGE#docker://}" || true
+docker rm -f buildbuddy-executor >/dev/null 2>&1 || true
+
+millicpu="\$(nproc)"
+millicpu="\$((millicpu * 1000))"
+memory_bytes="\$(awk '/MemTotal/ { print \$2 * 1024 }' /proc/meminfo)"
+
+docker run -d \
+  --name buildbuddy-executor \
+  --restart unless-stopped \
+  --privileged \
+  --network host \
+  -e "MY_POOL=\${POOL}" \
+  -e "MY_NODENAME=\$(hostname)" \
+  -e "MY_HOSTNAME=\$(hostname -I | awk '{print \$1}')" \
+  -e "SYS_MILLICPU=\${millicpu}" \
+  -e "SYS_MEMORY_BYTES=\${memory_bytes}" \
+  -e PODMAN_IGNORE_CGROUPSV1_WARNING=true \
+  -v /buildbuddy:/buildbuddy \
+  -v /etc/buildbuddy/config.yaml:/config.yaml:ro \
+  "\${EXECUTOR_IMAGE}" \
+  --server_type=buildbuddy-executor
+EOF
+}
+
+template_exists() {
+  gcloud compute instance-templates describe "${template}" --project "${project}" >/dev/null 2>&1
+}
+
+mig_exists() {
+  gcloud compute instance-groups managed describe "${mig}" --project "${project}" --zone "${zone}" >/dev/null 2>&1
+}
+
+ensure_template_and_mig() {
+  require_gcloud
+  ensure_service_account
+  if ! secret_exists "${api_key_secret}"; then
+    echo "error: Secret Manager secret ${api_key_secret} is missing; run sync-secrets first" >&2
+    exit 1
+  fi
+  if ! secret_exists "${endpoint_secret}"; then
+    echo "error: Secret Manager secret ${endpoint_secret} is missing; run sync-secrets first" >&2
+    exit 1
+  fi
+
+  if ! template_exists; then
+    startup_script="$(mktemp)"
+    trap 'rm -f "${startup_script}"' EXIT
+    write_startup_script "${startup_script}"
+    gcloud compute instance-templates create "${template}" \
+      --project "${project}" \
+      --machine-type "${machine_type}" \
+      --boot-disk-size "${boot_disk_gb}GB" \
+      --boot-disk-type pd-ssd \
+      --image-family debian-12 \
+      --image-project debian-cloud \
+      --maintenance-policy TERMINATE \
+      --provisioning-model STANDARD \
+      --service-account "${service_account}" \
+      --scopes cloud-platform \
+      --labels "${labels}" \
+      --metadata-from-file startup-script="${startup_script}" \
+      --quiet
+  fi
+
+  if ! mig_exists; then
+    gcloud compute instance-groups managed create "${mig}" \
+      --project "${project}" \
+      --zone "${zone}" \
+      --base-instance-name "${mig}" \
+      --size 0 \
+      --template "${template}" \
+      --quiet
+  fi
+}
+
+resize_pool() {
+  local size="$1"
+  ensure_template_and_mig
+  gcloud compute instance-groups managed resize "${mig}" \
+    --project "${project}" \
+    --zone "${zone}" \
+    --size "${size}" \
+    --quiet
+}
+
+wait_stable() {
+  require_gcloud
+  if ! mig_exists; then
+    echo "MIG ${mig}: absent"
+    return
+  fi
+  gcloud compute instance-groups managed wait-until "${mig}" \
+    --project "${project}" \
+    --zone "${zone}" \
+    --stable \
+    --timeout "${MEERKAT_GCP_BUILDBUDDY_WAIT_TIMEOUT:-900}"
+}
+
+status() {
+  require_gcloud
+  echo "project=${project} zone=${zone} mig=${mig} template=${template} pool=${pool}"
+  if mig_exists; then
+    gcloud compute instance-groups managed describe "${mig}" \
+      --project "${project}" \
+      --zone "${zone}" \
+      --format='table(name,targetSize,currentActions.creating,currentActions.deleting,currentActions.recreating,currentActions.refreshing,currentActions.restarting,currentActions.verifying)'
+    gcloud compute instance-groups managed list-instances "${mig}" \
+      --project "${project}" \
+      --zone "${zone}" \
+      --format='table(instance.basename(),instanceStatus,currentAction,lastAttempt.errors.errors[0].message)'
+  else
+    echo "MIG ${mig}: absent"
+  fi
+}
+
+command="${1:-status}"
+case "${command}" in
+  status)
+    status
+    ;;
+  sync-secrets)
+    sync_secrets
+    ;;
+  ensure)
+    ensure_template_and_mig
+    status
+    ;;
+  up)
+    size="${2:-${target_size}}"
+    resize_pool "${size}"
+    wait_stable
+    status
+    ;;
+  down)
+    resize_pool 0
+    wait_stable
+    status
+    ;;
+  wait)
+    wait_stable
+    status
+    ;;
+  -h|--help)
+    usage
+    ;;
+  *)
+    echo "unknown command: ${command}" >&2
+    usage >&2
+    exit 2
+    ;;
+esac

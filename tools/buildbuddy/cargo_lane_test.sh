@@ -54,7 +54,7 @@ if [[ -n "${rust_lld_bin}" ]]; then
 fi
 tool_path="$(IFS=:; printf '%s' "${tool_dirs[*]}")"
 export PATH="${tool_path}:${PATH:-/usr/bin:/bin:/usr/sbin:/sbin}"
-export CARGO_HOME="${TEST_TMPDIR}/cargo-home"
+export CARGO_HOME="${MEERKAT_HOST_CARGO_HOME:-${TEST_TMPDIR}/cargo-home}"
 export CARGO_TARGET_DIR="${TEST_TMPDIR}/cargo-target"
 export CARGO_INCREMENTAL=0
 export CARGO_TERM_COLOR=always

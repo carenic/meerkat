@@ -106,7 +106,7 @@ configure_rust() {
     prepend_path "$(dirname "${rust_lld_bin}")"
   fi
 
-  export CARGO_HOME="${TEST_TMPDIR}/cargo-home"
+  export CARGO_HOME="${MEERKAT_HOST_CARGO_HOME:-${TEST_TMPDIR}/cargo-home}"
   export CARGO_TARGET_DIR="${TEST_TMPDIR}/cargo-target"
   export CARGO_INCREMENTAL=0
   export CARGO_TERM_COLOR=always
@@ -136,7 +136,7 @@ configure_rust_with_wasm_target() {
   export RUSTFMT="${sandbox_toolchain}/bin/rustfmt"
   prepend_path "${sandbox_toolchain}/bin"
   prepend_path "${sandbox_toolchain}/lib/rustlib/${host_triple}/bin"
-  export CARGO_HOME="${TEST_TMPDIR}/cargo-home"
+  export CARGO_HOME="${MEERKAT_HOST_CARGO_HOME:-${TEST_TMPDIR}/cargo-home}"
   export CARGO_TARGET_DIR="${TEST_TMPDIR}/cargo-target"
   export CARGO_INCREMENTAL=0
   export CARGO_TERM_COLOR=always
