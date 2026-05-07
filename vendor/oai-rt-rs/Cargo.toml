@@ -27,6 +27,8 @@ url = "2.5"
 tracing = "0.1"
 async-trait = "0.1"
 
+[workspace]
+
 [lints.rust]
 unsafe_code = "forbid"
 

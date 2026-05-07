@@ -903,16 +903,24 @@ impl CoreExecutor for MobSessionRuntimeExecutor {
             .state
             .take_turn_context_for_inputs(&contributing_input_ids)
             .await;
+        // The runtime has already resolved handling_mode routing (Queue vs
+        // Steer) before the executor fires. The session-service start_turn
+        // path only supports Queue — Steer semantics are realized by the
+        // runtime ingress, not by the executor. Similarly, render_metadata
+        // is runtime-owned and must not leak into the session-service path.
+        // Strip both from turn_metadata to prevent the session extracting
+        // them from metadata and overriding the flattened Queue value.
+        let executor_turn_metadata = primitive.turn_metadata().map(|meta| {
+            let mut m = meta.clone();
+            m.handling_mode = Some(meerkat_core::types::HandlingMode::Queue);
+            m.render_metadata = None;
+            m
+        });
         let req = StartTurnRequest {
             prompt: primitive.extract_content_input(),
             system_prompt: None,
-            render_metadata: primitive
-                .turn_metadata()
-                .and_then(|meta| meta.render_metadata.clone()),
-            handling_mode: primitive
-                .turn_metadata()
-                .and_then(|meta| meta.handling_mode)
-                .unwrap_or(meerkat_core::types::HandlingMode::Queue),
+            render_metadata: None,
+            handling_mode: meerkat_core::types::HandlingMode::Queue,
             event_tx: queued_context.map(|context| context.event_tx),
             skill_references: primitive
                 .turn_metadata()
@@ -921,7 +929,7 @@ impl CoreExecutor for MobSessionRuntimeExecutor {
                 .turn_metadata()
                 .and_then(|meta| meta.flow_tool_overlay.clone()),
             pre_turn_context_appends,
-            turn_metadata: primitive.turn_metadata().cloned(),
+            turn_metadata: executor_turn_metadata,
         };
 
         self.session_service

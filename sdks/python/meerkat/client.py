@@ -47,6 +47,7 @@ from .generated.types import (
     MobRotateSupervisorResult,
     MobTurnStartParams,
     RealtimeCapabilitiesResult,
+    RealtimeChannelStatus,
     RealtimeOpenInfo,
     RealtimeOpenRequest,
     RealtimeStatusResult,
@@ -2492,6 +2493,9 @@ class MeerkatClient:
 
     async def realtime_status(self, params: dict[str, Any]) -> RealtimeStatusResult:
         raw = await self._request("realtime/status", _wire_params(params))
+        status_raw = raw.get("status", {})
+        if isinstance(status_raw, dict):
+            raw["status"] = RealtimeChannelStatus(**status_raw)
         return RealtimeStatusResult(**raw)
 
     async def realtime_capabilities(

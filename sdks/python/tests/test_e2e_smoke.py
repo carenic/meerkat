@@ -662,7 +662,7 @@ if include_scenario(58):
             channel = RealtimeChannel.mob_member(client, mob.id, "lead-rt")
             connection = await channel.connect()
             status = await channel.status()
-            assert status.status["state"] in {"opening", "ready", "reconnecting"}
+            assert status.status.state in {"opening", "ready", "reconnecting"}
 
             await connection.send_input(
                 {
@@ -688,7 +688,7 @@ if include_scenario(58):
 
             await mob.force_cancel("lead-rt")
             post_cancel_status = await channel.status()
-            assert post_cancel_status.status["state"] in {
+            assert post_cancel_status.status.state in {
                 "opening",
                 "ready",
                 "reconnecting",
@@ -791,7 +791,7 @@ if include_scenario(64):
             channel = RealtimeChannel.mob_member(client, mob.id, "lead-rt-switch")
             connection = await channel.connect()
             initial_status = await channel.status()
-            assert initial_status.status["state"] in {"opening", "ready", "reconnecting"}
+            assert initial_status.status.state in {"opening", "ready", "reconnecting"}
 
             await connection.send_input(
                 {
@@ -847,12 +847,12 @@ if include_scenario(64):
             # substrate even when the projected attachment state has not yet
             # converged to session-target "ready" semantics.
             settled_status = await channel.status()
-            assert settled_status.status["state"] in {
+            assert settled_status.status.state in {
                 "opening",
                 "ready",
                 "reconnecting",
             }
-            assert settled_status.status["attempt_count"] >= 0
+            assert settled_status.status.attempt_count >= 0
 
             await connection.send_input(
                 {
