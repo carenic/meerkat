@@ -58,7 +58,10 @@ env:
 jobs:
   release_validate:
     name: Validate release state
-    if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.publish_web_sdk_only != 'true' }}
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      (github.event.inputs.publish_web_sdk_only != 'true' &&
+       github.event.inputs.publish_release_assets_only != 'true')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -127,7 +130,6 @@ jobs:
         github.event.inputs.publish_release_assets_only == 'true')) &&
       !(github.event_name == 'workflow_dispatch' &&
         github.event.inputs.release_binary_backend == 'buildbuddy')
-    needs: [release_validate]
     runs-on: ${{ matrix.runs-on }}
     strategy:
       fail-fast: false
@@ -357,7 +359,10 @@ jobs:
       (startsWith(github.ref, 'refs/tags/v') ||
        (github.event_name == 'workflow_dispatch' &&
         github.event.inputs.publish_release_assets_only == 'true')) &&
-      needs.release_validate.result == 'success' &&
+      (needs.release_validate.result == 'success' ||
+       (github.event_name == 'workflow_dispatch' &&
+        github.event.inputs.publish_release_assets_only == 'true' &&
+        needs.release_validate.result == 'skipped')) &&
       (needs.build_binaries.result == 'success' ||
        needs.build_binaries_buildbuddy.result == 'success')
     needs: [release_validate, build_binaries, build_binaries_buildbuddy]
