@@ -1156,6 +1156,14 @@ for (const pkg of localPackages.values()) {
           internalAttrs[rustcEnvIndex] = `    rustc_env = {\n        "CARGO_MANIFEST_DIR": "./meerkat-core",\n        "MEERKAT_AGENT_FACTORY_POLICY_BRIDGE_SYMBOL_SUFFIX": ${q(agentFactoryBridgeSymbolSuffix)},\n    },`;
         }
       }
+      if (key === "meerkat-machine-schema" || key === "meerkat-runtime") {
+        const editionIndex = internalAttrs.indexOf(`    edition = "2024",`);
+        internalAttrs.splice(
+          editionIndex + 1,
+          0,
+          `    rustc_flags = ["-Copt-level=0"],`,
+        );
+      }
       rules.push(`rust_library(\n${internalAttrs.join("\n")}\n)`);
     }
     if (rule === "rust_library") {
