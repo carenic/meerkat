@@ -128,8 +128,19 @@ fn buildbuddy_machine_authority_lane_runs_tlc_machine_verify() {
             && build.contains(
                 "\"@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustc_lib\"",
             )
+            && build.contains("\"tests/rustfmt_host.sh\"")
             && build.contains(
-                "\"RUSTFMT\": \"$(rootpath @@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin)\"",
+                "\"@@rules_rust++rust+rustfmt_nightly-2026-04-16__x86_64-unknown-linux-gnu_tools//:rustfmt_bin\"",
+            )
+            && build.contains(
+                "\"@@rules_rust++rust+rustfmt_nightly-2026-04-16__x86_64-unknown-linux-gnu_tools//:rustc_lib\"",
+            )
+            && build.contains("\"RUSTFMT\": \"$(rootpath tests/rustfmt_host.sh)\"")
+            && build.contains(
+                "\"RUSTFMT_DARWIN\": \"$(rootpath @@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin)\"",
+            )
+            && build.contains(
+                "\"RUSTFMT_LINUX\": \"$(rootpath @@rules_rust++rust+rustfmt_nightly-2026-04-16__x86_64-unknown-linux-gnu_tools//:rustfmt_bin)\"",
             ),
         "machine_verify_all_tlc_test must run xtask with workspace runfiles and hermetic rustfmt"
     );

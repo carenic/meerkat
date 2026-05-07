@@ -1148,9 +1148,16 @@ for (const pkg of localPackages.values()) {
       if (key === "xtask") {
         const rustfmt = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin";
         const rustfmtLib = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustc_lib";
+        const rustfmtLinux = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__x86_64-unknown-linux-gnu_tools//:rustfmt_bin";
+        const rustfmtLinuxLib = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__x86_64-unknown-linux-gnu_tools//:rustc_lib";
+        data.push("tests/rustfmt_host.sh");
         data.push(rustfmt);
         data.push(rustfmtLib);
-        env.push(`        "RUSTFMT": "$(rootpath ${rustfmt})",`);
+        data.push(rustfmtLinux);
+        data.push(rustfmtLinuxLib);
+        env.push(`        "RUSTFMT": "$(rootpath tests/rustfmt_host.sh)",`);
+        env.push(`        "RUSTFMT_DARWIN": "$(rootpath ${rustfmt})",`);
+        env.push(`        "RUSTFMT_LINUX": "$(rootpath ${rustfmtLinux})",`);
         if (readFileSync(target.src_path, "utf8").includes("rev-parse")) {
           env.push(`        "WORKSPACE_ROOT": ".",`);
         }
@@ -1454,6 +1461,8 @@ for (const pkg of localPackages.values()) {
     needsShellTestLoad = true;
     const rustfmt = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin";
     const rustfmtLib = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustc_lib";
+    const rustfmtLinux = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__x86_64-unknown-linux-gnu_tools//:rustfmt_bin";
+    const rustfmtLinuxLib = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__x86_64-unknown-linux-gnu_tools//:rustc_lib";
     rules.push(`sh_test(
     name = "machine_verify_all_tlc_test",
     srcs = ["tests/machine_verify_all_tlc_test.sh"],
@@ -1461,11 +1470,16 @@ for (const pkg of localPackages.values()) {
     data = [
         ":xtask_bin",
         "//:workspace_runfiles",
+        "tests/rustfmt_host.sh",
         "${rustfmtLib}",
         "${rustfmt}",
+        "${rustfmtLinuxLib}",
+        "${rustfmtLinux}",
     ],
     env = {
-        "RUSTFMT": "$(rootpath ${rustfmt})",
+        "RUSTFMT": "$(rootpath tests/rustfmt_host.sh)",
+        "RUSTFMT_DARWIN": "$(rootpath ${rustfmt})",
+        "RUSTFMT_LINUX": "$(rootpath ${rustfmtLinux})",
     },
     size = "enormous",
     timeout = "eternal",
