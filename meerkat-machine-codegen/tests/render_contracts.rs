@@ -124,6 +124,20 @@ fn renders_kernel_seam_composition_with_namespaced_mob_native_helpers() {
 }
 
 #[test]
+fn renders_composition_witness_fairness_in_tlc_safe_chunks() {
+    let rendered = render_composition_semantic_model(&meerkat_mob_seam_composition());
+
+    assert!(rendered.contains("WitnessFairness_basic_round_trip_1 =="));
+    assert!(rendered.contains("    /\\ WitnessFairness_basic_round_trip_1"));
+    assert!(
+        !rendered.lines().any(
+            |line| line.contains("WitnessSpec_basic_round_trip ==") && line.contains("WF_vars")
+        ),
+        "WitnessSpec must reference fairness chunks instead of embedding every WF_vars clause on one line"
+    );
+}
+
+#[test]
 fn renders_machine_mapping_coverage_with_named_items() {
     let coverage = canonical_machine_coverage_manifests()
         .into_iter()

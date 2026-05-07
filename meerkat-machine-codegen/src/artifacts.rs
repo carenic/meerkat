@@ -1063,6 +1063,10 @@ fn composition_witness_spec_name(name: impl AsRef<str>) -> String {
     format!("WitnessSpec_{}", tla_ident(name.as_ref()))
 }
 
+fn composition_witness_fairness_name(name: impl AsRef<str>, index: usize) -> String {
+    format!("WitnessFairness_{}_{}", tla_ident(name.as_ref()), index + 1)
+}
+
 fn composition_witness_state_constraint_name(name: impl AsRef<str>) -> String {
     format!("WitnessStateConstraint_{}", tla_ident(name.as_ref()))
 }
@@ -3975,25 +3979,50 @@ impl<'a> CompositionTlaCompiler<'a> {
         }
         pushln!(&mut out);
 
-        pushln!(&mut out, "Spec == Init /\\ [][Next]_vars");
+        pushln!(&mut out, "Spec ==");
+        pushln!(&mut out, "    /\\ Init");
+        pushln!(&mut out, "    /\\ [][Next]_vars");
+        pushln!(&mut out);
+
         for witness in &self.schema.witnesses {
-            let fairness = self
-                .witness_fairness_clauses(witness)
-                .into_iter()
-                .map(|clause| format!("/\\ WF_vars({clause})"))
-                .collect::<Vec<_>>()
-                .join(" ");
+            let fairness_clauses = self.witness_fairness_clauses(witness);
+            let fairness_chunk_names = fairness_clauses
+                .chunks(24)
+                .enumerate()
+                .map(|(index, chunk)| {
+                    let chunk_name = composition_witness_fairness_name(&witness.name, index);
+                    writeln!(&mut out, "{chunk_name} ==").expect("write to string");
+                    for clause in chunk {
+                        writeln!(&mut out, "    /\\ WF_vars({clause})").expect("write to string");
+                    }
+                    pushln!(&mut out);
+                    chunk_name
+                })
+                .collect::<Vec<_>>();
+
             writeln!(
                 &mut out,
-                "{} == {} /\\ [] [{}]_vars {}",
+                "{} ==",
                 composition_witness_spec_name(&witness.name),
-                composition_witness_init_name(&witness.name),
-                composition_witness_next_name(&witness.name),
-                fairness
             )
             .expect("write to string");
+            writeln!(
+                &mut out,
+                "    /\\ {}",
+                composition_witness_init_name(&witness.name),
+            )
+            .expect("write to string");
+            writeln!(
+                &mut out,
+                "    /\\ [] [{}]_vars",
+                composition_witness_next_name(&witness.name)
+            )
+            .expect("write to string");
+            for chunk_name in fairness_chunk_names {
+                writeln!(&mut out, "    /\\ {chunk_name}").expect("write to string");
+            }
+            pushln!(&mut out);
         }
-        pushln!(&mut out);
         for witness in &self.schema.witnesses {
             for route in &witness.expected_routes {
                 writeln!(
