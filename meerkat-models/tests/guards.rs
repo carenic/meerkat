@@ -63,6 +63,8 @@ const EXPECTED_MODEL_PROFILE_FIELDS: &[&str] = &[
     "supports_web_search",
     "inline_video",
     "vision",
+    "image_input",
+    "image_generation",
     "image_tool_results",
     "realtime",
     "params_schema",

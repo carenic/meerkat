@@ -28492,14 +28492,37 @@ async fn test_root_frame_timeout_cleans_up_inflight_node() {
         .expect("flow status")
         .expect("run exists");
     let frame_id = crate::ids::FrameId::from(format!("{run_id}-root").as_str());
-    let frame = run.frames.get(&frame_id).expect("root frame snapshot");
-    let start_status = frame
+    let mut start_status = run
+        .frames
+        .get(&frame_id)
+        .expect("root frame snapshot")
         .kernel_state
         .node_status
         .get("start-node")
+        .copied()
         .expect("start node status");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while start_status == crate::run::flow_frame::NodeRunStatus::Running
+        && Instant::now() < deadline
+    {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let run = handle
+            .flow_status(run_id.clone())
+            .await
+            .expect("flow status")
+            .expect("run exists");
+        start_status = run
+            .frames
+            .get(&frame_id)
+            .expect("root frame snapshot")
+            .kernel_state
+            .node_status
+            .get("start-node")
+            .copied()
+            .expect("start node status");
+    }
     assert!(
-        *start_status == crate::run::flow_frame::NodeRunStatus::Failed,
+        start_status == crate::run::flow_frame::NodeRunStatus::Failed,
         "timed-out root-frame step should not remain Running after terminalization: {start_status:?}"
     );
 }
