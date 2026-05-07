@@ -52,6 +52,17 @@ SDK_TOOL_DATA = [
     "@python_linux_x86_64//:python",
 ]
 
+CARGO_EQUIVALENT_EXEC_PROPERTIES = {
+    "network": "external",
+    "test.network": "external",
+}
+
+CARGO_EQUIVALENT_TAGS = [
+    "buildbuddy",
+    "cargo-equivalent",
+    "requires-network",
+]
+
 sh_test(
     name = "cargo_available_test",
     srcs = ["cargo_available_test.sh"],
@@ -68,9 +79,10 @@ sh_test(
             ":lane_scripts",
             "//:workspace_runfiles",
         ] + RUST_TOOLCHAIN_DATA,
+        exec_properties = CARGO_EQUIVALENT_EXEC_PROPERTIES,
         size = "enormous",
         timeout = "long",
-        tags = ["buildbuddy", "cargo-equivalent"],
+        tags = CARGO_EQUIVALENT_TAGS,
     )
     for name, lane in {
         "minimal_feature_builds_cargo_equivalent_test": "test-minimal",
@@ -87,9 +99,10 @@ sh_test(
         "@cargo_deny_darwin_arm64//:cargo-deny",
         "@cargo_deny_linux_x86_64//:cargo-deny",
     ] + RUST_TOOLCHAIN_DATA,
+    exec_properties = CARGO_EQUIVALENT_EXEC_PROPERTIES,
     size = "large",
     timeout = "long",
-    tags = ["buildbuddy", "cargo-equivalent"],
+    tags = CARGO_EQUIVALENT_TAGS,
 )
 
 sh_test(
@@ -99,9 +112,10 @@ sh_test(
     data = [
         "//:workspace_runfiles",
     ] + RUST_TOOLCHAIN_DATA + SDK_TOOL_DATA,
+    exec_properties = CARGO_EQUIVALENT_EXEC_PROPERTIES,
     size = "enormous",
     timeout = "eternal",
-    tags = ["buildbuddy", "cargo-equivalent"],
+    tags = CARGO_EQUIVALENT_TAGS,
 )
 
 sh_test(
@@ -111,9 +125,10 @@ sh_test(
     data = [
         "//:workspace_runfiles",
     ] + RUST_TOOLCHAIN_DATA + SDK_TOOL_DATA,
+    exec_properties = CARGO_EQUIVALENT_EXEC_PROPERTIES,
     size = "enormous",
     timeout = "eternal",
-    tags = ["buildbuddy", "cargo-equivalent"],
+    tags = CARGO_EQUIVALENT_TAGS,
 )
 
 sh_test(
@@ -125,9 +140,10 @@ sh_test(
         "@wasm_pack_darwin_arm64//:wasm-pack",
         "@wasm_pack_linux_x86_64//:wasm-pack",
     ] + RUST_TOOLCHAIN_DATA + WASM_RUST_TOOLCHAIN_DATA,
+    exec_properties = CARGO_EQUIVALENT_EXEC_PROPERTIES,
     size = "enormous",
     timeout = "eternal",
-    tags = ["buildbuddy", "cargo-equivalent"],
+    tags = CARGO_EQUIVALENT_TAGS,
 )
 
 sh_test(
@@ -139,7 +155,8 @@ sh_test(
         "@wasm_pack_darwin_arm64//:wasm-pack",
         "@wasm_pack_linux_x86_64//:wasm-pack",
     ] + RUST_TOOLCHAIN_DATA + WASM_RUST_TOOLCHAIN_DATA + SDK_TOOL_DATA,
+    exec_properties = CARGO_EQUIVALENT_EXEC_PROPERTIES,
     size = "enormous",
     timeout = "eternal",
-    tags = ["buildbuddy", "cargo-equivalent"],
+    tags = CARGO_EQUIVALENT_TAGS,
 )
