@@ -21,7 +21,9 @@ Environment:
   MEERKAT_BUILDBUDDY_EXECUTOR_POOL       BuildBuddy pool name (default: meerkat-ci)
   MEERKAT_BUILDBUDDY_EXECUTOR_IMAGE      BuildBuddy executor image
   MEERKAT_BUILDBUDDY_CI_IMAGE            Bazel action container image
-  BUILDBUDDY_ENDPOINT                    Endpoint to sync to Secret Manager
+  MEERKAT_GCP_BUILDBUDDY_MANAGE_IAM      Create/bind executor IAM (default: 0)
+  BUILDBUDDY_GRPC_URL                    Self-hosted BuildBuddy gRPC URL
+  BUILDBUDDY_ENDPOINT                    Back-compat endpoint URL
   BUILDBUDDY_API_KEY                     API key to sync to Secret Manager
 EOF
 }
@@ -30,7 +32,7 @@ project="${MEERKAT_GCP_PROJECT_ID:-${GCP_PROJECT_ID:-king-dnn-training-dev}}"
 region="${MEERKAT_GCP_REGION:-europe-west1}"
 zone="${MEERKAT_GCP_ZONE:-europe-west1-b}"
 mig="${MEERKAT_GCP_BUILDBUDDY_MIG:-meerkat-bb-exec}"
-template="${MEERKAT_GCP_BUILDBUDDY_TEMPLATE:-${mig}-template-v1}"
+template="${MEERKAT_GCP_BUILDBUDDY_TEMPLATE:-${mig}-template-v3}"
 target_size="${MEERKAT_GCP_BUILDBUDDY_TARGET_SIZE:-12}"
 machine_type="${MEERKAT_GCP_BUILDBUDDY_MACHINE_TYPE:-c3d-standard-30}"
 boot_disk_gb="${MEERKAT_GCP_BUILDBUDDY_BOOT_DISK_GB:-1000}"
@@ -41,6 +43,7 @@ api_key_secret="${MEERKAT_BUILDBUDDY_API_KEY_SECRET:-buildbuddy-api-key}"
 endpoint_secret="${MEERKAT_BUILDBUDDY_ENDPOINT_SECRET:-buildbuddy-endpoint}"
 service_account_name="${MEERKAT_GCP_BUILDBUDDY_SERVICE_ACCOUNT_NAME:-meerkat-bb-executor}"
 service_account="${MEERKAT_GCP_BUILDBUDDY_SERVICE_ACCOUNT:-${service_account_name}@${project}.iam.gserviceaccount.com}"
+manage_iam="${MEERKAT_GCP_BUILDBUDDY_MANAGE_IAM:-0}"
 labels="purpose=buildbuddy-executor,repo=meerkat,pool=${pool}"
 
 require_gcloud() {
@@ -50,23 +53,45 @@ require_gcloud() {
   fi
 }
 
-normalize_endpoint() {
+canonical_grpc_url() {
   local endpoint="$1"
-  endpoint="${endpoint#http://}"
-  endpoint="${endpoint#https://}"
+  endpoint="${endpoint%/}"
+  case "${endpoint}" in
+    grpc://*|grpcs://*)
+      printf '%s\n' "${endpoint}"
+      ;;
+    http://*)
+      printf 'grpc://%s\n' "${endpoint#http://}"
+      ;;
+    https://*)
+      printf 'grpcs://%s\n' "${endpoint#https://}"
+      ;;
+    *)
+      printf 'grpcs://%s\n' "${endpoint}"
+      ;;
+  esac
+}
+
+endpoint_host() {
+  local endpoint="$1"
   endpoint="${endpoint#grpc://}"
   endpoint="${endpoint#grpcs://}"
-  endpoint="${endpoint%/}"
+  endpoint="${endpoint#http://}"
+  endpoint="${endpoint#https://}"
+  endpoint="${endpoint%%/*}"
+  endpoint="${endpoint%%:*}"
   printf '%s\n' "${endpoint}"
 }
 
 ensure_not_hosted_endpoint() {
-  local endpoint
-  endpoint="$(normalize_endpoint "$1")"
-  if [[ "${endpoint}" == "remote.buildbuddy.io" || "${endpoint}" == "app.buildbuddy.io" ]]; then
-    echo "error: refusing to configure hosted BuildBuddy endpoint for GCP CI" >&2
-    exit 1
-  fi
+  local host
+  host="$(endpoint_host "$1")"
+  case "${host}" in
+    buildbuddy.io|*.buildbuddy.io)
+      echo "error: refusing to configure hosted BuildBuddy endpoint for GCP CI: ${host}" >&2
+      exit 1
+      ;;
+  esac
 }
 
 secret_exists() {
@@ -104,26 +129,38 @@ sync_secret_value() {
 
 sync_secrets() {
   require_gcloud
-  if [[ -z "${BUILDBUDDY_ENDPOINT:-}" ]]; then
-    echo "error: BUILDBUDDY_ENDPOINT is required to sync executor secrets" >&2
+  local grpc_url
+  grpc_url="${BUILDBUDDY_GRPC_URL:-${BUILDBUDDY_ENDPOINT:-}}"
+  if [[ -z "${grpc_url}" ]]; then
+    echo "error: BUILDBUDDY_GRPC_URL is required to sync executor secrets" >&2
     exit 1
   fi
   if [[ -z "${BUILDBUDDY_API_KEY:-}" ]]; then
     echo "error: BUILDBUDDY_API_KEY is required to sync executor secrets" >&2
     exit 1
   fi
-  ensure_not_hosted_endpoint "${BUILDBUDDY_ENDPOINT}"
-  sync_secret_value "${endpoint_secret}" "$(normalize_endpoint "${BUILDBUDDY_ENDPOINT}")"
+  grpc_url="$(canonical_grpc_url "${grpc_url}")"
+  ensure_not_hosted_endpoint "${grpc_url}"
+  sync_secret_value "${endpoint_secret}" "${grpc_url}"
   sync_secret_value "${api_key_secret}" "${BUILDBUDDY_API_KEY}"
 }
 
 ensure_service_account() {
   require_gcloud
   if ! gcloud iam service-accounts describe "${service_account}" --project "${project}" >/dev/null 2>&1; then
+    if [[ "${manage_iam}" != "1" && "${manage_iam}" != "true" ]]; then
+      echo "error: executor service account ${service_account} is missing" >&2
+      echo "Run with MEERKAT_GCP_BUILDBUDDY_MANAGE_IAM=1 once, or create it during infra bootstrap." >&2
+      exit 1
+    fi
     gcloud iam service-accounts create "${service_account_name}" \
       --project "${project}" \
       --display-name "Meerkat BuildBuddy executor" \
       --quiet
+  fi
+
+  if [[ "${manage_iam}" != "1" && "${manage_iam}" != "true" ]]; then
+    return
   fi
 
   local role
@@ -178,18 +215,25 @@ secret_value() {
     python3 -c 'import base64,json,sys; print(base64.b64decode(json.load(sys.stdin)["payload"]["data"]).decode(), end="")'
 }
 
-endpoint="\$(secret_value "\${ENDPOINT_SECRET}")"
+app_target="\$(secret_value "\${ENDPOINT_SECRET}")"
 api_key="\$(secret_value "\${API_KEY_SECRET}")"
-endpoint="\${endpoint#http://}"
-endpoint="\${endpoint#https://}"
-endpoint="\${endpoint#grpc://}"
-endpoint="\${endpoint#grpcs://}"
-endpoint="\${endpoint%/}"
-
-if [[ "\${endpoint}" == "remote.buildbuddy.io" || "\${endpoint}" == "app.buildbuddy.io" ]]; then
-  echo "Refusing hosted BuildBuddy endpoint for self-hosted GCP executor" >&2
-  exit 1
-fi
+app_target="\${app_target%/}"
+case "\${app_target}" in
+  grpc://*|grpcs://*) ;;
+  http://*) app_target="grpc://\${app_target#http://}" ;;
+  https://*) app_target="grpcs://\${app_target#https://}" ;;
+  *) app_target="grpcs://\${app_target}" ;;
+esac
+endpoint_host="\${app_target#grpc://}"
+endpoint_host="\${endpoint_host#grpcs://}"
+endpoint_host="\${endpoint_host%%/*}"
+endpoint_host="\${endpoint_host%%:*}"
+case "\${endpoint_host}" in
+  buildbuddy.io|*.buildbuddy.io)
+    echo "Refusing hosted BuildBuddy endpoint for self-hosted GCP executor: \${endpoint_host}" >&2
+    exit 1
+    ;;
+esac
 
 registry_host="\${CI_IMAGE#docker://}"
 registry_host="\${registry_host%%/*}"
@@ -205,7 +249,7 @@ chmod -R a+rwX /buildbuddy
 cat >/etc/buildbuddy/config.yaml <<CONFIG
 executor:
   api_key: "\${api_key}"
-  app_target: "grpcs://\${endpoint}"
+  app_target: "\${app_target}"
   root_directory: "/buildbuddy/remotebuilds/"
   local_cache_directory: "/buildbuddy/filecache/"
   local_cache_size_bytes: \${LOCAL_CACHE_SIZE_BYTES}
@@ -225,7 +269,7 @@ docker rm -f buildbuddy-executor >/dev/null 2>&1 || true
 
 millicpu="\$(nproc)"
 millicpu="\$((millicpu * 1000))"
-memory_bytes="\$(awk '/MemTotal/ { print \$2 * 1024 }' /proc/meminfo)"
+memory_bytes="\$(awk '/MemTotal/ { printf "%.0f", \$2 * 1024 }' /proc/meminfo)"
 
 docker run -d \
   --name buildbuddy-executor \
@@ -251,6 +295,28 @@ template_exists() {
 
 mig_exists() {
   gcloud compute instance-groups managed describe "${mig}" --project "${project}" --zone "${zone}" >/dev/null 2>&1
+}
+
+template_self_link() {
+  gcloud compute instance-templates describe "${template}" \
+    --project "${project}" \
+    --format='value(selfLink)'
+}
+
+ensure_mig_template() {
+  local current desired
+  current="$(gcloud compute instance-groups managed describe "${mig}" \
+    --project "${project}" \
+    --zone "${zone}" \
+    --format='value(instanceTemplate)')"
+  desired="$(template_self_link)"
+  if [[ "${current}" != "${desired}" ]]; then
+    gcloud compute instance-groups managed set-instance-template "${mig}" \
+      --project "${project}" \
+      --zone "${zone}" \
+      --template "${template}" \
+      --quiet
+  fi
 }
 
 ensure_template_and_mig() {
@@ -293,6 +359,8 @@ ensure_template_and_mig() {
       --size 0 \
       --template "${template}" \
       --quiet
+  else
+    ensure_mig_template
   fi
 }
 

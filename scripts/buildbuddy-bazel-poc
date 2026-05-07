@@ -91,8 +91,8 @@ if [[ "${meerkat_bazel_backend}" != "gcp-local" && -z "${BUILDBUDDY_API_KEY:-}" 
   echo "error: BUILDBUDDY_API_KEY is not set" >&2
   exit 1
 fi
-if [[ "${meerkat_bazel_backend}" == "gcp-buildbuddy" && -z "${BUILDBUDDY_ENDPOINT:-}" ]]; then
-  echo "error: BUILDBUDDY_ENDPOINT is required for MEERKAT_BAZEL_BACKEND=gcp-buildbuddy" >&2
+if [[ "${meerkat_bazel_backend}" == "gcp-buildbuddy" && -z "${BUILDBUDDY_GRPC_URL:-${BUILDBUDDY_ENDPOINT:-}}" ]]; then
+  echo "error: BUILDBUDDY_GRPC_URL is required for MEERKAT_BAZEL_BACKEND=gcp-buildbuddy" >&2
   exit 1
 fi
 
@@ -815,17 +815,58 @@ if [[ "${meerkat_bazel_backend}" == "gcp-local" ]]; then
 else
   bb_args+=(--remote_header="x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}")
 fi
-if [[ "${meerkat_bazel_backend}" != "gcp-local" && -n "${BUILDBUDDY_ENDPOINT:-}" ]]; then
-  buildbuddy_endpoint="${BUILDBUDDY_ENDPOINT#http://}"
-  buildbuddy_endpoint="${buildbuddy_endpoint#https://}"
-  buildbuddy_endpoint="${buildbuddy_endpoint#grpc://}"
-  buildbuddy_endpoint="${buildbuddy_endpoint#grpcs://}"
-  buildbuddy_endpoint="${buildbuddy_endpoint%/}"
+buildbuddy_remote_url="${BUILDBUDDY_GRPC_URL:-${BUILDBUDDY_ENDPOINT:-}}"
+if [[ "${meerkat_bazel_backend}" != "gcp-local" && -n "${buildbuddy_remote_url}" ]]; then
+  buildbuddy_remote_url="${buildbuddy_remote_url%/}"
+  case "${buildbuddy_remote_url}" in
+    grpc://*|grpcs://*) ;;
+    http://*) buildbuddy_remote_url="grpc://${buildbuddy_remote_url#http://}" ;;
+    https://*) buildbuddy_remote_url="grpcs://${buildbuddy_remote_url#https://}" ;;
+    *) buildbuddy_remote_url="grpcs://${buildbuddy_remote_url}" ;;
+  esac
+
+  buildbuddy_endpoint_host="${buildbuddy_remote_url#grpc://}"
+  buildbuddy_endpoint_host="${buildbuddy_endpoint_host#grpcs://}"
+  buildbuddy_endpoint_host="${buildbuddy_endpoint_host%%/*}"
+  buildbuddy_endpoint_host="${buildbuddy_endpoint_host%%:*}"
+  if [[ "${meerkat_bazel_backend}" == "gcp-buildbuddy" ]]; then
+    case "${buildbuddy_endpoint_host}" in
+      buildbuddy.io|*.buildbuddy.io)
+        echo "error: refusing hosted BuildBuddy endpoint for gcp-buildbuddy: ${buildbuddy_endpoint_host}" >&2
+        exit 1
+        ;;
+    esac
+  fi
+
+  buildbuddy_results_url="${BUILDBUDDY_HTTP_URL:-}"
+  if [[ -z "${buildbuddy_results_url}" ]]; then
+    buildbuddy_endpoint="${buildbuddy_remote_url#grpc://}"
+    buildbuddy_endpoint="${buildbuddy_endpoint#grpcs://}"
+    buildbuddy_endpoint="${buildbuddy_endpoint%%/*}"
+    if [[ "${buildbuddy_remote_url}" == grpc://* ]]; then
+      buildbuddy_endpoint="${buildbuddy_endpoint%:1985}:8080"
+      buildbuddy_results_url="http://${buildbuddy_endpoint}"
+    else
+      buildbuddy_endpoint="${buildbuddy_endpoint%:1986}"
+      buildbuddy_results_url="https://${buildbuddy_endpoint}"
+    fi
+  fi
+  buildbuddy_results_url="${buildbuddy_results_url%/}"
+  case "${buildbuddy_results_url}" in
+    */invocation)
+      buildbuddy_results_url="${buildbuddy_results_url}/"
+      ;;
+    */invocation/)
+      ;;
+    *)
+      buildbuddy_results_url="${buildbuddy_results_url}/invocation/"
+      ;;
+  esac
   bb_args+=(
-    --bes_results_url="https://${buildbuddy_endpoint}/invocation/"
-    --bes_backend="grpcs://${buildbuddy_endpoint}"
-    --remote_cache="grpcs://${buildbuddy_endpoint}"
-    --remote_executor="grpcs://${buildbuddy_endpoint}"
+    --bes_results_url="${buildbuddy_results_url}"
+    --bes_backend="${buildbuddy_remote_url}"
+    --remote_cache="${buildbuddy_remote_url}"
+    --remote_executor="${buildbuddy_remote_url}"
   )
 fi
 if [[ "${#apple_platform_args[@]}" -gt 0 ]]; then

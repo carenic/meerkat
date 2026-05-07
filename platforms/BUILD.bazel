@@ -81,7 +81,6 @@ platform(
         "Pool": "meerkat-ci",
         "container-image": "docker://europe-west1-docker.pkg.dev/king-dnn-training-dev/meerkat-ci/meerkat-ci-rust:1.94.0",
         "network": "external",
-        "use-self-hosted-executors": "true",
     },
     parents = ["@toolchains_buildbuddy//platforms:linux_x86_64"],
 )

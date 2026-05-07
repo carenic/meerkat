@@ -43,7 +43,6 @@ build:buildbuddy-linux-gcp-ci-rbe --config=buildbuddy-linux-rbe
 build:buildbuddy-linux-gcp-ci-rbe --platforms=//platforms:linux_x86_64_gcp_ci
 build:buildbuddy-linux-gcp-ci-rbe --extra_execution_platforms=//platforms:linux_x86_64_gcp_ci
 build:buildbuddy-linux-gcp-ci-rbe --remote_default_exec_properties=Pool=meerkat-ci
-build:buildbuddy-linux-gcp-ci-rbe --remote_default_exec_properties=use-self-hosted-executors=true
 
 build:buildbuddy-linux-arm64-rbe --config=buildbuddy
 build:buildbuddy-linux-arm64-rbe --remote_executor=grpcs://remote.buildbuddy.io

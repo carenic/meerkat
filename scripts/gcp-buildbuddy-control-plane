@@ -1,0 +1,354 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'EOF'
+usage: gcp-buildbuddy-control-plane <status|ensure|start|stop|endpoint|logs>
+
+Manages the always-on GCP BuildBuddy control plane/cache used by CI. The control
+plane stays warm; executor VMs are burst separately by
+scripts/gcp-buildbuddy-executor-pool.
+
+Environment:
+  MEERKAT_GCP_PROJECT_ID                         GCP project
+  MEERKAT_GCP_REGION                             GCP region
+  MEERKAT_GCP_ZONE                               GCP zone
+  MEERKAT_GCP_BUILDBUDDY_CONTROL_INSTANCE        VM name (default: meerkat-bb-control)
+  MEERKAT_GCP_BUILDBUDDY_CONTROL_ADDRESS         Static address name
+  MEERKAT_GCP_BUILDBUDDY_CONTROL_DISK            Persistent data/cache disk name
+  MEERKAT_GCP_BUILDBUDDY_CONTROL_MACHINE_TYPE    VM machine type
+  MEERKAT_GCP_BUILDBUDDY_CONTROL_BOOT_DISK_GB    Boot disk size
+  MEERKAT_GCP_BUILDBUDDY_CONTROL_DATA_DISK_GB    Data/cache disk size
+  MEERKAT_GCP_BUILDBUDDY_CONTROL_IMAGE           BuildBuddy app image
+  MEERKAT_BUILDBUDDY_EXECUTOR_POOL               Default executor pool
+  MEERKAT_BUILDBUDDY_CONTROL_CACHE_BYTES         BuildBuddy disk cache limit
+  MEERKAT_GCP_BUILDBUDDY_MANAGE_IAM              Create/bind IAM (default: 0)
+EOF
+}
+
+project="${MEERKAT_GCP_PROJECT_ID:-${GCP_PROJECT_ID:-king-dnn-training-dev}}"
+region="${MEERKAT_GCP_REGION:-europe-west1}"
+zone="${MEERKAT_GCP_ZONE:-europe-west1-b}"
+instance="${MEERKAT_GCP_BUILDBUDDY_CONTROL_INSTANCE:-meerkat-bb-control}"
+address_name="${MEERKAT_GCP_BUILDBUDDY_CONTROL_ADDRESS:-${instance}-ip}"
+disk_name="${MEERKAT_GCP_BUILDBUDDY_CONTROL_DISK:-${instance}-data}"
+service_account_name="${MEERKAT_GCP_BUILDBUDDY_CONTROL_SERVICE_ACCOUNT_NAME:-meerkat-bb-control}"
+service_account="${MEERKAT_GCP_BUILDBUDDY_CONTROL_SERVICE_ACCOUNT:-${service_account_name}@${project}.iam.gserviceaccount.com}"
+machine_type="${MEERKAT_GCP_BUILDBUDDY_CONTROL_MACHINE_TYPE:-c3d-standard-8}"
+boot_disk_gb="${MEERKAT_GCP_BUILDBUDDY_CONTROL_BOOT_DISK_GB:-50}"
+data_disk_gb="${MEERKAT_GCP_BUILDBUDDY_CONTROL_DATA_DISK_GB:-1000}"
+image="${MEERKAT_GCP_BUILDBUDDY_CONTROL_IMAGE:-gcr.io/flame-public/buildbuddy-app-enterprise:latest}"
+pool="${MEERKAT_BUILDBUDDY_EXECUTOR_POOL:-meerkat-ci}"
+cache_bytes="${MEERKAT_BUILDBUDDY_CONTROL_CACHE_BYTES:-800000000000}"
+manage_iam="${MEERKAT_GCP_BUILDBUDDY_MANAGE_IAM:-0}"
+tags="meerkat-bb-control"
+labels="purpose=buildbuddy-control,repo=meerkat"
+
+require_gcloud() {
+  if ! command -v gcloud >/dev/null 2>&1; then
+    echo "error: gcloud is required" >&2
+    exit 1
+  fi
+}
+
+instance_exists() {
+  gcloud compute instances describe "${instance}" --project "${project}" --zone "${zone}" >/dev/null 2>&1
+}
+
+disk_exists() {
+  gcloud compute disks describe "${disk_name}" --project "${project}" --zone "${zone}" >/dev/null 2>&1
+}
+
+address_exists() {
+  gcloud compute addresses describe "${address_name}" --project "${project}" --region "${region}" >/dev/null 2>&1
+}
+
+firewall_exists() {
+  gcloud compute firewall-rules describe meerkat-bb-control-grpc-http --project "${project}" >/dev/null 2>&1
+}
+
+ensure_service_account() {
+  require_gcloud
+  if ! gcloud iam service-accounts describe "${service_account}" --project "${project}" >/dev/null 2>&1; then
+    if [[ "${manage_iam}" != "1" && "${manage_iam}" != "true" ]]; then
+      echo "error: control-plane service account ${service_account} is missing" >&2
+      echo "Run with MEERKAT_GCP_BUILDBUDDY_MANAGE_IAM=1 once, or create it during infra bootstrap." >&2
+      exit 1
+    fi
+    gcloud iam service-accounts create "${service_account_name}" \
+      --project "${project}" \
+      --display-name "Meerkat BuildBuddy control plane" \
+      --quiet
+  fi
+
+  if [[ "${manage_iam}" != "1" && "${manage_iam}" != "true" ]]; then
+    return
+  fi
+
+  local role
+  for role in \
+    roles/logging.logWriter \
+    roles/monitoring.metricWriter; do
+    gcloud projects add-iam-policy-binding "${project}" \
+      --member "serviceAccount:${service_account}" \
+      --role "${role}" \
+      --condition=None \
+      --quiet >/dev/null
+  done
+}
+
+write_startup_script() {
+  local path="$1"
+  cat >"${path}" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+
+exec > >(tee -a /var/log/meerkat-buildbuddy-control-startup.log | logger -t meerkat-bb-control-startup -s 2>/dev/console) 2>&1
+
+IMAGE="${image}"
+POOL="${pool}"
+CACHE_BYTES="${cache_bytes}"
+
+apt-get update -y
+DEBIAN_FRONTEND=noninteractive apt-get install -y ca-certificates curl docker.io python3 redis-server
+systemctl enable --now docker
+systemctl enable --now redis-server
+
+mkdir -p /data/buildbuddy
+if ! findmnt /data/buildbuddy >/dev/null 2>&1; then
+  device="/dev/disk/by-id/google-bb-data"
+  if [[ -e "\${device}" ]]; then
+    if ! blkid "\${device}" >/dev/null 2>&1; then
+      mkfs.ext4 -F "\${device}"
+    fi
+    mkdir -p /data/buildbuddy
+    if ! grep -q '/data/buildbuddy' /etc/fstab; then
+      echo "\${device} /data/buildbuddy ext4 defaults,nofail 0 2" >> /etc/fstab
+    fi
+    mount /data/buildbuddy
+  fi
+fi
+
+mkdir -p /data/buildbuddy/blobstore /data/buildbuddy/cache /etc/buildbuddy
+chmod -R a+rwX /data/buildbuddy
+
+metadata() {
+  curl -fsS -H "Metadata-Flavor: Google" "http://metadata.google.internal/computeMetadata/v1/\$1"
+}
+
+external_ip="\$(metadata 'instance/network-interfaces/0/access-configs/0/external-ip' || true)"
+internal_ip="\$(metadata 'instance/network-interfaces/0/ip')"
+host="\${external_ip:-\${internal_ip}}"
+http_url="http://\${host}:8080"
+grpc_url="grpc://\${host}:1985"
+
+cat >/etc/buildbuddy/config.yaml <<CONFIG
+app:
+  build_buddy_url: "\${http_url}"
+  events_api_url: "\${grpc_url}"
+  cache_api_url: "\${grpc_url}"
+
+database:
+  data_source: "sqlite3:///data/buildbuddy/buildbuddy.db"
+
+storage:
+  ttl_seconds: 2592000
+  chunk_file_size_bytes: 3000000
+  disk:
+    root_directory: /data/buildbuddy/blobstore
+
+cache:
+  max_size_bytes: \${CACHE_BYTES}
+  disk:
+    root_directory: /data/buildbuddy/cache
+
+auth:
+  enable_anonymous_usage: true
+
+remote_execution:
+  enable_remote_exec: true
+  enable_user_owned_executors: true
+  require_executor_authorization: false
+  default_pool_name: "\${POOL}"
+  redis_target: "127.0.0.1:6379"
+
+disable_telemetry: true
+CONFIG
+
+docker pull "\${IMAGE}"
+docker rm -f buildbuddy-control >/dev/null 2>&1 || true
+docker run -d \
+  --name buildbuddy-control \
+  --restart unless-stopped \
+  --network host \
+  -v /etc/buildbuddy/config.yaml:/config.yaml:ro \
+  -v /data/buildbuddy:/data/buildbuddy \
+  "\${IMAGE}" \
+  --config_file=/config.yaml \
+  --server_type=buildbuddy-server
+EOF
+}
+
+ensure_address() {
+  if ! address_exists; then
+    gcloud compute addresses create "${address_name}" \
+      --project "${project}" \
+      --region "${region}" \
+      --network-tier PREMIUM \
+      --quiet
+  fi
+}
+
+ensure_disk() {
+  if ! disk_exists; then
+    gcloud compute disks create "${disk_name}" \
+      --project "${project}" \
+      --zone "${zone}" \
+      --size "${data_disk_gb}GB" \
+      --type pd-ssd \
+      --labels "${labels}" \
+      --quiet
+  fi
+}
+
+ensure_firewall() {
+  if ! firewall_exists; then
+    gcloud compute firewall-rules create meerkat-bb-control-grpc-http \
+      --project "${project}" \
+      --network default \
+      --allow tcp:8080,tcp:1985 \
+      --source-ranges 0.0.0.0/0 \
+      --target-tags "${tags}" \
+      --description "Allow GitHub submitters and GCP executors to reach Meerkat BuildBuddy control plane" \
+      --quiet
+  fi
+}
+
+ensure_instance() {
+  require_gcloud
+  ensure_service_account
+  ensure_address
+  ensure_disk
+  ensure_firewall
+
+  if instance_exists; then
+    local status
+    status="$(gcloud compute instances describe "${instance}" --project "${project}" --zone "${zone}" --format='value(status)')"
+    if [[ "${status}" == "TERMINATED" ]]; then
+      gcloud compute instances start "${instance}" --project "${project}" --zone "${zone}" --quiet
+    fi
+    return
+  fi
+
+  startup_script="$(mktemp)"
+  trap 'rm -f "${startup_script}"' EXIT
+  write_startup_script "${startup_script}"
+  gcloud compute instances create "${instance}" \
+    --project "${project}" \
+    --zone "${zone}" \
+    --machine-type "${machine_type}" \
+    --boot-disk-size "${boot_disk_gb}GB" \
+    --boot-disk-type pd-ssd \
+    --image-family debian-12 \
+    --image-project debian-cloud \
+    --maintenance-policy MIGRATE \
+    --provisioning-model STANDARD \
+    --service-account "${service_account}" \
+    --scopes cloud-platform \
+    --address "${address_name}" \
+    --tags "${tags}" \
+    --labels "${labels}" \
+    --disk "name=${disk_name},device-name=bb-data,mode=rw,boot=no,auto-delete=no" \
+    --metadata-from-file startup-script="${startup_script}" \
+    --quiet
+}
+
+endpoint() {
+  require_gcloud
+  if ! instance_exists; then
+    echo "error: control-plane instance ${instance} is missing" >&2
+    exit 1
+  fi
+  local ip
+  ip="$(gcloud compute instances describe "${instance}" \
+    --project "${project}" \
+    --zone "${zone}" \
+    --format='value(networkInterfaces[0].accessConfigs[0].natIP)')"
+  if [[ -z "${ip}" ]]; then
+    ip="$(gcloud compute instances describe "${instance}" \
+      --project "${project}" \
+      --zone "${zone}" \
+      --format='value(networkInterfaces[0].networkIP)')"
+  fi
+  case "${1:-plain}" in
+    github-output)
+      {
+        echo "grpc_url=grpc://${ip}:1985"
+        echo "http_url=http://${ip}:8080"
+      } >>"${GITHUB_OUTPUT}"
+      ;;
+    shell)
+      echo "BUILDBUDDY_GRPC_URL=grpc://${ip}:1985"
+      echo "BUILDBUDDY_HTTP_URL=http://${ip}:8080"
+      ;;
+    *)
+      echo "grpc://{ip}:1985" | sed "s/{ip}/${ip}/"
+      echo "http://{ip}:8080" | sed "s/{ip}/${ip}/"
+      ;;
+  esac
+}
+
+status() {
+  require_gcloud
+  echo "project=${project} zone=${zone} instance=${instance} disk=${disk_name}"
+  if instance_exists; then
+    gcloud compute instances describe "${instance}" \
+      --project "${project}" \
+      --zone "${zone}" \
+      --format='table(name,status,machineType.basename(),networkInterfaces[0].networkIP,networkInterfaces[0].accessConfigs[0].natIP)'
+    endpoint shell
+  else
+    echo "instance ${instance}: absent"
+  fi
+}
+
+logs() {
+  require_gcloud
+  gcloud compute ssh "${instance}" \
+    --project "${project}" \
+    --zone "${zone}" \
+    --command='sudo systemctl --no-pager --full status google-startup-scripts.service || true; sudo docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Image}}" || true; sudo docker logs --tail 160 buildbuddy-control || true' \
+    --quiet
+}
+
+command="${1:-status}"
+case "${command}" in
+  status)
+    status
+    ;;
+  ensure|start)
+    ensure_instance
+    status
+    ;;
+  stop)
+    require_gcloud
+    if instance_exists; then
+      gcloud compute instances stop "${instance}" --project "${project}" --zone "${zone}" --quiet
+    fi
+    status
+    ;;
+  endpoint)
+    shift || true
+    endpoint "${1:-plain}"
+    ;;
+  logs)
+    logs
+    ;;
+  -h|--help|help)
+    usage
+    ;;
+  *)
+    usage >&2
+    exit 2
+    ;;
+esac
