@@ -109,6 +109,7 @@ jobs:
         run: make check-rust-release-packaging
 
       - name: Check rkat-mini skill size gate
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.publish_release_assets_only != 'true' }}
         run: make check-mini-skill-size
 
       - name: Verify tag matches version
