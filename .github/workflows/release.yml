@@ -273,6 +273,7 @@ jobs:
         env:
           BUILDBUDDY_BAZEL_COMMAND: ${{ matrix.bb_command }}
           BUILDBUDDY_OUTPUT_LANE: release-build-${{ matrix.target }}
+          BUILDBUDDY_OUTPUT_BASE: ${{ runner.temp }}/bb-release-${{ matrix.target }}
           MEERKAT_BUILDBUDDY_OUTPUT_ROOT: ${{ runner.temp }}/bb-release
         run: scripts/buildbuddy-bazel-poc --jobs=512
 
