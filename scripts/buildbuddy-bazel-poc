@@ -91,6 +91,10 @@ if [[ "${meerkat_bazel_backend}" != "gcp-local" && -z "${BUILDBUDDY_API_KEY:-}" 
   echo "error: BUILDBUDDY_API_KEY is not set" >&2
   exit 1
 fi
+if [[ "${meerkat_bazel_backend}" == "gcp-buildbuddy" && -z "${BUILDBUDDY_ENDPOINT:-}" ]]; then
+  echo "error: BUILDBUDDY_ENDPOINT is required for MEERKAT_BAZEL_BACKEND=gcp-buildbuddy" >&2
+  exit 1
+fi
 
 if [[ -n "${BUILDBUDDY_BB:-}" ]]; then
   bb_bin="${BUILDBUDDY_BB}"
