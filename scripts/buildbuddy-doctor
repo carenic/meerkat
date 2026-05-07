@@ -430,6 +430,21 @@ else
   bad "BuildBuddy release lanes are not aligned with the shipped binary surface set"
 fi
 
+if grep -Fq 'release_backend:' .github/workflows/release.yml &&
+  grep -Fq 'MEERKAT_RELEASE_BUILDBUDDY' .github/workflows/release.yml &&
+  grep -Fq 'release_validate_cargo:' .github/workflows/release.yml &&
+  grep -Fq 'release_validate_buildbuddy:' .github/workflows/release.yml &&
+  grep -Fq 'release_validate_gate:' .github/workflows/release.yml &&
+  grep -Fq 'build_binaries_gate:' .github/workflows/release.yml &&
+  grep -Fq 'lane: release-validate' .github/workflows/release.yml &&
+  grep -Fq 'release-validate-rbe' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'release-validate)' scripts/buildbuddy-ci-lane &&
+  grep -Fq 'release-validate|' scripts/buildbuddy-ci-dispatch; then
+  pass "Release workflow selects Cargo or BuildBuddy validation/build branches behind one backend switch"
+else
+  bad "Release workflow does not match the Cargo/BuildBuddy selected-backend model"
+fi
+
 if awk '
   /sdk-suites-rbe\)/ { lane = "sdk" }
   /wasm-contract-rbe\)/ { lane = "wasm-contract" }

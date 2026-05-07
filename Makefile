@@ -13,7 +13,7 @@ YELLOW := \033[0;33m
 RED := \033[0;31m
 NC := \033[0m
 
-.PHONY: all install-build-deps build test test-unit test-int e2e-fast e2e-build e2e-system e2e-live e2e-smoke e2e-auth test-int-real test-e2e test-all test-minimal test-feature-matrix-lib test-feature-matrix-surface test-feature-matrix test-surface-modularity test-sdk-python test-sdk-typescript test-sdk-suites lint lint-feature-matrix fmt fmt-check audit rust-lane-doctor agent-gate cargo-agent-gate buildbuddy-install buildbuddy-generate buildbuddy-generate-check buildbuddy-doctor buildbuddy-build buildbuddy-check buildbuddy-clippy buildbuddy-lint buildbuddy-test buildbuddy-test-all buildbuddy-test-unit buildbuddy-test-int buildbuddy-e2e-fast buildbuddy-e2e-system buildbuddy-e2e-live buildbuddy-e2e-smoke buildbuddy-e2e-auth buildbuddy-agent-gate buildbuddy-ci-dispatch buildbuddy-fast buildbuddy-benchmark buildbuddy-ci buildbuddy-ci-warm buildbuddy-ci-full buildbuddy-ci-full-warm ci ci-smoke release-preflight release-preflight-smoke publish-dry-run publish-dry-run-python publish-dry-run-typescript release-dry-run release-dry-run-smoke clean doc release install-hooks coverage check help legacy-surface-gate legacy-surface-inventory session-control-gate deprecated-backend-gate deprecated-backend-inventory dogma-cleanup-gate dogma-cleanup-gate-fixtures dogma-cleanup-ci-gate verify-version-parity verify-schema-freshness verify-rpc-surface-alignment verify-sdk-wrapper-freshness check-rust-release-packaging check-mini-skill-size bump-sdk-versions smoke-sdk-python-artifact smoke-sdk-typescript-artifact xtask-build machine-codegen machine-verify machine-check-drift seam-inventory rmat-audit audit-generated-headers
+.PHONY: all install-build-deps build test test-unit test-int e2e-fast e2e-build e2e-system e2e-live e2e-smoke e2e-auth test-int-real test-e2e test-all test-minimal test-feature-matrix-lib test-feature-matrix-surface test-feature-matrix test-surface-modularity test-sdk-python test-sdk-typescript test-sdk-suites lint lint-feature-matrix fmt fmt-check audit rust-lane-doctor agent-gate cargo-agent-gate buildbuddy-install buildbuddy-generate buildbuddy-generate-check buildbuddy-doctor buildbuddy-build buildbuddy-check buildbuddy-clippy buildbuddy-lint buildbuddy-test buildbuddy-test-all buildbuddy-test-unit buildbuddy-test-int buildbuddy-e2e-fast buildbuddy-e2e-system buildbuddy-e2e-live buildbuddy-e2e-smoke buildbuddy-e2e-auth buildbuddy-agent-gate buildbuddy-ci-dispatch buildbuddy-fast buildbuddy-benchmark buildbuddy-ci buildbuddy-ci-warm buildbuddy-ci-full buildbuddy-ci-full-warm ci ci-smoke release-preflight release-preflight-smoke release-workflow release-assets release-packages release-web-sdk publish-dry-run publish-dry-run-python publish-dry-run-typescript release-dry-run release-dry-run-smoke clean doc release install-hooks coverage check help legacy-surface-gate legacy-surface-inventory session-control-gate deprecated-backend-gate deprecated-backend-inventory dogma-cleanup-gate dogma-cleanup-gate-fixtures dogma-cleanup-ci-gate verify-version-parity verify-schema-freshness verify-rpc-surface-alignment verify-sdk-wrapper-freshness check-rust-release-packaging check-mini-skill-size bump-sdk-versions smoke-sdk-python-artifact smoke-sdk-typescript-artifact xtask-build machine-codegen machine-verify machine-check-drift seam-inventory rmat-audit audit-generated-headers
 
 # Default target
 all: ci
@@ -561,6 +561,22 @@ release-preflight-smoke: ci-smoke verify-schema-freshness check-rust-release-pac
 	@echo ""
 	@echo "$(GREEN)Ready for smoke dry-run. Use release-preflight for full checks.$(NC)"
 
+release-workflow:
+	@echo "$(GREEN)Dispatching full release workflow...$(NC)"
+	@scripts/release-workflow-dispatch --mode full
+
+release-assets:
+	@echo "$(GREEN)Dispatching release asset workflow...$(NC)"
+	@scripts/release-workflow-dispatch --mode assets
+
+release-packages:
+	@echo "$(GREEN)Dispatching release package workflow...$(NC)"
+	@scripts/release-workflow-dispatch --mode packages
+
+release-web-sdk:
+	@echo "$(GREEN)Dispatching Web SDK release recovery workflow...$(NC)"
+	@scripts/release-workflow-dispatch --mode web-sdk
+
 # Dry-run publish for Python SDK (build + twine check only)
 publish-dry-run-python:
 	@echo "$(GREEN)Checking Python SDK publish readiness...$(NC)"
@@ -735,6 +751,10 @@ help:
 	@echo "  $(GREEN)regen-schemas$(NC)         - Re-emit schemas + run SDK codegen"
 	@echo "  $(GREEN)release-preflight$(NC)     - Full pre-release checklist (CI + freshness)"
 	@echo "  $(GREEN)release-preflight-smoke$(NC)- Smoke pre-release checklist"
+	@echo "  $(GREEN)release-workflow$(NC)      - Dispatch full release workflow (VERSION=vX.Y.Z; MEERKAT_BUILDBUDDY=1 selects BB)"
+	@echo "  $(GREEN)release-assets$(NC)        - Dispatch binary asset release/recovery workflow"
+	@echo "  $(GREEN)release-packages$(NC)      - Dispatch registry package release/recovery workflow"
+	@echo "  $(GREEN)release-web-sdk$(NC)       - Dispatch Web SDK package recovery workflow"
 	@echo "  $(GREEN)publish-dry-run$(NC)       - Dry-run cargo publish for all crates"
 	@echo "  $(GREEN)publish-dry-run-python$(NC) - Dry-run Python SDK publish check (build + twine check)"
 	@echo "  $(GREEN)publish-dry-run-typescript$(NC)- Dry-run TypeScript SDK publish check (npm publish --dry-run)"

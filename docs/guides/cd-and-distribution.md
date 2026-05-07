@@ -104,8 +104,12 @@ For MCP-style tooling (`claude mcp add`, `npx`), provide a CLI entrypoint packag
 
 ### Job 1 — Validate
 
-- `make ci`
-- `make verify-version-parity`
+- Cargo/GitHub-hosted branch: run the release validation checks directly on
+  GitHub-hosted runners.
+- BuildBuddy branch: run the same release validation contract through
+  `release-validate-rbe`.
+- A release validation gate verifies exactly one branch ran, matching the
+  selected backend.
 
 ### Job 2 — Build matrix
 
@@ -115,14 +119,37 @@ For MCP-style tooling (`claude mcp add`, `npx`), provide a CLI entrypoint packag
   - `ubuntu-latest`
   - `windows-latest`
 - Build release binaries for all required targets.
+- The BuildBuddy branch builds the same binary set through the generated Bazel
+  release lanes.
+- A binary build gate verifies exactly one branch ran, matching the selected
+  backend.
 
-### Owner-only BuildBuddy binary recovery path
+### Release backend selection
 
-BuildBuddy release binaries are an owner-only acceleration/recovery path, not
-the public default. Keep GitHub Actions as the standard release interface for
-contributors and public observers. Repository owners with BuildBuddy access may
-dispatch `release.yml` with `release_binary_backend=buildbuddy`, which routes
-the binary matrix through the generated Bazel release lanes:
+BuildBuddy release validation and binaries are an owner-only acceleration path,
+not the public default. Keep GitHub-hosted release jobs as the standard public
+interface for contributors and observers.
+
+The release workflow has the same selected-backend shape as CI:
+
+- Cargo/GitHub-hosted branch: default public path.
+- BuildBuddy branch: owner-only path when explicitly selected.
+- Gate job: confirms the selected branch passed and the other branch skipped.
+
+For tag-triggered releases, repository owners may set the public repository
+variable `MEERKAT_RELEASE_BUILDBUDDY=1` to select the BuildBuddy release branch.
+For manual dispatches, use the `release_backend` input.
+
+The Make dispatch wrappers use the same local flip as CI:
+
+```bash
+make release-workflow VERSION=v0.6.1
+MEERKAT_BUILDBUDDY=1 make release-workflow VERSION=v0.6.1
+MEERKAT_BUILDBUDDY=1 make release-assets VERSION=v0.6.1
+```
+
+The BuildBuddy branch routes the release matrix through the generated Bazel
+release lanes:
 
 - `release-build-linux-x86`
 - `release-build-linux-arm64`
@@ -142,9 +169,9 @@ the public repository should document the variable shape, not the private
 value.
 
 `MEERKAT_RELEASE_BUILDBUDDY_JOBS` may be set as a repository variable to tune
-release build fanout for owner-only BuildBuddy dispatches. The workflow defaults
-to `64` jobs when the variable is unset; keep this knob public and endpoint
-values private.
+release validation and build fanout for owner-only BuildBuddy dispatches. The
+workflow defaults to `64` jobs when the variable is unset; keep this knob public
+and endpoint values private.
 
 Linux arm64 release binaries use extra RBE care because the release graph has a
 few very large generated Rust libraries and AArch64 `ld.gold` can fail during
@@ -224,6 +251,8 @@ You only mentioned Cargo is already configured; Pip/npm still require separate c
 
 - [ ] `make release-preflight`
 - [ ] tag release (`git tag -a vX.Y.Z`)
+- [ ] choose release backend: public default, or `MEERKAT_RELEASE_BUILDBUDDY=1`
+      / `release_backend=buildbuddy` for owner-only BuildBuddy
 - [ ] build + upload all binary assets in release workflow
 - [ ] publish crates
 - [ ] publish Python SDK
@@ -238,6 +267,8 @@ with minimal surface-area, no behavior changes to runtime APIs.
 ## Registry publish dry-run
 
 - Workflow dispatch inputs:
+  - `release_backend` (default: `github-hosted`): select `github-hosted` or
+    owner-only `buildbuddy` validation/binary branches.
   - `publish_release_packages` (default: false): enable publish job.
   - `registry_dry_run` (default: false): keep publish jobs in dry-run mode.
 - Dry-run behavior:
@@ -247,4 +278,5 @@ with minimal surface-area, no behavior changes to runtime APIs.
 - Local equivalent:
   - `make release-dry-run`
 - Example:
-  - `gh workflow run release.yml -f publish_release_packages=true -f registry_dry_run=true`
+  - `make release-workflow VERSION=v0.6.1 REGISTRY_DRY_RUN=true`
+  - `MEERKAT_BUILDBUDDY=1 make release-workflow VERSION=v0.6.1 REGISTRY_DRY_RUN=true`

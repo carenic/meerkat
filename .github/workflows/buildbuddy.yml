@@ -57,6 +57,7 @@ on:
           - full-warm
           - workspace-fresh
           - workspace-warm
+          - release-validate
           - fmt-lint
           - sdk-suites
           - machine-authority

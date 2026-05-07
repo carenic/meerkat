@@ -31,8 +31,8 @@ on:
         required: false
         default: ""
         type: string
-      release_binary_backend:
-        description: "Binary builder for manual release-asset recovery"
+      release_backend:
+        description: "Release backend for validation and binary builds"
         required: false
         default: github-hosted
         type: choice
@@ -47,6 +47,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
+  MEERKAT_RELEASE_BUILDBUDDY: ${{ vars.MEERKAT_RELEASE_BUILDBUDDY || 'false' }}
 
 # Required GitHub Actions secrets for full release:
 #   CARGO_REGISTRY_TOKEN  - crates.io API token
@@ -56,12 +57,17 @@ env:
 #   BUILDBUDDY_ENDPOINT   - optional owner-only Windows BB endpoint override
 
 jobs:
-  release_validate:
-    name: Validate release state
+  release_validate_cargo:
+    name: Validate release state with Cargo
     if: >-
-      github.event_name != 'workflow_dispatch' ||
-      (github.event.inputs.publish_web_sdk_only != 'true' &&
-       github.event.inputs.publish_release_assets_only != 'true')
+      (github.event_name != 'workflow_dispatch' ||
+       (github.event.inputs.publish_web_sdk_only != 'true' &&
+        github.event.inputs.publish_release_assets_only != 'true')) &&
+      !((github.event_name == 'workflow_dispatch' &&
+         github.event.inputs.release_backend == 'buildbuddy') ||
+        (github.event_name != 'workflow_dispatch' &&
+         (vars.MEERKAT_RELEASE_BUILDBUDDY == 'true' ||
+          vars.MEERKAT_RELEASE_BUILDBUDDY == '1')))
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -119,14 +125,95 @@ jobs:
       - name: Check formatting
         run: make fmt-check
 
+  release_validate_buildbuddy:
+    name: Validate release state with BuildBuddy
+    if: >-
+      (github.event_name != 'workflow_dispatch' ||
+       (github.event.inputs.publish_web_sdk_only != 'true' &&
+        github.event.inputs.publish_release_assets_only != 'true')) &&
+      ((github.event_name == 'workflow_dispatch' &&
+        github.event.inputs.release_backend == 'buildbuddy') ||
+       (github.event_name != 'workflow_dispatch' &&
+        (vars.MEERKAT_RELEASE_BUILDBUDDY == 'true' ||
+         vars.MEERKAT_RELEASE_BUILDBUDDY == '1')))
+    runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
+    env:
+      BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
+      MEERKAT_BUILDBUDDY_CI_JOBS: ${{ vars.MEERKAT_RELEASE_BUILDBUDDY_JOBS || vars.MEERKAT_BUILDBUDDY_CI_JOBS || '64' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag != '' && github.event.inputs.release_tag || github.ref }}
+          fetch-depth: 0
+
+      - uses: ./.github/actions/run-buildbuddy-ci-lane
+        with:
+          lane: release-validate
+          profile: native
+          mode: release-validate
+
+      - name: Verify tag matches version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(awk '
+            /^\[workspace.package\]/ { in_workspace_package = 1; next }
+            /^\[/ { in_workspace_package = 0 }
+            in_workspace_package && $1 == "version" {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.toml)"
+          tag="${GITHUB_REF_NAME#v}"
+          if [[ "${version}" != "${tag}" ]]; then
+            echo "Version mismatch: Cargo.toml has ${version} but tag is ${tag}" >&2
+            exit 1
+          fi
+          echo "Version ${version} matches tag"
+
+  release_validate_gate:
+    name: Release validation gate
+    if: >-
+      always() &&
+      (github.event_name != 'workflow_dispatch' ||
+       (github.event.inputs.publish_web_sdk_only != 'true' &&
+        github.event.inputs.publish_release_assets_only != 'true'))
+    needs: [release_validate_cargo, release_validate_buildbuddy]
+    runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
+    steps:
+      - name: Check selected release validation backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          bb_selected="${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.release_backend == 'buildbuddy') || (github.event_name != 'workflow_dispatch' && (vars.MEERKAT_RELEASE_BUILDBUDDY == 'true' || vars.MEERKAT_RELEASE_BUILDBUDDY == '1')) }}"
+          cargo_result="${{ needs.release_validate_cargo.result }}"
+          buildbuddy_result="${{ needs.release_validate_buildbuddy.result }}"
+
+          if [[ "${bb_selected}" == "true" ]]; then
+            echo "BuildBuddy release validation selected: ${buildbuddy_result}"
+            echo "Cargo release validation skipped: ${cargo_result}"
+            [[ "${buildbuddy_result}" == "success" && "${cargo_result}" == "skipped" ]]
+            exit $?
+          fi
+
+          echo "Cargo release validation selected: ${cargo_result}"
+          echo "BuildBuddy release validation skipped: ${buildbuddy_result}"
+          [[ "${cargo_result}" == "success" && "${buildbuddy_result}" == "skipped" ]]
+
   build_binaries:
-    name: Build and package surface binaries
+    name: Build and package surface binaries with GitHub-hosted runners
     if: >-
       (startsWith(github.ref, 'refs/tags/v') ||
        (github.event_name == 'workflow_dispatch' &&
         github.event.inputs.publish_release_assets_only == 'true')) &&
-      !(github.event_name == 'workflow_dispatch' &&
-        github.event.inputs.release_binary_backend == 'buildbuddy')
+      !((github.event_name == 'workflow_dispatch' &&
+         github.event.inputs.release_backend == 'buildbuddy') ||
+        (github.event_name != 'workflow_dispatch' &&
+         (vars.MEERKAT_RELEASE_BUILDBUDDY == 'true' ||
+          vars.MEERKAT_RELEASE_BUILDBUDDY == '1')))
     runs-on: ${{ matrix.runs-on }}
     strategy:
       fail-fast: false
@@ -236,9 +323,14 @@ jobs:
   build_binaries_buildbuddy:
     name: Build and package surface binaries via BuildBuddy
     if: >-
-      github.event_name == 'workflow_dispatch' &&
-      github.event.inputs.publish_release_assets_only == 'true' &&
-      github.event.inputs.release_binary_backend == 'buildbuddy'
+      (startsWith(github.ref, 'refs/tags/v') ||
+       (github.event_name == 'workflow_dispatch' &&
+        github.event.inputs.publish_release_assets_only == 'true')) &&
+      ((github.event_name == 'workflow_dispatch' &&
+        github.event.inputs.release_backend == 'buildbuddy') ||
+       (github.event_name != 'workflow_dispatch' &&
+        (vars.MEERKAT_RELEASE_BUILDBUDDY == 'true' ||
+         vars.MEERKAT_RELEASE_BUILDBUDDY == '1')))
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
     env:
       BUILDBUDDY_API_KEY: ${{ secrets.BUILDBUDDY_API_KEY }}
@@ -351,6 +443,35 @@ jobs:
           path: dist/*
           if-no-files-found: error
 
+  build_binaries_gate:
+    name: Release binary build gate
+    if: >-
+      always() &&
+      (startsWith(github.ref, 'refs/tags/v') ||
+       (github.event_name == 'workflow_dispatch' &&
+        github.event.inputs.publish_release_assets_only == 'true'))
+    needs: [build_binaries, build_binaries_buildbuddy]
+    runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
+    steps:
+      - name: Check selected release binary backend
+        shell: bash
+        run: |
+          set -euo pipefail
+          bb_selected="${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.release_backend == 'buildbuddy') || (github.event_name != 'workflow_dispatch' && (vars.MEERKAT_RELEASE_BUILDBUDDY == 'true' || vars.MEERKAT_RELEASE_BUILDBUDDY == '1')) }}"
+          github_result="${{ needs.build_binaries.result }}"
+          buildbuddy_result="${{ needs.build_binaries_buildbuddy.result }}"
+
+          if [[ "${bb_selected}" == "true" ]]; then
+            echo "BuildBuddy release binary build selected: ${buildbuddy_result}"
+            echo "GitHub-hosted release binary build skipped: ${github_result}"
+            [[ "${buildbuddy_result}" == "success" && "${github_result}" == "skipped" ]]
+            exit $?
+          fi
+
+          echo "GitHub-hosted release binary build selected: ${github_result}"
+          echo "BuildBuddy release binary build skipped: ${buildbuddy_result}"
+          [[ "${github_result}" == "success" && "${buildbuddy_result}" == "skipped" ]]
+
   publish_github_release:
     name: Publish GitHub release assets
     if: >-
@@ -358,13 +479,12 @@ jobs:
       (startsWith(github.ref, 'refs/tags/v') ||
        (github.event_name == 'workflow_dispatch' &&
         github.event.inputs.publish_release_assets_only == 'true')) &&
-      (needs.release_validate.result == 'success' ||
+      (needs.release_validate_gate.result == 'success' ||
        (github.event_name == 'workflow_dispatch' &&
         github.event.inputs.publish_release_assets_only == 'true' &&
-        needs.release_validate.result == 'skipped')) &&
-      (needs.build_binaries.result == 'success' ||
-       needs.build_binaries_buildbuddy.result == 'success')
-    needs: [release_validate, build_binaries, build_binaries_buildbuddy]
+        needs.release_validate_gate.result == 'skipped')) &&
+      needs.build_binaries_gate.result == 'success'
+    needs: [release_validate_gate, build_binaries_gate]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -558,7 +678,7 @@ jobs:
       (github.event_name == 'workflow_dispatch' &&
        github.event.inputs.publish_release_packages == 'true' &&
        github.event.inputs.publish_web_sdk_only != 'true')
-    needs: [release_validate]
+    needs: [release_validate_gate]
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
