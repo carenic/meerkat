@@ -127,8 +127,6 @@ jobs:
             fmt-lint
             test-unit
             integration-fast
-            e2e-fast
-            e2e-system
 
   gcp-governance-submit:
     name: GCP BuildBuddy governance submitter

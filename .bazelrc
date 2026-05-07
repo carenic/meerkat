@@ -35,6 +35,7 @@ build:buildbuddy-linux-rbe --platforms=//platforms:linux_x86_64
 build:buildbuddy-linux-rbe --extra_execution_platforms=//platforms:linux_x86_64
 build:buildbuddy-linux-rbe --remote_default_exec_properties=OSFamily=linux
 build:buildbuddy-linux-rbe --remote_default_exec_properties=Arch=amd64
+build:buildbuddy-linux-rbe --remote_default_exec_properties=network=external
 build:buildbuddy-linux-rbe --nobuild_runfile_links
 build:buildbuddy-linux-rbe --symlink_prefix=/
 
