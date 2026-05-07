@@ -109,6 +109,104 @@ env:
   MEERKAT_BUILDBUDDY_CI_JOBS: ${{ vars.MEERKAT_BUILDBUDDY_CI_JOBS || '8' }}
 
 jobs:
+  gcp-native-submit:
+    name: GCP BuildBuddy native submitter
+    if: ${{ (inputs.backend || 'buildbuddy-hosted') == 'gcp-buildbuddy' && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
+    runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
+        with:
+          group: gcp-native
+          profile: native
+          mode: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh') || 'full-fresh' }}
+          lanes: |
+            fmt-lint
+            test-unit
+            integration-fast
+            e2e-fast
+            e2e-system
+
+  gcp-governance-submit:
+    name: GCP BuildBuddy governance submitter
+    if: ${{ (inputs.backend || 'buildbuddy-hosted') == 'gcp-buildbuddy' && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
+    runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Detect machine-authority changes
+        id: machine-changes
+        shell: bash
+        env:
+          MACHINE_AUTHORITY_BASE_SHA: ${{ inputs.machine_authority_base_sha || '' }}
+          MACHINE_AUTHORITY_HEAD_SHA: ${{ inputs.machine_authority_head_sha || github.sha }}
+        run: |
+          changed=true
+          if [[ -n "${MACHINE_AUTHORITY_BASE_SHA}" && "${MACHINE_AUTHORITY_BASE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
+            set +e
+            scripts/machine-authority-changed --base "${MACHINE_AUTHORITY_BASE_SHA}" --head "${MACHINE_AUTHORITY_HEAD_SHA}"
+            status="$?"
+            set -e
+            case "${status}" in
+              0) changed=true ;;
+              1) changed=false ;;
+              *)
+                echo "Machine-authority diff failed; running conservative check."
+                changed=true
+                ;;
+            esac
+          else
+            echo "No reliable diff base; running machine authority."
+          fi
+          echo "changed=${changed}" >> "${GITHUB_OUTPUT}"
+      - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
+        if: ${{ steps.machine-changes.outputs.changed == 'true' }}
+        with:
+          group: gcp-governance
+          profile: native
+          mode: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh') || 'full-fresh' }}
+          lanes: |
+            seam-inventory
+            rmat-audit
+            machine-authority
+      - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
+        if: ${{ steps.machine-changes.outputs.changed != 'true' }}
+        with:
+          group: gcp-governance
+          profile: native
+          mode: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh') || 'full-fresh' }}
+          lanes: |
+            seam-inventory
+            rmat-audit
+
+  gcp-wasm-feature-submit:
+    name: GCP BuildBuddy wasm and feature submitter
+    if: ${{ (inputs.backend || 'buildbuddy-hosted') == 'gcp-buildbuddy' && !startsWith(inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh', 'workspace-') && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
+    runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
+        with:
+          group: gcp-wasm-feature
+          profile: native
+          mode: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh') || 'full-fresh' }}
+          lanes: |
+            sdk-suites
+            wasm-contract-tests
+            wasm-check
+            test-minimal
+            test-feature-matrix-lib
+            test-feature-matrix-surface-checks
+            audit
+
   doctor:
     name: BuildBuddy doctor
     if: ${{ (inputs.backend || 'buildbuddy-hosted') == 'buildbuddy-hosted' && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
@@ -129,7 +227,7 @@ jobs:
 
   fmt-lint:
     name: Format, lint, and static checks
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ (inputs.backend || 'buildbuddy-hosted') != 'gcp-buildbuddy' && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
     steps:
       - name: Checkout
@@ -144,7 +242,7 @@ jobs:
 
   test-unit:
     name: Unit tests
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ (inputs.backend || 'buildbuddy-hosted') != 'gcp-buildbuddy' && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
     steps:
       - name: Checkout
@@ -159,7 +257,7 @@ jobs:
 
   integration-fast:
     name: Integration-fast lane
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ (inputs.backend || 'buildbuddy-hosted') != 'gcp-buildbuddy' && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
     steps:
       - name: Checkout
@@ -174,7 +272,7 @@ jobs:
 
   e2e-system:
     name: E2E system lane
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ (inputs.backend || 'buildbuddy-hosted') != 'gcp-buildbuddy' && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
     steps:
       - name: Checkout
@@ -189,7 +287,7 @@ jobs:
 
   sdk-suites:
     name: SDK suites + parity gates
-    if: ${{ !startsWith(inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh', 'workspace-') && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
+    if: ${{ (inputs.backend || 'buildbuddy-hosted') != 'gcp-buildbuddy' && !startsWith(inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh', 'workspace-') && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
     steps:
       - name: Checkout
@@ -204,7 +302,7 @@ jobs:
 
   machine-authority:
     name: Machine authority workflow
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ (inputs.backend || 'buildbuddy-hosted') != 'gcp-buildbuddy' && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
     steps:
       - name: Checkout
@@ -248,7 +346,7 @@ jobs:
 
   rmat-audit:
     name: RMAT audit + ownership ledger
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ (inputs.backend || 'buildbuddy-hosted') != 'gcp-buildbuddy' && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
     steps:
       - name: Checkout
@@ -263,7 +361,7 @@ jobs:
 
   seam-inventory:
     name: Seam inventory (strict)
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ (inputs.backend || 'buildbuddy-hosted') != 'gcp-buildbuddy' && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
     steps:
       - name: Checkout
@@ -278,7 +376,7 @@ jobs:
 
   wasm-contract-tests:
     name: WASM contract tests
-    if: ${{ !startsWith(inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh', 'workspace-') && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
+    if: ${{ (inputs.backend || 'buildbuddy-hosted') != 'gcp-buildbuddy' && !startsWith(inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh', 'workspace-') && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
     steps:
       - name: Checkout
@@ -293,7 +391,7 @@ jobs:
 
   e2e-fast:
     name: E2E fast lane
-    if: ${{ github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository)) }}
+    if: ${{ (inputs.backend || 'buildbuddy-hosted') != 'gcp-buildbuddy' && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
     steps:
       - name: Checkout
@@ -308,7 +406,7 @@ jobs:
 
   test-minimal:
     name: Minimal feature builds
-    if: ${{ !startsWith(inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh', 'workspace-') && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
+    if: ${{ (inputs.backend || 'buildbuddy-hosted') != 'gcp-buildbuddy' && !startsWith(inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh', 'workspace-') && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
     steps:
       - name: Checkout
@@ -323,7 +421,7 @@ jobs:
 
   test-feature-matrix-lib:
     name: Feature matrix (library)
-    if: ${{ !startsWith(inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh', 'workspace-') && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
+    if: ${{ (inputs.backend || 'buildbuddy-hosted') != 'gcp-buildbuddy' && !startsWith(inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh', 'workspace-') && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
     steps:
       - name: Checkout
@@ -338,7 +436,7 @@ jobs:
 
   test-feature-matrix-surface-checks:
     name: Feature matrix (surface checks)
-    if: ${{ !startsWith(inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh', 'workspace-') && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
+    if: ${{ (inputs.backend || 'buildbuddy-hosted') != 'gcp-buildbuddy' && !startsWith(inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh', 'workspace-') && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
     steps:
       - name: Checkout
@@ -353,7 +451,7 @@ jobs:
 
   wasm-check:
     name: WASM compilation check
-    if: ${{ !startsWith(inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh', 'workspace-') && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
+    if: ${{ (inputs.backend || 'buildbuddy-hosted') != 'gcp-buildbuddy' && !startsWith(inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh', 'workspace-') && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
     steps:
       - name: Checkout
@@ -368,7 +466,7 @@ jobs:
 
   audit:
     name: Security audit
-    if: ${{ !startsWith(inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh', 'workspace-') && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
+    if: ${{ (inputs.backend || 'buildbuddy-hosted') != 'gcp-buildbuddy' && !startsWith(inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh', 'workspace-') && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
     steps:
       - name: Checkout
@@ -384,6 +482,9 @@ jobs:
   gate:
     name: BuildBuddy CI gate
     needs:
+      - gcp-native-submit
+      - gcp-governance-submit
+      - gcp-wasm-feature-submit
       - doctor
       - fmt-lint
       - sdk-suites

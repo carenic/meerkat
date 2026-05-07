@@ -1,0 +1,75 @@
+name: Run BuildBuddy CI lane batch
+description: Run a small batch of BuildBuddy CI lanes from one GitHub runner.
+
+inputs:
+  lanes:
+    description: Newline-separated BuildBuddy CI lane names.
+    required: true
+  group:
+    description: Short group name used for log artifact naming.
+    required: true
+  profile:
+    description: "Setup profile: full, native, or doctor."
+    required: true
+  mode:
+    description: BuildBuddy CI mode.
+    required: false
+    default: full-fresh
+
+runs:
+  using: composite
+  steps:
+    - name: Setup BuildBuddy CI
+      uses: ./.github/actions/setup-buildbuddy-ci
+      with:
+        profile: ${{ inputs.profile }}
+
+    - name: Run BuildBuddy lane batch
+      shell: bash
+      env:
+        LANES: ${{ inputs.lanes }}
+        MEERKAT_BUILDBUDDY_CI_MODE: ${{ inputs.mode }}
+        MEERKAT_BUILDBUDDY_LOG_ROOT: ${{ runner.temp }}/buildbuddy-logs
+        MEERKAT_BUILDBUDDY_OUTPUT_ROOT: ${{ env.MEERKAT_BAZEL_BACKEND == 'gcp-local' && '/home/gha/.cache/meerkat/gcp-bazel-output-roots' || '' }}
+        MEERKAT_BUILDBUDDY_REPOSITORY_CACHE: ${{ env.MEERKAT_BAZEL_BACKEND == 'gcp-local' && '/home/gha/.cache/meerkat/gcp-bazel-repository-cache' || format('{0}/buildbuddy-repository-cache', runner.temp) }}
+        MEERKAT_BAZEL_DISK_CACHE: ${{ env.MEERKAT_BAZEL_BACKEND == 'gcp-local' && '/home/gha/.cache/meerkat/gcp-bazel-disk-cache' || '' }}
+      run: |
+        mkdir -p "${MEERKAT_BUILDBUDDY_LOG_ROOT}"
+        mkdir -p "${MEERKAT_BUILDBUDDY_REPOSITORY_CACHE}"
+        if [[ -n "${MEERKAT_BUILDBUDDY_OUTPUT_ROOT}" ]]; then
+          mkdir -p "${MEERKAT_BUILDBUDDY_OUTPUT_ROOT}"
+        fi
+        if [[ -n "${MEERKAT_BAZEL_DISK_CACHE}" ]]; then
+          mkdir -p "${MEERKAT_BAZEL_DISK_CACHE}"
+        fi
+
+        status=0
+        while IFS= read -r lane; do
+          lane="${lane#"${lane%%[![:space:]]*}"}"
+          lane="${lane%"${lane##*[![:space:]]}"}"
+          if [[ -z "${lane}" || "${lane}" == \#* ]]; then
+            continue
+          fi
+
+          echo "::group::BuildBuddy lane ${lane}"
+          set +e
+          scripts/buildbuddy-ci-lane "${lane}"
+          lane_status="$?"
+          set -e
+          echo "::endgroup::"
+
+          if [[ "${lane_status}" != "0" ]]; then
+            echo "BuildBuddy lane ${lane} failed with ${lane_status}" >&2
+            status="${lane_status}"
+          fi
+        done <<< "${LANES}"
+
+        exit "${status}"
+
+    - name: Upload BuildBuddy logs
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: buildbuddy-${{ inputs.group }}-${{ github.run_id }}-${{ github.run_attempt }}
+        path: ${{ runner.temp }}/buildbuddy-logs
+        if-no-files-found: ignore
