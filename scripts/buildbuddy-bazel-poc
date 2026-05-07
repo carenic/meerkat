@@ -821,11 +821,16 @@ bb_args+=(
   --remote_header="x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}"
 )
 if [[ -n "${BUILDBUDDY_ENDPOINT:-}" ]]; then
+  buildbuddy_endpoint="${BUILDBUDDY_ENDPOINT#http://}"
+  buildbuddy_endpoint="${buildbuddy_endpoint#https://}"
+  buildbuddy_endpoint="${buildbuddy_endpoint#grpc://}"
+  buildbuddy_endpoint="${buildbuddy_endpoint#grpcs://}"
+  buildbuddy_endpoint="${buildbuddy_endpoint%/}"
   bb_args+=(
-    --bes_results_url="https://${BUILDBUDDY_ENDPOINT}/invocation/"
-    --bes_backend="grpcs://${BUILDBUDDY_ENDPOINT}"
-    --remote_cache="grpcs://${BUILDBUDDY_ENDPOINT}"
-    --remote_executor="grpcs://${BUILDBUDDY_ENDPOINT}"
+    --bes_results_url="https://${buildbuddy_endpoint}/invocation/"
+    --bes_backend="grpcs://${buildbuddy_endpoint}"
+    --remote_cache="grpcs://${buildbuddy_endpoint}"
+    --remote_executor="grpcs://${buildbuddy_endpoint}"
   )
 fi
 if [[ "${#apple_platform_args[@]}" -gt 0 ]]; then
