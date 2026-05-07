@@ -116,12 +116,8 @@ fn gate_job_requires_every_governance_lane() {
     let wrapper_needs = gate_needs(&ci_doc, &ci_yml);
     assert_eq!(
         wrapper_needs,
-        vec![
-            "cargo".to_string(),
-            "buildbuddy".to_string(),
-            "dogma-cleanup-gate".to_string()
-        ],
-        "{} jobs.gate.needs must gate both reusable backend workflows and the dogma cleanup review boundary",
+        vec!["cargo".to_string(), "dogma-cleanup-gate".to_string()],
+        "{} jobs.gate.needs must gate the GCP Cargo reusable workflow and the dogma cleanup review boundary",
         ci_yml.display(),
     );
 
@@ -232,10 +228,7 @@ fn gate_results_loop_enumerates_every_needed_lane() {
         if workflow == "buildbuddy.yml" && run_body.contains("needs.*.result") {
             continue;
         }
-        if workflow == "ci.yml"
-            && run_body.contains("needs.cargo.result")
-            && run_body.contains("needs.buildbuddy.result")
-        {
+        if workflow == "ci.yml" && declared.iter().all(|lane| run_body.contains(lane)) {
             continue;
         }
 
