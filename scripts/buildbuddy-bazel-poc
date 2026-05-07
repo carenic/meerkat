@@ -723,8 +723,29 @@ else
   target="${default_target}"
 fi
 
+module_lock_backup=""
+secret_bazelrc=""
+cleanup() {
+  if [[ -n "${module_lock_backup}" && -f "${module_lock_backup}" ]]; then
+    cp -p "${module_lock_backup}" "${lockfile}"
+    rm -f "${module_lock_backup}"
+    module_lock_backup=""
+  fi
+  if [[ -n "${secret_bazelrc}" ]]; then
+    rm -f "${secret_bazelrc}"
+    secret_bazelrc=""
+  fi
+}
+trap cleanup EXIT
+
 startup_args=()
 startup_args+=(--bazelrc="${workspace_root}/.bazelrc")
+if [[ "${meerkat_bazel_backend}" != "gcp-local" ]]; then
+  secret_bazelrc="$(mktemp "${TMPDIR:-/tmp}/meerkat-buildbuddy-auth.XXXXXX")"
+  chmod 600 "${secret_bazelrc}"
+  printf 'build --remote_header=x-buildbuddy-api-key=%s\n' "${BUILDBUDDY_API_KEY}" >"${secret_bazelrc}"
+  startup_args+=(--bazelrc="${secret_bazelrc}")
+fi
 if [[ -z "${BUILDBUDDY_NO_DEFAULT_OUTPUT_BASE:-}" ]]; then
   if [[ -z "${BUILDBUDDY_OUTPUT_BASE:-}" ]]; then
     cache_root="${MEERKAT_BUILDBUDDY_OUTPUT_ROOT:-${XDG_CACHE_HOME:-${HOME}/.cache}/meerkat/buildbuddy-bazel}"
@@ -749,24 +770,14 @@ if [[ -n "${BUILDBUDDY_MAX_IDLE_SECS:-}" ]]; then
   startup_args+=(--max_idle_secs="${BUILDBUDDY_MAX_IDLE_SECS}")
 fi
 
-module_lock_args=()
 lockfile="${workspace_root}/MODULE.bazel.lock"
-module_lock_backup=""
-restore_module_lock() {
-  if [[ -n "${module_lock_backup}" && -f "${module_lock_backup}" ]]; then
-    cp -p "${module_lock_backup}" "${lockfile}"
-    rm -f "${module_lock_backup}"
-  fi
-}
+module_lock_args=()
 if [[ -n "${BUILDBUDDY_KEEP_LOCK_REFRESH:-}" ]]; then
   echo "warning: BUILDBUDDY_KEEP_LOCK_REFRESH is ignored by local BuildBuddy runs; refresh Bazel metadata explicitly outside normal local lanes" >&2
 fi
 if [[ -f "${lockfile}" ]]; then
   module_lock_backup="$(mktemp "${TMPDIR:-/tmp}/meerkat-module-lock.XXXXXX")"
   cp -p "${lockfile}" "${module_lock_backup}"
-fi
-if [[ -n "${module_lock_backup}" ]]; then
-  trap restore_module_lock EXIT
 fi
 module_lock_args+=(--lockfile_mode="${BUILDBUDDY_LOCKFILE_MODE:-error}")
 
@@ -812,8 +823,6 @@ if [[ "${meerkat_bazel_backend}" == "gcp-local" ]]; then
     mkdir -p "${MEERKAT_BAZEL_DISK_CACHE}"
     bb_args+=(--disk_cache="${MEERKAT_BAZEL_DISK_CACHE}")
   fi
-else
-  bb_args+=(--remote_header="x-buildbuddy-api-key=${BUILDBUDDY_API_KEY}")
 fi
 buildbuddy_remote_url="${BUILDBUDDY_GRPC_URL:-${BUILDBUDDY_ENDPOINT:-}}"
 if [[ "${meerkat_bazel_backend}" != "gcp-local" && -n "${buildbuddy_remote_url}" ]]; then
@@ -891,9 +900,7 @@ set +e
 status="$?"
 set -e
 
-if [[ -n "${module_lock_backup}" ]]; then
-  restore_module_lock
-  trap - EXIT
-fi
+cleanup
+trap - EXIT
 
 exit "${status}"
