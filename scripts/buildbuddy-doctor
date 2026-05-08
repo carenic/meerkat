@@ -211,6 +211,7 @@ else
 fi
 
 if grep -Fq 'Cache Bazel external repositories' .github/actions/setup-buildbuddy-ci/action.yml &&
+  grep -Fq "env.MEERKAT_BAZEL_BACKEND != 'gcp-buildbuddy'" .github/actions/setup-buildbuddy-ci/action.yml &&
   grep -Fq -- '--repository_cache=' scripts/buildbuddy-bazel-poc &&
   grep -Fq 'MEERKAT_BUILDBUDDY_FETCH_RETRIES' scripts/buildbuddy-ci-lane &&
   grep -Fq 'Retrying %s after transient external repository fetch failure' scripts/buildbuddy-ci-lane; then

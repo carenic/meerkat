@@ -282,6 +282,9 @@ backend/cache plus zero idle executor VMs. A CI run bursts the executor MIG to
 the configured size, then parks it again. BuildBuddy CAS/action cache is the
 shared cache across the fleet; the executor VMs get large local SSD-backed boot
 disks for per-VM action/container/cache locality.
+The `gcp-buildbuddy` submitter jobs intentionally skip GitHub Actions' Bazel
+repository-cache save/restore, because uploading runner-local cache tarballs at
+job teardown adds latency and duplicates the self-hosted BuildBuddy cache.
 
 The control-plane and executor-pool scripts are intentionally idempotent and
 secret-safe:
