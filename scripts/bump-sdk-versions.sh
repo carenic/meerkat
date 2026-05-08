@@ -48,6 +48,20 @@ if [ -f "$PACKAGE_JSON" ]; then
     echo "  Updated: $PACKAGE_JSON"
 fi
 
+PACKAGE_LOCK="$ROOT/sdks/typescript/package-lock.json"
+if [ -f "$PACKAGE_LOCK" ]; then
+    node -e "
+        const fs = require('fs');
+        const lock = JSON.parse(fs.readFileSync('$PACKAGE_LOCK', 'utf8'));
+        lock.version = '$VERSION';
+        if (lock.packages && lock.packages['']) {
+            lock.packages[''].version = '$VERSION';
+        }
+        fs.writeFileSync('$PACKAGE_LOCK', JSON.stringify(lock, null, 2) + '\n');
+    "
+    echo "  Updated: $PACKAGE_LOCK"
+fi
+
 # ── Web SDK (@rkat/web) ───────────────────────────────────────────────────
 
 WEB_PACKAGE_JSON="$ROOT/sdks/web/package.json"
@@ -59,6 +73,31 @@ if [ -f "$WEB_PACKAGE_JSON" ]; then
         fs.writeFileSync('$WEB_PACKAGE_JSON', JSON.stringify(pkg, null, 2) + '\n');
     "
     echo "  Updated: $WEB_PACKAGE_JSON"
+fi
+
+WEB_PACKAGE_LOCK="$ROOT/sdks/web/package-lock.json"
+if [ -f "$WEB_PACKAGE_LOCK" ]; then
+    node -e "
+        const fs = require('fs');
+        const lock = JSON.parse(fs.readFileSync('$WEB_PACKAGE_LOCK', 'utf8'));
+        lock.version = '$VERSION';
+        if (lock.packages && lock.packages['']) {
+            lock.packages[''].version = '$VERSION';
+        }
+        fs.writeFileSync('$WEB_PACKAGE_LOCK', JSON.stringify(lock, null, 2) + '\n');
+    "
+    echo "  Updated: $WEB_PACKAGE_LOCK"
+fi
+
+WEB_WASM_PACKAGE_JSON="$ROOT/sdks/web/wasm/package.json"
+if [ -f "$WEB_WASM_PACKAGE_JSON" ]; then
+    node -e "
+        const fs = require('fs');
+        const pkg = JSON.parse(fs.readFileSync('$WEB_WASM_PACKAGE_JSON', 'utf8'));
+        pkg.version = '$VERSION';
+        fs.writeFileSync('$WEB_WASM_PACKAGE_JSON', JSON.stringify(pkg, null, 2) + '\n');
+    "
+    echo "  Updated: $WEB_WASM_PACKAGE_JSON"
 fi
 
 # Update EXPECTED_VERSION in web SDK runtime.ts

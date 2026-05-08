@@ -64,6 +64,11 @@ git add \
     "$ROOT/meerkat-contracts/src/version.rs" \
     "$ROOT/sdks/python/pyproject.toml" \
     "$ROOT/sdks/typescript/package.json" \
+    "$ROOT/sdks/typescript/package-lock.json" \
+    "$ROOT/sdks/web/package.json" \
+    "$ROOT/sdks/web/package-lock.json" \
+    "$ROOT/sdks/web/wasm/package.json" \
+    "$ROOT/sdks/web/src/runtime.ts" \
     "$ROOT/sdks/python/meerkat/generated/" \
     "$ROOT/sdks/typescript/src/generated/" \
     "$ROOT/artifacts/schemas/"
