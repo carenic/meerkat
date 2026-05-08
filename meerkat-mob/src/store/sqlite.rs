@@ -299,6 +299,13 @@ impl SqliteMobEventBus {
 
     fn publish_available_from_storage(&self) -> Result<(), MobStoreError> {
         let _catch_up_guard = lock_unpoisoned(&self.catch_up_lock);
+        if !self.path.try_exists().map_err(se)? {
+            // A successful mob destroy removes the SQLite database while
+            // existing handle clones may still keep this event bus alive. The
+            // watcher can wake on that delete event; avoid reopening the path,
+            // because opening SQLite would create a fresh empty database.
+            return Ok(());
+        }
         loop {
             let after_cursor = *lock_unpoisoned(&self.latest_broadcast_cursor);
             let batch = poll_events_sync(&self.path, after_cursor, EVENT_WATCH_CATCH_UP_LIMIT)?;
@@ -2822,6 +2829,28 @@ mod tests {
 
         let replayed = store.replay_all().await.unwrap();
         assert_eq!(replayed.len(), 1);
+    }
+
+    #[test]
+    fn test_sqlite_event_bus_catch_up_does_not_recreate_deleted_database() {
+        let (_dir, path) = temp_db_path();
+        let stores = SqliteMobStores::open(&path).unwrap();
+        assert!(
+            path.exists(),
+            "opening the store should create the database"
+        );
+
+        std::fs::remove_file(&path).unwrap();
+        assert!(
+            !path.exists(),
+            "test setup should remove the database before watcher catch-up"
+        );
+
+        stores.event_bus.publish_available_from_storage().unwrap();
+        assert!(
+            !path.exists(),
+            "watcher catch-up must not recreate intentionally deleted mob storage"
+        );
     }
 
     #[tokio::test]

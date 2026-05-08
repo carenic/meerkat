@@ -411,24 +411,39 @@ impl MobMcpState {
 
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(path) = path {
-            let mut last_error = None;
-            let mut delay = Duration::from_millis(10);
-            for attempt in 0..5 {
-                match tokio::fs::remove_file(path).await {
-                    Ok(()) => return,
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
-                    Err(error) => {
-                        last_error = Some(error);
-                        if attempt < 4 {
-                            ::tokio::time::sleep(delay).await;
-                            delay = delay.saturating_mul(2);
-                        }
+            let mut paths = Vec::with_capacity(3);
+            paths.push(path.to_path_buf());
+            for suffix in ["-wal", "-shm"] {
+                let mut value = path.as_os_str().to_os_string();
+                value.push(suffix);
+                paths.push(PathBuf::from(value));
+            }
+
+            for path in paths {
+                Self::maybe_remove_one_storage_file(&path).await;
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn maybe_remove_one_storage_file(path: &Path) {
+        let mut last_error = None;
+        let mut delay = Duration::from_millis(10);
+        for attempt in 0..5 {
+            match tokio::fs::remove_file(path).await {
+                Ok(()) => return,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(error) => {
+                    last_error = Some(error);
+                    if attempt < 4 {
+                        ::tokio::time::sleep(delay).await;
+                        delay = delay.saturating_mul(2);
                     }
                 }
             }
-            if let Some(error) = last_error {
-                tracing::warn!(path = %path.display(), error = %error, "failed to remove mob storage file");
-            }
+        }
+        if let Some(error) = last_error {
+            tracing::warn!(path = %path.display(), error = %error, "failed to remove mob storage file");
         }
     }
 
