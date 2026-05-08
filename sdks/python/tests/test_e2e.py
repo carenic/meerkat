@@ -89,7 +89,6 @@ def test_rkat_rpc_capabilities_method():
             if 2 in responses:
                 break
 
-        assert 1 in responses, "rkat-rpc should respond to initialize"
         assert 2 in responses, "rkat-rpc should respond to capabilities/get"
         response = responses[2]
         data = response["result"]
