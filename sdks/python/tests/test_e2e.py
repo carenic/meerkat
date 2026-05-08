@@ -79,11 +79,19 @@ def test_rkat_rpc_capabilities_method():
             proc.stdin.write((json.dumps(request) + "\n").encode())
             proc.stdin.flush()
 
-        response_line = proc.stdout.readline()
-        assert response_line, "rkat-rpc should respond to initialize"
-        response_line = proc.stdout.readline()
-        assert response_line, "rkat-rpc should respond to capabilities/get"
-        response = json.loads(response_line)
+        responses = {}
+        for _ in range(5):
+            response_line = proc.stdout.readline()
+            assert response_line, "rkat-rpc should respond to capabilities/get"
+            message = json.loads(response_line)
+            if "id" in message:
+                responses[message["id"]] = message
+            if 2 in responses:
+                break
+
+        assert 1 in responses, "rkat-rpc should respond to initialize"
+        assert 2 in responses, "rkat-rpc should respond to capabilities/get"
+        response = responses[2]
         data = response["result"]
         assert "capabilities" in data
         assert len(data["capabilities"]) > 0
