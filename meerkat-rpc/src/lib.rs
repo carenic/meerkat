@@ -25,7 +25,10 @@ pub mod session_executor;
 pub mod session_runtime;
 pub mod transport;
 
-pub use server::{serve_stdio, serve_stdio_with_skill_runtime, serve_tcp, serve_tcp_connection};
+pub use server::{
+    LiveWsConfig, serve_stdio, serve_stdio_with_options, serve_stdio_with_skill_runtime, serve_tcp,
+    serve_tcp_connection, serve_tcp_connection_with_options, serve_tcp_with_options,
+};
 
 /// Default capacity for notification / event channels throughout the crate.
 pub const NOTIFICATION_CHANNEL_CAPACITY: usize = 4096;
