@@ -354,6 +354,7 @@ if grep -Fq 'MEERKAT_CI_BACKEND' .github/workflows/ci.yml &&
   grep -Fq 'backend: buildbuddy-hosted' .github/workflows/ci.yml &&
   grep -Fq 'backend: gcp-buildbuddy' .github/workflows/ci.yml &&
   grep -Fq 'MEERKAT_GCP_BUILDBUDDY_CI_MAX_SECONDS' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'buildbuddy-gcp-executors' .github/workflows/buildbuddy.yml &&
   grep -Fq 'Check GCP CI duration SLO' .github/workflows/buildbuddy.yml &&
   grep -Fq 'MEERKAT_GCP_BUILDBUDDY_WAIT_ON_DOWN' .github/workflows/buildbuddy.yml &&
   grep -Fq 'gcloud compute instance-groups managed resize "${MEERKAT_GCP_BUILDBUDDY_MIG}"' .github/workflows/buildbuddy.yml &&

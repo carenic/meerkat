@@ -100,6 +100,10 @@ permissions:
   contents: read
   id-token: write
 
+concurrency:
+  group: ${{ (inputs.backend || 'buildbuddy-hosted') == 'gcp-buildbuddy' && 'buildbuddy-gcp-executors' || format('buildbuddy-{0}', github.run_id) }}
+  cancel-in-progress: false
+
 env:
   CARGO_HOME: /tmp/meerkat-cargo-home
   MEERKAT_BUILDBUDDY: ${{ vars.MEERKAT_BUILDBUDDY || 'false' }}
