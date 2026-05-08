@@ -70,7 +70,7 @@ sh_test(
     tags = ["buildbuddy"],
 )
 
-[
+def _cargo_equivalent_test(name, lane, timeout = "long"):
     sh_test(
         name = name,
         srcs = ["cargo_lane_test.sh"],
@@ -81,14 +81,49 @@ sh_test(
         ] + RUST_TOOLCHAIN_DATA,
         exec_properties = CARGO_EQUIVALENT_EXEC_PROPERTIES,
         size = "enormous",
-        timeout = "long",
+        timeout = timeout,
         tags = CARGO_EQUIVALENT_TAGS,
     )
-    for name, lane in {
-        "minimal_feature_builds_cargo_equivalent_test": "test-minimal",
-        "feature_matrix_lib_cargo_equivalent_test": "test-feature-matrix-lib",
-    }.items()
+
+_cargo_equivalent_test(
+    name = "minimal_feature_builds_cargo_equivalent_test",
+    lane = "test-minimal",
+)
+
+# Compatibility target for developers invoking the historic monolithic lane.
+_cargo_equivalent_test(
+    name = "feature_matrix_lib_cargo_equivalent_test",
+    lane = "test-feature-matrix-lib",
+)
+
+FEATURE_MATRIX_LIB_CARGO_EQUIVALENT_TESTS = {
+    "feature_matrix_tools_comms_cargo_equivalent_test": "test-feature-matrix-tools-comms",
+    "feature_matrix_tools_mcp_cargo_equivalent_test": "test-feature-matrix-tools-mcp",
+    "feature_matrix_tools_comms_mcp_cargo_equivalent_test": "test-feature-matrix-tools-comms-mcp",
+    "feature_matrix_meerkat_openai_memory_cargo_equivalent_test": "test-feature-matrix-meerkat-openai-memory",
+    "feature_matrix_meerkat_gemini_jsonl_cargo_equivalent_test": "test-feature-matrix-meerkat-gemini-jsonl",
+    "feature_matrix_meerkat_all_providers_check_cargo_equivalent_test": "test-feature-matrix-meerkat-all-providers-check",
+    "feature_matrix_mob_minimal_cargo_equivalent_test": "test-feature-matrix-mob-minimal",
+    "feature_matrix_mob_runtime_adapter_cargo_equivalent_test": "test-feature-matrix-mob-runtime-adapter",
+    "feature_matrix_meerkat_all_providers_tests_cargo_equivalent_test": "test-feature-matrix-meerkat-all-providers-tests",
+}
+
+[
+    _cargo_equivalent_test(
+        name = name,
+        lane = lane,
+    )
+    for name, lane in FEATURE_MATRIX_LIB_CARGO_EQUIVALENT_TESTS.items()
 ]
+
+test_suite(
+    name = "feature_matrix_lib_cargo_equivalent_tests",
+    tests = [
+        ":" + name
+        for name in FEATURE_MATRIX_LIB_CARGO_EQUIVALENT_TESTS.keys()
+    ],
+    tags = CARGO_EQUIVALENT_TAGS,
+)
 
 sh_test(
     name = "security_audit_cargo_equivalent_test",

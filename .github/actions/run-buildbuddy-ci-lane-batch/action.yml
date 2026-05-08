@@ -9,7 +9,7 @@ inputs:
     description: Short group name used for log artifact naming.
     required: true
   profile:
-    description: "Setup profile: full, native, or doctor."
+    description: "Setup profile: submitter, full, native, or doctor."
     required: true
   mode:
     description: BuildBuddy CI mode.

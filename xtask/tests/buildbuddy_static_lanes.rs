@@ -158,6 +158,99 @@ fn buildbuddy_machine_authority_lane_runs_tlc_machine_verify() {
 }
 
 #[test]
+fn gcp_feature_matrix_lane_fans_out_remote_cargo_actions() {
+    let root = repo_root();
+    let launcher = read(root.join("scripts/buildbuddy-bazel-poc"));
+    let build = read(root.join("tools/buildbuddy/BUILD.bazel"));
+    let wrapper = read(root.join("tools/buildbuddy/cargo_lane_test.sh"));
+    let workflow = read(root.join(".github/workflows/buildbuddy.yml"));
+    let setup = read(root.join(".github/actions/setup-buildbuddy-ci/action.yml"));
+
+    let split_targets = [
+        (
+            "feature_matrix_tools_comms_cargo_equivalent_test",
+            "test-feature-matrix-tools-comms",
+        ),
+        (
+            "feature_matrix_tools_mcp_cargo_equivalent_test",
+            "test-feature-matrix-tools-mcp",
+        ),
+        (
+            "feature_matrix_tools_comms_mcp_cargo_equivalent_test",
+            "test-feature-matrix-tools-comms-mcp",
+        ),
+        (
+            "feature_matrix_meerkat_openai_memory_cargo_equivalent_test",
+            "test-feature-matrix-meerkat-openai-memory",
+        ),
+        (
+            "feature_matrix_meerkat_gemini_jsonl_cargo_equivalent_test",
+            "test-feature-matrix-meerkat-gemini-jsonl",
+        ),
+        (
+            "feature_matrix_meerkat_all_providers_check_cargo_equivalent_test",
+            "test-feature-matrix-meerkat-all-providers-check",
+        ),
+        (
+            "feature_matrix_mob_minimal_cargo_equivalent_test",
+            "test-feature-matrix-mob-minimal",
+        ),
+        (
+            "feature_matrix_mob_runtime_adapter_cargo_equivalent_test",
+            "test-feature-matrix-mob-runtime-adapter",
+        ),
+        (
+            "feature_matrix_meerkat_all_providers_tests_cargo_equivalent_test",
+            "test-feature-matrix-meerkat-all-providers-tests",
+        ),
+    ];
+
+    let lane = find_all_between(&launcher, "feature-matrix-lib-rbe)", ";;")
+        .expect("feature-matrix-lib-rbe lane block");
+    assert!(
+        lane.contains(
+            "default_target=\"//tools/buildbuddy:feature_matrix_lib_cargo_equivalent_tests\""
+        ),
+        "feature-matrix-lib-rbe must target the split test suite; block:\n{lane}"
+    );
+    assert!(
+        !lane.contains(
+            "default_target=\"//tools/buildbuddy:feature_matrix_lib_cargo_equivalent_test\""
+        ),
+        "feature-matrix-lib-rbe must not target only the monolithic compatibility test"
+    );
+    assert!(
+        build.contains("name = \"feature_matrix_lib_cargo_equivalent_tests\""),
+        "tools/buildbuddy BUILD must declare the split feature matrix test suite"
+    );
+    assert!(
+        build.contains("name = \"feature_matrix_lib_cargo_equivalent_test\""),
+        "tools/buildbuddy BUILD should keep the monolithic compatibility target"
+    );
+
+    for (target, arg) in split_targets {
+        assert!(
+            build.contains(&format!("\"{target}\": \"{arg}\"")),
+            "split feature matrix target {target} must map to {arg}"
+        );
+        assert!(
+            wrapper.contains(&format!("{arg})")),
+            "cargo_lane_test.sh must handle split lane {arg}"
+        );
+    }
+
+    assert!(
+        setup.contains("submitter, native, doctor"),
+        "setup-buildbuddy-ci must document the lightweight submitter profile"
+    );
+    assert!(
+        workflow.contains("group: gcp-governance\n          profile: submitter")
+            && workflow.contains("group: gcp-wasm-feature\n          profile: submitter"),
+        "GCP submit-only jobs should skip local Rust/Node setup and let remote Bazel executors do the work"
+    );
+}
+
+#[test]
 fn rust_sources_are_formatted() {
     let root = repo_root();
     let rustfmt = std::env::var_os("RUSTFMT")

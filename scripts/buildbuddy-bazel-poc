@@ -35,7 +35,7 @@ Common commands:
   security-audit-rbe       Bazel-native dependency/security audit lane.
   minimal-feature-builds-rbe
                             Cargo-equivalent minimal feature lane as a Bazel test action.
-  feature-matrix-lib-rbe    Cargo-equivalent library feature matrix as a Bazel test action.
+  feature-matrix-lib-rbe    Cargo-equivalent library feature matrix as parallel Bazel test actions.
   feature-matrix-surface-rbe
                             Bazel-native surface feature matrix build targets.
   fast-test                  Root //:fast_tests suite.
@@ -491,7 +491,7 @@ case "${command}" in
   feature-matrix-lib-rbe)
     command="test"
     config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
-    default_target="//tools/buildbuddy:feature_matrix_lib_cargo_equivalent_test"
+    default_target="//tools/buildbuddy:feature_matrix_lib_cargo_equivalent_tests"
     extra_args+=(
       --test_output=errors
       --test_summary=terse

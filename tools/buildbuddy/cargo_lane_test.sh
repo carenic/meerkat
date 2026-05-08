@@ -61,6 +61,43 @@ export CARGO_TERM_COLOR=always
 
 cd "${work_root}"
 
+run_feature_matrix_lane() {
+  local feature_lane="$1"
+  case "${feature_lane}" in
+    test-feature-matrix-tools-comms)
+      "${CARGO}" check -p meerkat-tools --no-default-features --features comms
+      ;;
+    test-feature-matrix-tools-mcp)
+      "${CARGO}" check -p meerkat-tools --no-default-features --features mcp
+      ;;
+    test-feature-matrix-tools-comms-mcp)
+      "${CARGO}" check -p meerkat-tools --no-default-features --features comms,mcp
+      ;;
+    test-feature-matrix-meerkat-openai-memory)
+      "${CARGO}" check -p meerkat --no-default-features --features openai,memory-store
+      ;;
+    test-feature-matrix-meerkat-gemini-jsonl)
+      "${CARGO}" check -p meerkat --no-default-features --features gemini,jsonl-store
+      ;;
+    test-feature-matrix-meerkat-all-providers-check)
+      "${CARGO}" check -p meerkat --features all-providers,comms,mcp
+      ;;
+    test-feature-matrix-mob-minimal)
+      "${CARGO}" check -p meerkat-mob --no-default-features
+      ;;
+    test-feature-matrix-mob-runtime-adapter)
+      "${CARGO}" check -p meerkat-mob --no-default-features --features runtime-adapter
+      ;;
+    test-feature-matrix-meerkat-all-providers-tests)
+      "${CARGO}" test -p meerkat --features all-providers,comms,mcp --lib --tests
+      ;;
+    *)
+      echo "unknown cargo-equivalent feature-matrix lane: ${feature_lane}" >&2
+      exit 2
+      ;;
+  esac
+}
+
 case "${lane}" in
   test-minimal)
     "${CARGO}" check -p meerkat-core
@@ -71,15 +108,21 @@ case "${lane}" in
     "${CARGO}" test -p meerkat-core --lib --tests
     ;;
   test-feature-matrix-lib)
-    "${CARGO}" check -p meerkat-tools --no-default-features --features comms
-    "${CARGO}" check -p meerkat-tools --no-default-features --features mcp
-    "${CARGO}" check -p meerkat-tools --no-default-features --features comms,mcp
-    "${CARGO}" check -p meerkat --no-default-features --features openai,memory-store
-    "${CARGO}" check -p meerkat --no-default-features --features gemini,jsonl-store
-    "${CARGO}" check -p meerkat --features all-providers,comms,mcp
-    "${CARGO}" check -p meerkat-mob --no-default-features
-    "${CARGO}" check -p meerkat-mob --no-default-features --features runtime-adapter
-    "${CARGO}" test -p meerkat --features all-providers,comms,mcp --lib --tests
+    for feature_lane in \
+      test-feature-matrix-tools-comms \
+      test-feature-matrix-tools-mcp \
+      test-feature-matrix-tools-comms-mcp \
+      test-feature-matrix-meerkat-openai-memory \
+      test-feature-matrix-meerkat-gemini-jsonl \
+      test-feature-matrix-meerkat-all-providers-check \
+      test-feature-matrix-mob-minimal \
+      test-feature-matrix-mob-runtime-adapter \
+      test-feature-matrix-meerkat-all-providers-tests; do
+      run_feature_matrix_lane "${feature_lane}"
+    done
+    ;;
+  test-feature-matrix-*)
+    run_feature_matrix_lane "${lane}"
     ;;
   *)
     echo "unknown cargo-equivalent BuildBuddy lane: ${lane}" >&2

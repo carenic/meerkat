@@ -3,7 +3,7 @@ description: Install the toolchain needed by optional BuildBuddy CI lanes.
 
 inputs:
   profile:
-    description: "Setup profile: native, doctor, lint, sdk, rust, wasm, audit, or full."
+    description: "Setup profile: submitter, native, doctor, lint, sdk, rust, wasm, audit, or full."
     required: false
     default: native
 
