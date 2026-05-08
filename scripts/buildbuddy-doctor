@@ -335,6 +335,8 @@ if grep -Fq 'MEERKAT_CI_BACKEND' .github/workflows/ci.yml &&
   grep -Fq 'MEERKAT_GCP_BUILDBUDDY_CI_MAX_SECONDS' .github/workflows/buildbuddy.yml &&
   grep -Fq 'Check GCP CI duration SLO' .github/workflows/buildbuddy.yml &&
   grep -Fq 'MEERKAT_GCP_BUILDBUDDY_WAIT_ON_DOWN' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'gcloud compute instance-groups managed resize "${MEERKAT_GCP_BUILDBUDDY_MIG}"' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'resize_existing_pool 0' scripts/gcp-buildbuddy-executor-pool &&
   grep -Fq 'Skipping wait for executor pool scale-down' scripts/gcp-buildbuddy-executor-pool &&
   grep -Fq 'vars.MEERKAT_BUILDBUDDY == '"'"'true'"'"'' .github/workflows/buildbuddy.yml &&
   grep -Fq 'MEERKAT_BUILDBUDDY_CI_MODE' .github/workflows/ci.yml &&

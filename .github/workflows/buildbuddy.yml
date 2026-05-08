@@ -378,10 +378,6 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 1
       - name: Authenticate to GCP with Workload Identity
         if: ${{ vars.MEERKAT_GCP_WORKLOAD_IDENTITY_PROVIDER != '' && vars.MEERKAT_GCP_SERVICE_ACCOUNT != '' }}
         uses: google-github-actions/auth@v3
@@ -411,7 +407,31 @@ jobs:
         shell: bash
         env:
           MEERKAT_GCP_BUILDBUDDY_WAIT_ON_DOWN: ${{ vars.MEERKAT_GCP_BUILDBUDDY_WAIT_ON_DOWN || '0' }}
-        run: scripts/gcp-buildbuddy-executor-pool down
+          MEERKAT_GCP_BUILDBUDDY_WAIT_TIMEOUT: ${{ vars.MEERKAT_GCP_BUILDBUDDY_WAIT_TIMEOUT || '900' }}
+        run: |
+          gcloud compute instance-groups managed resize "${MEERKAT_GCP_BUILDBUDDY_MIG}" \
+            --project "${MEERKAT_GCP_PROJECT_ID}" \
+            --zone "${MEERKAT_GCP_ZONE}" \
+            --size 0 \
+            --quiet
+
+          case "${MEERKAT_GCP_BUILDBUDDY_WAIT_ON_DOWN}" in
+            0|false|False|FALSE|no|No|NO)
+              echo "Skipping wait for executor pool scale-down; target size is set to 0."
+              ;;
+            *)
+              gcloud compute instance-groups managed wait-until "${MEERKAT_GCP_BUILDBUDDY_MIG}" \
+                --project "${MEERKAT_GCP_PROJECT_ID}" \
+                --zone "${MEERKAT_GCP_ZONE}" \
+                --stable \
+                --timeout "${MEERKAT_GCP_BUILDBUDDY_WAIT_TIMEOUT}"
+              ;;
+          esac
+
+          gcloud compute instance-groups managed describe "${MEERKAT_GCP_BUILDBUDDY_MIG}" \
+            --project "${MEERKAT_GCP_PROJECT_ID}" \
+            --zone "${MEERKAT_GCP_ZONE}" \
+            --format='table(name,targetSize,currentActions.creating,currentActions.deleting,currentActions.recreating,currentActions.refreshing,currentActions.restarting,currentActions.verifying)'
 
   doctor:
     name: BuildBuddy doctor

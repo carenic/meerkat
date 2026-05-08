@@ -374,6 +374,20 @@ resize_pool() {
     --quiet
 }
 
+resize_existing_pool() {
+  local size="$1"
+  require_gcloud
+  if ! mig_exists; then
+    echo "MIG ${mig}: absent"
+    return
+  fi
+  gcloud compute instance-groups managed resize "${mig}" \
+    --project "${project}" \
+    --zone "${zone}" \
+    --size "${size}" \
+    --quiet
+}
+
 wait_stable() {
   require_gcloud
   if ! mig_exists; then
@@ -423,7 +437,7 @@ case "${command}" in
     status
     ;;
   down)
-    resize_pool 0
+    resize_existing_pool 0
     case "${MEERKAT_GCP_BUILDBUDDY_WAIT_ON_DOWN:-1}" in
       0|false|False|FALSE|no|No|NO)
         echo "Skipping wait for executor pool scale-down; target size is set to 0."
