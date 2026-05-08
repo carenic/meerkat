@@ -310,11 +310,26 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         None
     };
 
+    let live_ws_config = live_ws
+        .as_ref()
+        .map(|(state, addr, _)| meerkat_rpc::LiveWsConfig {
+            state: std::sync::Arc::clone(state),
+            base_url: format!("ws://{addr}"),
+        });
+
     let serve_result = if let Some(ref tcp_addr) = cli.tcp {
         eprintln!("rkat-rpc listening on tcp://{tcp_addr}");
-        meerkat_rpc::serve_tcp(tcp_addr, runtime, config_store, skill_runtime).await
+        meerkat_rpc::serve_tcp_with_options(
+            tcp_addr,
+            runtime,
+            config_store,
+            skill_runtime,
+            live_ws_config,
+        )
+        .await
     } else {
-        meerkat_rpc::serve_stdio_with_skill_runtime(runtime, config_store, skill_runtime).await
+        meerkat_rpc::serve_stdio_with_options(runtime, config_store, skill_runtime, live_ws_config)
+            .await
     };
 
     if let Some((_, _, handle)) = live_ws {

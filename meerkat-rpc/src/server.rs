@@ -128,6 +128,16 @@ impl<R: AsyncBufRead + Unpin, W: TransportWriter> RpcServer<R, W> {
         }
     }
 
+    /// Attach a live WebSocket transport for `live/open` token minting.
+    pub fn with_live_ws(
+        mut self,
+        state: std::sync::Arc<meerkat_live::LiveWsState>,
+        base_url: String,
+    ) -> Self {
+        self.router = self.router.with_live_ws(state, base_url);
+        self
+    }
+
     #[cfg(feature = "mob")]
     /// Create a new RPC server with an optional skill runtime and explicit mob state.
     ///
@@ -485,12 +495,32 @@ pub async fn serve_stdio_with_skill_runtime(
     config_store: Arc<dyn ConfigStore>,
     skill_runtime: Option<Arc<meerkat_core::skills::SkillRuntime>>,
 ) -> Result<(), ServerError> {
+    serve_stdio_with_options(runtime, config_store, skill_runtime, None).await
+}
+
+/// Start the RPC server on stdin/stdout with optional live WebSocket config.
+pub async fn serve_stdio_with_options(
+    runtime: Arc<SessionRuntime>,
+    config_store: Arc<dyn ConfigStore>,
+    skill_runtime: Option<Arc<meerkat_core::skills::SkillRuntime>>,
+    live_ws: Option<LiveWsConfig>,
+) -> Result<(), ServerError> {
     let stdin = tokio::io::stdin();
     let stdout = BlockingWriter::stdout();
     let reader = BufReader::new(stdin);
     let mut server =
         RpcServer::new_with_skill_runtime(reader, stdout, runtime, config_store, skill_runtime);
+    if let Some(live_ws) = live_ws {
+        server = server.with_live_ws(live_ws.state, live_ws.base_url);
+    }
     server.run().await
+}
+
+/// Optional live WebSocket configuration to thread into the RPC server.
+#[derive(Clone)]
+pub struct LiveWsConfig {
+    pub state: Arc<meerkat_live::LiveWsState>,
+    pub base_url: String,
 }
 
 /// Accept a single RPC client over an already-connected TCP stream.
@@ -504,24 +534,42 @@ pub async fn serve_tcp_connection(
     config_store: Arc<dyn ConfigStore>,
     skill_runtime: Option<Arc<meerkat_core::skills::SkillRuntime>>,
 ) -> Result<(), ServerError> {
+    serve_tcp_connection_with_options(stream, runtime, config_store, skill_runtime, None).await
+}
+
+pub async fn serve_tcp_connection_with_options(
+    stream: tokio::net::TcpStream,
+    runtime: Arc<SessionRuntime>,
+    config_store: Arc<dyn ConfigStore>,
+    skill_runtime: Option<Arc<meerkat_core::skills::SkillRuntime>>,
+    live_ws: Option<LiveWsConfig>,
+) -> Result<(), ServerError> {
     let (read_half, write_half) = stream.into_split();
     let reader = BufReader::new(read_half);
     let mut server =
         RpcServer::new_with_skill_runtime(reader, write_half, runtime, config_store, skill_runtime);
+    if let Some(live_ws) = live_ws {
+        server = server.with_live_ws(live_ws.state, live_ws.base_url);
+    }
     server.skip_shutdown_on_eof = true;
     server.run().await
 }
 
-/// Listen on a TCP address and serve RPC clients concurrently.
-///
-/// Each accepted connection is spawned into its own task with a dedicated
-/// `RpcServer` sharing the underlying `SessionRuntime`. This ensures a
-/// dead client (missing TCP FIN after kill) does not block new connections.
 pub async fn serve_tcp(
     addr: &str,
     runtime: Arc<SessionRuntime>,
     config_store: Arc<dyn ConfigStore>,
     skill_runtime: Option<Arc<meerkat_core::skills::SkillRuntime>>,
+) -> Result<(), ServerError> {
+    serve_tcp_with_options(addr, runtime, config_store, skill_runtime, None).await
+}
+
+pub async fn serve_tcp_with_options(
+    addr: &str,
+    runtime: Arc<SessionRuntime>,
+    config_store: Arc<dyn ConfigStore>,
+    skill_runtime: Option<Arc<meerkat_core::skills::SkillRuntime>>,
+    live_ws: Option<LiveWsConfig>,
 ) -> Result<(), ServerError> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     tracing::info!("RPC TCP listener bound to {addr}");
@@ -531,8 +579,16 @@ pub async fn serve_tcp(
         let runtime = Arc::clone(&runtime);
         let config_store = Arc::clone(&config_store);
         let skill_runtime = skill_runtime.clone();
+        let live_ws = live_ws.clone();
         tokio::spawn(async move {
-            if let Err(e) = serve_tcp_connection(stream, runtime, config_store, skill_runtime).await
+            if let Err(e) = serve_tcp_connection_with_options(
+                stream,
+                runtime,
+                config_store,
+                skill_runtime,
+                live_ws,
+            )
+            .await
             {
                 tracing::warn!("RPC client {peer_addr} disconnected: {e}");
             } else {
