@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Published facade linking** — `meerkat` now resolves the exact same-version
+  `meerkat-core` package when computing the private AgentFactory policy bridge
+  symbol, preventing downstream native link failures when older registry
+  versions are cached locally.
+
 ## [0.6.2] - 2026-05-08
 
 Meerkat 0.6.2 is a patch release for runtime authority, provider/tooling polish, blob/file tooling, OpenAI replay continuity, and the recovered BuildBuddy release path. It makes the runtime lifecycle spine machine-owned, improves model/tool visibility and multimodal handling, and simplifies published release assets to the four supported public runtime binaries.

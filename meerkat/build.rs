@@ -32,6 +32,7 @@ fn core_manifest_dir_candidates(
     let Some(parent) = manifest_dir.parent() else {
         return Vec::new();
     };
+    let package_version = std::env::var("CARGO_PKG_VERSION").unwrap_or_default();
 
     let mut candidates = Vec::new();
     let direct = parent.join("meerkat-core");
@@ -39,8 +40,19 @@ fn core_manifest_dir_candidates(
         candidates.push(path);
     }
 
+    if !package_version.is_empty() {
+        let exact = parent.join(format!("meerkat-core-{package_version}"));
+        if let Ok(path) = exact.canonicalize()
+            && !candidates.contains(&path)
+        {
+            candidates.push(path);
+        }
+    }
+
     if let Ok(entries) = std::fs::read_dir(parent) {
-        for entry in entries.flatten() {
+        let mut entries = entries.flatten().collect::<Vec<_>>();
+        entries.sort_by_key(std::fs::DirEntry::file_name);
+        for entry in entries {
             let path = entry.path();
             let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
                 continue;

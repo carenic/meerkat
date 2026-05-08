@@ -91,4 +91,11 @@ if [[ "$fail" -ne 0 ]]; then
     exit 1
 fi
 
+if [[ "$ISOLATED_TARGETS" == 1 || "$ISOLATED_TARGETS" == true ]]; then
+    "$ROOT/scripts/check-published-facade-link.sh"
+else
+    MEERKAT_PUBLISHED_FACADE_PACKAGE_TARGET="$TARGET_ROOT" \
+        "$ROOT/scripts/check-published-facade-link.sh"
+fi
+
 echo "All release crates package successfully"

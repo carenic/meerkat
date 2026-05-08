@@ -232,6 +232,10 @@ jobs:
           profile: native
           mode: release-validate
 
+      - name: Verify Rust release packaging
+        if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.publish_release_assets_only != 'true' }}
+        run: make check-rust-release-packaging
+
       - name: Verify tag matches version
         if: startsWith(github.ref, 'refs/tags/v')
         shell: bash

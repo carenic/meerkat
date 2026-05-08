@@ -776,6 +776,21 @@ fn authority_build_scripts_do_not_leak_factory_seal_metadata() {
 }
 
 #[test]
+fn facade_build_script_prefers_exact_registry_core_package() {
+    let facade_build = repo_file("meerkat/build.rs");
+
+    assert!(
+        facade_build.contains("CARGO_PKG_VERSION")
+            && facade_build.contains("meerkat-core-{package_version}")
+            && facade_build.contains("entries.sort_by_key"),
+        "facade build script must prefer the exact same-version \
+         meerkat-core registry package before scanning stale sibling versions; \
+         otherwise downstream published-crate builds can link the facade \
+         against a symbol suffix from an older cached meerkat-core package"
+    );
+}
+
+#[test]
 fn facade_cargo_does_not_feature_unify_standalone_builder_by_default() {
     let cargo = repo_file("meerkat/Cargo.toml");
     let core_cargo = repo_file("meerkat-core/Cargo.toml");
