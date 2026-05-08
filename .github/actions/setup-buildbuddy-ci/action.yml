@@ -94,6 +94,15 @@ runs:
         bb_bin="$(scripts/install-buildbuddy-cli --dir "${RUNNER_TEMP}/buildbuddy-cli")"
         echo "$(dirname "${bb_bin}")" >> "${GITHUB_PATH}"
 
+    - name: Restore Bazel external repositories
+      if: ${{ env.MEERKAT_BAZEL_BACKEND == 'gcp-buildbuddy' }}
+      uses: actions/cache/restore@v5
+      with:
+        path: ${{ runner.temp }}/buildbuddy-repository-cache
+        key: buildbuddy-bazel-repository-${{ runner.os }}-${{ hashFiles('MODULE.bazel', 'MODULE.bazel.lock') }}
+        restore-keys: |
+          buildbuddy-bazel-repository-${{ runner.os }}-
+
     - name: Cache Bazel external repositories
       if: ${{ env.MEERKAT_BAZEL_BACKEND != 'gcp-buildbuddy' }}
       uses: actions/cache@v5
