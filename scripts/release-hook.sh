@@ -16,6 +16,13 @@ VERSION="${1:?Usage: release-hook.sh <version>}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 CARGO="${CARGO:-$ROOT/scripts/repo-cargo}"
 
+case "${DRY_RUN:-}" in
+    1|true|TRUE|yes|YES|on|ON)
+        echo "==> Release hook: dry run detected; skipping mutating SDK/schema sync"
+        exit 0
+        ;;
+esac
+
 # cargo-release runs this hook per-crate. Only execute once.
 SENTINEL="$ROOT/.release-hook-done"
 if [[ -f "$SENTINEL" ]] && [[ "$(cat "$SENTINEL")" == "$VERSION" ]]; then
@@ -49,6 +56,9 @@ echo "==> Emitting schemas..."
 echo "==> Running SDK codegen..."
 python3 "$ROOT/tools/sdk-codegen/generate.py"
 
+echo "==> Regenerating BuildBuddy BUILD files..."
+make buildbuddy-generate
+
 # 3. Verify everything is in sync
 echo "==> Verifying version parity..."
 "$ROOT/scripts/verify-version-parity.sh"
@@ -64,14 +74,13 @@ git add \
     "$ROOT/meerkat-contracts/src/version.rs" \
     "$ROOT/sdks/python/pyproject.toml" \
     "$ROOT/sdks/typescript/package.json" \
-    "$ROOT/sdks/typescript/package-lock.json" \
     "$ROOT/sdks/web/package.json" \
-    "$ROOT/sdks/web/package-lock.json" \
-    "$ROOT/sdks/web/wasm/package.json" \
     "$ROOT/sdks/web/src/runtime.ts" \
+    "$ROOT/sdks/web/src/generated/" \
     "$ROOT/sdks/python/meerkat/generated/" \
     "$ROOT/sdks/typescript/src/generated/" \
     "$ROOT/artifacts/schemas/"
+git ls-files -z '*BUILD.bazel' | xargs -0 git add --
 
 # 5. Mark as done for this version
 echo "$VERSION" > "$SENTINEL"
