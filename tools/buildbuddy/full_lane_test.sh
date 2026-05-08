@@ -272,6 +272,8 @@ case "${lane}" in
     configure_node
     configure_python
     "${CARGO}" build -p meerkat-rpc
+    # The release workflow runs packaged-crate validation after this BB lane so
+    # the registry-layout smoke stays outside the remote Bazel test sandbox.
     parallel_jobs_file="${TEST_TMPDIR}/release-validate-jobs.tsv"
     : >"${parallel_jobs_file}"
     run_parallel_job release-contracts bash -lc '
@@ -280,10 +282,6 @@ case "${lane}" in
       make verify-rpc-surface-alignment CARGO="${CARGO}"
       make verify-sdk-wrapper-freshness CARGO="${CARGO}" PYTHON="${PYTHON}"
       make verify-schema-freshness CARGO="${CARGO}"
-    '
-    run_parallel_job rust-release-packaging bash -lc '
-      export CARGO_TARGET_DIR="${TEST_TMPDIR}/cargo-target-release-packaging"
-      make check-rust-release-packaging CARGO="${CARGO}"
     '
     run_parallel_job python-sdk bash -lc '
       cd sdks/python
