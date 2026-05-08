@@ -48,7 +48,7 @@ env:
 jobs:
   select_backend:
     name: Select CI backend
-    runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
+    runs-on: ubuntu-latest
     outputs:
       backend: ${{ steps.select.outputs.backend }}
       mode: ${{ steps.select.outputs.mode }}
@@ -206,7 +206,7 @@ jobs:
       - buildbuddy_hosted
       - gcp_buildbuddy
       - dogma-cleanup-gate
-    runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
+    runs-on: ubuntu-latest
     steps:
       - name: Check selected backend
         run: |

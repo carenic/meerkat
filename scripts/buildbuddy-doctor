@@ -23,6 +23,27 @@ bad() {
   printf 'FAIL %s\n' "$1"
 }
 
+job_has_line() {
+  local file="$1"
+  local job="$2"
+  local needle="$3"
+  awk -v job="  ${job}:" -v needle="${needle}" '
+    $0 == job {
+      in_job = 1
+      next
+    }
+    in_job && $0 ~ /^  [[:alnum:]_-]+:/ {
+      in_job = 0
+    }
+    in_job && index($0, needle) {
+      found = 1
+    }
+    END {
+      exit found ? 0 : 1
+    }
+  ' "${file}"
+}
+
 has_buildbuddy_key() {
   if [[ -n "${BUILDBUDDY_API_KEY:-}" ]]; then
     return 0
@@ -357,6 +378,22 @@ if grep -Fq 'MEERKAT_CI_BACKEND' .github/workflows/ci.yml &&
   pass "CI backend selector and local BuildBuddy opt-in switches are wired consistently"
 else
   bad "CI backend selector or BuildBuddy opt-in switch is not wired consistently"
+fi
+
+if job_has_line .github/workflows/ci.yml select_backend 'runs-on: ubuntu-latest' &&
+  job_has_line .github/workflows/ci.yml gate 'runs-on: ubuntu-latest' &&
+  job_has_line .github/workflows/buildbuddy.yml gcp-native-submit 'name: GCP BuildBuddy submitter' &&
+  job_has_line .github/workflows/buildbuddy.yml gcp-native-submit 'runs-on: ubuntu-latest' &&
+  job_has_line .github/workflows/buildbuddy.yml gcp-native-submit 'Select GCP BuildBuddy lanes' &&
+  job_has_line .github/workflows/buildbuddy.yml gcp-native-submit 'run-buildbuddy-ci-lane-batch' &&
+  job_has_line .github/workflows/buildbuddy.yml gcp-native-submit 'group: gcp' &&
+  job_has_line .github/workflows/buildbuddy.yml gcp-native-submit 'lanes: ${{ steps.gcp-lanes.outputs.lanes }}' &&
+  job_has_line .github/workflows/buildbuddy.yml gcp-governance-submit 'if: ${{ false }}' &&
+  job_has_line .github/workflows/buildbuddy.yml gcp-wasm-feature-submit 'if: ${{ false }}' &&
+  job_has_line .github/workflows/buildbuddy.yml gate 'runs-on: ubuntu-latest'; then
+  pass "GCP BuildBuddy CI uses one GitHub-hosted submitter with Bazel lane fanout"
+else
+  bad "GCP BuildBuddy CI still depends on multiple GitHub runner slots"
 fi
 
 if grep -Fq 'full-fresh' .github/workflows/buildbuddy.yml &&

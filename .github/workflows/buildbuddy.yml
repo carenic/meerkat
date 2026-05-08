@@ -251,10 +251,10 @@ jobs:
         run: scripts/gcp-buildbuddy-executor-pool up
 
   gcp-native-submit:
-    name: GCP BuildBuddy native submitter
+    name: GCP BuildBuddy submitter
     if: ${{ (inputs.backend || 'buildbuddy-hosted') == 'gcp-buildbuddy' && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
     needs: [gcp-control-plane-up, gcp-executors-up]
-    runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
       BUILDBUDDY_GRPC_URL: ${{ needs.gcp-control-plane-up.outputs.grpc_url }}
@@ -265,22 +265,64 @@ jobs:
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+      - name: Select GCP BuildBuddy lanes
+        id: gcp-lanes
+        shell: bash
+        env:
+          MACHINE_AUTHORITY_BASE_SHA: ${{ inputs.machine_authority_base_sha || '' }}
+          MACHINE_AUTHORITY_HEAD_SHA: ${{ inputs.machine_authority_head_sha || github.sha }}
+        run: |
+          machine_authority_changed=true
+          if [[ -n "${MACHINE_AUTHORITY_BASE_SHA}" && "${MACHINE_AUTHORITY_BASE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
+            set +e
+            scripts/machine-authority-changed --base "${MACHINE_AUTHORITY_BASE_SHA}" --head "${MACHINE_AUTHORITY_HEAD_SHA}"
+            status="$?"
+            set -e
+            case "${status}" in
+              0) machine_authority_changed=true ;;
+              1) machine_authority_changed=false ;;
+              *)
+                echo "Machine-authority diff failed; running conservative check."
+                machine_authority_changed=true
+                ;;
+            esac
+          else
+            echo "No reliable diff base; running machine authority."
+          fi
+
+          {
+            echo "lanes<<LANES"
+            printf '%s\n' \
+              fmt-static \
+              cargo-all-features-clippy \
+              feature-clippy \
+              unused-deps \
+              test-unit \
+              integration-fast \
+              seam-inventory \
+              rmat-audit \
+              sdk-suites \
+              wasm-contract-tests \
+              wasm-check \
+              test-minimal \
+              test-feature-matrix-lib \
+              test-feature-matrix-surface-checks \
+              audit
+            if [[ "${machine_authority_changed}" == "true" ]]; then
+              echo "machine-authority"
+            fi
+            echo "LANES"
+          } >> "${GITHUB_OUTPUT}"
       - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
         with:
-          group: gcp-native
+          group: gcp
           profile: native
           mode: ${{ (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call') && (inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh') || 'full-fresh' }}
-          lanes: |
-            fmt-static
-            cargo-all-features-clippy
-            feature-clippy
-            unused-deps
-            test-unit
-            integration-fast
+          lanes: ${{ steps.gcp-lanes.outputs.lanes }}
 
   gcp-governance-submit:
     name: GCP BuildBuddy governance submitter
-    if: ${{ (inputs.backend || 'buildbuddy-hosted') == 'gcp-buildbuddy' && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
+    if: ${{ false }}
     needs: [gcp-control-plane-up, gcp-executors-up]
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
     timeout-minutes: 10
@@ -340,9 +382,9 @@ jobs:
 
   gcp-wasm-feature-submit:
     name: GCP BuildBuddy wasm and feature submitter
-    if: ${{ (inputs.backend || 'buildbuddy-hosted') == 'gcp-buildbuddy' && !startsWith(inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh', 'workspace-') && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
+    if: ${{ false }}
     needs: [gcp-control-plane-up, gcp-executors-up]
-    runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     env:
       BUILDBUDDY_GRPC_URL: ${{ needs.gcp-control-plane-up.outputs.grpc_url }}
@@ -731,7 +773,7 @@ jobs:
       - wasm-check
       - audit
     if: ${{ always() && (github.event_name == 'workflow_dispatch' || github.event_name == 'workflow_call' || ((vars.MEERKAT_BUILDBUDDY == 'true' || vars.MEERKAT_BUILDBUDDY == '1') && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository))) }}
-    runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - name: Check results
