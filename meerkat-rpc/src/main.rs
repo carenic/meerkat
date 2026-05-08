@@ -50,6 +50,12 @@ struct Cli {
     /// This is an explicit transport exposure opt-in, not an auth mechanism.
     #[arg(long)]
     allow_remote: bool,
+    /// Start a live WebSocket listener on this address.
+    ///
+    /// Exposes the `/live/ws` endpoint for live audio/text channels.
+    /// Example: --live-ws 127.0.0.1:4900
+    #[arg(long)]
+    live_ws: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -289,12 +295,32 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         "rkat-rpc",
     )
     .await?;
+    let live_ws = if let Some(ref live_ws_addr) = cli.live_ws {
+        let listener = tokio::net::TcpListener::bind(live_ws_addr).await?;
+        let actual_addr = listener.local_addr()?;
+        eprintln!("rkat-rpc live-ws listening on ws://{actual_addr}/live/ws");
+        let host = std::sync::Arc::new(meerkat_runtime::live_adapter_host::LiveAdapterHost::new());
+        let ws_state = std::sync::Arc::new(meerkat_live::LiveWsState::new(host));
+        let ws_state_clone = std::sync::Arc::clone(&ws_state);
+        let handle = tokio::spawn(async move {
+            meerkat_live::serve_live_ws_listener(listener, ws_state_clone).await
+        });
+        Some((ws_state, actual_addr, handle))
+    } else {
+        None
+    };
+
     let serve_result = if let Some(ref tcp_addr) = cli.tcp {
         eprintln!("rkat-rpc listening on tcp://{tcp_addr}");
         meerkat_rpc::serve_tcp(tcp_addr, runtime, config_store, skill_runtime).await
     } else {
         meerkat_rpc::serve_stdio_with_skill_runtime(runtime, config_store, skill_runtime).await
     };
+
+    if let Some((_, _, handle)) = live_ws {
+        handle.abort();
+        let _ = handle.await;
+    }
     lease.shutdown().await;
     serve_result?;
 
