@@ -51,10 +51,12 @@ def main() -> int:
             elif isinstance(value, str) and not value.strip():
                 metadata_errors.append(f"{name}: empty required package metadata field `{field}`")
 
+    workspace_version = workspace["workspace"]["package"]["version"]
     missing = sorted(publishable - expected)
     unexpected = sorted(expected - publishable)
     order_errors = dependency_order_errors(workspace_packages, expected_order)
-    if missing or unexpected or metadata_errors or order_errors:
+    bazel_errors = bazel_release_binary_version_env_errors(root, workspace_version)
+    if missing or unexpected or metadata_errors or order_errors or bazel_errors:
         if missing:
             print("Publishable workspace crates missing from release list:", file=sys.stderr)
             for name in missing:
@@ -74,9 +76,60 @@ def main() -> int:
             print("Release crate list is not dependency ordered:", file=sys.stderr)
             for err in order_errors:
                 print(f"  - {err}", file=sys.stderr)
+        if bazel_errors:
+            print("BuildBuddy release binaries have invalid Cargo version metadata:", file=sys.stderr)
+            for err in bazel_errors:
+                print(f"  - {err}", file=sys.stderr)
         return 1
 
     return 0
+
+
+def bazel_release_binary_version_env_errors(root: pathlib.Path, version: str) -> list[str]:
+    """Check the generated Bazel release binary targets embed the crate version."""
+
+    targets = {
+        pathlib.Path("meerkat-cli/BUILD.bazel"): ["rkat"],
+        pathlib.Path("meerkat-rpc/BUILD.bazel"): ["rkat_rpc_bin"],
+        pathlib.Path("meerkat-rest/BUILD.bazel"): ["rkat_rest_bin"],
+        pathlib.Path("meerkat-mcp-server/BUILD.bazel"): ["rkat_mcp_bin"],
+    }
+    expected = f'"CARGO_PKG_VERSION": "{version}"'
+    errors = []
+
+    for rel_path, names in targets.items():
+        path = root / rel_path
+        try:
+            text = path.read_text()
+        except FileNotFoundError:
+            errors.append(f"{rel_path}: generated BUILD file is missing")
+            continue
+
+        for name in names:
+            block = find_bazel_target_block(text, name)
+            if block is None:
+                errors.append(f"{rel_path}: target {name} is missing")
+            elif expected not in block:
+                errors.append(f"{rel_path}: target {name} missing {expected}")
+
+    return errors
+
+
+def find_bazel_target_block(text: str, name: str) -> str | None:
+    marker = f'name = "{name}",'
+    marker_index = text.find(marker)
+    if marker_index < 0:
+        return None
+
+    start = text.rfind("\nrust_", 0, marker_index)
+    if start < 0:
+        start = 0
+    else:
+        start += 1
+    end = text.find("\n)", marker_index)
+    if end < 0:
+        end = len(text)
+    return text[start:end]
 
 
 def dependency_order_errors(

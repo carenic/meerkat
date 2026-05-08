@@ -397,6 +397,11 @@ jobs:
               echo "Missing expected binary at $src" >&2
               exit 1
             fi
+            if ! grep -aF -- "$VERSION" "$src" >/dev/null; then
+              echo "Binary ${bin} for ${TARGET} does not embed release version ${VERSION}" >&2
+              "$src" --version 2>/dev/null || true
+              exit 1
+            fi
 
             if [[ "$ARCHIVE_EXT" == "zip" ]]; then
               7z a -tzip "${GITHUB_WORKSPACE}/dist/${artifact_name}" "$(cygpath -w "$src")"
@@ -556,6 +561,11 @@ jobs:
             fi
             cp "$src" "${stage_dir}/${payload_name}"
             chmod +x "${stage_dir}/${payload_name}" || true
+            if ! grep -aF -- "$VERSION" "${stage_dir}/${payload_name}" >/dev/null; then
+              echo "Binary ${bin} for ${TARGET} does not embed release version ${VERSION}" >&2
+              "${stage_dir}/${payload_name}" --version 2>/dev/null || true
+              exit 1
+            fi
             archive_path="${PWD}/dist/${artifact_name}"
 
             if [[ "$ARCHIVE_EXT" == "zip" ]]; then
@@ -942,9 +952,9 @@ jobs:
           npm config set //registry.npmjs.org/:_authToken ${NODE_AUTH_TOKEN}
           npm run build
           if [[ "$DRY_RUN" == "true" ]]; then
-            npm publish --access public --dry-run
+            npm publish --access public --dry-run --ignore-scripts
           else
-            npm publish --access public
+            npm publish --access public --ignore-scripts
           fi
 
   publish_web_sdk_recovery:
@@ -957,6 +967,7 @@ jobs:
       github.event.inputs.publish_web_sdk_only == 'true'
     needs: [require_ci_green]
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -965,6 +976,9 @@ jobs:
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
 
       - name: Install Python + Node tooling
         uses: actions/setup-python@v5
@@ -1001,7 +1015,7 @@ jobs:
           npm config set //registry.npmjs.org/:_authToken ${NODE_AUTH_TOKEN}
           npm run build
           if [[ "$DRY_RUN" == "true" ]]; then
-            npm publish --access public --dry-run
+            npm publish --access public --dry-run --ignore-scripts
           else
-            npm publish --access public
+            npm publish --access public --ignore-scripts
           fi

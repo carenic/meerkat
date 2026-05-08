@@ -13,6 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   dependency-ordered crate list, streams per-crate `cargo publish` logs, applies
   a bounded timeout, and skips Cargo's duplicate verifier during real uploads
   because release validation already packages and links the published surface.
+- **Web SDK publishing** — npm Web SDK publish steps now publish the artifact
+  already built by the workflow instead of re-running the expensive wasm build
+  through `prepublishOnly`; Web SDK recovery also restores the Rust cache and a
+  bounded job timeout.
+- **BuildBuddy binary release metadata** — generated Bazel Rust targets now set
+  `CARGO_PKG_VERSION` from the workspace package version, and release packaging
+  rejects binaries that do not embed the requested release version.
 
 ## [0.6.3] - 2026-05-08
 

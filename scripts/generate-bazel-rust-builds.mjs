@@ -39,6 +39,7 @@ const packageKey = (pkg) => {
 const packageLabel = (pkg) => `//${relative(root, packageDir(pkg))}:${crateName(pkg.name)}`;
 const crateName = (name) => name.replaceAll("-", "_");
 const q = (value) => JSON.stringify(value);
+const cargoPackageVersionEnv = (pkg) => `        "CARGO_PKG_VERSION": ${q(pkg.version)},`;
 
 function defaultFeatures(pkg) {
   return pkg.features?.default ?? [];
@@ -1059,6 +1060,7 @@ for (const pkg of localPackages.values()) {
         ? `./${packageRunfilesDir}`
         : packageRunfilesDir;
       const rustcEnv = [
+        cargoPackageVersionEnv(pkg),
         `        "CARGO_BIN_NAME": ${q(target.name)},`,
         `        "CARGO_MANIFEST_DIR": ${q(cargoManifestDir)},`,
       ];
@@ -1068,12 +1070,13 @@ for (const pkg of localPackages.values()) {
       }
       attrs.splice(attrs.length - 1, 0, `    rustc_env = {\n${rustcEnv.join("\n")}\n    },`);
     }
-    if (rule === "rust_library" && (key === "meerkat" || key === "meerkat-core")) {
+    if (rule === "rust_library") {
       const packageRunfilesDir = relative(root, dir) || ".";
       const cargoManifestDir = packageRunfilesDir !== "."
         ? `./${packageRunfilesDir}`
         : packageRunfilesDir;
       const rustcEnv = [
+        cargoPackageVersionEnv(pkg),
         `        "CARGO_MANIFEST_DIR": ${q(cargoManifestDir)},`,
       ];
       if (key === "meerkat") {
@@ -1221,7 +1224,7 @@ for (const pkg of localPackages.values()) {
         );
         const rustcEnvIndex = internalAttrs.findIndex((line) => line.startsWith("    rustc_env = {"));
         if (rustcEnvIndex >= 0) {
-          internalAttrs[rustcEnvIndex] = `    rustc_env = {\n        "CARGO_MANIFEST_DIR": "./meerkat-core",\n        "MEERKAT_AGENT_FACTORY_POLICY_BRIDGE_SYMBOL_SUFFIX": ${q(agentFactoryBridgeSymbolSuffix)},\n    },`;
+          internalAttrs[rustcEnvIndex] = `    rustc_env = {\n${cargoPackageVersionEnv(pkg)}\n        "CARGO_MANIFEST_DIR": "./meerkat-core",\n        "MEERKAT_AGENT_FACTORY_POLICY_BRIDGE_SYMBOL_SUFFIX": ${q(agentFactoryBridgeSymbolSuffix)},\n    },`;
         }
       }
       if (key === "meerkat-machine-schema" || key === "meerkat-runtime") {
@@ -1283,6 +1286,7 @@ for (const pkg of localPackages.values()) {
         unitEnv.push(`        "WORKSPACE_ROOT": ".",`);
       }
       const unitRustcEnv = [
+        cargoPackageVersionEnv(pkg),
         `        "CARGO_MANIFEST_DIR": ${q(cargoManifestDir)},`,
       ];
       if (key === "meerkat") {
@@ -1396,6 +1400,7 @@ for (const pkg of localPackages.values()) {
         ];
         if (rule === "rust_binary") {
           const rustcEnv = [
+            cargoPackageVersionEnv(pkg),
             `        "CARGO_BIN_NAME": ${q(target.name)},`,
             `        "CARGO_MANIFEST_DIR": ${q(relative(root, dir) || ".")},`,
           ];
@@ -1407,10 +1412,17 @@ for (const pkg of localPackages.values()) {
           attrs.push(
             `    rustc_env = {\n${rustcEnv.join("\n")}\n    },`,
           );
-        } else if (key === "meerkat") {
-          attrs.push(
-            `    rustc_env = {\n        "CARGO_MANIFEST_DIR": ${q(relative(root, dir) || ".")},\n        "MEERKAT_AGENT_FACTORY_POLICY_BRIDGE_SYMBOL_SUFFIX": ${q(agentFactoryBridgeSymbolSuffix)},\n    },`,
-          );
+        } else {
+          const rustcEnv = [
+            cargoPackageVersionEnv(pkg),
+            `        "CARGO_MANIFEST_DIR": ${q(relative(root, dir) || ".")},`,
+          ];
+          if (key === "meerkat") {
+            rustcEnv.push(
+              `        "MEERKAT_AGENT_FACTORY_POLICY_BRIDGE_SYMBOL_SUFFIX": ${q(agentFactoryBridgeSymbolSuffix)},`,
+            );
+          }
+          attrs.push(`    rustc_env = {\n${rustcEnv.join("\n")}\n    },`);
         }
         attrs.push(
           `    tags = ${listExpr(["buildbuddy", "feature-matrix", "surface"])},`,

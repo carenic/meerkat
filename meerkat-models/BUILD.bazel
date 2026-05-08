@@ -40,6 +40,10 @@ rust_library(
     ],
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_MANIFEST_DIR": "./meerkat-models",
+    },
     proc_macro_deps = all_crate_deps(
         package_name = "meerkat-models",
         proc_macro = True,
@@ -66,6 +70,10 @@ rust_library(
     visibility = [
         "//meerkat:__pkg__",
     ],
+    rustc_env = {
+        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_MANIFEST_DIR": "./meerkat-models",
+    },
     proc_macro_deps = all_crate_deps(
         package_name = "meerkat-models",
         proc_macro = True,
@@ -97,6 +105,7 @@ rust_test(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
+        "CARGO_PKG_VERSION": "0.6.3",
         "CARGO_MANIFEST_DIR": "./meerkat-models",
     },
     tags = [
@@ -145,6 +154,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
+        "CARGO_PKG_VERSION": "0.6.3",
         "CARGO_BIN_NAME": "guards",
         "CARGO_MANIFEST_DIR": "./meerkat-models",
     },
