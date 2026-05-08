@@ -116,8 +116,14 @@ fn gate_job_requires_every_governance_lane() {
     let wrapper_needs = gate_needs(&ci_doc, &ci_yml);
     assert_eq!(
         wrapper_needs,
-        vec!["bazel".to_string(), "dogma-cleanup-gate".to_string()],
-        "{} jobs.gate.needs must gate the GCP Bazel reusable workflow and the dogma cleanup review boundary",
+        vec![
+            "select_backend".to_string(),
+            "cargo".to_string(),
+            "buildbuddy_hosted".to_string(),
+            "gcp_buildbuddy".to_string(),
+            "dogma-cleanup-gate".to_string(),
+        ],
+        "{} jobs.gate.needs must gate CI backend selection, every selectable CI backend, and the dogma cleanup review boundary",
         ci_yml.display(),
     );
 
