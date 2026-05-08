@@ -299,16 +299,14 @@ pub enum LiveContinuityMode {
 /// - realm/auth checks
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
-pub trait LiveAdapter: Send {
-    async fn send_command(&mut self, command: LiveAdapterCommand) -> Result<(), LiveAdapterError>;
+pub trait LiveAdapter: Send + Sync {
+    async fn send_command(&self, command: LiveAdapterCommand) -> Result<(), LiveAdapterError>;
 
-    async fn next_observation(
-        &mut self,
-    ) -> Result<Option<LiveAdapterObservation>, LiveAdapterError>;
+    async fn next_observation(&self) -> Result<Option<LiveAdapterObservation>, LiveAdapterError>;
 
-    fn status(&self) -> &LiveAdapterStatus;
+    fn status(&self) -> LiveAdapterStatus;
 
-    async fn close(&mut self) -> Result<(), LiveAdapterError>;
+    async fn close(&self) -> Result<(), LiveAdapterError>;
 }
 
 /// Errors from the adapter layer. These are transport/provider errors,
