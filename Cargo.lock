@@ -3452,9 +3452,9 @@ dependencies = [
 
 [[package]]
 name = "oai-rt-rs"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bab7be1012ba2d97c87b79fa254342ea622d650faba3cd42bdae46251822a733"
+checksum = "ffa624202cb21ad8d10f56124160a83b425564a4951d04c07837a0d060cd242f"
 dependencies = [
  "async-trait",
  "base64",
@@ -5666,7 +5666,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.48.0",
 ]
 
 [[package]]

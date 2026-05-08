@@ -588,6 +588,7 @@ pub struct MethodRouter {
     #[cfg(feature = "mob")]
     closed_mob_streams: Arc<Mutex<ClosedStreamSet>>,
     runtime_adapter: Arc<meerkat_runtime::MeerkatMachine>,
+    live_adapter_host: Arc<meerkat_runtime::live_adapter_host::LiveAdapterHost>,
 }
 
 impl MethodRouter {
@@ -693,6 +694,7 @@ impl MethodRouter {
             #[cfg(feature = "mob")]
             closed_mob_streams: Arc::new(Mutex::new(ClosedStreamSet::new())),
             runtime_adapter,
+            live_adapter_host: Arc::new(meerkat_runtime::live_adapter_host::LiveAdapterHost::new()),
         }
     }
 
@@ -974,6 +976,7 @@ impl MethodRouter {
             active_mob_streams: Arc::new(Mutex::new(HashMap::new())),
             closed_mob_streams: Arc::new(Mutex::new(ClosedStreamSet::new())),
             runtime_adapter,
+            live_adapter_host: Arc::new(meerkat_runtime::live_adapter_host::LiveAdapterHost::new()),
         }
     }
 
@@ -1466,6 +1469,18 @@ impl MethodRouter {
                     self.runtime.config_runtime(),
                 )
                 .await
+            }
+            #[cfg(not(feature = "mini-surface"))]
+            "live/open" => {
+                handlers::live::handle_live_open(id, params, &self.live_adapter_host).await
+            }
+            #[cfg(not(feature = "mini-surface"))]
+            "live/status" => {
+                handlers::live::handle_live_status(id, params, &self.live_adapter_host).await
+            }
+            #[cfg(not(feature = "mini-surface"))]
+            "live/close" => {
+                handlers::live::handle_live_close(id, params, &self.live_adapter_host).await
             }
             #[cfg(not(feature = "mini-surface"))]
             "mcp/add" => handlers::mcp::handle_add(id, params, &self.runtime).await,

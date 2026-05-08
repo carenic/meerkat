@@ -461,8 +461,11 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
     }
 
     if options.runtime_available {
-        // Realtime surface methods removed in live-adapter MVP.
-        let _ = &options;
+        methods.extend([
+            RpcMethodDescriptor::basic("live/open", "Open a live audio/text channel for a session"),
+            RpcMethodDescriptor::basic("live/status", "Get the status of a live channel"),
+            RpcMethodDescriptor::basic("live/close", "Close a live channel"),
+        ]);
     }
 
     if options.mob_enabled {

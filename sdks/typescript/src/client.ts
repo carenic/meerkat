@@ -2301,43 +2301,22 @@ export class MeerkatClient {
     });
   }
 
-  async realtimeOpenInfo(
-    request: RealtimeOpenRequest,
-  ): Promise<RealtimeOpenInfo> {
-    const result = await this.request("realtime/open_info", request);
-    if (typeof result.ws_url !== "string" || result.ws_url.length === 0) {
-      throw new MeerkatError(
-        "INVALID_RESPONSE",
-        "Invalid realtime/open_info response: missing ws_url",
-      );
-    }
-    return result as unknown as RealtimeOpenInfo;
+  async liveOpen(
+    params: { session_id: string },
+  ): Promise<Record<string, unknown>> {
+    return await this.request("live/open", params);
   }
 
-  async realtimeStatus(
-    params: { target: Record<string, unknown> },
-  ): Promise<RealtimeStatusResult> {
-    const result = await this.request("realtime/status", params);
-    if (typeof result.status !== "object" || result.status === null) {
-      throw new MeerkatError(
-        "INVALID_RESPONSE",
-        "Invalid realtime/status response: missing status",
-      );
-    }
-    return result as unknown as RealtimeStatusResult;
+  async liveStatus(
+    params: { channel_id: string },
+  ): Promise<Record<string, unknown>> {
+    return await this.request("live/status", params);
   }
 
-  async realtimeCapabilities(
-    params: { target: Record<string, unknown> },
-  ): Promise<RealtimeCapabilitiesResult> {
-    const result = await this.request("realtime/capabilities", params);
-    if (typeof result.capabilities !== "object" || result.capabilities === null) {
-      throw new MeerkatError(
-        "INVALID_RESPONSE",
-        "Invalid realtime/capabilities response: missing capabilities",
-      );
-    }
-    return result as unknown as RealtimeCapabilitiesResult;
+  async liveClose(
+    params: { channel_id: string },
+  ): Promise<Record<string, unknown>> {
+    return await this.request("live/close", params);
   }
 
   // -- Auth + realm (Phase 4d) --------------------------------------------
