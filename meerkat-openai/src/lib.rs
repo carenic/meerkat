@@ -15,8 +15,6 @@ pub mod client_compatible;
 pub mod image_generation;
 #[cfg(all(not(target_arch = "wasm32"), feature = "realtime"))]
 pub mod live;
-#[cfg(all(not(target_arch = "wasm32"), feature = "realtime"))]
-pub mod live_adapter;
 pub mod runtime;
 #[cfg(all(not(target_arch = "wasm32"), feature = "realtime"))]
 pub mod text_adapter;

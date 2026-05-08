@@ -40,7 +40,7 @@ struct ChannelState {
     session_id: SessionId,
     status: LiveAdapterStatus,
     snapshot_version: u64,
-    adapter: Option<Arc<Mutex<Box<dyn LiveAdapter>>>>,
+    adapter: Option<Arc<dyn LiveAdapter>>,
 }
 
 /// Errors from the live adapter host.
@@ -129,13 +129,13 @@ impl LiveAdapterHost {
     pub async fn attach_adapter(
         &self,
         channel_id: &LiveChannelId,
-        adapter: Box<dyn LiveAdapter>,
+        adapter: Arc<dyn LiveAdapter>,
     ) -> Result<(), LiveAdapterHostError> {
         let mut channels = self.channels.lock().await;
         let channel = channels
             .get_mut(channel_id)
             .ok_or_else(|| LiveAdapterHostError::ChannelNotFound(channel_id.clone()))?;
-        channel.adapter = Some(Arc::new(Mutex::new(adapter)));
+        channel.adapter = Some(adapter);
         channel.status = LiveAdapterStatus::Ready;
         Ok(())
     }
@@ -158,7 +158,6 @@ impl LiveAdapterHost {
                     .ok_or_else(|| LiveAdapterHostError::NoAdapter(channel_id.clone()))?,
             )
         };
-        let mut adapter = adapter.lock().await;
         adapter
             .send_command(command)
             .await
@@ -192,13 +191,10 @@ impl LiveAdapterHost {
                     .ok_or_else(|| LiveAdapterHostError::NoAdapter(channel_id.clone()))?,
             )
         };
-        let obs = {
-            let mut adapter = adapter.lock().await;
-            adapter
-                .next_observation()
-                .await
-                .map_err(|e| LiveAdapterHostError::AdapterError(e.to_string()))?
-        };
+        let obs = adapter
+            .next_observation()
+            .await
+            .map_err(|e| LiveAdapterHostError::AdapterError(e.to_string()))?;
 
         if let Some(ref obs) = obs {
             let routing = Self::classify_observation(obs);
@@ -226,7 +222,6 @@ impl LiveAdapterHost {
             }
         };
         if let Some(adapter) = adapter {
-            let mut adapter = adapter.lock().await;
             let _ = adapter.close().await;
         }
         Ok(())
@@ -573,7 +568,7 @@ mod tests {
             host.channel_status(&ch).await.unwrap(),
             LiveAdapterStatus::Opening
         );
-        host.attach_adapter(&ch, Box::new(StubAdapter::new()))
+        host.attach_adapter(&ch, Arc::new(StubAdapter::new()))
             .await
             .unwrap();
         assert_eq!(
@@ -582,39 +577,31 @@ mod tests {
         );
     }
 
-    struct StubAdapter {
-        status: LiveAdapterStatus,
-    }
+    struct StubAdapter;
 
     impl StubAdapter {
         fn new() -> Self {
-            Self {
-                status: LiveAdapterStatus::Ready,
-            }
+            Self
         }
     }
 
     #[async_trait::async_trait]
     impl LiveAdapter for StubAdapter {
-        async fn send_command(
-            &mut self,
-            _command: LiveAdapterCommand,
-        ) -> Result<(), LiveAdapterError> {
+        async fn send_command(&self, _command: LiveAdapterCommand) -> Result<(), LiveAdapterError> {
             Ok(())
         }
 
         async fn next_observation(
-            &mut self,
+            &self,
         ) -> Result<Option<LiveAdapterObservation>, LiveAdapterError> {
             Ok(None)
         }
 
-        fn status(&self) -> &LiveAdapterStatus {
-            &self.status
+        fn status(&self) -> LiveAdapterStatus {
+            LiveAdapterStatus::Ready
         }
 
-        async fn close(&mut self) -> Result<(), LiveAdapterError> {
-            self.status = LiveAdapterStatus::Closed;
+        async fn close(&self) -> Result<(), LiveAdapterError> {
             Ok(())
         }
     }

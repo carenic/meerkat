@@ -99,7 +99,8 @@ pub async fn handle_live_open(
         };
         match factory.open_session(&open_config).await {
             Ok(session) => {
-                let adapter = Box::new(meerkat_live::ProviderSessionAdapter::new(session));
+                let adapter =
+                    std::sync::Arc::new(meerkat_live::ProviderSessionAdapter::new(session));
                 if let Err(err) = host.attach_adapter(&channel_id, adapter).await {
                     let _ = host.close_channel(&channel_id).await;
                     return RpcResponse::error(

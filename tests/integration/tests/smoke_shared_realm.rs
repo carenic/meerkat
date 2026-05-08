@@ -3636,7 +3636,7 @@ async fn live_ws_next_text_frame(
             Ok(Some(Ok(WsMessage::Close(_)))) | Ok(None) => return Ok(None),
             Ok(Some(Ok(WsMessage::Frame(_)))) => continue,
             Ok(Some(Err(err))) => return Err(err.into()),
-            Err(_) => return Ok(None),
+            Err(_) => return Err("ws read timeout".into()),
         }
     }
 }
