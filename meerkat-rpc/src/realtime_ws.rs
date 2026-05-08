@@ -40,7 +40,7 @@ use tokio::sync::{Mutex, broadcast, mpsc, oneshot};
 use tokio::time::{Instant, MissedTickBehavior};
 use uuid::Uuid;
 
-use crate::session_runtime::SessionRuntime;
+use crate::{error, protocol::RpcError, session_runtime::SessionRuntime};
 
 /// Canonical websocket path for realtime channels hosted by `rkat-rpc`.
 pub const REALTIME_WS_PATH: &str = "/realtime/ws";
@@ -1491,6 +1491,7 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                                                             &state.runtime,
                                                             &session_id,
                                                             Duration::from_secs(2),
+                                                            "accepting new input",
                                                         )
                                                         .await {
                                                             Ok(waited_for_runtime) => {
@@ -1818,34 +1819,22 @@ async fn handle_realtime_socket(mut socket: WebSocket, state: RealtimeWsState) {
                                                 .await;
                                             }
                                         }
-                                        // Dogma round 2 U-C: own-turn commits (user transcript
-                                        // append, assistant-output append, tool-dispatch
-                                        // mutation) also emit `SessionContextAdvanced` effects,
-                                        // same as external mutations do. Fire the DSL
-                                        // `RealtimeProjectionRefreshed` input at the current
-                                        // session-context watermark so the freshness state
-                                        // returns to `Clean` for own-turn baselines — the own-
-                                        // turn commit is not an external mutation the provider
-                                        // session needs to absorb.
-                                        //
-                                        // #299 concurrency case: a peer_response_terminal
-                                        // observer tick that landed while our own turn was
-                                        // committing will have already pushed the DSL frontier
-                                        // above `watermark_ms` via the
-                                        // `BridgeProjectionToProductTurn` observer →
-                                        // `projection_advance_observed` path. In that case
-                                        // `RealtimeProjectionRefreshed`'s `not_behind_frontier`
-                                        // guard rejects this fire so the stale state at the
-                                        // higher frontier is preserved — the external advance
-                                        // still owes a refresh at the next drain site. No shell-
-                                        // side "drain the queue and re-apply the max" dance;
-                                        // the DSL monotonic-frontier guard decides.
+                                        // Dogma round 2 U-C: own-provider events (user
+                                        // transcript append, assistant-output append,
+                                        // tool-dispatch mutation) also emit
+                                        // `SessionContextAdvanced` effects, same as external
+                                        // mutations do. They are not provider-session refreshes:
+                                        // the currently-open provider session already contains
+                                        // its own event, but it may still owe an external
+                                        // runtime-context refresh. Fire the DSL baseline input
+                                        // so a clean frontier can advance without clearing stale.
                                         if lifecycle.advances_projection_known_state
                                             && let (Some(session_context), Some(product_turn)) =
                                                 (session_context_handle.as_ref(), product_turn_handle.as_ref())
                                         {
                                             let watermark_ms = session_context.current_watermark_ms();
-                                            let _ = product_turn.projection_refreshed(watermark_ms);
+                                            let _ = product_turn
+                                                .projection_baseline_observed(watermark_ms);
                                         }
                                         if let Some(handle) = product_turn_handle.as_ref() {
                                             // U9: fire typed lifecycle inputs in the order the
@@ -2616,7 +2605,7 @@ async fn send_protocol_error(
 }
 
 async fn bind_realtime_target(
-    runtime: &SessionRuntime,
+    runtime: &Arc<SessionRuntime>,
     accepted: &AcceptedRealtimeOpen,
     session_factory: Option<Arc<dyn RealtimeSessionFactory>>,
 ) -> Result<BindRealtimeTargetOutput, RealtimeChannelErrorFrame> {
@@ -2639,6 +2628,7 @@ async fn bind_realtime_target(
                         &session_id,
                         accepted.request.turning_mode,
                         session_factory,
+                        "opening realtime projection",
                     )
                     .await?;
                     Ok(BindRealtimeTargetOutput {
@@ -2711,32 +2701,19 @@ async fn bind_realtime_target(
                 }
             })?;
             let dsl_agent_identity = meerkat_mob::ids::AgentIdentity::from(agent_identity.as_str());
-            let current_session_id = mob_handle
-                .current_realtime_binding(dsl_agent_identity.clone())
-                .await
-                .map_err(|err| RealtimeChannelErrorFrame {
-                    code: RealtimeErrorCode::RuntimeInternal,
-                    message: format!("failed to query current realtime binding: {err}"),
-                    details: None,
-                })?
-                .ok_or_else(|| RealtimeChannelErrorFrame {
-                    code: RealtimeErrorCode::InvalidTarget,
-                    message: format!(
-                        "mob {mob_id:?} has no realtime binding for identity {agent_identity:?}"
-                    ),
-                    details: None,
-                })?;
-            require_realtime_bootstrap_eligibility(runtime, &current_session_id).await?;
             let binding = RealtimeSocketBinding::MobMemberPrimary {
-                mob_id: dsl_mob_id,
-                agent_identity: dsl_agent_identity,
+                mob_id: dsl_mob_id.clone(),
+                agent_identity: dsl_agent_identity.clone(),
             };
             if let Some(session_factory) = session_factory {
-                let (status, bridge) = open_product_session_bridge(
+                let (_session_id, status, bridge) = open_stable_mob_member_product_session_bridge(
                     runtime,
-                    &current_session_id,
+                    &mob_handle,
+                    &dsl_mob_id,
+                    &dsl_agent_identity,
                     accepted.request.turning_mode,
                     session_factory,
+                    "opening realtime projection",
                 )
                 .await?;
                 Ok(BindRealtimeTargetOutput {
@@ -2745,6 +2722,13 @@ async fn bind_realtime_target(
                     bridge: Some(bridge),
                 })
             } else {
+                let current_session_id = query_mob_member_current_realtime_binding(
+                    &mob_handle,
+                    &dsl_mob_id,
+                    &dsl_agent_identity,
+                )
+                .await?;
+                require_realtime_bootstrap_eligibility(runtime, &current_session_id).await?;
                 let status = runtime
                     .runtime_adapter()
                     .realtime_channel_status(&current_session_id)
@@ -2801,8 +2785,29 @@ struct BindRealtimeTargetOutput {
     bridge: Option<RealtimeProductSessionBridge>,
 }
 
-async fn open_product_session_bridge(
-    runtime: &SessionRuntime,
+const REALTIME_PROJECTION_QUIESCENCE_TIMEOUT: Duration = Duration::from_secs(2);
+
+async fn prepare_realtime_projection_open(
+    runtime: &Arc<SessionRuntime>,
+    session_id: &SessionId,
+    action: &'static str,
+) -> Result<(), RealtimeChannelErrorFrame> {
+    runtime
+        .ensure_runtime_executor(session_id)
+        .await
+        .map_err(|err| rpc_error_frame(err, "runtime executor"))?;
+    let _ = wait_for_runtime_turn_quiescence(
+        runtime,
+        session_id,
+        REALTIME_PROJECTION_QUIESCENCE_TIMEOUT,
+        action,
+    )
+    .await?;
+    Ok(())
+}
+
+async fn open_product_session_bridge_after_quiescence(
+    runtime: &Arc<SessionRuntime>,
     session_id: &SessionId,
     turning_mode: meerkat_contracts::RealtimeTurningMode,
     session_factory: Arc<dyn RealtimeSessionFactory>,
@@ -2868,6 +2873,220 @@ async fn open_product_session_bridge(
     ))
 }
 
+async fn open_product_session_bridge(
+    runtime: &Arc<SessionRuntime>,
+    session_id: &SessionId,
+    turning_mode: meerkat_contracts::RealtimeTurningMode,
+    session_factory: Arc<dyn RealtimeSessionFactory>,
+    action: &'static str,
+) -> Result<(RealtimeChannelStatus, RealtimeProductSessionBridge), RealtimeChannelErrorFrame> {
+    prepare_realtime_projection_open(runtime, session_id, action).await?;
+    open_product_session_bridge_after_quiescence(runtime, session_id, turning_mode, session_factory)
+        .await
+}
+
+#[cfg(feature = "mob")]
+const MOB_MEMBER_BINDING_STABILIZATION_ATTEMPTS: usize = 4;
+
+#[cfg(feature = "mob")]
+async fn query_mob_member_current_realtime_binding(
+    mob_handle: &meerkat_mob::MobHandle,
+    mob_id: &meerkat_mob::ids::MobId,
+    agent_identity: &meerkat_mob::ids::AgentIdentity,
+) -> Result<SessionId, RealtimeChannelErrorFrame> {
+    mob_handle
+        .current_realtime_binding(agent_identity.clone())
+        .await
+        .map_err(|err| RealtimeChannelErrorFrame {
+            code: RealtimeErrorCode::RuntimeInternal,
+            message: format!("failed to query current realtime binding: {err}"),
+            details: None,
+        })?
+        .ok_or_else(|| RealtimeChannelErrorFrame {
+            code: RealtimeErrorCode::InvalidTarget,
+            message: format!(
+                "mob {mob_id:?} has no realtime binding for identity {agent_identity:?}"
+            ),
+            details: None,
+        })
+}
+
+#[cfg(feature = "mob")]
+async fn resolve_stable_mob_member_realtime_binding(
+    runtime: &Arc<SessionRuntime>,
+    mob_handle: &meerkat_mob::MobHandle,
+    mob_id: &meerkat_mob::ids::MobId,
+    agent_identity: &meerkat_mob::ids::AgentIdentity,
+    action: &'static str,
+) -> Result<SessionId, RealtimeChannelErrorFrame> {
+    let mut current_session_id =
+        query_mob_member_current_realtime_binding(mob_handle, mob_id, agent_identity).await?;
+
+    for _attempt in 0..MOB_MEMBER_BINDING_STABILIZATION_ATTEMPTS {
+        match prepare_realtime_projection_open(runtime, &current_session_id, action).await {
+            Ok(()) => {}
+            Err(error) => {
+                let latest =
+                    query_mob_member_current_realtime_binding(mob_handle, mob_id, agent_identity)
+                        .await?;
+                if latest == current_session_id {
+                    return Err(error);
+                }
+                current_session_id = latest;
+                continue;
+            }
+        }
+
+        match require_realtime_bootstrap_eligibility(runtime, &current_session_id).await {
+            Ok(_) => {}
+            Err(error) => {
+                let latest =
+                    query_mob_member_current_realtime_binding(mob_handle, mob_id, agent_identity)
+                        .await?;
+                if latest == current_session_id {
+                    return Err(error);
+                }
+                current_session_id = latest;
+                continue;
+            }
+        }
+
+        let latest =
+            query_mob_member_current_realtime_binding(mob_handle, mob_id, agent_identity).await?;
+        if latest == current_session_id {
+            return Ok(current_session_id);
+        }
+        current_session_id = latest;
+    }
+
+    Err(RealtimeChannelErrorFrame {
+        code: RealtimeErrorCode::InvalidTarget,
+        message: format!(
+            "mob {mob_id:?} realtime binding for identity {agent_identity:?} did not stabilize before {action}"
+        ),
+        details: None,
+    })
+}
+
+#[cfg(feature = "mob")]
+async fn open_stable_mob_member_product_session_bridge(
+    runtime: &Arc<SessionRuntime>,
+    mob_handle: &meerkat_mob::MobHandle,
+    mob_id: &meerkat_mob::ids::MobId,
+    agent_identity: &meerkat_mob::ids::AgentIdentity,
+    turning_mode: meerkat_contracts::RealtimeTurningMode,
+    session_factory: Arc<dyn RealtimeSessionFactory>,
+    action: &'static str,
+) -> Result<
+    (
+        SessionId,
+        RealtimeChannelStatus,
+        RealtimeProductSessionBridge,
+    ),
+    RealtimeChannelErrorFrame,
+> {
+    let session_id = resolve_stable_mob_member_realtime_binding(
+        runtime,
+        mob_handle,
+        mob_id,
+        agent_identity,
+        action,
+    )
+    .await?;
+    let (status, bridge) = open_product_session_bridge_after_quiescence(
+        runtime,
+        &session_id,
+        turning_mode,
+        session_factory,
+    )
+    .await?;
+    Ok((session_id, status, bridge))
+}
+
+#[cfg(feature = "mob")]
+async fn mob_handle_for_realtime_binding(
+    runtime: &SessionRuntime,
+    mob_id: &meerkat_mob::ids::MobId,
+) -> Result<meerkat_mob::MobHandle, RealtimeChannelErrorFrame> {
+    let mob_state = runtime
+        .mob_state()
+        .ok_or_else(|| RealtimeChannelErrorFrame {
+            code: RealtimeErrorCode::InvalidTarget,
+            message: "mob-member channels require the mob feature to be enabled on this host"
+                .to_string(),
+            details: None,
+        })?;
+    mob_state
+        .handle_for(mob_id)
+        .await
+        .map_err(|err| RealtimeChannelErrorFrame {
+            code: RealtimeErrorCode::InvalidTarget,
+            message: format!("mob {mob_id:?} not found or handle unavailable: {err}"),
+            details: None,
+        })
+}
+
+async fn resolve_projection_open_session_for_primary_binding(
+    runtime: &Arc<SessionRuntime>,
+    binding: &RealtimeSocketBinding,
+    action: &'static str,
+) -> Result<SessionId, RealtimeChannelErrorFrame> {
+    match binding {
+        RealtimeSocketBinding::SessionPrimary { session_id } => {
+            prepare_realtime_projection_open(runtime, session_id, action).await?;
+            Ok(session_id.clone())
+        }
+        RealtimeSocketBinding::SessionObserver { .. } => Err(RealtimeChannelErrorFrame {
+            code: RealtimeErrorCode::ChannelNotBound,
+            message: format!(
+                "observer channel cannot own realtime provider session while {action}"
+            ),
+            details: None,
+        }),
+        #[cfg(feature = "mob")]
+        RealtimeSocketBinding::MobMemberPrimary {
+            mob_id,
+            agent_identity,
+        } => {
+            let mob_handle = mob_handle_for_realtime_binding(runtime, mob_id).await?;
+            resolve_stable_mob_member_realtime_binding(
+                runtime,
+                &mob_handle,
+                mob_id,
+                agent_identity,
+                action,
+            )
+            .await
+        }
+    }
+}
+
+async fn open_product_session_bridge_for_primary_binding(
+    runtime: &Arc<SessionRuntime>,
+    binding: &RealtimeSocketBinding,
+    turning_mode: meerkat_contracts::RealtimeTurningMode,
+    session_factory: Arc<dyn RealtimeSessionFactory>,
+    action: &'static str,
+) -> Result<
+    (
+        SessionId,
+        RealtimeChannelStatus,
+        RealtimeProductSessionBridge,
+    ),
+    RealtimeChannelErrorFrame,
+> {
+    let session_id =
+        resolve_projection_open_session_for_primary_binding(runtime, binding, action).await?;
+    let (status, bridge) = open_product_session_bridge_after_quiescence(
+        runtime,
+        &session_id,
+        turning_mode,
+        session_factory,
+    )
+    .await?;
+    Ok((session_id, status, bridge))
+}
+
 async fn cleanup_realtime_binding(
     runtime: &SessionRuntime,
     binding: Option<&RealtimeSocketBinding>,
@@ -2897,7 +3116,7 @@ async fn cleanup_realtime_binding(
 }
 
 async fn reconcile_product_session_binding(
-    runtime: &SessionRuntime,
+    runtime: &Arc<SessionRuntime>,
     binding: Option<&RealtimeSocketBinding>,
     turning_mode: meerkat_contracts::RealtimeTurningMode,
     session_factory: Option<Arc<dyn RealtimeSessionFactory>>,
@@ -2924,9 +3143,23 @@ async fn reconcile_product_session_binding(
             .to_string(),
         details: None,
     })?;
-    let (status, bridge) = open_product_session_bridge(
+    let binding = binding.ok_or_else(|| RealtimeChannelErrorFrame {
+        code: RealtimeErrorCode::ChannelNotBound,
+        message: "realtime product session is not wired to a session target".to_string(),
+        details: None,
+    })?;
+    let stable_session_id = resolve_projection_open_session_for_primary_binding(
         runtime,
-        &canonical_session_id,
+        binding,
+        "reconciling realtime projection binding",
+    )
+    .await?;
+    if stable_session_id == existing_session_id {
+        return Ok(None);
+    }
+    let (status, bridge) = open_product_session_bridge_after_quiescence(
+        runtime,
+        &stable_session_id,
         turning_mode,
         session_factory,
     )
@@ -3126,7 +3359,7 @@ async fn emit_status_update(
 }
 
 async fn attempt_realtime_reconnect(
-    runtime: &SessionRuntime,
+    runtime: &Arc<SessionRuntime>,
     binding: Option<&RealtimeSocketBinding>,
     turning_mode: meerkat_contracts::RealtimeTurningMode,
     session_factory: Option<Arc<dyn RealtimeSessionFactory>>,
@@ -3152,9 +3385,14 @@ async fn attempt_realtime_reconnect(
     )
     .await?;
     if let Some(session_factory) = session_factory {
-        let (_status, bridge) =
-            open_product_session_bridge(runtime, &session_id, turning_mode, session_factory)
-                .await?;
+        let (_session_id, _status, bridge) = open_product_session_bridge_for_primary_binding(
+            runtime,
+            binding,
+            turning_mode,
+            session_factory,
+            "reconnecting realtime projection",
+        )
+        .await?;
         Ok(Some(bridge))
     } else {
         runtime
@@ -3831,6 +4069,7 @@ async fn wait_for_runtime_turn_quiescence(
     runtime: &SessionRuntime,
     session_id: &SessionId,
     timeout: Duration,
+    action: &'static str,
 ) -> Result<bool, RealtimeChannelErrorFrame> {
     let deadline = tokio::time::Instant::now() + timeout;
     let mut waited = false;
@@ -3847,13 +4086,52 @@ async fn wait_for_runtime_turn_quiescence(
             Ok(active_inputs) => active_inputs,
             Err(error) => return Err(runtime_error_frame(error, "input")),
         };
+        if !active_inputs.is_empty()
+            && matches!(
+                state,
+                meerkat_runtime::RuntimeState::Idle | meerkat_runtime::RuntimeState::Attached
+            )
+        {
+            let _ = runtime
+                .runtime_adapter()
+                .wake_runtime_if_active_inputs(session_id)
+                .await;
+        }
         if matches!(state, meerkat_runtime::RuntimeState::Running) || !active_inputs.is_empty() {
             waited = true;
             if tokio::time::Instant::now() >= deadline {
+                let mut active_descriptions = Vec::new();
+                for input_id in &active_inputs {
+                    match runtime
+                        .runtime_adapter()
+                        .input_state(session_id, input_id)
+                        .await
+                    {
+                        Ok(Some(input_state)) => active_descriptions.push(format!(
+                            "{input_id}:phase={:?}:terminal={:?}:kind={}:semantics={:?}:policy={:?}",
+                            input_state.seed.phase,
+                            input_state.seed.terminal_outcome,
+                            input_state
+                                .state
+                                .persisted_input
+                                .as_ref()
+                                .map(|input| format!("{:?}", input.kind()))
+                                .unwrap_or_else(|| "<missing>".to_string()),
+                            input_state.state.runtime_semantics,
+                            input_state.state.policy,
+                        )),
+                        Ok(None) => active_descriptions.push(format!("{input_id}:missing")),
+                        Err(error) => {
+                            active_descriptions.push(format!("{input_id}:state_error={error}"));
+                        }
+                    }
+                }
                 return Err(RealtimeChannelErrorFrame {
                     code: RealtimeErrorCode::InvalidTarget,
-                    message: "realtime runtime work did not quiesce before accepting new input"
-                        .to_string(),
+                    message: format!(
+                        "realtime runtime work did not quiesce before {action} (runtime_state={state:?}, active_inputs=[{}])",
+                        active_descriptions.join(", ")
+                    ),
                     details: None,
                 });
             }
@@ -3865,7 +4143,7 @@ async fn wait_for_runtime_turn_quiescence(
 }
 
 async fn refresh_product_session_projection(
-    runtime: &SessionRuntime,
+    runtime: &Arc<SessionRuntime>,
     binding: Option<&RealtimeSocketBinding>,
     turning_mode: meerkat_contracts::RealtimeTurningMode,
     session_factory: Option<Arc<dyn RealtimeSessionFactory>>,
@@ -3881,6 +4159,17 @@ async fn refresh_product_session_projection(
         runtime,
         binding,
         "realtime product session is not wired to a session target",
+    )
+    .await?;
+    runtime
+        .ensure_runtime_executor(&session_id)
+        .await
+        .map_err(|err| rpc_error_frame(err, "runtime executor"))?;
+    let _ = wait_for_runtime_turn_quiescence(
+        runtime,
+        &session_id,
+        Duration::from_secs(2),
+        "refreshing realtime projection",
     )
     .await?;
     let open_config = runtime
@@ -4046,7 +4335,7 @@ impl meerkat_core::handles::RealtimeProjectionFreshnessObserver for RealtimeSock
 }
 
 /// Resolve the session's realtime DSL handles (context-refresh +
-/// product-turn lifecycle) for this socket by re-preparing bindings via
+/// product-turn lifecycle) for this socket by preparing local resources via
 /// the runtime adapter.
 ///
 /// Returns `None` when the socket has no bound session yet — the
@@ -4067,12 +4356,12 @@ async fn resolve_session_realtime_handles(
     )
     .await
     .ok()?;
-    // `prepare_bindings` re-binds the session's DSL authority to a fresh
-    // runtime epoch; the returned bindings expose the canonical handles
-    // shared by every other consumer of this session's DSL authority.
+    // Realtime projection refresh only needs handles into the session's shared
+    // DSL authority. It must not claim or re-emit the authoritative runtime
+    // binding for mob-owned bridge sessions.
     let bindings = runtime
         .runtime_adapter()
-        .prepare_bindings(session_id)
+        .prepare_local_session_bindings(session_id)
         .await
         .ok()?;
     Some((
@@ -4256,6 +4545,22 @@ fn session_error_frame(err: meerkat_core::service::SessionError) -> RealtimeChan
     }
 }
 
+fn rpc_error_frame(err: RpcError, action: &str) -> RealtimeChannelErrorFrame {
+    if err.code == error::SESSION_NOT_FOUND {
+        RealtimeChannelErrorFrame {
+            code: RealtimeErrorCode::InvalidTarget,
+            message: format!("realtime {action} target is unavailable"),
+            details: None,
+        }
+    } else {
+        RealtimeChannelErrorFrame {
+            code: RealtimeErrorCode::RuntimeInternal,
+            message: err.message,
+            details: None,
+        }
+    }
+}
+
 fn realtime_client_error_frame(
     err: meerkat_client::LlmError,
     action: &str,
@@ -4332,7 +4637,7 @@ mod tests {
         AcceptedRealtimeOpen, RealtimeErrorCode, RealtimeOpenError, RealtimeProtocolVersion,
         RealtimeReconnectRetryPlanner, RealtimeSocketBinding, RealtimeTurnCompletionDisposition,
         RealtimeWsHost, bind_realtime_target, product_turn_completion_disposition,
-        product_turn_completion_is_logically_terminal,
+        product_turn_completion_is_logically_terminal, resolve_session_realtime_handles,
     };
     use tokio::time::Instant;
 
@@ -4693,6 +4998,39 @@ mod tests {
             .expect("current typed protocol version must open");
 
         assert_eq!(accepted.protocol_version, RealtimeProtocolVersion::CURRENT);
+    }
+
+    #[tokio::test]
+    async fn realtime_handle_refresh_uses_local_resources_for_existing_authoritative_binding() {
+        use meerkat_runtime::meerkat_machine::dsl as mm_dsl;
+
+        let runtime = test_session_runtime();
+        let session_id = SessionId::new();
+        let adapter = runtime.runtime_adapter();
+        adapter.register_session(session_id.clone()).await;
+        adapter
+            .apply_routed_meerkat_input(
+                &session_id,
+                mm_dsl::MeerkatMachineInput::PrepareBindings {
+                    agent_runtime_id: mm_dsl::AgentRuntimeId("operator-rt:0".into()),
+                    fence_token: mm_dsl::FenceToken(23),
+                    generation: mm_dsl::Generation(0),
+                    session_id: mm_dsl::SessionId(session_id.to_string()),
+                },
+            )
+            .await
+            .expect("mob-owned binding applies");
+
+        let handles = resolve_session_realtime_handles(
+            &runtime,
+            Some(&RealtimeSocketBinding::SessionPrimary { session_id }),
+        )
+        .await;
+
+        assert!(
+            handles.is_some(),
+            "handle refresh must not attempt a conflicting session-owned runtime binding"
+        );
     }
 
     #[tokio::test]
@@ -5065,7 +5403,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconnect_open_status_for_observer_uses_machine_owned_attempts() {
-        let runtime = test_session_runtime();
+        let runtime = Arc::new(test_session_runtime());
         let session_id = register_ready_realtime_session(&runtime).await;
         let adapter = runtime.runtime_adapter();
         adapter
@@ -5110,7 +5448,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconnect_open_status_for_primary_without_factory_uses_machine_owned_exhaustion() {
-        let runtime = test_session_runtime();
+        let runtime = Arc::new(test_session_runtime());
         let session_id = register_ready_realtime_session(&runtime).await;
         let adapter = runtime.runtime_adapter();
         adapter
@@ -5171,6 +5509,66 @@ mod tests {
         assert!(
             bind_source.contains("realtime_bootstrap_eligibility"),
             "channel.open must re-check machine-owned realtime bootstrap eligibility before binding"
+        );
+    }
+
+    #[test]
+    fn mob_member_provider_open_stabilizes_machine_binding_before_ready() {
+        let source = include_str!("realtime_ws.rs");
+        let bind_start = source
+            .find("async fn bind_realtime_target")
+            .expect("bind_realtime_target should exist");
+        let bind_end = source[bind_start..]
+            .find("async fn require_realtime_bootstrap_eligibility")
+            .map(|offset| bind_start + offset)
+            .expect("require_realtime_bootstrap_eligibility should follow bind");
+        let bind_source = &source[bind_start..bind_end];
+        assert!(
+            bind_source.contains("open_stable_mob_member_product_session_bridge"),
+            "MobMember primary channel.open must stabilize the MobMachine current binding before provider open"
+        );
+        assert!(
+            !bind_source.contains("open_product_session_bridge(\n                    runtime,\n                    &current_session_id"),
+            "MobMember primary channel.open must not open a provider session from a pre-quiescence concrete session id"
+        );
+
+        let reconcile_start = source
+            .find("async fn reconcile_product_session_binding")
+            .expect("reconcile_product_session_binding should exist");
+        let reconcile_end = source[reconcile_start..]
+            .find("async fn begin_reconnect_cycle_in_dsl")
+            .map(|offset| reconcile_start + offset)
+            .expect("begin_reconnect_cycle_in_dsl should follow reconcile");
+        let reconcile_source = &source[reconcile_start..reconcile_end];
+        assert!(
+            reconcile_source.contains("resolve_projection_open_session_for_primary_binding"),
+            "mob-member rotation reconciliation must re-resolve/stabilize the canonical binding before provider open"
+        );
+        assert!(
+            !reconcile_source.contains(
+                "open_product_session_bridge(\n        runtime,\n        &canonical_session_id"
+            ),
+            "rotation reconciliation must not open against a stale pre-quiescence canonical session id"
+        );
+
+        let stable_start = source
+            .find("async fn resolve_stable_mob_member_realtime_binding")
+            .expect("stable mob-member resolver should exist");
+        let stable_end = source[stable_start..]
+            .find("async fn open_stable_mob_member_product_session_bridge")
+            .map(|offset| stable_start + offset)
+            .expect("open_stable_mob_member_product_session_bridge should follow stable resolver");
+        let stable_source = &source[stable_start..stable_end];
+        assert!(
+            stable_source.contains("prepare_realtime_projection_open"),
+            "stable mob-member resolver must wait for runtime quiescence before publishing provider readiness"
+        );
+        assert!(
+            stable_source
+                .matches("query_mob_member_current_realtime_binding")
+                .count()
+                >= 3,
+            "stable mob-member resolver must re-read MobMachine authority after waits/errors instead of trusting a cached concrete session id"
         );
     }
 
@@ -5607,6 +6005,42 @@ mod tests {
             RealtimeProjectionFreshness::StaleImmediate
         );
         assert_eq!(handle.projection_frontier_ms(), 500);
+    }
+
+    #[test]
+    fn projection_baseline_observed_advances_clean_without_clearing_stale() {
+        // Provider-owned events can advance the session-context watermark for
+        // facts already present in the current provider session. That is not a
+        // projection rebuild and must never clear an external stale advance.
+        let handle = RuntimeRealtimeProductTurnHandle::ephemeral();
+        assert!(handle.projection_reset(100).unwrap());
+        assert!(handle.projection_baseline_observed(150).unwrap());
+        assert_eq!(
+            handle.projection_freshness(),
+            RealtimeProjectionFreshness::Clean
+        );
+        assert_eq!(handle.projection_frontier_ms(), 150);
+
+        assert!(handle.turn_in_flight().unwrap());
+        assert!(handle.projection_advance_observed(500).unwrap());
+        assert_eq!(
+            handle.projection_freshness(),
+            RealtimeProjectionFreshness::StaleDeferred
+        );
+        assert!(
+            !handle.projection_baseline_observed(700).unwrap(),
+            "own-provider baseline observation must not clear pending external stale state",
+        );
+        assert_eq!(
+            handle.projection_freshness(),
+            RealtimeProjectionFreshness::StaleDeferred
+        );
+        assert_eq!(handle.projection_frontier_ms(), 500);
+        assert!(handle.classify_turn_terminated().unwrap());
+        assert_eq!(
+            handle.projection_freshness(),
+            RealtimeProjectionFreshness::StaleImmediate
+        );
     }
 
     #[test]

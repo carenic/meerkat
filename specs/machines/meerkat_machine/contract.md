@@ -204,6 +204,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `Prepare`(session_id: SessionId, run_id: RunId)
 - `Commit`(input_id: InputId, run_id: RunId)
 - `Fail`(run_id: RunId)
+- `CancelRun`(run_id: RunId)
 - `RollbackRun`(run_id: RunId)
 - `Recycle`
 - `StartConversationRun`(run_id: RunId, primitive_kind: TurnPrimitiveKind, admitted_content_shape: ContentShape, vision_enabled: Bool, image_tool_results_enabled: Bool, max_extraction_retries: u64)
@@ -234,6 +235,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `TimeBudgetExceeded`
 - `ForceCancelNoRun`
 - `RunCompleted`(run_id: RunId)
+- `ServiceTurnCommitted`(run_id: RunId)
 - `RunFailed`(run_id: RunId, runtime_apply_failure_cause: Option<RuntimeApplyFailureCause>, runtime_apply_failure_message: Option<String>, terminal_outcome: TurnTerminalOutcome, terminal_cause_kind: TurnTerminalCauseKind, error: String)
 - `RunCancelled`(run_id: RunId)
 - `RecoverInputLifecycle`(input_id: String, phase: InputPhase, terminal_kind: Option<InputTerminalKind>, superseded_by: Option<String>, aggregate_id: Option<String>, abandon_reason: Option<InputAbandonReason>, abandon_attempt_count: u64, attempt_count: u64, run_id: Option<String>, boundary_sequence: Option<u64>, lane: Option<InputLane>)
@@ -329,6 +331,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `ProductTurnTerminal`
 - `RealtimeProjectionAdvanceObserved`(advanced_at_ms: u64)
 - `RealtimeProjectionRefreshed`(observed_ms: u64)
+- `RealtimeProjectionBaselineObserved`(observed_ms: u64)
 - `RealtimeProjectionReset`(baseline_ms: u64)
 - `ClassifyRealtimeClientInputSubmitted`
 - `ClassifyRealtimeMidTurnActivity`
@@ -1475,11 +1478,23 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `RuntimeNotice`
 - To: `Idle`
 
-### `StopRuntimeExecutorUnbound`
-- From: `Initializing`, `Idle`, `Retired`
+### `StopRuntimeExecutorInitializing`
+- From: `Initializing`
 - On: `StopRuntimeExecutor`(reason)
 - Emits: `RuntimeNotice`, `RuntimeEffectFact`
-- To: `Stopped`
+- To: `Initializing`
+
+### `StopRuntimeExecutorIdle`
+- From: `Idle`
+- On: `StopRuntimeExecutor`(reason)
+- Emits: `RuntimeNotice`, `RuntimeEffectFact`
+- To: `Idle`
+
+### `StopRuntimeExecutorRetired`
+- From: `Retired`
+- On: `StopRuntimeExecutor`(reason)
+- Emits: `RuntimeNotice`, `RuntimeEffectFact`
+- To: `Retired`
 
 ### `StopRuntimeExecutorAttached`
 - From: `Attached`
@@ -1934,6 +1949,15 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `EnqueueClassifiedEntry`, `PeerIngressClassified`
 - To: `Attached`
 
+### `ClassifyExternalEnvelopeRequestPeerAddedIdle`
+- From: `Idle`
+- On: `ClassifyExternalEnvelope`(item_id, from_peer, envelope_kind, request_intent, lifecycle_kind, lifecycle_peer_param, response_status, in_reply_to)
+- Guards:
+  - `session_registered`
+  - `peer_ingress_request_peer_added`
+- Emits: `EnqueueClassifiedEntry`, `PeerIngressClassified`
+- To: `Idle`
+
 ### `ClassifyExternalEnvelopeRequestPeerAddedRunning`
 - From: `Running`
 - On: `ClassifyExternalEnvelope`(item_id, from_peer, envelope_kind, request_intent, lifecycle_kind, lifecycle_peer_param, response_status, in_reply_to)
@@ -1952,6 +1976,33 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `EnqueueClassifiedEntry`, `PeerIngressClassified`
 - To: `Attached`
 
+### `ClassifyExternalEnvelopeRequestPeerRetiredIdle`
+- From: `Idle`
+- On: `ClassifyExternalEnvelope`(item_id, from_peer, envelope_kind, request_intent, lifecycle_kind, lifecycle_peer_param, response_status, in_reply_to)
+- Guards:
+  - `session_registered`
+  - `peer_ingress_request_peer_retired`
+- Emits: `EnqueueClassifiedEntry`, `PeerIngressClassified`
+- To: `Idle`
+
+### `ClassifyExternalEnvelopeRequestPeerRetiredRetired`
+- From: `Retired`
+- On: `ClassifyExternalEnvelope`(item_id, from_peer, envelope_kind, request_intent, lifecycle_kind, lifecycle_peer_param, response_status, in_reply_to)
+- Guards:
+  - `session_registered`
+  - `peer_ingress_request_peer_retired`
+- Emits: `EnqueueClassifiedEntry`, `PeerIngressClassified`
+- To: `Retired`
+
+### `ClassifyExternalEnvelopeRequestPeerRetiredStopped`
+- From: `Stopped`
+- On: `ClassifyExternalEnvelope`(item_id, from_peer, envelope_kind, request_intent, lifecycle_kind, lifecycle_peer_param, response_status, in_reply_to)
+- Guards:
+  - `session_registered`
+  - `peer_ingress_request_peer_retired`
+- Emits: `EnqueueClassifiedEntry`, `PeerIngressClassified`
+- To: `Stopped`
+
 ### `ClassifyExternalEnvelopeRequestPeerRetiredRunning`
 - From: `Running`
 - On: `ClassifyExternalEnvelope`(item_id, from_peer, envelope_kind, request_intent, lifecycle_kind, lifecycle_peer_param, response_status, in_reply_to)
@@ -1969,6 +2020,33 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `peer_ingress_request_peer_unwired`
 - Emits: `EnqueueClassifiedEntry`, `PeerIngressClassified`
 - To: `Attached`
+
+### `ClassifyExternalEnvelopeRequestPeerUnwiredIdle`
+- From: `Idle`
+- On: `ClassifyExternalEnvelope`(item_id, from_peer, envelope_kind, request_intent, lifecycle_kind, lifecycle_peer_param, response_status, in_reply_to)
+- Guards:
+  - `session_registered`
+  - `peer_ingress_request_peer_unwired`
+- Emits: `EnqueueClassifiedEntry`, `PeerIngressClassified`
+- To: `Idle`
+
+### `ClassifyExternalEnvelopeRequestPeerUnwiredRetired`
+- From: `Retired`
+- On: `ClassifyExternalEnvelope`(item_id, from_peer, envelope_kind, request_intent, lifecycle_kind, lifecycle_peer_param, response_status, in_reply_to)
+- Guards:
+  - `session_registered`
+  - `peer_ingress_request_peer_unwired`
+- Emits: `EnqueueClassifiedEntry`, `PeerIngressClassified`
+- To: `Retired`
+
+### `ClassifyExternalEnvelopeRequestPeerUnwiredStopped`
+- From: `Stopped`
+- On: `ClassifyExternalEnvelope`(item_id, from_peer, envelope_kind, request_intent, lifecycle_kind, lifecycle_peer_param, response_status, in_reply_to)
+- Guards:
+  - `session_registered`
+  - `peer_ingress_request_peer_unwired`
+- Emits: `EnqueueClassifiedEntry`, `PeerIngressClassified`
+- To: `Stopped`
 
 ### `ClassifyExternalEnvelopeRequestPeerUnwiredRunning`
 - From: `Running`
@@ -2051,6 +2129,15 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `EnqueueClassifiedEntry`, `PeerIngressClassified`
 - To: `Running`
 
+### `ClassifyExternalEnvelopeLifecycleAddedIdle`
+- From: `Idle`
+- On: `ClassifyExternalEnvelope`(item_id, from_peer, envelope_kind, request_intent, lifecycle_kind, lifecycle_peer_param, response_status, in_reply_to)
+- Guards:
+  - `session_registered`
+  - `peer_ingress_lifecycle_added`
+- Emits: `EnqueueClassifiedEntry`, `PeerIngressClassified`
+- To: `Idle`
+
 ### `ClassifyExternalEnvelopeLifecycleAddedAttached`
 - From: `Attached`
 - On: `ClassifyExternalEnvelope`(item_id, from_peer, envelope_kind, request_intent, lifecycle_kind, lifecycle_peer_param, response_status, in_reply_to)
@@ -2069,6 +2156,33 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `EnqueueClassifiedEntry`, `PeerIngressClassified`
 - To: `Running`
 
+### `ClassifyExternalEnvelopeLifecycleRetiredIdle`
+- From: `Idle`
+- On: `ClassifyExternalEnvelope`(item_id, from_peer, envelope_kind, request_intent, lifecycle_kind, lifecycle_peer_param, response_status, in_reply_to)
+- Guards:
+  - `session_registered`
+  - `peer_ingress_lifecycle_retired`
+- Emits: `EnqueueClassifiedEntry`, `PeerIngressClassified`
+- To: `Idle`
+
+### `ClassifyExternalEnvelopeLifecycleRetiredRetired`
+- From: `Retired`
+- On: `ClassifyExternalEnvelope`(item_id, from_peer, envelope_kind, request_intent, lifecycle_kind, lifecycle_peer_param, response_status, in_reply_to)
+- Guards:
+  - `session_registered`
+  - `peer_ingress_lifecycle_retired`
+- Emits: `EnqueueClassifiedEntry`, `PeerIngressClassified`
+- To: `Retired`
+
+### `ClassifyExternalEnvelopeLifecycleRetiredStopped`
+- From: `Stopped`
+- On: `ClassifyExternalEnvelope`(item_id, from_peer, envelope_kind, request_intent, lifecycle_kind, lifecycle_peer_param, response_status, in_reply_to)
+- Guards:
+  - `session_registered`
+  - `peer_ingress_lifecycle_retired`
+- Emits: `EnqueueClassifiedEntry`, `PeerIngressClassified`
+- To: `Stopped`
+
 ### `ClassifyExternalEnvelopeLifecycleRetiredAttached`
 - From: `Attached`
 - On: `ClassifyExternalEnvelope`(item_id, from_peer, envelope_kind, request_intent, lifecycle_kind, lifecycle_peer_param, response_status, in_reply_to)
@@ -2086,6 +2200,33 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `peer_ingress_lifecycle_retired`
 - Emits: `EnqueueClassifiedEntry`, `PeerIngressClassified`
 - To: `Running`
+
+### `ClassifyExternalEnvelopeLifecycleUnwiredIdle`
+- From: `Idle`
+- On: `ClassifyExternalEnvelope`(item_id, from_peer, envelope_kind, request_intent, lifecycle_kind, lifecycle_peer_param, response_status, in_reply_to)
+- Guards:
+  - `session_registered`
+  - `peer_ingress_lifecycle_unwired`
+- Emits: `EnqueueClassifiedEntry`, `PeerIngressClassified`
+- To: `Idle`
+
+### `ClassifyExternalEnvelopeLifecycleUnwiredRetired`
+- From: `Retired`
+- On: `ClassifyExternalEnvelope`(item_id, from_peer, envelope_kind, request_intent, lifecycle_kind, lifecycle_peer_param, response_status, in_reply_to)
+- Guards:
+  - `session_registered`
+  - `peer_ingress_lifecycle_unwired`
+- Emits: `EnqueueClassifiedEntry`, `PeerIngressClassified`
+- To: `Retired`
+
+### `ClassifyExternalEnvelopeLifecycleUnwiredStopped`
+- From: `Stopped`
+- On: `ClassifyExternalEnvelope`(item_id, from_peer, envelope_kind, request_intent, lifecycle_kind, lifecycle_peer_param, response_status, in_reply_to)
+- Guards:
+  - `session_registered`
+  - `peer_ingress_lifecycle_unwired`
+- Emits: `EnqueueClassifiedEntry`, `PeerIngressClassified`
+- To: `Stopped`
 
 ### `ClassifyExternalEnvelopeLifecycleUnwiredAttached`
 - From: `Attached`
@@ -2518,6 +2659,33 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `run_matches_binding`
 - To: `Running`
 
+### `ServiceTurnCommittedRunningToIdle`
+- From: `Running`
+- On: `ServiceTurnCommitted`(run_id)
+- Guards:
+  - `pre_run_phase_matches_idle`
+  - `run_matches_binding`
+  - `turn_completed`
+- To: `Idle`
+
+### `ServiceTurnCommittedRunningToAttached`
+- From: `Running`
+- On: `ServiceTurnCommitted`(run_id)
+- Guards:
+  - `pre_run_phase_matches_attached`
+  - `run_matches_binding`
+  - `turn_completed`
+- To: `Attached`
+
+### `ServiceTurnCommittedRunningToRetired`
+- From: `Running`
+- On: `ServiceTurnCommitted`(run_id)
+- Guards:
+  - `pre_run_phase_matches_retired`
+  - `run_matches_binding`
+  - `turn_completed`
+- To: `Retired`
+
 ### `RunFailed`
 - From: `Running`
 - On: `RunFailed`(run_id, runtime_apply_failure_cause, runtime_apply_failure_message, terminal_outcome, terminal_cause_kind, error)
@@ -2908,6 +3076,36 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `pre_run_phase_matches_retired`
   - `current_run_id_matches_binding`
   - `turn_failed_with_cause`
+- Emits: `RecordTerminalOutcome`
+- To: `Retired`
+
+### `CancelRunningToIdle`
+- From: `Running`
+- On: `CancelRun`(run_id)
+- Guards:
+  - `pre_run_phase_matches_idle`
+  - `current_run_id_matches_binding`
+  - `turn_cancelled`
+- Emits: `RecordTerminalOutcome`
+- To: `Idle`
+
+### `CancelRunningToAttached`
+- From: `Running`
+- On: `CancelRun`(run_id)
+- Guards:
+  - `pre_run_phase_matches_attached`
+  - `current_run_id_matches_binding`
+  - `turn_cancelled`
+- Emits: `RecordTerminalOutcome`
+- To: `Attached`
+
+### `CancelRunningToRetired`
+- From: `Running`
+- On: `CancelRun`(run_id)
+- Guards:
+  - `pre_run_phase_matches_retired`
+  - `current_run_id_matches_binding`
+  - `turn_cancelled`
 - Emits: `RecordTerminalOutcome`
 - To: `Retired`
 
@@ -6544,6 +6742,60 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `not_behind_frontier`
   - `actually_changing`
+- Emits: `RealtimeProjectionFreshnessChanged`
+- To: `Stopped`
+
+### `RealtimeProjectionBaselineObservedCleanInitializing`
+- From: `Initializing`
+- On: `RealtimeProjectionBaselineObserved`(observed_ms)
+- Guards:
+  - `clean`
+  - `monotonic`
+- Emits: `RealtimeProjectionFreshnessChanged`
+- To: `Initializing`
+
+### `RealtimeProjectionBaselineObservedCleanIdle`
+- From: `Idle`
+- On: `RealtimeProjectionBaselineObserved`(observed_ms)
+- Guards:
+  - `clean`
+  - `monotonic`
+- Emits: `RealtimeProjectionFreshnessChanged`
+- To: `Idle`
+
+### `RealtimeProjectionBaselineObservedCleanAttached`
+- From: `Attached`
+- On: `RealtimeProjectionBaselineObserved`(observed_ms)
+- Guards:
+  - `clean`
+  - `monotonic`
+- Emits: `RealtimeProjectionFreshnessChanged`
+- To: `Attached`
+
+### `RealtimeProjectionBaselineObservedCleanRunning`
+- From: `Running`
+- On: `RealtimeProjectionBaselineObserved`(observed_ms)
+- Guards:
+  - `clean`
+  - `monotonic`
+- Emits: `RealtimeProjectionFreshnessChanged`
+- To: `Running`
+
+### `RealtimeProjectionBaselineObservedCleanRetired`
+- From: `Retired`
+- On: `RealtimeProjectionBaselineObserved`(observed_ms)
+- Guards:
+  - `clean`
+  - `monotonic`
+- Emits: `RealtimeProjectionFreshnessChanged`
+- To: `Retired`
+
+### `RealtimeProjectionBaselineObservedCleanStopped`
+- From: `Stopped`
+- On: `RealtimeProjectionBaselineObserved`(observed_ms)
+- Guards:
+  - `clean`
+  - `monotonic`
 - Emits: `RealtimeProjectionFreshnessChanged`
 - To: `Stopped`
 

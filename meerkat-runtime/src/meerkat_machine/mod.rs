@@ -68,6 +68,9 @@ pub enum RuntimeBindingsError {
     /// Session was not found after registration (should not happen in practice).
     #[error("session {0} not found in runtime adapter after registration")]
     SessionNotFound(SessionId),
+    /// Machine-owned binding preparation failed before bindings were published.
+    #[error("failed to prepare runtime bindings for session {0}: {1}")]
+    PrepareFailed(SessionId, String),
 }
 
 #[derive(Debug, Default)]
@@ -109,6 +112,13 @@ fn runtime_store_identity(store: &Arc<dyn RuntimeStore>) -> PersistentAuthAuthor
         .unwrap_or_else(|| {
             PersistentAuthAuthorityKey::Process(Arc::as_ptr(store).cast::<()>() as usize)
         })
+}
+
+fn runtime_stores_share_authority(a: &Arc<dyn RuntimeStore>, b: &Arc<dyn RuntimeStore>) -> bool {
+    match (a.auth_authority_key(), b.auth_authority_key()) {
+        (Some(a), Some(b)) => a == b,
+        _ => Arc::ptr_eq(a, b),
+    }
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -289,15 +299,16 @@ type MeerkatMachineCommandFuture<'a> = Pin<
 >;
 
 pub(crate) use driver::{
-    DriverEntry, SharedCompletionRegistry, SharedDriver, commit_runtime_loop_run, fail_machine_run,
-    fail_runtime_loop_run, machine_apply_run_return_projection,
-    machine_batch_primitive_projections, machine_batch_runtime_semantics, machine_begin_run,
-    machine_commit_prepared_destroy, machine_executor_attach_projection, machine_input_boundary,
-    machine_prepare_bindings_projection, machine_prepare_destroy, machine_recover_ephemeral_driver,
-    machine_recover_persistent_driver, machine_recycle_preserving_work, machine_reset,
-    machine_retire, machine_select_runtime_loop_batch, machine_stop_runtime,
-    machine_unregister_session_projection, prepare_runtime_loop_batch_start,
-    rollback_runtime_loop_run_after_boundary_commit_failure,
+    DriverEntry, SharedCompletionRegistry, SharedDriver, cancel_runtime_loop_run,
+    commit_runtime_loop_run, fail_machine_run, fail_runtime_loop_run,
+    machine_apply_run_return_projection, machine_batch_primitive_projections,
+    machine_batch_runtime_semantics, machine_begin_run, machine_commit_prepared_destroy,
+    machine_commit_service_turn_terminal_receipt, machine_executor_attach_projection,
+    machine_input_boundary, machine_prepare_bindings_projection, machine_prepare_destroy,
+    machine_recover_ephemeral_driver, machine_recover_persistent_driver,
+    machine_recycle_preserving_work, machine_reset, machine_retire,
+    machine_select_runtime_loop_batch, machine_stop_runtime, machine_unregister_session_projection,
+    prepare_runtime_loop_batch_start, rollback_runtime_loop_run_after_boundary_commit_failure,
 };
 
 pub(crate) mod driver;
@@ -707,6 +718,55 @@ impl MeerkatMachine {
         Ok(())
     }
 
+    async fn clear_dead_runtime_attachment(&self, session_id: &SessionId) {
+        let mut sessions = self.sessions.write().await;
+        if let Some(entry) = sessions.get_mut(session_id) {
+            entry.clear_dead_attachment();
+        }
+    }
+
+    async fn dispatch_interrupt_yielding_runtime_effect(
+        &self,
+        session_id: &SessionId,
+        effect_tx: Option<mpsc::Sender<crate::effect::RuntimeEffect>>,
+        boundary_handle: Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorBoundaryHandle>>,
+        projected_effect: crate::effect::ProjectedRuntimeEffect,
+        context: &str,
+    ) -> Result<(), RuntimeDriverError> {
+        let Some(effect_tx) = effect_tx else {
+            let state = self
+                .existing_session_runtime_state(session_id)
+                .await
+                .unwrap_or(RuntimeState::Destroyed);
+            return Err(RuntimeDriverError::NotReady { state });
+        };
+
+        let reason = projected_effect.reason().to_string();
+        if let Some(boundary_handle) = boundary_handle {
+            boundary_handle
+                .cancel_after_boundary(reason)
+                .await
+                .map_err(|err| {
+                    RuntimeDriverError::Internal(format!(
+                        "{context}: failed to apply live boundary cancel: {err}"
+                    ))
+                })?;
+        }
+
+        match effect_tx.try_send(projected_effect.into_effect()) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(RuntimeDriverError::Internal(format!(
+                "{context}: runtime effect channel full after accepted boundary cancel"
+            ))),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.clear_dead_runtime_attachment(session_id).await;
+                Err(RuntimeDriverError::NotReady {
+                    state: RuntimeState::Idle,
+                })
+            }
+        }
+    }
+
     async fn restore_session_dsl_state(
         &self,
         session_id: &SessionId,
@@ -779,6 +839,34 @@ impl MeerkatMachine {
     #[must_use]
     pub fn session_control_authority(&self) -> MachineSessionControlAuthority {
         MachineSessionControlAuthority { _private: () }
+    }
+
+    /// Whether this adapter shares the same runtime persistence authority as
+    /// another adapter. Runtime-backed composition surfaces use this to reject
+    /// mismatched adapters before visible terminal events can outrun the store
+    /// that owns their durable commit.
+    #[must_use]
+    pub fn shares_runtime_persistence_with(&self, other: &Self) -> bool {
+        match (&self.store, &other.store) {
+            (None, None) => true,
+            (Some(a), Some(b)) => runtime_stores_share_authority(a, b),
+            _ => false,
+        }
+    }
+
+    /// Whether this adapter owns the same runtime persistence authority as a
+    /// concrete runtime store handle.
+    #[must_use]
+    pub fn shares_runtime_store_authority(&self, store: &Arc<dyn RuntimeStore>) -> bool {
+        self.store
+            .as_ref()
+            .is_some_and(|machine_store| runtime_stores_share_authority(machine_store, store))
+    }
+
+    /// Whether this adapter has a runtime persistence store.
+    #[must_use]
+    pub fn has_runtime_persistence(&self) -> bool {
+        self.store.is_some()
     }
 
     fn normalize_destroyed_error(err: RuntimeDriverError) -> RuntimeDriverError {
@@ -1057,9 +1145,14 @@ impl MeerkatMachine {
         &self,
         runtime_id: LogicalRuntimeId,
         dsl_authority: crate::driver::ephemeral::SharedIngressDslAuthority,
+        initial_runtime_state: RuntimeState,
     ) -> DriverEntry {
         let control_projection = Arc::new(StdRwLock::new(
-            crate::driver::ephemeral::RuntimeControlProjection::default(),
+            crate::driver::ephemeral::RuntimeControlProjection {
+                phase: initial_runtime_state,
+                current_run_id: None,
+                pre_run_phase: None,
+            },
         ));
         match (&self.store, &self.blob_store) {
             (Some(store), Some(blob_store)) => {
@@ -1095,71 +1188,44 @@ impl MeerkatMachine {
         Arc<meerkat_core::EpochCursorState>,
     ) {
         if let Some(ref store) = self.store {
-            let legacy_alias = LogicalRuntimeId::legacy_session_uuid_alias(session_id);
-            let candidates = if &legacy_alias == runtime_id {
-                vec![runtime_id.clone()]
-            } else {
-                vec![runtime_id.clone(), legacy_alias]
-            };
-            let mut recovered: Option<(
-                LogicalRuntimeId,
-                crate::ops_lifecycle::PersistedOpsSnapshot,
-            )> = None;
-            for candidate in candidates {
-                match store.load_ops_lifecycle(&candidate).await {
-                    Ok(Some(snapshot)) => {
-                        if candidate == *runtime_id {
-                            recovered = Some((candidate, snapshot));
-                            break;
-                        }
-                        recovered = Some((candidate, snapshot));
-                    }
-                    Ok(None) => {}
-                    Err(err) if recovered.is_some() => {
-                        tracing::warn!(
-                            %session_id,
-                            %candidate,
-                            error = %err,
-                            "ignoring legacy ops lifecycle fallback error because canonical snapshot was already recovered"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            %session_id,
-                            %candidate,
-                            error = %err,
-                            "failed to load ops lifecycle; epoch rotated"
-                        );
-                        return (
-                            Arc::new(crate::ops_lifecycle::RuntimeOpsLifecycleRegistry::new()),
-                            meerkat_core::RuntimeEpochId::new(),
-                            Arc::new(meerkat_core::EpochCursorState::new()),
-                        );
-                    }
+            match store.load_ops_lifecycle(runtime_id).await {
+                Ok(Some(snapshot)) => {
+                    let recovered_epoch = snapshot.epoch_id.clone();
+                    let recovered_cursors = meerkat_core::EpochCursorState::from_recovered(
+                        snapshot.cursors.agent_applied_cursor,
+                        snapshot.cursors.runtime_observed_seq,
+                        snapshot.cursors.runtime_last_injected_seq,
+                    );
+                    let recovered_ops_count = snapshot.completion_entries.len();
+                    let registry =
+                        crate::ops_lifecycle::RuntimeOpsLifecycleRegistry::from_recovered(snapshot);
+                    tracing::info!(
+                        %session_id,
+                        %runtime_id,
+                        epoch_id = %recovered_epoch,
+                        recovered_ops = recovered_ops_count,
+                        "ops lifecycle recovered from durable store (same epoch)"
+                    );
+                    return (
+                        Arc::new(registry),
+                        recovered_epoch,
+                        Arc::new(recovered_cursors),
+                    );
                 }
-            }
-            if let Some((candidate, snapshot)) = recovered {
-                let recovered_epoch = snapshot.epoch_id.clone();
-                let recovered_cursors = meerkat_core::EpochCursorState::from_recovered(
-                    snapshot.cursors.agent_applied_cursor,
-                    snapshot.cursors.runtime_observed_seq,
-                    snapshot.cursors.runtime_last_injected_seq,
-                );
-                let recovered_ops_count = snapshot.completion_entries.len();
-                let registry =
-                    crate::ops_lifecycle::RuntimeOpsLifecycleRegistry::from_recovered(snapshot);
-                tracing::info!(
-                    %session_id,
-                    %candidate,
-                    epoch_id = %recovered_epoch,
-                    recovered_ops = recovered_ops_count,
-                    "ops lifecycle recovered from durable store (same epoch)"
-                );
-                return (
-                    Arc::new(registry),
-                    recovered_epoch,
-                    Arc::new(recovered_cursors),
-                );
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        %session_id,
+                        %runtime_id,
+                        error = %err,
+                        "failed to load ops lifecycle; epoch rotated"
+                    );
+                    return (
+                        Arc::new(crate::ops_lifecycle::RuntimeOpsLifecycleRegistry::new()),
+                        meerkat_core::RuntimeEpochId::new(),
+                        Arc::new(meerkat_core::EpochCursorState::new()),
+                    );
+                }
             }
             tracing::debug!(%session_id, "no persisted ops lifecycle; fresh epoch");
             (
@@ -1200,6 +1266,7 @@ impl MeerkatMachine {
                 | MeerkatMachineCommand::SetSilentIntents { .. }
                 | MeerkatMachineCommand::CancelAfterBoundary { .. }
                 | MeerkatMachineCommand::StopRuntimeExecutor { .. }
+                | MeerkatMachineCommand::CommitServiceTurnTerminalReceipt { .. }
                 | MeerkatMachineCommand::ContainsSession { .. }
                 | MeerkatMachineCommand::SessionHasExecutor { .. }
                 | MeerkatMachineCommand::SessionHasComms { .. }

@@ -163,14 +163,6 @@ async fn stop_runtime_loop_executor_from_dsl_effect(
                 error = %error,
                 "failed to apply DSL stop-runtime-executor transition after runtime loop snapshot failure"
             );
-            if let Err(stop_error) =
-                crate::control_plane::terminalize_async_stop(driver, completions).await
-            {
-                tracing::warn!(
-                    error = %stop_error,
-                    "failed to terminalize runtime loop after stop-runtime-executor DSL rejection"
-                );
-            }
             return true;
         }
     };
@@ -183,25 +175,27 @@ async fn stop_runtime_loop_executor_from_dsl_effect(
                 error = %error,
                 "DSL stop-runtime-executor transition did not emit a runtime effect fact"
             );
-            if let Err(stop_error) =
-                crate::control_plane::terminalize_async_stop(driver, completions).await
-            {
-                tracing::warn!(
-                    error = %stop_error,
-                    "failed to terminalize runtime loop after missing stop-runtime-executor effect"
-                );
-            }
             return true;
         }
     };
 
-    crate::control_plane::apply_executor_effect(
+    match crate::control_plane::apply_executor_effect(
         driver,
         completions,
         executor,
         projected_effect.into_effect(),
     )
     .await
+    {
+        Ok(should_stop) => should_stop,
+        Err(error) => {
+            tracing::error!(
+                error = %error,
+                "failed to apply stop-runtime-executor effect from runtime loop"
+            );
+            true
+        }
+    }
 }
 
 fn abandon_completion_waiters(
@@ -513,7 +507,7 @@ pub(crate) fn spawn_runtime_loop_with_completions(
                 maybe_effect = effect_rx.recv() => {
                     match maybe_effect {
                         Some(effect) => {
-                            if crate::control_plane::apply_executor_effect(
+                            match crate::control_plane::apply_executor_effect(
                                 &driver,
                                 completions.as_ref(),
                                 &mut *executor,
@@ -521,7 +515,15 @@ pub(crate) fn spawn_runtime_loop_with_completions(
                             )
                             .await
                             {
-                                break;
+                                Ok(true) => break,
+                                Ok(false) => {}
+                                Err(error) => {
+                                    tracing::error!(
+                                        error = %error,
+                                        "failed to apply runtime executor effect"
+                                    );
+                                    break;
+                                }
                             }
                         }
                         None => break,
@@ -708,7 +710,7 @@ async fn process_queue(
     completions: Option<&crate::meerkat_machine::SharedCompletionRegistry>,
 ) -> bool {
     loop {
-        if crate::control_plane::drain_ready_executor_effects(
+        match crate::control_plane::drain_ready_executor_effects(
             driver,
             completions,
             executor,
@@ -716,7 +718,15 @@ async fn process_queue(
         )
         .await
         {
-            return true;
+            Ok(true) => return true,
+            Ok(false) => {}
+            Err(error) => {
+                tracing::error!(
+                    error = %error,
+                    "failed to drain runtime executor effect"
+                );
+                return true;
+            }
         }
 
         // Dequeue and prepare under the driver lock
@@ -822,12 +832,31 @@ async fn process_queue(
                             reason = conflict.reason,
                             "batch turn-metadata merge conflict"
                         );
-                        let _ = crate::meerkat_machine::fail_runtime_loop_run(
+                        if let Err(err) = crate::meerkat_machine::fail_runtime_loop_run(
                             driver,
                             run_id,
                             CoreApplyFailureCause::primitive_rejected(conflict.to_string()),
                         )
-                        .await;
+                        .await
+                        {
+                            tracing::error!(error = %err, "failed to record primitive rejection terminal event");
+                            let should_stop = stop_runtime_loop_executor_from_dsl_effect(
+                                driver,
+                                completions,
+                                executor,
+                                format!("runtime primitive rejection snapshot failed: {err}"),
+                            )
+                            .await;
+                            if let Some(completions) = completions.as_ref() {
+                                let mut completions = completions.lock().await;
+                                abandon_completion_waiters(
+                                    &mut completions,
+                                    &input_ids,
+                                    format!("runtime primitive rejection snapshot failed: {err}"),
+                                );
+                            }
+                            return should_stop;
+                        }
                         if let Some(completions) = completions.as_ref() {
                             let mut completions = completions.lock().await;
                             abandon_completion_waiters(
@@ -843,12 +872,31 @@ async fn process_queue(
                     prepare_turn_state_for_primitive(driver, &run_id, &primitive).await
                 {
                     tracing::error!(%run_id, error = %error, "failed to start runtime turn state");
-                    let _ = crate::meerkat_machine::fail_runtime_loop_run(
+                    if let Err(err) = crate::meerkat_machine::fail_runtime_loop_run(
                         driver,
                         run_id,
                         CoreApplyFailureCause::executor_internal(error.to_string()),
                     )
-                    .await;
+                    .await
+                    {
+                        tracing::error!(error = %err, "failed to record turn-state preparation terminal event");
+                        let should_stop = stop_runtime_loop_executor_from_dsl_effect(
+                            driver,
+                            completions,
+                            executor,
+                            format!("runtime turn-state preparation snapshot failed: {err}"),
+                        )
+                        .await;
+                        if let Some(completions) = completions.as_ref() {
+                            let mut completions = completions.lock().await;
+                            abandon_completion_waiters(
+                                &mut completions,
+                                &input_ids,
+                                format!("runtime turn-state preparation snapshot failed: {err}"),
+                            );
+                        }
+                        return should_stop;
+                    }
                     if let Some(completions) = completions.as_ref() {
                         let mut completions = completions.lock().await;
                         abandon_completion_waiters(
@@ -917,13 +965,17 @@ async fn process_queue(
                         let error_msg = e.to_string();
                         let terminal_failure = match &e {
                             CoreExecutorError::TerminalFailure {
+                                outcome,
                                 cause_kind,
                                 message,
                                 ..
-                            } => Some(crate::meerkat_machine_types::MeerkatMachineRunFailure::new(
-                                *cause_kind,
-                                message.clone(),
-                            )),
+                            } => Some(
+                                crate::meerkat_machine_types::MeerkatMachineRunFailure::terminal(
+                                    *outcome,
+                                    *cause_kind,
+                                    message.clone(),
+                                ),
+                            ),
                             _ => None,
                         };
                         let completion_error = match &e {
@@ -939,8 +991,9 @@ async fn process_queue(
                             _ => None,
                         };
                         drop(d);
-                        // RunFailed rolls back Staged → Queued and returns to Idle
-                        let fail_result = if let Some(failure) = terminal_failure {
+                        let fail_result = if cancelled {
+                            crate::meerkat_machine::cancel_runtime_loop_run(driver, run_id).await
+                        } else if let Some(failure) = terminal_failure {
                             crate::meerkat_machine::fail_machine_run(driver, run_id, failure).await
                         } else {
                             crate::meerkat_machine::fail_runtime_loop_run(
@@ -951,7 +1004,7 @@ async fn process_queue(
                             .await
                         };
                         if let Err(err) = fail_result {
-                            tracing::error!(error = %err, "failed to record run-failed event");
+                            tracing::error!(error = %err, "failed to record runtime terminal event");
                             let should_stop = stop_runtime_loop_executor_from_dsl_effect(
                                 driver,
                                 completions,
@@ -1025,7 +1078,11 @@ mod tests {
     use meerkat_core::lifecycle::run_primitive::{
         ConversationAppendRole, CoreRenderable, PeerResponseTerminalApplyIntent,
     };
-    use std::sync::Arc;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use std::time::Duration;
 
     use meerkat_core::ops_lifecycle::{
         OperationKind, OperationResult, OperationSpec, OpsLifecycleRegistry,
@@ -1066,6 +1123,111 @@ mod tests {
                 ),
             ),
         ))
+    }
+
+    fn stop_runtime_executor_effect(reason: &str) -> crate::effect::RuntimeEffect {
+        crate::effect::runtime_effect_for_test(
+            crate::meerkat_machine::dsl::RuntimeEffectKind::StopRuntimeExecutor,
+            reason,
+        )
+    }
+
+    #[tokio::test]
+    async fn runtime_loop_stop_effect_failure_is_fail_closed_from_helper() {
+        let driver = make_shared_ephemeral_driver("stop-helper-fail-closed");
+        let stop_calls = Arc::new(AtomicUsize::new(0));
+        let apply_calls = Arc::new(AtomicUsize::new(0));
+        let mut executor = crate::control_plane::test_support::StopFailingExecutor::new(
+            Arc::clone(&stop_calls),
+            Arc::clone(&apply_calls),
+        );
+
+        let should_stop = stop_runtime_loop_executor_from_dsl_effect(
+            &driver,
+            None,
+            &mut executor,
+            "snapshot failure should stop the runtime loop".to_string(),
+        )
+        .await;
+
+        assert!(
+            should_stop,
+            "stop-effect failures must fail closed by stopping the runtime loop"
+        );
+        assert_eq!(stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            apply_calls.load(Ordering::SeqCst),
+            0,
+            "stop-effect failure must not fall through to queued work"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_loop_drain_effect_failure_is_fail_closed() {
+        let driver = make_shared_ephemeral_driver("drain-effect-fail-closed");
+        let stop_calls = Arc::new(AtomicUsize::new(0));
+        let apply_calls = Arc::new(AtomicUsize::new(0));
+        let mut executor = crate::control_plane::test_support::StopFailingExecutor::new(
+            Arc::clone(&stop_calls),
+            Arc::clone(&apply_calls),
+        );
+        let (effect_tx, mut effect_rx) = tokio::sync::mpsc::channel(1);
+        effect_tx
+            .send(stop_runtime_executor_effect("drain failure should stop"))
+            .await
+            .expect("test effect should enqueue");
+
+        let should_stop = process_queue(&driver, &mut executor, &mut effect_rx, None).await;
+
+        assert!(
+            should_stop,
+            "drained executor-effect failures must stop the runtime loop"
+        );
+        assert_eq!(stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            apply_calls.load(Ordering::SeqCst),
+            0,
+            "failed stop effect must not be followed by ordinary queue processing"
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_loop_direct_effect_failure_exits_loop_with_channels_open() {
+        let driver = make_shared_ephemeral_driver("direct-effect-fail-closed");
+        let stop_calls = Arc::new(AtomicUsize::new(0));
+        let apply_calls = Arc::new(AtomicUsize::new(0));
+        let executor = crate::control_plane::test_support::StopFailingExecutor::new(
+            Arc::clone(&stop_calls),
+            Arc::clone(&apply_calls),
+        );
+        let (wake_tx, wake_rx) = tokio::sync::mpsc::channel(1);
+        let (effect_tx, effect_rx) = tokio::sync::mpsc::channel(1);
+        let handle = spawn_runtime_loop_with_completions(
+            driver,
+            Box::new(executor),
+            wake_rx,
+            effect_rx,
+            None,
+            None,
+            None,
+            std::sync::Weak::<crate::meerkat_machine::MeerkatMachine>::new(),
+            SessionId::new(),
+        );
+
+        effect_tx
+            .send(stop_runtime_executor_effect(
+                "direct effect failure should stop",
+            ))
+            .await
+            .expect("test effect should enqueue");
+
+        tokio::time::timeout(Duration::from_secs(1), handle)
+            .await
+            .expect("runtime loop must exit after executor-effect failure")
+            .expect("runtime loop task should not panic");
+        assert_eq!(stop_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(apply_calls.load(Ordering::SeqCst), 0);
+        drop((wake_tx, effect_tx));
     }
 
     fn make_prompt(text: &str) -> Input {
@@ -1193,7 +1355,7 @@ mod tests {
                 id: InputId::new(),
                 timestamp: Utc::now(),
                 source: InputOrigin::Peer {
-                    peer_id: "analyst-rt".into(),
+                    peer_id: TEST_PEER_RESPONSE_ROUTE_ID.into(),
                     display_identity: Some("Analyst".into()),
                     runtime_id: None,
                 },
@@ -1242,7 +1404,7 @@ mod tests {
                 id: InputId::new(),
                 timestamp: Utc::now(),
                 source: InputOrigin::Peer {
-                    peer_id: "analyst-rt".into(),
+                    peer_id: TEST_PEER_RESPONSE_ROUTE_ID.into(),
                     display_identity: Some("Analyst".into()),
                     runtime_id: None,
                 },
@@ -1353,7 +1515,7 @@ mod tests {
                 id: InputId::new(),
                 timestamp: Utc::now(),
                 source: InputOrigin::Peer {
-                    peer_id: "analyst-rt".into(),
+                    peer_id: TEST_PEER_RESPONSE_ROUTE_ID.into(),
                     display_identity: Some("Analyst".into()),
                     runtime_id: None,
                 },
@@ -1400,7 +1562,9 @@ mod tests {
         assert_eq!(staged.context_appends.len(), 1);
         assert_eq!(
             staged.context_appends[0].key,
-            "peer_response_terminal:analyst-rt:018f6f79-7a82-7c4e-a552-a3b86f9630f1"
+            format!(
+                "peer_response_terminal:{TEST_PEER_RESPONSE_ROUTE_ID}:018f6f79-7a82-7c4e-a552-a3b86f9630f1"
+            )
         );
         match &staged.context_appends[0].content {
             CoreRenderable::Text { text } => {
@@ -1425,7 +1589,7 @@ mod tests {
                 id: InputId::new(),
                 timestamp: Utc::now(),
                 source: InputOrigin::Peer {
-                    peer_id: "analyst-rt".into(),
+                    peer_id: TEST_PEER_RESPONSE_ROUTE_ID.into(),
                     display_identity: Some("Analyst".into()),
                     runtime_id: None,
                 },

@@ -64,6 +64,25 @@ fn seed_mob_authority(
     authority
 }
 
+#[cfg(feature = "runtime-adapter")]
+fn canonical_runtime_adapter_for_session_service(
+    session_service: &Arc<dyn MobSessionService>,
+    runtime_adapter: RuntimeAdapterOption,
+) -> Result<RuntimeAdapterOption, MobError> {
+    let service_adapter = session_service.runtime_adapter();
+    match (runtime_adapter, service_adapter) {
+        (Some(adapter), Some(service_adapter))
+            if !adapter.shares_runtime_persistence_with(&service_adapter) =>
+        {
+            Err(MobError::Internal(
+                "explicit mob runtime adapter does not share the session service runtime persistence authority".to_string(),
+            ))
+        }
+        (Some(adapter), _) => Ok(Some(adapter)),
+        (None, service_adapter) => Ok(service_adapter),
+    }
+}
+
 /// Seed the DSL authority's membership-tracking fields from a reconstructed
 /// shell roster on resume paths.
 ///
@@ -661,6 +680,8 @@ impl MobBuilder {
                     .to_string(),
             ));
         }
+        let runtime_adapter =
+            canonical_runtime_adapter_for_session_service(&session_service, runtime_adapter)?;
 
         // §8: AutonomousHost profiles require a runtime adapter. Validate at
         // build time so Option<adapter> on the trait doesn't hide an ownership
@@ -774,6 +795,8 @@ impl MobBuilder {
                     .to_string(),
             ));
         }
+        let runtime_adapter =
+            canonical_runtime_adapter_for_session_service(&session_service, runtime_adapter)?;
         // §8 check deferred until after definition recovery — the definition
         // comes from the event log, so we can't check profiles before replay.
         let all_events = storage.events.replay_all().await?;
@@ -1139,7 +1162,9 @@ impl MobBuilder {
             if session_service
                 .session_belongs_to_mob(session_id, &definition.id)
                 .await
-                && let Err(error) = session_service.archive(session_id).await
+                && let Err(error) = session_service
+                    .archive_with_mob_lifecycle_authority(session_id)
+                    .await
                 && !matches!(error, meerkat_core::service::SessionError::NotFound { .. })
             {
                 return Err(error.into());
@@ -1556,13 +1581,9 @@ impl MobBuilder {
                             meerkat_core::service::StartTurnRequest {
                                 prompt: resume_message.into(),
                                 system_prompt: None,
-                                render_metadata: None,
-                                handling_mode: meerkat_core::types::HandlingMode::Queue,
                                 event_tx: None,
-                                skill_references: None,
-                                flow_tool_overlay: None,
-                                pre_turn_context_appends: Vec::new(),
-                                turn_metadata: None,
+                                runtime: meerkat_core::service::StartTurnRuntimeSemantics::default(
+                                ),
                             },
                         )
                         .await?;

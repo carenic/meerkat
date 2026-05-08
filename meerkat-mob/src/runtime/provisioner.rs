@@ -15,9 +15,9 @@ use meerkat_core::comms::TrustedPeerDescriptor;
 use meerkat_core::event_injector::SubscribableInjector;
 #[cfg(feature = "runtime-adapter")]
 use meerkat_core::lifecycle::core_executor::{
-    CoreApplyOutput, CoreExecutor, CoreExecutorBoundaryHandle,
+    CoreApplyOutput, CoreExecutor, CoreExecutorBoundaryHandle, CoreExecutorError,
+    CoreExecutorInterruptHandle,
 };
-use meerkat_core::lifecycle::core_executor::{CoreExecutorError, CoreExecutorInterruptHandle};
 #[cfg(feature = "runtime-adapter")]
 use meerkat_core::lifecycle::run_primitive::{CoreRenderable, RunApplyBoundary, RunPrimitive};
 #[cfg(feature = "runtime-adapter")]
@@ -42,9 +42,76 @@ use std::collections::HashMap;
 #[cfg(feature = "runtime-adapter")]
 use std::time::Duration;
 #[cfg(feature = "runtime-adapter")]
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::{Mutex, RwLock, mpsc, oneshot};
 
 type TurnEventTx = tokio::sync::mpsc::Sender<meerkat_core::EventEnvelope<meerkat_core::AgentEvent>>;
+
+#[cfg(feature = "runtime-adapter")]
+struct DeferredTurnEventDelivery {
+    release_tx: oneshot::Sender<()>,
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl DeferredTurnEventDelivery {
+    fn release(self) {
+        let _ = self.release_tx.send(());
+    }
+}
+
+#[cfg(feature = "runtime-adapter")]
+fn defer_turn_events_until_machine_completion(
+    session_id: &SessionId,
+    event_tx: Option<TurnEventTx>,
+) -> (Option<TurnEventTx>, Option<DeferredTurnEventDelivery>) {
+    let Some(event_tx) = event_tx else {
+        return (None, None);
+    };
+
+    let (deferred_tx, mut deferred_rx) = mpsc::channel(64);
+    let (release_tx, release_rx) = oneshot::channel();
+    let session_id = session_id.clone();
+    tokio::spawn(async move {
+        let mut release_rx = Box::pin(release_rx);
+        let mut buffered = Vec::new();
+        let mut stream_closed = false;
+        let mut released = false;
+
+        loop {
+            tokio::select! {
+                event = deferred_rx.recv(), if !stream_closed => {
+                    match event {
+                        Some(event) => buffered.push(event),
+                        None => stream_closed = true,
+                    }
+                }
+                result = &mut release_rx, if !released => {
+                    released = true;
+                    drop(result);
+                }
+            }
+
+            if stream_closed && released {
+                break;
+            }
+        }
+
+        for event in buffered {
+            if event_tx.send(event).await.is_err() {
+                return;
+            }
+        }
+        // No synthetic terminal event. The mob actor receives the
+        // authoritative terminal signal from CompletionOutcome via
+        // runtime_completion_to_mob_result(). Shell code must not
+        // fabricate EventEnvelopes with invented sequence numbers
+        // (dogma §3: shell owns mechanics, not meaning).
+    });
+
+    (
+        Some(deferred_tx),
+        Some(DeferredTurnEventDelivery { release_tx }),
+    )
+}
 
 pub struct ProvisionMemberRequest {
     pub create_session: CreateSessionRequest,
@@ -259,6 +326,45 @@ impl SessionBackend {
         }
     }
 
+    async fn unregister_runtime_session_binding(&self, session_id: &SessionId) {
+        if let Some(adapter) = &self.runtime_adapter {
+            if adapter.contains_session(session_id).await {
+                adapter.unregister_session(session_id).await;
+            }
+            self.remove_runtime_session_state(session_id).await;
+        }
+    }
+
+    async fn archive_with_authority_then_unregister(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), SessionError> {
+        match self
+            .session_service
+            .archive_with_mob_lifecycle_authority(session_id)
+            .await
+        {
+            Ok(()) => {
+                self.unregister_runtime_session_binding(session_id).await;
+                Ok(())
+            }
+            Err(SessionError::NotFound { id }) => {
+                if let Some(adapter) = &self.runtime_adapter
+                    && adapter.contains_session(session_id).await
+                {
+                    return Err(SessionError::Agent(
+                        meerkat_core::error::AgentError::InternalError(format!(
+                            "mob archive authority returned NotFound for registered runtime session {session_id}"
+                        )),
+                    ));
+                }
+                self.unregister_runtime_session_binding(session_id).await;
+                Err(SessionError::NotFound { id })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
     async fn execute_runtime_input(
         &self,
         session_id: &SessionId,
@@ -274,6 +380,8 @@ impl SessionBackend {
         let adapter_session_id = session_id.clone();
         let requested_input_id = input.id().clone();
         let mut context_input_id = requested_input_id.clone();
+        let (queued_event_tx, deferred_delivery) =
+            defer_turn_events_until_machine_completion(session_id, event_tx);
 
         // Queue only owner bridge context that cannot be reconstructed from
         // runtime primitives. Bind context by canonical input identity (not by
@@ -281,7 +389,7 @@ impl SessionBackend {
         // of semantic ordering.
         let queued_context = if let Some(ref state) = state {
             state
-                .enqueue_turn_context(requested_input_id.clone(), event_tx)
+                .enqueue_turn_context(requested_input_id.clone(), queued_event_tx)
                 .await
         } else {
             false
@@ -298,7 +406,11 @@ impl SessionBackend {
                 {
                     let _ = state.discard_turn_context(&requested_input_id).await;
                 }
-                return Err(MobError::Internal(err.to_string()));
+                let error = err.to_string();
+                if let Some(delivery) = deferred_delivery {
+                    delivery.release();
+                }
+                return Err(MobError::Internal(error));
             }
         };
 
@@ -333,6 +445,9 @@ impl SessionBackend {
             {
                 let _ = state.discard_turn_context(&context_input_id).await;
             }
+            if let Some(delivery) = deferred_delivery {
+                delivery.release();
+            }
             return Ok(());
         };
 
@@ -341,6 +456,9 @@ impl SessionBackend {
             && queued_context
         {
             let _ = state.discard_turn_context(&context_input_id).await;
+        }
+        if let Some(delivery) = deferred_delivery {
+            delivery.release();
         }
 
         runtime_completion_to_mob_result(session_id, completion)
@@ -361,10 +479,12 @@ impl SessionBackend {
         let adapter_session_id = session_id.clone();
         let requested_input_id = input.id().clone();
         let mut context_input_id = requested_input_id.clone();
+        let (queued_event_tx, deferred_delivery) =
+            defer_turn_events_until_machine_completion(session_id, event_tx);
 
         let queued_context = if let Some(ref state) = state {
             state
-                .enqueue_turn_context(requested_input_id.clone(), event_tx)
+                .enqueue_turn_context(requested_input_id.clone(), queued_event_tx)
                 .await
         } else {
             false
@@ -381,7 +501,11 @@ impl SessionBackend {
                 {
                     let _ = state.discard_turn_context(&requested_input_id).await;
                 }
-                return Err(MobError::Internal(err.to_string()));
+                let error = err.to_string();
+                if let Some(delivery) = deferred_delivery {
+                    delivery.release();
+                }
+                return Err(MobError::Internal(error));
             }
         };
 
@@ -413,6 +537,9 @@ impl SessionBackend {
             {
                 let _ = state.discard_turn_context(&context_input_id).await;
             }
+            if let Some(delivery) = deferred_delivery {
+                delivery.release();
+            }
             return Ok(());
         };
 
@@ -420,8 +547,16 @@ impl SessionBackend {
             && queued_context
         {
             tokio::spawn(async move {
-                let _ = handle.wait().await;
+                let _completion = handle.wait().await;
                 let _ = state.discard_turn_context(&context_input_id).await;
+                if let Some(delivery) = deferred_delivery {
+                    delivery.release();
+                }
+            });
+        } else if let Some(delivery) = deferred_delivery {
+            tokio::spawn(async move {
+                let _completion = handle.wait().await;
+                delivery.release();
             });
         }
 
@@ -573,7 +708,8 @@ impl RuntimeSessionState {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::{
-        MultiBackendProvisioner, runtime_completion_to_mob_result, session_turn_error_to_mob_error,
+        MultiBackendProvisioner, defer_turn_events_until_machine_completion,
+        runtime_completion_to_mob_result, session_turn_error_to_mob_error,
     };
     use crate::error::MobError;
     use meerkat_core::service::SessionError;
@@ -629,6 +765,27 @@ mod tests {
             }
             other => panic!("expected callback-pending mob error, got {other:?}"),
         }
+    }
+
+    #[cfg(feature = "runtime-adapter")]
+    #[tokio::test]
+    async fn deferred_turn_delivery_closes_channel_without_synthetic_events() {
+        let session_id = SessionId::new();
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::channel(1);
+        let (queued_event_tx, deferred_delivery) =
+            defer_turn_events_until_machine_completion(&session_id, Some(event_tx));
+
+        let deferred_delivery = deferred_delivery.expect("deferred delivery handle");
+        deferred_delivery.release();
+        drop(queued_event_tx);
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+            .await
+            .expect("channel should close promptly after release");
+        assert!(
+            result.is_none(),
+            "deferred buffer must not fabricate events; channel should close empty"
+        );
     }
 
     #[cfg(feature = "runtime-adapter")]
@@ -767,6 +924,7 @@ impl MobSessionRuntimeExecutor {
 #[cfg(feature = "runtime-adapter")]
 struct MobSessionRuntimeBoundaryHandle {
     session_service: Arc<dyn MobSessionService>,
+    runtime_adapter: Arc<MeerkatMachine>,
     bridge_session_id: SessionId,
 }
 
@@ -776,7 +934,10 @@ struct MobSessionRuntimeBoundaryHandle {
 impl CoreExecutorBoundaryHandle for MobSessionRuntimeBoundaryHandle {
     async fn cancel_after_boundary(&self, _reason: String) -> Result<(), CoreExecutorError> {
         self.session_service
-            .cancel_after_boundary(&self.bridge_session_id)
+            .cancel_after_boundary_with_machine_authority(
+                &self.bridge_session_id,
+                self.runtime_adapter.session_control_authority(),
+            )
             .await
             .or_else(|err| match err {
                 SessionError::NotRunning { .. } => Ok(()),
@@ -786,17 +947,23 @@ impl CoreExecutorBoundaryHandle for MobSessionRuntimeBoundaryHandle {
     }
 }
 
+#[cfg(feature = "runtime-adapter")]
 struct MobSessionServiceInterruptHandle {
     session_service: Arc<dyn MobSessionService>,
+    runtime_adapter: Arc<MeerkatMachine>,
     bridge_session_id: SessionId,
 }
 
+#[cfg(feature = "runtime-adapter")]
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl CoreExecutorInterruptHandle for MobSessionServiceInterruptHandle {
     async fn hard_cancel_current_run(&self, _reason: String) -> Result<(), CoreExecutorError> {
         self.session_service
-            .interrupt(&self.bridge_session_id)
+            .interrupt_with_machine_authority(
+                &self.bridge_session_id,
+                self.runtime_adapter.session_control_authority(),
+            )
             .await
             .or_else(|err| match err {
                 SessionError::NotRunning { .. } => Ok(()),
@@ -848,6 +1015,7 @@ impl CoreExecutor for MobSessionRuntimeExecutor {
     fn boundary_handle(&self) -> Option<Arc<dyn CoreExecutorBoundaryHandle>> {
         Some(Arc::new(MobSessionRuntimeBoundaryHandle {
             session_service: Arc::clone(&self.session_service),
+            runtime_adapter: Arc::clone(&self.runtime_adapter),
             bridge_session_id: self.bridge_session_id.clone(),
         }))
     }
@@ -855,6 +1023,7 @@ impl CoreExecutor for MobSessionRuntimeExecutor {
     fn interrupt_handle(&self) -> Option<Arc<dyn CoreExecutorInterruptHandle>> {
         Some(Arc::new(MobSessionServiceInterruptHandle {
             session_service: Arc::clone(&self.session_service),
+            runtime_adapter: Arc::clone(&self.runtime_adapter),
             bridge_session_id: self.bridge_session_id.clone(),
         }))
     }
@@ -903,15 +1072,12 @@ impl CoreExecutor for MobSessionRuntimeExecutor {
             .state
             .take_turn_context_for_inputs(&contributing_input_ids)
             .await;
-        let runtime_render_metadata = primitive
-            .turn_metadata()
-            .and_then(|meta| meta.render_metadata.clone());
         // The runtime has already resolved handling_mode routing (Queue vs
         // Steer) before the executor fires. The session-service start_turn
         // path only supports Queue — Steer semantics are realized by the
-        // runtime ingress, not by the executor. Render metadata is carried on
-        // the flattened request while stripped from turn_metadata so session
-        // implementations cannot re-extract metadata and override the request.
+        // runtime ingress, not by the executor. render_metadata is
+        // runtime-owned and must not leak into the session-service path;
+        // strip it from turn_metadata and pass None at the request level.
         let executor_turn_metadata = primitive.turn_metadata().map(|meta| {
             let mut m = meta.clone();
             m.handling_mode = Some(meerkat_core::types::HandlingMode::Queue);
@@ -921,17 +1087,19 @@ impl CoreExecutor for MobSessionRuntimeExecutor {
         let req = StartTurnRequest {
             prompt: primitive.extract_content_input(),
             system_prompt: None,
-            render_metadata: runtime_render_metadata,
-            handling_mode: meerkat_core::types::HandlingMode::Queue,
             event_tx: queued_context.map(|context| context.event_tx),
-            skill_references: primitive
-                .turn_metadata()
-                .and_then(|meta| meta.skill_references.clone()),
-            flow_tool_overlay: primitive
-                .turn_metadata()
-                .and_then(|meta| meta.flow_tool_overlay.clone()),
-            pre_turn_context_appends,
-            turn_metadata: executor_turn_metadata,
+            runtime: meerkat_core::service::StartTurnRuntimeSemantics::new(
+                None,
+                meerkat_core::types::HandlingMode::Queue,
+                primitive
+                    .turn_metadata()
+                    .and_then(|meta| meta.skill_references.clone()),
+                primitive
+                    .turn_metadata()
+                    .and_then(|meta| meta.flow_tool_overlay.clone()),
+                pre_turn_context_appends,
+                executor_turn_metadata,
+            ),
         };
 
         self.session_service
@@ -951,7 +1119,10 @@ impl CoreExecutor for MobSessionRuntimeExecutor {
 
     async fn cancel_after_boundary(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
         self.session_service
-            .cancel_after_boundary(&self.bridge_session_id)
+            .cancel_after_boundary_with_machine_authority(
+                &self.bridge_session_id,
+                self.runtime_adapter.session_control_authority(),
+            )
             .await
             .or_else(|err| match err {
                 SessionError::NotRunning { .. } => Ok(()),
@@ -961,6 +1132,10 @@ impl CoreExecutor for MobSessionRuntimeExecutor {
     }
 
     async fn stop_runtime_executor(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
+        Ok(())
+    }
+
+    async fn cleanup_after_runtime_stop_terminalized(&mut self) -> Result<(), CoreExecutorError> {
         tracing::debug!(
             bridge_session_id = %self.bridge_session_id,
             "mob runtime executor received stop; discarding live session"
@@ -1014,8 +1189,10 @@ impl MobProvisioner for SessionBackend {
             .as_ref()
             .and_then(|build| build.resume_session.as_ref())
             .map(|session| session.id().clone());
-        // Prepare authoritative bindings through the runtime adapter so the
-        // factory receives the session resources it is allowed to consume.
+        // Prepare local session resources for the factory. The authoritative
+        // mob binding is emitted later by the routed
+        // RequestRuntimeBinding -> PrepareBindings path, after MobMachine has
+        // committed the member-owned AgentRuntimeId and fence.
         let pre_registered_bridge_session_id = if let Some(adapter) = &self.runtime_adapter {
             if req.create_session.build.is_none() {
                 req.create_session.build =
@@ -1073,17 +1250,8 @@ impl MobProvisioner for SessionBackend {
         if let Some(admitted_bridge_session_id) = admitted_bridge_session_id.as_ref()
             && admitted_bridge_session_id != &created_bridge_session_id
         {
-            if let Some(adapter) = &self.runtime_adapter {
-                adapter.unregister_session(admitted_bridge_session_id).await;
-                adapter.unregister_session(&created_bridge_session_id).await;
-            }
-            self.remove_runtime_session_state(admitted_bridge_session_id)
-                .await;
-            self.remove_runtime_session_state(&created_bridge_session_id)
-                .await;
             if let Err(error) = self
-                .session_service
-                .archive(&created_bridge_session_id)
+                .archive_with_authority_then_unregister(&created_bridge_session_id)
                 .await
                 && !matches!(error, SessionError::NotFound { .. })
             {
@@ -1091,6 +1259,8 @@ impl MobProvisioner for SessionBackend {
                     "session service returned bridge session '{created_bridge_session_id}' for admitted mob spawn session '{admitted_bridge_session_id}', and cleanup archive failed: {error}"
                 )));
             }
+            self.unregister_runtime_session_binding(admitted_bridge_session_id)
+                .await;
             return Err(MobError::Internal(format!(
                 "session service returned bridge session '{created_bridge_session_id}' for admitted mob spawn session '{admitted_bridge_session_id}'"
             )));
@@ -1146,13 +1316,10 @@ impl MobProvisioner for SessionBackend {
             .operation_status(&bridge_session_id, operation_id)
         {
             Some(OperationStatus::Provisioning) => {
-                if let Some(adapter) = &self.runtime_adapter {
-                    if adapter.contains_session(&bridge_session_id).await {
-                        adapter.unregister_session(&bridge_session_id).await;
-                    }
-                    self.remove_runtime_session_state(&bridge_session_id).await;
-                }
-                match self.session_service.archive(&bridge_session_id).await {
+                match self
+                    .archive_with_authority_then_unregister(&bridge_session_id)
+                    .await
+                {
                     Ok(()) | Err(SessionError::NotFound { .. }) => {}
                     Err(error) => return Err(error.into()),
                 }
@@ -1175,26 +1342,20 @@ impl MobProvisioner for SessionBackend {
                 | OperationStatus::Retired
                 | OperationStatus::Terminated,
             ) => {
-                if let Some(adapter) = &self.runtime_adapter {
-                    if adapter.contains_session(&bridge_session_id).await {
-                        adapter.unregister_session(&bridge_session_id).await;
-                    }
-                    self.remove_runtime_session_state(&bridge_session_id).await;
-                }
-                match self.session_service.archive(&bridge_session_id).await {
+                match self
+                    .archive_with_authority_then_unregister(&bridge_session_id)
+                    .await
+                {
                     Ok(()) | Err(SessionError::NotFound { .. }) => {}
                     Err(error) => return Err(error.into()),
                 }
                 Ok(())
             }
             Some(OperationStatus::Absent) | None => {
-                if let Some(adapter) = &self.runtime_adapter {
-                    if adapter.contains_session(&bridge_session_id).await {
-                        adapter.unregister_session(&bridge_session_id).await;
-                    }
-                    self.remove_runtime_session_state(&bridge_session_id).await;
-                }
-                match self.session_service.archive(&bridge_session_id).await {
+                match self
+                    .archive_with_authority_then_unregister(&bridge_session_id)
+                    .await
+                {
                     Ok(()) | Err(SessionError::NotFound { .. }) => {}
                     Err(error) => return Err(error.into()),
                 }
@@ -1212,11 +1373,10 @@ impl MobProvisioner for SessionBackend {
                     .await
                     .map(|_| ())
                     .map_err(|err| MobError::Internal(err.to_string()))?;
-                adapter.unregister_session(&session_id).await;
             }
-            self.remove_runtime_session_state(&session_id).await;
         }
-        self.session_service.archive(&session_id).await?;
+        self.archive_with_authority_then_unregister(&session_id)
+            .await?;
         self.ops_adapter.mark_member_retired(member_ref).await?;
         Ok(())
     }
@@ -1283,14 +1443,9 @@ impl MobProvisioner for SessionBackend {
                 "runtime-backed hard cancel requested for unregistered runtime session '{session_id}'"
             )));
         }
-        MobSessionServiceInterruptHandle {
-            session_service: Arc::clone(&self.session_service),
-            bridge_session_id: session_id,
-        }
-        .hard_cancel_current_run(reason.to_string())
-        .await
-        .map_err(|error| MobError::Internal(format!("mob session hard cancel failed: {error}")))?;
-        Ok(())
+        Err(MobError::Internal(format!(
+            "mob session hard cancel for '{session_id}' requires MeerkatMachine runtime authority"
+        )))
     }
 
     async fn start_turn(
@@ -1304,11 +1459,11 @@ impl MobProvisioner for SessionBackend {
                 .report_member_progress(member_ref, "turn dispatched")
                 .await?;
             let turn_metadata = meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
-                handling_mode: Some(req.handling_mode),
+                handling_mode: Some(req.runtime.handling_mode),
                 keep_alive: None,
-                skill_references: req.skill_references.clone(),
-                flow_tool_overlay: req.flow_tool_overlay.clone(),
-                render_metadata: req.render_metadata.clone(),
+                skill_references: req.runtime.skill_references.clone(),
+                flow_tool_overlay: req.runtime.flow_tool_overlay.clone(),
+                render_metadata: req.runtime.render_metadata.clone(),
                 ..Default::default()
             };
             let prompt = req.prompt.clone();
@@ -1359,11 +1514,11 @@ impl MobProvisioner for SessionBackend {
                 0,
                 Some(
                     meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
-                        handling_mode: Some(req.handling_mode),
+                        handling_mode: Some(req.runtime.handling_mode),
                         keep_alive: None,
-                        skill_references: req.skill_references.clone(),
-                        flow_tool_overlay: req.flow_tool_overlay.clone(),
-                        render_metadata: req.render_metadata.clone(),
+                        skill_references: req.runtime.skill_references.clone(),
+                        flow_tool_overlay: req.runtime.flow_tool_overlay.clone(),
+                        render_metadata: req.runtime.render_metadata.clone(),
                         ..Default::default()
                     },
                 ),
@@ -2160,7 +2315,7 @@ impl MobProvisioner for MultiBackendProvisioner {
                         protocol_version: authority.protocol_version,
                         input_id: meerkat_core::time_compat::new_uuid_v7().to_string(),
                         content: req.prompt.clone(),
-                        handling_mode: req.handling_mode,
+                        handling_mode: req.runtime.handling_mode,
                     },
                 );
                 let response: super::bridge_protocol::BridgeDeliveryResponse = self

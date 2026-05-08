@@ -16,7 +16,7 @@ use crate::input::{Input, externalize_input_images};
 use crate::input_state::{InputAbandonReason, InputLifecycleState, InputState, StoredInputState};
 use crate::runtime_event::RuntimeEventEnvelope;
 use crate::runtime_state::RuntimeState;
-use crate::store::RuntimeStore;
+use crate::store::{MachineLifecycleCommit, RuntimeStore};
 use crate::traits::{DestroyReport, RecoveryReport, RuntimeDriver, RuntimeDriverError};
 
 use super::ephemeral::{
@@ -129,7 +129,11 @@ impl PersistentRuntimeDriver {
         let input_states = self.inner.stored_input_states_snapshot();
         if let Err(err) = self
             .store
-            .atomic_lifecycle_commit(&self.runtime_id, target_state, &input_states)
+            .commit_machine_lifecycle(
+                &self.runtime_id,
+                MachineLifecycleCommit::new(target_state),
+                &input_states,
+            )
             .await
         {
             self.inner.restore_rollback_snapshot(checkpoint);
@@ -137,6 +141,21 @@ impl PersistentRuntimeDriver {
                 "{context} persist failed: {err}"
             )));
         }
+        Ok(())
+    }
+
+    pub(crate) async fn publish_service_turn_terminal_lifecycle(
+        &mut self,
+        checkpoint: super::ephemeral::EphemeralDriverRollbackSnapshot,
+        target_state: RuntimeState,
+    ) -> Result<(), RuntimeDriverError> {
+        self.commit_lifecycle_with_rollback(
+            checkpoint,
+            target_state,
+            "service turn terminal receipt",
+        )
+        .await?;
+        self.inner.set_control_projection(target_state, None, None);
         Ok(())
     }
 
@@ -154,25 +173,8 @@ impl PersistentRuntimeDriver {
     ///
     /// This does not decide lifecycle legality; it only applies an already
     /// chosen MeerkatMachine control projection to the concrete driver shell.
-    #[doc(hidden)]
-    pub fn contract_set_control_projection(
-        &mut self,
-        next_phase: RuntimeState,
-        current_run_id: Option<RunId>,
-        pre_run_phase: Option<RuntimeState>,
-    ) {
-        self.set_control_projection(next_phase, current_run_id, pre_run_phase);
-    }
-
     pub(crate) fn sync_control_projection_from_dsl_authority(&mut self) {
         self.inner.sync_control_projection_from_dsl_authority();
-    }
-
-    /// Contract helper for external tests that need a registered DSL session
-    /// before replaying lifecycle inputs through canonical authority.
-    #[doc(hidden)]
-    pub fn contract_register_session_authority(&mut self) -> Result<(), RuntimeDriverError> {
-        self.inner.contract_register_session_authority()
     }
 
     /// Contract helper for external tests that need to start a run through the
@@ -185,25 +187,11 @@ impl PersistentRuntimeDriver {
         self.inner.contract_begin_run_authority(run_id)
     }
 
-    /// Contract helper for external tests that need retired lifecycle
-    /// authority replayed through the DSL before invoking shell assertions.
-    #[doc(hidden)]
-    pub fn contract_retire_runtime_authority(&mut self) -> Result<(), RuntimeDriverError> {
-        self.inner.contract_retire_runtime_authority()
-    }
-
-    /// Contract helper for external tests that need reset lifecycle authority
-    /// replayed through the DSL before invoking shell assertions.
-    #[doc(hidden)]
-    pub fn contract_reset_runtime_authority(&mut self) -> Result<(), RuntimeDriverError> {
-        self.inner.contract_reset_runtime_authority()
-    }
-
     /// Test-only authority override for crate-unit tests that need to seed
     /// impossible or already-realized runtime phases.
     #[cfg(test)]
     #[doc(hidden)]
-    pub fn contract_force_runtime_authority(
+    pub(crate) fn contract_force_runtime_authority(
         &mut self,
         next_phase: RuntimeState,
         current_run_id: Option<RunId>,
@@ -211,35 +199,6 @@ impl PersistentRuntimeDriver {
     ) {
         self.inner
             .contract_force_runtime_authority(next_phase, current_run_id, pre_run_phase);
-    }
-
-    fn apply_destroy_dsl_authority(&mut self) -> Result<(), RuntimeDriverError> {
-        let fallback_session_id =
-            crate::meerkat_machine::dsl::SessionId::from(self.runtime_id.to_string());
-        let authority = self.inner.shared_dsl_authority();
-        let transition = {
-            let mut authority = authority
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            let session_id = authority
-                .state
-                .session_id
-                .clone()
-                .unwrap_or(fallback_session_id);
-            crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
-                &mut *authority,
-                crate::meerkat_machine::dsl::MeerkatMachineInput::Destroy { session_id },
-            )
-        };
-        transition
-            .map(|_| {
-                self.inner.sync_control_projection_from_dsl_authority();
-            })
-            .map_err(|err| {
-                RuntimeDriverError::Internal(format!(
-                    "DSL authority (Destroy) rejected runtime destroy: {err:?}"
-                ))
-            })
     }
 
     /// Get pending events (delegates to inner).
@@ -386,15 +345,6 @@ impl PersistentRuntimeDriver {
         self.inner.rollback_staged(input_ids)
     }
 
-    /// Consume applied inputs without completing a runtime run.
-    pub fn consume_inputs(
-        &mut self,
-        input_ids: &[InputId],
-        run_id: &meerkat_core::lifecycle::RunId,
-    ) -> Result<(), crate::traits::RuntimeDriverError> {
-        self.inner.consume_inputs(input_ids, run_id)
-    }
-
     async fn persist_state(&self, state: &StoredInputState) -> Result<(), RuntimeDriverError> {
         self.store
             .persist_input_state(&self.runtime_id, state)
@@ -402,7 +352,7 @@ impl PersistentRuntimeDriver {
             .map_err(|e| RuntimeDriverError::Internal(e.to_string()))
     }
 
-    pub async fn abandon_pending_inputs(
+    pub(crate) async fn abandon_pending_inputs(
         &mut self,
         reason: InputAbandonReason,
     ) -> Result<usize, RuntimeDriverError> {
@@ -411,9 +361,9 @@ impl PersistentRuntimeDriver {
         let input_states = self.inner.stored_input_states_snapshot();
         if let Err(err) = self
             .store
-            .atomic_lifecycle_commit(
+            .commit_machine_lifecycle(
                 &self.runtime_id,
-                self.runtime_state_for_persistence(),
+                MachineLifecycleCommit::new(self.runtime_state_for_persistence()),
                 &input_states,
             )
             .await
@@ -430,17 +380,24 @@ impl PersistentRuntimeDriver {
     /// work from durable runtime truth.
     ///
     /// Unlike `reset()`, this must not abandon queued/staged work.
-    pub async fn recycle_preserving_work(
+    pub(crate) async fn recycle_preserving_work(
         &mut self,
         target_phase: RuntimeState,
     ) -> Result<usize, RuntimeDriverError> {
         let checkpoint = self.inner.rollback_snapshot();
+        let transferred = match self.inner.recycle_preserving_work() {
+            Ok(transferred) => transferred,
+            Err(err) => {
+                self.inner.restore_rollback_snapshot(checkpoint);
+                return Err(err);
+            }
+        };
         let input_states = self.inner.stored_input_states_snapshot();
         if let Err(err) = self
             .store
-            .atomic_lifecycle_commit(
+            .commit_machine_lifecycle(
                 &self.runtime_id,
-                self.runtime_state_for_persistence(),
+                MachineLifecycleCommit::new(target_phase),
                 &input_states,
             )
             .await
@@ -451,66 +408,19 @@ impl PersistentRuntimeDriver {
             )));
         }
 
-        let _ = self.inner.recycle_preserving_work()?;
         self.inner.set_control_projection(target_phase, None, None);
-        Ok(self.inner.active_input_ids().len())
-    }
-
-    pub async fn finalize_retire(
-        &mut self,
-    ) -> Result<crate::traits::RetireReport, RuntimeDriverError> {
-        let checkpoint = self.inner.rollback_snapshot();
-        let report = self.inner.finalize_retire();
-        self.commit_lifecycle_with_rollback(
-            checkpoint,
-            self.runtime_state_for_persistence(),
-            "retire",
-        )
-        .await?;
-        Ok(report)
+        Ok(transferred)
     }
 
     pub(crate) async fn realize_retire_lifecycle(
         &mut self,
     ) -> Result<crate::traits::RetireReport, RuntimeDriverError> {
         let checkpoint = self.inner.rollback_snapshot();
-        self.inner
-            .set_control_projection(RuntimeState::Retired, None, None);
         let report = self.inner.finalize_retire();
         self.commit_lifecycle_with_rollback(checkpoint, RuntimeState::Retired, "retire")
             .await?;
-        Ok(report)
-    }
-
-    /// Low-level lifecycle realization shim for external contract tests.
-    #[doc(hidden)]
-    pub async fn contract_realize_retire_lifecycle(
-        &mut self,
-    ) -> Result<crate::traits::RetireReport, RuntimeDriverError> {
-        self.realize_retire_lifecycle().await
-    }
-
-    /// Low-level retire realization shim for external contract tests.
-    ///
-    /// Callers are responsible for setting the control projection first.
-    #[doc(hidden)]
-    pub async fn contract_finalize_retire(
-        &mut self,
-    ) -> Result<crate::traits::RetireReport, RuntimeDriverError> {
-        self.finalize_retire().await
-    }
-
-    pub async fn finalize_reset(
-        &mut self,
-    ) -> Result<crate::traits::ResetReport, RuntimeDriverError> {
-        let checkpoint = self.inner.rollback_snapshot();
-        let report = self.inner.reset_cleanup();
-        self.commit_lifecycle_with_rollback(
-            checkpoint,
-            self.runtime_state_for_persistence(),
-            "reset",
-        )
-        .await?;
+        self.inner
+            .set_control_projection(RuntimeState::Retired, None, None);
         Ok(report)
     }
 
@@ -518,40 +428,11 @@ impl PersistentRuntimeDriver {
         &mut self,
     ) -> Result<crate::traits::ResetReport, RuntimeDriverError> {
         let checkpoint = self.inner.rollback_snapshot();
-        self.inner
-            .set_control_projection(RuntimeState::Idle, None, None);
         let report = self.inner.reset_cleanup();
         self.commit_lifecycle_with_rollback(checkpoint, RuntimeState::Idle, "reset")
             .await?;
-        Ok(report)
-    }
-
-    /// Low-level lifecycle realization shim for external contract tests.
-    #[doc(hidden)]
-    pub async fn contract_realize_reset_lifecycle(
-        &mut self,
-    ) -> Result<crate::traits::ResetReport, RuntimeDriverError> {
-        self.realize_reset_lifecycle().await
-    }
-
-    /// Low-level reset realization shim for external contract tests.
-    ///
-    /// Callers are responsible for setting the post-reset control projection.
-    #[doc(hidden)]
-    pub async fn contract_finalize_reset(
-        &mut self,
-    ) -> Result<crate::traits::ResetReport, RuntimeDriverError> {
-        self.finalize_reset().await
-    }
-
-    pub async fn destroy(&mut self) -> Result<DestroyReport, RuntimeDriverError> {
-        let (checkpoint, report) = self.prepare_destroy_lifecycle();
-        if let Err(err) = self.apply_destroy_dsl_authority() {
-            self.inner.restore_rollback_snapshot(checkpoint);
-            self.inner.sync_control_projection_from_dsl_authority();
-            return Err(err);
-        }
-        self.commit_prepared_destroy_lifecycle(checkpoint).await?;
+        self.inner
+            .set_control_projection(RuntimeState::Idle, None, None);
         Ok(report)
     }
 
@@ -587,26 +468,6 @@ impl PersistentRuntimeDriver {
         self.inner.restore_rollback_snapshot(checkpoint);
     }
 
-    /// Low-level destroy realization shim for external contract tests.
-    ///
-    /// Callers are responsible for setting the destroyed control projection.
-    #[doc(hidden)]
-    pub async fn contract_destroy(&mut self) -> Result<DestroyReport, RuntimeDriverError> {
-        self.destroy().await
-    }
-
-    pub async fn finalize_stop_runtime(&mut self) -> Result<(), RuntimeDriverError> {
-        let checkpoint = self.inner.rollback_snapshot();
-        self.inner.sync_control_projection_from_dsl_authority();
-        self.inner.stop_runtime_cleanup();
-        self.commit_lifecycle_with_rollback(
-            checkpoint,
-            self.runtime_state_for_persistence(),
-            "stop",
-        )
-        .await
-    }
-
     pub(crate) async fn finalize_runtime_executor_exit(
         &mut self,
     ) -> Result<(), RuntimeDriverError> {
@@ -615,78 +476,36 @@ impl PersistentRuntimeDriver {
             self.inner.restore_rollback_snapshot(checkpoint);
             return Err(err);
         }
-        self.inner.sync_control_projection_from_dsl_authority();
         self.inner.stop_runtime_cleanup();
         self.commit_lifecycle_with_rollback(checkpoint, RuntimeState::Stopped, "stop")
-            .await
-    }
-
-    pub(crate) async fn realize_stop_lifecycle(&mut self) -> Result<(), RuntimeDriverError> {
-        let checkpoint = self.inner.rollback_snapshot();
-        self.inner.apply_stop_runtime_executor_authority()?;
-        let _ = self.inner.apply_runtime_executor_exited_authority();
+            .await?;
         self.inner.sync_control_projection_from_dsl_authority();
-        self.inner.stop_runtime_cleanup();
-        self.commit_lifecycle_with_rollback(checkpoint, RuntimeState::Stopped, "stop")
-            .await
+        Ok(())
     }
 
-    /// Low-level lifecycle realization shim for external contract tests.
-    #[doc(hidden)]
-    pub async fn contract_realize_stop_lifecycle(&mut self) -> Result<(), RuntimeDriverError> {
-        self.realize_stop_lifecycle().await
-    }
-
-    /// Low-level stop realization shim for external contract tests.
-    ///
-    /// Callers are responsible for setting the stopped control projection.
-    #[doc(hidden)]
-    pub async fn contract_finalize_stop_runtime(&mut self) -> Result<(), RuntimeDriverError> {
-        self.finalize_stop_runtime().await
-    }
-
-    /// Low-level async executor-exit realization shim for external contract tests.
-    #[doc(hidden)]
-    pub async fn contract_finalize_runtime_executor_exit(
-        &mut self,
-    ) -> Result<(), RuntimeDriverError> {
-        self.finalize_runtime_executor_exit().await
-    }
-
-    pub async fn boundary_applied(
-        &mut self,
-        run_id: RunId,
-        receipt: RunBoundaryReceipt,
-        session_snapshot: Option<Vec<u8>>,
-    ) -> Result<(), RuntimeDriverError> {
-        self.machine_realize_boundary_applied(&run_id, &receipt, session_snapshot.as_ref())
-            .await
-    }
-
-    pub(crate) async fn machine_realize_boundary_applied(
+    pub(crate) fn machine_realize_boundary_applied_in_memory(
         &mut self,
         run_id: &RunId,
         receipt: &RunBoundaryReceipt,
+    ) -> Result<(), RuntimeDriverError> {
+        self.inner.machine_realize_boundary_applied(run_id, receipt)
+    }
+
+    pub(crate) fn machine_realize_run_completed_in_memory(
+        &mut self,
+        run_id: &RunId,
+        consumed_input_ids: &[InputId],
+    ) -> Result<(), RuntimeDriverError> {
+        self.inner
+            .machine_realize_run_completed(run_id, consumed_input_ids)
+    }
+
+    pub(crate) async fn machine_commit_completed_boundary_snapshot(
+        &mut self,
+        receipt: &RunBoundaryReceipt,
         session_snapshot: Option<&Vec<u8>>,
     ) -> Result<(), RuntimeDriverError> {
-        let checkpoint = self.inner.rollback_snapshot();
-        self.inner
-            .machine_realize_boundary_applied(run_id, receipt)?;
-        if self
-            .store
-            .load_boundary_receipt(&self.runtime_id, &receipt.run_id, receipt.sequence)
-            .await
-            .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?
-            .is_some()
-        {
-            return Ok(());
-        }
-        let input_updates: Vec<StoredInputState> = receipt
-            .contributing_input_ids
-            .iter()
-            .filter_map(|id| self.inner.stored_input_state(id))
-            .collect();
-
+        let input_updates = self.inner.stored_input_states_snapshot();
         self.store
             .atomic_apply(
                 &self.runtime_id,
@@ -703,64 +522,10 @@ impl PersistentRuntimeDriver {
             )
             .await
             .map_err(|e| {
-                self.inner.restore_rollback_snapshot(checkpoint);
-                RuntimeDriverError::Internal(format!("runtime boundary commit failed: {e}"))
-            })?;
-        Ok(())
-    }
-
-    pub async fn run_completed(
-        &mut self,
-        run_id: RunId,
-        consumed_input_ids: Vec<InputId>,
-    ) -> Result<(), RuntimeDriverError> {
-        self.machine_realize_run_completed(&run_id, &consumed_input_ids)
-            .await
-    }
-
-    pub(crate) async fn machine_realize_run_completed(
-        &mut self,
-        run_id: &RunId,
-        consumed_input_ids: &[InputId],
-    ) -> Result<(), RuntimeDriverError> {
-        let checkpoint = self.inner.rollback_snapshot();
-        self.inner
-            .machine_realize_run_completed(run_id, consumed_input_ids)?;
-        let input_states = self.inner.stored_input_states_snapshot();
-        if let Err(err) = self
-            .store
-            .atomic_lifecycle_commit(
-                &self.runtime_id,
-                self.runtime_state_for_persistence(),
-                &input_states,
-            )
-            .await
-        {
-            self.inner.restore_rollback_snapshot(checkpoint);
-            return Err(RuntimeDriverError::Internal(format!(
-                "terminal event persist failed: {err}"
-            )));
-        }
-        Ok(())
-    }
-
-    pub async fn run_failed(
-        &mut self,
-        run_id: RunId,
-        contributing_input_ids: Vec<InputId>,
-        replay_plan: super::ephemeral::ReplayQueuedContributorsPlan,
-        failure: meerkat_core::lifecycle::CoreApplyFailureCause,
-        recoverable: bool,
-    ) -> Result<(), RuntimeDriverError> {
-        self.machine_realize_run_failed(
-            &run_id,
-            &contributing_input_ids,
-            &replay_plan,
-            failure.message(),
-            Some(&failure),
-            recoverable,
-        )
-        .await
+                RuntimeDriverError::Internal(format!(
+                    "runtime completed-boundary commit failed: {e}"
+                ))
+            })
     }
 
     pub(crate) async fn machine_realize_run_failed(
@@ -786,9 +551,9 @@ impl PersistentRuntimeDriver {
         let input_states = self.inner.stored_input_states_snapshot();
         if let Err(err) = self
             .store
-            .atomic_lifecycle_commit(
+            .commit_machine_lifecycle(
                 &self.runtime_id,
-                self.runtime_state_for_persistence(),
+                MachineLifecycleCommit::new(self.runtime_state_for_persistence()),
                 &input_states,
             )
             .await
@@ -796,6 +561,37 @@ impl PersistentRuntimeDriver {
             self.inner.restore_rollback_snapshot(checkpoint);
             return Err(RuntimeDriverError::Internal(format!(
                 "terminal event persist failed: {err}"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn machine_realize_run_cancelled(
+        &mut self,
+        run_id: &RunId,
+        contributing_input_ids: &[InputId],
+    ) -> Result<(), RuntimeDriverError> {
+        let checkpoint = self.inner.rollback_snapshot();
+        self.inner
+            .machine_realize_run_cancelled(run_id, contributing_input_ids)?;
+        tracing::debug!(
+            run_id = ?run_id,
+            contributors = contributing_input_ids.len(),
+            "persistent driver realized machine-owned cancelled run"
+        );
+        let input_states = self.inner.stored_input_states_snapshot();
+        if let Err(err) = self
+            .store
+            .commit_machine_lifecycle(
+                &self.runtime_id,
+                MachineLifecycleCommit::new(self.runtime_state_for_persistence()),
+                &input_states,
+            )
+            .await
+        {
+            self.inner.restore_rollback_snapshot(checkpoint);
+            return Err(RuntimeDriverError::Internal(format!(
+                "terminal cancellation persist failed: {err}"
             )));
         }
         Ok(())
@@ -834,12 +630,9 @@ impl RuntimeDriver for PersistentRuntimeDriver {
         };
 
         // Persist recovered state atomically
-        self.commit_lifecycle_with_rollback(
-            checkpoint,
-            self.runtime_state_for_persistence(),
-            "recovery",
-        )
-        .await?;
+        let runtime_state_for_persistence = self.runtime_state_for_persistence();
+        self.commit_lifecycle_with_rollback(checkpoint, runtime_state_for_persistence, "recovery")
+            .await?;
         Ok(report)
     }
 

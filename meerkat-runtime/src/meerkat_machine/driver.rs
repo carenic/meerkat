@@ -385,32 +385,43 @@ impl DriverEntry {
         }
     }
 
-    pub(crate) async fn machine_realize_boundary_applied(
+    pub(crate) fn machine_realize_boundary_applied_in_memory(
         &mut self,
-        run_id: RunId,
-        receipt: meerkat_core::lifecycle::RunBoundaryReceipt,
-        session_snapshot: Option<Vec<u8>>,
+        run_id: &RunId,
+        receipt: &meerkat_core::lifecycle::RunBoundaryReceipt,
     ) -> Result<(), RuntimeDriverError> {
         match self {
-            DriverEntry::Ephemeral(d) => d.machine_realize_boundary_applied(&run_id, &receipt),
+            DriverEntry::Ephemeral(d) => d.machine_realize_boundary_applied(run_id, receipt),
             DriverEntry::Persistent(d) => {
-                d.machine_realize_boundary_applied(&run_id, &receipt, session_snapshot.as_ref())
-                    .await
+                d.machine_realize_boundary_applied_in_memory(run_id, receipt)
             }
         }
     }
 
-    pub(crate) async fn machine_realize_run_completed(
+    pub(crate) fn machine_realize_run_completed_in_memory(
         &mut self,
-        run_id: RunId,
-        consumed_input_ids: Vec<InputId>,
+        run_id: &RunId,
+        consumed_input_ids: &[InputId],
     ) -> Result<(), RuntimeDriverError> {
         match self {
             DriverEntry::Ephemeral(d) => {
-                d.machine_realize_run_completed(&run_id, &consumed_input_ids)
+                d.machine_realize_run_completed(run_id, consumed_input_ids)
             }
             DriverEntry::Persistent(d) => {
-                d.machine_realize_run_completed(&run_id, &consumed_input_ids)
+                d.machine_realize_run_completed_in_memory(run_id, consumed_input_ids)
+            }
+        }
+    }
+
+    pub(crate) async fn machine_commit_completed_boundary_snapshot(
+        &mut self,
+        receipt: &meerkat_core::lifecycle::RunBoundaryReceipt,
+        session_snapshot: Option<&Vec<u8>>,
+    ) -> Result<(), RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(_) => Ok(()),
+            DriverEntry::Persistent(d) => {
+                d.machine_commit_completed_boundary_snapshot(receipt, session_snapshot)
                     .await
             }
         }
@@ -440,6 +451,22 @@ impl DriverEntry {
                     recoverable,
                 )
                 .await
+            }
+        }
+    }
+
+    pub(crate) async fn machine_realize_run_cancelled(
+        &mut self,
+        run_id: RunId,
+        contributing_input_ids: Vec<InputId>,
+    ) -> Result<(), RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(d) => {
+                d.machine_realize_run_cancelled(&run_id, &contributing_input_ids)
+            }
+            DriverEntry::Persistent(d) => {
+                d.machine_realize_run_cancelled(&run_id, &contributing_input_ids)
+                    .await
             }
         }
     }
@@ -652,9 +679,11 @@ pub(crate) fn machine_begin_run(
 /// turn-state authority has recorded a typed failed terminal cause; `Rollback`
 /// is non-semantic cleanup for prepare/stage failures before turn failure
 /// exists.
+#[derive(Clone, Copy)]
 pub(crate) enum RunReturnDisposition<'a> {
     Commit { input_id: &'a InputId },
     Failed,
+    Cancelled,
     Rollback,
 }
 
@@ -668,10 +697,7 @@ pub(crate) enum RuntimeLoopRunCommitError {
 
 impl RuntimeLoopRunCommitError {
     pub(crate) fn should_unregister_session(&self) -> bool {
-        matches!(
-            self,
-            Self::PostBoundaryValidation(_) | Self::TerminalSnapshot(_)
-        )
+        false
     }
 
     pub(crate) fn is_boundary_commit(&self) -> bool {
@@ -709,7 +735,7 @@ pub(crate) enum RuntimeLoopRunFailError {
 
 impl RuntimeLoopRunFailError {
     pub(crate) fn should_unregister_session(&self) -> bool {
-        matches!(self, Self::TerminalSnapshot(_))
+        false
     }
 
     pub(crate) fn into_driver_error(self) -> RuntimeDriverError {
@@ -755,6 +781,8 @@ pub(crate) fn machine_apply_run_return_projection(
     // flip `lifecycle_phase` accordingly. The runtime-loop path owns this
     // DSL transition uniformly; dispatch-ingress no longer snapshots or
     // pre-stages the return input.
+    let publish_control_immediately = matches!(driver, DriverEntry::Ephemeral(_))
+        || matches!(disposition, RunReturnDisposition::Rollback);
     let authority = driver.shared_dsl_authority();
     {
         let mut auth = authority
@@ -772,6 +800,11 @@ pub(crate) fn machine_apply_run_return_projection(
                     run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
                 }
             }
+            RunReturnDisposition::Cancelled => {
+                crate::meerkat_machine::dsl::MeerkatMachineInput::CancelRun {
+                    run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
+                }
+            }
             RunReturnDisposition::Rollback => {
                 crate::meerkat_machine::dsl::MeerkatMachineInput::RollbackRun {
                     run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
@@ -786,11 +819,100 @@ pub(crate) fn machine_apply_run_return_projection(
         }
     }
 
-    // Shell `control_projection` update is retained as mechanical event
-    // plumbing. DSL's Commit/Fail transition is the authoritative
-    // lifecycle/run writer above; DriverEntry readers consult DSL state, so
-    // this projection must stay mechanical.
-    driver.set_control_projection(next_phase, None, None);
+    // Persistent terminal paths publish the user-visible control projection
+    // only after the durable receipt succeeds. Rollback is non-terminal
+    // cleanup, and ephemeral drivers have no durable receipt to await.
+    if publish_control_immediately {
+        driver.set_control_projection(next_phase, None, None);
+    }
+    Ok(())
+}
+
+pub(crate) async fn machine_commit_service_turn_terminal_receipt(
+    driver: &mut DriverEntry,
+) -> Result<(), RuntimeDriverError> {
+    let current_phase = driver.runtime_state();
+    if current_phase != RuntimeState::Running {
+        return Err(RuntimeDriverError::Internal(format!(
+            "service-turn terminal receipt requires a running machine-owned lifecycle; found {current_phase:?}"
+        )));
+    }
+    let active_inputs = driver.as_driver().active_input_ids();
+    if !active_inputs.is_empty() {
+        return Err(RuntimeDriverError::Internal(format!(
+            "direct service turn returned while runtime inputs are still active: {}",
+            active_inputs
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )));
+    }
+    let Some(run_id) = driver.current_run_id() else {
+        return Err(RuntimeDriverError::Internal(
+            "service-turn terminal receipt requires a machine-owned current_run_id".to_string(),
+        ));
+    };
+    let turn_needs_completion = {
+        let authority = driver.shared_dsl_authority();
+        let auth = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        !matches!(
+            auth.state.turn_phase,
+            crate::meerkat_machine::dsl::TurnPhase::Completed
+                | crate::meerkat_machine::dsl::TurnPhase::Failed
+                | crate::meerkat_machine::dsl::TurnPhase::Cancelled
+        )
+    };
+    let next_phase =
+        crate::runtime_state::run_return_phase_from_pre_run_phase(driver.pre_run_phase());
+    let terminal_checkpoint = driver.rollback_snapshot();
+    if turn_needs_completion && let Err(err) = machine_apply_turn_run_completed(driver, &run_id) {
+        driver.restore_rollback_snapshot(terminal_checkpoint);
+        return Err(err);
+    }
+    let authority = driver.shared_dsl_authority();
+    let service_turn_commit_result = {
+        let mut auth = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+            &mut *auth,
+            crate::meerkat_machine::dsl::MeerkatMachineInput::ServiceTurnCommitted {
+                run_id: crate::meerkat_machine::dsl::RunId::from_domain(&run_id),
+            },
+        )
+        .map_err(|_| {
+            RuntimeDriverError::Internal(
+                crate::runtime_state::RuntimeStateTransitionError {
+                    from: current_phase,
+                    to: next_phase,
+                }
+                .to_string(),
+            )
+        })
+    };
+    if let Err(err) = service_turn_commit_result {
+        driver.restore_rollback_snapshot(terminal_checkpoint);
+        return Err(err);
+    }
+    match (driver, terminal_checkpoint) {
+        (DriverEntry::Persistent(driver), DriverRollbackSnapshot::Persistent(rollback)) => {
+            driver
+                .publish_service_turn_terminal_lifecycle(rollback, next_phase)
+                .await?;
+        }
+        (DriverEntry::Ephemeral(driver), DriverRollbackSnapshot::Ephemeral(_)) => {
+            driver.set_control_projection(next_phase, None, None);
+        }
+        (driver, checkpoint) => {
+            driver.restore_rollback_snapshot(checkpoint);
+            return Err(RuntimeDriverError::Internal(
+                "service-turn terminal receipt rollback snapshot/driver kind mismatch".to_string(),
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -861,6 +983,7 @@ fn machine_apply_turn_run_failed(
     driver: &mut DriverEntry,
     run_id: &RunId,
     terminal_error: &str,
+    terminal_outcome: meerkat_core::TurnTerminalOutcome,
     terminal_cause_kind: meerkat_core::TurnTerminalCauseKind,
     runtime_apply_failure: Option<&CoreApplyFailureCause>,
 ) -> Result<(), RuntimeDriverError> {
@@ -882,7 +1005,7 @@ fn machine_apply_turn_run_failed(
                 .map(crate::meerkat_machine::dsl::RuntimeApplyFailureCause::from),
             runtime_apply_failure_message: runtime_apply_failure
                 .map(|failure| failure.message().to_owned()),
-            terminal_outcome: crate::meerkat_machine::dsl::TurnTerminalOutcome::Failed,
+            terminal_outcome: terminal_outcome.into(),
             terminal_cause_kind: terminal_cause_kind.into(),
             error: terminal_error.to_owned(),
         },
@@ -891,6 +1014,34 @@ fn machine_apply_turn_run_failed(
     .map_err(|err| {
         RuntimeDriverError::Internal(format!(
             "failed to apply runtime turn failure for run {run_id}: {err}"
+        ))
+    })
+}
+
+fn machine_apply_turn_run_cancelled(
+    driver: &mut DriverEntry,
+    run_id: &RunId,
+) -> Result<(), RuntimeDriverError> {
+    let authority = driver.shared_dsl_authority();
+    let mut auth = authority
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if auth.state.lifecycle_phase != crate::meerkat_machine::dsl::MeerkatPhase::Running
+        || auth.state.current_run_id.as_ref().map(|id| id.0.as_str())
+            != Some(run_id.to_string().as_str())
+    {
+        return Ok(());
+    }
+    crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+        &mut *auth,
+        crate::meerkat_machine::dsl::MeerkatMachineInput::RunCancelled {
+            run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
+        },
+    )
+    .map(|_| ())
+    .map_err(|err| {
+        RuntimeDriverError::Internal(format!(
+            "failed to apply runtime turn cancellation for run {run_id}: {err}"
         ))
     })
 }
@@ -1185,10 +1336,31 @@ pub(crate) fn machine_validate_run_failed(
     Ok(())
 }
 
+pub(crate) fn machine_validate_run_cancelled(
+    driver: &DriverEntry,
+    contributing_work_ids: &[InputId],
+) -> Result<(), RuntimeDriverError> {
+    if contributing_work_ids.is_empty() {
+        return Err(RuntimeDriverError::Internal(
+            "run cancelled requires at least one staged contributor".to_string(),
+        ));
+    }
+
+    for work_id in contributing_work_ids {
+        let lifecycle = driver.as_driver().input_phase(work_id);
+        if lifecycle != Some(InputLifecycleState::Staged) {
+            return Err(RuntimeDriverError::Internal(format!(
+                "run cancelled requires staged contributors, but {work_id:?} is {lifecycle:?}"
+            )));
+        }
+    }
+
+    Ok(())
+}
+
 pub(crate) async fn machine_normalize_recovered_input_state(
     store: &dyn crate::store::RuntimeStore,
     runtime_id: &LogicalRuntimeId,
-    stored_runtime_id: &LogicalRuntimeId,
     mut bundle: StoredInputState,
 ) -> Result<StoredInputState, RuntimeDriverError> {
     let applied_boundary_committed = if matches!(
@@ -1200,16 +1372,12 @@ pub(crate) async fn machine_normalize_recovered_input_state(
                 bundle.seed.last_run_id.clone(),
                 bundle.seed.last_boundary_sequence,
             ) {
-                (Some(run_id), Some(sequence)) => load_boundary_receipt_for_storage_aliases(
-                    store,
-                    runtime_id,
-                    stored_runtime_id == runtime_id,
-                    &run_id,
-                    sequence,
-                )
-                .await
-                .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?
-                .is_some(),
+                (Some(run_id), Some(sequence)) => {
+                    load_boundary_receipt_for_runtime(store, runtime_id, &run_id, sequence)
+                        .await
+                        .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?
+                        .is_some()
+                }
                 _ => false,
             },
         )
@@ -1222,93 +1390,27 @@ pub(crate) async fn machine_normalize_recovered_input_state(
     Ok(bundle)
 }
 
-pub(super) async fn load_boundary_receipt_for_storage_aliases(
+pub(super) async fn load_boundary_receipt_for_runtime(
     store: &dyn crate::store::RuntimeStore,
     runtime_id: &LogicalRuntimeId,
-    canonical_miss_authoritative: bool,
     run_id: &RunId,
     sequence: u64,
 ) -> Result<Option<RunBoundaryReceipt>, crate::store::RuntimeStoreError> {
-    let mut primary_alias_loaded = false;
-    for (candidate_index, candidate) in runtime_id
-        .storage_alias_candidates()
-        .into_iter()
-        .enumerate()
-    {
-        match store
-            .load_boundary_receipt(&candidate, run_id, sequence)
-            .await
-        {
-            Ok(Some(receipt)) => return Ok(Some(receipt)),
-            Ok(None) => {
-                if candidate_index == 0 && canonical_miss_authoritative {
-                    return Ok(None);
-                }
-                if candidate_index == 0 {
-                    primary_alias_loaded = true;
-                }
-            }
-            Err(_err)
-                if candidate_index > 0 && primary_alias_loaded && canonical_miss_authoritative =>
-            {
-                continue;
-            }
-            Err(err) => return Err(err),
-        }
-    }
-    Ok(None)
+    store
+        .load_boundary_receipt(runtime_id, run_id, sequence)
+        .await
 }
 
-async fn load_input_states_for_storage_aliases(
+async fn load_input_states_for_runtime(
     store: &dyn crate::store::RuntimeStore,
     runtime_id: &LogicalRuntimeId,
 ) -> Result<Vec<(LogicalRuntimeId, StoredInputState)>, crate::store::RuntimeStoreError> {
-    let mut merged: Vec<(usize, LogicalRuntimeId, StoredInputState)> = Vec::new();
-    let mut primary_alias_loaded = false;
-
-    for (candidate_index, candidate) in runtime_id
-        .storage_alias_candidates()
-        .into_iter()
-        .enumerate()
-    {
-        let states = match store.load_input_states(&candidate).await {
-            Ok(states) => {
-                if candidate_index == 0 {
-                    primary_alias_loaded = true;
-                }
-                states
-            }
-            Err(_err) if candidate_index > 0 && primary_alias_loaded => continue,
-            Err(err) => return Err(err),
-        };
-        for state in states {
-            let input_id = state.state.input_id.clone();
-            if let Some((existing_index, existing_runtime_id, existing_state)) = merged
-                .iter_mut()
-                .find(|(_, _, existing)| existing.state.input_id == input_id)
-            {
-                let candidate_updated_at = state.state.updated_at();
-                let existing_updated_at = existing_state.state.updated_at();
-                let should_replace = if candidate_index == *existing_index {
-                    candidate_updated_at > existing_updated_at
-                } else {
-                    candidate_index < *existing_index
-                };
-                if should_replace {
-                    *existing_index = candidate_index;
-                    *existing_runtime_id = candidate.clone();
-                    *existing_state = state;
-                }
-            } else {
-                merged.push((candidate_index, candidate.clone(), state));
-            }
-        }
-    }
-
-    Ok(merged
-        .into_iter()
-        .map(|(_, runtime_id, state)| (runtime_id, state))
-        .collect())
+    store.load_input_states(runtime_id).await.map(|states| {
+        states
+            .into_iter()
+            .map(|state| (runtime_id.clone(), state))
+            .collect()
+    })
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -1508,100 +1610,6 @@ fn missing_recovered_ingress_entry_reason(state: &InputState) -> String {
     )
 }
 
-fn recovered_runtime_state_corruption(
-    runtime_state: RuntimeState,
-    reason: impl Into<String>,
-) -> RuntimeDriverError {
-    RuntimeDriverError::RecoveryCorruption {
-        reason: format!(
-            "store corruption: recovered '{runtime_state}' runtime state cannot be replayed through DSL authority: {}",
-            reason.into()
-        ),
-    }
-}
-
-fn recovered_session_id(
-    driver: &crate::driver::ephemeral::EphemeralRuntimeDriver,
-    runtime_state: RuntimeState,
-) -> Result<crate::meerkat_machine::dsl::SessionId, RuntimeDriverError> {
-    let authority = driver.shared_dsl_authority();
-    let auth = authority
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    auth.state.session_id.clone().ok_or_else(|| {
-        recovered_runtime_state_corruption(
-            runtime_state,
-            "missing DSL session authority for session-scoped lifecycle input",
-        )
-    })
-}
-
-fn replay_recovered_runtime_input(
-    driver: &crate::driver::ephemeral::EphemeralRuntimeDriver,
-    runtime_state: RuntimeState,
-    input: crate::meerkat_machine::dsl::MeerkatMachineInput,
-    context: &'static str,
-) -> Result<(), RuntimeDriverError> {
-    let authority = driver.shared_dsl_authority();
-    let mut auth = authority
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(&mut *auth, input)
-        .map(|_| ())
-        .map_err(|err| {
-            recovered_runtime_state_corruption(
-                runtime_state,
-                crate::meerkat_machine::dsl_authority::map_error(err, context),
-            )
-        })
-}
-
-pub(crate) fn machine_realize_recovered_runtime_state(
-    driver: &mut crate::driver::ephemeral::EphemeralRuntimeDriver,
-    runtime_state: RuntimeState,
-) -> Result<(), RuntimeDriverError> {
-    match runtime_state {
-        RuntimeState::Retired if driver.runtime_state() != RuntimeState::Retired => {
-            let session_id = recovered_session_id(driver, runtime_state)?;
-            replay_recovered_runtime_input(
-                driver,
-                runtime_state,
-                crate::meerkat_machine::dsl::MeerkatMachineInput::Retire { session_id },
-                "RecoverRuntimeState(Retired)",
-            )?;
-            driver.sync_control_projection_from_dsl_authority();
-        }
-        RuntimeState::Stopped
-            if driver.runtime_state() != RuntimeState::Stopped
-                && driver.runtime_state() != RuntimeState::Destroyed =>
-        {
-            replay_recovered_runtime_input(
-                driver,
-                runtime_state,
-                crate::meerkat_machine::dsl::MeerkatMachineInput::StopRuntimeExecutor {
-                    reason: "recovered stopped runtime".to_string(),
-                },
-                "RecoverRuntimeState(Stopped)",
-            )?;
-            driver.sync_control_projection_from_dsl_authority();
-            driver.stop_runtime_cleanup();
-        }
-        RuntimeState::Destroyed if driver.runtime_state() != RuntimeState::Destroyed => {
-            let session_id = recovered_session_id(driver, runtime_state)?;
-            replay_recovered_runtime_input(
-                driver,
-                runtime_state,
-                crate::meerkat_machine::dsl::MeerkatMachineInput::Destroy { session_id },
-                "RecoverRuntimeState(Destroyed)",
-            )?;
-            driver.sync_control_projection_from_dsl_authority();
-            driver.destroy_cleanup();
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 pub(crate) fn machine_recover_ephemeral_driver(
     driver: &mut crate::driver::ephemeral::EphemeralRuntimeDriver,
 ) -> Result<RecoveryReport, RuntimeDriverError> {
@@ -1680,13 +1688,11 @@ pub(crate) async fn machine_recover_persistent_driver(
 ) -> Result<RecoveryReport, RuntimeDriverError> {
     let mut recovered_payloads = Vec::new();
 
-    for (stored_runtime_id, bundle) in load_input_states_for_storage_aliases(store, runtime_id)
+    for (_stored_runtime_id, bundle) in load_input_states_for_runtime(store, runtime_id)
         .await
         .map_err(|e| RuntimeDriverError::Internal(e.to_string()))?
     {
-        let bundle =
-            machine_normalize_recovered_input_state(store, runtime_id, &stored_runtime_id, bundle)
-                .await?;
+        let bundle = machine_normalize_recovered_input_state(store, runtime_id, bundle).await?;
 
         if bundle.state.durability == Some(crate::input::InputDurability::Ephemeral) {
             continue;
@@ -1745,39 +1751,23 @@ pub(crate) async fn machine_recover_persistent_driver(
         }
     }
 
-    let mut recovered_runtime_state = None;
-    let mut primary_runtime_state_loaded = false;
-    for (candidate_index, candidate) in runtime_id
-        .storage_alias_candidates()
-        .into_iter()
-        .enumerate()
+    let recovered_runtime_state = store
+        .load_runtime_state(runtime_id)
+        .await
+        .map_err(|err| RuntimeDriverError::Internal(err.to_string()))?;
+    if let Some(runtime_state) = recovered_runtime_state
+        && matches!(
+            runtime_state,
+            RuntimeState::Stopped | RuntimeState::Destroyed
+        )
     {
-        match store.load_runtime_state(&candidate).await {
-            Ok(state) => {
-                if candidate_index == 0 {
-                    primary_runtime_state_loaded = true;
-                }
-                recovered_runtime_state = state;
-            }
-            Err(_err) if candidate_index > 0 && primary_runtime_state_loaded => continue,
-            Err(err) => return Err(RuntimeDriverError::Internal(err.to_string())),
-        }
-        if recovered_runtime_state.is_some() {
-            break;
-        }
-    }
-    if let Some(runtime_state) = recovered_runtime_state {
-        machine_realize_recovered_runtime_state(driver, runtime_state)?;
-
-        if runtime_state.is_terminal() {
-            let active = driver.active_input_ids();
-            if !active.is_empty() {
-                return Err(RuntimeDriverError::Internal(format!(
-                    "store corruption: terminal runtime '{}' has {} active inputs",
-                    runtime_state,
-                    active.len()
-                )));
-            }
+        let active = driver.active_input_ids();
+        if !active.is_empty() {
+            return Err(RuntimeDriverError::Internal(format!(
+                "store corruption: recovered runtime-state projection '{}' conflicts with {} active inputs",
+                runtime_state,
+                active.len()
+            )));
         }
     }
 
@@ -2414,10 +2404,11 @@ pub(crate) fn machine_prepare_bindings_projection(
             driver.set_control_projection(RuntimeState::Attached, None, None);
             Ok(())
         }
-        RuntimeState::Attached
-        | RuntimeState::Running
-        | RuntimeState::Retired
-        | RuntimeState::Stopped => Ok(()),
+        RuntimeState::Attached => {
+            driver.set_control_projection(RuntimeState::Attached, None, None);
+            Ok(())
+        }
+        RuntimeState::Running | RuntimeState::Retired | RuntimeState::Stopped => Ok(()),
         from => Err(RuntimeDriverError::Internal(
             crate::runtime_state::RuntimeStateTransitionError {
                 from,
@@ -2436,7 +2427,10 @@ pub(crate) fn machine_executor_attach_projection(
             driver.set_control_projection(RuntimeState::Attached, None, None);
             Ok(true)
         }
-        RuntimeState::Attached => Ok(false),
+        RuntimeState::Attached => {
+            driver.set_control_projection(RuntimeState::Attached, None, None);
+            Ok(false)
+        }
         from => Err(RuntimeDriverError::Internal(
             crate::runtime_state::RuntimeStateTransitionError {
                 from,
@@ -2480,9 +2474,11 @@ pub(crate) async fn machine_recycle_preserving_work(
         ));
     }
 
-    driver.set_control_projection(target_phase, None, None);
     match driver {
-        DriverEntry::Ephemeral(driver) => driver.recycle_preserving_work(),
+        DriverEntry::Ephemeral(driver) => {
+            driver.set_control_projection(target_phase, None, None);
+            driver.recycle_preserving_work()
+        }
         DriverEntry::Persistent(driver) => driver.recycle_preserving_work(target_phase).await,
     }
 }
@@ -2542,18 +2538,14 @@ pub(crate) async fn commit_runtime_loop_run(
     })?;
     let completed_run_id = run_id.clone();
 
-    let boundary_checkpoint = driver.rollback_snapshot();
-    if let Err(err) = driver
-        .machine_realize_boundary_applied(run_id.clone(), receipt, session_snapshot)
-        .await
-    {
-        driver.restore_rollback_snapshot(boundary_checkpoint);
+    let terminal_checkpoint = driver.rollback_snapshot();
+    if let Err(err) = driver.machine_realize_boundary_applied_in_memory(&run_id, &receipt) {
+        driver.restore_rollback_snapshot(terminal_checkpoint);
         return Err(RuntimeLoopRunCommitError::BoundaryCommit(
-            RuntimeDriverError::Internal(format!("runtime boundary commit failed: {err}")),
+            RuntimeDriverError::Internal(format!("runtime boundary realization failed: {err}")),
         ));
     }
 
-    let terminal_checkpoint = driver.rollback_snapshot();
     if let Err(err) = machine_validate_run_completed(&driver, &consumed_input_ids) {
         driver.restore_rollback_snapshot(terminal_checkpoint);
         return Err(RuntimeLoopRunCommitError::PostBoundaryValidation(
@@ -2580,16 +2572,29 @@ pub(crate) async fn commit_runtime_loop_run(
             )),
         ));
     }
+    if let Err(err) =
+        driver.machine_realize_run_completed_in_memory(&completed_run_id, &consumed_input_ids)
+    {
+        driver.restore_rollback_snapshot(terminal_checkpoint);
+        return Err(RuntimeLoopRunCommitError::Rejected(
+            RuntimeDriverError::Internal(format!(
+                "failed to realize runtime completion snapshot: {err}"
+            )),
+        ));
+    }
     if let Err(err) = driver
-        .machine_realize_run_completed(completed_run_id.clone(), consumed_input_ids)
+        .machine_commit_completed_boundary_snapshot(&receipt, session_snapshot.as_ref())
         .await
     {
         driver.restore_rollback_snapshot(terminal_checkpoint);
         return Err(RuntimeLoopRunCommitError::TerminalSnapshot(
             RuntimeDriverError::Internal(format!(
-                "failed to persist runtime completion snapshot: {err}"
+                "failed to persist runtime completed-boundary snapshot: {err}"
             )),
         ));
+    }
+    if matches!(&*driver, DriverEntry::Persistent(_)) {
+        driver.set_control_projection(next_phase, None, None);
     }
 
     Ok(())
@@ -2604,6 +2609,7 @@ pub(crate) async fn fail_runtime_loop_run(
         driver,
         run_id,
         failure.message().to_owned(),
+        meerkat_core::TurnTerminalOutcome::Failed,
         meerkat_core::TurnTerminalCauseKind::RuntimeApplyFailure,
         Some(failure),
     )
@@ -2619,16 +2625,64 @@ pub(crate) async fn fail_machine_run(
         driver,
         run_id,
         failure.error,
+        failure.terminal_outcome,
         failure.terminal_cause_kind,
         None,
     )
     .await
 }
 
+pub(crate) async fn cancel_runtime_loop_run(
+    driver: &SharedDriver,
+    run_id: RunId,
+) -> Result<(), RuntimeLoopRunFailError> {
+    let mut driver = driver.lock().await;
+    let next_phase =
+        crate::runtime_state::run_return_phase_from_pre_run_phase(driver.pre_run_phase());
+    let cancelled_run_id = run_id.clone();
+    let staged_input_ids = machine_staged_contributors(&driver);
+    machine_validate_run_cancelled(&driver, &staged_input_ids)
+        .map_err(RuntimeLoopRunFailError::Rejected)?;
+    let terminal_checkpoint = driver.rollback_snapshot();
+    if let Err(err) = machine_apply_turn_run_cancelled(&mut driver, &cancelled_run_id) {
+        driver.restore_rollback_snapshot(terminal_checkpoint);
+        return Err(RuntimeLoopRunFailError::Rejected(err));
+    }
+    if let Err(err) = machine_apply_run_return_projection(
+        &mut driver,
+        &cancelled_run_id,
+        RunReturnDisposition::Cancelled,
+        next_phase,
+    ) {
+        driver.restore_rollback_snapshot(terminal_checkpoint);
+        return Err(RuntimeLoopRunFailError::Rejected(
+            RuntimeDriverError::Internal(format!(
+                "failed to apply runtime return projection after cancellation: {err}"
+            )),
+        ));
+    }
+    if let Err(run_err) = driver
+        .machine_realize_run_cancelled(cancelled_run_id.clone(), staged_input_ids)
+        .await
+    {
+        driver.restore_rollback_snapshot(terminal_checkpoint);
+        return Err(RuntimeLoopRunFailError::TerminalSnapshot(
+            RuntimeDriverError::Internal(format!(
+                "failed to record run-cancelled event: {run_err}"
+            )),
+        ));
+    }
+    if matches!(&*driver, DriverEntry::Persistent(_)) {
+        driver.set_control_projection(next_phase, None, None);
+    }
+    Ok(())
+}
+
 async fn fail_runtime_loop_run_inner(
     driver: &SharedDriver,
     run_id: RunId,
     terminal_error: String,
+    terminal_outcome: meerkat_core::TurnTerminalOutcome,
     terminal_cause_kind: meerkat_core::TurnTerminalCauseKind,
     runtime_apply_failure: Option<CoreApplyFailureCause>,
 ) -> Result<(), RuntimeLoopRunFailError> {
@@ -2652,6 +2706,7 @@ async fn fail_runtime_loop_run_inner(
         &mut driver,
         &failed_run_id,
         &terminal_error,
+        terminal_outcome,
         terminal_cause_kind,
         runtime_apply_failure.as_ref(),
     ) {
@@ -2688,6 +2743,9 @@ async fn fail_runtime_loop_run_inner(
             RuntimeDriverError::Internal(format!("failed to record run-failed event: {run_err}")),
         ));
     }
+    if matches!(&*driver, DriverEntry::Persistent(_)) {
+        driver.set_control_projection(next_phase, None, None);
+    }
     Ok(())
 }
 
@@ -2722,6 +2780,7 @@ mod run_failed_cause_tests {
             &mut driver,
             &run_id,
             "legacy failure",
+            meerkat_core::TurnTerminalOutcome::Failed,
             meerkat_core::TurnTerminalCauseKind::FatalFailure,
             None,
         )
@@ -2734,6 +2793,10 @@ mod run_failed_cause_tests {
         assert_eq!(
             auth.state.terminal_cause_kind,
             Some(crate::meerkat_machine::dsl::TurnTerminalCauseKind::FatalFailure)
+        );
+        assert_eq!(
+            auth.state.terminal_outcome,
+            Some(crate::meerkat_machine::dsl::TurnTerminalOutcome::Failed)
         );
         assert_eq!(auth.state.last_runtime_apply_failure_cause, None);
         assert_eq!(auth.state.last_runtime_apply_failure_message, None);
@@ -2748,6 +2811,7 @@ mod run_failed_cause_tests {
             &mut driver,
             &run_id,
             "runtime apply failure: display-only text",
+            meerkat_core::TurnTerminalOutcome::Failed,
             meerkat_core::TurnTerminalCauseKind::FatalFailure,
             None,
         )
@@ -2760,6 +2824,10 @@ mod run_failed_cause_tests {
         assert_eq!(
             auth.state.terminal_cause_kind,
             Some(crate::meerkat_machine::dsl::TurnTerminalCauseKind::FatalFailure)
+        );
+        assert_eq!(
+            auth.state.terminal_outcome,
+            Some(crate::meerkat_machine::dsl::TurnTerminalOutcome::Failed)
         );
         assert_eq!(auth.state.last_runtime_apply_failure_cause, None);
         assert_eq!(auth.state.last_runtime_apply_failure_message, None);
@@ -2775,6 +2843,7 @@ mod run_failed_cause_tests {
             &mut driver,
             &run_id,
             failure.message(),
+            meerkat_core::TurnTerminalOutcome::Failed,
             meerkat_core::TurnTerminalCauseKind::RuntimeApplyFailure,
             Some(&failure),
         )
@@ -2789,12 +2858,54 @@ mod run_failed_cause_tests {
             Some(crate::meerkat_machine::dsl::TurnTerminalCauseKind::RuntimeApplyFailure)
         );
         assert_eq!(
+            auth.state.terminal_outcome,
+            Some(crate::meerkat_machine::dsl::TurnTerminalOutcome::Failed)
+        );
+        assert_eq!(
             auth.state.last_runtime_apply_failure_cause,
             Some(crate::meerkat_machine::dsl::RuntimeApplyFailureCause::RuntimeTurn)
         );
         assert_eq!(
             auth.state.last_runtime_apply_failure_message.as_deref(),
             Some("runtime apply failed")
+        );
+    }
+
+    #[test]
+    fn run_completed_preserves_existing_machine_terminal_outcome() {
+        let run_id = RunId::new();
+        let mut driver = running_driver(&run_id);
+
+        {
+            let authority = driver.shared_dsl_authority();
+            let mut auth = authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+                &mut *auth,
+                crate::meerkat_machine::dsl::MeerkatMachineInput::BudgetExhausted,
+            )
+            .expect("budget terminal should apply");
+        }
+
+        machine_apply_turn_run_completed(&mut driver, &run_id)
+            .expect("durable commit completion should not overwrite terminal evidence");
+
+        let authority = driver.shared_dsl_authority();
+        let auth = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            auth.state.turn_phase,
+            crate::meerkat_machine::dsl::TurnPhase::Failed
+        );
+        assert_eq!(
+            auth.state.terminal_outcome,
+            Some(crate::meerkat_machine::dsl::TurnTerminalOutcome::BudgetExhausted)
+        );
+        assert_eq!(
+            auth.state.terminal_cause_kind,
+            Some(crate::meerkat_machine::dsl::TurnTerminalCauseKind::BudgetExhausted)
         );
     }
 }

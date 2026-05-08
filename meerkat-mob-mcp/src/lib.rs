@@ -861,7 +861,7 @@ impl MobMcpState {
             {
                 return self
                     .session_service()
-                    .archive(bridge_session_id)
+                    .archive_with_mob_lifecycle_authority(bridge_session_id)
                     .await
                     .map_err(|error| {
                         MobError::Internal(format!(
@@ -1020,11 +1020,6 @@ impl MobMcpState {
         handling_mode: HandlingMode,
         render_metadata: Option<RenderMetadata>,
     ) -> Result<meerkat_mob::MemberDeliveryReceipt, MobError> {
-        if matches!(handling_mode, HandlingMode::Steer) {
-            return Err(MobError::Internal(
-                "handling_mode Steer requires a runtime-backed surface".to_string(),
-            ));
-        }
         self.handle_for(mob_id)
             .await?
             .member(&identity)
@@ -1631,8 +1626,26 @@ impl MobMcpState {
             .ok_or_else(|| MobError::Internal(format!("mob not found: {mob_id}")))
     }
 
-    /// W3-H: resolve a realtime channel target to the concrete bridge
-    /// session id. `SessionTarget` returns its parsed session id directly;
+    async fn resolve_standalone_realtime_session_target(
+        &self,
+        session_id: &str,
+    ) -> Result<meerkat_core::types::SessionId, MobError> {
+        let session_id = meerkat_core::types::SessionId::parse(session_id)
+            .map_err(|err| MobError::Internal(format!("invalid session target: {err}")))?;
+        if self.owns_live_bridge_session(&session_id).await
+            || self.owns_service_reported_bridge_session(&session_id).await
+            || self.owns_persisted_bridge_session(&session_id).await
+        {
+            return Err(MobError::Internal(format!(
+                "session target {session_id} is a mob-owned bridge session; use realtime target type 'mob_member' with mob_id and agent_identity"
+            )));
+        }
+        Ok(session_id)
+    }
+
+    /// W3-H: resolve a realtime channel target to the concrete session id.
+    /// `SessionTarget` is accepted only for standalone sessions; mob-owned
+    /// bridge sessions fail closed and must be addressed as `MobMember`.
     /// `MobMember` resolves `(mob_id, agent_identity)` against the
     /// MobMachine's canonical `member_session_bindings` map via the mob
     /// handle — a single read through the authoritative source (dogma #1).
@@ -1647,8 +1660,8 @@ impl MobMcpState {
     ) -> Result<meerkat_core::types::SessionId, MobError> {
         match target {
             meerkat_contracts::RealtimeChannelTarget::SessionTarget { session_id } => {
-                meerkat_core::types::SessionId::parse(session_id)
-                    .map_err(|err| MobError::Internal(format!("invalid session target: {err}")))
+                self.resolve_standalone_realtime_session_target(session_id)
+                    .await
             }
             meerkat_contracts::RealtimeChannelTarget::MobMember {
                 mob_id,
@@ -1880,6 +1893,7 @@ struct LocalSessionService {
     /// Per-session broadcast channels for event streaming.
     event_txs:
         RwLock<HashMap<SessionId, tokio::sync::broadcast::Sender<EventEnvelope<AgentEvent>>>>,
+    runtime_adapter: Arc<meerkat_runtime::MeerkatMachine>,
     counter: std::sync::atomic::AtomicU64,
     archive_delay_ms: std::sync::atomic::AtomicU64,
     archive_failures: Arc<InMemoryArchiveFailureControl>,
@@ -1896,6 +1910,7 @@ impl LocalSessionService {
             archived_views: RwLock::new(HashMap::new()),
             pending_context: RwLock::new(HashMap::new()),
             event_txs: RwLock::new(HashMap::new()),
+            runtime_adapter: Arc::new(meerkat_runtime::MeerkatMachine::ephemeral()),
             counter: std::sync::atomic::AtomicU64::new(0),
             archive_delay_ms: std::sync::atomic::AtomicU64::new(0),
             archive_failures,
@@ -1905,6 +1920,42 @@ impl LocalSessionService {
     fn set_archive_delay_ms(&self, delay_ms: u64) {
         self.archive_delay_ms
             .store(delay_ms, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    async fn retire_with_machine_archive_authority(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), SessionError> {
+        if !self.sessions.read().await.contains_key(session_id)
+            && !self.runtime_adapter.contains_session(session_id).await
+        {
+            return Ok(());
+        }
+
+        let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(session_id);
+        match meerkat_runtime::RuntimeControlPlane::retire(&*self.runtime_adapter, &runtime_id)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(meerkat_runtime::RuntimeControlPlaneError::NotFound(_)) => {
+                self.runtime_adapter
+                    .register_session(session_id.clone())
+                    .await;
+                meerkat_runtime::RuntimeControlPlane::retire(&*self.runtime_adapter, &runtime_id)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| {
+                        SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                            format!("machine archive retire failed after registration: {error}"),
+                        ))
+                    })
+            }
+            Err(error) => Err(SessionError::Agent(
+                meerkat_core::error::AgentError::InternalError(format!(
+                    "machine archive retire failed: {error}"
+                )),
+            )),
+        }
     }
 }
 
@@ -2247,9 +2298,16 @@ impl MobSessionService for LocalSessionService {
     }
 
     fn runtime_adapter(&self) -> Option<std::sync::Arc<meerkat_runtime::MeerkatMachine>> {
-        Some(std::sync::Arc::new(
-            meerkat_runtime::MeerkatMachine::ephemeral(),
-        ))
+        Some(Arc::clone(&self.runtime_adapter))
+    }
+
+    async fn archive_with_mob_lifecycle_authority(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), SessionError> {
+        self.retire_with_machine_archive_authority(session_id)
+            .await?;
+        SessionService::archive(self, session_id).await
     }
 
     async fn apply_runtime_turn(
@@ -3705,6 +3763,45 @@ mod tests {
             self.sessions.read().await.contains_key(id)
                 || self.persisted_sessions.read().await.contains_key(id)
         }
+
+        async fn retire_with_machine_archive_authority(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<(), SessionError> {
+            if !self.session_exists(session_id).await
+                && !self.runtime_adapter.contains_session(session_id).await
+            {
+                return Ok(());
+            }
+
+            let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(session_id);
+            match meerkat_runtime::RuntimeControlPlane::retire(&*self.runtime_adapter, &runtime_id)
+                .await
+            {
+                Ok(_) => Ok(()),
+                Err(meerkat_runtime::RuntimeControlPlaneError::NotFound(_)) => {
+                    self.runtime_adapter
+                        .register_session(session_id.clone())
+                        .await;
+                    meerkat_runtime::RuntimeControlPlane::retire(
+                        &*self.runtime_adapter,
+                        &runtime_id,
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| {
+                        SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                            format!("machine archive retire failed after registration: {error}"),
+                        ))
+                    })
+                }
+                Err(error) => Err(SessionError::Agent(
+                    meerkat_core::error::AgentError::InternalError(format!(
+                        "machine archive retire failed: {error}"
+                    )),
+                )),
+            }
+        }
     }
 
     #[async_trait]
@@ -3940,6 +4037,15 @@ mod tests {
             Some(self.runtime_adapter.clone())
         }
 
+        async fn archive_with_mob_lifecycle_authority(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<(), SessionError> {
+            self.retire_with_machine_archive_authority(session_id)
+                .await?;
+            SessionService::archive(self, session_id).await
+        }
+
         async fn session_belongs_to_mob(&self, _session_id: &SessionId, _mob_id: &MobId) -> bool {
             true
         }
@@ -4064,13 +4170,15 @@ mod tests {
                 StartTurnRequest {
                     prompt: "hello".to_string().into(),
                     system_prompt: None,
-                    render_metadata: None,
-                    handling_mode: HandlingMode::Queue,
                     event_tx: None,
-                    skill_references: None,
-                    flow_tool_overlay: None,
-                    pre_turn_context_appends: Vec::new(),
-                    turn_metadata: None,
+                    runtime: meerkat_core::service::StartTurnRuntimeSemantics::new(
+                        None,
+                        HandlingMode::Queue,
+                        None,
+                        None,
+                        Vec::new(),
+                        None,
+                    ),
                 },
             )
             .await
@@ -4251,13 +4359,15 @@ mod tests {
                 StartTurnRequest {
                     prompt: "hello".to_string().into(),
                     system_prompt: None,
-                    render_metadata: None,
-                    handling_mode: HandlingMode::Queue,
                     event_tx: None,
-                    skill_references: None,
-                    flow_tool_overlay: None,
-                    pre_turn_context_appends: Vec::new(),
-                    turn_metadata: None,
+                    runtime: meerkat_core::service::StartTurnRuntimeSemantics::new(
+                        None,
+                        HandlingMode::Queue,
+                        None,
+                        None,
+                        Vec::new(),
+                        None,
+                    ),
                 },
             )
             .await;
@@ -5515,6 +5625,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_realtime_session_target_rejects_mob_bridge_session() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let state = Arc::new(MobMcpState::new(svc));
+        let mob_id = state
+            .mob_create_definition(explicit_definition("realtime-target-guard"))
+            .await
+            .expect("create explicit mob");
+        state
+            .mob_spawn(
+                &mob_id,
+                ProfileName::from("worker"),
+                AgentIdentity::from("worker-1"),
+                Some(MobRuntimeMode::TurnDriven),
+                None,
+            )
+            .await
+            .expect("spawn worker");
+        let status = state
+            .mob_member_status(&mob_id, &AgentIdentity::from("worker-1"))
+            .await
+            .expect("member status");
+        let bridge_session_id = status
+            .current_session_id
+            .expect("member should expose diagnostic bridge session id");
+
+        let err = state
+            .resolve_realtime_target_session(
+                &meerkat_contracts::RealtimeChannelTarget::SessionTarget {
+                    session_id: bridge_session_id.to_string(),
+                },
+            )
+            .await
+            .expect_err("mob bridge sessions must not be routable through SessionTarget");
+        let message = err.to_string();
+        assert!(
+            message.contains("mob-owned bridge session") && message.contains("mob_member"),
+            "unexpected rejection: {message}"
+        );
+
+        let resolved = state
+            .resolve_realtime_target_session(&meerkat_contracts::RealtimeChannelTarget::MobMember {
+                mob_id: mob_id.to_string(),
+                agent_identity: "worker-1".to_string(),
+            })
+            .await
+            .expect("stable mob-member target should resolve through machine binding");
+        assert_eq!(resolved, bridge_session_id);
+    }
+
+    #[tokio::test]
     async fn test_mob_destroy_removes_persistent_store_file() {
         let svc = Arc::new(MockSessionSvc::new());
         let root = tempfile::tempdir().expect("tempdir");
@@ -6217,13 +6377,8 @@ mod tests {
             StartTurnRequest {
                 prompt: "test".into(),
                 system_prompt: None,
-                render_metadata: None,
-                handling_mode: meerkat_core::types::HandlingMode::Queue,
                 event_tx: None,
-                skill_references: None,
-                flow_tool_overlay: None,
-                pre_turn_context_appends: Vec::new(),
-                turn_metadata: None,
+                runtime: meerkat_core::service::StartTurnRuntimeSemantics::default(),
             },
             meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunStart,
             vec![],

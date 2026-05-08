@@ -46,11 +46,12 @@ use meerkat::surface::{
     RequestAlreadyExists, RequestContext, RequestTerminal, RequestTerminalResolution,
     SurfaceRequestExecutor, SurfaceSessionRecoveryContext, SurfaceSessionRecoveryOverrides,
     build_recovered_session, noop_request_action, request_action,
+    run_runtime_backed_initial_turn_with_machine, split_runtime_backed_eager_create_request,
 };
 use meerkat::{
-    AgentEvent, AgentFactory, FactoryAgentBuilder, LlmClient, OutputSchema,
-    PersistentSessionService, ScheduleService, ScheduleToolDispatcher, Session, SessionId,
-    SessionService, SessionServiceControlExt, SessionServiceHistoryExt,
+    AgentEvent, AgentFactory, FactoryAgentBuilder, LlmClient, MachineSessionArchiveProtocol,
+    OutputSchema, PersistentSessionService, ScheduleService, ScheduleToolDispatcher, Session,
+    SessionId, SessionService, SessionServiceControlExt, SessionServiceHistoryExt,
     encode_llm_client_override_for_service, handle_schedule_tools_call, open_realm_persistence_in,
     schedule_tools_list,
 };
@@ -219,7 +220,10 @@ impl CoreExecutorBoundaryHandle for RestSessionRuntimeBoundaryHandle {
     async fn cancel_after_boundary(&self, _reason: String) -> Result<(), CoreExecutorError> {
         self.context
             .session_service
-            .cancel_after_boundary(&self.session_id)
+            .cancel_after_boundary_with_machine_authority(
+                &self.session_id,
+                self.context.runtime_adapter.session_control_authority(),
+            )
             .await
             .or_else(|err| match err {
                 SessionError::NotRunning { .. } => Ok(()),
@@ -239,7 +243,10 @@ impl CoreExecutorInterruptHandle for RestSessionRuntimeInterruptHandle {
     async fn hard_cancel_current_run(&self, _reason: String) -> Result<(), CoreExecutorError> {
         self.context
             .session_service
-            .interrupt(&self.session_id)
+            .interrupt_with_machine_authority(
+                &self.session_id,
+                self.context.runtime_adapter.session_control_authority(),
+            )
             .await
             .or_else(|err| match err {
                 SessionError::NotRunning { .. } => Ok(()),
@@ -855,12 +862,14 @@ async fn cleanup_rest_runtime_after_completion_outcome(
     session_id: &SessionId,
     outcome: &meerkat_runtime::completion::CompletionOutcome,
 ) -> Result<(), SessionError> {
-    let archived_now = state
+    let archived_now = match state
         .session_service
         .load_authoritative_session(session_id)
         .await?
-        .as_ref()
-        .is_some_and(session_metadata_marks_archived);
+    {
+        Some(session) => session_archived_by_authority(state, session_id, &session).await?,
+        None => false,
+    };
     if archived_now {
         match state.session_service.discard_live_session(session_id).await {
             Ok(()) | Err(SessionError::NotFound { .. }) => {}
@@ -1083,13 +1092,20 @@ async fn apply_runtime_turn(
         ));
     }
 
-    if context
+    let archived_now = match context
         .session_service
         .load_authoritative_session(session_id)
         .await?
-        .as_ref()
-        .is_some_and(session_metadata_marks_archived)
     {
+        Some(session) => {
+            context
+                .session_service
+                .session_archived_by_authority(session_id, &session)
+                .await?
+        }
+        None => false,
+    };
+    if archived_now {
         context.runtime_adapter.unregister_session(session_id).await;
         return Err(SessionError::NotFound {
             id: session_id.clone(),
@@ -1153,7 +1169,11 @@ async fn apply_runtime_turn(
                     .ok_or(SessionError::NotFound {
                         id: session_id.clone(),
                     })?;
-                if session_metadata_marks_archived(&session) {
+                if context
+                    .session_service
+                    .session_archived_by_authority(session_id, &session)
+                    .await?
+                {
                     context.runtime_adapter.unregister_session(session_id).await;
                     return Err(SessionError::NotFound {
                         id: session_id.clone(),
@@ -1303,18 +1323,19 @@ async fn apply_runtime_turn(
     let svc_req = SvcStartTurnRequest {
         prompt: prompt.clone(),
         system_prompt: None,
-        render_metadata: None,
-        handling_mode: meerkat_core::types::HandlingMode::Queue,
         event_tx: Some(event_tx.clone()),
-
-        skill_references: primitive
-            .turn_metadata()
-            .and_then(|meta| meta.skill_references.clone()),
-        flow_tool_overlay: primitive
-            .turn_metadata()
-            .and_then(|meta| meta.flow_tool_overlay.clone()),
-        pre_turn_context_appends: pre_turn_context_appends.clone(),
-        turn_metadata: primitive.turn_metadata().cloned(),
+        runtime: meerkat_core::service::StartTurnRuntimeSemantics::new(
+            None,
+            meerkat_core::types::HandlingMode::Queue,
+            primitive
+                .turn_metadata()
+                .and_then(|meta| meta.skill_references.clone()),
+            primitive
+                .turn_metadata()
+                .and_then(|meta| meta.flow_tool_overlay.clone()),
+            pre_turn_context_appends.clone(),
+            primitive.turn_metadata().cloned(),
+        ),
     };
 
     let session_identity = context
@@ -1390,7 +1411,11 @@ async fn apply_runtime_turn(
                 .ok_or(SessionError::NotFound {
                     id: session_id.clone(),
                 })?;
-            if session_metadata_marks_archived(&session) {
+            if context
+                .session_service
+                .session_archived_by_authority(session_id, &session)
+                .await?
+            {
                 context.runtime_adapter.unregister_session(session_id).await;
                 return Err(SessionError::NotFound {
                     id: session_id.clone(),
@@ -1493,18 +1518,19 @@ async fn apply_runtime_turn(
                     SvcStartTurnRequest {
                         prompt,
                         system_prompt: None,
-                        render_metadata: None,
-                        handling_mode: meerkat_core::types::HandlingMode::Queue,
                         event_tx: Some(event_tx.clone()),
-
-                        skill_references: primitive
-                            .turn_metadata()
-                            .and_then(|meta| meta.skill_references.clone()),
-                        flow_tool_overlay: primitive
-                            .turn_metadata()
-                            .and_then(|meta| meta.flow_tool_overlay.clone()),
-                        pre_turn_context_appends,
-                        turn_metadata: primitive.turn_metadata().cloned(),
+                        runtime: meerkat_core::service::StartTurnRuntimeSemantics::new(
+                            None,
+                            meerkat_core::types::HandlingMode::Queue,
+                            primitive
+                                .turn_metadata()
+                                .and_then(|meta| meta.skill_references.clone()),
+                            primitive
+                                .turn_metadata()
+                                .and_then(|meta| meta.flow_tool_overlay.clone()),
+                            pre_turn_context_appends,
+                            primitive.turn_metadata().cloned(),
+                        ),
                     },
                     boundary,
                     contributing_input_ids,
@@ -1558,7 +1584,10 @@ impl CoreExecutor for RestSessionRuntimeExecutor {
     async fn cancel_after_boundary(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
         self.context
             .session_service
-            .cancel_after_boundary(&self.session_id)
+            .cancel_after_boundary_with_machine_authority(
+                &self.session_id,
+                self.context.runtime_adapter.session_control_authority(),
+            )
             .await
             .or_else(|err| match err {
                 SessionError::NotRunning { .. } => Ok(()),
@@ -1568,6 +1597,10 @@ impl CoreExecutor for RestSessionRuntimeExecutor {
     }
 
     async fn stop_runtime_executor(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
+        Ok(())
+    }
+
+    async fn cleanup_after_runtime_stop_terminalized(&mut self) -> Result<(), CoreExecutorError> {
         let discard_result = self
             .context
             .session_service
@@ -2047,12 +2080,44 @@ fn get_runtime_adapter(state: &AppState) -> &Arc<meerkat_runtime::MeerkatMachine
     &state.runtime_adapter
 }
 
-fn session_metadata_marks_archived(session: &Session) -> bool {
-    session
-        .metadata()
-        .get("session_archived")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
+async fn session_archived_by_authority(
+    state: &AppState,
+    session_id: &SessionId,
+    session: &Session,
+) -> Result<bool, SessionError> {
+    state
+        .session_service
+        .session_archived_by_authority(session_id, session)
+        .await
+}
+
+async fn authoritative_session_archived_response(
+    state: &AppState,
+    session_id: &SessionId,
+) -> Result<bool, Response> {
+    let session = state
+        .session_service
+        .load_authoritative_session(session_id)
+        .await
+        .map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("failed to load session: {err}")})),
+            )
+                .into_response()
+        })?;
+    let Some(session) = session else {
+        return Ok(false);
+    };
+    session_archived_by_authority(state, session_id, &session)
+        .await
+        .map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("failed to load session archive state: {err}")})),
+            )
+                .into_response()
+        })
 }
 
 fn session_metadata_marks_mob_member(session: &Session) -> bool {
@@ -2885,33 +2950,19 @@ async fn admit_runtime_input_via_webhook(
 ) -> Result<(StatusCode, Json<Value>), Response> {
     let outcome = match mode {
         WebhookAdmissionMode::WithoutWake => {
-            match state
-                .session_service
-                .load_authoritative_session(session_id)
-                .await
-            {
-                Ok(Some(session)) if session_metadata_marks_archived(&session) => {
-                    if let Err(error) = cleanup_archived_session_runtime(state, session_id).await {
-                        return Err((
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(json!({"error": format!("failed to clean up archived session runtime: {error}")})),
-                        )
-                            .into_response());
-                    }
-                    return Err((
-                        StatusCode::NOT_FOUND,
-                        Json(json!({"error": format!("session not found: {session_id}")})),
-                    )
-                        .into_response());
-                }
-                Ok(_) => {}
-                Err(err) => {
+            if authoritative_session_archived_response(state, session_id).await? {
+                if let Err(error) = cleanup_archived_session_runtime(state, session_id).await {
                     return Err((
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": format!("failed to load session: {err}")})),
+                        Json(json!({"error": format!("failed to clean up archived session runtime: {error}")})),
                     )
                         .into_response());
                 }
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": format!("session not found: {session_id}")})),
+                )
+                    .into_response());
             }
             state
                 .runtime_adapter
@@ -2927,37 +2978,21 @@ async fn admit_runtime_input_via_webhook(
             {
                 Ok(admission) => admission,
                 Err(err) => {
-                    match state
-                        .session_service
-                        .load_authoritative_session(session_id)
-                        .await
-                    {
-                        Ok(Some(session)) if session_metadata_marks_archived(&session) => {
-                            if let Err(error) =
-                                cleanup_archived_session_runtime(state, session_id).await
-                            {
-                                return Err((
-                                    StatusCode::INTERNAL_SERVER_ERROR,
-                                    Json(json!({"error": format!("failed to clean up archived session runtime: {error}")})),
-                                )
-                                    .into_response());
-                            }
-                            return Err((
-                                StatusCode::NOT_FOUND,
-                                Json(json!({"error": format!("session not found: {session_id}")})),
-                            )
-                                .into_response());
-                        }
-                        Ok(_) => {}
-                        Err(load_err) => {
+                    if authoritative_session_archived_response(state, session_id).await? {
+                        if let Err(error) =
+                            cleanup_archived_session_runtime(state, session_id).await
+                        {
                             return Err((
                                 StatusCode::INTERNAL_SERVER_ERROR,
-                                Json(
-                                    json!({"error": format!("failed to load session: {load_err}")}),
-                                ),
+                                Json(json!({"error": format!("failed to clean up archived session runtime: {error}")})),
                             )
                                 .into_response());
                         }
+                        return Err((
+                            StatusCode::NOT_FOUND,
+                            Json(json!({"error": format!("session not found: {session_id}")})),
+                        )
+                            .into_response());
                     }
                     return Err((
                         StatusCode::CONFLICT,
@@ -2986,53 +3021,29 @@ async fn admit_runtime_input_via_webhook(
                 input_id.clone(),
             ));
 
-            match state
-                .session_service
-                .load_authoritative_session(session_id)
-                .await
-            {
-                Ok(Some(session)) if session_metadata_marks_archived(&session) => {
-                    discard_rest_runtime_pre_admission(
-                        &state.runtime_pre_admissions,
-                        session_id,
-                        &input_id,
-                    )
-                    .await;
-                    if let Some(registration) = pre_admission_registration.take() {
-                        registration.disarm();
-                    }
-                    if let Err(error) = cleanup_archived_session_runtime(state, session_id).await {
-                        return Err((
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            Json(json!({"error": format!("failed to clean up archived session runtime: {error}")})),
-                        )
-                            .into_response());
-                    }
-                    return Err((
-                        StatusCode::NOT_FOUND,
-                        Json(json!({"error": format!("session not found: {session_id}")})),
-                    )
-                        .into_response());
+            if authoritative_session_archived_response(state, session_id).await? {
+                discard_rest_runtime_pre_admission(
+                    &state.runtime_pre_admissions,
+                    session_id,
+                    &input_id,
+                )
+                .await;
+                if let Some(registration) = pre_admission_registration.take() {
+                    registration.disarm();
                 }
-                Ok(_) => {}
-                Err(err) => {
-                    discard_rest_runtime_pre_admission(
-                        &state.runtime_pre_admissions,
-                        session_id,
-                        &input_id,
-                    )
-                    .await;
-                    if let Some(registration) = pre_admission_registration.take() {
-                        registration.disarm();
-                    }
+                if let Err(error) = cleanup_archived_session_runtime(state, session_id).await {
                     return Err((
                         StatusCode::INTERNAL_SERVER_ERROR,
-                        Json(json!({"error": format!("failed to load session: {err}")})),
+                        Json(json!({"error": format!("failed to clean up archived session runtime: {error}")})),
                     )
                         .into_response());
                 }
+                return Err((
+                    StatusCode::NOT_FOUND,
+                    Json(json!({"error": format!("session not found: {session_id}")})),
+                )
+                    .into_response());
             }
-
             let runtime_registration_lock = rest_runtime_registration_lock(state, session_id);
             let runtime_registration_guard = runtime_registration_lock.mutex().lock().await;
             let runtime_was_registered = state.runtime_adapter.contains_session(session_id).await;
@@ -3680,26 +3691,13 @@ fn resolve_session_id_for_state(input: &str, state: &AppState) -> Result<Session
 enum InterruptNoopTarget {
     Present,
     Missing,
-    NotInterruptible(meerkat_runtime::RuntimeState),
 }
 
-fn persisted_runtime_state_blocks_interrupt_noop(state: meerkat_runtime::RuntimeState) -> bool {
-    matches!(
-        state,
-        meerkat_runtime::RuntimeState::Retired | meerkat_runtime::RuntimeState::Stopped
-    )
-}
-
-fn interrupt_noop_target_for_presence(
-    present: bool,
-    blocking_runtime_state: Option<meerkat_runtime::RuntimeState>,
-) -> InterruptNoopTarget {
-    if !present {
-        return InterruptNoopTarget::Missing;
-    }
-    match blocking_runtime_state {
-        Some(state) => InterruptNoopTarget::NotInterruptible(state),
-        None => InterruptNoopTarget::Present,
+fn interrupt_noop_target_for_presence(present: bool) -> InterruptNoopTarget {
+    if present {
+        InterruptNoopTarget::Present
+    } else {
+        InterruptNoopTarget::Missing
     }
 }
 
@@ -3707,46 +3705,33 @@ async fn interrupt_noop_target(
     state: &AppState,
     session_id: &SessionId,
 ) -> Result<InterruptNoopTarget, ApiError> {
-    let blocking_runtime_state = state
-        .session_service
-        .persisted_runtime_state(session_id)
-        .await
-        .map_err(|err| {
-            ApiError::Internal(format!(
-                "Failed to load runtime state before interrupt no-op: {err}"
-            ))
-        })?
-        .filter(|state| persisted_runtime_state_blocks_interrupt_noop(*state));
-
     match state
         .session_service
         .load_authoritative_session(session_id)
         .await
     {
-        Ok(Some(session)) if session_metadata_marks_archived(&session) => {
-            return Ok(InterruptNoopTarget::Missing);
-        }
-        Ok(Some(session)) if session_metadata_marks_mob_member(&session) => {
-            #[cfg(feature = "mob")]
+        Ok(Some(session)) => {
+            if session_archived_by_authority(state, session_id, &session)
+                .await
+                .map_err(|err| ApiError::Internal(err.to_string()))?
             {
-                let owns_mob_session = state.mob_state.owns_live_bridge_session(session_id).await
-                    || state
-                        .mob_state
-                        .owns_persisted_bridge_session(session_id)
-                        .await;
-                return Ok(interrupt_noop_target_for_presence(
-                    owns_mob_session,
-                    blocking_runtime_state,
-                ));
+                return Ok(InterruptNoopTarget::Missing);
             }
-            #[cfg(not(feature = "mob"))]
-            return Ok(InterruptNoopTarget::Missing);
-        }
-        Ok(Some(_)) => {
-            return Ok(interrupt_noop_target_for_presence(
-                true,
-                blocking_runtime_state,
-            ));
+            if session_metadata_marks_mob_member(&session) {
+                #[cfg(feature = "mob")]
+                {
+                    let owns_mob_session =
+                        state.mob_state.owns_live_bridge_session(session_id).await
+                            || state
+                                .mob_state
+                                .owns_persisted_bridge_session(session_id)
+                                .await;
+                    return Ok(interrupt_noop_target_for_presence(owns_mob_session));
+                }
+                #[cfg(not(feature = "mob"))]
+                return Ok(InterruptNoopTarget::Missing);
+            }
+            return Ok(interrupt_noop_target_for_presence(true));
         }
         Ok(_) => {}
         Err(SessionError::NotFound { .. }) => {}
@@ -3766,10 +3751,7 @@ async fn interrupt_noop_target(
     {
         match state.mob_state.session_service().read(session_id).await {
             Ok(_) => {
-                return Ok(interrupt_noop_target_for_presence(
-                    true,
-                    blocking_runtime_state,
-                ));
+                return Ok(interrupt_noop_target_for_presence(true));
             }
             Err(SessionError::NotFound { .. }) => {}
             Err(err) => {
@@ -3782,10 +3764,7 @@ async fn interrupt_noop_target(
 
     match state.session_service.read(session_id).await {
         Ok(_) => {
-            return Ok(interrupt_noop_target_for_presence(
-                true,
-                blocking_runtime_state,
-            ));
+            return Ok(interrupt_noop_target_for_presence(true));
         }
         Err(SessionError::NotFound { .. }) => {}
         Err(err) => {
@@ -3795,10 +3774,7 @@ async fn interrupt_noop_target(
         }
     }
 
-    Ok(interrupt_noop_target_for_presence(
-        false,
-        blocking_runtime_state,
-    ))
+    Ok(interrupt_noop_target_for_presence(false))
 }
 
 fn resolve_schedule_id(input: &str) -> Result<meerkat::ScheduleId, ApiError> {
@@ -4076,7 +4052,21 @@ async fn create_session_inner(
             let state = cleanup_state.clone();
             let sid = cleanup_session_id.clone();
             async move {
-                let _ = state.session_service.archive(&sid).await;
+                if let Err(error) = state
+                    .session_service
+                    .archive_with_machine_protocol(
+                        &sid,
+                        MachineSessionArchiveProtocol::from_machine(state.runtime_adapter.as_ref()),
+                    )
+                    .await
+                {
+                    tracing::error!(
+                        session_id = %sid,
+                        error = %error,
+                        "REST unpublished create archive failed; leaving runtime state registered"
+                    );
+                    return;
+                }
                 if let Err(error) = cleanup_archived_session_runtime(&state, &sid).await {
                     tracing::error!(
                         session_id = %sid,
@@ -4651,9 +4641,6 @@ async fn interrupt_session(
                 InterruptNoopTarget::Missing => {
                     Err(ApiError::NotFound(format!("Session not found: {id}")))
                 }
-                InterruptNoopTarget::NotInterruptible(state) => Err(ApiError::Conflict(format!(
-                    "Session is not interruptible while runtime is {state}"
-                ))),
             }
         }
         Err(meerkat_runtime::RuntimeDriverError::NotReady { state }) => Err(ApiError::Conflict(
@@ -4842,16 +4829,25 @@ async fn continue_session_inner(
             ))));
         }
     };
-    if loaded_session
-        .as_ref()
-        .is_some_and(session_metadata_marks_archived)
-    {
-        state.runtime_adapter.unregister_session(&session_id).await;
-        drop(caller_event_tx);
-        drain_event_forwarder(&session_id, forward_task).await;
-        return RequestTerminal::RespondWithoutPublish(Err(ApiError::NotFound(format!(
-            "Session not found: {session_id}"
-        ))));
+    if let Some(session) = loaded_session.as_ref() {
+        match session_archived_by_authority(state, &session_id, session).await {
+            Ok(true) => {
+                state.runtime_adapter.unregister_session(&session_id).await;
+                drop(caller_event_tx);
+                drain_event_forwarder(&session_id, forward_task).await;
+                return RequestTerminal::RespondWithoutPublish(Err(ApiError::NotFound(format!(
+                    "Session not found: {session_id}"
+                ))));
+            }
+            Ok(false) => {}
+            Err(err) => {
+                drop(caller_event_tx);
+                drain_event_forwarder(&session_id, forward_task).await;
+                return RequestTerminal::RespondWithoutPublish(Err(ApiError::Internal(format!(
+                    "Failed to load session archive state: {err}"
+                ))));
+            }
+        }
     }
     let stored_metadata = loaded_session
         .as_ref()
@@ -5227,25 +5223,43 @@ async fn continue_session_inner(
         let runtime_registration_lock = rest_runtime_registration_lock(state, &session_id);
         let runtime_registration_guard = runtime_registration_lock.mutex().lock().await;
         let runtime_was_registered = state.runtime_adapter.contains_session(&session_id).await;
-        if state
+        match state
             .session_service
             .load_authoritative_session(&session_id)
             .await
-            .ok()
-            .flatten()
-            .as_ref()
-            .is_some_and(session_metadata_marks_archived)
         {
-            let _ = state
-                .session_service
-                .discard_live_session(&session_id)
-                .await;
-            state.runtime_adapter.unregister_session(&session_id).await;
-            drop(caller_event_tx);
-            drain_event_forwarder(&session_id, forward_task).await;
-            return RequestTerminal::RespondWithoutPublish(Err(ApiError::NotFound(format!(
-                "Session not found: {session_id}"
-            ))));
+            Ok(Some(session)) => {
+                match session_archived_by_authority(state, &session_id, &session).await {
+                    Ok(true) => {
+                        let _ = state
+                            .session_service
+                            .discard_live_session(&session_id)
+                            .await;
+                        state.runtime_adapter.unregister_session(&session_id).await;
+                        drop(caller_event_tx);
+                        drain_event_forwarder(&session_id, forward_task).await;
+                        return RequestTerminal::RespondWithoutPublish(Err(ApiError::NotFound(
+                            format!("Session not found: {session_id}"),
+                        )));
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        drop(caller_event_tx);
+                        drain_event_forwarder(&session_id, forward_task).await;
+                        return RequestTerminal::RespondWithoutPublish(Err(ApiError::Internal(
+                            format!("Failed to load session archive state: {err}"),
+                        )));
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(err) => {
+                drop(caller_event_tx);
+                drain_event_forwarder(&session_id, forward_task).await;
+                return RequestTerminal::RespondWithoutPublish(Err(ApiError::Internal(format!(
+                    "Failed to load session: {err}"
+                ))));
+            }
         }
         #[cfg(feature = "comms")]
         let comms_rt = {
@@ -5647,14 +5661,28 @@ async fn continue_session_inner(
                     if message.contains("runtime boundary commit failed")
                         || message.contains("runtime loop commit failed")
             );
-            let archived_now = state
+            let archived_now = match state
                 .session_service
                 .load_authoritative_session(&session_id)
                 .await
-                .ok()
-                .flatten()
-                .as_ref()
-                .is_some_and(session_metadata_marks_archived);
+            {
+                Ok(Some(session)) => {
+                    match session_archived_by_authority(state, &session_id, &session).await {
+                        Ok(archived) => archived,
+                        Err(error) => {
+                            return RequestTerminal::Publish(Err(ApiError::Internal(format!(
+                                "Failed to load session archive state: {error}"
+                            ))));
+                        }
+                    }
+                }
+                Ok(None) => false,
+                Err(error) => {
+                    return RequestTerminal::Publish(Err(ApiError::Internal(format!(
+                        "Failed to load session: {error}"
+                    ))));
+                }
+            };
             if runtime_failure_requires_cleanup || archived_now {
                 let cleanup_result = async {
                     match state
@@ -5904,19 +5932,23 @@ async fn resolve_mcp_adapter(
         .load_authoritative_session(session_id)
         .await
     {
-        Ok(Some(session)) if session_metadata_marks_archived(&session) => {
-            cleanup_archived_session_runtime(state, session_id)
+        Ok(Some(session)) => {
+            if session_archived_by_authority(state, session_id, &session)
                 .await
-                .map_err(|error| {
-                    ApiError::Internal(format!(
-                        "failed to clean up archived session runtime: {error}"
-                    ))
-                })?;
-            return Err(ApiError::NotFound(format!(
-                "Session not found: {session_id}"
-            )));
+                .map_err(|err| ApiError::Internal(err.to_string()))?
+            {
+                cleanup_archived_session_runtime(state, session_id)
+                    .await
+                    .map_err(|error| {
+                        ApiError::Internal(format!(
+                            "failed to clean up archived session runtime: {error}"
+                        ))
+                    })?;
+                return Err(ApiError::NotFound(format!(
+                    "Session not found: {session_id}"
+                )));
+            }
         }
-        Ok(Some(_)) => {}
         Ok(None) => {
             return Err(ApiError::NotFound(format!(
                 "Session not found: {session_id}"
@@ -6164,9 +6196,9 @@ async fn archive_session_with_runtime_cleanup(
         }
 
         let result = service
-            .archive_with_machine_authority(
+            .archive_with_machine_protocol(
                 &session_id,
-                state.runtime_adapter.session_control_authority(),
+                MachineSessionArchiveProtocol::from_machine(state.runtime_adapter.as_ref()),
             )
             .await;
         let not_found = matches!(&result, Err(SessionError::NotFound { .. }));
@@ -6379,17 +6411,13 @@ mod tests {
     }
 
     #[test]
-    fn interrupt_noop_target_for_presence_rejects_terminal_runtime_state() {
+    fn interrupt_noop_target_for_presence_tracks_authoritative_presence_only() {
         assert_eq!(
-            interrupt_noop_target_for_presence(true, Some(meerkat_runtime::RuntimeState::Stopped)),
-            InterruptNoopTarget::NotInterruptible(meerkat_runtime::RuntimeState::Stopped)
-        );
-        assert_eq!(
-            interrupt_noop_target_for_presence(true, None),
+            interrupt_noop_target_for_presence(true),
             InterruptNoopTarget::Present
         );
         assert_eq!(
-            interrupt_noop_target_for_presence(false, Some(meerkat_runtime::RuntimeState::Stopped)),
+            interrupt_noop_target_for_presence(false),
             InterruptNoopTarget::Missing
         );
     }
@@ -6908,11 +6936,13 @@ mod tests {
         assert_eq!(output.receipt.contributing_input_ids, vec![input_id]);
         assert!(state.runtime_adapter.contains_session(&session_id).await);
 
-        let exported = state
-            .session_service
-            .export_live_session(&session_id)
-            .await
-            .expect("export recovered live session");
+        let exported: Session = serde_json::from_slice(
+            output
+                .session_snapshot
+                .as_deref()
+                .expect("runtime output should carry a staged session snapshot"),
+        )
+        .expect("staged REST session snapshot should deserialize");
         let system_context = exported
             .messages()
             .iter()
@@ -6925,6 +6955,11 @@ mod tests {
             system_context.contains("ctx-rest-recovered-live-missing")
                 && system_context.contains("rest recovered runtime context"),
             "context-only recovery should persist REST runtime context append: {system_context}"
+        );
+        let live_export = state.session_service.export_live_session(&session_id).await;
+        assert!(
+            matches!(live_export, Err(SessionError::NotFound { .. })),
+            "context-only recovery output must wait for the machine-owned commit before exporting live truth"
         );
     }
 
@@ -6995,12 +7030,15 @@ mod tests {
             .expect("deferred session create should succeed");
         state
             .session_service
-            .archive(&session_id)
+            .archive_with_machine_protocol(
+                &session_id,
+                MachineSessionArchiveProtocol::from_machine(state.runtime_adapter.as_ref()),
+            )
             .await
-            .expect("archive should succeed");
+            .expect("archive should retire through machine authority");
         assert!(
             state.runtime_adapter.contains_session(&session_id).await,
-            "test requires stale runtime registration after service-only archive"
+            "machine archive leaves a retired runtime registration for cleanup"
         );
         session_id
     }
@@ -7258,9 +7296,8 @@ mod tests {
             .prepare_bindings(session_id.clone())
             .await
             .expect("runtime bindings should prepare");
-        let created = state
-            .session_service
-            .create_session(SvcCreateSessionRequest {
+        let (request, initial_turn) =
+            split_runtime_backed_eager_create_request(SvcCreateSessionRequest {
                 model: state.default_model.to_string(),
                 prompt: "Hello".to_string().into(),
                 render_metadata: None,
@@ -7277,22 +7314,27 @@ mod tests {
                         .clone()
                         .map(encode_llm_client_override_for_service),
                     runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
-                    initial_turn_metadata: Some(
-                        meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
-                            execution_kind: Some(
-                                meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn,
-                            ),
-                            ..Default::default()
-                        },
-                    ),
                     ..Default::default()
                 }),
                 labels: None,
-            })
+            });
+        let created = state
+            .session_service
+            .create_session(request)
             .await
-            .expect("completed session create should succeed");
+            .expect("deferred session create should succeed");
+        let initial_turn =
+            initial_turn.expect("runtime-backed eager fixture should split an initial turn");
+        let completed = run_runtime_backed_initial_turn_with_machine(
+            &state.session_service,
+            &state.runtime_adapter,
+            &created.session_id,
+            initial_turn,
+        )
+        .await
+        .expect("initial service turn should commit through machine receipt");
         ensure_rest_session_runtime_executor(state, &created.session_id).await;
-        created.session_id
+        completed.session_id
     }
 
     #[cfg(feature = "comms")]
@@ -7304,9 +7346,8 @@ mod tests {
             .prepare_bindings(session_id.clone())
             .await
             .expect("runtime bindings should prepare");
-        let created = state
-            .session_service
-            .create_session(SvcCreateSessionRequest {
+        let (request, initial_turn) =
+            split_runtime_backed_eager_create_request(SvcCreateSessionRequest {
                 model: state.default_model.to_string(),
                 prompt: "Hello".to_string().into(),
                 render_metadata: None,
@@ -7325,22 +7366,27 @@ mod tests {
                         .clone()
                         .map(encode_llm_client_override_for_service),
                     runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
-                    initial_turn_metadata: Some(
-                        meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
-                            execution_kind: Some(
-                                meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn,
-                            ),
-                            ..Default::default()
-                        },
-                    ),
                     ..Default::default()
                 }),
                 labels: None,
-            })
+            });
+        let created = state
+            .session_service
+            .create_session(request)
             .await
-            .expect("completed comms session create should succeed");
+            .expect("deferred comms session create should succeed");
+        let initial_turn =
+            initial_turn.expect("runtime-backed eager fixture should split an initial turn");
+        let completed = run_runtime_backed_initial_turn_with_machine(
+            &state.session_service,
+            &state.runtime_adapter,
+            &created.session_id,
+            initial_turn,
+        )
+        .await
+        .expect("initial comms service turn should commit through machine receipt");
         ensure_rest_session_runtime_executor(state, &created.session_id).await;
-        created.session_id
+        completed.session_id
     }
 
     async fn wait_for_rest_llm_calls(calls: &AtomicUsize, expected: usize, description: &str) {
@@ -7796,13 +7842,55 @@ mod tests {
             .session_service
             .runtime_store()
             .expect("REST capacity test state should include runtime store");
+        let persisted_input = meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
+            "conflicting recovered prompt",
+            Some(
+                meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+                    execution_kind: Some(
+                        meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn,
+                    ),
+                    ..Default::default()
+                },
+            ),
+        ));
+        let policy = meerkat_runtime::DefaultPolicyTable::resolve(&persisted_input, true);
+        let mut input_state =
+            meerkat_runtime::InputState::new_accepted(persisted_input.header().id.clone());
+        input_state.runtime_semantics = Some(
+            meerkat_runtime::ingress_types::RuntimeInputSemantics::from_policy_and_kind(
+                &policy,
+                persisted_input.kind(),
+            ),
+        );
+        input_state.policy = Some(meerkat_runtime::PolicySnapshot {
+            version: policy.policy_version,
+            decision: policy,
+        });
+        input_state.persisted_input = Some(persisted_input);
+        let active_input = meerkat_runtime::input_state::StoredInputState {
+            state: input_state,
+            seed: meerkat_runtime::input_state::InputStateSeed::new_accepted(),
+        };
+        state
+            .runtime_adapter
+            .register_session(target_session_id.clone())
+            .await;
+        state
+            .runtime_adapter
+            .stop_runtime_executor(&target_session_id, "seed stopped projection")
+            .await
+            .expect("persist conflicting stopped runtime projection");
+        state
+            .runtime_adapter
+            .unregister_session(&target_session_id)
+            .await;
         runtime_store
-            .persist_runtime_state(
+            .persist_input_state(
                 &meerkat_runtime::LogicalRuntimeId::for_session(&target_session_id),
-                meerkat_runtime::RuntimeState::Stopped,
+                &active_input,
             )
             .await
-            .expect("persist stopped runtime state");
+            .expect("persist conflicting active input state");
 
         let outcome = Box::pin(continue_session_inner(
             &state,
@@ -7832,11 +7920,13 @@ mod tests {
         match outcome {
             RequestTerminal::RespondWithoutPublish(Err(ApiError::Internal(message))) => {
                 assert!(
-                    message.contains("stopped"),
-                    "expected stopped-runtime accept failure: {message}"
+                    message.contains(
+                        "runtime-state projection 'stopped' conflicts with 1 active inputs"
+                    ),
+                    "expected terminal projection conflict: {message}"
                 );
             }
-            other => panic!("expected stopped-runtime accept failure, got {other:?}"),
+            other => panic!("expected terminal projection conflict, got {other:?}"),
         }
 
         assert!(
@@ -8382,9 +8472,12 @@ mod tests {
         let session_id = created.session_id;
         state
             .session_service
-            .archive(&session_id)
+            .archive_with_machine_protocol(
+                &session_id,
+                MachineSessionArchiveProtocol::from_machine(state.runtime_adapter.as_ref()),
+            )
             .await
-            .expect("archive should succeed");
+            .expect("archive should retire through machine authority");
 
         let primitive =
             RunPrimitive::StagedInput(meerkat_core::lifecycle::run_primitive::StagedRunInput {
@@ -10008,51 +10101,37 @@ mod tests {
             .unwrap();
         state.llm_client_override = Some(Arc::new(MockLlmClient));
         let session_service = state.session_service.clone();
-        let created = session_service
-            .create_session(SvcCreateSessionRequest {
-                model: state.default_model.to_string(),
-                prompt: "Hello".to_string().into(),
-                render_metadata: None,
-                system_prompt: None,
-                max_tokens: Some(state.max_tokens),
-                event_tx: None,
-
-                skill_references: None,
-                initial_turn: InitialTurnPolicy::RunImmediately,
-                deferred_prompt_policy: DeferredPromptPolicy::Discard,
-                build: Some(SessionBuildOptions {
-                    llm_client_override: state
-                        .llm_client_override
-                        .clone()
-                        .map(encode_llm_client_override_for_service),
-                    ..Default::default()
-                }),
-                labels: None,
-            })
-            .await
-            .expect("session create should succeed");
-        let session_id = created.session_id.to_string();
-
-        session_service
-            .start_turn(
-                &created.session_id,
-                meerkat_core::service::StartTurnRequest {
-                    prompt: "Follow up".to_string().into(),
-                    system_prompt: None,
-                    render_metadata: None,
-                    handling_mode: meerkat_core::types::HandlingMode::Queue,
-                    event_tx: None,
-
-                    skill_references: None,
-                    flow_tool_overlay: None,
-                    pre_turn_context_appends: Vec::new(),
-                    turn_metadata: None,
-                },
-            )
-            .await
-            .expect("second turn should succeed");
+        let created_session_id = create_completed_rest_runtime_session(&state).await;
+        let session_id = created_session_id.to_string();
 
         let app = router(state.clone());
+        let continue_request = axum::http::Request::builder()
+            .method("POST")
+            .uri(format!("/sessions/{session_id}/messages"))
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "session_id": session_id,
+                    "prompt": "Follow up"
+                }))
+                .unwrap(),
+            ))
+            .unwrap();
+        let continue_response = app.clone().oneshot(continue_request).await.unwrap();
+        let continue_status = continue_response.status();
+        let continue_body = continue_response
+            .into_body()
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(
+            continue_status,
+            StatusCode::OK,
+            "second turn should succeed through the REST/session-runtime composition path: {}",
+            String::from_utf8_lossy(&continue_body)
+        );
+
         let request = axum::http::Request::builder()
             .method("GET")
             .uri(format!("/sessions/{session_id}/history?offset=1&limit=2"))
@@ -10074,9 +10153,12 @@ mod tests {
         assert_eq!(payload["messages"].as_array().unwrap().len(), 2);
 
         session_service
-            .archive(&created.session_id)
+            .archive_with_machine_protocol(
+                &created_session_id,
+                MachineSessionArchiveProtocol::from_machine(state.runtime_adapter.as_ref()),
+            )
             .await
-            .expect("archive should succeed");
+            .expect("archive should retire through machine authority");
 
         let archived_request = axum::http::Request::builder()
             .method("GET")
@@ -10102,11 +10184,11 @@ mod tests {
             "archived history should return the full transcript"
         );
 
-        ensure_rest_session_runtime_executor(&state, &created.session_id).await;
+        ensure_rest_session_runtime_executor(&state, &created_session_id).await;
         assert!(
             state
                 .runtime_adapter
-                .contains_session(&created.session_id)
+                .contains_session(&created_session_id)
                 .await,
             "test should start with a stale runtime registration"
         );
@@ -10128,7 +10210,7 @@ mod tests {
         assert!(
             !state
                 .runtime_adapter
-                .contains_session(&created.session_id)
+                .contains_session(&created_session_id)
                 .await,
             "archived REST continue must not register runtime state"
         );
@@ -11907,7 +11989,7 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn test_interrupt_cold_persisted_stopped_runtime_returns_conflict() {
+        async fn test_interrupt_cold_persisted_stopped_projection_is_noop_when_session_exists() {
             use axum::body::Body;
             use http_body_util::BodyExt;
             use tower::ServiceExt;
@@ -11940,17 +12022,19 @@ mod tests {
                 })
                 .await
                 .expect("service-owned idle session should be created");
-            let runtime_store = state
-                .session_service
-                .runtime_store()
-                .expect("REST test state should include runtime store");
-            runtime_store
-                .persist_runtime_state(
-                    &meerkat_runtime::LogicalRuntimeId::for_session(&created.session_id),
-                    meerkat_runtime::RuntimeState::Stopped,
-                )
+            state
+                .runtime_adapter
+                .register_session(created.session_id.clone())
+                .await;
+            state
+                .runtime_adapter
+                .stop_runtime_executor(&created.session_id, "seed stopped projection")
                 .await
                 .expect("runtime state should persist");
+            state
+                .runtime_adapter
+                .unregister_session(&created.session_id)
+                .await;
             let app = router(state);
 
             let response = app
@@ -11966,17 +12050,9 @@ mod tests {
 
             let status = response.status();
             let body = response.into_body().collect().await.unwrap().to_bytes();
-            assert_eq!(
-                status,
-                StatusCode::CONFLICT,
-                "interrupt response body: {}",
-                String::from_utf8_lossy(&body)
-            );
+            assert_eq!(status, StatusCode::OK);
             let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-            assert!(
-                payload["error"].as_str().unwrap().contains("stopped"),
-                "unexpected payload: {payload}"
-            );
+            assert_eq!(payload["interrupted"], true);
         }
 
         #[tokio::test]

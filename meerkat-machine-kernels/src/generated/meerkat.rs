@@ -4459,6 +4459,10 @@ pub mod inputs {
         pub run_id: RunId,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct CancelRun {
+        pub run_id: RunId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct RollbackRun {
         pub run_id: RunId,
     }
@@ -4557,6 +4561,10 @@ pub mod inputs {
     pub struct ForceCancelNoRun {}
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct RunCompleted {
+        pub run_id: RunId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ServiceTurnCommitted {
         pub run_id: RunId,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -4957,6 +4965,10 @@ pub mod inputs {
         pub observed_ms: u64,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RealtimeProjectionBaselineObserved {
+        pub observed_ms: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct RealtimeProjectionReset {
         pub baseline_ms: u64,
     }
@@ -5089,6 +5101,7 @@ pub enum Input {
     Prepare(inputs::Prepare),
     Commit(inputs::Commit),
     Fail(inputs::Fail),
+    CancelRun(inputs::CancelRun),
     RollbackRun(inputs::RollbackRun),
     Recycle(inputs::Recycle),
     StartConversationRun(inputs::StartConversationRun),
@@ -5119,6 +5132,7 @@ pub enum Input {
     TimeBudgetExceeded(inputs::TimeBudgetExceeded),
     ForceCancelNoRun(inputs::ForceCancelNoRun),
     RunCompleted(inputs::RunCompleted),
+    ServiceTurnCommitted(inputs::ServiceTurnCommitted),
     RunFailed(inputs::RunFailed),
     RunCancelled(inputs::RunCancelled),
     RecoverInputLifecycle(inputs::RecoverInputLifecycle),
@@ -5214,6 +5228,7 @@ pub enum Input {
     ProductTurnTerminal(inputs::ProductTurnTerminal),
     RealtimeProjectionAdvanceObserved(inputs::RealtimeProjectionAdvanceObserved),
     RealtimeProjectionRefreshed(inputs::RealtimeProjectionRefreshed),
+    RealtimeProjectionBaselineObserved(inputs::RealtimeProjectionBaselineObserved),
     RealtimeProjectionReset(inputs::RealtimeProjectionReset),
     ClassifyRealtimeClientInputSubmitted(inputs::ClassifyRealtimeClientInputSubmitted),
     ClassifyRealtimeMidTurnActivity(inputs::ClassifyRealtimeMidTurnActivity),
@@ -5287,6 +5302,7 @@ impl Input {
             Self::Prepare(_) => InputKind::Prepare,
             Self::Commit(_) => InputKind::Commit,
             Self::Fail(_) => InputKind::Fail,
+            Self::CancelRun(_) => InputKind::CancelRun,
             Self::RollbackRun(_) => InputKind::RollbackRun,
             Self::Recycle(_) => InputKind::Recycle,
             Self::StartConversationRun(_) => InputKind::StartConversationRun,
@@ -5317,6 +5333,7 @@ impl Input {
             Self::TimeBudgetExceeded(_) => InputKind::TimeBudgetExceeded,
             Self::ForceCancelNoRun(_) => InputKind::ForceCancelNoRun,
             Self::RunCompleted(_) => InputKind::RunCompleted,
+            Self::ServiceTurnCommitted(_) => InputKind::ServiceTurnCommitted,
             Self::RunFailed(_) => InputKind::RunFailed,
             Self::RunCancelled(_) => InputKind::RunCancelled,
             Self::RecoverInputLifecycle(_) => InputKind::RecoverInputLifecycle,
@@ -5416,6 +5433,9 @@ impl Input {
                 InputKind::RealtimeProjectionAdvanceObserved
             }
             Self::RealtimeProjectionRefreshed(_) => InputKind::RealtimeProjectionRefreshed,
+            Self::RealtimeProjectionBaselineObserved(_) => {
+                InputKind::RealtimeProjectionBaselineObserved
+            }
             Self::RealtimeProjectionReset(_) => InputKind::RealtimeProjectionReset,
             Self::ClassifyRealtimeClientInputSubmitted(_) => {
                 InputKind::ClassifyRealtimeClientInputSubmitted
@@ -5492,6 +5512,7 @@ pub enum InputKind {
     Prepare,
     Commit,
     Fail,
+    CancelRun,
     RollbackRun,
     Recycle,
     StartConversationRun,
@@ -5522,6 +5543,7 @@ pub enum InputKind {
     TimeBudgetExceeded,
     ForceCancelNoRun,
     RunCompleted,
+    ServiceTurnCommitted,
     RunFailed,
     RunCancelled,
     RecoverInputLifecycle,
@@ -5617,6 +5639,7 @@ pub enum InputKind {
     ProductTurnTerminal,
     RealtimeProjectionAdvanceObserved,
     RealtimeProjectionRefreshed,
+    RealtimeProjectionBaselineObserved,
     RealtimeProjectionReset,
     ClassifyRealtimeClientInputSubmitted,
     ClassifyRealtimeMidTurnActivity,
@@ -6289,7 +6312,9 @@ pub enum TransitionId {
     RetireRequestedFromIdle,
     RetireAlreadyRetired,
     Reset,
-    StopRuntimeExecutorUnbound,
+    StopRuntimeExecutorInitializing,
+    StopRuntimeExecutorIdle,
+    StopRuntimeExecutorRetired,
     StopRuntimeExecutorAttached,
     StopRuntimeExecutorRunning,
     RuntimeExecutorExitedFromAttached,
@@ -6353,10 +6378,17 @@ pub enum TransitionId {
     ClassifyExternalEnvelopeMessageAttached,
     ClassifyExternalEnvelopeMessageRunning,
     ClassifyExternalEnvelopeRequestPeerAddedAttached,
+    ClassifyExternalEnvelopeRequestPeerAddedIdle,
     ClassifyExternalEnvelopeRequestPeerAddedRunning,
     ClassifyExternalEnvelopeRequestPeerRetiredAttached,
+    ClassifyExternalEnvelopeRequestPeerRetiredIdle,
+    ClassifyExternalEnvelopeRequestPeerRetiredRetired,
+    ClassifyExternalEnvelopeRequestPeerRetiredStopped,
     ClassifyExternalEnvelopeRequestPeerRetiredRunning,
     ClassifyExternalEnvelopeRequestPeerUnwiredAttached,
+    ClassifyExternalEnvelopeRequestPeerUnwiredIdle,
+    ClassifyExternalEnvelopeRequestPeerUnwiredRetired,
+    ClassifyExternalEnvelopeRequestPeerUnwiredStopped,
     ClassifyExternalEnvelopeRequestPeerUnwiredRunning,
     ClassifyExternalEnvelopeRequestSupervisorSilentAttached,
     ClassifyExternalEnvelopeRequestSupervisorSilentRunning,
@@ -6366,10 +6398,17 @@ pub enum TransitionId {
     ClassifyExternalEnvelopeRequestSupervisorRunning,
     ClassifyExternalEnvelopeRequestActionableAttached,
     ClassifyExternalEnvelopeRequestActionableRunning,
+    ClassifyExternalEnvelopeLifecycleAddedIdle,
     ClassifyExternalEnvelopeLifecycleAddedAttached,
     ClassifyExternalEnvelopeLifecycleAddedRunning,
+    ClassifyExternalEnvelopeLifecycleRetiredIdle,
+    ClassifyExternalEnvelopeLifecycleRetiredRetired,
+    ClassifyExternalEnvelopeLifecycleRetiredStopped,
     ClassifyExternalEnvelopeLifecycleRetiredAttached,
     ClassifyExternalEnvelopeLifecycleRetiredRunning,
+    ClassifyExternalEnvelopeLifecycleUnwiredIdle,
+    ClassifyExternalEnvelopeLifecycleUnwiredRetired,
+    ClassifyExternalEnvelopeLifecycleUnwiredStopped,
     ClassifyExternalEnvelopeLifecycleUnwiredAttached,
     ClassifyExternalEnvelopeLifecycleUnwiredRunning,
     ClassifyExternalEnvelopeResponseAcceptedAttached,
@@ -6423,6 +6462,9 @@ pub enum TransitionId {
     TimeBudgetExceeded,
     ForceCancelNoRun,
     RunCompleted,
+    ServiceTurnCommittedRunningToIdle,
+    ServiceTurnCommittedRunningToAttached,
+    ServiceTurnCommittedRunningToRetired,
     RunFailed,
     RunCancelled,
     SurfaceRegisterAttached,
@@ -6469,6 +6511,9 @@ pub enum TransitionId {
     FailRunningToIdle,
     FailRunningToAttached,
     FailRunningToRetired,
+    CancelRunningToIdle,
+    CancelRunningToAttached,
+    CancelRunningToRetired,
     RollbackRunRunningToIdle,
     RollbackRunRunningToAttached,
     RollbackRunRunningToRetired,
@@ -6910,6 +6955,12 @@ pub enum TransitionId {
     RealtimeProjectionRefreshedRunning,
     RealtimeProjectionRefreshedRetired,
     RealtimeProjectionRefreshedStopped,
+    RealtimeProjectionBaselineObservedCleanInitializing,
+    RealtimeProjectionBaselineObservedCleanIdle,
+    RealtimeProjectionBaselineObservedCleanAttached,
+    RealtimeProjectionBaselineObservedCleanRunning,
+    RealtimeProjectionBaselineObservedCleanRetired,
+    RealtimeProjectionBaselineObservedCleanStopped,
     RealtimeProjectionResetInitializing,
     RealtimeProjectionResetIdle,
     RealtimeProjectionResetAttached,

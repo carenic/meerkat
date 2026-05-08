@@ -1132,7 +1132,7 @@ async fn destroy_keeps_committed_dsl_state_when_runtime_destroyed_signal_dispatc
 }
 
 #[tokio::test]
-async fn persistent_retire_keeps_committed_dsl_state_when_runtime_retired_signal_dispatch_fails() {
+async fn persistent_retire_signal_failure_recovery_preserves_durable_terminal_state() {
     let store = Arc::new(crate::store::InMemoryRuntimeStore::new());
     let machine = MeerkatMachine::persistent(
         store.clone() as Arc<dyn crate::store::RuntimeStore>,
@@ -1164,14 +1164,21 @@ async fn persistent_retire_keeps_committed_dsl_state_when_runtime_retired_signal
     );
 
     let recovered = MeerkatMachine::persistent(
-        store as Arc<dyn crate::store::RuntimeStore>,
+        store.clone() as Arc<dyn crate::store::RuntimeStore>,
         memory_blob_store(),
     );
     recovered.register_session(session_id.clone()).await;
     assert_eq!(
         recovered.existing_session_runtime_state(&session_id).await,
         Some(RuntimeState::Retired),
-        "cold restart must agree with the live process after failed retire signal dispatch"
+        "cold restart must preserve the durable machine-owned terminal state"
+    );
+    assert_eq!(
+        crate::store::RuntimeStore::load_runtime_state(store.as_ref(), &runtime_id)
+            .await
+            .expect("load persisted runtime state after recovery"),
+        Some(RuntimeState::Retired),
+        "recovery must not rewrite the durable terminal projection back to a live lifecycle"
     );
 }
 
@@ -1457,7 +1464,90 @@ async fn machine_terminal_failure_preserves_typed_cause_through_runtime_loop() {
         other => panic!("expected typed abandoned completion, got {other:?}"),
     }
 
-    let (terminal_cause_kind, runtime_apply_failure_cause, runtime_apply_failure_message) =
+    let (
+        terminal_outcome,
+        terminal_cause_kind,
+        runtime_apply_failure_cause,
+        runtime_apply_failure_message,
+    ) = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let observed = {
+                let sessions = adapter.sessions.read().await;
+                let entry = sessions.get(&session_id).expect("session should exist");
+                let authority = entry
+                    .dsl_authority
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                (
+                    authority.state.terminal_outcome,
+                    authority.state.terminal_cause_kind,
+                    authority.state.last_runtime_apply_failure_cause,
+                    authority.state.last_runtime_apply_failure_message.clone(),
+                )
+            };
+            if observed.1.is_some() {
+                break observed;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("runtime loop should terminalize the typed machine failure");
+
+    assert_eq!(terminal_outcome, Some(mm_dsl::TurnTerminalOutcome::Failed));
+    assert_eq!(
+        terminal_cause_kind,
+        Some(mm_dsl::TurnTerminalCauseKind::LlmFailure)
+    );
+    assert_eq!(runtime_apply_failure_cause, None);
+    assert_eq!(runtime_apply_failure_message, None);
+}
+
+#[tokio::test]
+async fn machine_terminal_failure_preserves_typed_outcome_through_runtime_loop() {
+    struct TypedOutcomeFailureExecutor;
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for TypedOutcomeFailureExecutor {
+        async fn apply(
+            &mut self,
+            _run_id: RunId,
+            _primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            Err(CoreExecutorError::terminal_failure(
+                meerkat_core::TurnTerminalOutcome::StructuredOutputValidationFailed,
+                meerkat_core::TurnTerminalCauseKind::StructuredOutputValidationFailed,
+                "schema validation failed",
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    adapter
+        .register_session_with_executor(session_id.clone(), Box::new(TypedOutcomeFailureExecutor))
+        .await;
+
+    adapter
+        .accept_input(&session_id, make_prompt("typed outcome machine failure"))
+        .await
+        .expect("input should be accepted");
+
+    let (terminal_outcome, terminal_cause_kind) =
         tokio::time::timeout(Duration::from_secs(1), async {
             loop {
                 let observed = {
@@ -1468,12 +1558,11 @@ async fn machine_terminal_failure_preserves_typed_cause_through_runtime_loop() {
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
                     (
+                        authority.state.terminal_outcome,
                         authority.state.terminal_cause_kind,
-                        authority.state.last_runtime_apply_failure_cause,
-                        authority.state.last_runtime_apply_failure_message.clone(),
                     )
                 };
-                if observed.0.is_some() {
+                if observed.1.is_some() {
                     break observed;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1483,11 +1572,13 @@ async fn machine_terminal_failure_preserves_typed_cause_through_runtime_loop() {
         .expect("runtime loop should terminalize the typed machine failure");
 
     assert_eq!(
-        terminal_cause_kind,
-        Some(mm_dsl::TurnTerminalCauseKind::LlmFailure)
+        terminal_outcome,
+        Some(mm_dsl::TurnTerminalOutcome::StructuredOutputValidationFailed)
     );
-    assert_eq!(runtime_apply_failure_cause, None);
-    assert_eq!(runtime_apply_failure_message, None);
+    assert_eq!(
+        terminal_cause_kind,
+        Some(mm_dsl::TurnTerminalCauseKind::StructuredOutputValidationFailed)
+    );
 }
 
 #[tokio::test]
@@ -3837,27 +3928,6 @@ async fn persistent_destroy_durable_commit_observes_canonical_destroy_truth() {
 
     #[async_trait::async_trait]
     impl RuntimeStore for BlockingDestroyCommitStore {
-        async fn commit_session_boundary(
-            &self,
-            runtime_id: &LogicalRuntimeId,
-            session_delta: crate::store::SessionDelta,
-            run_id: RunId,
-            boundary: RunApplyBoundary,
-            contributing_input_ids: Vec<InputId>,
-            input_updates: Vec<crate::input_state::StoredInputState>,
-        ) -> Result<RunBoundaryReceipt, crate::store::RuntimeStoreError> {
-            self.inner
-                .commit_session_boundary(
-                    runtime_id,
-                    session_delta,
-                    run_id,
-                    boundary,
-                    contributing_input_ids,
-                    input_updates,
-                )
-                .await
-        }
-
         async fn commit_session_snapshot(
             &self,
             runtime_id: &LogicalRuntimeId,
@@ -3930,14 +4000,6 @@ async fn persistent_destroy_durable_commit_observes_canonical_destroy_truth() {
             self.inner.load_input_state(runtime_id, input_id).await
         }
 
-        async fn persist_runtime_state(
-            &self,
-            runtime_id: &LogicalRuntimeId,
-            state: RuntimeState,
-        ) -> Result<(), crate::store::RuntimeStoreError> {
-            self.inner.persist_runtime_state(runtime_id, state).await
-        }
-
         async fn load_runtime_state(
             &self,
             runtime_id: &LogicalRuntimeId,
@@ -3945,16 +4007,16 @@ async fn persistent_destroy_durable_commit_observes_canonical_destroy_truth() {
             self.inner.load_runtime_state(runtime_id).await
         }
 
-        async fn atomic_lifecycle_commit(
+        async fn commit_machine_lifecycle(
             &self,
             runtime_id: &LogicalRuntimeId,
-            runtime_state: RuntimeState,
+            commit: crate::store::MachineLifecycleCommit,
             input_states: &[crate::input_state::StoredInputState],
         ) -> Result<(), crate::store::RuntimeStoreError> {
             self.inner
-                .atomic_lifecycle_commit(runtime_id, runtime_state, input_states)
+                .commit_machine_lifecycle(runtime_id, commit, input_states)
                 .await?;
-            if runtime_state == RuntimeState::Destroyed {
+            if commit.runtime_state() == RuntimeState::Destroyed {
                 self.destroy_commit_started.notify_one();
                 self.release_destroy_commit.notified().await;
             }
@@ -3984,21 +4046,15 @@ async fn persistent_destroy_durable_commit_observes_canonical_destroy_truth() {
     .await
     .expect("destroy should reach the durable lifecycle commit");
 
-    assert_eq!(
-        store.inner.load_runtime_state(&runtime_id).await.unwrap(),
-        Some(RuntimeState::Destroyed),
-        "test probe should observe the store after durable destroyed commit",
-    );
-
     {
         let sessions = adapter.sessions.read().await;
         let entry = sessions
             .get(&session_id)
             .expect("destroy keeps the session entry available for terminal snapshots");
-        assert_eq!(
+        assert_ne!(
             entry.control_snapshot().phase,
             RuntimeState::Destroyed,
-            "durable destroyed state must not become visible while the shared driver projection still trails canonical destroy",
+            "destroyed visibility must wait until the lifecycle commit is acknowledged",
         );
         let authority = entry
             .dsl_authority
@@ -4018,6 +4074,22 @@ async fn persistent_destroy_durable_commit_observes_canonical_destroy_truth() {
         .expect("destroy task should not panic")
         .expect("destroy should succeed");
     assert_eq!(report.inputs_abandoned, 0);
+    assert_eq!(
+        store.inner.load_runtime_state(&runtime_id).await.unwrap(),
+        Some(RuntimeState::Destroyed),
+        "test probe should observe the durable destroyed commit after ack",
+    );
+    {
+        let sessions = adapter.sessions.read().await;
+        let entry = sessions
+            .get(&session_id)
+            .expect("destroy keeps the session entry available for terminal snapshots");
+        assert_eq!(
+            entry.control_snapshot().phase,
+            RuntimeState::Destroyed,
+            "destroyed visibility should publish after the lifecycle commit is acknowledged",
+        );
+    }
 }
 
 #[tokio::test]
@@ -5818,7 +5890,7 @@ async fn cancel_after_boundary_on_attached_runtime_calls_live_handle_and_queues_
 }
 
 #[tokio::test]
-async fn cancel_after_boundary_live_wake_is_not_blocked_by_full_effect_channel() {
+async fn cancel_after_boundary_full_effect_channel_fails_closed_after_live_wake() {
     struct BlockingExecutor {
         live_boundary_cancel_calls: Arc<AtomicUsize>,
         queued_boundary_cancel_calls: Arc<AtomicUsize>,
@@ -5943,17 +6015,21 @@ async fn cancel_after_boundary_live_wake_is_not_blocked_by_full_effect_channel()
         "runtime loop is still blocked inside apply, so queued effects have not drained"
     );
 
-    tokio::time::timeout(
+    let err = tokio::time::timeout(
         Duration::from_millis(500),
         adapter.cancel_after_boundary(&session_id),
     )
     .await
     .expect("live boundary cancel must not wait for capacity in the bounded effect channel")
-    .expect("live boundary cancel should succeed after best-effort enqueue");
+    .expect_err("full effect channel must fail closed instead of dropping the queued effect");
+    assert!(
+        err.to_string().contains("runtime effect channel full"),
+        "unexpected cancel error: {err}"
+    );
     assert_eq!(
         live_boundary_cancel_calls.load(Ordering::SeqCst),
         17,
-        "saturated effect channel must not prevent the live cooperative wake"
+        "saturated effect channel reports failure after attempting the live cooperative wake"
     );
 
     allow_finish.notify_waiters();
@@ -14050,50 +14126,45 @@ fn batch_receipt(run_id: RunId, contributing_input_ids: Vec<InputId>) -> RunBoun
 struct RuntimeCommitAtomicityStore {
     inner: Arc<crate::store::InMemoryRuntimeStore>,
     fail_atomic_apply: AtomicBool,
-    fail_atomic_lifecycle_commit: AtomicBool,
+    fail_commit_machine_lifecycle: AtomicBool,
+    commit_machine_lifecycle_calls: AtomicUsize,
 }
 
 impl RuntimeCommitAtomicityStore {
+    fn pass_through(inner: Arc<crate::store::InMemoryRuntimeStore>) -> Self {
+        Self {
+            inner,
+            fail_atomic_apply: AtomicBool::new(false),
+            fail_commit_machine_lifecycle: AtomicBool::new(false),
+            commit_machine_lifecycle_calls: AtomicUsize::new(0),
+        }
+    }
+
     fn fail_atomic_apply_once(inner: Arc<crate::store::InMemoryRuntimeStore>) -> Self {
         Self {
             inner,
             fail_atomic_apply: AtomicBool::new(true),
-            fail_atomic_lifecycle_commit: AtomicBool::new(false),
+            fail_commit_machine_lifecycle: AtomicBool::new(false),
+            commit_machine_lifecycle_calls: AtomicUsize::new(0),
         }
     }
 
-    fn fail_atomic_lifecycle_commit_once(inner: Arc<crate::store::InMemoryRuntimeStore>) -> Self {
+    fn fail_commit_machine_lifecycle_once(inner: Arc<crate::store::InMemoryRuntimeStore>) -> Self {
         Self {
             inner,
             fail_atomic_apply: AtomicBool::new(false),
-            fail_atomic_lifecycle_commit: AtomicBool::new(true),
+            fail_commit_machine_lifecycle: AtomicBool::new(true),
+            commit_machine_lifecycle_calls: AtomicUsize::new(0),
         }
+    }
+
+    fn commit_machine_lifecycle_calls(&self) -> usize {
+        self.commit_machine_lifecycle_calls.load(Ordering::SeqCst)
     }
 }
 
 #[async_trait::async_trait]
 impl RuntimeStore for RuntimeCommitAtomicityStore {
-    async fn commit_session_boundary(
-        &self,
-        runtime_id: &LogicalRuntimeId,
-        session_delta: crate::store::SessionDelta,
-        run_id: RunId,
-        boundary: RunApplyBoundary,
-        contributing_input_ids: Vec<InputId>,
-        input_updates: Vec<crate::input_state::StoredInputState>,
-    ) -> Result<RunBoundaryReceipt, crate::store::RuntimeStoreError> {
-        self.inner
-            .commit_session_boundary(
-                runtime_id,
-                session_delta,
-                run_id,
-                boundary,
-                contributing_input_ids,
-                input_updates,
-            )
-            .await
-    }
-
     async fn commit_session_snapshot(
         &self,
         runtime_id: &LogicalRuntimeId,
@@ -14169,14 +14240,6 @@ impl RuntimeStore for RuntimeCommitAtomicityStore {
         self.inner.load_input_state(runtime_id, input_id).await
     }
 
-    async fn persist_runtime_state(
-        &self,
-        runtime_id: &LogicalRuntimeId,
-        state: RuntimeState,
-    ) -> Result<(), crate::store::RuntimeStoreError> {
-        self.inner.persist_runtime_state(runtime_id, state).await
-    }
-
     async fn load_runtime_state(
         &self,
         runtime_id: &LogicalRuntimeId,
@@ -14184,22 +14247,24 @@ impl RuntimeStore for RuntimeCommitAtomicityStore {
         self.inner.load_runtime_state(runtime_id).await
     }
 
-    async fn atomic_lifecycle_commit(
+    async fn commit_machine_lifecycle(
         &self,
         runtime_id: &LogicalRuntimeId,
-        runtime_state: RuntimeState,
+        commit: crate::store::MachineLifecycleCommit,
         input_states: &[crate::input_state::StoredInputState],
     ) -> Result<(), crate::store::RuntimeStoreError> {
+        self.commit_machine_lifecycle_calls
+            .fetch_add(1, Ordering::SeqCst);
         if self
-            .fail_atomic_lifecycle_commit
+            .fail_commit_machine_lifecycle
             .swap(false, Ordering::SeqCst)
         {
             return Err(crate::store::RuntimeStoreError::WriteFailed(
-                "synthetic atomic_lifecycle_commit failure".into(),
+                "synthetic commit_machine_lifecycle failure".into(),
             ));
         }
         self.inner
-            .atomic_lifecycle_commit(runtime_id, runtime_state, input_states)
+            .commit_machine_lifecycle(runtime_id, commit, input_states)
             .await
     }
 }
@@ -14475,10 +14540,59 @@ async fn persistent_commit_success_persists_receipt_and_terminalizes_once() {
 }
 
 #[tokio::test]
+async fn persistent_commit_success_uses_one_durable_receipt_terminal_write() {
+    let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let counting_store = Arc::new(RuntimeCommitAtomicityStore::pass_through(Arc::clone(
+        &inner,
+    )));
+    let store: Arc<dyn RuntimeStore> = counting_store.clone();
+    let (driver, runtime_id, run_id, input_id) = persistent_staged_run_driver(store).await;
+
+    commit_runtime_loop_run(
+        &driver,
+        run_id.clone(),
+        vec![input_id.clone()],
+        batch_receipt(run_id.clone(), vec![input_id.clone()]),
+        Some(b"session-data".to_vec()),
+    )
+    .await
+    .expect("persistent commit should succeed");
+
+    assert_eq!(
+        counting_store.commit_machine_lifecycle_calls(),
+        0,
+        "successful completed-run terminalization must not use a second lifecycle writer"
+    );
+    assert!(
+        inner
+            .load_boundary_receipt(&runtime_id, &run_id, 0)
+            .await
+            .unwrap()
+            .is_some(),
+        "successful commit must persist the durable boundary receipt"
+    );
+    let stored = inner
+        .load_input_state(&runtime_id, &input_id)
+        .await
+        .unwrap()
+        .expect("completed input state should be persisted with the receipt");
+    assert_eq!(
+        stored.seed.phase,
+        crate::input_state::InputLifecycleState::Consumed,
+        "receipt commit must persist the terminal input phase atomically"
+    );
+    assert_eq!(
+        stored.seed.terminal_outcome,
+        Some(crate::input_state::InputTerminalOutcome::Consumed),
+        "receipt commit must persist the terminal input outcome atomically"
+    );
+}
+
+#[tokio::test]
 async fn persistent_failed_run_lifecycle_commit_failure_preserves_pre_terminal_state() {
     let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
     let store: Arc<dyn RuntimeStore> = Arc::new(
-        RuntimeCommitAtomicityStore::fail_atomic_lifecycle_commit_once(Arc::clone(&inner)),
+        RuntimeCommitAtomicityStore::fail_commit_machine_lifecycle_once(Arc::clone(&inner)),
     );
     let (driver, runtime_id, run_id, input_id) = persistent_staged_run_driver(store).await;
 
@@ -14491,7 +14605,7 @@ async fn persistent_failed_run_lifecycle_commit_failure_preserves_pre_terminal_s
     .expect_err("synthetic lifecycle commit failure should reject the failed-run persist");
     assert!(
         err.to_string()
-            .contains("synthetic atomic_lifecycle_commit failure"),
+            .contains("synthetic commit_machine_lifecycle failure"),
         "unexpected failed-run error: {err}"
     );
 
@@ -19194,6 +19308,86 @@ async fn modeled_meerkat_accept_with_completion_idle_queue_signal_matches_runtim
         }
         other => panic!("expected runtime destroyed termination, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn wake_runtime_if_active_inputs_drains_existing_attached_queue() {
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    let apply_started = Arc::new(Notify::new());
+    let allow_finish = Arc::new(Notify::new());
+
+    adapter
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("bindings should prepare for wake replay");
+    adapter
+        .ensure_session_with_executor(
+            session_id.clone(),
+            Box::new(RuntimeParityBlockingExecutor {
+                apply_started: Arc::clone(&apply_started),
+                allow_finish: Arc::clone(&allow_finish),
+            }),
+        )
+        .await;
+    wait_for_runtime_parity_phase(&adapter, &session_id, RuntimeState::Attached).await;
+
+    let driver = {
+        let sessions = adapter.sessions.read().await;
+        sessions
+            .get(&session_id)
+            .expect("session entry should exist")
+            .driver
+            .clone()
+    };
+    {
+        let mut driver = driver.lock().await;
+        let outcome = driver
+            .as_driver_mut()
+            .accept_input(Input::Peer(crate::input::PeerInput {
+                header: crate::input::InputHeader {
+                    id: InputId::new(),
+                    timestamp: Utc::now(),
+                    source: crate::input::InputOrigin::Peer {
+                        peer_id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+                        display_identity: Some("Analyst".to_string()),
+                        runtime_id: None,
+                    },
+                    durability: crate::input::InputDurability::Durable,
+                    visibility: crate::input::InputVisibility::default(),
+                    idempotency_key: None,
+                    supersession_key: None,
+                    correlation_id: None,
+                },
+                convention: Some(crate::input::PeerConvention::ResponseTerminal {
+                    request_id: "018f6f79-7a82-7c4e-a552-a3b86f9630f1".to_string(),
+                    status: crate::input::ResponseTerminalStatus::Completed,
+                }),
+                body: "done".to_string(),
+                payload: Some(serde_json::json!({ "token": "birch seventeen" })),
+                blocks: None,
+                handling_mode: None,
+            }))
+            .await
+            .expect("direct driver accept should queue terminal peer response");
+        assert!(
+            matches!(outcome, AcceptOutcome::Accepted { .. }),
+            "expected queued accepted input, got {outcome:?}"
+        );
+    }
+
+    assert!(
+        adapter
+            .wake_runtime_if_active_inputs(&session_id)
+            .await
+            .expect("wake replay should succeed"),
+        "active queued input should request a runtime wake"
+    );
+    tokio::time::timeout(Duration::from_secs(1), apply_started.notified())
+        .await
+        .expect("wake replay should drain the attached queue");
+
+    allow_finish.notify_waiters();
 }
 
 #[tokio::test]

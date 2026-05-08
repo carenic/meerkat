@@ -225,6 +225,7 @@ pub use staged_sessions::{
 
 // Session service
 pub use meerkat_core::service::InitialTurnPolicy;
+pub use meerkat_core::service::StartTurnRuntimeSemantics;
 pub use meerkat_core::{
     AppendSystemContextRequest, AppendSystemContextResult, AppendSystemContextStatus, BlobStore,
     CreateSessionRequest, DeferredPromptPolicy, MobToolsBuildArgs, MobToolsFactory,
@@ -238,10 +239,12 @@ pub use meerkat_session::DefaultCompactor;
 // PersistentSessionService: used by runtime-backed surfaces (REST, RPC, MCP).
 // EphemeralSessionService: in-memory substrate for testing/embedded use only.
 // Both implement SessionService. Production paths add MeerkatMachine on top.
-#[cfg(feature = "session-store")]
-pub use meerkat_session::PersistentSessionService;
 pub use meerkat_session::{
     EphemeralSessionService, RuntimeContextAdmissionGuard, SessionAgent, SessionAgentBuilder,
+};
+#[cfg(feature = "session-store")]
+pub use meerkat_session::{
+    MachineServiceTurnCommitProtocol, MachineSessionArchiveProtocol, PersistentSessionService,
 };
 
 #[cfg(feature = "anthropic")]

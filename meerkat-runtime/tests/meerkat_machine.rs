@@ -5,8 +5,9 @@
     clippy::unwrap_used
 )]
 
+use std::collections::HashMap;
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 use std::time::Duration;
@@ -17,7 +18,7 @@ use meerkat_core::lifecycle::{
     InputId, RunBoundaryReceipt, RunId, run_primitive::RunApplyBoundary,
 };
 use meerkat_core::types::SessionId;
-use meerkat_runtime::input_state::StoredInputState;
+use meerkat_runtime::input_state::{InputAbandonReason, InputTerminalOutcome, StoredInputState};
 use meerkat_runtime::{
     Input, InputDurability, InputHeader, InputOrigin, InputVisibility, LogicalRuntimeId,
     MeerkatMachine, PromptInput, RuntimeDriverError, RuntimeState, RuntimeStore, RuntimeStoreError,
@@ -126,91 +127,101 @@ async fn wait_for_runtime_state(
 struct HarnessRuntimeStore {
     inner: meerkat_runtime::store::InMemoryRuntimeStore,
     fail_atomic_apply: bool,
-    /// Fail atomic_lifecycle_commit after N successful calls (None = never fail).
-    fail_atomic_lifecycle_commit_after: Option<usize>,
-    atomic_lifecycle_commit_calls: AtomicUsize,
+    fail_commit_machine_lifecycle_now: AtomicBool,
+    /// Fail commit_machine_lifecycle after N successful calls (None = never fail).
+    fail_commit_machine_lifecycle_after: Option<usize>,
+    /// Delay commit_machine_lifecycle after N successful calls (None = never delay).
+    delay_commit_machine_lifecycle_after: Option<usize>,
+    commit_machine_lifecycle_delay: Duration,
+    commit_machine_lifecycle_calls: AtomicUsize,
     load_input_states_delay: Duration,
     fail_persist_input_state_after: Option<usize>,
     persist_input_state_calls: AtomicUsize,
+    runtime_state_overrides: Mutex<HashMap<LogicalRuntimeId, RuntimeState>>,
 }
 
 impl HarnessRuntimeStore {
-    fn failing_atomic_apply() -> Self {
+    fn new() -> Self {
         Self {
             inner: meerkat_runtime::store::InMemoryRuntimeStore::new(),
-            fail_atomic_apply: true,
-            fail_atomic_lifecycle_commit_after: None,
-            atomic_lifecycle_commit_calls: AtomicUsize::new(0),
+            fail_atomic_apply: false,
+            fail_commit_machine_lifecycle_now: AtomicBool::new(false),
+            fail_commit_machine_lifecycle_after: None,
+            delay_commit_machine_lifecycle_after: None,
+            commit_machine_lifecycle_delay: Duration::ZERO,
+            commit_machine_lifecycle_calls: AtomicUsize::new(0),
             load_input_states_delay: Duration::ZERO,
             fail_persist_input_state_after: None,
             persist_input_state_calls: AtomicUsize::new(0),
+            runtime_state_overrides: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn failing_atomic_apply() -> Self {
+        Self {
+            fail_atomic_apply: true,
+            ..Self::new()
         }
     }
 
     fn delayed_recover(delay: Duration) -> Self {
         Self {
-            inner: meerkat_runtime::store::InMemoryRuntimeStore::new(),
-            fail_atomic_apply: false,
-            fail_atomic_lifecycle_commit_after: None,
-            atomic_lifecycle_commit_calls: AtomicUsize::new(0),
             load_input_states_delay: delay,
-            fail_persist_input_state_after: None,
-            persist_input_state_calls: AtomicUsize::new(0),
+            ..Self::new()
         }
     }
 
     fn failing_lifecycle_commit() -> Self {
+        Self::failing_lifecycle_commit_after(1)
+    }
+
+    fn failing_lifecycle_commit_after(successful_calls: usize) -> Self {
         Self {
-            inner: meerkat_runtime::store::InMemoryRuntimeStore::new(),
-            fail_atomic_apply: false,
-            // Session registration/recovery performs the first lifecycle
-            // commit. Let that seed succeed, then fail the command commit.
-            fail_atomic_lifecycle_commit_after: Some(1),
-            atomic_lifecycle_commit_calls: AtomicUsize::new(0),
-            load_input_states_delay: Duration::ZERO,
-            fail_persist_input_state_after: None,
-            persist_input_state_calls: AtomicUsize::new(0),
+            fail_commit_machine_lifecycle_after: Some(successful_calls),
+            ..Self::new()
         }
     }
 
     fn failing_terminal_snapshot() -> Self {
         Self {
-            inner: meerkat_runtime::store::InMemoryRuntimeStore::new(),
-            fail_atomic_apply: false,
-            // Recovery calls atomic_lifecycle_commit once (call 0 succeeds),
+            // Recovery calls commit_machine_lifecycle once (call 0 succeeds),
             // the terminal event call (call 1) fails.
-            fail_atomic_lifecycle_commit_after: Some(1),
-            atomic_lifecycle_commit_calls: AtomicUsize::new(0),
-            load_input_states_delay: Duration::ZERO,
-            fail_persist_input_state_after: None,
-            persist_input_state_calls: AtomicUsize::new(0),
+            fail_commit_machine_lifecycle_after: Some(1),
+            ..Self::new()
         }
+    }
+
+    fn delayed_terminal_lifecycle_commit(delay: Duration) -> Self {
+        Self {
+            delay_commit_machine_lifecycle_after: Some(1),
+            commit_machine_lifecycle_delay: delay,
+            ..Self::new()
+        }
+    }
+
+    fn commit_machine_lifecycle_calls(&self) -> usize {
+        self.commit_machine_lifecycle_calls.load(Ordering::SeqCst)
+    }
+
+    fn set_fail_commit_machine_lifecycle_now(&self, fail: bool) {
+        self.fail_commit_machine_lifecycle_now
+            .store(fail, Ordering::SeqCst);
+    }
+
+    fn seed_runtime_state_projection(
+        &self,
+        runtime_id: LogicalRuntimeId,
+        runtime_state: RuntimeState,
+    ) {
+        self.runtime_state_overrides
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(runtime_id, runtime_state);
     }
 }
 
 #[async_trait::async_trait]
 impl RuntimeStore for HarnessRuntimeStore {
-    async fn commit_session_boundary(
-        &self,
-        runtime_id: &meerkat_runtime::identifiers::LogicalRuntimeId,
-        session_delta: SessionDelta,
-        run_id: RunId,
-        boundary: meerkat_core::lifecycle::run_primitive::RunApplyBoundary,
-        contributing_input_ids: Vec<InputId>,
-        input_updates: Vec<StoredInputState>,
-    ) -> Result<meerkat_core::lifecycle::RunBoundaryReceipt, RuntimeStoreError> {
-        self.inner
-            .commit_session_boundary(
-                runtime_id,
-                session_delta,
-                run_id,
-                boundary,
-                contributing_input_ids,
-                input_updates,
-            )
-            .await
-    }
-
     async fn commit_session_snapshot(
         &self,
         runtime_id: &meerkat_runtime::identifiers::LogicalRuntimeId,
@@ -300,40 +311,56 @@ impl RuntimeStore for HarnessRuntimeStore {
         self.inner.load_input_state(runtime_id, input_id).await
     }
 
-    async fn persist_runtime_state(
-        &self,
-        runtime_id: &meerkat_runtime::identifiers::LogicalRuntimeId,
-        state: RuntimeState,
-    ) -> Result<(), RuntimeStoreError> {
-        self.inner.persist_runtime_state(runtime_id, state).await
-    }
-
     async fn load_runtime_state(
         &self,
         runtime_id: &meerkat_runtime::identifiers::LogicalRuntimeId,
     ) -> Result<Option<RuntimeState>, RuntimeStoreError> {
+        if let Some(runtime_state) = self
+            .runtime_state_overrides
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(runtime_id)
+            .copied()
+        {
+            return Ok(Some(runtime_state));
+        }
         self.inner.load_runtime_state(runtime_id).await
     }
 
-    async fn atomic_lifecycle_commit(
+    async fn commit_machine_lifecycle(
         &self,
         runtime_id: &meerkat_runtime::identifiers::LogicalRuntimeId,
-        runtime_state: RuntimeState,
+        commit: meerkat_runtime::store::MachineLifecycleCommit,
         input_states: &[StoredInputState],
     ) -> Result<(), RuntimeStoreError> {
         let call_index = self
-            .atomic_lifecycle_commit_calls
+            .commit_machine_lifecycle_calls
             .fetch_add(1, Ordering::SeqCst);
         if self
-            .fail_atomic_lifecycle_commit_after
+            .fail_commit_machine_lifecycle_now
+            .load(Ordering::SeqCst)
+        {
+            return Err(RuntimeStoreError::WriteFailed(
+                "synthetic commit_machine_lifecycle failure".to_string(),
+            ));
+        }
+        if self
+            .fail_commit_machine_lifecycle_after
             .is_some_and(|fail_after| call_index >= fail_after)
         {
             return Err(RuntimeStoreError::WriteFailed(
-                "synthetic atomic_lifecycle_commit failure".to_string(),
+                "synthetic commit_machine_lifecycle failure".to_string(),
             ));
         }
+        if self
+            .delay_commit_machine_lifecycle_after
+            .is_some_and(|delay_after| call_index >= delay_after)
+            && !self.commit_machine_lifecycle_delay.is_zero()
+        {
+            tokio::time::sleep(self.commit_machine_lifecycle_delay).await;
+        }
         self.inner
-            .atomic_lifecycle_commit(runtime_id, runtime_state, input_states)
+            .commit_machine_lifecycle(runtime_id, commit, input_states)
             .await
     }
 
@@ -428,7 +455,7 @@ async fn lifecycle_commit_failure_restores_staged_session_dsl_state() {
         .expect_err("retire should surface lifecycle commit failure");
     assert!(
         err.to_string()
-            .contains("synthetic atomic_lifecycle_commit failure"),
+            .contains("synthetic commit_machine_lifecycle failure"),
         "unexpected error: {err}",
     );
     assert_eq!(
@@ -468,7 +495,7 @@ async fn destroy_lifecycle_commit_failure_restores_staged_session_dsl_state() {
         .expect_err("destroy should surface lifecycle commit failure");
     assert!(
         err.to_string()
-            .contains("synthetic atomic_lifecycle_commit failure"),
+            .contains("synthetic commit_machine_lifecycle failure"),
         "unexpected error: {err}",
     );
     assert_eq!(
@@ -495,7 +522,316 @@ async fn destroy_lifecycle_commit_failure_restores_staged_session_dsl_state() {
 }
 
 #[tokio::test]
-async fn cold_reregister_preserves_destroyed_runtime_state() {
+async fn service_turn_terminal_lifecycle_commit_failure_rolls_back_turn_completion() {
+    let store = Arc::new(HarnessRuntimeStore::new());
+    let adapter = Arc::new(MeerkatMachine::persistent(
+        store.clone() as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
+    let sid = SessionId::new();
+    let bindings = adapter
+        .prepare_bindings(sid.clone())
+        .await
+        .expect("prepare runtime bindings");
+    let run_id = RunId::new();
+    bindings
+        .turn_state()
+        .start_immediate_append(run_id.clone())
+        .expect("start service turn through runtime handle");
+    assert_eq!(
+        adapter.runtime_state(&sid).await.unwrap(),
+        RuntimeState::Running,
+        "service turn should put the machine in a running lifecycle before terminal commit"
+    );
+
+    store.set_fail_commit_machine_lifecycle_now(true);
+    let err = adapter
+        .commit_service_turn_terminal_receipt(&sid)
+        .await
+        .expect_err("terminal lifecycle commit failure should surface");
+    assert!(
+        err.to_string()
+            .contains("synthetic commit_machine_lifecycle failure"),
+        "unexpected error: {err}",
+    );
+
+    let snapshot = bindings.turn_state().snapshot();
+    assert_eq!(snapshot.active_run_id, Some(run_id));
+    assert_eq!(
+        snapshot.turn_phase,
+        meerkat_core::turn_execution_authority::TurnPhase::ApplyingPrimitive,
+        "failed durable service-turn receipt must roll back visible terminal turn state"
+    );
+    assert_eq!(
+        snapshot.terminal_outcome, None,
+        "failed durable service-turn receipt must not leave a terminal outcome projection"
+    );
+    assert_eq!(
+        adapter.runtime_state(&sid).await.unwrap(),
+        RuntimeState::Running,
+        "failed durable service-turn receipt must preserve the running lifecycle"
+    );
+}
+
+#[tokio::test]
+async fn destroy_does_not_publish_destroyed_while_lifecycle_commit_is_in_flight() {
+    let store = Arc::new(HarnessRuntimeStore::delayed_terminal_lifecycle_commit(
+        Duration::from_millis(250),
+    ));
+    let adapter = Arc::new(MeerkatMachine::persistent(
+        store.clone() as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
+    let sid = SessionId::new();
+    adapter.register_session(sid.clone()).await;
+    let runtime_id = LogicalRuntimeId::for_session(&sid);
+
+    let (outcome, handle) = adapter
+        .accept_input_with_completion(&sid, make_prompt("destroy in flight"))
+        .await
+        .expect("input admission should succeed before delayed destroy");
+    assert!(outcome.is_accepted());
+    let handle = handle.expect("accepted input should produce a completion handle");
+
+    let baseline_commits = store.commit_machine_lifecycle_calls();
+    let destroy_adapter = Arc::clone(&adapter);
+    let destroy_runtime_id = runtime_id.clone();
+    let destroy_task = tokio::spawn(async move {
+        meerkat_runtime::traits::RuntimeControlPlane::destroy(
+            &*destroy_adapter,
+            &destroy_runtime_id,
+        )
+        .await
+    });
+
+    wait_for_atomic_usize_at_least(
+        &store.commit_machine_lifecycle_calls,
+        baseline_commits + 1,
+        "destroy lifecycle commit should enter delayed store call",
+    )
+    .await;
+
+    assert_ne!(
+        adapter.runtime_state(&sid).await.unwrap(),
+        RuntimeState::Destroyed,
+        "in-flight durable destroy commit must not publish visible Destroyed state"
+    );
+    assert_ne!(
+        store.load_runtime_state(&runtime_id).await.unwrap(),
+        Some(RuntimeState::Destroyed),
+        "in-flight durable destroy commit must not publish durable Destroyed state"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), handle.wait())
+            .await
+            .is_err(),
+        "destroy must not terminate completion waiters before durable commit"
+    );
+
+    destroy_task
+        .await
+        .expect("destroy task should not panic")
+        .expect("delayed destroy should eventually commit");
+    wait_for_runtime_state(
+        &adapter,
+        &sid,
+        RuntimeState::Destroyed,
+        "destroy should publish after durable commit",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn async_stop_lifecycle_commit_failure_does_not_publish_stopped() {
+    use meerkat_core::lifecycle::core_executor::{
+        CoreApplyOutput, CoreExecutor, CoreExecutorError,
+    };
+    use meerkat_core::lifecycle::run_primitive::RunPrimitive;
+
+    struct StopRecordingExecutor {
+        stop_called: Arc<AtomicBool>,
+        cleanup_called: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for StopRecordingExecutor {
+        async fn apply(
+            &mut self,
+            _run_id: RunId,
+            _primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            Err(CoreExecutorError::apply_failed_runtime_turn(
+                "unexpected apply during stop regression",
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            self.stop_called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn cleanup_after_runtime_stop_terminalized(
+            &mut self,
+        ) -> Result<(), CoreExecutorError> {
+            self.cleanup_called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let store = Arc::new(HarnessRuntimeStore::failing_lifecycle_commit());
+    let adapter = Arc::new(MeerkatMachine::persistent(
+        store.clone() as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
+    let sid = SessionId::new();
+    let stop_called = Arc::new(AtomicBool::new(false));
+    let cleanup_called = Arc::new(AtomicBool::new(false));
+    adapter
+        .register_session_with_executor(
+            sid.clone(),
+            Box::new(StopRecordingExecutor {
+                stop_called: Arc::clone(&stop_called),
+                cleanup_called: Arc::clone(&cleanup_called),
+            }),
+        )
+        .await;
+
+    adapter
+        .stop_runtime_executor(&sid, "async stop lifecycle failure")
+        .await
+        .expect("async stop command should enqueue the machine-approved effect");
+    wait_for_atomic_bool(&stop_called, "stop effect should reach executor").await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    assert!(
+        !cleanup_called.load(Ordering::SeqCst),
+        "post-stop cleanup must not run when durable stop terminalization fails"
+    );
+    assert!(
+        adapter.contains_session(&sid).await,
+        "failed durable stop terminalization must not unregister the session"
+    );
+    assert_ne!(
+        adapter.runtime_state(&sid).await.unwrap(),
+        RuntimeState::Stopped,
+        "failed durable stop commit must not publish visible Stopped state"
+    );
+    assert_ne!(
+        store
+            .load_runtime_state(&LogicalRuntimeId::for_session(&sid))
+            .await
+            .unwrap(),
+        Some(RuntimeState::Stopped),
+        "failed durable stop commit must not publish durable Stopped state"
+    );
+}
+
+#[tokio::test]
+async fn async_stop_does_not_publish_stopped_while_lifecycle_commit_is_in_flight() {
+    use meerkat_core::lifecycle::core_executor::{
+        CoreApplyOutput, CoreExecutor, CoreExecutorError,
+    };
+    use meerkat_core::lifecycle::run_primitive::RunPrimitive;
+
+    struct StopRecordingExecutor {
+        stop_called: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for StopRecordingExecutor {
+        async fn apply(
+            &mut self,
+            _run_id: RunId,
+            _primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            Err(CoreExecutorError::apply_failed_runtime_turn(
+                "unexpected apply during stop publish regression",
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            self.stop_called.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    let store = Arc::new(HarnessRuntimeStore::delayed_terminal_lifecycle_commit(
+        Duration::from_millis(250),
+    ));
+    let adapter = Arc::new(MeerkatMachine::persistent(
+        store.clone() as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
+    let sid = SessionId::new();
+    let stop_called = Arc::new(AtomicBool::new(false));
+    adapter
+        .register_session_with_executor(
+            sid.clone(),
+            Box::new(StopRecordingExecutor {
+                stop_called: Arc::clone(&stop_called),
+            }),
+        )
+        .await;
+
+    let baseline_commits = store.commit_machine_lifecycle_calls();
+    let stop_adapter = Arc::clone(&adapter);
+    let stop_sid = sid.clone();
+    let stop_task = tokio::spawn(async move {
+        stop_adapter
+            .stop_runtime_executor(&stop_sid, "delayed async stop")
+            .await
+    });
+
+    wait_for_atomic_bool(&stop_called, "stop effect should reach executor").await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while store.commit_machine_lifecycle_calls() <= baseline_commits {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("stop lifecycle commit should enter the delayed store call");
+
+    assert_ne!(
+        adapter.runtime_state(&sid).await.unwrap(),
+        RuntimeState::Stopped,
+        "in-flight durable stop commit must not publish visible Stopped state"
+    );
+
+    stop_task
+        .await
+        .expect("stop task should not panic")
+        .expect("delayed stop should eventually commit");
+    wait_for_runtime_state(
+        &adapter,
+        &sid,
+        RuntimeState::Stopped,
+        "stop should publish after durable commit",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn cold_reregister_preserves_canonical_destroyed_runtime_state() {
     let store = Arc::new(meerkat_runtime::store::InMemoryRuntimeStore::new());
     let sid = SessionId::new();
 
@@ -518,19 +854,21 @@ async fn cold_reregister_preserves_destroyed_runtime_state() {
     assert_eq!(
         restarted.runtime_state(&sid).await.unwrap(),
         RuntimeState::Destroyed,
-        "cold re-registration must preserve the stored destroyed phase",
+        "cold re-registration must preserve canonical durable destroyed runtime truth",
+    );
+    assert_eq!(
+        store.load_runtime_state(&runtime_id).await.unwrap(),
+        Some(RuntimeState::Destroyed),
+        "cold re-registration must not rewrite canonical durable destroyed runtime truth",
     );
 }
 
 #[tokio::test]
-async fn cold_reregister_recovers_legacy_session_uuid_runtime_state_alias() {
-    let store = Arc::new(meerkat_runtime::store::InMemoryRuntimeStore::new());
+async fn cold_reregister_ignores_legacy_session_uuid_runtime_state_alias() {
+    let store = Arc::new(HarnessRuntimeStore::delayed_recover(Duration::ZERO));
     let sid = SessionId::new();
     let legacy_runtime_alias = LogicalRuntimeId::legacy_session_uuid_alias(&sid);
-    store
-        .atomic_lifecycle_commit(&legacy_runtime_alias, RuntimeState::Destroyed, &[])
-        .await
-        .expect("seed legacy runtime state alias");
+    store.seed_runtime_state_projection(legacy_runtime_alias, RuntimeState::Destroyed);
 
     let adapter = Arc::new(MeerkatMachine::persistent(
         Arc::clone(&store) as Arc<dyn RuntimeStore>,
@@ -539,25 +877,19 @@ async fn cold_reregister_recovers_legacy_session_uuid_runtime_state_alias() {
     adapter.register_session(sid.clone()).await;
     assert_eq!(
         adapter.runtime_state(&sid).await.unwrap(),
-        RuntimeState::Destroyed,
-        "cold re-registration must recover terminal state stored under the legacy raw session UUID alias",
+        RuntimeState::Idle,
+        "cold re-registration must not let the legacy runtime-state alias drive lifecycle",
     );
 }
 
 #[tokio::test]
 async fn cold_reregister_prefers_canonical_runtime_state_over_stale_legacy_alias() {
-    let store = Arc::new(meerkat_runtime::store::InMemoryRuntimeStore::new());
+    let store = Arc::new(HarnessRuntimeStore::delayed_recover(Duration::ZERO));
     let sid = SessionId::new();
     let canonical_runtime_id = LogicalRuntimeId::for_session(&sid);
     let legacy_runtime_alias = LogicalRuntimeId::legacy_session_uuid_alias(&sid);
-    store
-        .atomic_lifecycle_commit(&canonical_runtime_id, RuntimeState::Idle, &[])
-        .await
-        .expect("seed canonical runtime state alias");
-    store
-        .atomic_lifecycle_commit(&legacy_runtime_alias, RuntimeState::Retired, &[])
-        .await
-        .expect("seed legacy runtime state alias");
+    store.seed_runtime_state_projection(canonical_runtime_id, RuntimeState::Idle);
+    store.seed_runtime_state_projection(legacy_runtime_alias, RuntimeState::Retired);
 
     let adapter = Arc::new(MeerkatMachine::persistent(
         Arc::clone(&store) as Arc<dyn RuntimeStore>,
@@ -572,7 +904,7 @@ async fn cold_reregister_prefers_canonical_runtime_state_over_stale_legacy_alias
 }
 
 #[tokio::test]
-async fn control_plane_receipt_lookup_uses_canonical_runtime_id_with_legacy_storage_fallback() {
+async fn control_plane_receipt_lookup_ignores_legacy_storage_alias() {
     let store = Arc::new(meerkat_runtime::store::InMemoryRuntimeStore::new());
     let sid = SessionId::new();
     let canonical_runtime_id = LogicalRuntimeId::for_session(&sid);
@@ -611,10 +943,9 @@ async fn control_plane_receipt_lookup_uses_canonical_runtime_id_with_legacy_stor
     )
     .await
     .expect("canonical runtime id should be accepted");
-    assert_eq!(
-        loaded.map(|loaded| loaded.run_id),
-        Some(run_id.clone()),
-        "canonical control-plane lookup should read legacy receipt storage"
+    assert!(
+        loaded.is_none(),
+        "canonical control-plane lookup must not read legacy receipt storage"
     );
 
     let raw_alias_err = meerkat_runtime::traits::RuntimeControlPlane::load_boundary_receipt(
@@ -732,6 +1063,49 @@ async fn recycle_preserves_persistent_queued_work() {
     assert_eq!(
         second_state.seed.phase,
         meerkat_runtime::InputLifecycleState::Queued
+    );
+}
+
+#[tokio::test]
+async fn recycle_lifecycle_commit_failure_restores_retired_projection() {
+    let store = Arc::new(HarnessRuntimeStore::failing_lifecycle_commit_after(2));
+    let adapter = Arc::new(MeerkatMachine::persistent(
+        store.clone() as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
+    let sid = SessionId::new();
+    adapter.register_session(sid.clone()).await;
+    let runtime_id = LogicalRuntimeId::for_session(&sid);
+
+    meerkat_runtime::traits::RuntimeControlPlane::retire(&*adapter, &runtime_id)
+        .await
+        .expect("retire should commit before recycle failure");
+    assert_eq!(
+        adapter.runtime_state(&sid).await.unwrap(),
+        RuntimeState::Retired
+    );
+    assert_eq!(
+        store.load_runtime_state(&runtime_id).await.unwrap(),
+        Some(RuntimeState::Retired)
+    );
+
+    let err = meerkat_runtime::traits::RuntimeControlPlane::recycle(&*adapter, &runtime_id)
+        .await
+        .expect_err("recycle should surface lifecycle commit failure");
+    assert!(
+        err.to_string()
+            .contains("synthetic commit_machine_lifecycle failure"),
+        "unexpected error: {err}",
+    );
+    assert_eq!(
+        adapter.runtime_state(&sid).await.unwrap(),
+        RuntimeState::Retired,
+        "failed recycle must restore visible retired projection",
+    );
+    assert_eq!(
+        store.load_runtime_state(&runtime_id).await.unwrap(),
+        Some(RuntimeState::Retired),
+        "failed recycle must not persist idle runtime truth",
     );
 }
 
@@ -2104,7 +2478,7 @@ async fn stop_runtime_executor_keeps_attachment_live_until_stop_completes() {
 }
 
 #[tokio::test]
-async fn boundary_commit_failure_unwinds_sync_runtime_state() {
+async fn completed_boundary_commit_failure_preserves_sync_pre_terminal_state() {
     use meerkat_core::lifecycle::core_executor::CoreApplyOutput;
     use meerkat_core::lifecycle::run_primitive::RunApplyBoundary;
     use meerkat_core::lifecycle::run_receipt::RunBoundaryReceipt;
@@ -2136,28 +2510,33 @@ async fn boundary_commit_failure_unwinds_sync_runtime_state() {
             ))
         })
         .await;
-    assert!(result.is_err(), "boundary commit failure should surface");
-    let Err(err) = result else {
-        unreachable!("asserted runtime boundary commit failure above");
-    };
     assert!(
-        err.to_string().contains("runtime boundary commit failed"),
+        result.is_err(),
+        "completed boundary commit failure should surface"
+    );
+    let Err(err) = result else {
+        unreachable!("asserted runtime completed boundary commit failure above");
+    };
+    let err = err.to_string();
+    assert!(
+        err.contains("failed to persist runtime completed-boundary snapshot")
+            && err.contains("synthetic atomic_apply failure"),
         "unexpected error: {err}"
     );
     assert!(
         adapter.contains_session(&sid).await,
-        "boundary commit rollback should preserve the registered session"
+        "completed boundary commit rollback should preserve the registered session"
     );
     assert_eq!(
         adapter.runtime_state(&sid).await.unwrap(),
-        RuntimeState::Idle
+        RuntimeState::Running
     );
     let state = adapter.input_state(&sid, &input_id).await.unwrap().unwrap();
-    assert_eq!(state.seed.phase, InputLifecycleState::Queued);
+    assert_eq!(state.seed.phase, InputLifecycleState::Staged);
 }
 
 #[tokio::test]
-async fn boundary_commit_failure_unwinds_runtime_loop_state() {
+async fn completed_boundary_commit_failure_unwinds_runtime_loop_state() {
     use meerkat_core::lifecycle::core_executor::{
         CoreApplyOutput, CoreExecutor, CoreExecutorError,
     };
@@ -2237,7 +2616,7 @@ async fn boundary_commit_failure_unwinds_runtime_loop_state() {
 }
 
 #[tokio::test]
-async fn boundary_commit_failure_terminates_runtime_loop_completion_waiter() {
+async fn completed_boundary_commit_failure_terminates_runtime_loop_completion_waiter() {
     use meerkat_core::lifecycle::core_executor::{
         CoreApplyOutput, CoreExecutor, CoreExecutorError,
     };
@@ -2314,7 +2693,7 @@ async fn boundary_commit_failure_terminates_runtime_loop_completion_waiter() {
 }
 
 #[tokio::test]
-async fn terminal_snapshot_failure_unregisters_runtime_loop_session() {
+async fn completed_run_runtime_loop_skips_terminal_lifecycle_snapshot_writer() {
     use meerkat_core::lifecycle::core_executor::{
         CoreApplyOutput, CoreExecutor, CoreExecutorError,
     };
@@ -2366,7 +2745,10 @@ async fn terminal_snapshot_failure_unregisters_runtime_loop_session() {
     }
 
     let store = Arc::new(HarnessRuntimeStore::failing_terminal_snapshot());
-    let adapter = Arc::new(MeerkatMachine::persistent(store, memory_blob_store()));
+    let adapter = Arc::new(MeerkatMachine::persistent(
+        store.clone() as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
     let sid = SessionId::new();
     let stop_called = Arc::new(AtomicBool::new(false));
     adapter
@@ -2380,47 +2762,55 @@ async fn terminal_snapshot_failure_unregisters_runtime_loop_session() {
         )
         .await;
 
-    adapter
-        .accept_input(&sid, make_prompt("terminal snapshot failure"))
+    let (outcome, handle) = adapter
+        .accept_input_with_completion(&sid, make_prompt("loop skips terminal lifecycle snapshot"))
         .await
         .unwrap();
-
-    wait_for_atomic_bool(
-        &stop_called,
-        "terminal snapshot persistence failures should stop the runtime loop",
+    assert!(outcome.is_accepted());
+    let result = tokio::time::timeout(
+        Duration::from_secs(1),
+        handle
+            .expect("accepted input should expose a completion handle")
+            .wait(),
     )
-    .await;
-    let state_result = adapter.runtime_state(&sid).await;
+    .await
+    .expect("completion waiter should resolve");
     assert!(
-        state_result.is_err(),
-        "stopped runtime sessions should be unregistered"
+        matches!(
+            result,
+            meerkat_runtime::completion::CompletionOutcome::CompletedWithoutResult
+        ),
+        "completed runtime loop should not trip the old terminal lifecycle writer, got {result:?}"
     );
-    let Err(err) = state_result else {
-        unreachable!("asserted stopped runtime unregistration above");
-    };
-    assert!(matches!(
-        err,
-        RuntimeDriverError::NotReady {
-            state: RuntimeState::Destroyed
-        }
-    ));
+    assert_eq!(
+        store.commit_machine_lifecycle_calls(),
+        1,
+        "completed runtime loop must not use the old post-receipt lifecycle snapshot writer"
+    );
+    assert!(
+        !stop_called.load(Ordering::SeqCst),
+        "old terminal snapshot failure path should not stop the executor"
+    );
 }
 
 #[tokio::test]
-async fn terminal_snapshot_failure_unregisters_sync_runtime_session() {
+async fn completed_run_sync_path_skips_terminal_lifecycle_snapshot_writer() {
     use meerkat_core::lifecycle::core_executor::CoreApplyOutput;
     use meerkat_core::lifecycle::run_primitive::RunApplyBoundary;
     use meerkat_core::lifecycle::run_receipt::RunBoundaryReceipt;
 
     let store = Arc::new(HarnessRuntimeStore::failing_terminal_snapshot());
-    let adapter = Arc::new(MeerkatMachine::persistent(store, memory_blob_store()));
+    let adapter = Arc::new(MeerkatMachine::persistent(
+        store.clone() as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
     let sid = SessionId::new();
     adapter.register_session(sid.clone()).await;
 
     let result = adapter
         .accept_input_and_run(
             &sid,
-            make_prompt("sync terminal snapshot failure"),
+            make_prompt("sync skips terminal lifecycle snapshot"),
             move |run_id, primitive| async move {
                 Ok((
                     (),
@@ -2441,29 +2831,17 @@ async fn terminal_snapshot_failure_unregisters_sync_runtime_session() {
         )
         .await;
     assert!(
-        result.is_err(),
-        "terminal snapshot persistence failure should surface"
+        result.is_ok(),
+        "completed sync path should not use the old terminal lifecycle writer: {result:?}"
     );
-    let Err(err) = result else {
-        unreachable!("asserted terminal snapshot failure above");
-    };
-
-    assert!(
-        err.to_string().contains("terminal event persist failed")
-            || err
-                .to_string()
-                .contains("failed to persist runtime completion snapshot"),
-        "unexpected error: {err}"
+    assert_eq!(
+        store.commit_machine_lifecycle_calls(),
+        1,
+        "completed sync path must not use the old post-receipt lifecycle snapshot writer"
     );
-    let runtime_state = adapter.runtime_state(&sid).await;
-    assert!(
-        matches!(
-            runtime_state,
-            Err(RuntimeDriverError::NotReady {
-                state: RuntimeState::Destroyed
-            })
-        ),
-        "sync path should unregister the broken runtime session"
+    assert_eq!(
+        adapter.runtime_state(&sid).await.unwrap(),
+        RuntimeState::Idle
     );
 }
 
@@ -2797,6 +3175,196 @@ async fn completion_handle_resolves_without_result() {
             meerkat_runtime::completion::CompletionOutcome::CompletedWithoutResult
         ),
         "executor returning no terminal result should resolve as CompletedWithoutResult, got {result:?}"
+    );
+}
+
+#[tokio::test]
+async fn completion_handle_resolves_cancelled_executor_separately() {
+    use meerkat_core::lifecycle::core_executor::{
+        CoreApplyOutput, CoreExecutor, CoreExecutorError,
+    };
+    use meerkat_core::lifecycle::run_primitive::RunPrimitive;
+
+    struct CancelledExecutor;
+    #[async_trait::async_trait]
+    impl CoreExecutor for CancelledExecutor {
+        async fn apply(
+            &mut self,
+            _run_id: RunId,
+            _primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            Err(CoreExecutorError::Cancelled)
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let sid = SessionId::new();
+    adapter
+        .register_session_with_executor(sid.clone(), Box::new(CancelledExecutor))
+        .await;
+
+    let input = make_prompt("cancelled");
+    let input_id = input.id().clone();
+    let (outcome, handle) = adapter
+        .accept_input_with_completion(&sid, input)
+        .await
+        .unwrap();
+    assert!(outcome.is_accepted());
+
+    let result = handle.unwrap().wait().await;
+    assert!(
+        matches!(
+            result,
+            meerkat_runtime::completion::CompletionOutcome::Cancelled
+        ),
+        "executor cancellation should resolve as Cancelled, got {result:?}"
+    );
+
+    let state = adapter
+        .input_state(&sid, &input_id)
+        .await
+        .unwrap()
+        .expect("cancelled input state should remain observable");
+    assert_eq!(
+        state.seed.phase,
+        meerkat_runtime::InputLifecycleState::Abandoned,
+        "cancelled run must not requeue staged contributors"
+    );
+    assert_eq!(
+        state.seed.terminal_outcome,
+        Some(InputTerminalOutcome::Abandoned {
+            reason: InputAbandonReason::Cancelled,
+        }),
+        "cancelled run must preserve a cancellation-specific input terminal"
+    );
+    assert!(
+        adapter.list_active_inputs(&sid).await.unwrap().is_empty(),
+        "cancelled run must not leave active/requeued work"
+    );
+    let snapshot = adapter
+        .meerkat_machine_spine_snapshot(&sid)
+        .await
+        .expect("snapshot should exist for cancelled runtime");
+    assert_eq!(snapshot.control.phase, RuntimeState::Attached);
+    let admitted = snapshot
+        .inputs
+        .admission_order
+        .iter()
+        .find(|entry| entry.input_id == input_id)
+        .expect("cancelled input should remain in admission diagnostics");
+    assert_eq!(
+        admitted.lifecycle,
+        Some(meerkat_runtime::InputLifecycleState::Abandoned)
+    );
+    assert_eq!(
+        admitted.terminal_outcome.clone(),
+        Some(InputTerminalOutcome::Abandoned {
+            reason: InputAbandonReason::Cancelled,
+        })
+    );
+}
+
+#[tokio::test]
+async fn persistent_cancelled_executor_persists_cancelled_terminal_not_failed_requeued() {
+    use meerkat_core::lifecycle::core_executor::{
+        CoreApplyOutput, CoreExecutor, CoreExecutorError,
+    };
+    use meerkat_core::lifecycle::run_primitive::RunPrimitive;
+
+    struct CancelledExecutor;
+    #[async_trait::async_trait]
+    impl CoreExecutor for CancelledExecutor {
+        async fn apply(
+            &mut self,
+            _run_id: RunId,
+            _primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            Err(CoreExecutorError::Cancelled)
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    let store = Arc::new(meerkat_runtime::store::InMemoryRuntimeStore::new());
+    let adapter = Arc::new(MeerkatMachine::persistent(
+        store.clone() as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
+    let sid = SessionId::new();
+    let runtime_id = LogicalRuntimeId::for_session(&sid);
+    adapter
+        .register_session_with_executor(sid.clone(), Box::new(CancelledExecutor))
+        .await;
+
+    let input = make_prompt("persistent cancelled");
+    let input_id = input.id().clone();
+    let (outcome, handle) = adapter
+        .accept_input_with_completion(&sid, input)
+        .await
+        .unwrap();
+    assert!(outcome.is_accepted());
+
+    let result = handle.unwrap().wait().await;
+    assert!(matches!(
+        result,
+        meerkat_runtime::completion::CompletionOutcome::Cancelled
+    ));
+
+    assert_eq!(
+        adapter.runtime_state(&sid).await.unwrap(),
+        RuntimeState::Attached,
+        "cancelled persistent run should publish pre-run phase after durable commit"
+    );
+    assert_eq!(
+        store.load_runtime_state(&runtime_id).await.unwrap(),
+        Some(RuntimeState::Idle),
+        "persistent storage maps live Attached back to Idle for recovery"
+    );
+    let stored = store
+        .load_input_state(&runtime_id, &input_id)
+        .await
+        .unwrap()
+        .expect("cancelled input state should be durable");
+    assert_eq!(
+        stored.seed.phase,
+        meerkat_runtime::InputLifecycleState::Abandoned
+    );
+    assert_eq!(
+        stored.seed.terminal_outcome,
+        Some(InputTerminalOutcome::Abandoned {
+            reason: InputAbandonReason::Cancelled,
+        }),
+        "durable input terminal must be cancelled, not failed/requeued"
+    );
+    assert!(
+        adapter.list_active_inputs(&sid).await.unwrap().is_empty(),
+        "persistent cancelled run must not requeue staged contributors"
     );
 }
 

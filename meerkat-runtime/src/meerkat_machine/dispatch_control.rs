@@ -47,7 +47,7 @@ impl MeerkatMachine {
                     }
                 };
 
-                let (outcome, signal, runtime_effect) = {
+                let (outcome, signal, runtime_effect, effect_previous_dsl_state) = {
                     let mut drv = driver.lock().await;
                     let runtime_idle = self
                         .existing_session_runtime_state(&session_id)
@@ -82,7 +82,7 @@ impl MeerkatMachine {
                     };
                     let signal = match &result {
                         AcceptOutcome::Accepted { input_id, .. } => {
-                            let (_, effects) = self
+                            let (accept_previous_dsl_state, effects) = self
                                 .apply_session_dsl_input(
                                     &session_id,
                                     crate::meerkat_machine::dsl::MeerkatMachineInput::AcceptWithCompletion {
@@ -106,13 +106,15 @@ impl MeerkatMachine {
                                 )
                                 .map_err(RuntimeControlPlaneError::Internal)?;
                             drv.absorb_post_admission_effects(&effects);
-                            (signal, runtime_effect)
+                            (signal, runtime_effect, Some(accept_previous_dsl_state))
                         }
-                        AcceptOutcome::Deduplicated { .. } | AcceptOutcome::Rejected { .. } => {
-                            (crate::driver::ephemeral::PostAdmissionSignal::None, None)
-                        }
+                        AcceptOutcome::Deduplicated { .. } | AcceptOutcome::Rejected { .. } => (
+                            crate::driver::ephemeral::PostAdmissionSignal::None,
+                            None,
+                            None,
+                        ),
                     };
-                    (result, signal.0, signal.1)
+                    (result, signal.0, signal.1, signal.2)
                 };
 
                 // If the driver rejected the input, rollback DSL state.
@@ -126,24 +128,22 @@ impl MeerkatMachine {
                 {
                     let _ = tx.try_send(());
                 }
-                if signal.should_interrupt_yielding()
-                    && let (Some(tx), Some(projected_effect)) = (&effect_tx, runtime_effect.clone())
+                if let Some(projected_effect) = runtime_effect
+                    && let Err(err) = self
+                        .dispatch_interrupt_yielding_runtime_effect(
+                            &session_id,
+                            effect_tx,
+                            boundary_handle,
+                            projected_effect,
+                            "AcceptWithCompletion(Ingest)",
+                        )
+                        .await
                 {
-                    let _ = tx.try_send(projected_effect.into_effect());
-                }
-                if signal.should_interrupt_yielding()
-                    && let (Some(boundary_handle), Some(projected_effect)) =
-                        (boundary_handle, runtime_effect)
-                {
-                    let result = boundary_handle
-                        .cancel_after_boundary(projected_effect.reason().to_string())
-                        .await;
-                    if let Err(err) = result {
-                        tracing::trace!(
-                            error = %err,
-                            "out-of-band Ingest boundary cancel was not applied"
-                        );
+                    if let Some(previous_dsl_state) = effect_previous_dsl_state {
+                        self.restore_session_dsl_state(&session_id, previous_dsl_state)
+                            .await;
                     }
+                    return Err(RuntimeControlPlaneError::Internal(err.to_string()));
                 }
 
                 Ok(MeerkatMachineCommandResult::AcceptOutcome(outcome))
@@ -435,7 +435,6 @@ impl MeerkatMachine {
                         return Err(RuntimeControlPlaneError::Internal(reason));
                     }
                 };
-                drv.sync_control_projection_from_dsl_authority();
                 let report = prepared_destroy.report;
                 match Box::pin(machine_commit_prepared_destroy(
                     &mut drv,
@@ -872,10 +871,9 @@ impl MeerkatMachine {
             } => {
                 let _session_id = self.resolve_session_id(&runtime_id).await?;
                 let receipt = match &self.store {
-                    Some(store) => super::driver::load_boundary_receipt_for_storage_aliases(
+                    Some(store) => super::driver::load_boundary_receipt_for_runtime(
                         store.as_ref(),
                         &runtime_id,
-                        false,
                         &run_id,
                         sequence,
                     )

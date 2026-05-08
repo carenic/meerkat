@@ -421,28 +421,6 @@ impl FailingOpsLifecycleStore {
 
 #[async_trait::async_trait]
 impl RuntimeStore for FailingOpsLifecycleStore {
-    async fn commit_session_boundary(
-        &self,
-        runtime_id: &meerkat_runtime::identifiers::LogicalRuntimeId,
-        session_delta: meerkat_runtime::SessionDelta,
-        run_id: RunId,
-        boundary: RunApplyBoundary,
-        contributing_input_ids: Vec<meerkat_core::lifecycle::InputId>,
-        input_updates: Vec<meerkat_runtime::input_state::StoredInputState>,
-    ) -> Result<meerkat_core::lifecycle::RunBoundaryReceipt, meerkat_runtime::RuntimeStoreError>
-    {
-        self.inner
-            .commit_session_boundary(
-                runtime_id,
-                session_delta,
-                run_id,
-                boundary,
-                contributing_input_ids,
-                input_updates,
-            )
-            .await
-    }
-
     async fn commit_session_snapshot(
         &self,
         runtime_id: &meerkat_runtime::identifiers::LogicalRuntimeId,
@@ -522,14 +500,6 @@ impl RuntimeStore for FailingOpsLifecycleStore {
         self.inner.load_input_state(runtime_id, input_id).await
     }
 
-    async fn persist_runtime_state(
-        &self,
-        runtime_id: &meerkat_runtime::identifiers::LogicalRuntimeId,
-        state: meerkat_runtime::RuntimeState,
-    ) -> Result<(), meerkat_runtime::RuntimeStoreError> {
-        self.inner.persist_runtime_state(runtime_id, state).await
-    }
-
     async fn load_runtime_state(
         &self,
         runtime_id: &meerkat_runtime::identifiers::LogicalRuntimeId,
@@ -537,14 +507,14 @@ impl RuntimeStore for FailingOpsLifecycleStore {
         self.inner.load_runtime_state(runtime_id).await
     }
 
-    async fn atomic_lifecycle_commit(
+    async fn commit_machine_lifecycle(
         &self,
         runtime_id: &meerkat_runtime::identifiers::LogicalRuntimeId,
-        runtime_state: meerkat_runtime::RuntimeState,
+        commit: meerkat_runtime::store::MachineLifecycleCommit,
         input_states: &[meerkat_runtime::input_state::StoredInputState],
     ) -> Result<(), meerkat_runtime::RuntimeStoreError> {
         self.inner
-            .atomic_lifecycle_commit(runtime_id, runtime_state, input_states)
+            .commit_machine_lifecycle(runtime_id, commit, input_states)
             .await
     }
 
@@ -693,7 +663,7 @@ async fn cold_persistent_adapter_recovers_persisted_epoch() {
 
     let session_id = SessionId::new();
 
-    // Phase 1: Persist a snapshot manually under the legacy raw UUID alias.
+    // Phase 1: Persist a snapshot manually under the canonical runtime id.
     let registry = meerkat_runtime::RuntimeOpsLifecycleRegistry::new();
     let cursor_state = Arc::new(EpochCursorState::new());
     let epoch_id = RuntimeEpochId::new();
@@ -707,8 +677,7 @@ async fn cold_persistent_adapter_recovers_persisted_epoch() {
         .unwrap();
 
     let snapshot = registry.capture_persistence_snapshot(epoch_id.clone(), &cursor_state);
-    let runtime_id =
-        meerkat_runtime::identifiers::LogicalRuntimeId::legacy_session_uuid_alias(&session_id);
+    let runtime_id = meerkat_runtime::identifiers::LogicalRuntimeId::for_session(&session_id);
     store
         .persist_ops_lifecycle(&runtime_id, &snapshot)
         .await
@@ -842,7 +811,7 @@ async fn cold_ensure_session_with_executor_recovers_persisted_epoch() {
 
     let session_id = SessionId::new();
 
-    // Persist a snapshot under the legacy raw UUID alias.
+    // Persist a snapshot under the canonical runtime id.
     let registry = meerkat_runtime::RuntimeOpsLifecycleRegistry::new();
     let cursor_state = Arc::new(EpochCursorState::new());
     let epoch_id = RuntimeEpochId::new();
@@ -856,8 +825,7 @@ async fn cold_ensure_session_with_executor_recovers_persisted_epoch() {
         .unwrap();
 
     let snapshot = registry.capture_persistence_snapshot(epoch_id.clone(), &cursor_state);
-    let runtime_id =
-        meerkat_runtime::identifiers::LogicalRuntimeId::legacy_session_uuid_alias(&session_id);
+    let runtime_id = meerkat_runtime::identifiers::LogicalRuntimeId::for_session(&session_id);
     store
         .persist_ops_lifecycle(&runtime_id, &snapshot)
         .await

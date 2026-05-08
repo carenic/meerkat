@@ -397,9 +397,15 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `Reset`
   - anchors: `meerkat_machine`
   - scenarios: `retire-reset-destroy`, `product_turn_streaming`
-- `StopRuntimeExecutorUnbound`
+- `StopRuntimeExecutorInitializing`
   - anchors: `meerkat_machine`
-  - scenarios: `retire-reset-destroy`, `session_registration_and_binding`
+  - scenarios: `session_registration_and_binding`
+- `StopRuntimeExecutorIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `retire-reset-destroy`, `session_registration_and_binding`, `recycle_and_compaction`
+- `StopRuntimeExecutorRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `session_registration_and_binding`
 - `StopRuntimeExecutorAttached`
   - anchors: `meerkat_machine`
   - scenarios: `retire-reset-destroy`, `session_registration_and_binding`
@@ -589,16 +595,37 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `ClassifyExternalEnvelopeRequestPeerAddedAttached`
   - anchors: `meerkat_machine`
   - scenarios: `input_admission_and_queueing`
+- `ClassifyExternalEnvelopeRequestPeerAddedIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
 - `ClassifyExternalEnvelopeRequestPeerAddedRunning`
   - anchors: `meerkat_machine`
   - scenarios: `input_admission_and_queueing`
 - `ClassifyExternalEnvelopeRequestPeerRetiredAttached`
   - anchors: `meerkat_machine`
   - scenarios: `input_admission_and_queueing`
+- `ClassifyExternalEnvelopeRequestPeerRetiredIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `ClassifyExternalEnvelopeRequestPeerRetiredRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `ClassifyExternalEnvelopeRequestPeerRetiredStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
 - `ClassifyExternalEnvelopeRequestPeerRetiredRunning`
   - anchors: `meerkat_machine`
   - scenarios: `input_admission_and_queueing`
 - `ClassifyExternalEnvelopeRequestPeerUnwiredAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `ClassifyExternalEnvelopeRequestPeerUnwiredIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `ClassifyExternalEnvelopeRequestPeerUnwiredRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `ClassifyExternalEnvelopeRequestPeerUnwiredStopped`
   - anchors: `meerkat_machine`
   - scenarios: `input_admission_and_queueing`
 - `ClassifyExternalEnvelopeRequestPeerUnwiredRunning`
@@ -628,16 +655,37 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `ClassifyExternalEnvelopeRequestActionableRunning`
   - anchors: `meerkat_machine`
   - scenarios: `input_admission_and_queueing`
+- `ClassifyExternalEnvelopeLifecycleAddedIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
 - `ClassifyExternalEnvelopeLifecycleAddedAttached`
   - anchors: `meerkat_machine`
   - scenarios: `input_admission_and_queueing`
 - `ClassifyExternalEnvelopeLifecycleAddedRunning`
   - anchors: `meerkat_machine`
   - scenarios: `input_admission_and_queueing`
+- `ClassifyExternalEnvelopeLifecycleRetiredIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `ClassifyExternalEnvelopeLifecycleRetiredRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `ClassifyExternalEnvelopeLifecycleRetiredStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
 - `ClassifyExternalEnvelopeLifecycleRetiredAttached`
   - anchors: `meerkat_machine`
   - scenarios: `input_admission_and_queueing`
 - `ClassifyExternalEnvelopeLifecycleRetiredRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `ClassifyExternalEnvelopeLifecycleUnwiredIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `ClassifyExternalEnvelopeLifecycleUnwiredRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `input_admission_and_queueing`
+- `ClassifyExternalEnvelopeLifecycleUnwiredStopped`
   - anchors: `meerkat_machine`
   - scenarios: `input_admission_and_queueing`
 - `ClassifyExternalEnvelopeLifecycleUnwiredAttached`
@@ -799,6 +847,15 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RunCompleted`
   - anchors: `meerkat_machine`
   - scenarios: `recycle_and_compaction`
+- `ServiceTurnCommittedRunningToIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `product_turn_streaming`
+- `ServiceTurnCommittedRunningToAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `product_turn_streaming`
+- `ServiceTurnCommittedRunningToRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `product_turn_streaming`
 - `RunFailed`
   - anchors: `meerkat_machine`
   - scenarios: `bind-run-boundary-terminal`, `retire-reset-destroy`, `turn_interrupt_and_shutdown`, `session_registration_and_binding`, `input_admission_and_queueing`, `realtime_connection_projection`, `recycle_and_compaction`
@@ -937,6 +994,15 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `FailRunningToRetired`
   - anchors: `meerkat_machine`
   - scenarios: `turn_interrupt_and_shutdown`, `input_admission_and_queueing`, `realtime_connection_projection`, `live_topology_and_supervision`
+- `CancelRunningToIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`
+- `CancelRunningToAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`
+- `CancelRunningToRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `turn_interrupt_and_shutdown`, `ops_completion_and_waiters`
 - `RollbackRunRunningToIdle`
   - anchors: `meerkat_machine`
   - scenarios: `turn_interrupt_and_shutdown`
@@ -2260,6 +2326,24 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RealtimeProjectionRefreshedStopped`
   - anchors: `meerkat_machine`
   - scenarios: `product_turn_streaming`
+- `RealtimeProjectionBaselineObservedCleanInitializing`
+  - anchors: `meerkat_machine`
+  - scenarios: `realtime_connection_projection`, `product_turn_streaming`
+- `RealtimeProjectionBaselineObservedCleanIdle`
+  - anchors: `meerkat_machine`
+  - scenarios: `realtime_connection_projection`, `product_turn_streaming`
+- `RealtimeProjectionBaselineObservedCleanAttached`
+  - anchors: `meerkat_machine`
+  - scenarios: `realtime_connection_projection`
+- `RealtimeProjectionBaselineObservedCleanRunning`
+  - anchors: `meerkat_machine`
+  - scenarios: `realtime_connection_projection`, `product_turn_streaming`
+- `RealtimeProjectionBaselineObservedCleanRetired`
+  - anchors: `meerkat_machine`
+  - scenarios: `realtime_connection_projection`, `product_turn_streaming`
+- `RealtimeProjectionBaselineObservedCleanStopped`
+  - anchors: `meerkat_machine`
+  - scenarios: `realtime_connection_projection`, `product_turn_streaming`
 - `RealtimeProjectionResetInitializing`
   - anchors: `meerkat_machine`
   - scenarios: `product_turn_streaming`

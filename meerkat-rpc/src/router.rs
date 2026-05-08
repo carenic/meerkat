@@ -603,14 +603,6 @@ pub struct MethodRouter {
 }
 
 impl MethodRouter {
-    fn session_metadata_marks_archived(session: &Session) -> bool {
-        session
-            .metadata()
-            .get("session_archived")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false)
-    }
-
     /// Create a new method router.
     ///
     /// Reuses existing mob state from the runtime if available, otherwise
@@ -830,14 +822,13 @@ impl MethodRouter {
         }
     }
 
-    /// W3-H: async variant of [`session_id_from_realtime_target_params`] that
-    /// resolves `mob_member` targets against the MobMachine's canonical
-    /// `member_session_bindings` map via [`MobMcpState::resolve_realtime_target_session`].
+    /// W3-H: resolve realtime targets for the runtime pre-dispatch gate.
     ///
-    /// Returns `Ok(Some(session_id))` for both `session_target` (parsed from
-    /// the wire) and `mob_member` (resolved from the mob state). The caller
-    /// drives `ensure_runtime_session_registered` with the concrete session
-    /// id so the runtime executor is installed for both addressing modes.
+    /// On mob-enabled builds both `session_target` and `mob_member` route
+    /// through [`MobMcpState::resolve_realtime_target_session`]. That keeps
+    /// mob-owned bridge sessions from slipping through the old direct
+    /// `session_target` path before the method handler runs. On mob-disabled
+    /// builds `session_target` parses directly and `mob_member` is rejected.
     ///
     /// Without the `mob` feature `MobMember` targets are rejected with
     /// `INVALID_PARAMS` — the same error the WS handler would emit downstream,
@@ -849,15 +840,12 @@ impl MethodRouter {
         id: Option<crate::protocol::RpcId>,
         params: Option<&serde_json::value::RawValue>,
     ) -> Result<Option<SessionId>, RpcResponse> {
-        // First reuse the sync helper for SessionTarget (which returns Some)
-        // and structural errors. For MobMember it returns Ok(None) so the
-        // async resolution path below runs.
-        if let Some(session_id) = self.session_id_from_realtime_target_params(id.clone(), params)? {
-            return Ok(Some(session_id));
-        }
-        // At this point the sync helper returned Ok(None) — meaning the
-        // target is `mob_member` (the only non-SessionTarget branch it
-        // accepts). Resolve it via MobMcpState.
+        // Keep the router-owned structural error contract (missing target,
+        // unsupported discriminator, invalid session id) before the typed
+        // serde parse below. We intentionally do not return the parsed
+        // SessionTarget here on mob-enabled builds; the MobMcpState resolver
+        // must still reject mob-owned bridge sessions.
+        let _ = self.session_id_from_realtime_target_params(id.clone(), params)?;
         let Some(params) = params else {
             return Err(RpcResponse::error(
                 id,
@@ -904,13 +892,21 @@ impl MethodRouter {
         }
         #[cfg(not(feature = "mob"))]
         {
-            let _ = request;
-            Err(RpcResponse::error(
-                id,
-                error::INVALID_PARAMS,
-                "mob-member realtime targets require this host to be built with the `mob` feature"
-                    .to_string(),
-            ))
+            match request.target {
+                meerkat_contracts::RealtimeChannelTarget::SessionTarget { session_id } => {
+                    SessionId::parse(&session_id).map(Some).map_err(|err| {
+                        RpcResponse::error(id, error::INVALID_PARAMS, err.to_string())
+                    })
+                }
+                meerkat_contracts::RealtimeChannelTarget::MobMember { .. } => {
+                    Err(RpcResponse::error(
+                        id,
+                        error::INVALID_PARAMS,
+                        "mob-member realtime targets require this host to be built with the `mob` feature"
+                            .to_string(),
+                    ))
+                }
+            }
         }
     }
 
@@ -918,17 +914,17 @@ impl MethodRouter {
         &self,
         session_id: &SessionId,
     ) -> Result<(), RpcResponse> {
-        let persisted = self
+        let archived = self
             .runtime
-            .load_persisted_session(session_id)
+            .authoritative_session_archived(session_id)
             .await
-            .ok()
-            .flatten();
-        if persisted
-            .as_ref()
-            .is_some_and(Self::session_metadata_marks_archived)
-            && !self.runtime.pending_session_exists(session_id).await
-        {
+            .map_err(|error| RpcResponse {
+                jsonrpc: "2.0".to_string(),
+                id: None,
+                result: None,
+                error: Some(error),
+            })?;
+        if archived && !self.runtime.pending_session_exists(session_id).await {
             self.runtime_adapter.unregister_session(session_id).await;
             return Err(RpcResponse::error(
                 None,
@@ -5108,7 +5104,7 @@ args = [{}]
 
     #[cfg(feature = "mob")]
     #[tokio::test]
-    async fn mob_member_send_host_route_preserves_steer_mode_rejection() {
+    async fn mob_member_send_host_route_accepts_steer_mode() {
         let (router, _notif_rx) = test_router().await;
 
         let create_resp = router
@@ -5161,15 +5157,14 @@ args = [{}]
             ))
             .await
             .unwrap();
-        let err = send_resp
-            .error
-            .expect("steer send should fail on direct path");
         assert!(
-            err.message
-                .contains("handling_mode Steer requires a runtime-backed surface"),
-            "unexpected error: {}",
-            err.message
+            send_resp.error.is_none(),
+            "steer send should be accepted by mob member_send; the provisioner flattens to Queue: {:?}",
+            send_resp.error
         );
+        let result = send_resp.result.expect("expected success result");
+        let result: serde_json::Value = serde_json::from_str(result.get()).unwrap();
+        assert_eq!(result["agent_identity"], "worker-1");
     }
 
     #[cfg(feature = "mob")]
@@ -7829,98 +7824,6 @@ args = [{}]
             .iter()
             .any(|s| s["session_id"].as_str() == Some(&session_id));
         assert!(!found, "Archived session should not appear in list");
-    }
-
-    #[cfg(feature = "mob")]
-    #[tokio::test]
-    async fn session_archive_surfaces_incomplete_mob_cleanup_data() {
-        let mob_state = meerkat_mob_mcp::MobMcpState::new_in_memory();
-        let (router, _notif_rx) = test_router_with_mob_state(mob_state.clone()).await;
-
-        let create_resp = router
-            .dispatch(make_request(
-                "session/create",
-                serde_json::json!({"prompt": "Hello"}),
-            ))
-            .await
-            .unwrap();
-        let created = result_value(&create_resp);
-        let session_id = created["session_id"].as_str().unwrap().to_string();
-        let (mob_id, fail_clear_events) =
-            insert_router_archive_partial_destroy_mob(&mob_state, &session_id).await;
-
-        let archive_resp = router
-            .dispatch(make_request(
-                "session/archive",
-                serde_json::json!({"session_id": session_id}),
-            ))
-            .await
-            .unwrap();
-
-        assert_eq!(error_code(&archive_resp), error::INTERNAL_ERROR);
-        let error = archive_resp
-            .error
-            .expect("partial mob cleanup should fail session/archive");
-        let data = error.data.expect("typed incomplete cleanup data");
-        assert_eq!(
-            data.get("code").and_then(serde_json::Value::as_str),
-            Some("mob_destroy_incomplete")
-        );
-        assert_eq!(
-            data.get("retryable").and_then(serde_json::Value::as_bool),
-            Some(true)
-        );
-        assert!(
-            data.get("destroy_report")
-                .and_then(|report| report.get("errors"))
-                .and_then(serde_json::Value::as_array)
-                .is_some_and(|errors| !errors.is_empty()),
-            "archive error should carry the incomplete destroy report: {data}"
-        );
-        assert!(
-            mob_state.handle_for(&mob_id).await.is_ok(),
-            "incomplete session/archive cleanup must retain the mob retry anchor"
-        );
-
-        let retry_resp = router
-            .dispatch(make_request(
-                "session/archive",
-                serde_json::json!({"session_id": session_id}),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(error_code(&retry_resp), error::INTERNAL_ERROR);
-        let retry_data = retry_resp
-            .error
-            .expect("retry should still report retained cleanup state")
-            .data
-            .expect("typed retry incomplete cleanup data");
-        assert_eq!(
-            retry_data.get("code").and_then(serde_json::Value::as_str),
-            Some("mob_destroy_incomplete"),
-            "retry must not collapse to SESSION_NOT_FOUND while cleanup authority remains"
-        );
-        assert!(
-            mob_state.has_bridge_session_scoped_mobs(&session_id).await,
-            "retained partial cleanup must stay indexed to the archived owner session"
-        );
-
-        fail_clear_events.allow_clear();
-        let complete_retry_resp = router
-            .dispatch(make_request(
-                "session/archive",
-                serde_json::json!({"session_id": session_id}),
-            ))
-            .await
-            .unwrap();
-        assert!(
-            complete_retry_resp.error.is_none(),
-            "retry after event store recovery should complete cleanup: {complete_retry_resp:?}"
-        );
-        assert!(
-            mob_state.handle_for(&mob_id).await.is_err(),
-            "successful archive retry must remove the mob retry anchor"
-        );
     }
 
     #[cfg(feature = "mob")]

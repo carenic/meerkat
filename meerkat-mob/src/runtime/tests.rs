@@ -728,6 +728,10 @@ impl MockSessionService {
         adapter
     }
 
+    fn set_runtime_adapter(&self, adapter: Arc<meerkat_runtime::MeerkatMachine>) {
+        *self.runtime_adapter.lock().expect("runtime_adapter mutex") = Some(adapter);
+    }
+
     /// Get recorded prompts for inspection in tests.
     async fn recorded_prompts(&self) -> Vec<(SessionId, String)> {
         self.prompts.read().await.clone()
@@ -1231,7 +1235,7 @@ impl SessionService for MockSessionService {
         self.flow_turn_overlays
             .write()
             .await
-            .push((id.clone(), req.flow_tool_overlay.clone()));
+            .push((id.clone(), req.runtime.flow_tool_overlay.clone()));
         self.start_turn_calls.fetch_add(1, Ordering::Relaxed);
         // Determine keep-alive by checking if a notifier was registered for this session
         // (created in create_session when build.keep_alive is true).
@@ -1466,6 +1470,38 @@ impl SessionService for MockSessionService {
     }
 }
 
+#[cfg(feature = "runtime-adapter")]
+async fn retire_test_runtime_archive(
+    adapter: &meerkat_runtime::MeerkatMachine,
+    session_id: &SessionId,
+    session_present: bool,
+) -> Result<(), SessionError> {
+    if !session_present && !adapter.contains_session(session_id).await {
+        return Ok(());
+    }
+
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(session_id);
+    match meerkat_runtime::RuntimeControlPlane::retire(adapter, &runtime_id).await {
+        Ok(_) => Ok(()),
+        Err(meerkat_runtime::RuntimeControlPlaneError::NotFound(_)) => {
+            adapter.register_session(session_id.clone()).await;
+            meerkat_runtime::RuntimeControlPlane::retire(adapter, &runtime_id)
+                .await
+                .map(|_| ())
+                .map_err(|error| {
+                    SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
+                        "test machine archive retire failed after registration: {error}"
+                    )))
+                })
+        }
+        Err(error) => Err(SessionError::Agent(
+            meerkat_core::error::AgentError::InternalError(format!(
+                "test machine archive retire failed: {error}"
+            )),
+        )),
+    }
+}
+
 struct CountingInjector {
     calls: Arc<AtomicU64>,
     delay_ms: u64,
@@ -1683,6 +1719,34 @@ impl MobSessionService for MockSessionService {
             .lock()
             .expect("runtime_adapter mutex")
             .clone()
+    }
+
+    async fn interrupt_with_machine_authority(
+        &self,
+        session_id: &SessionId,
+        _authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<(), SessionError> {
+        SessionService::interrupt(self, session_id).await
+    }
+
+    async fn cancel_after_boundary_with_machine_authority(
+        &self,
+        session_id: &SessionId,
+        _authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<(), SessionError> {
+        SessionService::cancel_after_boundary(self, session_id).await
+    }
+
+    async fn archive_with_mob_lifecycle_authority(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), SessionError> {
+        if let Some(adapter) = self.runtime_adapter() {
+            let session_present = self.sessions.read().await.contains_key(session_id);
+            retire_test_runtime_archive(adapter.as_ref(), session_id, session_present).await?;
+        }
+
+        SessionService::archive(self, session_id).await
     }
 
     async fn session_belongs_to_mob(&self, session_id: &SessionId, mob_id: &MobId) -> bool {
@@ -4550,6 +4614,26 @@ impl MobSessionService for PersistedListingSessionService {
         self.inner.runtime_adapter()
     }
 
+    async fn interrupt_with_machine_authority(
+        &self,
+        session_id: &SessionId,
+        authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<(), SessionError> {
+        self.inner
+            .interrupt_with_machine_authority(session_id, authority)
+            .await
+    }
+
+    async fn cancel_after_boundary_with_machine_authority(
+        &self,
+        session_id: &SessionId,
+        authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<(), SessionError> {
+        self.inner
+            .cancel_after_boundary_with_machine_authority(session_id, authority)
+            .await
+    }
+
     async fn session_belongs_to_mob(&self, session_id: &SessionId, mob_id: &MobId) -> bool {
         self.inner.session_belongs_to_mob(session_id, mob_id).await
     }
@@ -4726,6 +4810,26 @@ impl MobSessionService for InactiveReadSessionService {
 
     fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::MeerkatMachine>> {
         self.inner.runtime_adapter()
+    }
+
+    async fn interrupt_with_machine_authority(
+        &self,
+        session_id: &SessionId,
+        authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<(), SessionError> {
+        self.inner
+            .interrupt_with_machine_authority(session_id, authority)
+            .await
+    }
+
+    async fn cancel_after_boundary_with_machine_authority(
+        &self,
+        session_id: &SessionId,
+        authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<(), SessionError> {
+        self.inner
+            .cancel_after_boundary_with_machine_authority(session_id, authority)
+            .await
     }
 
     async fn session_belongs_to_mob(&self, session_id: &SessionId, mob_id: &MobId) -> bool {
@@ -11261,13 +11365,8 @@ async fn test_flow_step_tool_overlay_is_step_scoped() {
             StartTurnRequest {
                 prompt: "non-flow turn".to_string().into(),
                 system_prompt: None,
-                render_metadata: None,
-                handling_mode: meerkat_core::types::HandlingMode::Queue,
                 event_tx: None,
-                skill_references: None,
-                flow_tool_overlay: None,
-                pre_turn_context_appends: Vec::new(),
-                turn_metadata: None,
+                runtime: meerkat_core::service::StartTurnRuntimeSemantics::default(),
             },
         )
         .await
@@ -17753,6 +17852,176 @@ async fn test_runtime_backed_turn_driven_dispatch_surfaces_start_turn_failure() 
     );
 }
 
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test]
+async fn test_abort_member_provision_retires_runtime_before_absent_cleanup_unregisters() {
+    let service = Arc::new(MockSessionService::new());
+    let runtime_store = Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let runtime_store_for_machine: Arc<dyn meerkat_runtime::RuntimeStore> = runtime_store.clone();
+    let adapter = Arc::new(meerkat_runtime::MeerkatMachine::persistent_without_blobs(
+        runtime_store_for_machine,
+    ));
+    service.set_runtime_adapter(adapter.clone());
+    let provisioner =
+        super::provisioner::SessionBackend::new(service.clone(), Some(adapter.clone()));
+    let session = Session::new();
+    let session_id = session.id().clone();
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
+
+    service
+        .create_session(CreateSessionRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            prompt: "abort absent cleanup".to_string().into(),
+            render_metadata: None,
+            system_prompt: None,
+            max_tokens: None,
+            event_tx: None,
+            build: Some(meerkat_core::service::SessionBuildOptions {
+                resume_session: Some(session),
+                comms_name: Some("test-mob/worker/abort-absent-cleanup".to_string()),
+                keep_alive: true,
+                ..Default::default()
+            }),
+            skill_references: None,
+            initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+            labels: None,
+        })
+        .await
+        .expect("create runtime-backed cleanup session");
+    adapter.register_session(session_id.clone()).await;
+
+    provisioner
+        .abort_member_provision(
+            &MemberRef::from_bridge_session_id(session_id.clone()),
+            &meerkat_core::ops::OperationId::new(),
+            "cleanup absent operation",
+        )
+        .await
+        .expect("absent operation cleanup should archive then unregister");
+
+    assert!(
+        !adapter.contains_session(&session_id).await,
+        "successful cleanup should unregister only after archive authority succeeds"
+    );
+    assert_eq!(
+        meerkat_runtime::RuntimeStore::load_runtime_state(runtime_store.as_ref(), &runtime_id)
+            .await
+            .expect("load runtime state"),
+        Some(meerkat_runtime::RuntimeState::Retired),
+        "runtime lifecycle must be durably retired before registration cleanup"
+    );
+    assert!(
+        !service
+            .has_live_session(&session_id)
+            .await
+            .expect("read live service state"),
+        "successful cleanup should archive the session projection"
+    );
+}
+
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test]
+async fn test_abort_member_provision_archive_failure_keeps_runtime_binding_for_retry() {
+    let service = Arc::new(MockSessionService::new());
+    let runtime_store = Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let runtime_store_for_machine: Arc<dyn meerkat_runtime::RuntimeStore> = runtime_store.clone();
+    let adapter = Arc::new(meerkat_runtime::MeerkatMachine::persistent_without_blobs(
+        runtime_store_for_machine,
+    ));
+    service.set_runtime_adapter(adapter.clone());
+    let provisioner =
+        super::provisioner::SessionBackend::new(service.clone(), Some(adapter.clone()));
+    let session = Session::new();
+    let session_id = session.id().clone();
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
+
+    service
+        .create_session(CreateSessionRequest {
+            model: "claude-sonnet-4-5".to_string(),
+            prompt: "abort archive failure".to_string().into(),
+            render_metadata: None,
+            system_prompt: None,
+            max_tokens: None,
+            event_tx: None,
+            build: Some(meerkat_core::service::SessionBuildOptions {
+                resume_session: Some(session),
+                comms_name: Some("test-mob/worker/abort-archive-failure".to_string()),
+                keep_alive: true,
+                ..Default::default()
+            }),
+            skill_references: None,
+            initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+            labels: None,
+        })
+        .await
+        .expect("create runtime-backed cleanup session");
+    adapter.register_session(session_id.clone()).await;
+    service.set_archive_failure(&session_id).await;
+
+    let err = provisioner
+        .abort_member_provision(
+            &MemberRef::from_bridge_session_id(session_id.clone()),
+            &meerkat_core::ops::OperationId::new(),
+            "cleanup absent operation",
+        )
+        .await
+        .expect_err("archive failure should block runtime unregister cleanup");
+
+    assert!(
+        err.to_string().contains("mock archive failure"),
+        "archive failure should surface to caller, got {err:?}"
+    );
+    assert!(
+        adapter.contains_session(&session_id).await,
+        "failed archive projection must keep the runtime binding for retry"
+    );
+    assert_eq!(
+        meerkat_runtime::RuntimeStore::load_runtime_state(runtime_store.as_ref(), &runtime_id)
+            .await
+            .expect("load runtime state"),
+        Some(meerkat_runtime::RuntimeState::Retired),
+        "archive authority may retire durably before projection cleanup fails"
+    );
+    assert!(
+        service
+            .has_live_session(&session_id)
+            .await
+            .expect("read live service state"),
+        "failed archive projection should retain the live session for retry"
+    );
+}
+
+#[tokio::test]
+async fn test_builder_rejects_runtime_adapter_with_mismatched_persistence_authority() {
+    let service = Arc::new(MockSessionService::new());
+    let service_store = Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let service_adapter = Arc::new(meerkat_runtime::MeerkatMachine::persistent_without_blobs(
+        service_store,
+    ));
+    *service
+        .runtime_adapter
+        .lock()
+        .expect("runtime_adapter mutex") = Some(service_adapter);
+    let builder_adapter = Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
+
+    let err = match MobBuilder::new(sample_definition(), MobStorage::in_memory())
+        .with_session_service(service)
+        .with_runtime_adapter(builder_adapter)
+        .create()
+        .await
+    {
+        Ok(_) => panic!("mismatched runtime persistence authority should fail closed"),
+        Err(err) => err,
+    };
+
+    assert!(
+        err.to_string().contains("runtime persistence authority"),
+        "unexpected error: {err}"
+    );
+}
+
 #[tokio::test]
 async fn test_autonomous_host_loop_uses_builder_runtime_adapter_for_comms_drain() {
     let service = Arc::new(MockSessionService::new());
@@ -18017,6 +18286,100 @@ async fn test_runtime_adapter_cancel_all_work_rejects_unsupported_boundary_cance
 
 #[cfg(feature = "runtime-adapter")]
 #[tokio::test]
+async fn test_provision_member_uses_local_bindings_before_routed_runtime_bound() {
+    type RecordingSignalFields = Vec<(
+        meerkat_machine_schema::identity::FieldId,
+        meerkat_runtime::composition::OwnedFieldValue,
+    )>;
+    type RecordingMobSignalLog = Vec<(
+        meerkat_machine_schema::identity::SignalVariantId,
+        RecordingSignalFields,
+    )>;
+
+    #[derive(Default)]
+    struct RecordingMobSignalSurface {
+        log: tokio::sync::Mutex<RecordingMobSignalLog>,
+    }
+
+    #[async_trait]
+    impl meerkat_runtime::composition::SignalConsumerSurface for RecordingMobSignalSurface {
+        fn instance_id(&self) -> &meerkat_machine_schema::identity::MachineInstanceId {
+            static ID: std::sync::OnceLock<meerkat_machine_schema::identity::MachineInstanceId> =
+                std::sync::OnceLock::new();
+            ID.get_or_init(|| {
+                meerkat_machine_schema::identity::MachineInstanceId::parse("mob")
+                    .expect("canonical mob instance id")
+            })
+        }
+
+        async fn receive_signal(
+            &self,
+            variant: meerkat_machine_schema::identity::SignalVariantId,
+            projected_fields: RecordingSignalFields,
+        ) -> Result<(), String> {
+            self.log.lock().await.push((variant, projected_fields));
+            Ok(())
+        }
+    }
+
+    let service = Arc::new(MockSessionService::new());
+    let adapter = Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
+    let signal_surface = Arc::new(RecordingMobSignalSurface::default());
+    let schema = meerkat_machine_schema::catalog::meerkat_mob_seam_composition();
+    let table =
+        meerkat_runtime::composition::RouteTable::from_schema(&schema).expect("catalog routes");
+    let dispatcher: meerkat_runtime::composition::CatalogCompositionSignalDispatcher<
+        meerkat_runtime::meerkat_machine::composition::MeerkatSeamSignal,
+    > = meerkat_runtime::composition::CatalogCompositionSignalDispatcher::new(
+        schema.name.clone(),
+        table,
+    )
+    .with_consumer(signal_surface.clone());
+    adapter.set_composition_signal_dispatcher(Arc::new(dispatcher));
+    let provisioner = super::provisioner::SessionBackend::new(service, Some(adapter.clone()));
+    let bridge_session = Session::new();
+    let bridge_session_id = bridge_session.id().clone();
+
+    provisioner
+        .provision_member(super::provisioner::ProvisionMemberRequest {
+            create_session: CreateSessionRequest {
+                model: "claude-sonnet-4-5".to_string(),
+                prompt: "local binding provision".to_string().into(),
+                render_metadata: None,
+                system_prompt: None,
+                max_tokens: None,
+                event_tx: None,
+                build: Some(meerkat_core::service::SessionBuildOptions {
+                    resume_session: Some(bridge_session),
+                    comms_name: Some("test-mob/worker/local-binding".to_string()),
+                    keep_alive: true,
+                    ..Default::default()
+                }),
+                skill_references: None,
+                initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+                deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+                labels: None,
+            },
+            binding: test_external_binding("local-binding-worker"),
+            peer_name: "local-binding-worker".to_string(),
+            owner_bridge_session_id: None,
+            ops_registry: None,
+        })
+        .await
+        .expect("member provision should install local runtime resources");
+
+    assert!(
+        adapter.contains_session(&bridge_session_id).await,
+        "local binding preparation should still register the bridge session"
+    );
+    assert!(
+        signal_surface.log.lock().await.is_empty(),
+        "member provisioning must not publish RuntimeBound with the session runtime id; the routed mob binding owns that signal"
+    );
+}
+
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test]
 async fn test_cancel_all_work_without_adapter_uses_boundary_cancel_not_hard_interrupt() {
     let service = Arc::new(MockSessionService::new());
     let session = service
@@ -18129,7 +18492,7 @@ async fn test_interrupt_member_without_adapter_rejects_unsupported_boundary_canc
 
 #[cfg(feature = "runtime-adapter")]
 #[tokio::test]
-async fn test_explicit_hard_cancel_member_without_adapter_still_uses_hard_interrupt() {
+async fn test_explicit_hard_cancel_member_without_adapter_is_rejected() {
     let service = Arc::new(MockSessionService::new());
     let session = service
         .create_session(CreateSessionRequest {
@@ -18155,15 +18518,19 @@ async fn test_explicit_hard_cancel_member_without_adapter_still_uses_hard_interr
     let baseline_boundary = service.cancel_after_boundary_call_count();
     let baseline_interrupts = service.interrupt_call_count();
 
-    provisioner
+    let error = provisioner
         .hard_cancel_member(&member_ref, "explicit no-adapter force cancel")
         .await
-        .expect("no-adapter hard_cancel_member should remain explicit hard cancel");
+        .expect_err("no-adapter hard_cancel_member must not bypass runtime authority");
 
+    assert!(
+        matches!(error, MobError::Internal(ref message) if message.contains("requires MeerkatMachine runtime authority")),
+        "no-adapter hard cancel should fail closed on missing runtime authority, got {error:?}"
+    );
     assert_eq!(
         service.interrupt_call_count(),
-        baseline_interrupts + 1,
-        "explicit no-adapter force cancel should use hard session interrupt"
+        baseline_interrupts,
+        "explicit no-adapter force cancel must not use hard session interrupt"
     );
     assert_eq!(
         service.cancel_after_boundary_call_count(),
@@ -22957,6 +23324,31 @@ impl MobSessionService for RealCommsSessionService {
         Some(Arc::clone(&self.runtime_adapter))
     }
 
+    async fn interrupt_with_machine_authority(
+        &self,
+        session_id: &SessionId,
+        _authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<(), SessionError> {
+        SessionService::interrupt(self, session_id).await
+    }
+
+    async fn cancel_after_boundary_with_machine_authority(
+        &self,
+        session_id: &SessionId,
+        _authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<(), SessionError> {
+        SessionService::cancel_after_boundary(self, session_id).await
+    }
+
+    async fn archive_with_mob_lifecycle_authority(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), SessionError> {
+        let session_present = self.sessions.read().await.contains_key(session_id);
+        retire_test_runtime_archive(&self.runtime_adapter, session_id, session_present).await?;
+        SessionService::archive(self, session_id).await
+    }
+
     async fn session_belongs_to_mob(&self, session_id: &SessionId, mob_id: &MobId) -> bool {
         let names = self.session_comms_names.read().await;
         names
@@ -23304,6 +23696,31 @@ impl MobSessionService for RuntimeBackedRealCommsSessionService {
         Some(Arc::clone(&self.runtime_adapter))
     }
 
+    async fn interrupt_with_machine_authority(
+        &self,
+        session_id: &SessionId,
+        _authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<(), SessionError> {
+        SessionService::interrupt(self, session_id).await
+    }
+
+    async fn cancel_after_boundary_with_machine_authority(
+        &self,
+        session_id: &SessionId,
+        _authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<(), SessionError> {
+        SessionService::cancel_after_boundary(self, session_id).await
+    }
+
+    async fn archive_with_mob_lifecycle_authority(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), SessionError> {
+        let session_present = self.sessions.read().await.contains_key(session_id);
+        retire_test_runtime_archive(&self.runtime_adapter, session_id, session_present).await?;
+        SessionService::archive(self, session_id).await
+    }
+
     async fn session_belongs_to_mob(&self, session_id: &SessionId, mob_id: &MobId) -> bool {
         let names = self.session_comms_names.read().await;
         names
@@ -23319,7 +23736,7 @@ impl MobSessionService for RuntimeBackedRealCommsSessionService {
         boundary: meerkat_core::lifecycle::run_primitive::RunApplyBoundary,
         contributing_input_ids: Vec<meerkat_core::InputId>,
     ) -> Result<meerkat_core::lifecycle::core_executor::CoreApplyOutput, SessionError> {
-        let pre_turn_context_appends = req.pre_turn_context_appends;
+        let pre_turn_context_appends = req.runtime.pre_turn_context_appends;
         if !pre_turn_context_appends.is_empty() {
             for append in pre_turn_context_appends {
                 self.append_system_context(
@@ -23351,7 +23768,7 @@ impl MobSessionService for RuntimeBackedRealCommsSessionService {
             .await
             .entry(session_id.clone())
             .or_default()
-            .push(req.render_metadata.clone());
+            .push(req.runtime.render_metadata.clone());
 
         if let Some(notifier) = self
             .keep_alive_notifiers
@@ -24755,9 +25172,12 @@ async fn test_runtime_backed_turn_driven_send_preserves_render_metadata() {
         .await
         .expect("runtime-backed turn-driven send should succeed");
 
+    // render_metadata is runtime-owned and stripped at the provisioner
+    // level before reaching the session service (dogma: render_metadata
+    // must not leak into the session-service path).
     assert_eq!(
         service.applied_runtime_render_metadata(&member).await,
-        vec![Some(render_metadata)]
+        vec![None]
     );
 }
 
@@ -25588,12 +26008,11 @@ async fn test_member_status_round_trips_through_machine_command_surface() {
 }
 
 #[tokio::test]
-async fn test_member_status_surface_exposes_current_session_id_for_realtime_routing() {
-    // Identity-first realtime routing (Phase 5G/T5i) requires callers to
-    // resolve `mob/member_status → current_session_id → realtime/open_info
-    // (session_target)`. The session id MUST survive serialization to
-    // JSON — it is the sole bridge from mob membership to a realtime
-    // session handle since `mob_member_target` was removed.
+async fn test_member_status_surface_exposes_current_session_id_for_diagnostics_only() {
+    // `current_session_id` remains observable for status/continuity
+    // diagnostics, but it is not a realtime routing contract. Public
+    // realtime callers use `RealtimeChannelTarget::MobMember` so the server
+    // resolves the machine-owned bridge binding at open/reconnect time.
     let (handle, _service) = create_test_mob(sample_definition()).await;
     let receipt = handle
         .spawn(ProfileName::from("worker"), MeerkatId::from("w-1"), None)
@@ -25615,7 +26034,7 @@ async fn test_member_status_surface_exposes_current_session_id_for_realtime_rout
             .get("current_session_id")
             .and_then(|v| v.as_str()),
         Some(expected_session_id.to_string().as_str()),
-        "mob/member_status response must surface current_session_id for realtime routing: {json_value}"
+        "mob/member_status response should surface current_session_id for diagnostics: {json_value}"
     );
     // The bridge-internal alias stays hidden — it is not part of the
     // public identity contract.
