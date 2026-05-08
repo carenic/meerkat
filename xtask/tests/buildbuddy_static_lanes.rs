@@ -224,7 +224,11 @@ fn gcp_feature_matrix_lane_fans_out_remote_cargo_actions() {
         "tools/buildbuddy BUILD must declare the split feature matrix test suite"
     );
     assert!(
-        build.contains("name = \"feature_matrix_lib_cargo_equivalent_test\""),
+        !build.contains("\ndef "),
+        "tools/buildbuddy BUILD must stay Bazel-9-compatible; put helper functions in .bzl files"
+    );
+    assert!(
+        build.contains("\"feature_matrix_lib_cargo_equivalent_test\": \"test-feature-matrix-lib\""),
         "tools/buildbuddy BUILD should keep the monolithic compatibility target"
     );
 

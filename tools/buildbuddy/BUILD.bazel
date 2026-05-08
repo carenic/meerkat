@@ -70,7 +70,8 @@ sh_test(
     tags = ["buildbuddy"],
 )
 
-def _cargo_equivalent_test(name, lane, timeout = "long"):
+# Compatibility target for developers invoking the historic monolithic lane.
+[
     sh_test(
         name = name,
         srcs = ["cargo_lane_test.sh"],
@@ -81,20 +82,14 @@ def _cargo_equivalent_test(name, lane, timeout = "long"):
         ] + RUST_TOOLCHAIN_DATA,
         exec_properties = CARGO_EQUIVALENT_EXEC_PROPERTIES,
         size = "enormous",
-        timeout = timeout,
+        timeout = "long",
         tags = CARGO_EQUIVALENT_TAGS,
     )
-
-_cargo_equivalent_test(
-    name = "minimal_feature_builds_cargo_equivalent_test",
-    lane = "test-minimal",
-)
-
-# Compatibility target for developers invoking the historic monolithic lane.
-_cargo_equivalent_test(
-    name = "feature_matrix_lib_cargo_equivalent_test",
-    lane = "test-feature-matrix-lib",
-)
+    for name, lane in {
+        "minimal_feature_builds_cargo_equivalent_test": "test-minimal",
+        "feature_matrix_lib_cargo_equivalent_test": "test-feature-matrix-lib",
+    }.items()
+]
 
 FEATURE_MATRIX_LIB_CARGO_EQUIVALENT_TESTS = {
     "feature_matrix_tools_comms_cargo_equivalent_test": "test-feature-matrix-tools-comms",
@@ -109,9 +104,18 @@ FEATURE_MATRIX_LIB_CARGO_EQUIVALENT_TESTS = {
 }
 
 [
-    _cargo_equivalent_test(
+    sh_test(
         name = name,
-        lane = lane,
+        srcs = ["cargo_lane_test.sh"],
+        args = [lane],
+        data = [
+            ":lane_scripts",
+            "//:workspace_runfiles",
+        ] + RUST_TOOLCHAIN_DATA,
+        exec_properties = CARGO_EQUIVALENT_EXEC_PROPERTIES,
+        size = "enormous",
+        timeout = "long",
+        tags = CARGO_EQUIVALENT_TAGS,
     )
     for name, lane in FEATURE_MATRIX_LIB_CARGO_EQUIVALENT_TESTS.items()
 ]
