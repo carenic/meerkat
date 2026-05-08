@@ -275,7 +275,11 @@ submitter/coordinator:
    the pre-baked Artifact Registry image
    `europe-west1-docker.pkg.dev/king-dnn-training-dev/meerkat-ci/meerkat-ci-rust:1.94.0`.
 5. `gcp-executors-down` always scales the managed instance group back to zero
-   after the submitters finish.
+   after the submitters finish. In GitHub CI it sets target size to zero and
+   skips waiting for every VM deletion to settle, so teardown does not inflate
+   the required CI status. Manual `scripts/gcp-buildbuddy-executor-pool down`
+   still waits by default; set `MEERKAT_GCP_BUILDBUDDY_WAIT_ON_DOWN=0` for the
+   asynchronous behavior.
 
 The intended steady-state cost shape is one small always-on BuildBuddy
 backend/cache plus zero idle executor VMs. A CI run bursts the executor MIG to

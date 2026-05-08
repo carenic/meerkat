@@ -424,7 +424,14 @@ case "${command}" in
     ;;
   down)
     resize_pool 0
-    wait_stable
+    case "${MEERKAT_GCP_BUILDBUDDY_WAIT_ON_DOWN:-1}" in
+      0|false|False|FALSE|no|No|NO)
+        echo "Skipping wait for executor pool scale-down; target size is set to 0."
+        ;;
+      *)
+        wait_stable
+        ;;
+    esac
     status
     ;;
   wait)

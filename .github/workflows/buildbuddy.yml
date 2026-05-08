@@ -392,6 +392,8 @@ jobs:
           rm -f "${key_file}"
       - name: Scale down BuildBuddy executors
         shell: bash
+        env:
+          MEERKAT_GCP_BUILDBUDDY_WAIT_ON_DOWN: ${{ vars.MEERKAT_GCP_BUILDBUDDY_WAIT_ON_DOWN || '0' }}
         run: scripts/gcp-buildbuddy-executor-pool down
 
   doctor:
