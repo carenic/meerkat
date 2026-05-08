@@ -54,7 +54,7 @@ rust_binary(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "rkat",
         "CARGO_MANIFEST_DIR": "meerkat-cli",
     },
@@ -113,7 +113,7 @@ rust_binary(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "rkat-mini",
         "CARGO_MANIFEST_DIR": "meerkat-cli",
     },
@@ -180,7 +180,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "auth_binding_single_parser",
         "CARGO_MANIFEST_DIR": "./meerkat-cli",
     },
@@ -266,7 +266,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "cli_auth_flow",
         "CARGO_MANIFEST_DIR": "./meerkat-cli",
     },
@@ -352,7 +352,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "cli_mobpack_live_smoke",
         "CARGO_MANIFEST_DIR": "./meerkat-cli",
     },
@@ -438,7 +438,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "cli_mobpack_live_smoke",
         "CARGO_MANIFEST_DIR": "./meerkat-cli",
     },
@@ -533,7 +533,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "cli_mobpack_live_smoke",
         "CARGO_MANIFEST_DIR": "./meerkat-cli",
     },
@@ -628,7 +628,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "cli_mobpack_live_smoke",
         "CARGO_MANIFEST_DIR": "./meerkat-cli",
     },
@@ -723,7 +723,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "live_smoke_cli",
         "CARGO_MANIFEST_DIR": "./meerkat-cli",
     },
@@ -809,7 +809,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "live_smoke_cli",
         "CARGO_MANIFEST_DIR": "./meerkat-cli",
     },
@@ -904,7 +904,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "runtime_backed_ingress",
         "CARGO_MANIFEST_DIR": "./meerkat-cli",
     },
@@ -989,7 +989,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "sqlite_tools_full_reuse",
         "CARGO_MANIFEST_DIR": "./meerkat-cli",
     },
@@ -1074,7 +1074,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "system_cli_init",
         "CARGO_MANIFEST_DIR": "./meerkat-cli",
     },
@@ -1160,7 +1160,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "system_cli_init",
         "CARGO_MANIFEST_DIR": "./meerkat-cli",
     },
@@ -1254,7 +1254,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "system_cli_mini",
         "CARGO_MANIFEST_DIR": "./meerkat-cli",
     },
@@ -1338,7 +1338,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "system_cli_resume",
         "CARGO_MANIFEST_DIR": "./meerkat-cli",
     },
@@ -1424,7 +1424,7 @@ rust_test(
     ],
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "system_cli_resume",
         "CARGO_MANIFEST_DIR": "./meerkat-cli",
     },
@@ -1500,7 +1500,7 @@ rust_binary(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "rkat",
         "CARGO_MANIFEST_DIR": "meerkat-cli",
     },
@@ -1549,7 +1549,7 @@ rust_binary(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "rkat-mini",
         "CARGO_MANIFEST_DIR": "meerkat-cli",
     },
@@ -1599,7 +1599,7 @@ rust_binary(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "rkat",
         "CARGO_MANIFEST_DIR": "meerkat-cli",
     },
@@ -1650,7 +1650,7 @@ rust_binary(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "rkat-mini",
         "CARGO_MANIFEST_DIR": "meerkat-cli",
     },
@@ -1704,7 +1704,7 @@ rust_binary(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "rkat-mini",
         "CARGO_MANIFEST_DIR": "meerkat-cli",
     },
@@ -1758,7 +1758,7 @@ rust_binary(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "rkat-mini",
         "CARGO_MANIFEST_DIR": "meerkat-cli",
     },
@@ -1809,7 +1809,7 @@ rust_binary(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "rkat",
         "CARGO_MANIFEST_DIR": "meerkat-cli",
     },
@@ -1861,7 +1861,7 @@ rust_binary(
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//visibility:public"],
     rustc_env = {
-        "CARGO_PKG_VERSION": "0.6.3",
+        "CARGO_PKG_VERSION": "0.6.4",
         "CARGO_BIN_NAME": "rkat-mini",
         "CARGO_MANIFEST_DIR": "meerkat-cli",
     },
