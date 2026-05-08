@@ -217,10 +217,11 @@ if grep -Fq 'Restore Bazel external repositories' .github/actions/setup-buildbud
   grep -Fq "env.MEERKAT_BAZEL_BACKEND != 'gcp-buildbuddy'" .github/actions/setup-buildbuddy-ci/action.yml &&
   grep -Fq -- '--repository_cache=' scripts/buildbuddy-bazel-poc &&
   grep -Fq 'MEERKAT_BUILDBUDDY_FETCH_RETRIES' scripts/buildbuddy-ci-lane &&
-  grep -Fq 'Retrying %s after transient external repository fetch failure' scripts/buildbuddy-ci-lane; then
-  pass "BuildBuddy CI caches and retries external repository fetches"
+  grep -Fq 'No registered executors in pool' scripts/buildbuddy-ci-lane &&
+  grep -Fq 'Retrying %s after transient BuildBuddy remote/cache failure' scripts/buildbuddy-ci-lane; then
+  pass "BuildBuddy CI caches and retries transient remote/cache failures"
 else
-  bad "BuildBuddy CI does not guard against transient external repository fetch failures"
+  bad "BuildBuddy CI does not guard against transient remote/cache failures"
 fi
 
 if [[ -x scripts/run-surface-feature-matrix ]] &&

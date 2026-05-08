@@ -171,9 +171,9 @@ run_logged() {
     set -e
     while [[ "${status}" != "0" &&
       "${attempt}" -lt "${max_fetch_retries}" ]] &&
-      grep -Eq 'GET returned 5[0-9][0-9]|Bad Gateway|Proxy Error|Error downloading' "${log}"; do
+      grep -Eq 'GET returned 5[0-9][0-9]|Bad Gateway|Proxy Error|Error downloading|No registered executors in pool' "${log}"; do
       attempt="$((attempt + 1))"
-      printf 'Retrying %s after transient external repository fetch failure (%s/%s)...\n' \
+      printf 'Retrying %s after transient BuildBuddy remote/cache failure (%s/%s)...\n' \
         "${name}" "${attempt}" "${max_fetch_retries}" | tee -a "${log}"
       sleep "$((attempt * 5))"
       set +e
