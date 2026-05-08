@@ -583,6 +583,8 @@ pub struct MethodRouter {
     closed_mob_streams: Arc<Mutex<ClosedStreamSet>>,
     runtime_adapter: Arc<meerkat_runtime::MeerkatMachine>,
     live_adapter_host: Arc<meerkat_runtime::live_adapter_host::LiveAdapterHost>,
+    live_ws_state: Option<Arc<meerkat_live::LiveWsState>>,
+    live_ws_base_url: Option<String>,
 }
 
 impl MethodRouter {
@@ -687,7 +689,16 @@ impl MethodRouter {
             closed_mob_streams: Arc::new(Mutex::new(ClosedStreamSet::new())),
             runtime_adapter,
             live_adapter_host: Arc::new(meerkat_runtime::live_adapter_host::LiveAdapterHost::new()),
+            live_ws_state: None,
+            live_ws_base_url: None,
         }
+    }
+
+    /// Attach a live WebSocket transport state for `live/open` token minting.
+    pub fn with_live_ws(mut self, state: Arc<meerkat_live::LiveWsState>, base_url: String) -> Self {
+        self.live_ws_state = Some(state);
+        self.live_ws_base_url = Some(base_url);
+        self
     }
 
     /// Get a reference to the runtime adapter for session registration.
@@ -962,6 +973,8 @@ impl MethodRouter {
             closed_mob_streams: Arc::new(Mutex::new(ClosedStreamSet::new())),
             runtime_adapter,
             live_adapter_host: Arc::new(meerkat_runtime::live_adapter_host::LiveAdapterHost::new()),
+            live_ws_state: None,
+            live_ws_base_url: None,
         }
     }
 
@@ -1431,7 +1444,14 @@ impl MethodRouter {
                 .await
             }
             "live/open" => {
-                handlers::live::handle_live_open(id, params, &self.live_adapter_host).await
+                handlers::live::handle_live_open(
+                    id,
+                    params,
+                    &self.live_adapter_host,
+                    self.live_ws_state.as_deref(),
+                    self.live_ws_base_url.as_deref(),
+                )
+                .await
             }
             "live/status" => {
                 handlers::live::handle_live_status(id, params, &self.live_adapter_host).await
