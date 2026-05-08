@@ -4,6 +4,7 @@
 //! invent attachment semantics or runtime lifecycle truth.
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use meerkat_contracts::{
     RealtimeAudioChunk, RealtimeAudioFormat, RealtimeCapabilities, RealtimeInputChunk,
     RealtimeInputKind, RealtimeOutputKind, RealtimeTurningMode,
@@ -24,11 +25,14 @@ use oai_rt_rs::protocol::models::{
     InputAudioTranscription, Item, Nullable, OutputAudioConfig, OutputModalities, ResponseConfig,
     Role, SessionUpdate, SessionUpdateConfig, Tool, TurnDetection, Voice,
 };
-use oai_rt_rs::{ClientEvent, Error as OpenAiLiveError, RealtimeClient, ServerEvent};
+use oai_rt_rs::{
+    ClientEvent, Error as OpenAiLiveError, RealtimeClient, RealtimeSender, ServerEvent,
+};
 use serde::Deserialize;
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 
 pub use oai_rt_rs::ClientEvent as OpenAiLiveClientEvent;
 pub use oai_rt_rs::ServerEvent as OpenAiLiveServerEvent;
@@ -101,9 +105,55 @@ impl OpenAiLiveClient {
     }
 }
 
+/// Split-half wrapper around `RealtimeClient`.
+///
+/// The receive half is consumed into a stream that runs in a dedicated task
+/// pumping events into a `tokio::sync::mpsc` channel. This makes
+/// `next_event` cancel-safe: the underlying tungstenite WebSocket read is
+/// driven by a task that never gets cancelled, so dropping a
+/// `next_event().await` future (e.g. by `tokio::select!`) only discards
+/// the wake-up — events already in the channel remain available on the
+/// next poll.
+///
+/// This matters for the live-adapter pump in `meerkat-live`, which uses
+/// `tokio::select!` to multiplex commands and event polls. Without the
+/// split, cancelling a `RealtimeClient::next_event` future mid-frame can
+/// lose WebSocket frames and stall multi-turn conversations (notably
+/// barge-in scenarios where send and receive must overlap).
 struct RealtimeOpenAiLiveSession {
-    inner: RealtimeClient,
+    sender: RealtimeSender,
+    event_rx: mpsc::Receiver<Result<ServerEvent, OpenAiLiveError>>,
+    recv_task: Option<tokio::task::JoinHandle<()>>,
     pending_events: VecDeque<ServerEvent>,
+}
+
+impl RealtimeOpenAiLiveSession {
+    fn from_client(client: RealtimeClient) -> Self {
+        let (sender, receiver) = client.split();
+        let mut stream = receiver.try_into_stream();
+        let (event_tx, event_rx) = mpsc::channel(256);
+        let recv_task = tokio::spawn(async move {
+            while let Some(res) = stream.next().await {
+                if event_tx.send(res).await.is_err() {
+                    break;
+                }
+            }
+        });
+        Self {
+            sender,
+            event_rx,
+            recv_task: Some(recv_task),
+            pending_events: VecDeque::new(),
+        }
+    }
+}
+
+impl Drop for RealtimeOpenAiLiveSession {
+    fn drop(&mut self) {
+        if let Some(handle) = self.recv_task.take() {
+            handle.abort();
+        }
+    }
 }
 
 fn trace_client_event_json(event: &ClientEvent) -> Option<String> {
@@ -139,18 +189,20 @@ impl OpenAiLiveSession for RealtimeOpenAiLiveSession {
             // the trace itself untrustworthy during smoke debugging.
             eprintln!("[openai-realtime-send] {serialized}");
         }
-        self.inner.send(event).await.map_err(map_openai_live_error)
+        self.sender.send(event).await.map_err(map_openai_live_error)
     }
 
     async fn next_event(&mut self) -> Result<Option<ServerEvent>, LlmError> {
         if let Some(event) = self.pending_events.pop_front() {
             return Ok(Some(event));
         }
-        let event = self
-            .inner
-            .next_event()
-            .await
-            .map_err(map_openai_live_error)?;
+        // `mpsc::Receiver::recv` is cancel-safe; the spawned recv task owns
+        // the underlying WS read and never sees this select! cancel.
+        let event = match self.event_rx.recv().await {
+            Some(Ok(event)) => Some(event),
+            Some(Err(err)) => return Err(map_openai_live_error(err)),
+            None => None,
+        };
         if std::env::var_os("RKAT_OPENAI_REALTIME_TRACE_JSON").is_some()
             && let Some(event) = event.as_ref()
             && let Some(serialized) = trace_server_event_json(event)
@@ -168,16 +220,14 @@ impl OpenAiLiveSessionFactory for OpenAiLiveClient {
         &self,
         open_config: &RealtimeSessionOpenConfig,
     ) -> Result<Box<dyn OpenAiLiveSession>, LlmError> {
-        let mut session = RealtimeOpenAiLiveSession {
-            inner: RealtimeClient::connect(
-                &self.api_key,
-                Some(&openai_realtime_connect_model(&open_config.llm_identity)),
-                None,
-            )
-            .await
-            .map_err(map_openai_live_error)?,
-            pending_events: VecDeque::new(),
-        };
+        let client = RealtimeClient::connect(
+            &self.api_key,
+            Some(&openai_realtime_connect_model(&open_config.llm_identity)),
+            None,
+        )
+        .await
+        .map_err(map_openai_live_error)?;
+        let mut session = RealtimeOpenAiLiveSession::from_client(client);
         configure_openai_live_session(&mut session, open_config).await?;
         Ok(Box::new(session))
     }
@@ -186,12 +236,10 @@ impl OpenAiLiveSessionFactory for OpenAiLiveClient {
         &self,
         target: &OpenAiLiveCallTarget,
     ) -> Result<Box<dyn OpenAiLiveSession>, LlmError> {
-        let mut session = RealtimeOpenAiLiveSession {
-            inner: RealtimeClient::connect(&self.api_key, None, Some(target.call_id.as_str()))
-                .await
-                .map_err(map_openai_live_error)?,
-            pending_events: VecDeque::new(),
-        };
+        let client = RealtimeClient::connect(&self.api_key, None, Some(target.call_id.as_str()))
+            .await
+            .map_err(map_openai_live_error)?;
+        let mut session = RealtimeOpenAiLiveSession::from_client(client);
         wait_for_openai_session_created(&mut session).await?;
         Ok(Box::new(session))
     }

@@ -95,17 +95,15 @@ impl LiveAdapter for ProviderSessionAdapter {
 /// Pump task: owns the `RealtimeSession` exclusively. Uses biased select
 /// between commands and event polls.
 ///
-/// **Cancellation note**: `RealtimeSession::next_event` future may be
-/// dropped when a command arrives. The OpenAI provider impl
-/// (`RealtimeOpenAiLiveSession`) buffers events in `pending_events` so
-/// dropping a poll mid-await only discards the wake-up, not the event.
-/// The next call to `next_event` picks up buffered events first.
+/// Cancellation note: `RealtimeSession::next_event` future may be dropped
+/// when a command arrives. The OpenAI provider impl buffers events in
+/// `pending_events` so dropping a poll mid-await only discards the wake-up,
+/// not the event.
 async fn pump_task(
     mut session: Box<dyn RealtimeSession>,
     mut cmd_rx: mpsc::Receiver<LiveAdapterCommand>,
     obs_tx: mpsc::Sender<LiveAdapterObservation>,
 ) {
-    // Emit synthetic Ready first so consumers know the channel is alive.
     if obs_tx.send(LiveAdapterObservation::Ready).await.is_err() {
         return;
     }

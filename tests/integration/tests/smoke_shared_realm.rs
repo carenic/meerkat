@@ -3317,7 +3317,7 @@ const OPENAI_TTS_DEFAULT_VOICE: &str = "alloy";
 const LIVE_AUDIO_SAMPLE_RATE_HZ: usize = 24_000;
 const LIVE_AUDIO_BYTES_PER_SAMPLE: usize = 2;
 const LIVE_AUDIO_FRAME_MS: usize = 200;
-const LIVE_AUDIO_TRAILING_SILENCE_MS: usize = 500;
+const LIVE_AUDIO_TRAILING_SILENCE_MS: usize = 1500;
 const LIVE_AUDIO_INTERNAL_SILENCE_THRESHOLD: i16 = 100;
 const LIVE_AUDIO_MAX_INTERNAL_SILENCE_MS: usize = 200;
 const LIVE_AUDIO_PRESERVED_INTERNAL_SILENCE_MS: usize = 80;
@@ -4304,13 +4304,32 @@ async fn e2e_scenario_71_live_adapter_channel_lifecycle_rpc_ws()
         let _turn2_quiesced =
             ensure_live_session_quiescent(&mut ws_write, &mut ws_read, &turn2_capture, 5).await?;
         eprintln!("[scenario 71] send turn 3 explanation and barge into turn 4");
-        let turn3_commit = send_live_audio_and_wait_for_turn(
+        let turn3_commit = match send_live_audio_and_wait_for_turn(
             &mut ws_write,
             &mut ws_read,
             &token_explain_pcm,
             120,
         )
-        .await?;
+        .await
+        {
+            Ok(capture) => capture,
+            Err(error) => {
+                let rpc_stderr = read_available_stderr(&mut rpc, 2_000).await;
+                let interesting_lines: Vec<&str> = rpc_stderr
+                    .lines()
+                    .filter(|l| {
+                        l.contains("[pump]")
+                            || l.contains("openai-realtime")
+                            || l.contains("[live-ws]")
+                    })
+                    .collect();
+                eprintln!("=== last 200 trace events ===");
+                for line in interesting_lines.iter().rev().take(200).rev() {
+                    eprintln!("{line}");
+                }
+                return Err(format!("scenario 71 turn 3 failed: {error}").into());
+            }
+        };
         let turn34_preemption_capture = match collect_live_observations_until_barge_in(
             &mut ws_write,
             &mut ws_read,
