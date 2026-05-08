@@ -232,6 +232,11 @@ jobs:
           profile: native
           mode: release-validate
 
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
       - name: Verify Rust release packaging
         if: ${{ github.event_name != 'workflow_dispatch' || github.event.inputs.publish_release_assets_only != 'true' }}
         run: make check-rust-release-packaging
