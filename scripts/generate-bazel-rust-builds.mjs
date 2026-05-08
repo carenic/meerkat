@@ -831,8 +831,15 @@ function writeRootBuild(fastTestLabels, e2eSystemTestLabels, surfaceFeatureMatri
     `        "@node_darwin_arm64//:lib/node_modules/npm/bin/npx-cli.js",`,
     `        "@node_darwin_arm64//:node",`,
     `        "@node_darwin_arm64//:npm_runtime",`,
+    `        "@node_linux_x86_64//:bin/node",`,
+    `        "@node_linux_x86_64//:lib/node_modules/npm/bin/npm-cli.js",`,
+    `        "@node_linux_x86_64//:lib/node_modules/npm/bin/npx-cli.js",`,
+    `        "@node_linux_x86_64//:node",`,
+    `        "@node_linux_x86_64//:npm_runtime",`,
     `        "@python_darwin_arm64//:python/bin/python3",`,
     `        "@python_darwin_arm64//:python",`,
+    `        "@python_linux_x86_64//:python/bin/python3",`,
+    `        "@python_linux_x86_64//:python",`,
     `        "@rules_rust//rust/toolchain:current_cargo_files",`,
     `        "@rules_rust//rust/toolchain:current_rust_stdlib_files",`,
     `        "@rules_rust//rust/toolchain:current_rust_toolchain",`,
@@ -840,6 +847,7 @@ function writeRootBuild(fastTestLabels, e2eSystemTestLabels, surfaceFeatureMatri
     `        "@rules_rust//rust/toolchain:current_rustc_lib_files",`,
     `        "@rust_std_wasm32_unknown_unknown_1_94_0//:rust_std",`,
     `        "@wasm_pack_darwin_arm64//:wasm-pack",`,
+    `        "@wasm_pack_linux_x86_64//:wasm-pack",`,
     `        "//meerkat-cli:cli_mobpack_live_smoke_test",`,
     `        "//meerkat-cli:live_smoke_cli_test",`,
     `        "//meerkat-cli:rkat",`,
@@ -856,11 +864,16 @@ function writeRootBuild(fastTestLabels, e2eSystemTestLabels, surfaceFeatureMatri
     `    ],`,
     `    env = {`,
     `        "MEERKAT_E2E_ARTIFACTS_BIN": "$(rootpath //tests/integration:e2e_artifacts_bin)",`,
-    `        "MEERKAT_E2E_NODE_BIN": "$(rootpath @node_darwin_arm64//:bin/node)",`,
-    `        "MEERKAT_E2E_NPM_CLI": "$(rootpath @node_darwin_arm64//:lib/node_modules/npm/bin/npm-cli.js)",`,
-    `        "MEERKAT_E2E_NPX_CLI": "$(rootpath @node_darwin_arm64//:lib/node_modules/npm/bin/npx-cli.js)",`,
-    `        "MEERKAT_E2E_PYTHON_BIN": "$(rootpath @python_darwin_arm64//:python/bin/python3)",`,
-    `        "MEERKAT_E2E_WASM_PACK_BIN": "$(rootpath @wasm_pack_darwin_arm64//:wasm-pack)",`,
+    `        "MEERKAT_E2E_DARWIN_NODE_BIN": "$(rootpath @node_darwin_arm64//:bin/node)",`,
+    `        "MEERKAT_E2E_DARWIN_NPM_CLI": "$(rootpath @node_darwin_arm64//:lib/node_modules/npm/bin/npm-cli.js)",`,
+    `        "MEERKAT_E2E_DARWIN_NPX_CLI": "$(rootpath @node_darwin_arm64//:lib/node_modules/npm/bin/npx-cli.js)",`,
+    `        "MEERKAT_E2E_DARWIN_PYTHON_BIN": "$(rootpath @python_darwin_arm64//:python/bin/python3)",`,
+    `        "MEERKAT_E2E_DARWIN_WASM_PACK_BIN": "$(rootpath @wasm_pack_darwin_arm64//:wasm-pack)",`,
+    `        "MEERKAT_E2E_LINUX_NODE_BIN": "$(rootpath @node_linux_x86_64//:bin/node)",`,
+    `        "MEERKAT_E2E_LINUX_NPM_CLI": "$(rootpath @node_linux_x86_64//:lib/node_modules/npm/bin/npm-cli.js)",`,
+    `        "MEERKAT_E2E_LINUX_NPX_CLI": "$(rootpath @node_linux_x86_64//:lib/node_modules/npm/bin/npx-cli.js)",`,
+    `        "MEERKAT_E2E_LINUX_PYTHON_BIN": "$(rootpath @python_linux_x86_64//:python/bin/python3)",`,
+    `        "MEERKAT_E2E_LINUX_WASM_PACK_BIN": "$(rootpath @wasm_pack_linux_x86_64//:wasm-pack)",`,
     `    },`,
     `    size = "enormous",`,
     `    tags = [`,
@@ -1130,6 +1143,7 @@ for (const pkg of localPackages.values()) {
       }
       if (key === "xtask" && target.name === "buildbuddy_static_lanes") {
         data.push("BUILD.bazel");
+        data.push("//tools/buildbuddy:build_file");
       }
       if (needsLiveWorkspaceRunfiles || isE2eLaneHarness) {
         data.push("//:workspace_runfiles");
@@ -1255,10 +1269,17 @@ for (const pkg of localPackages.values()) {
       if (key === "xtask") {
         const rustfmt = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustfmt_bin";
         const rustfmtLib = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__aarch64-apple-darwin_tools//:rustc_lib";
+        const rustfmtLinux = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__x86_64-unknown-linux-gnu_tools//:rustfmt_bin";
+        const rustfmtLinuxLib = "@@rules_rust++rust+rustfmt_nightly-2026-04-16__x86_64-unknown-linux-gnu_tools//:rustc_lib";
         unitData.push("//:workspace_runfiles");
-        unitData.push(rustfmt);
         unitData.push(rustfmtLib);
-        unitEnv.push(`        "RUSTFMT": "$(rootpath ${rustfmt})",`);
+        unitData.push(rustfmt);
+        unitData.push("tests/rustfmt_host.sh");
+        unitData.push(rustfmtLinuxLib);
+        unitData.push(rustfmtLinux);
+        unitEnv.push(`        "RUSTFMT": "$(rootpath tests/rustfmt_host.sh)",`);
+        unitEnv.push(`        "RUSTFMT_DARWIN": "$(rootpath ${rustfmt})",`);
+        unitEnv.push(`        "RUSTFMT_LINUX": "$(rootpath ${rustfmtLinux})",`);
         unitEnv.push(`        "WORKSPACE_ROOT": ".",`);
       }
       const unitRustcEnv = [

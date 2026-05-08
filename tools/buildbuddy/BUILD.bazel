@@ -1,6 +1,12 @@
 load("@rules_shell//shell:sh_test.bzl", "sh_test")
 
 filegroup(
+    name = "build_file",
+    srcs = ["BUILD.bazel"],
+    visibility = ["//visibility:public"],
+)
+
+filegroup(
     name = "lane_scripts",
     srcs = [
         "cargo_lane_test.sh",

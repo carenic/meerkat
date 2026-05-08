@@ -179,7 +179,8 @@ fi
 
 if grep -Fq -- '--lockfile_mode="${BUILDBUDDY_LOCKFILE_MODE:-error}"' scripts/buildbuddy-bazel-poc &&
   ! grep -Fq -- '--lockfile_mode=refresh' scripts/buildbuddy-bazel-poc &&
-  grep -Fq 'restore_module_lock' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'module_lock_backup=' scripts/buildbuddy-bazel-poc &&
+  grep -Fq 'cp -p "${module_lock_backup}" "${lockfile}"' scripts/buildbuddy-bazel-poc &&
   ! grep -Fq '/vendor/oai-rt-rs' scripts/buildbuddy-bazel-poc &&
   ! grep -Fq 'local_oai_vendor' scripts/buildbuddy-bazel-poc; then
   pass "BuildBuddy launcher restores MODULE.bazel.lock without vendored oai-rt-rs path rewrites"
@@ -291,8 +292,10 @@ fi
 rm -rf "${dispatch_log_root}"
 
 if grep -Fq 'name: CI' .github/workflows/ci.yml &&
-  grep -Fq 'uses: ./.github/workflows/cargo.yml' .github/workflows/ci.yml &&
+  ! grep -Fq 'uses: ./.github/workflows/cargo.yml' .github/workflows/ci.yml &&
   grep -Fq 'uses: ./.github/workflows/buildbuddy.yml' .github/workflows/ci.yml &&
+  grep -Fq 'backend: gcp-buildbuddy' .github/workflows/ci.yml &&
+  grep -Fq 'mode: ${{ vars.MEERKAT_BUILDBUDDY_CI_MODE || '"'"'full-warm'"'"' }}' .github/workflows/ci.yml &&
   grep -Fq 'name: CI gate' .github/workflows/ci.yml &&
   grep -Fq 'name: Cargo CI' .github/workflows/cargo.yml &&
   grep -Fq 'workflow_call:' .github/workflows/cargo.yml &&
@@ -303,16 +306,16 @@ if grep -Fq 'name: CI' .github/workflows/ci.yml &&
   ! grep -Fq 'push:' .github/workflows/cargo.yml &&
   ! grep -Fq 'pull_request:' .github/workflows/buildbuddy.yml &&
   ! grep -Fq 'push:' .github/workflows/buildbuddy.yml &&
-  grep -Fq 'MEERKAT_BUILDBUDDY' .github/workflows/buildbuddy.yml &&
+  grep -Fq 'gcp-buildbuddy' .github/workflows/buildbuddy.yml &&
   grep -Fq 'BuildBuddy CI gate' .github/workflows/buildbuddy.yml; then
-  pass "Automatic CI selects Cargo or reusable BuildBuddy, not both"
+  pass "Automatic CI selects the reusable GCP BuildBuddy workflow"
 else
-  bad "Automatic CI does not select exactly one build backend"
+  bad "Automatic CI does not route to the GCP BuildBuddy backend"
 fi
 
-if grep -Fq 'vars.MEERKAT_BUILDBUDDY == '"'"'true'"'"'' .github/workflows/ci.yml &&
+if grep -Fq 'backend: gcp-buildbuddy' .github/workflows/ci.yml &&
   grep -Fq 'vars.MEERKAT_BUILDBUDDY == '"'"'true'"'"'' .github/workflows/buildbuddy.yml &&
-  grep -Fq 'MEERKAT_BUILDBUDDY: ${{ vars.MEERKAT_BUILDBUDDY' .github/workflows/ci.yml &&
+  grep -Fq 'MEERKAT_BUILDBUDDY_CI_MODE' .github/workflows/ci.yml &&
   grep -Fq 'MEERKAT_BUILDBUDDY: ${{ vars.MEERKAT_BUILDBUDDY' .github/workflows/buildbuddy.yml &&
   grep -Fq 'MEERKAT_BUILDBUDDY=1' CLAUDE.md &&
   grep -Fq 'MEERKAT_BUILDBUDDY=1' AGENTS.md &&
@@ -326,7 +329,7 @@ if grep -Fq 'vars.MEERKAT_BUILDBUDDY == '"'"'true'"'"'' .github/workflows/ci.yml
   grep -Fq 'source "${ROOT}/scripts/build-backend-env"' scripts/pre-push-unit.sh &&
   grep -Fq 'scripts/agent-gate" --staged' scripts/test-changed-crates.sh &&
   grep -Fq 'scripts/agent-gate" --committed --clippy-only' scripts/pre-push-clippy.sh; then
-  pass "MEERKAT_BUILDBUDDY is the single opt-in switch for CI and hooks"
+  pass "GCP CI and local BuildBuddy opt-in switches are wired consistently"
 else
   bad "BuildBuddy opt-in switch is not wired consistently"
 fi
@@ -466,11 +469,12 @@ if ! grep -Fq 'rust-release-packaging:' .github/workflows/cargo.yml &&
   ! grep -Fq 'e2e-live:' .github/workflows/cargo.yml &&
   ! grep -Fq 'e2e-smoke:' .github/workflows/cargo.yml &&
   grep -Fq 'Cargo E2E live lane' .github/workflows/live-e2e.yml &&
-  grep -Fq 'GCP Bazel E2E smoke lane' .github/workflows/live-e2e.yml &&
+  grep -Fq 'BuildBuddy E2E smoke lane' .github/workflows/live-e2e.yml &&
   grep -Fq 'needs: [bazel, dogma-cleanup-gate]' .github/workflows/ci.yml &&
+  grep -Fq 'echo "GCP Bazel CI selected: $bazel_result"' .github/workflows/ci.yml &&
   grep -Fq 'needs: [fmt-lint, sdk-suites, machine-authority, test-unit, integration-fast, e2e-fast, e2e-system, test-minimal' .github/workflows/cargo.yml &&
   ! grep -Fq 'needs: [fmt-lint, sdk-suites, rust-release-packaging' .github/workflows/cargo.yml; then
-  pass "CI gate selects one backend and Cargo gate depends on every standard Cargo CI lane"
+  pass "CI gate selects GCP BuildBuddy and Cargo gate preserves standard Cargo lane coverage"
 else
   bad "CI gate does not match the backend selector and standard/nightly lane split"
 fi
