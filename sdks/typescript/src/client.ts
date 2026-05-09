@@ -204,6 +204,7 @@ export interface ConnectOptions {
   stateRoot?: string;
   contextRoot?: string;
   userConfigRoot?: string;
+  liveWs?: boolean;
 }
 
 interface WireSkillKey {
@@ -398,13 +399,23 @@ export class MeerkatClient {
     const resolved = await MeerkatClient.resolveBinaryPath(this.rkatPath);
     this.rkatPath = resolved.command;
 
-    const args = MeerkatClient.buildArgs(resolved.useLegacySubcommand, options);
-    if (resolved.useLegacySubcommand && args.length > 1) {
+    const hasAdvancedOptions = Boolean(
+      options?.isolated
+        || options?.realmId
+        || options?.instanceId
+        || options?.realmBackend
+        || options?.stateRoot
+        || options?.contextRoot
+        || options?.userConfigRoot
+        || options?.liveWs,
+    );
+    if (resolved.useLegacySubcommand && hasAdvancedOptions) {
       throw new MeerkatError(
         "LEGACY_BINARY_UNSUPPORTED",
         "Realm/context options require the standalone rkat-rpc binary. Install rkat-rpc and retry.",
       );
     }
+    const args = MeerkatClient.buildArgs(resolved.useLegacySubcommand, options);
 
     this.process = spawn(this.rkatPath, args, {
       stdio: ["pipe", "pipe", "pipe"],
@@ -3534,8 +3545,9 @@ export class MeerkatClient {
 
   private static buildArgs(legacy: boolean, options?: ConnectOptions): string[] {
     if (legacy) return ["rpc"];
-    const args: string[] = ["--live-ws", "127.0.0.1:0"];
+    const args: string[] = [];
     if (!options) return args;
+    if (options.liveWs) args.push("--live-ws", "127.0.0.1:0");
     if (options.isolated) args.push("--isolated");
     if (options.realmId) args.push("--realm", options.realmId);
     if (options.instanceId) args.push("--instance", options.instanceId);

@@ -321,6 +321,7 @@ class MeerkatClient:
         state_root: str | None = None,
         context_root: str | None = None,
         user_config_root: str | None = None,
+        live_ws: bool = False,
     ) -> MeerkatClient:
         """Start the rkat-rpc subprocess and perform handshake."""
         if realm_id and isolated:
@@ -332,7 +333,7 @@ class MeerkatClient:
 
         has_advanced_opts = any([
             isolated, realm_id, instance_id, realm_backend,
-            state_root, context_root, user_config_root,
+            state_root, context_root, user_config_root, live_ws,
         ])
         if self._legacy_rpc_subcommand and has_advanced_opts:
             raise MeerkatError(
@@ -345,7 +346,7 @@ class MeerkatClient:
             use_legacy, isolated=isolated, realm_id=realm_id,
             instance_id=instance_id, realm_backend=realm_backend,
             state_root=state_root, context_root=context_root,
-            user_config_root=user_config_root,
+            user_config_root=user_config_root, live_ws=live_ws,
         )
 
         self._process = await asyncio.create_subprocess_exec(
@@ -2815,10 +2816,13 @@ class MeerkatClient:
         state_root: str | None,
         context_root: str | None,
         user_config_root: str | None,
+        live_ws: bool,
     ) -> list[str]:
         if legacy:
             return ["rpc"]
-        args: list[str] = ["--live-ws", "127.0.0.1:0"]
+        args: list[str] = []
+        if live_ws:
+            args.extend(["--live-ws", "127.0.0.1:0"])
         if isolated:
             args.append("--isolated")
         if realm_id:
