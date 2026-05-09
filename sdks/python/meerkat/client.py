@@ -2529,6 +2529,15 @@ class MeerkatClient:
             },
         )
 
+    async def live_refresh(self, channel_id: str) -> dict[str, Any]:
+        """Re-seed an open live channel against the latest canonical session
+        state without tearing the channel down. Wraps ``live/refresh``.
+        """
+        return await self._request(
+            "live/refresh",
+            {"channel_id": channel_id},
+        )
+
     async def mob_ensure_member(
         self, mob_id: str, spec: dict[str, Any]
     ) -> dict[str, Any]:
