@@ -271,6 +271,8 @@ only the submitter/coordinator:
    actions. Governance and WASM/SDK/feature/audit are path-aware edge lanes;
    they start in parallel after the executor pool is up and do not wait for the
    prebuild, because they do not consume the shared Bazel-native prebuild output.
+   Governance is intentionally keyed to the machine DSL/generated-machine
+   surfaces, not broad Bazel metadata such as `MODULE.bazel.lock`.
 5. Bazel uses `--config=buildbuddy-linux-gcp-ci-rbe`, which selects
    `//platforms:linux_x86_64_gcp_ci`. That platform routes actions to
    BuildBuddy pool `meerkat-ci`, enables external network, and runs actions in

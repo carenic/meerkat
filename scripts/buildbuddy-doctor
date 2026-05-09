@@ -404,6 +404,8 @@ if job_has_line .github/workflows/ci.yml cargo 'name: GHA Cargo' &&
   job_has_line .github/workflows/buildbuddy.yml wasm-feature-submit 'group: gcp-wasm-feature' &&
   job_has_line .github/workflows/buildbuddy.yml governance-submit 'Detect machine-authority changes' &&
   job_has_line .github/workflows/buildbuddy.yml wasm-feature-submit 'Detect WASM, SDK, feature, or audit changes' &&
+  ! ./scripts/machine-authority-changed MODULE.bazel.lock >/dev/null 2>&1 &&
+  ! job_has_line .github/workflows/buildbuddy.yml wasm-feature-submit 'MODULE.bazel.lock' &&
   ! job_has_line .github/workflows/buildbuddy.yml governance-submit "steps.machine-changes.outputs.changed != 'true'" &&
   ! job_has_line .github/workflows/buildbuddy.yml wasm-feature-submit 'seam-inventory' &&
   ! job_has_line .github/workflows/buildbuddy.yml wasm-feature-submit 'rmat-audit' &&

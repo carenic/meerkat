@@ -377,7 +377,7 @@ jobs:
             changed=false
             while IFS= read -r path; do
               case "${path}" in
-                Cargo.toml|Cargo.lock|MODULE.bazel|MODULE.bazel.lock|.bazelrc)
+                Cargo.toml|Cargo.lock|MODULE.bazel|.bazelrc)
                   changed=true
                   break
                   ;;

@@ -96,9 +96,6 @@ machine_authority_path() {
     xtask/tests/machine_verify_all_tlc_test.sh|xtask/tests/machines_contracts.rs|xtask/tests/protocol_codegen_drift.rs)
       return 0
       ;;
-    Cargo.toml|Cargo.lock|BUILD.bazel|MODULE.bazel|MODULE.bazel.lock|.bazelrc)
-      return 0
-      ;;
   esac
   return 1
 }
