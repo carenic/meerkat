@@ -283,7 +283,7 @@ jobs:
 
   governance-submit:
     name: Governance submitter
-    needs: [control-plane-up, executors-up, prebuild-submit]
+    needs: [control-plane-up, executors-up]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -348,7 +348,7 @@ jobs:
 
   wasm-feature-submit:
     name: WASM and feature submitter
-    needs: [control-plane-up, executors-up, prebuild-submit]
+    needs: [control-plane-up, executors-up]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:

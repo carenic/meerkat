@@ -394,8 +394,8 @@ if job_has_line .github/workflows/ci.yml cargo 'name: GHA Cargo' &&
   job_has_line .github/workflows/buildbuddy.yml governance-submit 'name: Governance submitter' &&
   job_has_line .github/workflows/buildbuddy.yml wasm-feature-submit 'name: WASM and feature submitter' &&
   job_has_line .github/workflows/buildbuddy.yml native-submit 'needs: [control-plane-up, executors-up, prebuild-submit]' &&
-  job_has_line .github/workflows/buildbuddy.yml governance-submit 'needs: [control-plane-up, executors-up, prebuild-submit]' &&
-  job_has_line .github/workflows/buildbuddy.yml wasm-feature-submit 'needs: [control-plane-up, executors-up, prebuild-submit]' &&
+  job_has_line .github/workflows/buildbuddy.yml governance-submit 'needs: [control-plane-up, executors-up]' &&
+  job_has_line .github/workflows/buildbuddy.yml wasm-feature-submit 'needs: [control-plane-up, executors-up]' &&
   job_has_line .github/workflows/buildbuddy.yml native-submit 'CI_STARTED_AT_EPOCH:' &&
   job_has_line .github/workflows/buildbuddy.yml governance-submit 'CI_STARTED_AT_EPOCH:' &&
   job_has_line .github/workflows/buildbuddy.yml wasm-feature-submit 'CI_STARTED_AT_EPOCH:' &&

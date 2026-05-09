@@ -264,12 +264,13 @@ only the submitter/coordinator:
    lanes start. It deliberately does not execute TLC/RMAT/governance or
    cargo-equivalent WASM/SDK wrappers; those are policy/shell lanes, not the
    shared Bazel-native compilation graph.
-4. The targeted submitter jobs then run format/static, clippy, unit, and
+4. The native submitter then runs format/static, clippy, unit, and
    integration-fast checks against the warmed graph. GCP batches default to one
    local submitter per job because the desired parallelism is Bazel action-level
    remote execution, not several GitHub jobs racing the same first-touch compile
-   actions. Governance and WASM/SDK/feature/audit lanes are path-aware edge
-   lanes; they run only when their inputs changed.
+   actions. Governance and WASM/SDK/feature/audit are path-aware edge lanes;
+   they start in parallel after the executor pool is up and do not wait for the
+   prebuild, because they do not consume the shared Bazel-native prebuild output.
 5. Bazel uses `--config=buildbuddy-linux-gcp-ci-rbe`, which selects
    `//platforms:linux_x86_64_gcp_ci`. That platform routes actions to
    BuildBuddy pool `meerkat-ci`, enables external network, and runs actions in
