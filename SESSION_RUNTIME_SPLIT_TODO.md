@@ -204,7 +204,7 @@ self-verify.
 
 ### Phase 1 — Wave 1: pure session-orchestration types (parallel by file)
 
-- [x] fix · [ ] verify · **W1-A.** Move
+- [x] fix · [x] verify · **W1-A.** Move
   `StagedCapacityAdmissions` (typedef + helpers
   `take_staged_capacity_admission`, `insert_staged_capacity_admission`,
   `has_staged_capacity_admission`, `discard_staged_capacity_admission`,
@@ -213,7 +213,7 @@ self-verify.
   `meerkat::session_runtime::admission`. Re-export from
   `meerkat-rpc::session_runtime` for backward compatibility.
 
-- [x] fix · [ ] verify · **W1-B.** Move `PendingPromotionCleanup`
+- [x] fix · [x] verify · **W1-B.** Move `PendingPromotionCleanup`
   (struct + Drop impl + all 13 methods) from
   `meerkat-rpc/src/session_runtime.rs:828-1129` to
   `meerkat::session_runtime::staged_promotion`. The Drop impl spawns
@@ -226,7 +226,7 @@ self-verify.
   feature. `meerkat-rpc` already enables `session-store` so the
   re-export works unconditionally on its side.
 
-- [x] fix · [ ] verify · **W1-C.** Move `RuntimePreAdmission`,
+- [x] fix · [x] verify · **W1-C.** Move `RuntimePreAdmission`,
   `RuntimePreAdmissionGuard`, `RuntimePreAdmissionEntry`,
   `RuntimePreAdmissionRegistration`, `RuntimeRegistrationLockLease`,
   `StagedArchiveRollbackGuard`, `StagedAdmissionRestore` from
@@ -243,12 +243,12 @@ self-verify.
   `RuntimeRegistrationLockLease`, `StagedArchiveRollbackGuard`)
   moved cleanly with their Drop semantics intact.
 
-- [x] fix · [ ] verify · **W1-D.** Move `RecoveredCreateRequest` and
+- [x] fix · [x] verify · **W1-D.** Move `RecoveredCreateRequest` and
   `RecoveryRuntimeBindingMode` from `session_runtime.rs:210,216` to
   `meerkat::session_runtime::recovery`. These are pure data types;
   zero behavioural risk.
 
-- [x] fix · [ ] verify · **W1-E.** Move `ArchiveRuntimeCleanup`,
+- [x] fix · [x] verify · **W1-E.** Move `ArchiveRuntimeCleanup`,
   `PendingSessionEventStreams`, `PendingSessionEventStreamDrop` from
   `session_runtime.rs:222-300` to
   `meerkat::session_runtime::runtime_state`. The Drop impl on
