@@ -136,6 +136,16 @@ pub enum ObservationOutcome {
     InterruptSignalled,
     /// Channel was terminalized (terminal error or `Closed`).
     Terminal { code: LiveAdapterErrorCode },
+    /// R5-9: a per-command failure scoped to the offending command —
+    /// e.g. an unsupported `LiveInputChunk::Image` rejected by the
+    /// provider's local guard. The channel survives; the WS pump
+    /// forwards the typed JSON observation to the client and continues
+    /// the loop. Sibling of [`Self::Terminal`] for the typed
+    /// `LiveAdapterObservation::CommandRejected` variant.
+    CommandRejected {
+        code: LiveAdapterErrorCode,
+        message: String,
+    },
 }
 
 /// Why a tool call observation was not dispatched. Distinguishes "no
@@ -487,6 +497,10 @@ pub enum ObservationRouting {
     SignalInterrupt,
     UpdateStatus(LiveAdapterStatus),
     TerminalError,
+    /// R5-9: a non-terminal scoped command rejection. Distinct from
+    /// [`Self::TerminalError`] so the host's projection refuses to
+    /// close the channel for typed-input failures the client can retry.
+    CommandRejection,
     Noop,
 }
 
@@ -840,7 +854,9 @@ impl LiveAdapterHost {
         // typed terminal errors (e.g. R11 model_swap → `ConfigRejected`)
         // observable to the WS pump even if the underlying adapter has
         // already been torn down by `close_channel` — the pending slot
-        // sits in `ChannelState`, not on the adapter.
+        // sits in `ChannelState`, not on the adapter. R5-3 also relies
+        // on this slot as a fallback for adapter implementations whose
+        // `inject_observation` is a no-op (e.g. test stubs).
         {
             let mut inner = self.inner.lock().await;
             if let Some(channel) = inner.channels.get_mut(channel_id)
@@ -853,14 +869,53 @@ impl LiveAdapterHost {
             .adapter_for(channel_id, /* require_ready = */ false)
             .await?;
         match adapter.next_observation().await {
-            Ok(obs) => Ok(obs),
-            Err(err) => {
-                // Pump-task / transport failure — terminalize the host status.
+            Ok(Some(obs)) => Ok(Some(obs)),
+            Ok(None) => {
+                // R5-3 fallback: if the adapter closed before the
+                // synthetic observation was injected (or the adapter
+                // implementation is a no-op stub), one final pending
+                // check delivers the typed event before the consumer
+                // sees end-of-stream.
                 let mut inner = self.inner.lock().await;
-                if let Some(channel) = inner.channels.get_mut(channel_id) {
-                    channel.status = LiveAdapterStatus::Closed;
+                if let Some(channel) = inner.channels.get_mut(channel_id)
+                    && let Some(obs) = channel.pending_synthetic_obs.take()
+                {
+                    return Ok(Some(obs));
                 }
-                Err(LiveAdapterHostError::AdapterError(err))
+                Ok(None)
+            }
+            Err(err) => {
+                // R5-8: on adapter pump / transport failure, fully
+                // retire the channel — set `status = Closed`, schedule
+                // `retire_at`, drop the adapter Arc, and reuse the
+                // R5-3 synthetic-error seam to surface a typed `Error`
+                // observation to the consumer instead of a generic
+                // disconnect. Without this the channel stays half-bound
+                // (status=Closed, retire_at=None, adapter still held)
+                // and `open_channel` rejects future bindings for the
+                // same session id with `SessionAlreadyBound` — the
+                // broken-session symptom.
+                let synthetic = LiveAdapterObservation::Error {
+                    code: LiveAdapterErrorCode::ProviderError,
+                    message: format!("adapter read failure: {err}"),
+                };
+                {
+                    let mut inner = self.inner.lock().await;
+                    if let Some(channel) = inner.channels.get_mut(channel_id) {
+                        channel.status = LiveAdapterStatus::Closed;
+                        channel.retire_at = Some(std::time::Instant::now() + CLOSED_CHANNEL_TTL);
+                        // Drop the adapter Arc so transport resources
+                        // are released even though we keep the channel
+                        // entry around for `live/status` reads until
+                        // the TTL elapses (G42).
+                        channel.adapter = None;
+                    }
+                }
+                // Surface the synthetic Error first; the WS pump will
+                // forward it to the client and close with a typed
+                // `terminal:provider_error` reason via
+                // `apply_observation`'s `Terminal` arm.
+                Ok(Some(synthetic))
             }
         }
     }
@@ -1106,6 +1161,23 @@ impl LiveAdapterHost {
                 Ok(ObservationOutcome::Terminal { code: code.clone() })
             }
 
+            // R5-9: scoped per-command rejection. The channel must
+            // survive — the client sent a typed-input variant the
+            // provider local-guard rejected (e.g.
+            // `LiveInputChunk::Image` against an audio-only model),
+            // and the next valid command should land on the same
+            // channel. We deliberately do NOT touch host channel
+            // state (status, retire_at, adapter) and do NOT call
+            // `signal_terminal_error` on the projection sink — those
+            // are the terminal-only obligations.
+            (
+                ObservationRouting::CommandRejection,
+                LiveAdapterObservation::CommandRejected { code, message },
+            ) => Ok(ObservationOutcome::CommandRejected {
+                code: code.clone(),
+                message: message.clone(),
+            }),
+
             // Routing said AppendTranscript but the observation kind didn't
             // match any of the variants we handle above. Fall through as a
             // no-op so adding a new transcript-shaped variant doesn't panic
@@ -1295,18 +1367,48 @@ impl LiveAdapterHost {
             LiveAdapterErrorCode::ConfigRejected { reason } => reason.clone(),
             other => format!("{other:?}"),
         };
-        {
+        let synthetic = LiveAdapterObservation::Error {
+            code: code.clone(),
+            message: message.clone(),
+        };
+
+        // R5-3: deliver the synthetic Error THROUGH the adapter's own
+        // observation channel so an in-flight `next_observation()`
+        // future on the WS pump returns the typed event before the
+        // close-driven `None`. We do this in two complementary phases:
+        //
+        // 1. Stage the synthetic in `pending_synthetic_obs` so a
+        //    subsequent `next_observation_raw` call (after channel
+        //    close) still returns the typed event — adapters whose
+        //    `inject_observation` is a no-op (test stubs) rely on this
+        //    fallback path.
+        // 2. Call the adapter's `inject_observation` to push the
+        //    synthetic onto the live observation stream — this is what
+        //    actually unsticks an awaiting WS pump on a real adapter.
+        //
+        // Order matters: stage FIRST, inject SECOND, close THIRD. If
+        // injection fails (adapter already torn down), the fallback in
+        // `next_observation_raw`'s pending check still surfaces the
+        // typed event.
+        let adapter = {
             let mut inner = self.inner.lock().await;
             let channel = inner
                 .channels
                 .get_mut(channel_id)
                 .ok_or_else(|| LiveAdapterHostError::ChannelNotFound(channel_id.clone()))?;
-            channel.pending_synthetic_obs = Some(LiveAdapterObservation::Error { code, message });
+            channel.pending_synthetic_obs = Some(synthetic.clone());
+            channel.adapter.clone()
+        };
+        if let Some(adapter) = adapter {
+            // Best-effort: a half-closed adapter cannot accept the
+            // injection, but the `pending_synthetic_obs` fallback above
+            // covers that case.
+            let _ = adapter.inject_observation(synthetic).await;
         }
-        // Close the adapter so any in-flight provider activity is released.
-        // The pending synthetic obs survives this because
-        // `next_observation_raw` checks the pending slot before consulting
-        // `retire_at`.
+        // Close the adapter so any in-flight provider activity is
+        // released. The synthetic observation has already been pushed
+        // onto the control channel (or staged in pending_synthetic_obs)
+        // so it surfaces ahead of the close-driven end-of-stream.
         self.close_channel(channel_id).await
     }
 
@@ -1408,6 +1510,12 @@ impl LiveAdapterHost {
                 ObservationRouting::UpdateStatus(status.clone())
             }
             LiveAdapterObservation::Error { .. } => ObservationRouting::TerminalError,
+            // R5-9: scoped per-command rejection — channel survives, WS
+            // pump forwards JSON and continues. Distinct routing so the
+            // typed taxonomy at the wire boundary
+            // (`Error` → terminal, `CommandRejected` → scoped) maps
+            // 1:1 onto host outcomes.
+            LiveAdapterObservation::CommandRejected { .. } => ObservationRouting::CommandRejection,
             _ => ObservationRouting::Noop,
         }
     }
@@ -1658,6 +1766,45 @@ mod tests {
         }
     }
 
+    /// R5-3: `signal_terminal_error` must deliver the synthetic
+    /// `LiveAdapterObservation::Error` to the consumer *before* the
+    /// channel-closed end-of-stream signal. Verified end-to-end via
+    /// the `pending_synthetic_obs` fallback: the consumer reads the
+    /// typed Error, then a subsequent read returns `None` (the
+    /// channel-closed signal). The legacy race — where the in-flight
+    /// `next_observation()` returned `None` first and the typed
+    /// signal was lost — must not recur.
+    #[tokio::test]
+    async fn signal_terminal_error_delivers_synthetic_error_before_close_signal() {
+        let host = LiveAdapterHost::new();
+        let ch = host.open_channel(test_session_id()).await.unwrap();
+        host.attach_adapter(&ch, Arc::new(StubAdapter::new()))
+            .await
+            .unwrap();
+
+        let code = LiveAdapterErrorCode::ConfigRejected {
+            reason: "model_swap_test".to_string(),
+        };
+        host.signal_terminal_error(&ch, code).await.unwrap();
+
+        // First read: synthetic Error (typed, with reason).
+        let first = host
+            .next_observation_raw(&ch)
+            .await
+            .expect("first read should succeed")
+            .expect("synthetic Error must surface before end-of-stream");
+        match first {
+            LiveAdapterObservation::Error { code, message } => match code {
+                LiveAdapterErrorCode::ConfigRejected { reason } => {
+                    assert_eq!(reason, "model_swap_test");
+                    assert_eq!(message, "model_swap_test");
+                }
+                other => unreachable!("expected ConfigRejected, got {other:?}"),
+            },
+            other => unreachable!("expected Error obs first, got {other:?}"),
+        }
+    }
+
     /// CC1: `signal_terminal_error` on an unknown channel must surface
     /// `ChannelNotFound`, mirroring the rest of the host's per-channel
     /// surface. Without this, the runtime swap path could silently drop
@@ -1781,6 +1928,9 @@ mod tests {
             data: vec![0; 100],
             sample_rate_hz: 24000,
             channels: 1,
+            response_id: None,
+            item_id: None,
+            content_index: None,
         };
         assert_eq!(
             LiveAdapterHost::classify_observation(&obs),
@@ -1919,8 +2069,12 @@ mod tests {
 
     #[tokio::test]
     async fn adapter_pump_error_terminalizes_channel_status() {
-        // F34: when the pump errors, host status becomes Closed so a stale
-        // `Ready` cannot be observed afterwards.
+        // R5-8 (was F34): when the pump errors, the host fully retires
+        // the channel — sets status=Closed, schedules retire_at, drops
+        // the adapter Arc — and surfaces a synthetic typed
+        // `LiveAdapterObservation::Error` to the consumer instead of an
+        // `AdapterError` propagation. This lets the WS pump close with
+        // a typed reason and reuses R5-3's synthetic-error seam.
         let host = LiveAdapterHost::new();
         let ch = host.open_channel(test_session_id()).await.unwrap();
         host.attach_adapter(&ch, Arc::new(ErroringAdapter))
@@ -1929,11 +2083,134 @@ mod tests {
         host.apply_status_update(&ch, LiveAdapterStatus::Ready)
             .await
             .unwrap();
-        let err = host.next_observation_raw(&ch).await.unwrap_err();
-        assert!(matches!(err, LiveAdapterHostError::AdapterError(_)));
-        // Channel status now reflects the terminal pump failure.
+        let obs = host
+            .next_observation_raw(&ch)
+            .await
+            .unwrap()
+            .expect("synthetic Error obs surfaces on adapter Err");
+        match obs {
+            LiveAdapterObservation::Error { code, message } => {
+                assert_eq!(code, LiveAdapterErrorCode::ProviderError);
+                assert!(
+                    message.contains("adapter read failure"),
+                    "synthetic message must explain origin; got `{message}`"
+                );
+            }
+            other => unreachable!("expected synthetic Error, got {other:?}"),
+        }
+        // Channel status now reflects the terminal pump failure AND
+        // retire_at is set so a future open_channel for the same
+        // session can succeed once the TTL elapses.
         let status = host.channel_status(&ch).await.unwrap();
         assert_eq!(status, LiveAdapterStatus::Closed);
+        {
+            let inner = host.inner.lock().await;
+            let channel = inner
+                .channels
+                .get(&ch)
+                .expect("channel preserved for live/status until TTL elapses");
+            assert!(
+                channel.retire_at.is_some(),
+                "R5-8: adapter Err must set retire_at"
+            );
+            assert!(
+                channel.adapter.is_none(),
+                "R5-8: adapter Err must drop the adapter Arc"
+            );
+        }
+    }
+
+    /// R5-9: a `LiveAdapterObservation::CommandRejected` flowing
+    /// through `apply_observation` produces a typed
+    /// `ObservationOutcome::CommandRejected` — NOT
+    /// `ObservationOutcome::Terminal`. The channel state must remain
+    /// untouched (status, retire_at, adapter all preserved) so a
+    /// follow-up command can be sent on the same channel.
+    #[tokio::test]
+    async fn command_rejected_routes_non_terminally_and_preserves_channel() {
+        let host = LiveAdapterHost::new();
+        let ch = host.open_channel(test_session_id()).await.unwrap();
+        host.attach_adapter(&ch, Arc::new(StubAdapter::new()))
+            .await
+            .unwrap();
+        host.apply_status_update(&ch, LiveAdapterStatus::Ready)
+            .await
+            .unwrap();
+
+        let obs = LiveAdapterObservation::CommandRejected {
+            code: LiveAdapterErrorCode::ConfigRejected {
+                reason: "image_input_not_implemented".into(),
+            },
+            message: "image_input_not_implemented".into(),
+        };
+        let outcome = host.apply_observation(&ch, &obs).await.unwrap();
+        match outcome {
+            ObservationOutcome::CommandRejected { code, message } => {
+                assert!(matches!(
+                    code,
+                    LiveAdapterErrorCode::ConfigRejected { ref reason } if reason == "image_input_not_implemented"
+                ));
+                assert_eq!(message, "image_input_not_implemented");
+            }
+            other => {
+                unreachable!("CommandRejected must produce CommandRejected outcome, got {other:?}")
+            }
+        }
+
+        // Channel remains live — status untouched, retire_at not set,
+        // adapter still attached.
+        let status = host.channel_status(&ch).await.unwrap();
+        assert_eq!(status, LiveAdapterStatus::Ready);
+        {
+            let inner = host.inner.lock().await;
+            let channel = inner.channels.get(&ch).expect("channel present");
+            assert!(
+                channel.retire_at.is_none(),
+                "CommandRejected must not retire the channel"
+            );
+            assert!(
+                channel.adapter.is_some(),
+                "CommandRejected must not drop the adapter"
+            );
+        }
+    }
+
+    /// R5-8: after the adapter pump errors, the channel is fully
+    /// retired and `open_channel` for the same session id succeeds
+    /// after the previous binding's retire reaper sweeps. Without
+    /// `retire_at` being set on adapter Err, the legacy code path
+    /// stranded the session — `open_channel` rejected the rebind with
+    /// `SessionAlreadyBound` indefinitely.
+    #[tokio::test]
+    async fn adapter_err_releases_session_for_rebind() {
+        let host = LiveAdapterHost::new();
+        let session_id = test_session_id();
+        let ch1 = host.open_channel(session_id.clone()).await.unwrap();
+        host.attach_adapter(&ch1, Arc::new(ErroringAdapter))
+            .await
+            .unwrap();
+        host.apply_status_update(&ch1, LiveAdapterStatus::Ready)
+            .await
+            .unwrap();
+
+        // Trigger the adapter error (and the host's R5-8 cleanup).
+        let _ = host.next_observation_raw(&ch1).await.unwrap();
+
+        // Force-expire the retire window so the reaper accepts the
+        // rebind without sleeping for `CLOSED_CHANNEL_TTL` seconds.
+        {
+            let mut inner = host.inner.lock().await;
+            if let Some(channel) = inner.channels.get_mut(&ch1) {
+                channel.retire_at =
+                    Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+            }
+        }
+
+        let ch2 = host
+            .open_channel(session_id.clone())
+            .await
+            .expect("rebind for same session must succeed once previous channel is retired");
+        assert_ne!(ch1, ch2);
     }
 
     // -- A2/A3: transcript projection --

@@ -2789,13 +2789,83 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// the pump on timeout instead of detaching it) are preserved.
 pub struct OpenAiLiveAdapter {
     cmd_tx: mpsc::Sender<LiveAdapterCommand>,
-    obs_rx: tokio::sync::Mutex<mpsc::Receiver<LiveAdapterObservation>>,
+    /// R5-1: control / semantic-event channel.
+    ///
+    /// Carries every observation that MUST NOT be dropped — transcript
+    /// deltas, `TurnCompleted` (authoritative `stop_reason` + `usage`),
+    /// `ToolCallRequested`, `Error`, `CommandRejected`, status changes, etc.
+    /// Producer side uses `send().await` (backpressure); the receiver is
+    /// drained with priority over the audio channel so a `TurnCompleted`
+    /// queued behind a burst of audio chunks still reaches the consumer
+    /// in semantic order.
+    ///
+    /// Capacity 256: control events arrive at human-conversation cadence
+    /// (a handful per turn) and the consumer drains them via the WS pump
+    /// in microseconds. 256 is far above any realistic single-turn burst
+    /// but bounded so a stuck consumer cannot grow the queue without limit.
+    control_rx: tokio::sync::Mutex<mpsc::Receiver<LiveAdapterObservation>>,
+    /// R5-1: lossy audio channel.
+    ///
+    /// Carries `AssistantAudioChunk` only. Producer uses `try_send` and
+    /// drops on full — audio playback may legitimately drop bursts when
+    /// the consumer briefly stalls (better than blocking the realtime
+    /// session pump on a slow socket).
+    ///
+    /// Capacity 64: at 24 kHz / mono / 16-bit PCM, OpenAI Realtime emits
+    /// audio deltas at roughly 50 ms cadence (~20 chunks/s). 64 chunks
+    /// ≈ 3.2 s of buffered playback — comfortably above any reasonable
+    /// transient consumer stall, and well below the size at which a
+    /// stalled consumer would accumulate enough audio to confuse the
+    /// playback cursor on resume.
+    audio_rx: tokio::sync::Mutex<mpsc::Receiver<LiveAdapterObservation>>,
     closed: AtomicBool,
     status: Arc<StdMutex<LiveAdapterStatus>>,
     pump_handle: StdMutex<Option<tokio::task::JoinHandle<()>>>,
+    /// R5-3 / R5-8: control-channel sender retained on the adapter facade
+    /// so the host (via `inject_observation`) can push synthetic terminal
+    /// errors or scoped command rejections directly into the same channel
+    /// the WS pump is awaiting. Without this, a `signal_terminal_error`
+    /// queued in the host's `pending_synthetic_obs` slot cannot wake an
+    /// in-flight `next_observation()` read, and the consumer sees a
+    /// generic close instead of the typed reason.
+    control_tx: mpsc::Sender<LiveAdapterObservation>,
 }
 
 impl OpenAiLiveAdapter {
+    /// Test-only constructor that builds an adapter facade WITHOUT
+    /// spawning the realtime pump. Lets unit tests pre-queue
+    /// observations onto both internal channels and exercise the
+    /// biased-select drain in `next_observation` directly.
+    ///
+    /// Returned tuple: (adapter, control_tx, audio_tx, cmd_rx). The
+    /// caller drops/keeps the senders to drive the test scenarios; the
+    /// `cmd_rx` exists so the adapter facade's command channel doesn't
+    /// instantly observe a closed receiver and reject `send_command`
+    /// during tests.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn new_for_test() -> (
+        Self,
+        mpsc::Sender<LiveAdapterObservation>,
+        mpsc::Sender<LiveAdapterObservation>,
+        mpsc::Receiver<LiveAdapterCommand>,
+    ) {
+        let (cmd_tx, cmd_rx) = mpsc::channel(64);
+        let (control_tx, control_rx) = mpsc::channel(256);
+        let (audio_tx, audio_rx) = mpsc::channel(64);
+        let status = Arc::new(StdMutex::new(LiveAdapterStatus::Ready));
+        let adapter = Self {
+            cmd_tx,
+            control_rx: tokio::sync::Mutex::new(control_rx),
+            audio_rx: tokio::sync::Mutex::new(audio_rx),
+            closed: AtomicBool::new(false),
+            status,
+            pump_handle: StdMutex::new(None),
+            control_tx: control_tx.clone(),
+        };
+        (adapter, control_tx, audio_tx, cmd_rx)
+    }
+
     /// Wrap an OpenAI realtime session in a provider-native live adapter.
     ///
     /// The realtime session is moved into the pump task; the adapter facade
@@ -2805,20 +2875,26 @@ impl OpenAiLiveAdapter {
     #[must_use]
     pub fn new(session: OpenAiRealtimeSession) -> Self {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
-        let (obs_tx, obs_rx) = mpsc::channel(256);
+        // R5-1: split lossy audio from reliable control. See struct field
+        // docs above for capacity rationale.
+        let (control_tx, control_rx) = mpsc::channel(256);
+        let (audio_tx, audio_rx) = mpsc::channel(64);
         let status = Arc::new(StdMutex::new(LiveAdapterStatus::Opening));
         let pump_handle = tokio::spawn(openai_live_pump(
             session,
             cmd_rx,
-            obs_tx,
+            control_tx.clone(),
+            audio_tx,
             Arc::clone(&status),
         ));
         Self {
             cmd_tx,
-            obs_rx: tokio::sync::Mutex::new(obs_rx),
+            control_rx: tokio::sync::Mutex::new(control_rx),
+            audio_rx: tokio::sync::Mutex::new(audio_rx),
             closed: AtomicBool::new(false),
             status,
             pump_handle: StdMutex::new(Some(pump_handle)),
+            control_tx,
         }
     }
 }
@@ -2843,8 +2919,53 @@ impl LiveAdapter for OpenAiLiveAdapter {
     }
 
     async fn next_observation(&self) -> Result<Option<LiveAdapterObservation>, LiveAdapterError> {
-        let mut rx = self.obs_rx.lock().await;
-        Ok(rx.recv().await)
+        // R5-1: biased select between the two internal channels. `biased`
+        // ordering means the runtime tries `control_rx` first on every
+        // wake; only if it has nothing pending do we poll the audio
+        // channel. This guarantees that semantic events (`TurnCompleted`,
+        // tool calls, errors, transcript deltas) drain ahead of audio
+        // chunks queued behind them — even when both channels have
+        // messages ready simultaneously.
+        //
+        // Channel-closed semantics: when both producers drop their
+        // senders the pump task has exited and the adapter is fully
+        // drained. We return `None` only when `control_rx` is closed AND
+        // `audio_rx` is empty, mirroring the "single channel returns
+        // None when the pump dies" contract the host previously
+        // depended on.
+        let mut control_rx = self.control_rx.lock().await;
+        let mut audio_rx = self.audio_rx.lock().await;
+        loop {
+            // Once the audio channel has been closed we cannot keep
+            // selecting on its `recv()` — it returns `None` immediately
+            // and the loop would busy-spin. Detect that case and only
+            // await the control side.
+            if audio_rx.is_closed() && audio_rx.is_empty() {
+                return Ok(control_rx.recv().await);
+            }
+            tokio::select! {
+                biased;
+                obs = control_rx.recv() => {
+                    match obs {
+                        Some(o) => return Ok(Some(o)),
+                        None => {
+                            // Control side closed. Drain any remaining
+                            // audio (test stubs can pre-queue chunks)
+                            // then report end-of-stream. `try_recv` is
+                            // non-blocking.
+                            return Ok(audio_rx.try_recv().ok());
+                        }
+                    }
+                }
+                obs = audio_rx.recv() => {
+                    if let Some(o) = obs {
+                        return Ok(Some(o));
+                    }
+                    // Audio side closed; loop back so the top-of-loop
+                    // guard sends us into a control-only await.
+                }
+            }
+        }
     }
 
     fn status(&self) -> LiveAdapterStatus {
@@ -2900,6 +3021,37 @@ impl LiveAdapter for OpenAiLiveAdapter {
             provider_native_resume: false,
         }
     }
+
+    /// R5-3 / R5-8: push a synthetic observation onto the same control
+    /// channel the pump uses, so an in-flight `next_observation()`
+    /// awaiting on the consumer side returns the synthetic event before
+    /// any subsequent close-driven `None`.
+    ///
+    /// Synthetic terminal errors (`Error`) and scoped command rejections
+    /// (`CommandRejected`) are control-lane by definition; injecting
+    /// them onto the audio lane would defeat the lossy-vs-reliable split
+    /// from R5-1. We refuse to inject `AssistantAudioChunk` since the
+    /// runtime never has a legitimate reason to synthesize lossy media,
+    /// and a misuse would silently corrupt the audio playback cursor.
+    async fn inject_observation(
+        &self,
+        observation: LiveAdapterObservation,
+    ) -> Result<(), LiveAdapterError> {
+        if matches!(
+            observation,
+            LiveAdapterObservation::AssistantAudioChunk { .. }
+        ) {
+            return Err(LiveAdapterError::TransportError {
+                message:
+                    "inject_observation: lossy audio chunks must not be injected from the host"
+                        .into(),
+            });
+        }
+        self.control_tx
+            .send(observation)
+            .await
+            .map_err(|_| LiveAdapterError::Closed)
+    }
 }
 
 /// Pump task. Owns the `OpenAiRealtimeSession` exclusively; biased select
@@ -2912,10 +3064,20 @@ impl LiveAdapter for OpenAiLiveAdapter {
 async fn openai_live_pump(
     mut session: OpenAiRealtimeSession,
     mut cmd_rx: mpsc::Receiver<LiveAdapterCommand>,
-    obs_tx: mpsc::Sender<LiveAdapterObservation>,
+    control_tx: mpsc::Sender<LiveAdapterObservation>,
+    audio_tx: mpsc::Sender<LiveAdapterObservation>,
     status: Arc<StdMutex<LiveAdapterStatus>>,
 ) {
-    if obs_tx.send(LiveAdapterObservation::Ready).await.is_err() {
+    // R5-1: route observations by variant. Audio chunks are lossy
+    // (try_send + drop on full); everything else is reliable
+    // (send().await with backpressure). The host's biased select on the
+    // consumer side guarantees control events drain ahead of queued
+    // audio.
+    if control_tx
+        .send(LiveAdapterObservation::Ready)
+        .await
+        .is_err()
+    {
         return;
     }
     set_status(&status, LiveAdapterStatus::Ready);
@@ -3019,7 +3181,12 @@ async fn openai_live_pump(
                                     message: err.to_string(),
                                 }
                             };
-                            let _ = obs_tx.send(obs).await;
+                            // Command rejections / errors are control-lane;
+                            // never drop. If the consumer has gone away,
+                            // exit the pump.
+                            if control_tx.send(obs).await.is_err() {
+                                break;
+                            }
                         }
                     }
                 }
@@ -3031,21 +3198,38 @@ async fn openai_live_pump(
                         if let LiveAdapterObservation::StatusChanged { status: ref s } = obs {
                             set_status(&status, s.clone());
                         }
-                        match obs_tx.try_send(obs) {
-                            Ok(()) => {}
-                            Err(mpsc::error::TrySendError::Full(dropped)) => {
-                                tracing::warn!(
-                                    target: "meerkat_openai::live_adapter",
-                                    ?dropped,
-                                    "live adapter observation channel full; dropping frame"
-                                );
+                        // R5-1: route by variant — audio is lossy, control
+                        // is reliable. Audio uses try_send so a slow
+                        // consumer cannot stall the realtime session pump
+                        // by holding back transcript / tool / status
+                        // events; control uses send().await so a backed-up
+                        // consumer applies backpressure to the provider
+                        // event stream rather than silently dropping
+                        // semantic facts.
+                        match obs {
+                            LiveAdapterObservation::AssistantAudioChunk { .. } => {
+                                match audio_tx.try_send(obs) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(dropped)) => {
+                                        tracing::warn!(
+                                            target: "meerkat_openai::live_adapter",
+                                            ?dropped,
+                                            "live adapter audio channel full; dropping frame"
+                                        );
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                                }
                             }
-                            Err(mpsc::error::TrySendError::Closed(_)) => break,
+                            other => {
+                                if control_tx.send(other).await.is_err() {
+                                    break;
+                                }
+                            }
                         }
                     }
                     Ok(None) => {
                         set_status(&status, LiveAdapterStatus::Closed);
-                        let _ = obs_tx
+                        let _ = control_tx
                             .send(LiveAdapterObservation::StatusChanged {
                                 status: LiveAdapterStatus::Closed,
                             })
@@ -3053,7 +3237,7 @@ async fn openai_live_pump(
                         break;
                     }
                     Err(err) => {
-                        let _ = obs_tx
+                        let _ = control_tx
                             .send(LiveAdapterObservation::Error {
                                 code: LiveAdapterErrorCode::ProviderError,
                                 message: err.to_string(),
@@ -7328,6 +7512,211 @@ mod tests {
             other => panic!(
                 "mixed response must emit text-delta then transcript-delta in order, got {other:?}"
             ),
+        }
+    }
+
+    /// R5-1: when the lossy audio channel fills, additional audio
+    /// chunks are dropped, but reliable control events queued onto the
+    /// control channel are NEVER dropped — the consumer drains them
+    /// intact via `next_observation`.
+    #[tokio::test]
+    async fn audio_backpressure_drops_audio_but_preserves_control() {
+        use meerkat_core::live_adapter::LiveAdapter;
+
+        let (adapter, control_tx, audio_tx, _cmd_rx) = OpenAiLiveAdapter::new_for_test();
+
+        // Flood the audio channel beyond its 64-slot capacity.
+        // `try_send` mirrors the pump's lossy-audio path.
+        let mut audio_sent = 0usize;
+        let mut audio_dropped = 0usize;
+        for i in 0..200 {
+            let chunk = LiveAdapterObservation::AssistantAudioChunk {
+                data: vec![i as u8; 16],
+                sample_rate_hz: 24000,
+                channels: 1,
+                response_id: Some("resp".into()),
+                item_id: Some("item".into()),
+                content_index: Some(0),
+            };
+            match audio_tx.try_send(chunk) {
+                Ok(()) => audio_sent += 1,
+                Err(mpsc::error::TrySendError::Full(_)) => audio_dropped += 1,
+                Err(mpsc::error::TrySendError::Closed(_)) => unreachable!(
+                    "control_rx is held by the adapter; channel cannot be closed mid-test"
+                ),
+            }
+        }
+        assert!(
+            audio_dropped > 0,
+            "saturating the audio channel must drop frames; sent={audio_sent} dropped={audio_dropped}"
+        );
+
+        // Push a single critical control event AFTER the audio flood.
+        // Reliable channel: `send().await` applies backpressure rather
+        // than dropping.
+        let critical = LiveAdapterObservation::TurnCompleted {
+            response_id: None,
+            stop_reason: meerkat_core::types::StopReason::EndTurn,
+            usage: meerkat_core::types::Usage::default(),
+        };
+        control_tx
+            .send(critical.clone())
+            .await
+            .expect("control channel send must not fail with adapter live");
+
+        // R5-1 biased select: control drains first. The very next
+        // observation read must be the TurnCompleted, NOT an audio
+        // chunk — even though the audio channel was filled first.
+        let next = adapter
+            .next_observation()
+            .await
+            .expect("next_observation should not error on healthy adapter")
+            .expect("control event must surface ahead of any audio");
+        match next {
+            LiveAdapterObservation::TurnCompleted { .. } => {}
+            other => unreachable!("biased select must yield TurnCompleted first; got {other:?}"),
+        }
+
+        // Drain the audio that survived. Should be ≤ 64 (channel
+        // capacity) and strictly less than the 200 we attempted to
+        // send.
+        let mut audio_drained = 0usize;
+        loop {
+            let read = tokio::time::timeout(
+                std::time::Duration::from_millis(20),
+                adapter.next_observation(),
+            )
+            .await;
+            match read {
+                Ok(Ok(Some(LiveAdapterObservation::AssistantAudioChunk { .. }))) => {
+                    audio_drained += 1;
+                    if audio_drained > 200 {
+                        unreachable!("drained more audio than we attempted to send");
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            audio_drained < 200,
+            "lossy semantics: at least one audio chunk must be dropped (drained={audio_drained})"
+        );
+    }
+
+    /// R5-1: when both channels have observations ready simultaneously,
+    /// the biased `tokio::select!` in `next_observation` drains the
+    /// control channel first. Verifies the priority guarantee that
+    /// keeps `TurnCompleted` ordered ahead of any audio chunks queued
+    /// behind it.
+    #[tokio::test]
+    async fn control_drains_before_audio_when_both_ready() {
+        use meerkat_core::live_adapter::LiveAdapter;
+
+        let (adapter, control_tx, audio_tx, _cmd_rx) = OpenAiLiveAdapter::new_for_test();
+
+        // Pre-queue a chunk of audio AND a control event.
+        audio_tx
+            .send(LiveAdapterObservation::AssistantAudioChunk {
+                data: vec![0u8; 16],
+                sample_rate_hz: 24000,
+                channels: 1,
+                response_id: None,
+                item_id: None,
+                content_index: None,
+            })
+            .await
+            .expect("audio send should succeed (channel empty)");
+        control_tx
+            .send(LiveAdapterObservation::TurnCompleted {
+                response_id: None,
+                stop_reason: meerkat_core::types::StopReason::EndTurn,
+                usage: meerkat_core::types::Usage::default(),
+            })
+            .await
+            .expect("control send should succeed");
+
+        // First read: control wins regardless of which arrived first.
+        let first = adapter
+            .next_observation()
+            .await
+            .expect("read should succeed")
+            .expect("first observation must be Some");
+        match first {
+            LiveAdapterObservation::TurnCompleted { .. } => {}
+            other => unreachable!("biased select must yield control first; got {other:?}"),
+        }
+
+        // Second read: audio drains.
+        let second = adapter
+            .next_observation()
+            .await
+            .expect("read should succeed")
+            .expect("second observation must be Some");
+        match second {
+            LiveAdapterObservation::AssistantAudioChunk { .. } => {}
+            other => unreachable!("expected audio chunk, got {other:?}"),
+        }
+    }
+
+    /// R5-3: `inject_observation` on the OpenAI adapter pushes the
+    /// synthetic observation onto the same control channel a real
+    /// pump would write to, so an in-flight `next_observation()` read
+    /// returns the typed event.
+    #[tokio::test]
+    async fn inject_observation_surfaces_through_next_observation_on_openai_adapter() {
+        use meerkat_core::live_adapter::LiveAdapter;
+
+        let (adapter, _control_tx, _audio_tx, _cmd_rx) = OpenAiLiveAdapter::new_for_test();
+
+        let synthetic = LiveAdapterObservation::Error {
+            code: LiveAdapterErrorCode::ConfigRejected {
+                reason: "model_swap_test".into(),
+            },
+            message: "model_swap_test".into(),
+        };
+        adapter
+            .inject_observation(synthetic.clone())
+            .await
+            .expect("inject_observation must succeed on a live adapter");
+
+        let observed = adapter
+            .next_observation()
+            .await
+            .expect("read should succeed")
+            .expect("injected observation must surface");
+        assert_eq!(observed, synthetic);
+    }
+
+    /// R5-3 / R5-1: refuse audio injection. Lossy media observations
+    /// must never enter the control channel via the host's typed
+    /// terminal-error seam — that would bypass the lane split and
+    /// silently desync the audio playback cursor.
+    #[tokio::test]
+    async fn inject_observation_refuses_audio_chunks() {
+        use meerkat_core::live_adapter::LiveAdapter;
+
+        let (adapter, _control_tx, _audio_tx, _cmd_rx) = OpenAiLiveAdapter::new_for_test();
+
+        let chunk = LiveAdapterObservation::AssistantAudioChunk {
+            data: vec![0u8; 8],
+            sample_rate_hz: 24000,
+            channels: 1,
+            response_id: None,
+            item_id: None,
+            content_index: None,
+        };
+        let err = adapter
+            .inject_observation(chunk)
+            .await
+            .expect_err("audio chunks must not be injectable from the host");
+        match err {
+            meerkat_core::live_adapter::LiveAdapterError::TransportError { message } => {
+                assert!(
+                    message.contains("lossy audio chunks must not be injected"),
+                    "unexpected error message: {message}"
+                );
+            }
+            other => unreachable!("expected TransportError, got {other:?}"),
         }
     }
 }

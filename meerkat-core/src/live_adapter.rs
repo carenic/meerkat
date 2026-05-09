@@ -649,6 +649,35 @@ pub trait LiveAdapter: Send + Sync {
     fn capabilities(&self) -> LiveChannelCapabilities {
         LiveChannelCapabilities::default()
     }
+
+    /// R5-3: inject a synthetic observation into the same channel the
+    /// adapter's pump produces real observations on, so it surfaces
+    /// through the next [`Self::next_observation`] read.
+    ///
+    /// The host calls this when the *runtime* (not the provider) decides
+    /// the channel must surface a typed event — the canonical case being
+    /// `signal_terminal_error`, where a model-swap on `config/patch`
+    /// produces a synthetic `LiveAdapterObservation::Error` that the WS
+    /// pump must see *before* the channel is closed. Without this seam
+    /// the synthetic event would race against the in-flight
+    /// `next_observation()` future and the consumer would observe a
+    /// generic close instead of the typed reason.
+    ///
+    /// Order contract: callers MUST inject before calling [`Self::close`]
+    /// so the pump's drain ordering carries the synthetic observation
+    /// out ahead of the channel-closed signal.
+    ///
+    /// The default implementation is a no-op `Ok(())` — adapters that
+    /// don't surface typed terminal events through the same channel
+    /// (test stubs, future provider adapters that take a different
+    /// approach) opt out cleanly. Production adapters that own a real
+    /// observation channel MUST override.
+    async fn inject_observation(
+        &self,
+        _observation: LiveAdapterObservation,
+    ) -> Result<(), LiveAdapterError> {
+        Ok(())
+    }
 }
 
 /// Errors from the adapter layer. These are transport/provider errors,

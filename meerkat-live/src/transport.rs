@@ -417,6 +417,23 @@ async fn handle_live_socket(
                                 close_with(&mut socket, close_code::POLICY, &reason).await;
                                 break;
                             }
+                            // R5-9: typed scoped command rejection. The
+                            // JSON observation has already been forwarded
+                            // to the client above (the same forward path
+                            // every observation takes); we deliberately
+                            // do NOT close the WS — the channel survives
+                            // so the client can retry with a supported
+                            // input shape. Logged at info level so the
+                            // operator can see scoped failures without
+                            // an alarm.
+                            Ok(ObservationOutcome::CommandRejected { code, message }) => {
+                                tracing::info!(
+                                    channel = %channel_id,
+                                    ?code,
+                                    %message,
+                                    "live command rejected; channel remains open"
+                                );
+                            }
                             Ok(_) => {}
                             Err(err) => {
                                 tracing::warn!(
@@ -834,6 +851,85 @@ mod tests {
         assert!(
             saw_close_with_terminal_reason,
             "WS pump must close with a typed terminal:<code> reason on Error observations"
+        );
+
+        server_handle.abort();
+    }
+
+    /// R5-9: a `LiveAdapterObservation::CommandRejected` flowing
+    /// through the WS pump is forwarded to the client as JSON but does
+    /// NOT close the WebSocket. The channel survives so the client can
+    /// retry with a supported input shape.
+    #[tokio::test]
+    async fn websocket_forwards_command_rejected_without_closing() {
+        use meerkat_core::live_adapter::{LiveAdapterErrorCode, LiveAdapterObservation};
+
+        let host = Arc::new(LiveAdapterHost::new());
+        let session_id = meerkat_core::types::SessionId::new();
+        let channel_id = host.open_channel(session_id).await.unwrap();
+        host.attach_adapter(
+            &channel_id,
+            Arc::new(ScriptedAdapter::new(
+                LiveAdapterObservation::CommandRejected {
+                    code: LiveAdapterErrorCode::ConfigRejected {
+                        reason: "image_input_not_implemented".into(),
+                    },
+                    message: "image_input_not_implemented".into(),
+                },
+            )),
+        )
+        .await
+        .unwrap();
+
+        let state = Arc::new(LiveWsState::new(host));
+        let token = state.mint_token(channel_id.clone()).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ws_state = Arc::clone(&state);
+        let server_handle =
+            tokio::spawn(async move { serve_live_ws_listener(listener, ws_state).await });
+
+        let url = format!("ws://{addr}{LIVE_WS_PATH}?token={token}&channel={channel_id}");
+        let (ws_stream, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        use futures::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let (_write, mut read) = ws_stream.split();
+
+        // Read the first JSON frame — must be the typed CommandRejected
+        // observation. After that the WS must remain open (no Close
+        // frame within a short window). The ScriptedAdapter idles
+        // forever after delivering its single observation, so the pump
+        // sits on `next_observation()` and never closes naturally.
+        let mut saw_command_rejected = false;
+        let mut saw_close = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(300);
+        while let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) {
+            match tokio::time::timeout(remaining, read.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    if text.contains("command_rejected")
+                        && text.contains("image_input_not_implemented")
+                    {
+                        saw_command_rejected = true;
+                    }
+                }
+                Ok(Some(Ok(Message::Close(_)))) => {
+                    saw_close = true;
+                    break;
+                }
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) | Ok(None) => break,
+                Err(_) => break, // timeout — desired path: WS still open
+            }
+        }
+
+        assert!(
+            saw_command_rejected,
+            "client must receive the typed CommandRejected observation JSON"
+        );
+        assert!(
+            !saw_close,
+            "R5-9: WS must NOT close after a CommandRejected observation"
         );
 
         server_handle.abort();
