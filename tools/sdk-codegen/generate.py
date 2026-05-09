@@ -321,6 +321,10 @@ def _promote_nested_schema_def(name: str) -> bool:
         # the schema-local `$defs` as anonymous `dict[str, Any]` / `unknown`.
         "WireLiveChannelCapabilities",
         "WireLiveContinuityMode",
+        # R5-10: promote `LiveInputChunkWire` so `LiveSendInputParams.chunk`
+        # carries the typed discriminated-union shape into SDK codegen instead
+        # of falling back to opaque `dict[str, Any]` / `Record<string, unknown>`.
+        "LiveInputChunkWire",
         *MCP_CONFIG_HELPER_TYPES,
         *MCP_CONFIG_ALIAS_TYPES,
         *MOB_RPC_PROMOTED_SCHEMA_DEFS,

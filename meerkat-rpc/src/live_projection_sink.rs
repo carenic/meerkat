@@ -334,34 +334,60 @@ impl LiveProjectionSink for SessionServiceProjectionSink {
 
     async fn append_assistant_transcript_final(
         &self,
-        _session_id: &SessionId,
-        _text: &str,
-        _identity: LiveTranscriptIdentity<'_>,
+        session_id: &SessionId,
+        text: &str,
+        identity: LiveTranscriptIdentity<'_>,
         _stop_reason: StopReason,
         _usage: Usage,
-        _response_id: Option<&str>,
+        response_id: Option<&str>,
     ) -> Result<(), LiveProjectionError> {
-        // CC2/CC3 architectural reconciliation: the spoken-transcript commit
-        // path is canonical via the realtime-staging pipeline. Provider
-        // deltas are already routed through
-        // `RealtimeTranscriptEvent::AssistantTranscriptDelta` and staged in
-        // `SessionRealtimeTranscriptState`; `signal_turn_completed` then
-        // synthesizes `RealtimeTranscriptEvent::AssistantTurnCompleted` so
-        // the materializer flushes them as
-        // `AssistantBlock::Transcript { source: Spoken }`.
+        // R5-7: forward the authoritative final transcript text into the
+        // realtime-staging pipeline as
+        // `RealtimeTranscriptEvent::AssistantTranscriptFinalText`. The
+        // materializer (Phase-1, `meerkat-core/src/session.rs:1062-1107`)
+        //   - respects `discarded_assistant_response_ids` (barge-in invariant),
+        //   - looks up / creates the staged item via `observe_realtime_item`
+        //     keyed on `(response_id, item_id)` so final-only providers get
+        //     a freshly-staged item,
+        //   - promotes the item lane to `Spoken` (heard transcript always
+        //     materializes as `AssistantBlock::Transcript`),
+        //   - REPLACES `content_segments[content_index]` with the
+        //     authoritative text — overriding any partial / dropped delta
+        //     accumulation,
+        //   - is idempotent across order with `AssistantTurnCompleted`:
+        //     before the turn completes it updates staged content; after,
+        //     it re-applies as a recovery-from-loss late final.
         //
-        // The provider-emitted `AssistantTranscriptFinal` observation
-        // carries the same text the deltas concatenate to, plus best-effort
-        // sentinel `stop_reason`/`usage` (the real values arrive atomically
-        // with `TurnCompleted`). Buffering it here would cause a
-        // double-commit: once via this path and once via the materializer.
+        // `stop_reason` / `usage` are intentionally ignored here — they are
+        // best-effort sentinels on the provider's transcript event; the
+        // canonical values arrive atomically with `TurnCompleted` and
+        // `signal_turn_completed` records them.
         //
-        // We deliberately drop the observation on the floor — it is a pure
-        // signal, not a content carrier in the canonical commit path.
-        // If a future provider carries display-text-final-shaped output
-        // here, we'd need a different observation variant; today no such
-        // variant exists.
-        Ok(())
+        // The `response_id` plumbed via `LiveTranscriptIdentity::response_id`
+        // takes precedence over the function-arg `response_id`; either is
+        // acceptable per the wire contract, so we fall back to the arg form
+        // and finally to an empty string (the materializer rejects empty
+        // ids via `normalize_realtime_response_id` and surfaces them as
+        // `Unsupported`, which we forward as a typed Rejected).
+        let response_id = identity
+            .response_id
+            .map(|s| s.to_string())
+            .or_else(|| response_id.map(|s| s.to_string()))
+            .unwrap_or_default();
+        let event = RealtimeTranscriptEvent::AssistantTranscriptFinalText {
+            response_id,
+            item_id: identity
+                .provider_item_id
+                .map(|s| s.to_string())
+                .unwrap_or_default(),
+            content_index: identity.content_index.unwrap_or(0),
+            text: text.to_string(),
+        };
+        self.runtime
+            .append_realtime_transcript_event(session_id, event)
+            .await
+            .map(|_outcome| ())
+            .map_err(|err| session_error_to_projection(err, session_id))
     }
 
     async fn truncate_assistant_transcript(
@@ -1099,20 +1125,62 @@ mod tests {
                 .push(PendingAssistantContent::Text(text.to_string()));
         }
 
-        /// CC2/CC3: `AssistantTranscriptFinal` is intentionally a no-op in
-        /// the production sink — the spoken-transcript commit path is the
-        /// realtime-staging materializer (driven by `signal_turn_completed`
-        /// via `RealtimeTranscriptEvent::AssistantTurnCompleted`). The test
-        /// fixture mirrors that behavior so tests against the shared
-        /// `collapse_pending_blocks` semantics see the same arrival-order
-        /// projection as production.
-        #[allow(dead_code)]
-        fn append_assistant_transcript_final_is_noop_in_production(
+        /// R5-7: `AssistantTranscriptFinal` now forwards into the
+        /// realtime-staging pipeline as
+        /// `RealtimeTranscriptEvent::AssistantTranscriptFinalText`. The
+        /// fixture mirrors the production sink's emission shape so seam
+        /// regressions (final-only providers, delta-loss recovery) can be
+        /// pinned without a real `SessionRuntime`.
+        fn append_assistant_transcript_final(
             &self,
-            _session_id: &SessionId,
-            _text: &str,
-            _response_id: Option<&str>,
+            session_id: &SessionId,
+            text: &str,
+            response_id: Option<&str>,
+            item_id: Option<&str>,
+            content_index: Option<u32>,
         ) {
+            let event = RealtimeTranscriptEvent::AssistantTranscriptFinalText {
+                response_id: response_id.unwrap_or_default().to_string(),
+                item_id: item_id.unwrap_or_default().to_string(),
+                content_index: content_index.unwrap_or(0),
+                text: text.to_string(),
+            };
+            self.calls
+                .lock()
+                .unwrap()
+                .push(CapturedRuntimeCall::RealtimeTranscript(
+                    session_id.clone(),
+                    event,
+                ));
+        }
+
+        /// Helper for `final_text_repairs_dropped_delta_text`: stage a
+        /// transcript delta on the spoken lane (mirrors the production
+        /// `append_assistant_transcript_delta` -> `RealtimeTranscriptEvent::
+        /// AssistantTranscriptDelta` route).
+        fn append_assistant_transcript_delta(
+            &self,
+            session_id: &SessionId,
+            delta: &str,
+            response_id: Option<&str>,
+            item_id: Option<&str>,
+            content_index: Option<u32>,
+        ) {
+            let event = RealtimeTranscriptEvent::AssistantTranscriptDelta {
+                response_id: response_id.unwrap_or_default().to_string(),
+                delta_id: String::new(),
+                item_id: item_id.unwrap_or_default().to_string(),
+                previous_item_id: None,
+                content_index: content_index.unwrap_or(0),
+                delta: delta.to_string(),
+            };
+            self.calls
+                .lock()
+                .unwrap()
+                .push(CapturedRuntimeCall::RealtimeTranscript(
+                    session_id.clone(),
+                    event,
+                ));
         }
 
         /// CC4: barge-in fans `AssistantTurnInterrupted` realtime events to
@@ -1814,6 +1882,199 @@ mod tests {
         }
         // No runtime call was made — the inert fabricated-empty commit is gone.
         assert!(sink.calls.lock().unwrap().is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // R5-7: production sink forwards `AssistantTranscriptFinal` into the
+    // realtime-staging pipeline as
+    // `RealtimeTranscriptEvent::AssistantTranscriptFinalText` so the
+    // materializer can repair partial / dropped delta accumulation and
+    // commit canonical history for final-only providers. Pre-fix the
+    // sink dropped the observation on the floor and final-only / lossy
+    // delta paths produced no transcript block.
+    //
+    // Phase-1 already covers the materializer behavior in
+    // `meerkat-core/src/session.rs` regression tests:
+    //   - `realtime_transcript_final_text_overrides_partial_delta_and_promotes_to_spoken_lane`
+    //   - `realtime_transcript_final_text_creates_item_when_no_delta_staged`
+    //
+    // Here we pin the sink-side seam: the production sink emits the right
+    // event variant in the right order alongside the existing transcript
+    // delta + `AssistantTurnCompleted` flow.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn final_text_repairs_dropped_delta_text() {
+        // Lossy-delta recovery (R5-1 sibling): a partial transcript delta
+        // arrives ("I sai" — the rest got dropped), then the authoritative
+        // `AssistantTranscriptFinal` carries the full text ("I said hi"),
+        // then `TurnCompleted` flushes. The sink must emit
+        // `AssistantTranscriptDelta { delta: "I sai" }`,
+        // `AssistantTranscriptFinalText { text: "I said hi" }`, and
+        // `AssistantTurnCompleted`. The materializer (verified separately)
+        // replaces the staged segment with the final's text and commits a
+        // single `AssistantBlock::Transcript { text: "I said hi" }`.
+        let sink = BufferingTestSink::new();
+        let session_id = test_session_id();
+
+        sink.append_assistant_transcript_delta(
+            &session_id,
+            "I sai",
+            Some("resp_x"),
+            Some("item_x"),
+            Some(0),
+        );
+        sink.append_assistant_transcript_final(
+            &session_id,
+            "I said hi",
+            Some("resp_x"),
+            Some("item_x"),
+            Some(0),
+        );
+        sink.signal_turn_completed_with_realtime(
+            &session_id,
+            StopReason::EndTurn,
+            real_usage(),
+            Some("resp_x"),
+            true,
+        );
+
+        let calls = sink.calls.lock().unwrap();
+        // Three realtime events in order: Delta -> FinalText -> TurnCompleted.
+        // No buffered ExternalAssistantOutput drain (the realtime
+        // materializer owns the commit when transcript is on the spoken
+        // lane and there is no display-text fragment).
+        let realtime_events: Vec<&RealtimeTranscriptEvent> = calls
+            .iter()
+            .filter_map(|call| match call {
+                CapturedRuntimeCall::RealtimeTranscript(_, event) => Some(event),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            realtime_events.len(),
+            3,
+            "expected Delta -> FinalText -> TurnCompleted; got {realtime_events:?}"
+        );
+        assert!(matches!(
+            realtime_events[0],
+            RealtimeTranscriptEvent::AssistantTranscriptDelta { delta, .. } if delta == "I sai"
+        ));
+        match realtime_events[1] {
+            RealtimeTranscriptEvent::AssistantTranscriptFinalText {
+                response_id,
+                item_id,
+                content_index,
+                text,
+            } => {
+                assert_eq!(response_id, "resp_x");
+                assert_eq!(item_id, "item_x");
+                assert_eq!(*content_index, 0);
+                // R5-7 contract: the final's text is the authoritative
+                // content the materializer uses to repair the dropped
+                // delta. The committed `AssistantBlock::Transcript.text`
+                // (verified by Phase-1's session.rs tests) ends up
+                // equal to this string, NOT the partial delta accumulation.
+                assert_eq!(text, "I said hi");
+            }
+            other => panic!(
+                "expected AssistantTranscriptFinalText repairing the partial delta, got {other:?}"
+            ),
+        }
+        assert!(matches!(
+            realtime_events[2],
+            RealtimeTranscriptEvent::AssistantTurnCompleted { response_id, .. }
+                if response_id == "resp_x"
+        ));
+        // realtime_materialized=true + no buffered display-text fragments
+        // -> no buffered drain.
+        let externals: Vec<_> = calls
+            .iter()
+            .filter(|call| matches!(call, CapturedRuntimeCall::ExternalAssistantOutput { .. }))
+            .collect();
+        assert!(
+            externals.is_empty(),
+            "realtime materializer owns the spoken-lane commit; no buffered drain expected: {externals:?}"
+        );
+    }
+
+    #[test]
+    fn final_only_provider_commits_via_final_text() {
+        // Final-only provider: no `AssistantTranscriptDelta` events ever
+        // arrive — the provider emits a single
+        // `AssistantTranscriptFinal` carrying the whole transcript,
+        // followed by `TurnCompleted`. The sink must still drive a
+        // `RealtimeTranscriptEvent::AssistantTranscriptFinalText` so the
+        // materializer creates the staged item from scratch on the
+        // spoken lane (per Phase-1's `observe_realtime_item` create-on-
+        // missing arm) and commits an `AssistantBlock::Transcript` with
+        // the final's text.
+        let sink = BufferingTestSink::new();
+        let session_id = test_session_id();
+
+        // No delta stage at all.
+        sink.append_assistant_transcript_final(
+            &session_id,
+            "I said hi",
+            Some("resp_y"),
+            Some("item_y"),
+            Some(0),
+        );
+        sink.signal_turn_completed_with_realtime(
+            &session_id,
+            StopReason::EndTurn,
+            real_usage(),
+            Some("resp_y"),
+            true,
+        );
+
+        let calls = sink.calls.lock().unwrap();
+        let realtime_events: Vec<&RealtimeTranscriptEvent> = calls
+            .iter()
+            .filter_map(|call| match call {
+                CapturedRuntimeCall::RealtimeTranscript(_, event) => Some(event),
+                _ => None,
+            })
+            .collect();
+        // Two events: FinalText -> TurnCompleted. No delta upstream; the
+        // final's text is the only content carrier the materializer sees.
+        assert_eq!(
+            realtime_events.len(),
+            2,
+            "expected FinalText -> TurnCompleted only; got {realtime_events:?}"
+        );
+        match realtime_events[0] {
+            RealtimeTranscriptEvent::AssistantTranscriptFinalText {
+                response_id,
+                item_id,
+                content_index,
+                text,
+            } => {
+                assert_eq!(response_id, "resp_y");
+                assert_eq!(item_id, "item_y");
+                assert_eq!(*content_index, 0);
+                assert_eq!(text, "I said hi");
+            }
+            other => {
+                panic!("final-only provider must drive AssistantTranscriptFinalText, got {other:?}")
+            }
+        }
+        assert!(matches!(
+            realtime_events[1],
+            RealtimeTranscriptEvent::AssistantTurnCompleted { response_id, .. }
+                if response_id == "resp_y"
+        ));
+        // realtime_materialized=true + no buffered display-text fragments
+        // -> no buffered drain. The committed assistant message comes
+        // entirely from the realtime-staging materializer.
+        let externals: Vec<_> = calls
+            .iter()
+            .filter(|call| matches!(call, CapturedRuntimeCall::ExternalAssistantOutput { .. }))
+            .collect();
+        assert!(
+            externals.is_empty(),
+            "final-only provider commits via realtime materializer; no buffered drain: {externals:?}"
+        );
     }
 
     // ------------------------------------------------------------------

@@ -62,6 +62,13 @@ from .generated.types import (
     MobWiringRulesInput as MobWiringRulesInput,
     LiveChannelParams as LiveChannelParams,
     LiveInputChunkWire as LiveInputChunkWire,
+    # R5-10: re-export typed `LiveInputChunkWire` variants so SDK consumers
+    # can construct typed chunks at the `LiveSendInputParams.chunk` slot
+    # without dipping into `meerkat.generated.types`.
+    LiveInputChunkWireAudio as LiveInputChunkWireAudio,
+    LiveInputChunkWireText as LiveInputChunkWireText,
+    LiveInputChunkWireImage as LiveInputChunkWireImage,
+    LiveInputChunkWireVideoFrame as LiveInputChunkWireVideoFrame,
     LiveOpenParams as LiveOpenParams,
     LiveOpenResult as LiveOpenResult,
     LiveSendInputParams as LiveSendInputParams,

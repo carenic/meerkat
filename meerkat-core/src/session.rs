@@ -1053,10 +1053,24 @@ impl Session {
                     RealtimeTranscriptRole::Assistant,
                     Some(response_id),
                 ) {
-                    item.content_segments.insert(content_index, text);
-                    if response_completed && !item.text().is_empty() {
-                        item.ready = true;
+                    // R5-6: truncation is a Spoken-lane-only semantic — it
+                    // describes the audio output that was actually heard
+                    // before barge-in cut it short. Promote to Spoken so the
+                    // materializer commits as `AssistantBlock::Transcript`.
+                    // If a Display delta arrived first and content is
+                    // staged under Display, `promote_item_lane` keeps the
+                    // existing lane and emits a `tracing::warn!` — that's a
+                    // provider bug (truncation routed to a Display-classified
+                    // item). Treat as a no-op so we don't clobber Display
+                    // content with spoken-truncation text.
+                    promote_item_lane(item, TranscriptLane::Spoken);
+                    if item.lane == TranscriptLane::Spoken {
+                        item.content_segments.insert(content_index, text);
+                        if response_completed && !item.text().is_empty() {
+                            item.ready = true;
+                        }
                     }
+                    // else: misroute. `promote_item_lane` already warned.
                 }
             }
             RealtimeTranscriptEvent::AssistantTranscriptFinalText {
@@ -1146,7 +1160,26 @@ impl Session {
                 let Some(response_id) = normalize_realtime_response_id(response_id) else {
                     return RealtimeTranscriptApplyOutcome::default();
                 };
-                discard_realtime_assistant_response(&mut state, &response_id);
+                // R5-5: barge-in invalidates the spoken/audio lane (the user
+                // is speaking over what they heard) but preserves the
+                // Display lane (sideband display text from the same response
+                // is not "spoken over"). The interrupt is also terminal for
+                // the response on the realtime-staging path: any later
+                // `AssistantTurnCompleted` arrives with `StopReason::Cancelled`
+                // and short-circuits via the discarded-set guard. Therefore
+                // we must materialize retained Display items immediately here
+                // by inserting a synthetic `assistant_completions` entry —
+                // otherwise they would never commit.
+                discard_realtime_assistant_response_by_lane(&mut state, &response_id);
+                state
+                    .assistant_completions
+                    .entry(response_id.clone())
+                    .or_insert(RealtimeAssistantCompletion {
+                        stop_reason: StopReason::Cancelled,
+                        usage: Usage::default(),
+                        usage_consumed: false,
+                    });
+                mark_realtime_assistant_response_ready(&mut state, &response_id);
             }
         }
 
@@ -2330,6 +2363,51 @@ fn discard_realtime_assistant_response(
     state.assistant_completions.remove(response_id);
 }
 
+/// R5-5: lane-scoped discard for barge-in (`AssistantTurnInterrupted`).
+///
+/// Drops Spoken-lane staged items (the heard audio + transcript the user
+/// spoke over) and preserves Display-lane items as committable content.
+/// Items with empty content (no deltas observed yet, lane still defaulting
+/// to `Display`) are also discarded — they carry no preserveable Display
+/// text. The caller is responsible for inserting a synthetic
+/// `assistant_completions` entry so the materializer can flush retained
+/// Display items immediately.
+///
+/// Unlike [`discard_realtime_assistant_response`], this helper does NOT
+/// remove the response from `assistant_completions`: barge-in must seed a
+/// completion entry so retained Display items can materialize before any
+/// late `AssistantTurnCompleted` (which would short-circuit on the
+/// discarded-set membership) arrives.
+fn discard_realtime_assistant_response_by_lane(
+    state: &mut SessionRealtimeTranscriptState,
+    response_id: &str,
+) {
+    state
+        .discarded_assistant_response_ids
+        .insert(response_id.to_string());
+    for item in state.items.values_mut() {
+        if item.role != RealtimeTranscriptRole::Assistant
+            || item.response_id.as_deref() != Some(response_id)
+            || item.materialized
+        {
+            continue;
+        }
+        let has_content = item.content_segments.values().any(|s| !s.is_empty());
+        if item.lane == TranscriptLane::Display && has_content {
+            // Retain the Display content; the caller's synthetic
+            // completion entry + `mark_realtime_assistant_response_ready`
+            // will flag it ready for the next materializer pass.
+            continue;
+        }
+        // Spoken (or empty Display, which carries no preserveable text):
+        // drop content and mark as a contentless predecessor so chained
+        // items downstream of it can still materialize.
+        item.content_segments.clear();
+        item.skipped = true;
+        item.ready = true;
+    }
+}
+
 fn realtime_transcript_order(state: &SessionRealtimeTranscriptState) -> Vec<String> {
     let mut roots = Vec::new();
     let mut children: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -2877,6 +2955,12 @@ mod tests {
 
     #[test]
     fn realtime_transcript_interrupted_assistant_item_unblocks_later_provider_items() {
+        // R5-5 (Round-5): the staged assistant content is a Display-lane item
+        // (`AssistantTextDelta`). Under the new lane-aware barge-in contract,
+        // the Display lane survives interruption and materializes. The User
+        // "Stop." item, gated on the chained Display item being materialized,
+        // also unblocks. Round-4's "must stay non-canonical" assertion was
+        // wrong — that contract was lane-blind.
         let mut session = Session::new();
 
         let _ = session.append_realtime_transcript_event(
@@ -2917,27 +3001,28 @@ mod tests {
             },
         );
 
-        assert_eq!(outcome.materialized_messages.len(), 1);
-        assert_eq!(session.messages().len(), 2);
+        // R5-5: materializer commits 2 messages (the retained Display item +
+        // the unblocked "Stop." User message).
+        assert_eq!(outcome.materialized_messages.len(), 2);
+        // Canonical history: User-repeat, BlockAssistant(Display "Looping now"), User-Stop.
+        assert_eq!(session.messages().len(), 3);
         assert!(matches!(
             &session.messages()[0],
             Message::User(user) if user.text_content() == "repeat until stop"
         ));
+        match &session.messages()[1] {
+            Message::BlockAssistant(assistant) => {
+                let text = block_assistant_text(assistant);
+                assert_eq!(text, "Looping now");
+            }
+            other => unreachable!(
+                "Display lane assistant item must be retained on Interrupted, got {other:?}"
+            ),
+        }
         assert!(matches!(
-            &session.messages()[1],
+            &session.messages()[2],
             Message::User(user) if user.text_content() == "Stop."
         ));
-        assert!(
-            session
-                .messages()
-                .iter()
-                .filter_map(|message| match message {
-                    Message::BlockAssistant(assistant) => Some(block_assistant_text(assistant)),
-                    _ => None,
-                })
-                .all(|text| !text.contains("Looping now")),
-            "interrupted assistant text must remain non-canonical"
-        );
     }
 
     #[test]
@@ -3194,6 +3279,11 @@ mod tests {
 
     #[test]
     fn realtime_transcript_interruption_discards_only_matching_response() {
+        // R5-5: cross-response isolation invariant — Interrupted on resp_a
+        // does NOT touch resp_b's staged content. Both responses use
+        // `AssistantTextDelta` (Display lane); under R5-5 resp_a's Display
+        // item is RETAINED at Interrupted time and resp_b's continues
+        // unaffected, materializing on its later TurnCompleted.
         let mut session = Session::new();
 
         let _ = session.append_realtime_transcript_event(
@@ -3211,7 +3301,7 @@ mod tests {
                 item_id: "item_a".to_string(),
                 previous_item_id: Some("item_user".to_string()),
                 content_index: 0,
-                delta: "discard me".to_string(),
+                delta: "interrupted display".to_string(),
             });
         let _ =
             session.append_realtime_transcript_event(RealtimeTranscriptEvent::AssistantTextDelta {
@@ -3223,15 +3313,19 @@ mod tests {
                 delta: "keep me".to_string(),
             });
 
-        assert!(
-            session
-                .append_realtime_transcript_event(
-                    RealtimeTranscriptEvent::AssistantTurnInterrupted {
-                        response_id: "resp_a".to_string(),
-                    }
-                )
-                .is_inert()
+        // R5-5: Interrupted commits the resp_a Display item; resp_b
+        // remains untouched.
+        let interrupt_outcome = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTurnInterrupted {
+                response_id: "resp_a".to_string(),
+            },
         );
+        assert_eq!(
+            interrupt_outcome.materialized_messages.len(),
+            1,
+            "resp_a's Display item commits on Interrupted"
+        );
+
         let outcome = session.append_realtime_transcript_event(
             RealtimeTranscriptEvent::AssistantTurnCompleted {
                 response_id: "resp_b".to_string(),
@@ -3239,11 +3333,20 @@ mod tests {
                 usage: Usage::default(),
             },
         );
+        assert_eq!(
+            outcome.materialized_messages.len(),
+            1,
+            "resp_b commits on its TurnCompleted, untouched by resp_a's Interrupted"
+        );
 
-        assert_eq!(outcome.materialized_messages.len(), 1);
-        assert_eq!(session.messages().len(), 2);
+        // 1 user + 2 assistant messages.
+        assert_eq!(session.messages().len(), 3);
         assert!(matches!(
             &session.messages()[1],
+            Message::BlockAssistant(assistant) if block_assistant_text(assistant) == "interrupted display"
+        ));
+        assert!(matches!(
+            &session.messages()[2],
             Message::BlockAssistant(assistant) if block_assistant_text(assistant) == "keep me"
         ));
     }
@@ -4071,21 +4174,22 @@ mod tests {
     }
 
     #[test]
-    fn round4_cc7_mixed_response_barge_in_discards_entire_in_flight_response() {
-        // CC7 sibling regression: when a mixed-modality response is
-        // interrupted (barge-in) BEFORE TurnCompleted, the entire in-flight
-        // response is discarded — both the display-text lane and the
-        // spoken-transcript lane. No `BlockAssistant` is committed for the
-        // interrupted response.
+    fn round5_r55_mixed_response_barge_in_preserves_display_drops_spoken() {
+        // R5-5 (Round-5 contract update): barge-in MUST filter staged items
+        // by lane — `Spoken` is invalidated (the user spoke over the audio
+        // they were hearing) but `Display` survives as committed history
+        // (sideband display text from the same response is not "spoken
+        // over"). Round-4's `round4_cc7_mixed_response_barge_in_discards_*`
+        // pinned the wrong invariant; this test replaces it.
         //
-        // The architectural rationale: barge-in semantics treat the in-flight
-        // response as a single unit because the user spoke over the
-        // assistant's reply mid-stream. The display-text portion of that same
-        // mixed reply is an artifact of the same uncommitted draft and is
-        // discarded with it. (Display text from a SEPARATE, earlier turn
-        // would already have been committed by its own TurnCompleted event;
-        // CC4 tests cover the cross-response isolation. This test pins the
-        // intra-response unit-of-discard contract.)
+        // Architectural decision: `AssistantTurnInterrupted` is terminal for
+        // the response on the realtime-staging path — any later
+        // `AssistantTurnCompleted { stop_reason: Cancelled }` short-circuits
+        // via the `discarded_assistant_response_ids` guard. So the
+        // Interrupted handler must seed a synthetic
+        // `assistant_completions` entry (`StopReason::Cancelled`,
+        // `Usage::default()`) so retained Display items materialize
+        // immediately rather than stranding forever.
         let mut session = Session::new();
 
         let display = RealtimeTranscriptEvent::AssistantTextDelta {
@@ -4108,31 +4212,38 @@ mod tests {
         };
         let _ = session.append_realtime_transcript_event(spoken);
 
-        // Barge-in arrives BEFORE TurnCompleted.
+        // Barge-in arrives BEFORE TurnCompleted. The Display item with
+        // staged content materializes immediately under the synthetic
+        // Cancelled completion.
         let outcome = session.append_realtime_transcript_event(
             RealtimeTranscriptEvent::AssistantTurnInterrupted {
                 response_id: "resp_mixed_2".to_string(),
             },
         );
-        // Interruption itself does not materialize anything.
-        assert_eq!(outcome.materialized_messages.len(), 0);
+        assert_eq!(
+            outcome.materialized_messages.len(),
+            1,
+            "Display lane item must materialize on Interrupted: {outcome:?}"
+        );
 
-        // Even if a (delayed/late) TurnCompleted arrives after barge-in, the
-        // discarded items must remain unmaterialized — the response is dead.
+        // A late `AssistantTurnCompleted` (the provider's response.done
+        // emitted after cancel) must be a no-op: the Display item is
+        // already materialized; the Spoken item was dropped at Interrupted.
         let late_completion = session.append_realtime_transcript_event(
             RealtimeTranscriptEvent::AssistantTurnCompleted {
                 response_id: "resp_mixed_2".to_string(),
-                stop_reason: StopReason::EndTurn,
+                stop_reason: StopReason::Cancelled,
                 usage: Usage::default(),
             },
         );
         assert_eq!(
             late_completion.materialized_messages.len(),
             0,
-            "post-barge-in TurnCompleted must not resurrect discarded mixed-response items"
+            "post-barge-in TurnCompleted must not resurrect anything"
         );
 
-        // Canonical history is unchanged: no BlockAssistant message survives.
+        // Canonical history: exactly one BlockAssistant carrying the
+        // Display text (no Transcript block — Spoken was dropped).
         let messages = session.messages();
         let assistants: Vec<&BlockAssistantMessage> = messages
             .iter()
@@ -4141,17 +4252,241 @@ mod tests {
                 _ => None,
             })
             .collect();
+        assert_eq!(
+            assistants.len(),
+            1,
+            "barge-in must commit exactly one BlockAssistant containing the Display lane: {assistants:?}"
+        );
+        let assistant = assistants[0];
+        assert_eq!(assistant.blocks.len(), 1, "blocks: {:?}", assistant.blocks);
+        match &assistant.blocks[0] {
+            AssistantBlock::Text { text, .. } => {
+                assert_eq!(text, "Working on the report...");
+            }
+            other => {
+                unreachable!("Display lane must materialize as AssistantBlock::Text, got {other:?}")
+            }
+        }
+        // No Transcript block — Spoken lane was dropped.
         assert!(
-            assistants.is_empty(),
-            "barge-in on a mixed response must discard ALL in-flight content (display + spoken), got: {assistants:?}"
+            !assistant
+                .blocks
+                .iter()
+                .any(|b| matches!(b, AssistantBlock::Transcript { .. })),
+            "Spoken lane must be dropped on barge-in"
         );
 
-        // The in-flight tracker also reports the response as gone.
+        // The in-flight tracker reports the response as no longer in flight
+        // (the Display item is materialized; the Spoken item is skipped).
         assert!(
             !session
                 .in_flight_realtime_assistant_response_ids()
                 .contains(&"resp_mixed_2".to_string()),
             "barged-in response must not appear in in_flight_realtime_assistant_response_ids"
         );
+    }
+
+    #[test]
+    fn round5_r55_barge_in_preserves_display_lane_drops_spoken() {
+        // R5-5 unit test: pin the lane-filter behavior at the staged-item
+        // level (no chained predecessor). One Display item, one Spoken item,
+        // both unchained, both staged before Interrupted.
+        let mut session = Session::new();
+
+        let _ =
+            session.append_realtime_transcript_event(RealtimeTranscriptEvent::AssistantTextDelta {
+                response_id: "resp_a".to_string(),
+                delta_id: "delta_d_1".to_string(),
+                item_id: "item_display".to_string(),
+                previous_item_id: None,
+                content_index: 0,
+                delta: "display-text".to_string(),
+            });
+        let _ = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTranscriptDelta {
+                response_id: "resp_a".to_string(),
+                delta_id: "delta_s_1".to_string(),
+                item_id: "item_spoken".to_string(),
+                previous_item_id: None,
+                content_index: 0,
+                delta: "spoken-transcript".to_string(),
+            },
+        );
+
+        let outcome = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTurnInterrupted {
+                response_id: "resp_a".to_string(),
+            },
+        );
+        // Display materializes, Spoken does not.
+        assert_eq!(outcome.materialized_messages.len(), 1);
+
+        let messages = session.messages();
+        let assistants: Vec<&BlockAssistantMessage> = messages
+            .iter()
+            .filter_map(|m| match m {
+                Message::BlockAssistant(a) => Some(a),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(assistants.len(), 1);
+        // Single Text block (the Display lane) — no Transcript.
+        assert_eq!(assistants[0].blocks.len(), 1);
+        match &assistants[0].blocks[0] {
+            AssistantBlock::Text { text, .. } => assert_eq!(text, "display-text"),
+            other => unreachable!("expected Text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round5_r55_barge_in_finalizes_retained_display_into_committed_block() {
+        // R5-5: the architectural decision — Interrupted is terminal for the
+        // response. Display lane must commit at Interrupted time, not wait
+        // on a hypothetical AssistantTurnCompleted that may never arrive
+        // (or arrives Cancelled and short-circuits).
+        let mut session = Session::new();
+
+        let _ =
+            session.append_realtime_transcript_event(RealtimeTranscriptEvent::AssistantTextDelta {
+                response_id: "resp_a".to_string(),
+                delta_id: "delta_d_1".to_string(),
+                item_id: "item_display".to_string(),
+                previous_item_id: None,
+                content_index: 0,
+                delta: "committed-display-text".to_string(),
+            });
+
+        // Pre-condition: nothing committed yet.
+        assert!(session.messages().is_empty());
+
+        let outcome = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTurnInterrupted {
+                response_id: "resp_a".to_string(),
+            },
+        );
+        assert_eq!(
+            outcome.materialized_messages.len(),
+            1,
+            "Interrupted must finalize retained Display lane immediately"
+        );
+
+        // Post-condition: BlockAssistant in canonical history, no Transcript.
+        let messages = session.messages();
+        assert_eq!(messages.len(), 1);
+        match &messages[0] {
+            Message::BlockAssistant(assistant) => {
+                assert_eq!(assistant.blocks.len(), 1);
+                match &assistant.blocks[0] {
+                    AssistantBlock::Text { text, .. } => {
+                        assert_eq!(text, "committed-display-text");
+                    }
+                    other => unreachable!("expected Text, got {other:?}"),
+                }
+            }
+            other => unreachable!("expected BlockAssistant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round5_r56_truncation_promotes_default_lane_item_to_spoken() {
+        // R5-6: when truncation is the first content-bearing event for an
+        // item (no prior delta), the staged item's lane MUST be promoted to
+        // Spoken so the materializer commits as `AssistantBlock::Transcript`.
+        // Without the explicit promotion, the lane stays `Display` (the
+        // default) and the heard audio transcript persists as
+        // `AssistantBlock::Text`.
+        let mut session = Session::new();
+
+        let _ = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTranscriptTruncated {
+                response_id: "resp_a".to_string(),
+                item_id: "item_a".to_string(),
+                content_index: 0,
+                text: "what was actually heard".to_string(),
+            },
+        );
+
+        let outcome = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTurnCompleted {
+                response_id: "resp_a".to_string(),
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            },
+        );
+        assert_eq!(outcome.materialized_messages.len(), 1);
+
+        assert_eq!(session.messages().len(), 1);
+        match &session.messages()[0] {
+            Message::BlockAssistant(assistant) => {
+                assert_eq!(assistant.blocks.len(), 1);
+                match &assistant.blocks[0] {
+                    AssistantBlock::Transcript { text, source, .. } => {
+                        assert_eq!(text, "what was actually heard");
+                        assert_eq!(*source, crate::types::TranscriptSource::Spoken);
+                    }
+                    other => unreachable!(
+                        "truncation-only path must materialize as AssistantBlock::Transcript, got {other:?}"
+                    ),
+                }
+            }
+            other => unreachable!("expected BlockAssistant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn round5_r56_truncation_after_display_delta_is_no_op_keeping_display_content() {
+        // R5-6 edge case: a Display delta arrived first and staged Display
+        // content; a truncation event arrives for the SAME item id
+        // (provider bug — truncation only applies to spoken/audio output).
+        // Contract: the staged Display content must NOT be clobbered by
+        // the truncation text. `promote_item_lane` keeps the existing
+        // Display lane and emits a `tracing::warn!`; the truncation arm
+        // sees the lane stayed Display and skips the segment-write.
+        let mut session = Session::new();
+
+        let _ =
+            session.append_realtime_transcript_event(RealtimeTranscriptEvent::AssistantTextDelta {
+                response_id: "resp_a".to_string(),
+                delta_id: "delta_d_1".to_string(),
+                item_id: "item_a".to_string(),
+                previous_item_id: None,
+                content_index: 0,
+                delta: "display-text-from-delta".to_string(),
+            });
+
+        let _ = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTranscriptTruncated {
+                response_id: "resp_a".to_string(),
+                item_id: "item_a".to_string(),
+                content_index: 0,
+                text: "spoken-truncation-text".to_string(),
+            },
+        );
+
+        let _ = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTurnCompleted {
+                response_id: "resp_a".to_string(),
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            },
+        );
+
+        // Display content survives unchanged — the truncation text was
+        // refused. Materializes as `AssistantBlock::Text` (Display lane).
+        assert_eq!(session.messages().len(), 1);
+        match &session.messages()[0] {
+            Message::BlockAssistant(assistant) => {
+                assert_eq!(assistant.blocks.len(), 1);
+                match &assistant.blocks[0] {
+                    AssistantBlock::Text { text, .. } => {
+                        assert_eq!(text, "display-text-from-delta");
+                    }
+                    other => unreachable!(
+                        "Display content must survive misrouted truncation, got {other:?}"
+                    ),
+                }
+            }
+            other => unreachable!("expected BlockAssistant, got {other:?}"),
+        }
     }
 }

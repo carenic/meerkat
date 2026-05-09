@@ -198,6 +198,13 @@ export type {
   MobWiringRulesInput,
   LiveChannelParams,
   LiveInputChunkWire,
+  // R5-10: re-export typed `LiveInputChunkWire` variants so TS consumers
+  // can construct typed chunks at the `LiveSendInputParams.chunk` slot
+  // without dipping into `./generated/types`.
+  LiveInputChunkWireAudio,
+  LiveInputChunkWireText,
+  LiveInputChunkWireImage,
+  LiveInputChunkWireVideoFrame,
   LiveOpenParams,
   LiveOpenResult,
   LiveSendInputParams,

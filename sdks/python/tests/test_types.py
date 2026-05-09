@@ -2836,3 +2836,52 @@ def test_generated_live_open_result_references_typed_capabilities_and_continuity
     # `WireLiveContinuityMode` is a `Union[...]` alias; the dataclass field
     # type must be exactly this alias, not `Any`.
     assert hints["continuity"] == WireLiveContinuityMode
+
+
+def test_generated_live_send_input_params_chunk_is_typed_union():
+    """R5-10: `LiveSendInputParams.chunk` is the typed `LiveInputChunkWire`
+    union, not opaque `dict[str, Any]`.
+
+    Before R5-10, schema codegen erased `LiveInputChunkWire` at the
+    `LiveSendInputParams.chunk` boundary and emitted `chunk: dict[str, Any]`.
+    The fix promotes `LiveInputChunkWire` into the codegen lookup root so
+    the `LiveSendInputParams` dataclass references the typed union by name.
+    """
+    from dataclasses import fields
+    from typing import get_type_hints
+
+    from meerkat.types import (
+        LiveInputChunkWire,
+        LiveInputChunkWireAudio,
+        LiveInputChunkWireImage,
+        LiveInputChunkWireText,
+        LiveInputChunkWireVideoFrame,
+        LiveSendInputParams,
+    )
+
+    hints = get_type_hints(LiveSendInputParams)
+    # The `chunk` field is exactly the `LiveInputChunkWire` union — not
+    # `dict[str, Any]` and not `Any`.
+    assert hints["chunk"] == LiveInputChunkWire
+
+    field_names = {f.name for f in fields(LiveSendInputParams)}
+    assert field_names == {"channel_id", "chunk"}
+
+    # All four typed variants must be constructible and assignable to the
+    # `chunk` slot — proves the union is the discriminated `kind`-tagged
+    # shape, not a structurally-empty placeholder.
+    audio = LiveInputChunkWireAudio(
+        kind="audio", data="AQID", sample_rate_hz=24_000, channels=1
+    )
+    text = LiveInputChunkWireText(kind="text", text="hello")
+    image = LiveInputChunkWireImage(
+        kind="image", mime="image/png", data="iVBORw0KGgo="
+    )
+    video_frame = LiveInputChunkWireVideoFrame(
+        kind="video_frame", codec="vp8", data="AQID", timestamp_ms=1_234
+    )
+
+    for chunk in (audio, text, image, video_frame):
+        params = LiveSendInputParams(channel_id="live_1", chunk=chunk)
+        assert params.channel_id == "live_1"
+        assert params.chunk is chunk

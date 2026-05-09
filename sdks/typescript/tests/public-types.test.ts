@@ -20,6 +20,10 @@ import type {
   MobSpawnSpecParams as PublicMobSpawnSpecParams,
 } from "../src/index.js";
 import type {
+  LiveInputChunkWire,
+  LiveSendInputParams,
+} from "../src/index.js";
+import type {
   MobCreateParams,
   MobDefinitionInput,
   MobEnsureMemberParams,
@@ -649,3 +653,60 @@ void sdkCommsPeerMessageWithBlocks;
 void sdkCommsPeerRequestWithBlocks;
 void sdkCommsSupervisorBridgeWithPublicBlocks;
 void sdkCommsPeerRequestIntentMismatch;
+
+// R5-10: `LiveSendInputParams.chunk` must be the typed `LiveInputChunkWire`
+// discriminated union, not an opaque `Record<string, unknown>`. Each typed
+// variant must compile under the typed `chunk` slot.
+const liveAudioChunk: LiveInputChunkWire = {
+  kind: "audio",
+  data: "AQID",
+  sample_rate_hz: 24_000,
+  channels: 1,
+};
+const liveTextChunk: LiveInputChunkWire = {
+  kind: "text",
+  text: "hello",
+};
+const liveImageChunk: LiveInputChunkWire = {
+  kind: "image",
+  mime: "image/png",
+  data: "iVBORw0KGgo=",
+};
+const liveVideoFrameChunk: LiveInputChunkWire = {
+  kind: "video_frame",
+  codec: "vp8",
+  data: "AQID",
+  timestamp_ms: 1_234,
+};
+
+const liveSendInputAudio: LiveSendInputParams = {
+  channel_id: "live_1",
+  chunk: liveAudioChunk,
+};
+const liveSendInputText: LiveSendInputParams = {
+  channel_id: "live_1",
+  chunk: liveTextChunk,
+};
+const liveSendInputImage: LiveSendInputParams = {
+  channel_id: "live_1",
+  chunk: liveImageChunk,
+};
+const liveSendInputVideoFrame: LiveSendInputParams = {
+  channel_id: "live_1",
+  chunk: liveVideoFrameChunk,
+};
+
+// R5-10: chunks missing the `kind` discriminator must be rejected at compile
+// time. This proves `chunk` is no longer typed as `Record<string, unknown>`,
+// which would have accepted any free-form object.
+const liveSendInputUntyped: LiveSendInputParams = {
+  channel_id: "live_1",
+  // @ts-expect-error LiveInputChunkWire requires a discriminated `kind` tag.
+  chunk: { foo: "bar" },
+};
+
+void liveSendInputAudio;
+void liveSendInputText;
+void liveSendInputImage;
+void liveSendInputVideoFrame;
+void liveSendInputUntyped;

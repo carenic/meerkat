@@ -1719,7 +1719,7 @@ export interface LiveStatusResult {
 
 export interface LiveSendInputParams {
   channel_id: string;
-  chunk: Record<string, unknown>;
+  chunk: LiveInputChunkWire;
 }
 
 export interface LiveTruncateParams {

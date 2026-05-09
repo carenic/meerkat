@@ -1521,7 +1521,7 @@ class LiveSendInputParams:
 a flattened sibling of `channel_id`. WS protocol clients that piggyback on
 this shape must use the nested form."""
     channel_id: str
-    chunk: dict[str, Any]
+    chunk: LiveInputChunkWire
 
 
 @dataclass
