@@ -28,7 +28,7 @@ use std::collections::BTreeMap;
 use meerkat_core::{
     AssistantBlock, BlobId, ContentBlock, ContentInput, ImageData, Message, ProviderMeta,
     SessionHistoryPage, SessionId, SessionInfo, SessionSummary, StopReason, SystemNoticeKind,
-    TranscriptEditRunningBehavior, TranscriptReplacement, VideoData,
+    TranscriptEditRunningBehavior, TranscriptReplacement, TranscriptSource, VideoData,
 };
 use std::convert::TryFrom;
 
@@ -418,6 +418,14 @@ pub enum WireAssistantBlock {
         #[serde(skip_serializing_if = "Option::is_none")]
         meta: Option<WireProviderMeta>,
     },
+    /// Spoken-transcript output (provider audio output → text). Distinct
+    /// from `Text` so callers can render or filter by lane provenance.
+    Transcript {
+        text: String,
+        source: WireTranscriptSource,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        meta: Option<WireProviderMeta>,
+    },
     Reasoning {
         #[serde(default)]
         text: String,
@@ -461,11 +469,43 @@ pub enum WireAssistantBlock {
     Unknown,
 }
 
+/// Wire projection of `meerkat_core::TranscriptSource`. Lane provenance
+/// for spoken-transcript blocks. Single variant today; future-expandable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WireTranscriptSource {
+    Spoken,
+}
+
+impl From<TranscriptSource> for WireTranscriptSource {
+    fn from(value: TranscriptSource) -> Self {
+        match value {
+            TranscriptSource::Spoken => Self::Spoken,
+            _ => Self::Spoken,
+        }
+    }
+}
+
+impl From<WireTranscriptSource> for TranscriptSource {
+    fn from(value: WireTranscriptSource) -> Self {
+        match value {
+            WireTranscriptSource::Spoken => Self::Spoken,
+        }
+    }
+}
+
 impl From<AssistantBlock> for WireAssistantBlock {
     fn from(value: AssistantBlock) -> Self {
         match value {
             AssistantBlock::Text { text, meta } => Self::Text {
                 text,
+                meta: meta.map(|m| (*m).into()),
+            },
+            AssistantBlock::Transcript { text, source, meta } => Self::Transcript {
+                text,
+                source: source.into(),
                 meta: meta.map(|m| (*m).into()),
             },
             AssistantBlock::Reasoning { text, meta } => Self::Reasoning {

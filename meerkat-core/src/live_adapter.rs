@@ -165,7 +165,39 @@ pub enum LiveAdapterObservation {
         content_index: Option<u32>,
         text: String,
     },
+    /// Streaming **display** text delta from the provider. Distinct from
+    /// [`Self::AssistantTranscriptDelta`]: this lane carries authored text
+    /// the provider emits as primary output (`response.output_text.delta` on
+    /// the OpenAI realtime surface), not audio-derived speech transcription.
+    ///
+    /// The runtime flushes these into [`crate::types::AssistantBlock::Text`].
+    /// Display text is preserved across barge-in (the user is not "speaking
+    /// over" written output).
     AssistantTextDelta {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_index: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delta_id: Option<String>,
+        delta: String,
+    },
+    /// Streaming **spoken-transcript** delta — text derived from the
+    /// provider's audio output (`response.output_audio_transcript.delta` on
+    /// the OpenAI realtime surface). Distinct from
+    /// [`Self::AssistantTextDelta`] because it represents what the model
+    /// *said*, not what it *wrote*; the runtime flushes these into
+    /// [`crate::types::AssistantBlock::Transcript`] with
+    /// `source: TranscriptSource::Spoken`.
+    ///
+    /// Identity shape mirrors `AssistantTextDelta` so per-response buffering
+    /// (R6 `(SessionId, Option<response_id>)`) and barge-in scoping
+    /// ([`Self::TurnInterrupted`]) apply uniformly.
+    AssistantTranscriptDelta {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         provider_item_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -222,6 +254,16 @@ pub enum LiveAdapterObservation {
         tool_name: String,
         arguments: serde_json::Value,
     },
+    /// Barge-in: the user interrupted the assistant mid-turn.
+    ///
+    /// Scope (T7): this observation invalidates **only** spoken-transcript
+    /// and audio-playback state for the in-flight turn. Display-text state
+    /// (the [`Self::AssistantTextDelta`] / [`AssistantBlock::Text`] lane) is
+    /// **preserved** — the user did not speak over written output, so any
+    /// already-buffered display-text final still commits at
+    /// [`Self::TurnCompleted`] (or via the projection sink's text-only
+    /// flush). Sinks must drain transcript buffers and any audio playback
+    /// state at this signal but leave the display-text buffer alone.
     TurnInterrupted,
     TurnCompleted {
         /// R6: the provider's response identifier for the turn that just
@@ -362,6 +404,14 @@ pub struct LiveAudioConfig {
 /// A modality-neutral input chunk admitted by Meerkat for delivery to the
 /// provider. Meerkat already decided this input is admitted; the adapter
 /// just delivers it.
+///
+/// T11: image and video-frame variants are typed at this seam so future
+/// provider support (gpt-realtime-2 image input, Gemini Live video input)
+/// flows through `live/send_input` without a wire reshape. Adapters that do
+/// not yet support a variant must reject the command with
+/// [`LiveAdapterErrorCode::ConfigRejected`] carrying a typed `reason`
+/// (`"image_input_not_implemented"` / `"video_frame_input_not_implemented"`)
+/// rather than collapsing onto a free-form provider error string.
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -377,66 +427,115 @@ pub enum LiveInputChunk {
     Text {
         text: String,
     },
+    /// Image input (e.g. future `gpt-realtime-2` image support). `mime` is
+    /// the IANA MIME type of the encoded bytes (`image/png`, `image/jpeg`,
+    /// `image/webp`, …); `data` is the raw encoded bytes — base64-encoded
+    /// on the wire (mirrors the [`Self::Audio`] / `AssistantAudioChunk`
+    /// pattern) but a plain `Vec<u8>` in Rust so adapters never see the
+    /// b64 wrapper.
+    Image {
+        mime: String,
+        #[serde(with = "base64_bytes")]
+        #[cfg_attr(feature = "schema", schemars(with = "String"))]
+        data: Vec<u8>,
+    },
+    /// Single video-frame input (e.g. Gemini Live). `codec` is the encoding
+    /// of the frame bytes (`vp8`, `vp9`, `h264`, `image/jpeg` for
+    /// keyframe-as-image transports, …); `data` is the encoded frame
+    /// payload (base64 on the wire, raw `Vec<u8>` in Rust);
+    /// `timestamp_ms` is the presentation timestamp the adapter should
+    /// stamp into the provider envelope so frames remain ordered.
+    VideoFrame {
+        codec: String,
+        #[serde(with = "base64_bytes")]
+        #[cfg_attr(feature = "schema", schemars(with = "String"))]
+        data: Vec<u8>,
+        timestamp_ms: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------
 // Transport bootstrap — tagged transport info for surface API
 // ---------------------------------------------------------------------------
 
-/// A single ICE server entry for WebRTC bootstrap. Replaces a bare
-/// `Vec<String>` so credentialed TURN servers carry their auth fields
-/// alongside their URLs (typed truth, dogma sin #1).
-#[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub struct LiveIceServer {
-    pub urls: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub username: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub credential: Option<String>,
-}
-
 /// Tagged transport bootstrap returned when opening a live channel.
 ///
 /// The surface API returns this instead of a bare `ws_url` so Meerkat
-/// semantics do not depend on transport kind (dogma sin #10).
+/// semantics do not depend on transport kind (dogma sin #10). The enum is
+/// `#[non_exhaustive]` so additional transports can be added without
+/// breaking downstream consumers.
+///
+/// **WebRTC reintroduction (deferred to follow-up PR):** an earlier
+/// `Webrtc { offer_sdp, ice_servers }` variant was removed because it
+/// modeled the wrong shape — Meerkat would pre-compute an SDP offer and
+/// hand it to the browser, but in the production WebRTC flow the browser
+/// owns the local `RTCPeerConnection`, calls `getUserMedia`, generates the
+/// offer SDP itself, then sends it to a Meerkat terminator which
+/// negotiates with the upstream provider. The follow-up PR will reintroduce
+/// WebRTC via a real signaling shape (likely a dedicated
+/// `live/webrtc/open` RPC, or an extended `live/open` returning a
+/// signaling endpoint + token; the browser POSTs its offer to that
+/// endpoint, the terminator returns the answer SDP and ICE candidates,
+/// and the resulting media/data channel binds to the existing live
+/// channel identity). See `LIVE_ADAPTER_ROUND4_TODO.md` Phase 1 / T4 and
+/// the PR #650 design notes.
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "transport", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum LiveTransportBootstrap {
-    Websocket {
-        url: String,
-        token: String,
-    },
-    Webrtc {
-        offer_sdp: String,
-        ice_servers: Vec<LiveIceServer>,
-    },
+    Websocket { url: String, token: String },
 }
 
 /// Capabilities advertised when a live channel opens.
+///
+/// T8: typed-boolean matrix only — no `input_kinds` / `output_kinds` lists.
+/// New modalities (image input on `gpt-realtime-2`, video input on Gemini
+/// Live) appear as additional typed booleans without provider-specific
+/// fields. Consumers grep for the exact capability they care about; lists
+/// of stringly-typed `RealtimeInputKind` are only used inside the
+/// provider-session capability projection (`RealtimeCapabilities`), not at
+/// this surface boundary.
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct LiveChannelCapabilities {
-    pub audio_input: bool,
-    pub audio_output: bool,
-    pub text_input: bool,
-    pub text_output: bool,
-    pub barge_in: bool,
-    pub transcript: bool,
+    /// Adapter accepts audio chunks via `live/send_input`.
+    pub audio_in: bool,
+    /// Adapter emits audio chunks via `AssistantAudioChunk` observations.
+    pub audio_out: bool,
+    /// Adapter accepts text chunks via `live/send_input`.
+    pub text_in: bool,
+    /// Adapter emits display text via `AssistantTextDelta` observations.
+    pub text_out: bool,
+    /// Adapter accepts image input via `live/send_input` (e.g. future
+    /// `gpt-realtime-2` image support). Today: `false` for OpenAI realtime.
+    pub image_in: bool,
+    /// Adapter accepts video-frame input via `live/send_input` (e.g.
+    /// Gemini Live). Today: `false` for OpenAI realtime.
+    pub video_in: bool,
+    /// Adapter emits spoken-audio transcripts via
+    /// `AssistantTranscriptDelta` / `AssistantTranscriptFinal`.
+    pub transcript_supported: bool,
+    /// Adapter supports user-initiated barge-in (turn truncation) via
+    /// `live/interrupt` and the `TurnInterrupted` observation.
+    pub barge_in_supported: bool,
+    /// Adapter can resume a prior provider-side session by id (transcript-
+    /// only resume does not count). `false` until a provider exposes a
+    /// real continuation handle.
     pub provider_native_resume: bool,
 }
 
 impl Default for LiveChannelCapabilities {
     fn default() -> Self {
         Self {
-            audio_input: true,
-            audio_output: true,
-            text_input: true,
-            text_output: true,
-            barge_in: true,
-            transcript: true,
+            audio_in: true,
+            audio_out: true,
+            text_in: true,
+            text_out: true,
+            image_in: false,
+            video_in: false,
+            transcript_supported: true,
+            barge_in_supported: true,
             provider_native_resume: false,
         }
     }
@@ -453,14 +552,42 @@ pub struct LiveChannelOpenResponse {
 }
 
 /// Explicit continuity classification (dogma sin #8: no resume lies).
+///
+/// Used in the [`LiveChannelOpenResponse`] so callers can distinguish how
+/// much state the new live channel actually inherits from prior canonical
+/// session history. The variants are ordered by *fidelity*, from no
+/// continuity (a brand-new channel) up to provider-native resume (the
+/// strongest form of continuation Meerkat can currently express):
+///
+/// - [`Self::Fresh`] — a brand-new live channel with no prior history.
+///   The adapter has no seed messages and no provider session id to attach
+///   to; the first turn starts from a clean slate.
+/// - [`Self::TranscriptOnly`] — history seeded from canonical transcript
+///   only. Honest about the loss of audio tone, pronunciation,
+///   partial-playback cursor position, and any provider-native state
+///   (cached tool reasoning, attention KV, intra-response buffers). The
+///   conversation is *semantically* continuous, but the model rebuilds its
+///   acoustic / latent state from text.
+/// - [`Self::Degraded`] — history seeded but with known gaps (e.g.
+///   canonical replay failed mid-way, or a tool call's structured output
+///   was lost between sessions). The caller is told continuity is partial
+///   so user-facing UI can warn.
+/// - [`Self::ProviderNativeResume { provider_session_id }`] — the provider
+///   surfaced a session id we attached back to. This is the *only* mode
+///   that preserves provider-native state across reconnects (audio tone,
+///   pronunciation, cached attention, partial playback cursor, etc.). No
+///   provider Meerkat ships today returns a usable resume id, so this
+///   variant is reserved for future wiring; the open-time helper in
+///   `meerkat-rpc` never synthesizes it.
 #[cfg_attr(feature = "schema", derive(JsonSchema))]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "mode", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum LiveContinuityMode {
-    ProviderNative,
+    Fresh,
     TranscriptOnly,
     Degraded,
-    Fresh,
+    ProviderNativeResume { provider_session_id: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -496,15 +623,7 @@ pub trait LiveAdapter: Send + Sync {
     /// barge-in, transcripts; no provider-native resume yet). Providers that
     /// expose narrower or richer capability sets should override this.
     fn capabilities(&self) -> LiveChannelCapabilities {
-        LiveChannelCapabilities {
-            audio_input: true,
-            audio_output: true,
-            text_input: true,
-            text_output: true,
-            barge_in: true,
-            transcript: true,
-            provider_native_resume: false,
-        }
+        LiveChannelCapabilities::default()
     }
 }
 
@@ -905,6 +1024,51 @@ mod tests {
         assert_eq!(without, deser);
     }
 
+    // -- T5: AssistantTranscriptDelta is typed-distinct from AssistantTextDelta --
+
+    #[test]
+    fn assistant_transcript_delta_round_trips_with_full_ordering_identity() {
+        // T5: the spoken-transcript delta variant must serialize with a
+        // distinct `observation` tag so producers/consumers cannot collapse
+        // it onto the display-text channel.
+        let obs = LiveAdapterObservation::AssistantTranscriptDelta {
+            provider_item_id: Some("item_t1".into()),
+            previous_item_id: Some("item_t0".into()),
+            content_index: Some(0),
+            response_id: Some("resp_42".into()),
+            delta_id: Some("delta_3".into()),
+            delta: "spoken".into(),
+        };
+        let json = serde_json::to_string(&obs).unwrap();
+        assert!(
+            json.contains("\"observation\":\"assistant_transcript_delta\""),
+            "AssistantTranscriptDelta must serialize with its own snake_case tag, got {json}"
+        );
+        assert!(
+            !json.contains("\"observation\":\"assistant_text_delta\""),
+            "AssistantTranscriptDelta must NOT collide with assistant_text_delta tag, got {json}"
+        );
+        let deser: LiveAdapterObservation = serde_json::from_str(&json).unwrap();
+        assert_eq!(obs, deser);
+    }
+
+    #[test]
+    fn assistant_transcript_delta_round_trips_without_optional_identity() {
+        let obs = LiveAdapterObservation::AssistantTranscriptDelta {
+            provider_item_id: None,
+            previous_item_id: None,
+            content_index: None,
+            response_id: None,
+            delta_id: None,
+            delta: "spoken".into(),
+        };
+        let json = serde_json::to_string(&obs).unwrap();
+        assert!(!json.contains("provider_item_id"));
+        assert!(!json.contains("response_id"));
+        let deser: LiveAdapterObservation = serde_json::from_str(&json).unwrap();
+        assert_eq!(obs, deser);
+    }
+
     // -- A11 ordering identity round-trips --
 
     #[test]
@@ -1163,78 +1327,124 @@ mod tests {
         };
         let json = serde_json::to_string(&ws).unwrap();
         assert!(json.contains("\"transport\":\"websocket\""));
-
-        let webrtc = LiveTransportBootstrap::Webrtc {
-            offer_sdp: "v=0\r\n...".into(),
-            ice_servers: vec![LiveIceServer {
-                urls: vec!["stun:stun.example.com".into()],
-                username: None,
-                credential: None,
-            }],
-        };
-        let json = serde_json::to_string(&webrtc).unwrap();
-        assert!(json.contains("\"transport\":\"webrtc\""));
     }
 
-    #[test]
-    fn ice_server_round_trips_with_credentials() {
-        let server = LiveIceServer {
-            urls: vec![
-                "turn:turn.example.com:3478".into(),
-                "turns:turn.example.com:5349".into(),
-            ],
-            username: Some("user".into()),
-            credential: Some("secret".into()),
-        };
-        let json = serde_json::to_string(&server).unwrap();
-        assert!(json.contains("\"username\":\"user\""));
-        assert!(json.contains("\"credential\":\"secret\""));
-        let deser: LiveIceServer = serde_json::from_str(&json).unwrap();
-        assert_eq!(server, deser);
-    }
-
-    #[test]
-    fn ice_server_omits_optional_fields_when_absent() {
-        let server = LiveIceServer {
-            urls: vec!["stun:stun.example.com".into()],
-            username: None,
-            credential: None,
-        };
-        let json = serde_json::to_string(&server).unwrap();
-        assert!(!json.contains("username"));
-        assert!(!json.contains("credential"));
-        let deser: LiveIceServer = serde_json::from_str(&json).unwrap();
-        assert_eq!(server, deser);
-    }
-
-    #[test]
-    fn webrtc_bootstrap_carries_typed_ice_servers() {
-        let webrtc = LiveTransportBootstrap::Webrtc {
-            offer_sdp: "v=0\r\n...".into(),
-            ice_servers: vec![LiveIceServer {
-                urls: vec!["turn:turn.example.com".into()],
-                username: Some("u".into()),
-                credential: Some("c".into()),
-            }],
-        };
-        let json = serde_json::to_string(&webrtc).unwrap();
-        let deser: LiveTransportBootstrap = serde_json::from_str(&json).unwrap();
-        assert_eq!(webrtc, deser);
-    }
+    // NOTE: WebRTC bootstrap variants (and the `LiveIceServer` type) were
+    // removed from this PR — the previous shape modeled the wrong flow
+    // (Meerkat-generated offer SDP). A future PR will reintroduce a real
+    // signaling-based shape; see the doc-comment on
+    // `LiveTransportBootstrap` for the planned design.
 
     // -- Continuity mode invariants --
 
     #[test]
     fn continuity_mode_distinguishes_provider_native_from_transcript_only() {
-        assert_ne!(
-            LiveContinuityMode::ProviderNative,
-            LiveContinuityMode::TranscriptOnly
-        );
+        let resume = LiveContinuityMode::ProviderNativeResume {
+            provider_session_id: "sess_abc".into(),
+        };
+        assert_ne!(resume, LiveContinuityMode::TranscriptOnly);
         assert_ne!(
             LiveContinuityMode::TranscriptOnly,
             LiveContinuityMode::Degraded
         );
         assert_ne!(LiveContinuityMode::Degraded, LiveContinuityMode::Fresh);
+    }
+
+    // -- T12: ProviderNativeResume round-trip --
+
+    #[test]
+    fn continuity_mode_provider_native_resume_round_trips() {
+        // T12: the resume variant must carry the provider session id and
+        // round-trip through serde with the snake_case `mode` tag.
+        let mode = LiveContinuityMode::ProviderNativeResume {
+            provider_session_id: "sess_42".to_string(),
+        };
+        let json = serde_json::to_string(&mode).unwrap();
+        assert!(
+            json.contains("\"mode\":\"provider_native_resume\""),
+            "ProviderNativeResume must serialize with the snake_case mode tag, got {json}"
+        );
+        assert!(
+            json.contains("\"provider_session_id\":\"sess_42\""),
+            "ProviderNativeResume must carry provider_session_id verbatim, got {json}"
+        );
+        let deser: LiveContinuityMode = serde_json::from_str(&json).unwrap();
+        assert_eq!(mode, deser);
+    }
+
+    #[test]
+    fn continuity_mode_payload_less_variants_round_trip() {
+        for mode in [
+            LiveContinuityMode::Fresh,
+            LiveContinuityMode::TranscriptOnly,
+            LiveContinuityMode::Degraded,
+        ] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let deser: LiveContinuityMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(mode, deser);
+        }
+    }
+
+    // -- T11: Image / VideoFrame input chunks --
+
+    #[test]
+    fn live_input_image_round_trips_with_base64_bytes() {
+        let bytes = vec![0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        let chunk = LiveInputChunk::Image {
+            mime: "image/png".to_string(),
+            data: bytes.clone(),
+        };
+        let json = serde_json::to_string(&chunk).unwrap();
+        // Negative: must NOT serialize bytes as a JSON integer array.
+        assert!(
+            !json.contains("[137,80,78"),
+            "image bytes must not serialize as JSON integer array; got {json}"
+        );
+        // Positive: base64 wrapper mirrors AssistantAudioChunk / Audio.
+        let expected = BASE64_STANDARD.encode(&bytes);
+        assert!(
+            json.contains(&format!("\"data\":\"{expected}\"")),
+            "expected base64 string for image data; got {json}"
+        );
+        assert!(json.contains("\"kind\":\"image\""));
+        assert!(json.contains("\"mime\":\"image/png\""));
+        let deser: LiveInputChunk = serde_json::from_str(&json).unwrap();
+        match deser {
+            LiveInputChunk::Image { mime, data } => {
+                assert_eq!(mime, "image/png");
+                assert_eq!(data, bytes);
+            }
+            other => panic!("expected Image, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn live_input_video_frame_round_trips_with_codec_and_timestamp() {
+        let bytes = vec![0u8, 1, 2, 3, 4, 5, 6, 7];
+        let chunk = LiveInputChunk::VideoFrame {
+            codec: "vp8".to_string(),
+            data: bytes.clone(),
+            timestamp_ms: 12_345,
+        };
+        let json = serde_json::to_string(&chunk).unwrap();
+        assert!(json.contains("\"kind\":\"video_frame\""));
+        assert!(json.contains("\"codec\":\"vp8\""));
+        assert!(json.contains("\"timestamp_ms\":12345"));
+        let expected = BASE64_STANDARD.encode(&bytes);
+        assert!(json.contains(&format!("\"data\":\"{expected}\"")));
+        let deser: LiveInputChunk = serde_json::from_str(&json).unwrap();
+        match deser {
+            LiveInputChunk::VideoFrame {
+                codec,
+                data,
+                timestamp_ms,
+            } => {
+                assert_eq!(codec, "vp8");
+                assert_eq!(data, bytes);
+                assert_eq!(timestamp_ms, 12_345);
+            }
+            other => panic!("expected VideoFrame, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1258,6 +1468,8 @@ mod tests {
         assert_eq!(resp, deser);
         assert_eq!(deser.continuity, LiveContinuityMode::TranscriptOnly);
         assert!(!deser.capabilities.provider_native_resume);
+        assert!(deser.capabilities.audio_in);
+        assert!(deser.capabilities.audio_out);
     }
 
     // -- Capabilities default invariants --
@@ -1265,11 +1477,33 @@ mod tests {
     #[test]
     fn default_capabilities_enable_core_features_but_not_provider_resume() {
         let caps = LiveChannelCapabilities::default();
-        assert!(caps.audio_input);
-        assert!(caps.audio_output);
-        assert!(caps.barge_in);
-        assert!(caps.transcript);
+        assert!(caps.audio_in);
+        assert!(caps.audio_out);
+        assert!(caps.text_in);
+        assert!(caps.text_out);
+        assert!(caps.barge_in_supported);
+        assert!(caps.transcript_supported);
+        assert!(!caps.image_in);
+        assert!(!caps.video_in);
         assert!(!caps.provider_native_resume);
+    }
+
+    #[test]
+    fn capabilities_carry_typed_image_and_video_booleans() {
+        // T8: gpt-realtime-2 / Gemini Live capability shape — both can be
+        // expressed without provider-specific fields.
+        let gpt_realtime_2 = LiveChannelCapabilities {
+            image_in: true,
+            ..LiveChannelCapabilities::default()
+        };
+        let gemini_live = LiveChannelCapabilities {
+            video_in: true,
+            ..LiveChannelCapabilities::default()
+        };
+        assert!(gpt_realtime_2.image_in);
+        assert!(!gpt_realtime_2.video_in);
+        assert!(gemini_live.video_in);
+        assert!(!gemini_live.image_in);
     }
 
     // -- Error code invariants --

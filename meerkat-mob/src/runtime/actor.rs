@@ -187,11 +187,15 @@ fn render_fork_context(
                 }
             }
             Message::BlockAssistant(ba) => {
+                // Both `Text` (display) and `Transcript` (spoken) lanes
+                // project to the rendered text stream; supervisor sees the
+                // assistant's full visible output regardless of lane.
                 let text: String = ba
                     .blocks
                     .iter()
                     .filter_map(|b| match b {
-                        meerkat_core::types::AssistantBlock::Text { text, .. } => {
+                        meerkat_core::types::AssistantBlock::Text { text, .. }
+                        | meerkat_core::types::AssistantBlock::Transcript { text, .. } => {
                             Some(text.as_str())
                         }
                         _ => None,

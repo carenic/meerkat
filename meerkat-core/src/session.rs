@@ -13,7 +13,7 @@ use crate::Provider;
 use crate::peer_meta::PeerMeta;
 use crate::realtime_transcript::{
     RealtimeTranscriptApplyOutcome, RealtimeTranscriptEvent, RealtimeTranscriptMaterializedMessage,
-    RealtimeTranscriptRole, SESSION_REALTIME_TRANSCRIPT_STATE_KEY,
+    RealtimeTranscriptRole, SESSION_REALTIME_TRANSCRIPT_STATE_KEY, TranscriptLane,
 };
 use crate::service::{AppendSystemContextRequest, MobToolAuthorityContext};
 use crate::time_compat::SystemTime;
@@ -140,6 +140,13 @@ struct RealtimeTranscriptItemState {
     ready: bool,
     #[serde(default)]
     materialized: bool,
+    /// T9/T10: output lane this assistant item carries. `Display` is the
+    /// default (matches all pre-T10 sessions on disk); promoted to `Spoken`
+    /// the first time an [`RealtimeTranscriptEvent::AssistantTranscriptDelta`]
+    /// fragment arrives for the item. User-role items always carry
+    /// `Display` (the field is unused for user transcripts).
+    #[serde(default)]
+    lane: TranscriptLane,
 }
 
 impl RealtimeTranscriptItemState {
@@ -156,6 +163,7 @@ impl RealtimeTranscriptItemState {
             skipped: false,
             ready: false,
             materialized: false,
+            lane: TranscriptLane::Display,
         }
     }
 
@@ -168,6 +176,7 @@ impl RealtimeTranscriptItemState {
             skipped: true,
             ready: true,
             materialized: false,
+            lane: TranscriptLane::Display,
         }
     }
 
@@ -962,6 +971,53 @@ impl Session {
                     RealtimeTranscriptRole::Assistant,
                     Some(response_id),
                 ) {
+                    promote_item_lane(item, TranscriptLane::Display);
+                    item.content_segments
+                        .entry(content_index)
+                        .or_default()
+                        .push_str(&delta);
+                    if response_completed && !item.text().is_empty() {
+                        item.ready = true;
+                    }
+                }
+            }
+            RealtimeTranscriptEvent::AssistantTranscriptDelta {
+                response_id,
+                delta_id,
+                item_id,
+                previous_item_id,
+                content_index,
+                delta,
+            } => {
+                // T9/T10: spoken-transcript lane. Identical staging shape to
+                // `AssistantTextDelta` (same idempotency / ordering / dedup
+                // logic owns both lanes); the only difference is that the
+                // owning item is tagged `Spoken` so the materializer flushes
+                // `AssistantBlock::Transcript` instead of `AssistantBlock::Text`.
+                let Some(response_id) = normalize_realtime_response_id(response_id) else {
+                    return RealtimeTranscriptApplyOutcome::default();
+                };
+                if state
+                    .discarded_assistant_response_ids
+                    .contains(&response_id)
+                {
+                    observe_realtime_skipped_item(&mut state, item_id, previous_item_id);
+                    let outcome = self.materialize_realtime_transcript_ready_items(&mut state);
+                    self.store_realtime_transcript_state(&state);
+                    return outcome;
+                }
+                if !delta_id.trim().is_empty() && !state.seen_delta_ids.insert(delta_id) {
+                    return RealtimeTranscriptApplyOutcome::default();
+                }
+                let response_completed = state.assistant_completions.contains_key(&response_id);
+                if let Some(item) = observe_realtime_item(
+                    &mut state,
+                    item_id,
+                    previous_item_id,
+                    RealtimeTranscriptRole::Assistant,
+                    Some(response_id),
+                ) {
+                    promote_item_lane(item, TranscriptLane::Spoken);
                     item.content_segments
                         .entry(content_index)
                         .or_default()
@@ -1125,6 +1181,7 @@ impl Session {
                             text,
                             stop_reason: completion.stop_reason,
                             usage,
+                            lane: item.lane,
                         });
                     }
                 }
@@ -1151,6 +1208,7 @@ impl Session {
                         text,
                         stop_reason,
                         usage,
+                        lane,
                     } => {
                         if let Some(item) = state.items.get_mut(item_id) {
                             item.materialized = true;
@@ -1158,11 +1216,25 @@ impl Session {
                         if let Some(completion) = state.assistant_completions.get_mut(response_id) {
                             completion.usage_consumed = true;
                         }
-                        self.append_external_assistant_blocks(
-                            vec![AssistantBlock::Text {
+                        // T9/T10: route to the correct canonical block by
+                        // lane. `Display` keeps the legacy `AssistantBlock::Text`
+                        // shape; `Spoken` flushes
+                        // `AssistantBlock::Transcript { source: Spoken }` so
+                        // OpenAI realtime audio transcripts stop being
+                        // persisted as authored display text.
+                        let block = match lane {
+                            TranscriptLane::Display => AssistantBlock::Text {
                                 text: text.clone(),
                                 meta: None,
-                            }],
+                            },
+                            TranscriptLane::Spoken => AssistantBlock::Transcript {
+                                text: text.clone(),
+                                source: crate::types::TranscriptSource::Spoken,
+                                meta: None,
+                            },
+                        };
+                        self.append_external_assistant_blocks(
+                            vec![block],
                             *stop_reason,
                             usage.clone(),
                         );
@@ -1329,13 +1401,22 @@ impl Session {
     }
 
     /// Get the last assistant message text content.
+    ///
+    /// Concatenates both `Text` (display) and `Transcript` (spoken) blocks
+    /// in document order, since both lanes project to the same human-readable
+    /// stream. Lane provenance is preserved on the underlying `AssistantBlock`
+    /// for callers that need it.
     pub fn last_assistant_text(&self) -> Option<String> {
         self.messages.iter().rev().find_map(|m| match m {
             Message::BlockAssistant(a) => {
                 let mut buf = String::new();
                 for block in &a.blocks {
-                    if let crate::types::AssistantBlock::Text { text, .. } = block {
-                        buf.push_str(text);
+                    match block {
+                        crate::types::AssistantBlock::Text { text, .. }
+                        | crate::types::AssistantBlock::Transcript { text, .. } => {
+                            buf.push_str(text);
+                        }
+                        _ => {}
                     }
                 }
                 if buf.is_empty() { None } else { Some(buf) }
@@ -1928,6 +2009,32 @@ fn normalize_realtime_response_id(response_id: String) -> Option<String> {
 
 fn normalize_realtime_optional_response_id(response_id: Option<String>) -> Option<String> {
     response_id.and_then(normalize_realtime_response_id)
+}
+
+/// T9/T10: tag the assistant item with its output lane (Display vs Spoken).
+///
+/// First lane wins: if a later delta tries to promote an item already
+/// classified as the other lane, we keep the existing lane and emit a
+/// `tracing::warn!`. The materializer can only flush one block-type per
+/// item; mixed-lane content on the same `item_id` is not expected from
+/// any provider and would be a provider-side bug. Items with empty
+/// content (no deltas yet observed) accept any lane.
+fn promote_item_lane(item: &mut RealtimeTranscriptItemState, lane: TranscriptLane) {
+    if item.lane == lane {
+        return;
+    }
+    let has_content = item.content_segments.values().any(|s| !s.is_empty());
+    if !has_content {
+        // No content has been staged on the original lane yet; safe to
+        // re-classify.
+        item.lane = lane;
+        return;
+    }
+    tracing::warn!(
+        existing_lane = ?item.lane,
+        observed_lane = ?lane,
+        "ignoring realtime transcript lane conflict on item with staged content"
+    );
 }
 
 fn observe_realtime_item(
@@ -3327,5 +3434,98 @@ mod tests {
             .unwrap_or_default();
         assert!(system_prompt.contains("Authoritative peer token is birch seventeen."));
         assert!(!system_prompt.contains("Conflicting peer token should not reach the prompt."));
+    }
+
+    // ------------------------------------------------------------------
+    // T9/T10: realtime transcript lane materialization.
+    //
+    // The display-text lane (`AssistantTextDelta`) materializes as
+    // `AssistantBlock::Text`; the spoken-transcript lane
+    // (`AssistantTranscriptDelta`) materializes as
+    // `AssistantBlock::Transcript { source: TranscriptSource::Spoken }`.
+    // These regressions pin both flushes and prove the materializer
+    // dispatches on the per-item `TranscriptLane`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn realtime_transcript_assistant_transcript_delta_materializes_transcript_block() {
+        let mut session = Session::new();
+
+        let delta = RealtimeTranscriptEvent::AssistantTranscriptDelta {
+            response_id: "resp_spoken".to_string(),
+            delta_id: "evt_delta_spoken_1".to_string(),
+            item_id: "item_spoken".to_string(),
+            previous_item_id: None,
+            content_index: 0,
+            delta: "I said hi".to_string(),
+        };
+        assert!(
+            session.append_realtime_transcript_event(delta).is_inert(),
+            "delta alone is inert until turn-completed flushes"
+        );
+
+        let terminal = RealtimeTranscriptEvent::AssistantTurnCompleted {
+            response_id: "resp_spoken".to_string(),
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        };
+        let outcome = session.append_realtime_transcript_event(terminal);
+        assert_eq!(outcome.materialized_messages.len(), 1);
+
+        // T9/T10: must be a Transcript block, NOT Text.
+        let messages = session.messages();
+        assert_eq!(messages.len(), 1);
+        match &messages[0] {
+            Message::BlockAssistant(assistant) => {
+                assert_eq!(assistant.blocks.len(), 1);
+                match &assistant.blocks[0] {
+                    AssistantBlock::Transcript { text, source, .. } => {
+                        assert_eq!(text, "I said hi");
+                        assert_eq!(*source, crate::types::TranscriptSource::Spoken);
+                    }
+                    other => panic!(
+                        "AssistantTranscriptDelta must materialize as AssistantBlock::Transcript, got {other:?}"
+                    ),
+                }
+            }
+            other => panic!("expected BlockAssistant message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn realtime_transcript_assistant_text_delta_still_materializes_text_block() {
+        // Counter-regression: the display-text lane must continue to
+        // produce `AssistantBlock::Text` after T9/T10. Prevents an
+        // accidental cross-lane flip.
+        let mut session = Session::new();
+
+        let delta = RealtimeTranscriptEvent::AssistantTextDelta {
+            response_id: "resp_display".to_string(),
+            delta_id: "evt_delta_display_1".to_string(),
+            item_id: "item_display".to_string(),
+            previous_item_id: None,
+            content_index: 0,
+            delta: "I wrote".to_string(),
+        };
+        let _ = session.append_realtime_transcript_event(delta);
+
+        let terminal = RealtimeTranscriptEvent::AssistantTurnCompleted {
+            response_id: "resp_display".to_string(),
+            stop_reason: StopReason::EndTurn,
+            usage: Usage::default(),
+        };
+        let outcome = session.append_realtime_transcript_event(terminal);
+        assert_eq!(outcome.materialized_messages.len(), 1);
+
+        let messages = session.messages();
+        match &messages[0] {
+            Message::BlockAssistant(assistant) => match &assistant.blocks[0] {
+                AssistantBlock::Text { text, .. } => assert_eq!(text, "I wrote"),
+                other => panic!(
+                    "AssistantTextDelta must keep materializing AssistantBlock::Text, got {other:?}"
+                ),
+            },
+            other => panic!("expected BlockAssistant message, got {other:?}"),
+        }
     }
 }

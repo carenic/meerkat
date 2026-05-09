@@ -205,12 +205,14 @@ pub async fn handle_live_open(
     // Only meaningful when a factory wired the channel; otherwise the
     // conservative all-false placeholder remains (no adapter, no claims).
     let mut capabilities = LiveChannelCapabilities {
-        audio_input: false,
-        audio_output: false,
-        text_input: false,
-        text_output: false,
-        barge_in: false,
-        transcript: false,
+        audio_in: false,
+        audio_out: false,
+        text_in: false,
+        text_out: false,
+        image_in: false,
+        video_in: false,
+        transcript_supported: false,
+        barge_in_supported: false,
         provider_native_resume: false,
     };
 
@@ -574,6 +576,10 @@ pub async fn handle_live_refresh(
 pub enum LiveSendInputError {
     #[error("invalid base64 audio payload: {0}")]
     InvalidAudioBase64(base64::DecodeError),
+    #[error("invalid base64 image payload: {0}")]
+    InvalidImageBase64(base64::DecodeError),
+    #[error("invalid base64 video-frame payload: {0}")]
+    InvalidVideoFrameBase64(base64::DecodeError),
 }
 
 /// Decode a wire-format input chunk into the core `LiveInputChunk` shape.
@@ -602,6 +608,31 @@ fn live_input_chunk_from_wire(
             })
         }
         LiveInputChunkWire::Text { text } => Ok(LiveInputChunk::Text { text }),
+        LiveInputChunkWire::Image { mime, data } => {
+            use base64::Engine;
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&data)
+                .map_err(LiveSendInputError::InvalidImageBase64)?;
+            Ok(LiveInputChunk::Image {
+                mime,
+                data: decoded,
+            })
+        }
+        LiveInputChunkWire::VideoFrame {
+            codec,
+            data,
+            timestamp_ms,
+        } => {
+            use base64::Engine;
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(&data)
+                .map_err(LiveSendInputError::InvalidVideoFrameBase64)?;
+            Ok(LiveInputChunk::VideoFrame {
+                codec,
+                data: decoded,
+                timestamp_ms,
+            })
+        }
     }
 }
 
@@ -875,17 +906,57 @@ mod tests {
                 token: "t".into(),
             },
             capabilities: LiveChannelCapabilities {
-                audio_input: true,
-                audio_output: true,
-                text_input: true,
-                text_output: true,
-                barge_in: true,
-                transcript: true,
+                audio_in: true,
+                audio_out: true,
+                text_in: true,
+                text_out: true,
+                image_in: false,
+                video_in: false,
+                barge_in_supported: true,
+                transcript_supported: true,
                 provider_native_resume: false,
             },
             continuity: LiveContinuityMode::Degraded,
         };
         assert_eq!(round_trip(&v), v);
+    }
+
+    #[test]
+    fn continuity_from_snapshot_never_synthesizes_provider_native_resume() {
+        // T12: `ProviderNativeResume { provider_session_id }` is reserved
+        // for a future provider that surfaces a resume id. No provider
+        // Meerkat ships today does, so the open-time helper must only emit
+        // `Fresh` (empty seed) or `TranscriptOnly` (any seed messages) —
+        // never `ProviderNativeResume` and never `Degraded` (the latter is
+        // only set on canonical-replay failure further up the open path).
+        use meerkat_core::Provider;
+        use meerkat_core::live_adapter::LiveProjectionSnapshot;
+        use meerkat_core::types::{Message, SessionId, UserMessage};
+
+        let empty = LiveProjectionSnapshot {
+            session_id: SessionId::new(),
+            snapshot_version: 1,
+            seed_messages: Vec::new(),
+            visible_tools: Vec::new(),
+            system_prompt: None,
+            model_id: "gpt-realtime".into(),
+            provider_id: Provider::OpenAI.as_str().into(),
+            audio_config: None,
+            runtime_system_context: Vec::new(),
+        };
+        assert_eq!(
+            super::continuity_from_snapshot(&empty),
+            LiveContinuityMode::Fresh
+        );
+
+        let seeded = LiveProjectionSnapshot {
+            seed_messages: vec![Message::User(UserMessage::text("hi".to_string()))],
+            ..empty
+        };
+        assert_eq!(
+            super::continuity_from_snapshot(&seeded),
+            LiveContinuityMode::TranscriptOnly
+        );
     }
 
     #[test]
@@ -1100,12 +1171,14 @@ mod tests {
     async fn arc_dyn_live_adapter_dispatches_capabilities() {
         use std::sync::Arc;
         let custom = LiveChannelCapabilities {
-            audio_input: true,
-            audio_output: false,
-            text_input: true,
-            text_output: true,
-            barge_in: false,
-            transcript: true,
+            audio_in: true,
+            audio_out: false,
+            text_in: true,
+            text_out: true,
+            image_in: false,
+            video_in: false,
+            barge_in_supported: false,
+            transcript_supported: true,
             provider_native_resume: false,
         };
         let adapter: Arc<dyn meerkat_core::live_adapter::LiveAdapter> =
@@ -1115,9 +1188,9 @@ mod tests {
         assert_eq!(adapter.capabilities(), custom);
         // Negative regression: must not silently degrade to all-false.
         assert!(
-            adapter.capabilities().audio_input
-                || adapter.capabilities().text_input
-                || adapter.capabilities().transcript,
+            adapter.capabilities().audio_in
+                || adapter.capabilities().text_in
+                || adapter.capabilities().transcript_supported,
             "fake-adapter capabilities must NOT be all-false (P2#3 regression)"
         );
     }

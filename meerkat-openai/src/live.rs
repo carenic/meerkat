@@ -1474,7 +1474,11 @@ impl OpenAiRealtimeSession {
             .entry(key)
             .or_default()
             .push_str(&delta);
-        RealtimeSessionEvent::OutputTextDeltaForItem {
+        // T9: route spoken-transcript deltas onto the dedicated lane so the
+        // runtime materializes `AssistantBlock::Transcript` rather than
+        // `AssistantBlock::Text`. Pre-T9 this collapsed onto
+        // `OutputTextDeltaForItem`, which is the bug T9/T10 closes.
+        RealtimeSessionEvent::OutputAudioTranscriptDeltaForItem {
             response_id,
             delta_id: event_id,
             item_id: item_id.to_string(),
@@ -1521,7 +1525,8 @@ impl OpenAiRealtimeSession {
             return None;
         }
         if seen.is_empty() {
-            return Some(RealtimeSessionEvent::OutputTextDeltaForItem {
+            // T9: trailing-delta on the spoken-transcript lane.
+            return Some(RealtimeSessionEvent::OutputAudioTranscriptDeltaForItem {
                 response_id,
                 delta_id: event_id,
                 item_id: item_id.to_string(),
@@ -1531,7 +1536,8 @@ impl OpenAiRealtimeSession {
             });
         }
         transcript.strip_prefix(&seen).and_then(|suffix| {
-            (!suffix.is_empty()).then(|| RealtimeSessionEvent::OutputTextDeltaForItem {
+            // T9: suffix-of-staged trailing-delta on the spoken-transcript lane.
+            (!suffix.is_empty()).then(|| RealtimeSessionEvent::OutputAudioTranscriptDeltaForItem {
                 response_id,
                 delta_id: event_id,
                 item_id: item_id.to_string(),
@@ -2859,21 +2865,25 @@ impl LiveAdapter for OpenAiLiveAdapter {
         Ok(())
     }
 
-    /// P2#3: report what the OpenAI Realtime API actually supports today.
+    /// P2#3 + T8: report what the OpenAI Realtime API actually supports
+    /// today.
     ///
-    /// `audio_input`, `audio_output`, `text_input`, `text_output`, `barge_in`
-    /// and `transcript` are all GA on the OpenAI Realtime surface. Provider-
-    /// native resume is not exposed yet — full continuation of a previous
-    /// response across a live channel close/reopen relies on the
-    /// transcript-only seam, not a provider-side handle.
+    /// All audio/text in/out lanes, spoken-transcript output, and
+    /// user-initiated barge-in are GA on the OpenAI Realtime surface.
+    /// `image_in` / `video_in` are reserved for `gpt-realtime-2` (image)
+    /// and Gemini Live (video) — `false` here. Provider-native resume is
+    /// not exposed yet (transcript-only seam handles continuation across
+    /// reconnect, see `LiveContinuityMode::TranscriptOnly`).
     fn capabilities(&self) -> LiveChannelCapabilities {
         LiveChannelCapabilities {
-            audio_input: true,
-            audio_output: true,
-            text_input: true,
-            text_output: true,
-            barge_in: true,
-            transcript: true,
+            audio_in: true,
+            audio_out: true,
+            text_in: true,
+            text_out: true,
+            image_in: false,
+            video_in: false,
+            transcript_supported: true,
+            barge_in_supported: true,
             provider_native_resume: false,
         }
     }
@@ -2941,9 +2951,12 @@ async fn openai_live_pump(
                             //   * audio-rate / channel mismatch on Refresh
                             //     (close+reopen needed) — third guard in
                             //     the Refresh arm.
-                            //   * unsupported `LiveInputChunk` variant on
-                            //     SendInput (caller error, NOT a reopen
-                            //     signal) — Video/Image guard.
+                            //   * `LiveInputChunk::Image` on SendInput
+                            //     (T11; caller error, NOT a reopen signal —
+                            //     reason: "image_input_not_implemented").
+                            //   * `LiveInputChunk::VideoFrame` on SendInput
+                            //     (T11; caller error, NOT a reopen signal —
+                            //     reason: "video_frame_input_not_implemented").
                             //   * unsupported `LiveAdapterCommand` variant
                             //     catch-all (caller error, NOT a reopen
                             //     signal).
@@ -3142,10 +3155,29 @@ async fn execute_openai_live_command(
                     use meerkat_contracts::RealtimeTextChunk;
                     RealtimeInputChunk::TextChunk(RealtimeTextChunk { text })
                 }
-                _unsupported => {
+                // T11: image / video-frame variants are typed at the seam
+                // but not yet supported by OpenAI Realtime. Reject with the
+                // documented `reason` strings; the pump (above) maps
+                // `LlmError::InvalidRequest` → `LiveAdapterErrorCode::
+                // ConfigRejected { reason }` so clients can route on the
+                // typed code without parsing English.
+                LiveInputChunk::Image { .. } => {
                     return Err(LlmError::InvalidRequest {
-                        message: "live adapter received unsupported LiveInputChunk variant"
-                            .to_string(),
+                        message: "image_input_not_implemented".to_string(),
+                    });
+                }
+                LiveInputChunk::VideoFrame { .. } => {
+                    return Err(LlmError::InvalidRequest {
+                        message: "video_frame_input_not_implemented".to_string(),
+                    });
+                }
+                // `LiveInputChunk` is `#[non_exhaustive]`. Future variants
+                // are unsupported here until OpenAI Realtime grows the
+                // capability; mirror the typed-rejection pattern with a
+                // generic reason rather than panicking.
+                _ => {
+                    return Err(LlmError::InvalidRequest {
+                        message: "unsupported_input_chunk_variant".to_string(),
                     });
                 }
             };
@@ -3226,6 +3258,25 @@ fn translate_realtime_event(event: RealtimeSessionEvent) -> LiveAdapterObservati
             content_index,
             delta,
         } => LiveAdapterObservation::AssistantTextDelta {
+            provider_item_id: Some(item_id),
+            previous_item_id,
+            content_index: Some(content_index),
+            response_id: Some(response_id),
+            delta_id: Some(delta_id),
+            delta,
+        },
+        // T9: spoken-transcript lane. Distinct from
+        // `OutputTextDeltaForItem` so the runtime can flush
+        // `AssistantBlock::Transcript { source: Spoken }` instead of
+        // `AssistantBlock::Text`.
+        RealtimeSessionEvent::OutputAudioTranscriptDeltaForItem {
+            response_id,
+            delta_id,
+            item_id,
+            previous_item_id,
+            content_index,
+            delta,
+        } => LiveAdapterObservation::AssistantTranscriptDelta {
             provider_item_id: Some(item_id),
             previous_item_id,
             content_index: Some(content_index),
@@ -5258,7 +5309,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn provider_neutral_session_projects_output_audio_transcripts_into_text_deltas() {
+    async fn provider_neutral_session_projects_output_audio_transcripts_into_transcript_deltas() {
         let mut session = OpenAiRealtimeSession::new(
             Box::new(FakeOpenAiLiveSession {
                 seen: Arc::new(Mutex::new(Vec::new())),
@@ -5302,14 +5353,17 @@ mod tests {
         // skipped the queued finals, which masked production behavior;
         // the BuildBuddy `cargo-all-features-clippy` / `test-unit`
         // lanes correctly tripped on it.
+        // T9: audio-transcript deltas now route onto the spoken-transcript
+        // lane (`OutputAudioTranscriptDeltaForItem`) rather than collapsing
+        // onto the display-text lane.
         assert!(matches!(
             session.next_event().await.expect("first delta"),
-            Some(RealtimeSessionEvent::OutputTextDeltaForItem { delta, item_id, .. })
+            Some(RealtimeSessionEvent::OutputAudioTranscriptDeltaForItem { delta, item_id, .. })
                 if delta == "birch " && item_id == "item_audio_1"
         ));
         assert!(matches!(
             session.next_event().await.expect("suffix delta"),
-            Some(RealtimeSessionEvent::OutputTextDeltaForItem { delta, item_id, .. })
+            Some(RealtimeSessionEvent::OutputAudioTranscriptDeltaForItem { delta, item_id, .. })
                 if delta == "seventeen" && item_id == "item_audio_1"
         ));
         assert!(matches!(
@@ -5318,8 +5372,8 @@ mod tests {
                 if item_id == "item_audio_1" && text == "birch seventeen"
         ));
         assert!(matches!(
-            session.next_event().await.expect("done without prior delta still projects text"),
-            Some(RealtimeSessionEvent::OutputTextDeltaForItem { delta, item_id, .. })
+            session.next_event().await.expect("done without prior delta still projects on transcript lane"),
+            Some(RealtimeSessionEvent::OutputAudioTranscriptDeltaForItem { delta, item_id, .. })
                 if delta == "silver harbor" && item_id == "item_audio_2"
         ));
         assert!(matches!(
@@ -5450,8 +5504,8 @@ mod tests {
         );
 
         assert!(matches!(
-            session.next_event().await.expect("text delta"),
-            Some(RealtimeSessionEvent::OutputTextDeltaForItem { delta, .. }) if delta == "Looping now"
+            session.next_event().await.expect("transcript delta"),
+            Some(RealtimeSessionEvent::OutputAudioTranscriptDeltaForItem { delta, .. }) if delta == "Looping now"
         ));
         assert!(matches!(
             session.next_event().await.expect("interrupted"),
@@ -5501,8 +5555,8 @@ mod tests {
         );
 
         assert!(matches!(
-            session.next_event().await.expect("text delta"),
-            Some(RealtimeSessionEvent::OutputTextDeltaForItem { delta, .. }) if delta == "Looping now"
+            session.next_event().await.expect("transcript delta"),
+            Some(RealtimeSessionEvent::OutputAudioTranscriptDeltaForItem { delta, .. }) if delta == "Looping now"
         ));
         assert!(matches!(
             session
@@ -6839,6 +6893,138 @@ mod tests {
         adapter.close().await.expect("close must succeed");
     }
 
+    /// T11: a `SendInput { LiveInputChunk::Image }` must be rejected with
+    /// the typed `LiveAdapterErrorCode::ConfigRejected` whose `reason` is
+    /// the documented `"image_input_not_implemented"` token. Routing this
+    /// onto the `ProviderError` path would force clients to parse English
+    /// to distinguish "OpenAI doesn't support image input on the realtime
+    /// surface" from a real provider outage.
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_input_image_chunk_is_rejected_as_config_rejected() {
+        use meerkat_core::Provider;
+        use meerkat_core::live_adapter::LiveInputChunk;
+
+        let ack_queue: VecDeque<Result<Option<ServerEvent>, LlmError>> = VecDeque::new();
+        let seen: Arc<Mutex<Vec<ClientEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let raw = Box::new(ParkingOpenAiLiveSession {
+            seen: Arc::clone(&seen),
+            next_events: Arc::new(Mutex::new(ack_queue)),
+        });
+        let mut session = OpenAiRealtimeSession::new(raw, RealtimeTurningMode::ExplicitCommit);
+        session.set_current_identity("gpt-realtime", Provider::OpenAI.as_str());
+        let adapter = OpenAiLiveAdapter::new(session);
+
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            adapter.next_observation(),
+        )
+        .await
+        .expect("Ready must arrive within 1s")
+        .expect("adapter must yield Ok");
+        assert!(matches!(first, Some(LiveAdapterObservation::Ready)));
+
+        adapter
+            .send_command(LiveAdapterCommand::SendInput {
+                chunk: LiveInputChunk::Image {
+                    mime: "image/png".into(),
+                    data: vec![0x89, 0x50, 0x4E, 0x47],
+                },
+            })
+            .await
+            .expect("SendInput must dispatch to the pump");
+
+        let observation = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            adapter.next_observation(),
+        )
+        .await
+        .expect("error observation must arrive within 1s")
+        .expect("adapter must yield Ok");
+        match observation {
+            Some(LiveAdapterObservation::Error { code, message }) => match code {
+                LiveAdapterErrorCode::ConfigRejected { reason } => {
+                    assert_eq!(reason, "image_input_not_implemented");
+                    assert!(
+                        message.contains("image_input_not_implemented"),
+                        "Error.message must mirror the typed reason, got {message}"
+                    );
+                }
+                other => panic!(
+                    "image rejection must surface as ConfigRejected, got code {other:?} \
+                     with message {message}"
+                ),
+            },
+            other => panic!("expected Error observation for image input, got {other:?}"),
+        }
+
+        adapter.close().await.expect("close must succeed");
+    }
+
+    /// T11: same shape as the image rejection — `LiveInputChunk::VideoFrame`
+    /// must surface as a typed `ConfigRejected` with the documented
+    /// `"video_frame_input_not_implemented"` reason.
+    #[tokio::test(flavor = "current_thread")]
+    async fn send_input_video_frame_chunk_is_rejected_as_config_rejected() {
+        use meerkat_core::Provider;
+        use meerkat_core::live_adapter::LiveInputChunk;
+
+        let ack_queue: VecDeque<Result<Option<ServerEvent>, LlmError>> = VecDeque::new();
+        let seen: Arc<Mutex<Vec<ClientEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let raw = Box::new(ParkingOpenAiLiveSession {
+            seen: Arc::clone(&seen),
+            next_events: Arc::new(Mutex::new(ack_queue)),
+        });
+        let mut session = OpenAiRealtimeSession::new(raw, RealtimeTurningMode::ExplicitCommit);
+        session.set_current_identity("gpt-realtime", Provider::OpenAI.as_str());
+        let adapter = OpenAiLiveAdapter::new(session);
+
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            adapter.next_observation(),
+        )
+        .await
+        .expect("Ready must arrive within 1s")
+        .expect("adapter must yield Ok");
+        assert!(matches!(first, Some(LiveAdapterObservation::Ready)));
+
+        adapter
+            .send_command(LiveAdapterCommand::SendInput {
+                chunk: LiveInputChunk::VideoFrame {
+                    codec: "vp8".into(),
+                    data: vec![0u8, 1, 2, 3, 4],
+                    timestamp_ms: 100,
+                },
+            })
+            .await
+            .expect("SendInput must dispatch to the pump");
+
+        let observation = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            adapter.next_observation(),
+        )
+        .await
+        .expect("error observation must arrive within 1s")
+        .expect("adapter must yield Ok");
+        match observation {
+            Some(LiveAdapterObservation::Error { code, message }) => match code {
+                LiveAdapterErrorCode::ConfigRejected { reason } => {
+                    assert_eq!(reason, "video_frame_input_not_implemented");
+                    assert!(
+                        message.contains("video_frame_input_not_implemented"),
+                        "Error.message must mirror the typed reason, got {message}"
+                    );
+                }
+                other => panic!(
+                    "video-frame rejection must surface as ConfigRejected, got code {other:?} \
+                     with message {message}"
+                ),
+            },
+            other => panic!("expected Error observation for video-frame input, got {other:?}"),
+        }
+
+        adapter.close().await.expect("close must succeed");
+    }
+
     /// P2#3: OpenAiLiveAdapter must report a truthful capability set; the
     /// previous behavior advertised every capability as `false` regardless
     /// of provider support, which made client-side capability discovery
@@ -6853,16 +7039,231 @@ mod tests {
         let session = OpenAiRealtimeSession::new(raw, RealtimeTurningMode::ExplicitCommit);
         let adapter = OpenAiLiveAdapter::new(session);
         let caps = LiveAdapter::capabilities(&adapter);
-        assert!(caps.audio_input);
-        assert!(caps.audio_output);
-        assert!(caps.text_input);
-        assert!(caps.text_output);
-        assert!(caps.barge_in);
-        assert!(caps.transcript);
+        assert!(caps.audio_in);
+        assert!(caps.audio_out);
+        assert!(caps.text_in);
+        assert!(caps.text_out);
+        assert!(caps.barge_in_supported);
+        assert!(caps.transcript_supported);
+        assert!(
+            !caps.image_in,
+            "OpenAI Realtime does not yet accept image input (gpt-realtime-2 reserved)"
+        );
+        assert!(
+            !caps.video_in,
+            "OpenAI Realtime does not accept video frames"
+        );
         assert!(
             !caps.provider_native_resume,
             "OpenAI Realtime does not yet expose provider-native resume"
         );
         adapter.close().await.expect("close must succeed");
+    }
+
+    // ------------------------------------------------------------------
+    // T9: OpenAI translator routes outputs to correct lanes.
+    //
+    // These regressions pin the server-event → realtime-event →
+    // `LiveAdapterObservation` mapping for the four output-event shapes
+    // OpenAI Realtime emits during a response (display text, audio
+    // transcript, audio chunks, and a mixed display+spoken response). The
+    // pre-T9 collapse of audio transcript onto the display-text lane is
+    // exactly what these tests catch.
+    // ------------------------------------------------------------------
+
+    fn empty_fake_session() -> OpenAiRealtimeSession {
+        OpenAiRealtimeSession::new(
+            Box::new(FakeOpenAiLiveSession {
+                seen: Arc::new(Mutex::new(Vec::new())),
+                next_events: Arc::new(Mutex::new(VecDeque::new())),
+            }),
+            RealtimeTurningMode::ProviderManaged,
+        )
+    }
+
+    #[test]
+    fn mapping_routes_response_output_text_delta_to_assistant_text_delta() {
+        let mut session = empty_fake_session();
+        let mapped = session
+            .map_server_event(ServerEvent::ResponseOutputTextDelta {
+                event_id: "evt_text_1".to_string(),
+                response_id: "resp_text".to_string(),
+                item_id: "item_text".to_string(),
+                output_index: 0,
+                content_index: 0,
+                delta: "hello".to_string(),
+            })
+            .expect("display-text delta must map cleanly")
+            .expect("display-text delta must produce a realtime event");
+        let obs = translate_realtime_event(mapped);
+        match obs {
+            LiveAdapterObservation::AssistantTextDelta { delta, .. } => {
+                assert_eq!(delta, "hello");
+            }
+            other => {
+                panic!("ResponseOutputTextDelta must map to AssistantTextDelta, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn mapping_routes_response_output_audio_transcript_delta_to_transcript_lane() {
+        let mut session = empty_fake_session();
+        let mapped = session
+            .map_server_event(ServerEvent::ResponseOutputAudioTranscriptDelta {
+                event_id: "evt_tx_1".to_string(),
+                response_id: "resp_tx".to_string(),
+                item_id: "item_tx".to_string(),
+                output_index: 0,
+                content_index: 0,
+                delta: "spoken".to_string(),
+            })
+            .expect("transcript delta must map cleanly")
+            .expect("transcript delta must produce a realtime event");
+        let obs = translate_realtime_event(mapped);
+        match obs {
+            LiveAdapterObservation::AssistantTranscriptDelta {
+                delta,
+                provider_item_id,
+                response_id,
+                ..
+            } => {
+                assert_eq!(delta, "spoken");
+                assert_eq!(provider_item_id.as_deref(), Some("item_tx"));
+                assert_eq!(response_id.as_deref(), Some("resp_tx"));
+            }
+            other => panic!(
+                "ResponseOutputAudioTranscriptDelta must map to AssistantTranscriptDelta, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn mapping_routes_response_output_audio_transcript_done_to_assistant_transcript_final() {
+        // A13 ordering: when no staged delta precedes the Done event, the
+        // helper returns the trailing-delta (full transcript) as the
+        // primary observation and queues the `AssistantTranscriptFinal`
+        // for the next call. T9 lane fix means the trailing-delta now
+        // routes to `AssistantTranscriptDelta` instead of the display
+        // `AssistantTextDelta`.
+        let mut session = empty_fake_session();
+        let mapped = session
+            .map_server_event(ServerEvent::ResponseOutputAudioTranscriptDone {
+                event_id: "evt_done".to_string(),
+                response_id: "resp_done".to_string(),
+                item_id: "item_done".to_string(),
+                output_index: 0,
+                content_index: 0,
+                transcript: "spoken final".to_string(),
+            })
+            .expect("transcript done must map cleanly")
+            .expect("transcript done must produce a realtime event");
+        let obs = translate_realtime_event(mapped);
+        // Primary: trailing-delta on the spoken-transcript lane.
+        match obs {
+            LiveAdapterObservation::AssistantTranscriptDelta { delta, .. } => {
+                assert_eq!(delta, "spoken final");
+            }
+            other => panic!(
+                "ResponseOutputAudioTranscriptDone trailing-delta must map to AssistantTranscriptDelta, got {other:?}"
+            ),
+        }
+        // Queued: the AssistantTranscriptFinal close.
+        let queued = session
+            .pending_events
+            .pop_front()
+            .expect("done must queue the AssistantTranscriptFinal close");
+        let final_obs = translate_realtime_event(queued);
+        match final_obs {
+            LiveAdapterObservation::AssistantTranscriptFinal {
+                text,
+                provider_item_id,
+                response_id,
+                ..
+            } => {
+                assert_eq!(text, "spoken final");
+                assert_eq!(provider_item_id, "item_done");
+                assert_eq!(response_id.as_deref(), Some("resp_done"));
+            }
+            other => panic!(
+                "ResponseOutputAudioTranscriptDone queued close must map to AssistantTranscriptFinal, got {other:?}"
+            ),
+        }
+    }
+
+    #[test]
+    fn mapping_routes_response_output_audio_delta_to_audio_chunk() {
+        let mut session = empty_fake_session();
+        let mapped = session
+            .map_server_event(ServerEvent::ResponseOutputAudioDelta {
+                event_id: "evt_audio".to_string(),
+                response_id: "resp_audio".to_string(),
+                item_id: "item_audio".to_string(),
+                output_index: 0,
+                content_index: 0,
+                delta: "AAEC".to_string(),
+            })
+            .expect("audio delta must map cleanly")
+            .expect("audio delta must produce a realtime event");
+        let obs = translate_realtime_event(mapped);
+        match obs {
+            LiveAdapterObservation::AssistantAudioChunk {
+                sample_rate_hz,
+                channels,
+                ..
+            } => {
+                assert_eq!(sample_rate_hz, OPENAI_REALTIME_AUDIO_SAMPLE_RATE_HZ);
+                assert_eq!(channels, u16::from(OPENAI_REALTIME_AUDIO_CHANNELS));
+            }
+            other => {
+                panic!("ResponseOutputAudioDelta must map to AssistantAudioChunk, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn mixed_response_emits_text_and_transcript_in_order() {
+        // T9 acceptance: a response that interleaves display text and
+        // spoken transcript must surface the two lanes as distinct
+        // observations in arrival order so the projection sink can flush
+        // them as separate `AssistantBlock::{Text,Transcript}` blocks.
+        let mut session = empty_fake_session();
+        let text_delta = session
+            .map_server_event(ServerEvent::ResponseOutputTextDelta {
+                event_id: "evt_t1".to_string(),
+                response_id: "resp_mixed".to_string(),
+                item_id: "item_text".to_string(),
+                output_index: 0,
+                content_index: 0,
+                delta: "I wrote".to_string(),
+            })
+            .expect("text delta maps cleanly")
+            .expect("text delta produces a realtime event");
+        let tx_delta = session
+            .map_server_event(ServerEvent::ResponseOutputAudioTranscriptDelta {
+                event_id: "evt_t2".to_string(),
+                response_id: "resp_mixed".to_string(),
+                item_id: "item_tx".to_string(),
+                output_index: 1,
+                content_index: 0,
+                delta: "I said".to_string(),
+            })
+            .expect("transcript delta maps cleanly")
+            .expect("transcript delta produces a realtime event");
+
+        let obs1 = translate_realtime_event(text_delta);
+        let obs2 = translate_realtime_event(tx_delta);
+        match (&obs1, &obs2) {
+            (
+                LiveAdapterObservation::AssistantTextDelta { delta: t, .. },
+                LiveAdapterObservation::AssistantTranscriptDelta { delta: x, .. },
+            ) => {
+                assert_eq!(t, "I wrote");
+                assert_eq!(x, "I said");
+            }
+            other => panic!(
+                "mixed response must emit text-delta then transcript-delta in order, got {other:?}"
+            ),
+        }
     }
 }

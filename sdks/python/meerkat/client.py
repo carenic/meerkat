@@ -2496,6 +2496,68 @@ class MeerkatClient:
             },
         )
 
+    async def live_send_input_image(
+        self,
+        channel_id: str,
+        mime: str,
+        data_base64: str,
+    ) -> dict[str, Any]:
+        """Send a base64-encoded image input chunk to a live channel.
+
+        Wraps `live/send_input` with `LiveSendInputParams { channel_id,
+        chunk: LiveInputChunkWire::Image { mime, data } }`. ``mime`` is the
+        IANA MIME type (``image/png``, ``image/jpeg``, ``image/webp``, …)
+        and ``data_base64`` is the raw image bytes encoded as standard
+        base64. Adapters that do not implement image input (today: every
+        provider Meerkat ships) reject with the typed
+        ``LiveAdapterErrorCode::ConfigRejected { reason:
+        "image_input_not_implemented" }``.
+        """
+        return await self._request(
+            "live/send_input",
+            {
+                "channel_id": channel_id,
+                "chunk": {
+                    "kind": "image",
+                    "mime": mime,
+                    "data": data_base64,
+                },
+            },
+        )
+
+    async def live_send_input_video_frame(
+        self,
+        channel_id: str,
+        codec: str,
+        data_base64: str,
+        timestamp_ms: int,
+    ) -> dict[str, Any]:
+        """Send a base64-encoded video-frame input chunk to a live channel.
+
+        Wraps `live/send_input` with `LiveSendInputParams { channel_id,
+        chunk: LiveInputChunkWire::VideoFrame { codec, data,
+        timestamp_ms } }`. ``codec`` is the frame encoding (``vp8``,
+        ``vp9``, ``h264``, ``image/jpeg`` for keyframe-as-image transports,
+        …); ``timestamp_ms`` is the presentation timestamp the adapter
+        will stamp into the provider envelope so frames remain ordered.
+        Adapters that do not implement video input (today: every provider
+        Meerkat ships) reject with the typed
+        ``LiveAdapterErrorCode::ConfigRejected { reason:
+        "video_frame_input_not_implemented" }``.
+        """
+        return await self._request(
+            "live/send_input",
+            {
+                "channel_id": channel_id,
+                "chunk": {
+                    "kind": "video_frame",
+                    "codec": codec,
+                    "data": data_base64,
+                    "timestamp_ms": timestamp_ms,
+                },
+            },
+        )
+
     async def live_commit_input(self, channel_id: str) -> dict[str, Any]:
         """Commit any buffered input on a live channel. Wraps `live/commit_input`."""
         return await self._request(
@@ -3107,6 +3169,10 @@ class MeerkatClient:
             block_data = {}
         blob_ref = block_data.get("blob_ref")
         blob_id = blob_ref.get("blob_id") if isinstance(blob_ref, dict) else None
+        # Lane provenance for transcript blocks (typed enum on the wire,
+        # serialized as snake_case string — currently only ``"spoken"``).
+        source_raw = block_data.get("source")
+        source = str(source_raw) if isinstance(source_raw, str) else None
         return SessionAssistantBlock(
             block_type=data.get("block_type", ""),
             text=block_data.get("text"),
@@ -3120,6 +3186,7 @@ class MeerkatClient:
             height=MeerkatClient._parse_int(block_data.get("height")) if "height" in block_data else None,
             revised_prompt=block_data.get("revised_prompt") if isinstance(block_data.get("revised_prompt"), dict) else None,
             meta=block_data.get("meta"),
+            source=source,
         )
 
     @staticmethod

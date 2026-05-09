@@ -2293,6 +2293,54 @@ export class MeerkatClient {
     await this.request("live/send_input", params as unknown as Record<string, unknown>);
   }
 
+  /**
+   * T11: typed helper to build an image `LiveInputChunkWire` and send it
+   * via `live/send_input`. `mime` is the IANA MIME type
+   * (`image/png`, `image/jpeg`, `image/webp`, …); `dataBase64` is the
+   * raw image bytes encoded as standard base64. Adapters that do not
+   * implement image input reject with
+   * `LiveAdapterErrorCode::ConfigRejected { reason:
+   * "image_input_not_implemented" }`.
+   */
+  async liveSendInputImage(
+    channelId: string,
+    mime: string,
+    dataBase64: string,
+  ): Promise<void> {
+    await this.request("live/send_input", {
+      channel_id: channelId,
+      chunk: { kind: "image", mime, data: dataBase64 },
+    });
+  }
+
+  /**
+   * T11: typed helper to build a video-frame `LiveInputChunkWire` and
+   * send it via `live/send_input`. `codec` is the frame encoding (`vp8`,
+   * `vp9`, `h264`, `image/jpeg` for keyframe-as-image transports, …);
+   * `dataBase64` is the encoded frame bytes encoded as standard base64;
+   * `timestampMs` is the presentation timestamp the adapter will stamp
+   * into the provider envelope so frames remain ordered. Adapters that do
+   * not implement video input reject with
+   * `LiveAdapterErrorCode::ConfigRejected { reason:
+   * "video_frame_input_not_implemented" }`.
+   */
+  async liveSendInputVideoFrame(
+    channelId: string,
+    codec: string,
+    dataBase64: string,
+    timestampMs: number,
+  ): Promise<void> {
+    await this.request("live/send_input", {
+      channel_id: channelId,
+      chunk: {
+        kind: "video_frame",
+        codec,
+        data: dataBase64,
+        timestamp_ms: timestampMs,
+      },
+    });
+  }
+
   async liveCommitInput(params: LiveChannelParams): Promise<void> {
     await this.request("live/commit_input", params as unknown as Record<string, unknown>);
   }
@@ -3208,6 +3256,9 @@ export class MeerkatClient {
       height: blockData.height != null ? Number(blockData.height) : undefined,
       revisedPrompt,
       meta: blockData.meta as Record<string, unknown> | undefined,
+      // Lane provenance for transcript blocks (typed enum on the wire,
+      // serialized as a snake_case string — currently only "spoken").
+      source: typeof blockData.source === "string" ? blockData.source : undefined,
     };
   }
 
