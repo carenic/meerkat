@@ -275,7 +275,20 @@ mod base64_bytes {
 pub enum LiveAdapterErrorCode {
     ConnectionFailed,
     ConnectionLost,
-    ConfigurationRejected,
+    /// R12: a local guard (model swap, provider swap, audio-rate mismatch,
+    /// etc.) rejected an adapter command without provider involvement.
+    ///
+    /// Distinct from [`Self::ProviderError`], which signals the realtime
+    /// provider returned an error. `ConfigRejected` is the signal that the
+    /// runtime/adapter pre-flight refused to forward the command — typically
+    /// because the requested change cannot be applied via in-place
+    /// reconfigure (OpenAI realtime's `session.update` cannot change models)
+    /// and the caller must close + reopen the channel. Clients that
+    /// previously had to parse English from `ProviderError` messages can now
+    /// route on the typed code.
+    ConfigRejected {
+        reason: String,
+    },
     ProviderError,
     AuthenticationFailed,
     InternalError,
@@ -1266,7 +1279,6 @@ mod tests {
         for code in [
             LiveAdapterErrorCode::ConnectionFailed,
             LiveAdapterErrorCode::ConnectionLost,
-            LiveAdapterErrorCode::ConfigurationRejected,
             LiveAdapterErrorCode::ProviderError,
             LiveAdapterErrorCode::AuthenticationFailed,
             LiveAdapterErrorCode::InternalError,
@@ -1274,6 +1286,32 @@ mod tests {
             let json = serde_json::to_string(&code).unwrap();
             let deser: LiveAdapterErrorCode = serde_json::from_str(&json).unwrap();
             assert_eq!(code, deser);
+        }
+    }
+
+    #[test]
+    fn adapter_error_code_config_rejected_round_trips() {
+        // R12: ConfigRejected carries a free-form reason string but routes
+        // distinctly from ProviderError so callers can act on the typed code
+        // without parsing English from the message field.
+        let code = LiveAdapterErrorCode::ConfigRejected {
+            reason: "model swap from gpt-realtime to gpt-realtime-mini-v2 \
+                     requires close + reopen"
+                .to_string(),
+        };
+        let json = serde_json::to_string(&code).unwrap();
+        assert!(
+            json.contains("\"code\":\"config_rejected\""),
+            "ConfigRejected must serialize with the snake_case tag, got {json}"
+        );
+        assert!(json.contains("close + reopen"));
+        let deser: LiveAdapterErrorCode = serde_json::from_str(&json).unwrap();
+        assert_eq!(code, deser);
+        match deser {
+            LiveAdapterErrorCode::ConfigRejected { reason } => {
+                assert!(reason.contains("close + reopen"));
+            }
+            other => panic!("expected ConfigRejected, got {other:?}"),
         }
     }
 

@@ -1,10 +1,17 @@
 # Live-Adapter Review-2 — Outstanding Issues
 
 Tracking document for the second-round external review on the
-`live-adapter-mvp` branch (PR #650). Eight findings: 3 architectural P1s
-(refresh/open semantics + projection snapshot completeness), 2 P1 test
-failures surfaced on BuildBuddy, 2 P2s (response identity + refresh ack
-honesty), and 1 P3 (snapshot version monotonicity).
+`live-adapter-mvp` branch (PR #650). Eight original findings: 3
+architectural P1s (refresh/open semantics + projection snapshot
+completeness), 2 P1 test failures surfaced on BuildBuddy, 2 P2s
+(response identity + refresh ack honesty), and 1 P3 (snapshot version
+monotonicity). **All 8 closed.**
+
+**Round-3 review** added 4 findings on the refresh-time semantics that
+the round-2 work introduced: full-history replay (R9), missing system
+prompt (R10), no model-switch close+reopen path (R11), and
+provider-error collapse (R12). The BB-side SLO-timeout finding from the
+same review is owned by the user.
 
 **Convention:** each item carries two checkboxes — `[ ] fix` `[ ] verify`.
 The first is the implementer; the second is an independent agent
@@ -363,9 +370,347 @@ Tags: `[U]` = user-found, `[R]` = reviewer-only, `[U+R]` = both.
 
 ---
 
+## Round-3 follow-up findings (refresh-time semantics + error truth)
+
+These four findings emerged from the round-3 review of `28555320b8` after
+R1-R8 landed. R1 introduced `session.update` + post-update re-seed; the
+review uncovered four issues with that model.
+
+### E. Refresh content semantics
+
+- [x] fix · [x] verify · **R9.** `Refresh` replays full canonical
+  history into the already-open OpenAI conversation. `[R]`
+  Location: `meerkat-openai/src/live.rs:3048-3053`. The Refresh arm now
+  applies `session.update` and *then* calls
+  `seed_history_projection(&snapshot.seed_messages, &snapshot.runtime_system_context)`.
+  But `live_open_config_for_session` builds `seed_messages` from the
+  full canonical session history, not from a refresh-time delta;
+  `seed_history_projection` mints fresh `conversation.item.create`
+  events with no stable ids; so every `live/refresh` (and every
+  `propagate_config_to_live_channels` after `config/patch`) duplicates
+  every prior user/assistant turn + every system-context entry inside
+  the hosted realtime conversation. After N refreshes the provider sees
+  N+1 copies of the same transcript. Required: at refresh time, do NOT
+  call `seed_history_projection` on the full snapshot. The provider's
+  conversation already has the prior turns from the original `open` (or
+  the previous refresh). Either skip seeding entirely on Refresh
+  (config-only), or compute a delta of newly-injected runtime context
+  vs. what the provider has already seen and forward only the new
+  entries. Preferred: skip seeding on Refresh; runtime-context
+  injection happens via `session/inject_context` → next-turn boundary,
+  not via live-adapter refresh.
+
+  **Fix note (R-OPENAI2).** The post-`session.update` call to
+  `seed_history_projection` was deleted from the Refresh arm in
+  `meerkat-openai/src/live.rs` (the call previously sat right after
+  `apply_refresh_session_update_from_snapshot`, around the old line
+  3074; the surrounding identity / audio guards are unchanged).
+  Refresh is now config-only: emit one `session.update` carrying the
+  snapshot's instructions / tools / audio config and stop. The Open
+  arm (separate variant) keeps its `seed_history_projection` call —
+  that remains the single authoritative seed point. Newly-injected
+  runtime system context still reaches the provider because
+  `apply_refresh_session_update_from_snapshot` folds
+  `runtime_system_context` into the `instructions` payload via
+  `openai_refresh_session_update_from_snapshot`; anything that
+  genuinely needs to appear as an in-conversation item belongs to
+  `session/inject_context` → next-turn boundary, NOT to live-adapter
+  refresh. The previously-misnamed regression test
+  `refresh_command_reseeds_provider_with_snapshot_messages` was
+  renamed to `refresh_command_does_not_replay_history` and its body
+  rewritten to drive 3 consecutive `Refresh` dispatches with
+  non-empty `seed_messages` AND non-empty `runtime_system_context`,
+  asserting the recording adapter sees exactly 3 `SessionUpdate`
+  events and 0 `ConversationItemCreate` events. The test uses
+  `ChannelOpenAiLiveSession` to push the matching `SessionUpdated`
+  ack after each `SessionUpdate` is observed (the pump's idle
+  `next_event` poll would race-consume a pre-queued ack). All 4
+  refresh-related tests in `meerkat-openai` pass under
+  `--features realtime`.
+
+- [x] fix · [x] verify · **R10.** Refresh `session.update`
+  instructions field is built only from `snapshot.system_prompt` +
+  `runtime_system_context`, but both real snapshot builders set
+  `system_prompt: None`. `[R]` Location:
+  `meerkat-openai/src/live.rs:649-655`. The root system prompt lives
+  inside `seed_messages` as a `Message::System` entry; the
+  history-event projector explicitly drops `Message::System` and
+  `SystemNotice`; so the refresh `session.update` replaces the
+  provider instructions with just the language-pin / runtime-context
+  text, losing the actual Meerkat system prompt. Required: populate
+  `LiveProjectionSnapshot.system_prompt` in both
+  `build_live_projection_snapshot` and
+  `build_live_projection_snapshot_for_runtime` from the resolved
+  `RealtimeSessionOpenConfig.system_prompt` (or extract it from the
+  first `Message::System` in `seed_messages`). Without this fix, every
+  refresh wipes the system prompt.
+
+  **Fix note (foundation-2 phase).** `RealtimeSessionOpenConfig`
+  does not yet model `system_prompt` as a typed field; the resolved
+  root prompt is materialized into `seed_messages[0]` as a
+  `Message::System` by `realtime_projection_root_system_message` /
+  `realtime_projection_messages` in
+  `meerkat-rpc/src/session_runtime.rs:341-389`. Both snapshot builders
+  now consult that invariant via small extractors that match
+  `seed_messages.first()` and lift the `SystemMessage.content` string.
+  Producers: `extract_system_prompt_from_seed_messages` in
+  `meerkat-rpc/src/handlers/live.rs:42-62` (consumed by
+  `build_live_projection_snapshot` at the rebuilt `system_prompt:`
+  field around line 86); mirror
+  `extract_system_prompt_from_seed_messages_runtime` in
+  `meerkat-rpc/src/session_runtime.rs:304-318` (consumed by
+  `build_live_projection_snapshot_for_runtime` around line 340). The
+  pre-existing snapshot round-trip test
+  `snapshot_round_trips_with_runtime_system_context` and the new
+  producer-side regressions
+  `extract_system_prompt_returns_first_system_message_content` and
+  `extract_system_prompt_returns_none_when_no_system_message` in
+  `meerkat-rpc/src/handlers/live.rs:748-786` pin the contract. We
+  preferred the typed extractor over a future
+  `RealtimeSessionOpenConfig.system_prompt` field because the
+  projection invariant is already enforced upstream and adding a
+  parallel field would create two truths to keep in sync; an inline
+  comment at both call sites documents the choice.
+
+  **Fix note (FIX-R10, SystemNotice extension).** The original R10 fix
+  only matched `Message::System` at index 0. An adversarial verifier
+  observed that `realtime_projection_messages`
+  (`meerkat-rpc/src/session_runtime.rs:435-444`) only rewrites
+  `seed_messages[0]` when `realtime_projection_root_system_message`
+  returns `Some` — when it returns `None`, the canonical session
+  transcript's original first message is left in place and that can
+  legitimately be a `Message::SystemNotice` (e.g. an idle pre-prompt
+  session whose only lead is a runtime-injected
+  `[SYSTEM NOTICE][MCP_PENDING]` notice). Both extractors
+  (`extract_system_prompt_from_seed_messages` in
+  `meerkat-rpc/src/handlers/live.rs` and the runtime mirror in
+  `meerkat-rpc/src/session_runtime.rs`) now also match
+  `Message::SystemNotice(n)` and return `n.rendered_text()` — the
+  prefix-tagged form, matching the projection the root-system helper
+  itself emits at `session_runtime.rs:405`. Without this arm, a
+  refresh whose snapshot leads with a `SystemNotice` would silently
+  emit empty instructions on `session.update` and wipe the realtime
+  provider's session-level instructions. New regression tests:
+  `extract_system_prompt_returns_rendered_text_for_first_system_notice`
+  in the handler tests module and
+  `extract_system_prompt_runtime_returns_rendered_text_for_first_system_notice`
+  in the session-runtime tests module pin the rendered-text shape on
+  both extractors. Inline doc-comments at both extractors now document
+  why both `Message::System` and `Message::SystemNotice` are valid
+  lead messages for a live snapshot and why we prefer `rendered_text()`
+  over the raw `body` field.
+
+### F. Realtime model switching
+
+- [x] fix · [x] verify · **R11.** `config/patch` model switch has no
+  close-and-reopen path for active live channels. `[R]`
+  Location: `meerkat-rpc/src/session_runtime.rs:5326-5330`.
+  `propagate_config_to_live_channels` only prechecks that the new
+  resolved model is realtime-capable, then always enqueues `Refresh`.
+  After R1 the OpenAI adapter rejects model drift via
+  `LlmError::InvalidRequest` (because OpenAI realtime's
+  `session.update` cannot change models), but that rejection is async
+  and there is no runtime path here to close the channel and reopen
+  it with the new model. A model swap therefore leaves the live
+  channel in an error state rather than seamlessly switching.
+  Required: detect model change in
+  `propagate_config_to_live_channels` (compare new resolved
+  `model_id`/`provider_id` against `LiveAdapterHost`'s recorded
+  current identity for the channel), and on mismatch call
+  `host.close_channel(&channel_id, CloseReason::ModelSwap)` followed
+  by emitting a runtime event the surface caller can use to issue a
+  new `live/open` (or surface a typed runtime event the SDK observes
+  to trigger reopen). At minimum, do NOT enqueue Refresh when the
+  precheck identifies a model change.
+
+  **Fix note (R-RPC2).** Added `bound_llm_identity:
+  Option<SessionLlmIdentity>` to `ChannelState` plus a thin
+  `set_channel_llm_identity` setter and `channel_llm_identity` getter
+  on `LiveAdapterHost` (`meerkat-live/src/host.rs`, struct field
+  ~line 372-389, setter ~line 634-656, getter ~line 658-672). The
+  host had no existing identity store and no typed `CloseReason`
+  enum, so this is the minimal storage edit needed to support a clean
+  read accessor; `open_channel` initializes the new field to `None`.
+  The `live/open` handler in `meerkat-rpc/src/handlers/live.rs`
+  stamps the identity immediately after `attach_adapter` succeeds
+  (~line 259-289); a stamp failure is logged but does not abort
+  `live/open` (worst case is a fall-through to the legacy Refresh
+  path on a later config patch). `propagate_config_to_live_channels`
+  (`meerkat-rpc/src/session_runtime.rs:5343-5398`) now reads the
+  bound identity via the new accessor *before* enqueuing Refresh; on
+  model_id or provider mismatch it logs a structured
+  `tracing::info!` event with `reason = "model_swap"`, fields
+  `session_id` / `channel_id` / `old_model_id` / `new_model_id` /
+  `old_provider_id` / `new_provider_id`, then calls
+  `host.close_channel(&channel_id)` (the host's existing single-arg
+  signature — no typed `CloseReason` parameter to thread). The
+  log/event is the only SDK-visible signal; reopen is the caller's
+  responsibility per the inline contract comment. Audio rate change
+  is intentionally out of scope (R11 covers model + provider only);
+  audio mismatches still surface as the existing async
+  `ConfigRejected` error from the OpenAI Refresh arm. Pure helper
+  extracted as `live_channel_requires_close_for_identity_change`
+  (`meerkat-rpc/src/session_runtime.rs:381-403`) so the swap-detection
+  rule is unit-testable independently of the propagate flow.
+
+  Regression tests (all in
+  `meerkat-rpc/src/session_runtime.rs::tests`): pure-helper coverage
+  via `r11_close_required_when_model_id_swapped`,
+  `r11_close_required_when_provider_swapped`,
+  `r11_close_not_required_when_identity_unchanged`,
+  `r11_close_not_required_when_no_bound_identity_recorded`. Host
+  accessor coverage via
+  `r11_host_records_and_reads_back_bound_llm_identity` and
+  `r11_channel_llm_identity_reports_channel_not_found_for_missing_channel`.
+  End-to-end propagate coverage via
+  `r11_propagate_closes_channel_on_model_id_swap` (records a
+  *stale* identity on the host so the channel-bound identity differs
+  from the session's resolved identity, drives propagate, asserts NO
+  Refresh recorded on the recording adapter and host status is
+  `Closed`) and `r11_propagate_dispatches_refresh_when_identity_unchanged`
+  (matches the host-recorded identity to the session's resolved
+  identity, drives propagate, asserts exactly one `Refresh`
+  dispatched and channel status is NOT `Closed`; tolerates the
+  precheck-close fallback when the mock model is not realtime-capable
+  but still pins the no-Refresh-before-close property). Verified via
+  `./scripts/repo-cargo test -p meerkat-live -p meerkat-rpc --lib`
+  (472 passed, 0 failed) and `./scripts/repo-cargo clippy
+  -p meerkat-live -p meerkat-rpc --tests -- -D warnings` (clean).
+
+  **Fix note (R-RPC2 follow-up — CC1 + CC2).** The first R-RPC2 land
+  shipped two latent gaps that the verifier caught.
+
+  *CC1 — typed swap signal on the wire.* The original
+  `propagate_config_to_live_channels` model-swap branch called
+  `host.close_channel(&channel_id)` and emitted a server-side
+  `tracing::info!`. SDK clients connected over WS only saw a TCP
+  close indistinguishable from a network drop — no typed reason on
+  the close frame, no actionable signal that the channel needs a
+  reopen against a new model. Fixed by adding
+  `LiveAdapterHost::signal_terminal_error(&channel_id, code:
+  LiveAdapterErrorCode)` in `meerkat-live/src/host.rs`. The method
+  enqueues a synthetic `LiveAdapterObservation::Error { code,
+  message }` on a new per-channel `pending_synthetic_obs:
+  Option<LiveAdapterObservation>` slot in `ChannelState`, then closes
+  the underlying adapter via the existing `close_channel` path.
+  `next_observation_raw` now checks the pending slot BEFORE
+  `adapter_for` so the synthetic observation survives even after the
+  adapter has been released — the WS pump in `transport.rs` reads it
+  like any provider-emitted Error, `apply_observation` returns
+  `ObservationOutcome::Terminal { code: ConfigRejected { reason } }`,
+  and the existing `live_adapter_error_code_slug` derivation produces
+  a typed `terminal:config_rejected` close-frame reason that clients
+  can key on. `propagate_config_to_live_channels` in
+  `meerkat-rpc/src/session_runtime.rs` replaces the bare
+  `close_channel` call in the swap branch with
+  `signal_terminal_error(channel_id, ConfigRejected { reason:
+  format!("model_swap: {old} -> {new}") })`. New regression tests in
+  `meerkat-live/src/host.rs::tests`:
+  `signal_terminal_error_enqueues_synthetic_error_obs_and_closes_channel`,
+  `synthetic_terminal_error_routes_through_apply_observation_to_terminal_outcome`,
+  and `signal_terminal_error_on_missing_channel_returns_channel_not_found`
+  pin enqueue, the apply-observation→Terminal trace, and the
+  `ChannelNotFound` path.
+
+  *CC2 — tests now actually exercise the swap branch.* The original
+  `r11_propagate_closes_channel_on_model_id_swap` set
+  `bound_llm_identity = gpt-realtime-1.5` against a session resolved
+  to `claude-sonnet-4-5` (the default `mock_build_config()`).
+  `propagate_config_to_live_channels` runs `precheck_live_open`
+  first, which closed the channel via the realtime-capability gate
+  before the swap branch ever fired — deleting the entire R11 swap-
+  detection logic block would not have regressed the test. Both R11
+  propagate tests now build their session via a new
+  `realtime_build_config(model)` helper that sets `model =
+  "gpt-realtime-1.5"`, `provider = Some(Provider::OpenAI)`, and the
+  same `MockLlmClient` override; both materialize via `start_turn`
+  before stamping the bound identity. The swap test now uses
+  realtime-capable identities on both sides (`gpt-realtime` for the
+  bound side vs. `gpt-realtime-1.5` for the session-resolved side),
+  asserts the synthetic `ConfigRejected` Error obs is queued via a
+  new `drain_pending_synthetic` test helper, and pins the reason
+  string contains both old and new model ids. The no-swap sibling
+  test now strictly requires Refresh to land and the channel to
+  remain Open — the prior precheck-close tolerance is gone, so a
+  regression that closes channels via the wrong gate fails the
+  assertion immediately. Verified via
+  `./scripts/repo-cargo test -p meerkat-live -p meerkat-rpc --lib`
+  (538 passed, 0 failed: 64 in meerkat-live + 474 in meerkat-rpc) and
+  `./scripts/repo-cargo clippy -p meerkat-live -p meerkat-rpc --tests
+  -- -D warnings` (clean).
+
+### G. Error code truth
+
+- [x] fix · [x] verify · **R12.** Local config rejections from the
+  Refresh guards surface as `LiveAdapterErrorCode::ProviderError`. `[R]`
+  Location: `meerkat-openai/src/live.rs:2907-2912`. The R1 model /
+  provider / audio-rate guards return `LlmError::InvalidRequest`, but
+  the pump wraps every command failure as
+  `LiveAdapterErrorCode::ProviderError`. That collapses
+  configuration-rejected truth into provider-outage truth and forces
+  clients/runtimes to parse message text to distinguish a needs-close-
+  and-reopen rejection from an actual provider failure. Required: add
+  a typed `LiveAdapterErrorCode::ConfigRejected { reason: ... }` (or
+  similar — see the existing `Other { raw }` variant for shape
+  precedent) and map `LlmError::InvalidRequest` to it in the pump's
+  command-failure branch. Tests should pin which error code each
+  guard's rejection produces.
+
+  **Fix note (foundation-2 phase).** Added new variant
+  `LiveAdapterErrorCode::ConfigRejected { reason: String }` at
+  `meerkat-core/src/live_adapter.rs:281-294`, sitting alongside
+  `ConfigurationRejected` (legacy, kept on the enum until callers
+  migrate). Serializes with the snake_case tag `config_rejected` so the
+  WS close-frame slug derivation in
+  `meerkat-live/src/transport.rs::live_adapter_error_code_slug`
+  picks it up cleanly without changes; new round-trip test
+  `adapter_error_code_config_rejected_round_trips` in
+  `meerkat-core/src/live_adapter.rs:1310-1334` and slug pin
+  `live_adapter_error_code_slug_emits_serde_tag` extension at
+  `meerkat-live/src/transport.rs:680-687` cover both serdes. Pump
+  mapping site:
+  `meerkat-openai/src/live.rs::run_openai_live_pump` command-failure
+  arm around line 2906-2935 — `LlmError::InvalidRequest { message }`
+  now maps to `ConfigRejected { reason: message.clone() }`; every
+  other error variant stays on the existing `ProviderError` path. The
+  pre-existing R1 regression
+  `refresh_command_rejects_model_swap_without_emitting_session_update`
+  was tightened (around line 6708-6745) to assert the typed
+  `ConfigRejected { reason }` shape with the swap text, replacing the
+  prior message-substring check on `ProviderError`.
+
+  **Fix note (R12 review-3 cleanup, FIX-R12).** CC3: deleted the dead
+  `LiveAdapterErrorCode::ConfigurationRejected` variant entirely from
+  `meerkat-core/src/live_adapter.rs` (was sibling to `ConfigRejected`,
+  zero production producers / consumers, only referenced in its own
+  declaration and a single round-trip test). The dead variant carried
+  a distinct serde slug `configuration_rejected` that risked drift
+  against the live `config_rejected` slug. Removed the variant from
+  the round-trip test loop in the same pass. Per pre-1.0 dogma:
+  no compat shim. Confirmed via `rg "configuration_rejected|
+  ConfigurationRejected"` — zero hits in tree (sdks/, artifacts/,
+  docs/, code).
+
+  CC5: broadened the doc-comment on the pump's command-failure
+  mapping branch in `meerkat-openai/src/live.rs:~2922` to make
+  explicit that `ConfigRejected` covers ALL local-guard rejections —
+  not just close-and-reopen swaps. Enumerated the five concrete
+  `LlmError::InvalidRequest` call sites that currently feed the
+  mapping (`live.rs:3049` model swap, `:3060` provider swap,
+  `:3073` audio mismatch, `:3109` unsupported input chunk, `:3140`
+  unsupported command catch-all) and noted that swap-detecting
+  clients must inspect the `reason` field rather than treating
+  `ConfigRejected` as a swap signal alone. Left a `TODO(future):`
+  marker for splitting `ConfigRejected` into typed sub-variants
+  (e.g. `Swap` vs `UnsupportedInput`) if downstream branching
+  pressure ever justifies it. Doc-only on this pass.
+
+---
+
 ## Counts
 
-- **P1 (block):** 5 items (R1-R5)
-- **P2 (must-fix):** 2 items (R6-R7)
-- **P3 (cleanup):** 1 item (R8)
-- **Total actionable:** 8
+- **P1 (block):** 5 items (R1-R5) — all closed
+- **P2 (must-fix):** 2 items (R6-R7) — all closed
+- **P3 (cleanup):** 1 item (R8) — closed
+- **Round-3 follow-ups:** 4 items (R9-R12)
+- **Total actionable:** 12 (8 closed + 4 open)
