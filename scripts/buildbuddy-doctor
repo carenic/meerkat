@@ -402,6 +402,9 @@ if job_has_line .github/workflows/ci.yml cargo 'name: GHA Cargo' &&
   job_has_line .github/workflows/buildbuddy.yml native-submit 'group: gcp' &&
   job_has_line .github/workflows/buildbuddy.yml governance-submit 'group: gcp-governance' &&
   job_has_line .github/workflows/buildbuddy.yml wasm-feature-submit 'group: gcp-wasm-feature' &&
+  job_has_line .github/workflows/buildbuddy.yml governance-submit 'Detect machine-authority changes' &&
+  job_has_line .github/workflows/buildbuddy.yml wasm-feature-submit 'Detect WASM, SDK, feature, or audit changes' &&
+  ! job_has_line .github/workflows/buildbuddy.yml governance-submit "steps.machine-changes.outputs.changed != 'true'" &&
   ! job_has_line .github/workflows/buildbuddy.yml wasm-feature-submit 'seam-inventory' &&
   ! job_has_line .github/workflows/buildbuddy.yml wasm-feature-submit 'rmat-audit' &&
   ! job_has_line .github/workflows/buildbuddy.yml wasm-feature-submit 'machine-authority' &&
@@ -410,10 +413,12 @@ if job_has_line .github/workflows/ci.yml cargo 'name: GHA Cargo' &&
   grep -Fq 'Active BuildBuddy lane heartbeat' scripts/buildbuddy-ci-lane-batch &&
   grep -Fq "inputs.profile == 'submitter' || inputs.profile == 'doctor'" .github/actions/setup-buildbuddy-ci/action.yml &&
   grep -Fq 'scripts/buildbuddy-ci-lane-batch' .github/actions/run-buildbuddy-ci-lane-batch/action.yml &&
+  grep -Fq 'default_target="//..."' scripts/buildbuddy-bazel-poc &&
+  grep -Fq -- '--build_tag_filters=-local,-manual,-e2e,-system,-live,-slow,-required-feature,-trybuild,-snapshot,-fixture,-cargo-equivalent,-requires-network' scripts/buildbuddy-bazel-poc &&
   job_has_line .github/workflows/buildbuddy.yml gate 'runs-on: ubuntu-latest'; then
-  pass "GCP BuildBuddy CI uses one remote prebuild before bounded split-submit validation"
+  pass "GCP BuildBuddy CI uses a broad Bazel-native prebuild plus path-aware edge lanes"
 else
-  bad "GCP BuildBuddy CI is not using the prebuild-plus-bounded-validation shape"
+  bad "GCP BuildBuddy CI is not using the broad-prebuild/path-aware edge-lane shape"
 fi
 
 if grep -Fq 'full-fresh' .github/workflows/buildbuddy.yml &&

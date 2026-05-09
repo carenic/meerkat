@@ -257,17 +257,19 @@ only the submitter/coordinator:
    Secret Manager for the executors, creates the executor managed instance group
    if it is missing, and scales it to
    `MEERKAT_GCP_BUILDBUDDY_TARGET_SIZE` (default `12`).
-3. `prebuild-submit` runs one remote Bazel prebuild over the shared CI
-   build graph. This is the cache-warming step: one Bazel invocation fans out
-   compile/link/test-wrapper actions across the GCP executor pool, so common
+3. `prebuild-submit` runs one remote Bazel build of the non-live workspace
+   graph. This is the cache-warming step: one Bazel invocation fans out
+   compile/link/test-binary actions across the GCP executor pool, so common
    artifacts enter the self-hosted BuildBuddy CAS before targeted validation
-   lanes start.
-4. The targeted submitter jobs then run format/static, clippy, unit,
-   integration-fast, SDK, WASM, feature-matrix, audit, RMAT, seam-inventory,
-   and machine-authority checks against the warmed graph. GCP batches default
-   to one local submitter per job because the desired parallelism is Bazel
-   action-level remote execution, not several GitHub jobs racing the same
-   first-touch compile actions.
+   lanes start. It deliberately does not execute TLC/RMAT/governance or
+   cargo-equivalent WASM/SDK wrappers; those are policy/shell lanes, not the
+   shared Bazel-native compilation graph.
+4. The targeted submitter jobs then run format/static, clippy, unit, and
+   integration-fast checks against the warmed graph. GCP batches default to one
+   local submitter per job because the desired parallelism is Bazel action-level
+   remote execution, not several GitHub jobs racing the same first-touch compile
+   actions. Governance and WASM/SDK/feature/audit lanes are path-aware edge
+   lanes; they run only when their inputs changed.
 5. Bazel uses `--config=buildbuddy-linux-gcp-ci-rbe`, which selects
    `//platforms:linux_x86_64_gcp_ci`. That platform routes actions to
    BuildBuddy pool `meerkat-ci`, enables external network, and runs actions in

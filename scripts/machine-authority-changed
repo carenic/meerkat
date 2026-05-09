@@ -96,12 +96,6 @@ machine_authority_path() {
     xtask/tests/machine_verify_all_tlc_test.sh|xtask/tests/machines_contracts.rs|xtask/tests/protocol_codegen_drift.rs)
       return 0
       ;;
-    scripts/machine-authority-changed|scripts/pre-push-machines.sh|scripts/pre-push-audit-generated-headers.sh|scripts/buildbuddy-bazel-poc|scripts/buildbuddy-ci-lane|scripts/buildbuddy-doctor|scripts/generate-bazel-rust-builds.mjs|scripts/compare-machine-verify-stats.sh)
-      return 0
-      ;;
-    .github/workflows/ci.yml|.github/workflows/cargo.yml|.github/workflows/buildbuddy.yml|.github/actions/run-buildbuddy-ci-lane/*|.github/actions/setup-buildbuddy-ci/*)
-      return 0
-      ;;
     Cargo.toml|Cargo.lock|BUILD.bazel|MODULE.bazel|MODULE.bazel.lock|.bazelrc)
       return 0
       ;;

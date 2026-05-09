@@ -346,16 +346,6 @@ jobs:
             rmat-audit
             machine-authority
 
-      - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
-        if: ${{ steps.machine-changes.outputs.changed != 'true' }}
-        with:
-          group: gcp-governance
-          profile: submitter
-          mode: ${{ inputs.mode || 'full-fresh' }}
-          lanes: |
-            seam-inventory
-            rmat-audit
-
   wasm-feature-submit:
     name: WASM and feature submitter
     needs: [control-plane-up, executors-up, prebuild-submit]
@@ -372,7 +362,42 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Detect WASM, SDK, feature, or audit changes
+        id: wasm-feature-changes
+        shell: bash
+        env:
+          BASE_SHA: ${{ inputs.machine_authority_base_sha || '' }}
+          HEAD_SHA: ${{ inputs.machine_authority_head_sha || github.sha }}
+        run: |
+          changed=true
+          if [[ -n "${BASE_SHA}" && "${BASE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
+            if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+              git fetch --no-tags --depth=1 origin "${BASE_SHA}" || true
+            fi
+            changed=false
+            while IFS= read -r path; do
+              case "${path}" in
+                Cargo.toml|Cargo.lock|MODULE.bazel|MODULE.bazel.lock|.bazelrc)
+                  changed=true
+                  break
+                  ;;
+                meerkat-web-runtime/*|meerkat-cli/src/web_runtime_template/*|sdks/*|tools/sdk-builder/*|tools/sdk-codegen/*|tools/buildbuddy/*)
+                  changed=true
+                  break
+                  ;;
+                scripts/run-surface-feature-matrix)
+                  changed=true
+                  break
+                  ;;
+              esac
+            done < <(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" --)
+          else
+            echo "No reliable diff base; running WASM/SDK/feature/audit lanes."
+          fi
+          echo "changed=${changed}" >> "${GITHUB_OUTPUT}"
+
       - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
+        if: ${{ steps.wasm-feature-changes.outputs.changed == 'true' }}
         with:
           group: gcp-wasm-feature
           profile: submitter
@@ -397,6 +422,11 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
       - name: Authenticate to GCP with Workload Identity
         if: ${{ vars.MEERKAT_GCP_WORKLOAD_IDENTITY_PROVIDER != '' && vars.MEERKAT_GCP_SERVICE_ACCOUNT != '' }}
         uses: google-github-actions/auth@v3
@@ -407,11 +437,6 @@ jobs:
 
       - name: Setup gcloud
         uses: google-github-actions/setup-gcloud@v3
-
-      - name: Checkout
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 1
 
       - name: Authenticate to GCP with JSON fallback
         shell: bash
