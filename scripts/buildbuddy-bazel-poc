@@ -18,6 +18,7 @@ Common commands:
                             Integration-fast remote workspace test lane.
   workspace-fast-clippy-rbe  Fast tests plus clippy aspect.
   workspace-build-clippy-rbe Build/clippy labels for the workspace build set.
+  ci-prebuild-rbe          Build the non-live CI workspace graph to warm remote cache.
   e2e-system-rbe           Bazel-native system e2e suite with runfile binaries.
   e2e-fast-rbe             Bazel-native fast e2e lane.
   e2e-live-rbe             Bazel-native live e2e lane.
@@ -243,6 +244,17 @@ case "${command}" in
       --aspects="@rules_rust//rust:defs.bzl%rust_clippy_aspect"
       --output_groups="+clippy_checks"
       --@rules_rust//rust/settings:clippy_flag=-Dwarnings
+    )
+    ;;
+  ci-prebuild-rbe)
+    command="build"
+    config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
+    default_target="//..."
+    extra_args+=(
+      --build_tag_filters=-local,-manual,-e2e,-system,-live,-slow,-required-feature,-trybuild,-snapshot,-fixture,-cargo-equivalent,-requires-network
+      --remote_download_minimal
+      --color=no
+      --curses=no
     )
     ;;
   e2e-system-rbe)

@@ -257,26 +257,44 @@ only the submitter/coordinator:
    Secret Manager for the executors, creates the executor managed instance group
    if it is missing, and scales it to
    `MEERKAT_GCP_BUILDBUDDY_TARGET_SIZE` (default `12`).
-3. One thin submitter job batches the Bazel lanes, including format/static,
-   clippy, unit, integration-fast, SDK, WASM, feature-matrix, audit, RMAT,
-   seam-inventory, and machine-authority checks.
-4. Bazel uses `--config=buildbuddy-linux-gcp-ci-rbe`, which selects
+3. `prebuild-submit` runs one remote Bazel build of the non-live workspace
+   graph. This is the cache-warming step: one Bazel invocation fans out
+   compile/link/test-binary actions across the GCP executor pool, so common
+   artifacts enter the self-hosted BuildBuddy CAS before targeted validation
+   lanes start. It deliberately does not execute TLC/RMAT/governance or
+   cargo-equivalent WASM/SDK wrappers; those are policy/shell lanes, not the
+   shared Bazel-native compilation graph.
+4. The static submitter runs format/static source checks in parallel with the
+   prebuild because it does not consume warmed Rust test binaries. The native
+   submitter then runs clippy, unit, and integration-fast checks against the
+   warmed graph. It uses a small number of local lane submitters so the
+   post-prebuild validation lanes can overlap without several GitHub jobs racing
+   the same first-touch compile actions. Governance and
+   WASM/SDK/feature/audit are path-aware edge lanes;
+   they start in parallel after the executor pool is up and do not wait for the
+   prebuild, because they do not consume the shared Bazel-native prebuild output.
+   Governance is intentionally keyed to the machine DSL/generated-machine
+   surfaces, not broad Bazel metadata such as `MODULE.bazel.lock`.
+5. Bazel uses `--config=buildbuddy-linux-gcp-ci-rbe`, which selects
    `//platforms:linux_x86_64_gcp_ci`. That platform routes actions to
    BuildBuddy pool `meerkat-ci`, enables external network, and runs actions in
    the pre-baked Artifact Registry image
    `europe-west1-docker.pkg.dev/king-dnn-training-dev/meerkat-ci/meerkat-ci-rust:1.94.0`.
-5. `gcp-executors-down` always scales the managed instance group back to zero
-   after the submitters finish. In GitHub CI it sets target size to zero and
-   skips waiting for every VM deletion to settle, so teardown does not inflate
-   the required CI status. Manual `scripts/gcp-buildbuddy-executor-pool down`
-   still waits by default; set `MEERKAT_GCP_BUILDBUDDY_WAIT_ON_DOWN=0` for the
-   asynchronous behavior.
+6. `executors-down` parks the managed instance group with stopped standby
+   VMs after the submitters finish. In GitHub CI it sets running size to zero,
+   preserves the configured stopped size, and can skip waiting for every stop to
+   settle so teardown does not inflate the required CI status. Manual
+   `scripts/gcp-buildbuddy-executor-pool down` still waits by default; set
+   `MEERKAT_GCP_BUILDBUDDY_WAIT_ON_DOWN=0` for the asynchronous behavior.
 
 The intended steady-state cost shape is one small always-on BuildBuddy
-backend/cache plus zero idle executor VMs. A CI run bursts the executor MIG to
-the configured size, then parks it again. BuildBuddy CAS/action cache is the
-shared cache across the fleet; the executor VMs get large local SSD-backed boot
-disks for per-VM action/container/cache locality.
+backend/cache plus stopped executor VMs with durable cache disks. A CI run
+starts the parked executor MIG to the configured running size, then parks it
+again. BuildBuddy CAS/action cache is the shared cache across the fleet; each
+executor also has its own stateful SSD-backed `/buildbuddy` disk for
+per-executor action/container/file-cache locality. The cache disk is not a
+multi-writer shared filesystem; sharing happens through BuildBuddy CAS/action
+cache, while stopped stateful disks avoid re-cold-starting every executor.
 The `gcp-buildbuddy` submitter jobs restore GitHub Actions' Bazel repository
 cache for fast local analysis/fetch setup, but intentionally skip the cache save
 at job teardown because uploading runner-local cache tarballs adds latency and
