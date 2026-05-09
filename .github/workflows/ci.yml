@@ -84,3 +84,37 @@ jobs:
         run: |
           echo "::error::Only lukacf can run the secret-backed GCP BuildBuddy lane."
           exit 1
+
+  gate:
+    name: CI gate
+    if: ${{ always() }}
+    needs:
+      - cargo
+      - gcp-buildbuddy
+      - unauthorized-gcp-buildbuddy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check selected CI backend
+        shell: bash
+        env:
+          CARGO_RESULT: ${{ needs.cargo.result }}
+          GCP_BUILDBUDDY_RESULT: ${{ needs.gcp-buildbuddy.result }}
+          UNAUTHORIZED_GCP_BUILDBUDDY_RESULT: ${{ needs.unauthorized-gcp-buildbuddy.result }}
+        run: |
+          echo "GHA Cargo result: ${CARGO_RESULT}"
+          echo "GCP BuildBuddy result: ${GCP_BUILDBUDDY_RESULT}"
+          echo "GCP BuildBuddy authorization result: ${UNAUTHORIZED_GCP_BUILDBUDDY_RESULT}"
+
+          for result in "${CARGO_RESULT}" "${GCP_BUILDBUDDY_RESULT}" "${UNAUTHORIZED_GCP_BUILDBUDDY_RESULT}"; do
+            case "${result}" in
+              failure|cancelled)
+                echo "::error::A CI backend failed or was cancelled."
+                exit 1
+                ;;
+            esac
+          done
+
+          if [[ "${CARGO_RESULT}" != "success" && "${GCP_BUILDBUDDY_RESULT}" != "success" ]]; then
+            echo "::error::No CI backend completed successfully."
+            exit 1
+          fi

@@ -336,6 +336,11 @@ rm -rf "${dispatch_log_root}"
 if grep -Fq 'name: CI' .github/workflows/ci.yml &&
   grep -Fq 'name: GHA Cargo' .github/workflows/ci.yml &&
   grep -Fq 'name: GCP BuildBuddy' .github/workflows/ci.yml &&
+  job_has_line .github/workflows/ci.yml gate 'name: CI gate' &&
+  job_has_line .github/workflows/ci.yml gate 'name: Check selected CI backend' &&
+  job_has_line .github/workflows/ci.yml gate 'CARGO_RESULT:' &&
+  job_has_line .github/workflows/ci.yml gate 'GCP_BUILDBUDDY_RESULT:' &&
+  job_has_line .github/workflows/ci.yml gate 'No CI backend completed successfully.' &&
   grep -Fq "github.actor == 'lukacf'" .github/workflows/ci.yml &&
   grep -Fq 'Only lukacf can run the secret-backed GCP BuildBuddy lane.' .github/workflows/ci.yml &&
   grep -Fq 'uses: ./.github/workflows/cargo.yml' .github/workflows/ci.yml &&
@@ -387,6 +392,7 @@ fi
 
 if job_has_line .github/workflows/ci.yml cargo 'name: GHA Cargo' &&
   job_has_line .github/workflows/ci.yml gcp-buildbuddy 'name: GCP BuildBuddy' &&
+  job_has_line .github/workflows/ci.yml gate 'name: CI gate' &&
   job_has_line .github/workflows/buildbuddy.yml prebuild-submit 'name: Prebuild submitter' &&
   job_has_line .github/workflows/buildbuddy.yml prebuild-submit 'group: gcp-prebuild' &&
   job_has_line .github/workflows/buildbuddy.yml prebuild-submit 'ci-prebuild' &&
