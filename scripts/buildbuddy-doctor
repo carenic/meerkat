@@ -406,7 +406,7 @@ if job_has_line .github/workflows/ci.yml select_backend 'runs-on: ubuntu-latest'
   job_has_line .github/workflows/buildbuddy.yml gcp-native-submit 'fetch-depth: 1' &&
   job_has_line .github/workflows/buildbuddy.yml gcp-native-submit 'Select GCP BuildBuddy lanes' &&
   job_has_line .github/workflows/buildbuddy.yml gcp-native-submit 'run-buildbuddy-ci-lane-batch' &&
-  job_has_line .github/workflows/buildbuddy.yml gcp-native-submit "CI_STARTED_AT_EPOCH: \${{ inputs.ci_started_at_epoch || needs.gcp-control-plane-up.outputs.started_at_epoch }}" &&
+  job_has_line .github/workflows/buildbuddy.yml gcp-native-submit "CI_STARTED_AT_EPOCH: \${{ needs.gcp-control-plane-up.outputs.started_at_epoch }}" &&
   job_has_line .github/workflows/buildbuddy.yml gcp-native-submit 'group: gcp' &&
   job_has_line .github/workflows/buildbuddy.yml gcp-native-submit 'profile: submitter' &&
   job_has_line .github/workflows/buildbuddy.yml gcp-native-submit "mode: \${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}" &&
@@ -416,18 +416,19 @@ if job_has_line .github/workflows/ci.yml select_backend 'runs-on: ubuntu-latest'
   job_has_line .github/workflows/buildbuddy.yml gcp-governance-submit 'runs-on: ubuntu-latest' &&
   job_has_line .github/workflows/buildbuddy.yml gcp-governance-submit 'timeout-minutes: 20' &&
   job_has_line .github/workflows/buildbuddy.yml gcp-governance-submit 'fetch-depth: 1' &&
-  job_has_line .github/workflows/buildbuddy.yml gcp-governance-submit "CI_STARTED_AT_EPOCH: \${{ inputs.ci_started_at_epoch || needs.gcp-control-plane-up.outputs.started_at_epoch }}" &&
+  job_has_line .github/workflows/buildbuddy.yml gcp-governance-submit "CI_STARTED_AT_EPOCH: \${{ needs.gcp-control-plane-up.outputs.started_at_epoch }}" &&
   job_has_line .github/workflows/buildbuddy.yml gcp-governance-submit 'group: gcp-governance' &&
   job_has_line .github/workflows/buildbuddy.yml gcp-governance-submit 'profile: submitter' &&
   job_has_line .github/workflows/buildbuddy.yml gcp-governance-submit "mode: \${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}" &&
   job_has_line .github/workflows/buildbuddy.yml gcp-wasm-feature-submit 'runs-on: ubuntu-latest' &&
   job_has_line .github/workflows/buildbuddy.yml gcp-wasm-feature-submit 'timeout-minutes: 20' &&
   job_has_line .github/workflows/buildbuddy.yml gcp-wasm-feature-submit 'fetch-depth: 1' &&
-  job_has_line .github/workflows/buildbuddy.yml gcp-wasm-feature-submit "CI_STARTED_AT_EPOCH: \${{ inputs.ci_started_at_epoch || needs.gcp-control-plane-up.outputs.started_at_epoch }}" &&
+  job_has_line .github/workflows/buildbuddy.yml gcp-wasm-feature-submit "CI_STARTED_AT_EPOCH: \${{ needs.gcp-control-plane-up.outputs.started_at_epoch }}" &&
   job_has_line .github/workflows/buildbuddy.yml gcp-wasm-feature-submit 'group: gcp-wasm-feature' &&
   job_has_line .github/workflows/buildbuddy.yml gcp-wasm-feature-submit 'profile: submitter' &&
   job_has_line .github/workflows/buildbuddy.yml gcp-wasm-feature-submit "mode: \${{ inputs.mode || vars.MEERKAT_BUILDBUDDY_CI_MODE || 'full-fresh' }}" &&
-  job_has_line .github/workflows/buildbuddy.yml gate 'runs-on: ubuntu-latest'; then
+  job_has_line .github/workflows/buildbuddy.yml gate 'runs-on: ubuntu-latest' &&
+  job_has_line .github/workflows/buildbuddy.yml gate "CI_STARTED_AT_EPOCH: \${{ inputs.ci_started_at_epoch || needs.gcp-control-plane-up.outputs.started_at_epoch }}"; then
   pass "GCP BuildBuddy CI uses a few GitHub-hosted submitters with Bazel lane fanout"
 else
   bad "GCP BuildBuddy CI is not using the bounded few-submitter GCP fanout shape"
