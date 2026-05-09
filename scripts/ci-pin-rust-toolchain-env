@@ -19,27 +19,42 @@ if ! command -v rustup >/dev/null 2>&1; then
   exit 1
 fi
 
-rustup component add --toolchain "${toolchain}" rustfmt clippy >/dev/null
+wrapper_root="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/meerkat-rust-toolchains"
+wrapper_bin="${wrapper_root}/${toolchain}/bin"
+mkdir -p "${wrapper_bin}"
 
-cargo_path="$(rustup which --toolchain "${toolchain}" cargo)"
-rustc_path="$(rustup which --toolchain "${toolchain}" rustc)"
-rustdoc_path="$(rustup which --toolchain "${toolchain}" rustdoc)"
-rustfmt_path="$(rustup which --toolchain "${toolchain}" rustfmt)"
-toolchain_bin="$(dirname "${cargo_path}")"
+write_wrapper() {
+  local tool="$1"
+  local path="${wrapper_bin}/${tool}"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'exec rustup run %q %q "$@"\n' "${toolchain}" "${tool}"
+  } >"${path}"
+  chmod +x "${path}"
+}
+
+write_wrapper cargo
+write_wrapper rustc
+write_wrapper rustdoc
+write_wrapper rustfmt
+
+resolved_cargo_path="$(rustup which --toolchain "${toolchain}" cargo)"
+resolved_toolchain_bin="$(dirname "${resolved_cargo_path}")"
 
 echo "Pinned Rust toolchain: ${toolchain}"
-"${rustc_path}" -Vv
+"${wrapper_bin}/rustc" -Vv
 
 if [[ -n "${GITHUB_PATH:-}" ]]; then
-  echo "${toolchain_bin}" >>"${GITHUB_PATH}"
+  echo "${wrapper_bin}" >>"${GITHUB_PATH}"
 fi
 
 if [[ -n "${GITHUB_ENV:-}" ]]; then
   {
     echo "RUSTUP_TOOLCHAIN=${toolchain}"
-    echo "RUSTC=${rustc_path}"
-    echo "RUSTDOC=${rustdoc_path}"
-    echo "RUSTFMT=${rustfmt_path}"
-    echo "MEERKAT_RUST_TOOLCHAIN_BIN=${toolchain_bin}"
+    echo "RUSTC=${wrapper_bin}/rustc"
+    echo "RUSTDOC=${wrapper_bin}/rustdoc"
+    echo "RUSTFMT=${wrapper_bin}/rustfmt"
+    echo "MEERKAT_RUST_TOOLCHAIN_BIN=${wrapper_bin}"
+    echo "MEERKAT_RUST_RESOLVED_TOOLCHAIN_BIN=${resolved_toolchain_bin}"
   } >>"${GITHUB_ENV}"
 fi

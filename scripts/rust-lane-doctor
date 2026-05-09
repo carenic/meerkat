@@ -158,12 +158,18 @@ else
 fi
 
 rust_channel="$(awk -F '"' '/^[[:space:]]*channel[[:space:]]*=/ { print $2; exit }' rust-toolchain.toml)"
+default_rustc_release=""
+if [[ -x "${default_rustc}" ]]; then
+  default_rustc_verbose="$("${default_rustc}" -Vv 2>/dev/null || true)"
+  default_rustc_release="$(printf '%s\n' "${default_rustc_verbose}" | awk -F ': ' '$1 == "release" { print $2; exit }')"
+fi
 if [[ -n "${rust_channel}" ]] &&
-  [[ "${default_rustc}" == *"/toolchains/${rust_channel}-"*"/bin/rustc" ]] &&
-  [[ "${default_toolchain_bin}" == *"/toolchains/${rust_channel}-"*"/bin" ]]; then
-  pass "repo-cargo resolves exact pinned Rust toolchain binaries"
+  [[ "${default_rustc_release}" == "${rust_channel}" ]] &&
+  [[ "${default_rustc}" == "${default_target}/.repo-cargo-toolchain-bin/rustc" ]] &&
+  [[ "${default_toolchain_bin}" == "${default_target}/.repo-cargo-toolchain-bin" ]]; then
+  pass "repo-cargo resolves stable pinned Rust toolchain wrappers"
 else
-  bad "repo-cargo does not resolve exact pinned Rust toolchain binaries"
+  bad "repo-cargo does not resolve stable pinned Rust toolchain wrappers"
 fi
 
 if [[ -n "${rust_channel}" ]] &&
@@ -189,7 +195,7 @@ if [[ -n "${rust_channel}" ]] &&
   grep -Fq "scripts/ci-pin-rust-toolchain-env" .github/actions/setup-buildbuddy-ci/action.yml &&
   grep -Fq "RUSTC=" scripts/ci-pin-rust-toolchain-env &&
   grep -Fq 'GITHUB_PATH' scripts/ci-pin-rust-toolchain-env; then
-  pass "Cargo and BuildBuddy CI export exact pinned Rust toolchain binaries"
+  pass "Cargo and BuildBuddy CI export stable pinned Rust toolchain wrappers"
 else
   bad "Cargo or BuildBuddy CI can fall back to runner Rust binaries"
 fi

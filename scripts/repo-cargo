@@ -34,6 +34,7 @@ toolchain_cargo=""
 toolchain_rustc=""
 toolchain_rustdoc=""
 toolchain_rustfmt=""
+resolved_toolchain_bin=""
 
 if [[ -n "${RUSTUP_TOOLCHAIN:-}" ]]; then
   toolchain_spec="${RUSTUP_TOOLCHAIN}"
@@ -59,7 +60,7 @@ if [[ -n "${toolchain_spec}" ]] && command -v rustup >/dev/null 2>&1; then
   toolchain_rustdoc="$(rustup which --toolchain "${toolchain_spec}" rustdoc 2>/dev/null || true)"
   toolchain_rustfmt="$(rustup which --toolchain "${toolchain_spec}" rustfmt 2>/dev/null || true)"
   if [[ -n "${toolchain_cargo}" ]]; then
-    toolchain_bin="$(dirname "${toolchain_cargo}")"
+    resolved_toolchain_bin="$(dirname "${toolchain_cargo}")"
   fi
 fi
 
@@ -112,6 +113,23 @@ if [[ "${GITHUB_ACTIONS:-}" == "true" && "${target_dir_was_set}" == "false" ]]; 
   fi
 fi
 
+if [[ -n "${toolchain_spec}" ]] && command -v rustup >/dev/null 2>&1; then
+  toolchain_bin="${CARGO_TARGET_DIR}/.repo-cargo-toolchain-bin"
+  mkdir -p "${toolchain_bin}"
+  for tool in cargo rustc rustdoc rustfmt; do
+    tool_path="${toolchain_bin}/${tool}"
+    {
+      printf '#!/usr/bin/env bash\n'
+      printf 'exec rustup run %q %q "$@"\n' "${toolchain_spec}" "${tool}"
+    } >"${tool_path}"
+    chmod +x "${tool_path}"
+  done
+  toolchain_cargo="${toolchain_bin}/cargo"
+  toolchain_rustc="${toolchain_bin}/rustc"
+  toolchain_rustdoc="${toolchain_bin}/rustdoc"
+  toolchain_rustfmt="${toolchain_bin}/rustfmt"
+fi
+
 if [[ "${1-}" == "--print-env" ]]; then
   printf '%s\n' \
     "repo_root=${repo_root}" \
@@ -125,6 +143,7 @@ if [[ "${1-}" == "--print-env" ]]; then
     "RUSTC=${toolchain_rustc}" \
     "RUSTDOC=${toolchain_rustdoc}" \
     "RUSTFMT=${toolchain_rustfmt}" \
+    "MEERKAT_RUST_RESOLVED_TOOLCHAIN_BIN=${resolved_toolchain_bin}" \
     "lane_key=${lane_key}" \
     "CARGO_HOME=${CARGO_HOME}" \
     "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}"
@@ -151,6 +170,7 @@ if [[ "${1-}" == "--doctor" ]]; then
     "RUSTC=${toolchain_rustc}" \
     "RUSTDOC=${toolchain_rustdoc}" \
     "RUSTFMT=${toolchain_rustfmt}" \
+    "MEERKAT_RUST_RESOLVED_TOOLCHAIN_BIN=${resolved_toolchain_bin}" \
     "lane_key=${lane_key}" \
     "CARGO_HOME=${CARGO_HOME}" \
     "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}"
