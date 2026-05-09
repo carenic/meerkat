@@ -40,7 +40,11 @@ permissions:
 jobs:
   cargo:
     name: GHA Cargo
-    if: ${{ github.event_name != 'workflow_dispatch' || inputs.lane == 'cargo' }}
+    if: >-
+      ${{
+        (github.event_name == 'workflow_dispatch' && inputs.lane == 'cargo') ||
+        (github.event_name != 'workflow_dispatch' && github.actor != 'lukacf')
+      }}
     uses: ./.github/workflows/cargo.yml
     with:
       base_sha: >-
@@ -52,7 +56,13 @@ jobs:
 
   gcp-buildbuddy:
     name: GCP BuildBuddy
-    if: ${{ github.event_name == 'workflow_dispatch' && inputs.lane == 'gcp-buildbuddy' && github.actor == 'lukacf' }}
+    if: >-
+      ${{
+        github.actor == 'lukacf' &&
+        ((github.event_name == 'workflow_dispatch' && inputs.lane == 'gcp-buildbuddy') ||
+         github.event_name == 'push' ||
+         github.event_name == 'pull_request')
+      }}
     uses: ./.github/workflows/buildbuddy.yml
     with:
       mode: ${{ inputs.mode || 'full-fresh' }}
