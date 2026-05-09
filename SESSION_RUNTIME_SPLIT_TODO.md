@@ -79,13 +79,15 @@ self-verify.
 
 ### Phase 0 — Foundation (sequential, must land before any wave)
 
-- [ ] fix · [ ] verify · **F1.** Add `meerkat-live` as an optional
+- [x] fix · [x] verify · **F1.** Add `meerkat-live` as an optional
   dep on the `meerkat` facade, gated by a new `live` feature
   (`meerkat/Cargo.toml`). Re-export `meerkat_live::*` under
   `meerkat::live` when the feature is enabled. Update CI feature
-  matrix to cover the new feature axis.
+  matrix to cover the new feature axis. *Verify: `cargo check -p
+  meerkat` and `cargo check -p meerkat --features live` both clean
+  at d8e8220aa.*
 
-- [ ] fix · [ ] verify · **F2.** Create
+- [x] fix · [x] verify · **F2.** Create
   `meerkat/src/session_runtime/mod.rs` with:
   - `pub struct MeerkatSessionRuntime` (empty shell, all
     fields pub(crate))
@@ -96,16 +98,20 @@ self-verify.
   - Re-export from `meerkat::session_runtime::{MeerkatSessionRuntime,
     SessionRuntimeBuilder, SessionInfo, SessionState,
     LiveOpenPrecheckError}`
+  *Verify: skeleton compiles; `meerkat::session_runtime::*` resolves
+  from facade re-exports.*
 
-- [ ] fix · [ ] verify · **F3.** Define a typed error taxonomy in
+- [x] fix · [x] verify · **F3.** Define a typed error taxonomy in
   `meerkat::session_runtime::errors` that does NOT depend on
   `meerkat_rpc::error::RpcError`. Use `thiserror`-derived enums with
   stable `code()` methods. Surfaces map these to their wire errors
   (RpcError, axum::Response, JS Error, etc.). Source the existing
   enum bodies from `meerkat-rpc/src/error.rs` and
-  `LiveOpenPrecheckError` in `session_runtime.rs:130`.
+  `LiveOpenPrecheckError` in `session_runtime.rs:130`. *Verify:
+  variants and `code()` slugs are surface-agnostic; no RPC type in
+  signature.*
 
-- [x] fix · [ ] verify · **F4.** Audit every symbol the W1/W2/W3
+- [x] fix · [x] verify · **F4.** Audit every symbol the W1/W2/W3
   moves will need. Listing below — the contract Wave 1/2/3 fulfills.
   Source line numbers are pinned at commit `b4b420d35`; subsequent
   diffs may re-number but the symbol identity is stable.
@@ -198,7 +204,7 @@ self-verify.
 
 ### Phase 1 — Wave 1: pure session-orchestration types (parallel by file)
 
-- [ ] fix · [ ] verify · **W1-A.** Move
+- [x] fix · [ ] verify · **W1-A.** Move
   `StagedCapacityAdmissions` (typedef + helpers
   `take_staged_capacity_admission`, `insert_staged_capacity_admission`,
   `has_staged_capacity_admission`, `discard_staged_capacity_admission`,

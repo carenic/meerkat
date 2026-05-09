@@ -192,8 +192,14 @@ type RecoverableServiceApplyRuntimeTurnResultReceiver = tokio::sync::oneshot::Re
     Result<CoreApplyOutput, SessionError>,
     Option<ActiveCapacityGuard>,
 )>;
-type ActiveCapacityGuard = meerkat::RuntimeContextAdmissionGuard;
-type StagedCapacityAdmissions = Arc<StdMutex<HashMap<SessionId, ActiveCapacityGuard>>>;
+pub(crate) use meerkat::session_runtime::admission::{
+    ActiveCapacityGuard, StagedCapacityAdmissions, StagedCapacityCollision,
+    discard_staged_capacity_admission as admission_discard_staged_capacity,
+    has_staged_capacity_admission as admission_has_staged_capacity,
+    insert_staged_capacity_admission as admission_insert_staged_capacity,
+    restore_staged_capacity_admission,
+    take_staged_capacity_admission as admission_take_staged_capacity,
+};
 
 #[derive(Clone)]
 struct StagedAdmissionRestore {
@@ -616,17 +622,6 @@ impl Drop for StagedArchiveRollbackGuard {
             let _ = staged_sessions.restore_archive(&session_id).await;
         });
     }
-}
-
-fn restore_staged_capacity_admission(
-    admissions: &StagedCapacityAdmissions,
-    session_id: SessionId,
-    admission: ActiveCapacityGuard,
-) {
-    let mut admissions = admissions
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    admissions.insert(session_id, admission);
 }
 
 impl RuntimePreAdmission {
@@ -3090,40 +3085,27 @@ impl SessionRuntime {
         session_id: SessionId,
         admission: ActiveCapacityGuard,
     ) -> Result<(), RpcError> {
-        let mut admissions = self
-            .staged_capacity_admissions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if admissions.contains_key(&session_id) {
-            return Err(RpcError {
+        admission_insert_staged_capacity(&self.staged_capacity_admissions, session_id, admission)
+            .map_err(|StagedCapacityCollision { session_id }| RpcError {
                 code: error::SESSION_BUSY,
                 message: format!("session {session_id} already has staged capacity"),
                 data: None,
-            });
-        }
-        admissions.insert(session_id, admission);
-        Ok(())
+            })
     }
 
     fn take_staged_capacity_admission(
         &self,
         session_id: &SessionId,
     ) -> Option<ActiveCapacityGuard> {
-        self.staged_capacity_admissions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .remove(session_id)
+        admission_take_staged_capacity(&self.staged_capacity_admissions, session_id)
     }
 
     fn has_staged_capacity_admission(&self, session_id: &SessionId) -> bool {
-        self.staged_capacity_admissions
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains_key(session_id)
+        admission_has_staged_capacity(&self.staged_capacity_admissions, session_id)
     }
 
     fn discard_staged_capacity_admission(&self, session_id: &SessionId) {
-        drop(self.take_staged_capacity_admission(session_id));
+        admission_discard_staged_capacity(&self.staged_capacity_admissions, session_id);
     }
 
     pub(crate) fn take_runtime_pre_admission(
