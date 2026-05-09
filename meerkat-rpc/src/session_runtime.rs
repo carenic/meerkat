@@ -8749,7 +8749,7 @@ mod tests {
             auth_binding: None,
         };
         let new = SessionLlmIdentity {
-            model: "gpt-realtime-1.5".to_string(),
+            model: "gpt-realtime-prior".to_string(),
             ..prev.clone()
         };
         assert!(
@@ -8918,15 +8918,15 @@ mod tests {
         use meerkat_core::model_profile::capabilities::capabilities_for;
 
         let realtime = capabilities_for(Provider::OpenAI, "gpt-realtime-2")
-            .expect("gpt-realtime should be present in the catalog");
+            .expect("gpt-realtime-2 should be present in the catalog");
         assert!(
             realtime.realtime,
-            "gpt-realtime is the canonical realtime alias; capability row must mark it realtime"
+            "gpt-realtime-2 is the canonical realtime model; capability row must mark it realtime"
         );
-
-        let realtime_15 = capabilities_for(Provider::OpenAI, "gpt-realtime-1.5")
-            .expect("gpt-realtime-1.5 should be present in the catalog");
-        assert!(realtime_15.realtime);
+        // Round-5 catalog cleanup retired `gpt-realtime` and
+        // `gpt-realtime-1.5`; gpt-realtime-2 is the only realtime row
+        // in the catalog now. The B18/B19 precheck and surface
+        // capability projections all flow through this single row.
 
         // Pick an arbitrary non-realtime OpenAI model from the catalog to
         // confirm the negative path: Codex/standard chat models are not
@@ -19584,7 +19584,10 @@ mod tests {
         assert_eq!(info.model, "gpt-realtime-2");
         assert_eq!(info.provider, "openai");
         assert!(capabilities.realtime);
-        assert!(!capabilities.image_input);
+        // gpt-realtime-2 accepts text + audio + image input per
+        // OpenAI's model docs; the catalog row sets `vision: true`
+        // and the surface projection mirrors that as `image_input`.
+        assert!(capabilities.image_input);
         assert!(!capabilities.image_tool_results);
         assert!(!capabilities.web_search);
     }
@@ -21200,25 +21203,28 @@ mod tests {
     /// host-recorded bound identity differs from the new resolved identity
     /// for the channel's session.
     ///
-    /// Both identities are realtime-capable OpenAI models (gpt-realtime
-    /// vs. gpt-realtime-1.5) so `precheck_live_open` returns OK and the
-    /// flow actually reaches the R11 swap-detection branch. Without the
-    /// realtime-capable mock identity, precheck would close the channel
-    /// first and the swap branch would never execute (CC2 verifier finding).
+    /// Session identity is realtime-capable (`gpt-realtime-2`) so
+    /// `precheck_live_open` returns OK and the flow reaches the R11
+    /// swap-detection branch. The bound identity uses a synthetic prior
+    /// model name (`gpt-realtime-prior`) — only the swap-detection
+    /// string compare reads it; the catalog is never consulted for the
+    /// bound side. The Round-5 catalog cleanup retired
+    /// `gpt-realtime-1.5`, so this test uses the synthetic name to keep
+    /// the swap-detection assertion exercising the correct branch.
     #[tokio::test]
     async fn r11_propagate_closes_channel_on_model_id_swap() {
         let temp = tempfile::tempdir().expect("tempdir");
         let mut runtime = make_runtime(temp_factory(&temp), 10);
         runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
 
-        // Session resolved identity: gpt-realtime-1.5 (realtime + OpenAI).
+        // Session resolved identity: gpt-realtime-2 (realtime + OpenAI).
         // We materialize the session via `start_turn` so
         // `live_open_config_for_session` (called inside `propagate_config_to_live_channels`)
         // can resolve a real open_config — staged sessions miss the live
         // service map and would surface NotFound, causing the swap branch
         // to be skipped entirely (the verifier's CC2 finding).
         let session_id = runtime
-            .create_session(realtime_build_config("gpt-realtime-1.5"), None, None)
+            .create_session(realtime_build_config("gpt-realtime-2"), None, None)
             .await
             .expect("create_session for live channel");
         let (event_tx, _rx) = mpsc::channel(100);
@@ -21253,11 +21259,13 @@ mod tests {
             .await
             .expect("attach_adapter");
 
-        // Bound identity: gpt-realtime (the *prior* model the channel was
-        // opened with). Different from the session's resolved identity
-        // (gpt-realtime-1.5), so the swap branch fires.
+        // Bound identity: synthetic `gpt-realtime-prior` (the *prior*
+        // model the channel was opened with). Different from the
+        // session's resolved identity (gpt-realtime-2), so the swap
+        // branch fires. The catalog isn't consulted for bound — only
+        // the model+provider string compare runs against it.
         let stale_bound = SessionLlmIdentity {
-            model: "gpt-realtime-2".to_string(),
+            model: "gpt-realtime-prior".to_string(),
             provider: meerkat_core::Provider::OpenAI,
             self_hosted_server_id: None,
             provider_params: None,
@@ -21304,7 +21312,7 @@ mod tests {
                         assert!(
                             reason.contains("model_swap")
                                 && reason.contains("gpt-realtime-2")
-                                && reason.contains("gpt-realtime-1.5"),
+                                && reason.contains("gpt-realtime-prior"),
                             "ConfigRejected.reason must name swap + both model ids; got: {reason}"
                         );
                         assert_eq!(
@@ -21339,7 +21347,7 @@ mod tests {
         runtime.set_default_llm_client(Some(Arc::new(MockLlmClient)));
 
         let session_id = runtime
-            .create_session(realtime_build_config("gpt-realtime-1.5"), None, None)
+            .create_session(realtime_build_config("gpt-realtime-2"), None, None)
             .await
             .expect("create_session for live channel");
 
@@ -21397,7 +21405,7 @@ mod tests {
 
         runtime.propagate_config_to_live_channels().await;
 
-        // CC2: precheck must succeed (gpt-realtime-1.5 is realtime + OpenAI),
+        // CC2: precheck must succeed (gpt-realtime-2 is realtime + OpenAI),
         // so the no-swap branch must dispatch exactly one Refresh and leave
         // the channel open. The earlier "tolerate precheck close" allowance
         // is gone — if status is Closed here, the R11 wiring is broken.
