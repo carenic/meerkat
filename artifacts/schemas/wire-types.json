@@ -22653,6 +22653,1280 @@
     "title": "WireInputStateHistoryEntry",
     "type": "object"
   },
+  "WireLiveAdapterErrorCode": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Wire mirror of [`meerkat_core::live_adapter::LiveAdapterErrorCode`].\n\nInternally-tagged on `code` (snake_case). SDK consumers route on `code`\nto distinguish payload-less variants from typed payload variants\n(`config_rejected { reason }`, `other { raw }`). FIX-SDK-OBS: makes the\nR5-9 `CommandRejected` observation's typed code visible at the SDK\nboundary instead of a free-form blob.",
+    "oneOf": [
+      {
+        "properties": {
+          "code": {
+            "const": "connection_failed",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "code": {
+            "const": "connection_lost",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "code": {
+            "const": "config_rejected",
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "reason"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "code": {
+            "const": "provider_error",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "code": {
+            "const": "authentication_failed",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "code": {
+            "const": "internal_error",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "code": {
+            "const": "other",
+            "type": "string"
+          },
+          "raw": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "raw"
+        ],
+        "type": "object"
+      }
+    ],
+    "title": "WireLiveAdapterErrorCode"
+  },
+  "WireLiveAdapterObservation": {
+    "$defs": {
+      "RealtimeTranscriptEvent": {
+        "description": "A typed, identity-bearing realtime transcript event consumed by the session.",
+        "oneOf": [
+          {
+            "description": "Observe a provider item and its causal predecessor without committing\ncontent yet.",
+            "properties": {
+              "item_id": {
+                "type": "string"
+              },
+              "previous_item_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "response_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "role": {
+                "$ref": "#/$defs/RealtimeTranscriptRole"
+              },
+              "type": {
+                "const": "item_observed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "item_id",
+              "role"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Observe a provider item that participates in provider causal ordering\nbut must not materialize transcript content.",
+            "properties": {
+              "item_id": {
+                "type": "string"
+              },
+              "previous_item_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "const": "item_skipped",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "item_id"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Provider finalized the transcript for a user input item.",
+            "properties": {
+              "content_index": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "item_id": {
+                "type": "string"
+              },
+              "previous_item_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "const": "user_transcript_final",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "item_id",
+              "content_index",
+              "text"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Provider emitted an assistant **display-text** delta for an output\nitem — authored text the model writes (e.g. OpenAI realtime\n`response.output_text.delta`).\n\nMaterializes as [`crate::types::AssistantBlock::Text`].",
+            "properties": {
+              "content_index": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "delta": {
+                "type": "string"
+              },
+              "delta_id": {
+                "type": "string"
+              },
+              "item_id": {
+                "type": "string"
+              },
+              "previous_item_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "response_id": {
+                "type": "string"
+              },
+              "type": {
+                "const": "assistant_text_delta",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "response_id",
+              "delta_id",
+              "item_id",
+              "content_index",
+              "delta"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Provider emitted an assistant **spoken-transcript** delta for an\noutput item — text derived from audio output (e.g. OpenAI realtime\n`response.output_audio_transcript.delta`).\n\nIdentity shape mirrors [`Self::AssistantTextDelta`] so the session's\nidempotent ordering / staging logic owns dedup uniformly across\nlanes. Materializes as [`crate::types::AssistantBlock::Transcript`]\nwith `source: TranscriptSource::Spoken` (T9/T10).",
+            "properties": {
+              "content_index": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "delta": {
+                "type": "string"
+              },
+              "delta_id": {
+                "type": "string"
+              },
+              "item_id": {
+                "type": "string"
+              },
+              "previous_item_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "response_id": {
+                "type": "string"
+              },
+              "type": {
+                "const": "assistant_transcript_delta",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "response_id",
+              "delta_id",
+              "item_id",
+              "content_index",
+              "delta"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Provider reported the assistant output item was truncated to the heard\ntranscript prefix.",
+            "properties": {
+              "content_index": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "item_id": {
+                "type": "string"
+              },
+              "response_id": {
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "const": "assistant_transcript_truncated",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "response_id",
+              "item_id",
+              "content_index",
+              "text"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "R5-7: provider supplied authoritative final transcript text for an\nassistant output item, overriding any incomplete delta accumulation.\n\nNecessary for two cases:\n  1. Final-only providers that emit a single `AssistantTranscriptFinal`\n     observation without prior deltas.\n  2. Recovery from delta loss (R5-1: lossy media lane back-pressure\n     may drop transcript deltas; the final's text is the authoritative\n     reconciliation).\n\nThe materializer locates the staged item by\n`(response_id, item_id, content_index)`, replaces its accumulated\ncontent with `text`, and (if no item is staged yet) creates one on\nthe spoken lane. Flush still happens via `AssistantTurnCompleted`;\nthis variant only updates the staged content.",
+            "properties": {
+              "content_index": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "item_id": {
+                "type": "string"
+              },
+              "response_id": {
+                "type": "string"
+              },
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "const": "assistant_transcript_final_text",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "response_id",
+              "item_id",
+              "content_index",
+              "text"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Provider turn reached a terminal boundary. The session decides which\nstaged assistant items, if any, are now canonical.",
+            "properties": {
+              "response_id": {
+                "type": "string"
+              },
+              "stop_reason": {
+                "$ref": "#/$defs/StopReason"
+              },
+              "type": {
+                "const": "assistant_turn_completed",
+                "type": "string"
+              },
+              "usage": {
+                "$ref": "#/$defs/Usage"
+              }
+            },
+            "required": [
+              "type",
+              "response_id",
+              "stop_reason",
+              "usage"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Provider turn was interrupted before terminal materialization.",
+            "properties": {
+              "response_id": {
+                "type": "string"
+              },
+              "type": {
+                "const": "assistant_turn_interrupted",
+                "type": "string"
+              }
+            },
+            "required": [
+              "type",
+              "response_id"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "RealtimeTranscriptRole": {
+        "description": "Provider-neutral role for a realtime transcript item.",
+        "enum": [
+          "user",
+          "assistant"
+        ],
+        "type": "string"
+      },
+      "StopReason": {
+        "description": "Why the model stopped generating",
+        "oneOf": [
+          {
+            "const": "end_turn",
+            "description": "Model finished naturally",
+            "type": "string"
+          },
+          {
+            "const": "tool_use",
+            "description": "Model wants to call tools",
+            "type": "string"
+          },
+          {
+            "const": "max_tokens",
+            "description": "Hit max output tokens",
+            "type": "string"
+          },
+          {
+            "const": "stop_sequence",
+            "description": "Hit a stop sequence",
+            "type": "string"
+          },
+          {
+            "const": "content_filter",
+            "description": "Blocked by content filter",
+            "type": "string"
+          },
+          {
+            "const": "cancelled",
+            "description": "Request was cancelled",
+            "type": "string"
+          }
+        ]
+      },
+      "Usage": {
+        "description": "Token usage statistics",
+        "properties": {
+          "cache_creation_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "cache_read_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "input_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "output_tokens": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "input_tokens",
+          "output_tokens"
+        ],
+        "type": "object"
+      },
+      "WireLiveAdapterErrorCode": {
+        "description": "Wire mirror of [`meerkat_core::live_adapter::LiveAdapterErrorCode`].\n\nInternally-tagged on `code` (snake_case). SDK consumers route on `code`\nto distinguish payload-less variants from typed payload variants\n(`config_rejected { reason }`, `other { raw }`). FIX-SDK-OBS: makes the\nR5-9 `CommandRejected` observation's typed code visible at the SDK\nboundary instead of a free-form blob.",
+        "oneOf": [
+          {
+            "properties": {
+              "code": {
+                "const": "connection_failed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "code"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "code": {
+                "const": "connection_lost",
+                "type": "string"
+              }
+            },
+            "required": [
+              "code"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "code": {
+                "const": "config_rejected",
+                "type": "string"
+              },
+              "reason": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "code": {
+                "const": "provider_error",
+                "type": "string"
+              }
+            },
+            "required": [
+              "code"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "code": {
+                "const": "authentication_failed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "code"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "code": {
+                "const": "internal_error",
+                "type": "string"
+              }
+            },
+            "required": [
+              "code"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "code": {
+                "const": "other",
+                "type": "string"
+              },
+              "raw": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "raw"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WireLiveAdapterStatus": {
+        "description": "Wire mirror of [`meerkat_core::live_adapter::LiveAdapterStatus`].\n\nInternally-tagged on `status` (snake_case). The `degraded` variant\nreferences [`WireLiveDegradationReason`] so the typed reason is visible at\nthe SDK boundary.",
+        "oneOf": [
+          {
+            "properties": {
+              "status": {
+                "const": "idle",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "status": {
+                "const": "opening",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "status": {
+                "const": "ready",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "reason": {
+                "$ref": "#/$defs/WireLiveDegradationReason"
+              },
+              "status": {
+                "const": "degraded",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "reason"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "status": {
+                "const": "closing",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "status": {
+                "const": "closed",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WireLiveDegradationReason": {
+        "description": "Wire mirror of [`meerkat_core::live_adapter::LiveDegradationReason`].\n\nInternally-tagged on `kind` (snake_case) — matches the core enum's serde\nshape exactly. SDK consumers route on `kind` to distinguish the\nnon-payload variants from the typed `other { detail }` payload.",
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "rate_limited",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "provider_throttled",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "network_unstable",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "detail": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "other",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "detail"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WireStopReason": {
+        "description": "Canonical stop reason for transcript messages.",
+        "enum": [
+          "end_turn",
+          "tool_use",
+          "max_tokens",
+          "stop_sequence",
+          "content_filter",
+          "cancelled"
+        ],
+        "type": "string"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Wire mirror of [`meerkat_core::live_adapter::LiveAdapterObservation`].\n\nFIX-SDK-OBS: closes the R5-4 verifier gap. The core enum is the canonical\nshape adapters emit, but it is not registered for schema emission and is\ntherefore invisible at the SDK boundary — browser/Python clients receive\nobservations as untyped JSON and cannot type-narrow on\n`assistant_audio_chunk` (to read the new `item_id` / `response_id` /\n`content_index` fields driving `live/truncate`) or on `command_rejected`\n(a typed channel-survives error introduced in R5-9). The wire mirror\nmakes every variant visible to schema codegen and produces a discriminated\nTypeScript union / typed Python `TypedDict` union.\n\nSerde shape mirrors the core enum exactly: internally-tagged on\n`observation` (snake_case). Round-trip with the core type is byte-\nidentical (see `wire_live_adapter_observation_byte_compatible_with_core`).\n\nField types reference other wire mirrors where they exist\n([`WireStopReason`], [`WireUsage`], [`WireLiveAdapterStatus`],\n[`WireLiveAdapterErrorCode`]) and the canonical\n[`RealtimeTranscriptEvent`] (which already derives `JsonSchema` and is\nauto-promoted by the SDK codegen `Realtime*` allowlist rule).\n\nAudio data is base64-encoded on the wire (matches the core\n[`LiveAdapterObservation::AssistantAudioChunk`] base64 mode); the wire\nmirror carries `data` as a `String` so the schema emits `String` instead\nof an opaque `Vec<u8>` JSON-array shape.",
+    "oneOf": [
+      {
+        "properties": {
+          "observation": {
+            "const": "ready",
+            "type": "string"
+          }
+        },
+        "required": [
+          "observation"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "content_index": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "observation": {
+            "const": "user_transcript_final",
+            "type": "string"
+          },
+          "previous_item_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider_item_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "text": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "observation",
+          "text"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "content_index": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "delta": {
+            "type": "string"
+          },
+          "delta_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "observation": {
+            "const": "assistant_text_delta",
+            "type": "string"
+          },
+          "previous_item_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider_item_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "response_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "observation",
+          "delta"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "content_index": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "delta": {
+            "type": "string"
+          },
+          "delta_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "observation": {
+            "const": "assistant_transcript_delta",
+            "type": "string"
+          },
+          "previous_item_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider_item_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "response_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "observation",
+          "delta"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "R5-4: identity fields (`response_id`, `item_id`, `content_index`)\npropagate the source server-event identity so clients can attach a\nplayback cursor to a provider item without racing on the\ntranscript-delta arrival order.",
+        "properties": {
+          "channels": {
+            "format": "uint16",
+            "maximum": 65535,
+            "minimum": 0,
+            "type": "integer"
+          },
+          "content_index": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "data": {
+            "description": "Base64-encoded PCM payload. Matches the core\n[`LiveAdapterObservation::AssistantAudioChunk`] serde shape.",
+            "type": "string"
+          },
+          "item_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "observation": {
+            "const": "assistant_audio_chunk",
+            "type": "string"
+          },
+          "response_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "sample_rate_hz": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "observation",
+          "data",
+          "sample_rate_hz",
+          "channels"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "content_index": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "observation": {
+            "const": "assistant_transcript_final",
+            "type": "string"
+          },
+          "previous_item_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider_item_id": {
+            "type": "string"
+          },
+          "response_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stop_reason": {
+            "$ref": "#/$defs/WireStopReason"
+          },
+          "text": {
+            "type": "string"
+          },
+          "usage": true
+        },
+        "required": [
+          "observation",
+          "provider_item_id",
+          "text",
+          "stop_reason",
+          "usage"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "content_index": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "observation": {
+            "const": "assistant_transcript_truncated",
+            "type": "string"
+          },
+          "previous_item_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "provider_item_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "response_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "text": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "observation"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "Pass-through of a structured `RealtimeTranscriptEvent` from the\nprovider. The core type already derives `JsonSchema` and the SDK\ncodegen auto-promotes `Realtime*` schemas, so the typed shape lands\nin generated SDK types without an additional wire mirror.",
+        "properties": {
+          "event": {
+            "$ref": "#/$defs/RealtimeTranscriptEvent"
+          },
+          "observation": {
+            "const": "realtime_transcript",
+            "type": "string"
+          }
+        },
+        "required": [
+          "observation",
+          "event"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "arguments": true,
+          "observation": {
+            "const": "tool_call_requested",
+            "type": "string"
+          },
+          "provider_call_id": {
+            "type": "string"
+          },
+          "tool_name": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "observation",
+          "provider_call_id",
+          "tool_name",
+          "arguments"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "Barge-in: the user interrupted the assistant mid-turn.",
+        "properties": {
+          "observation": {
+            "const": "turn_interrupted",
+            "type": "string"
+          }
+        },
+        "required": [
+          "observation"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "observation": {
+            "const": "turn_completed",
+            "type": "string"
+          },
+          "response_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "stop_reason": {
+            "$ref": "#/$defs/WireStopReason"
+          },
+          "usage": true
+        },
+        "required": [
+          "observation",
+          "stop_reason",
+          "usage"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "observation": {
+            "const": "status_changed",
+            "type": "string"
+          },
+          "status": {
+            "$ref": "#/$defs/WireLiveAdapterStatus"
+          }
+        },
+        "required": [
+          "observation",
+          "status"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "code": {
+            "$ref": "#/$defs/WireLiveAdapterErrorCode"
+          },
+          "message": {
+            "type": "string"
+          },
+          "observation": {
+            "const": "error",
+            "type": "string"
+          }
+        },
+        "required": [
+          "observation",
+          "code",
+          "message"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "R5-9: scoped command rejection. Channel survives — distinct from\nterminal [`Self::Error`].",
+        "properties": {
+          "code": {
+            "$ref": "#/$defs/WireLiveAdapterErrorCode"
+          },
+          "message": {
+            "type": "string"
+          },
+          "observation": {
+            "const": "command_rejected",
+            "type": "string"
+          }
+        },
+        "required": [
+          "observation",
+          "code",
+          "message"
+        ],
+        "type": "object"
+      }
+    ],
+    "title": "WireLiveAdapterObservation"
+  },
+  "WireLiveAdapterStatus": {
+    "$defs": {
+      "WireLiveDegradationReason": {
+        "description": "Wire mirror of [`meerkat_core::live_adapter::LiveDegradationReason`].\n\nInternally-tagged on `kind` (snake_case) — matches the core enum's serde\nshape exactly. SDK consumers route on `kind` to distinguish the\nnon-payload variants from the typed `other { detail }` payload.",
+        "oneOf": [
+          {
+            "properties": {
+              "kind": {
+                "const": "rate_limited",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "provider_throttled",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "network_unstable",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "detail": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "other",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "detail"
+            ],
+            "type": "object"
+          }
+        ]
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Wire mirror of [`meerkat_core::live_adapter::LiveAdapterStatus`].\n\nInternally-tagged on `status` (snake_case). The `degraded` variant\nreferences [`WireLiveDegradationReason`] so the typed reason is visible at\nthe SDK boundary.",
+    "oneOf": [
+      {
+        "properties": {
+          "status": {
+            "const": "idle",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "status": {
+            "const": "opening",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "status": {
+            "const": "ready",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "reason": {
+            "$ref": "#/$defs/WireLiveDegradationReason"
+          },
+          "status": {
+            "const": "degraded",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "reason"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "status": {
+            "const": "closing",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "status": {
+            "const": "closed",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status"
+        ],
+        "type": "object"
+      }
+    ],
+    "title": "WireLiveAdapterStatus"
+  },
   "WireLiveChannelCapabilities": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "description": "Wire projection of [`meerkat_core::live_adapter::LiveChannelCapabilities`].\n\nTyped-boolean matrix advertised when a live channel opens. SDK consumers\n(Python `client.py`, TypeScript `client.ts`, Web SDK) get typed access to\n`image_in` / `video_in` / `transcript_supported` etc. without needing to\nhand-decode an opaque JSON object. CC5: closes the typed-surface gap that\nhid T8's \"anticipate `gpt-realtime-2`\" goal at the SDK boundary.\n\nField shape mirrors the core type 1:1 — adding a new capability requires\nextending both the core type and this mirror; the `From` impls below\nfail-closed if a field is dropped (compile error: missing field). New\nmodalities appear here as additional typed booleans, never as\nstringly-typed lists or provider-specific enums.",
@@ -22770,6 +24044,65 @@
       }
     ],
     "title": "WireLiveContinuityMode"
+  },
+  "WireLiveDegradationReason": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Wire mirror of [`meerkat_core::live_adapter::LiveDegradationReason`].\n\nInternally-tagged on `kind` (snake_case) — matches the core enum's serde\nshape exactly. SDK consumers route on `kind` to distinguish the\nnon-payload variants from the typed `other { detail }` payload.",
+    "oneOf": [
+      {
+        "properties": {
+          "kind": {
+            "const": "rate_limited",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "kind": {
+            "const": "provider_throttled",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "kind": {
+            "const": "network_unstable",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "type": "object"
+      },
+      {
+        "properties": {
+          "detail": {
+            "type": "string"
+          },
+          "kind": {
+            "const": "other",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "detail"
+        ],
+        "type": "object"
+      }
+    ],
+    "title": "WireLiveDegradationReason"
   },
   "WireLoginReady": {
     "$defs": {

@@ -49,6 +49,7 @@ import {
   type LiveSendInputParams,
   type LiveStatusResult,
   type LiveTruncateParams,
+  type WireLiveAdapterObservation,
   type MobTurnStartParams,
   type MobRotateSupervisorResult,
   type McpAddParams,
@@ -2366,6 +2367,52 @@ export class MeerkatClient {
 
   async liveRefresh(params: LiveChannelParams): Promise<void> {
     await this.request("live/refresh", params as unknown as Record<string, unknown>);
+  }
+
+  /**
+   * Type-narrow an inbound live-adapter observation against
+   * {@link WireLiveAdapterObservation}.
+   *
+   * Observations stream over the WS transport returned by `live/open` as
+   * JSON objects internally tagged on `observation` (`ready`,
+   * `assistant_audio_chunk`, `command_rejected`, …). The Meerkat SDK
+   * does not own the WS transport (browsers/Node clients connect the URL
+   * from `LiveOpenResult.transport` directly); this helper is a typed
+   * cast / runtime guard so callers can pattern-match each variant
+   * without re-typing the discriminator.
+   *
+   * Example:
+   * ```ts
+   * const obs = MeerkatClient.parseLiveObservation(JSON.parse(frame));
+   * switch (obs.observation) {
+   *   case "assistant_audio_chunk":
+   *     // Typed: obs.item_id, obs.response_id, obs.content_index — R5-4.
+   *     truncateAt(obs.item_id, obs.content_index);
+   *     break;
+   *   case "command_rejected":
+   *     // R5-9: typed channel-survives error.
+   *     handleRejection(obs.code, obs.message);
+   *     break;
+   * }
+   * ```
+   *
+   * FIX-SDK-OBS: closes the verifier gap that left
+   * `WireLiveAdapterObservation` invisible at the SDK boundary.
+   */
+  static parseLiveObservation(raw: unknown): WireLiveAdapterObservation {
+    if (raw === null || typeof raw !== "object") {
+      throw new MeerkatError(
+        "INVALID_RESPONSE",
+        "live observation must be a JSON object",
+      );
+    }
+    if (!("observation" in raw)) {
+      throw new MeerkatError(
+        "INVALID_RESPONSE",
+        "live observation missing `observation` discriminator",
+      );
+    }
+    return raw as WireLiveAdapterObservation;
   }
 
   // -- Auth + realm (Phase 4d) --------------------------------------------

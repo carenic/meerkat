@@ -971,13 +971,24 @@ impl Session {
                     RealtimeTranscriptRole::Assistant,
                     Some(response_id),
                 ) {
-                    promote_item_lane(item, TranscriptLane::Display);
-                    item.content_segments
-                        .entry(content_index)
-                        .or_default()
-                        .push_str(&delta);
-                    if response_completed && !item.text().is_empty() {
-                        item.ready = true;
+                    if !promote_item_lane(item, TranscriptLane::Display) {
+                        // R5-6 sibling: this delta was routed at a
+                        // Spoken-classified item (e.g. truncation arrived
+                        // first and locked the lane). `promote_item_lane`
+                        // already warned about the lane conflict; drop the
+                        // delta to preserve the lane invariant rather than
+                        // clobbering Spoken content with Display text.
+                        tracing::warn!(
+                            "AssistantTextDelta routed to a Spoken-lane item; dropping delta to preserve lane invariant — this indicates a provider lane-classification bug"
+                        );
+                    } else {
+                        item.content_segments
+                            .entry(content_index)
+                            .or_default()
+                            .push_str(&delta);
+                        if response_completed && !item.text().is_empty() {
+                            item.ready = true;
+                        }
                     }
                 }
             }
@@ -1017,13 +1028,23 @@ impl Session {
                     RealtimeTranscriptRole::Assistant,
                     Some(response_id),
                 ) {
-                    promote_item_lane(item, TranscriptLane::Spoken);
-                    item.content_segments
-                        .entry(content_index)
-                        .or_default()
-                        .push_str(&delta);
-                    if response_completed && !item.text().is_empty() {
-                        item.ready = true;
+                    if !promote_item_lane(item, TranscriptLane::Spoken) {
+                        // R5-6 sibling: this transcript delta arrived for a
+                        // Display-classified item (a Display delta or other
+                        // Display-lane event landed first). `promote_item_lane`
+                        // already warned; drop the delta rather than appending
+                        // Spoken text into a Display-locked content_segment.
+                        tracing::warn!(
+                            "AssistantTranscriptDelta routed to a Display-lane item; dropping delta to preserve lane invariant — this indicates a provider lane-classification bug"
+                        );
+                    } else {
+                        item.content_segments
+                            .entry(content_index)
+                            .or_default()
+                            .push_str(&delta);
+                        if response_completed && !item.text().is_empty() {
+                            item.ready = true;
+                        }
                     }
                 }
             }
@@ -1059,18 +1080,17 @@ impl Session {
                     // materializer commits as `AssistantBlock::Transcript`.
                     // If a Display delta arrived first and content is
                     // staged under Display, `promote_item_lane` keeps the
-                    // existing lane and emits a `tracing::warn!` — that's a
-                    // provider bug (truncation routed to a Display-classified
-                    // item). Treat as a no-op so we don't clobber Display
-                    // content with spoken-truncation text.
-                    promote_item_lane(item, TranscriptLane::Spoken);
-                    if item.lane == TranscriptLane::Spoken {
+                    // existing lane and returns `false` — that's a provider
+                    // bug (truncation routed to a Display-classified item).
+                    // Treat as a no-op so we don't clobber Display content
+                    // with spoken-truncation text. The warn was already
+                    // emitted inside `promote_item_lane`.
+                    if promote_item_lane(item, TranscriptLane::Spoken) {
                         item.content_segments.insert(content_index, text);
                         if response_completed && !item.text().is_empty() {
                             item.ready = true;
                         }
                     }
-                    // else: misroute. `promote_item_lane` already warned.
                 }
             }
             RealtimeTranscriptEvent::AssistantTranscriptFinalText {
@@ -1106,16 +1126,43 @@ impl Session {
                     RealtimeTranscriptRole::Assistant,
                     Some(response_id),
                 ) {
+                    // R5-7: late `AssistantTranscriptFinalText` after the
+                    // item has already been committed to canonical history.
+                    // The staged item is `materialized = true` and the
+                    // session's `Message::BlockAssistant` already carries
+                    // the delta-accumulated text. Append-only history is a
+                    // stronger invariant than typed text repair: rewriting
+                    // the canonical message would violate it (consumers may
+                    // already have observed the prior text via the event
+                    // stream / projector). Warn-and-skip; the SDK or human
+                    // can decide whether the provider-side ordering bug
+                    // matters.
+                    if item.materialized {
+                        tracing::warn!(
+                            "AssistantTranscriptFinalText arrived after item already materialized; canonical message is locked, late repair dropped"
+                        );
+                        self.store_realtime_transcript_state(&state);
+                        return RealtimeTranscriptApplyOutcome::default();
+                    }
                     // Spoken lane: this variant is the authoritative
                     // transcript-final text path. Display-text finals come
-                    // through a different seam.
-                    promote_item_lane(item, TranscriptLane::Spoken);
-                    // Replace, not append: the final's text is authoritative
-                    // and supersedes any (possibly partial) accumulated
-                    // segment text.
-                    item.content_segments.insert(content_index, text);
-                    if response_completed && !item.text().is_empty() {
-                        item.ready = true;
+                    // through a different seam. If the item is locked to
+                    // Display (e.g. an earlier `AssistantTextDelta` staged
+                    // it), drop the final to preserve the lane invariant —
+                    // append-only history would otherwise silently switch
+                    // block type at materialize time.
+                    if !promote_item_lane(item, TranscriptLane::Spoken) {
+                        tracing::warn!(
+                            "AssistantTranscriptFinalText routed to a Display-lane item; dropping authoritative final to preserve lane invariant — this indicates a provider lane-classification bug"
+                        );
+                    } else {
+                        // Replace, not append: the final's text is
+                        // authoritative and supersedes any (possibly
+                        // partial) accumulated segment text.
+                        item.content_segments.insert(content_index, text);
+                        if response_completed && !item.text().is_empty() {
+                            item.ready = true;
+                        }
                     }
                 }
             }
@@ -2208,22 +2255,31 @@ fn normalize_realtime_optional_response_id(response_id: Option<String>) -> Optio
 /// item; mixed-lane content on the same `item_id` is not expected from
 /// any provider and would be a provider-side bug. Items with empty
 /// content (no deltas yet observed) accept any lane.
-fn promote_item_lane(item: &mut RealtimeTranscriptItemState, lane: TranscriptLane) {
+///
+/// Returns `true` when the item now carries the requested `lane` (either
+/// the lane already matched, or the item was empty so the lane was
+/// promoted). Returns `false` when the item already carried the *other*
+/// lane with staged content — in that case the caller MUST skip any
+/// content insert it was about to perform on `lane`, otherwise it would
+/// clobber the locked-in lane content (R5-6 sibling: silent-clobber bug).
+#[must_use]
+fn promote_item_lane(item: &mut RealtimeTranscriptItemState, lane: TranscriptLane) -> bool {
     if item.lane == lane {
-        return;
+        return true;
     }
     let has_content = item.content_segments.values().any(|s| !s.is_empty());
     if !has_content {
         // No content has been staged on the original lane yet; safe to
         // re-classify.
         item.lane = lane;
-        return;
+        return true;
     }
     tracing::warn!(
         existing_lane = ?item.lane,
         observed_lane = ?lane,
         "ignoring realtime transcript lane conflict on item with staged content"
     );
+    false
 }
 
 fn observe_realtime_item(
@@ -4484,6 +4540,197 @@ mod tests {
                     other => unreachable!(
                         "Display content must survive misrouted truncation, got {other:?}"
                     ),
+                }
+            }
+            other => unreachable!("expected BlockAssistant, got {other:?}"),
+        }
+    }
+
+    /// R5-6 sibling: a Spoken-classified item (transcript-truncation
+    /// arrived first and locked the lane to Spoken) must reject a later
+    /// `AssistantTextDelta` rather than silently appending the Display
+    /// text into the Spoken-locked content_segment. Pre-fix the delta
+    /// arm called `promote_item_lane` and unconditionally pushed the
+    /// delta — clobbering the lane invariant. Post-fix the delta is
+    /// dropped (warn fires) and the Spoken-truncation text survives.
+    #[test]
+    fn round5_r56_sibling_display_delta_skipped_on_spoken_item() {
+        let mut session = Session::new();
+
+        // Truncation arrives first and locks the item to the Spoken lane.
+        let _ = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTranscriptTruncated {
+                response_id: "resp_a".to_string(),
+                item_id: "item_a".to_string(),
+                content_index: 0,
+                text: "what was actually heard".to_string(),
+            },
+        );
+
+        // A Display delta arrives later for the SAME item id (provider
+        // lane-classification bug). It MUST be dropped.
+        let _ =
+            session.append_realtime_transcript_event(RealtimeTranscriptEvent::AssistantTextDelta {
+                response_id: "resp_a".to_string(),
+                delta_id: "delta_d_1".to_string(),
+                item_id: "item_a".to_string(),
+                previous_item_id: None,
+                content_index: 0,
+                delta: "should-not-appear".to_string(),
+            });
+
+        let _ = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTurnCompleted {
+                response_id: "resp_a".to_string(),
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            },
+        );
+
+        // The Spoken-truncation text survives intact; no Display text
+        // leaked into the Spoken lane content.
+        assert_eq!(session.messages().len(), 1);
+        match &session.messages()[0] {
+            Message::BlockAssistant(assistant) => {
+                assert_eq!(assistant.blocks.len(), 1);
+                match &assistant.blocks[0] {
+                    AssistantBlock::Transcript { text, source, .. } => {
+                        assert_eq!(text, "what was actually heard");
+                        assert_eq!(*source, crate::types::TranscriptSource::Spoken);
+                    }
+                    other => unreachable!(
+                        "Spoken-locked item must materialize as Transcript, got {other:?}"
+                    ),
+                }
+            }
+            other => unreachable!("expected BlockAssistant, got {other:?}"),
+        }
+    }
+
+    /// R5-6 sibling: a Display-classified item (a Display delta arrived
+    /// first and locked the lane to Display) must reject a later
+    /// `AssistantTranscriptDelta` rather than appending the Spoken text
+    /// into the Display-locked content_segment. Pre-fix the transcript
+    /// delta arm called `promote_item_lane` and unconditionally pushed —
+    /// silently mixing a Spoken stream into a Display block.
+    #[test]
+    fn round5_r56_sibling_spoken_delta_skipped_on_display_item() {
+        let mut session = Session::new();
+
+        // Display delta arrives first and locks the item to the Display lane.
+        let _ =
+            session.append_realtime_transcript_event(RealtimeTranscriptEvent::AssistantTextDelta {
+                response_id: "resp_a".to_string(),
+                delta_id: "delta_d_1".to_string(),
+                item_id: "item_a".to_string(),
+                previous_item_id: None,
+                content_index: 0,
+                delta: "display-locked-text".to_string(),
+            });
+
+        // A spoken-transcript delta arrives later for the SAME item id
+        // (provider lane-classification bug). It MUST be dropped.
+        let _ = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTranscriptDelta {
+                response_id: "resp_a".to_string(),
+                delta_id: "delta_s_1".to_string(),
+                item_id: "item_a".to_string(),
+                previous_item_id: None,
+                content_index: 0,
+                delta: "should-not-appear".to_string(),
+            },
+        );
+
+        let _ = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTurnCompleted {
+                response_id: "resp_a".to_string(),
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            },
+        );
+
+        // The Display text survives intact; no Spoken text leaked in.
+        assert_eq!(session.messages().len(), 1);
+        match &session.messages()[0] {
+            Message::BlockAssistant(assistant) => {
+                assert_eq!(assistant.blocks.len(), 1);
+                match &assistant.blocks[0] {
+                    AssistantBlock::Text { text, .. } => {
+                        assert_eq!(text, "display-locked-text");
+                    }
+                    other => {
+                        unreachable!("Display-locked item must materialize as Text, got {other:?}")
+                    }
+                }
+            }
+            other => unreachable!("expected BlockAssistant, got {other:?}"),
+        }
+    }
+
+    /// R5-7: a late `AssistantTranscriptFinalText` arriving AFTER
+    /// `AssistantTurnCompleted` already materialized the item must NOT
+    /// mutate `content_segments` and must NOT rewrite the canonical
+    /// `Message::BlockAssistant` (append-only history is a stronger
+    /// invariant than typed text repair). The committed message keeps
+    /// the delta-accumulated text; the late final is dropped with a
+    /// warn; the materializer outcome is inert (no new messages).
+    #[test]
+    fn round5_r57_late_final_text_after_turn_completed_warns_and_skips() {
+        let mut session = Session::new();
+
+        // Delta accumulates partial text on the Spoken lane.
+        let _ = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTranscriptDelta {
+                response_id: "resp_a".to_string(),
+                delta_id: "delta_s_1".to_string(),
+                item_id: "item_a".to_string(),
+                previous_item_id: None,
+                content_index: 0,
+                delta: "delta-accumulated".to_string(),
+            },
+        );
+
+        // TurnCompleted materializes the item with the delta-accumulated text.
+        let commit_outcome = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTurnCompleted {
+                response_id: "resp_a".to_string(),
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            },
+        );
+        assert_eq!(commit_outcome.materialized_messages.len(), 1);
+
+        // Late FinalText arrives — provider-side ordering bug. It MUST
+        // be dropped: no canonical message rewrite, no segment mutation,
+        // outcome is inert.
+        let late_outcome = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTranscriptFinalText {
+                response_id: "resp_a".to_string(),
+                item_id: "item_a".to_string(),
+                content_index: 0,
+                text: "authoritative-final-that-must-not-land".to_string(),
+            },
+        );
+        assert!(
+            late_outcome.is_inert(),
+            "late FinalText after materialization must produce inert outcome"
+        );
+
+        // Canonical history: still one message with the original
+        // delta-accumulated text — NOT the authoritative final.
+        assert_eq!(session.messages().len(), 1);
+        match &session.messages()[0] {
+            Message::BlockAssistant(assistant) => {
+                assert_eq!(assistant.blocks.len(), 1);
+                match &assistant.blocks[0] {
+                    AssistantBlock::Transcript { text, .. } => {
+                        assert_eq!(
+                            text, "delta-accumulated",
+                            "canonical message must preserve delta-accumulated text; \
+                             append-only history forbids late FinalText repair"
+                        );
+                    }
+                    other => unreachable!("expected Transcript, got {other:?}"),
                 }
             }
             other => unreachable!("expected BlockAssistant, got {other:?}"),

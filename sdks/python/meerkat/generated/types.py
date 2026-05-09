@@ -1539,6 +1539,267 @@ cursor in here when they want to truncate."""
     item_id: str
 
 
+# A typed, identity-bearing realtime transcript event consumed by the session.
+class RealtimeTranscriptEventItemObserved(TypedDict, total=False):
+    item_id: Required[str]
+    previous_item_id: NotRequired[str]
+    response_id: NotRequired[str]
+    role: Required[RealtimeTranscriptRole]
+    type: Required[Literal['item_observed']]
+
+class RealtimeTranscriptEventItemSkipped(TypedDict, total=False):
+    item_id: Required[str]
+    previous_item_id: NotRequired[str]
+    type: Required[Literal['item_skipped']]
+
+class RealtimeTranscriptEventUserTranscriptFinal(TypedDict, total=False):
+    content_index: Required[int]
+    item_id: Required[str]
+    previous_item_id: NotRequired[str]
+    text: Required[str]
+    type: Required[Literal['user_transcript_final']]
+
+class RealtimeTranscriptEventAssistantTextDelta(TypedDict, total=False):
+    content_index: Required[int]
+    delta: Required[str]
+    delta_id: Required[str]
+    item_id: Required[str]
+    previous_item_id: NotRequired[str]
+    response_id: Required[str]
+    type: Required[Literal['assistant_text_delta']]
+
+class RealtimeTranscriptEventAssistantTranscriptDelta(TypedDict, total=False):
+    content_index: Required[int]
+    delta: Required[str]
+    delta_id: Required[str]
+    item_id: Required[str]
+    previous_item_id: NotRequired[str]
+    response_id: Required[str]
+    type: Required[Literal['assistant_transcript_delta']]
+
+class RealtimeTranscriptEventAssistantTranscriptTruncated(TypedDict, total=False):
+    content_index: Required[int]
+    item_id: Required[str]
+    response_id: Required[str]
+    text: Required[str]
+    type: Required[Literal['assistant_transcript_truncated']]
+
+class RealtimeTranscriptEventAssistantTranscriptFinalText(TypedDict, total=False):
+    content_index: Required[int]
+    item_id: Required[str]
+    response_id: Required[str]
+    text: Required[str]
+    type: Required[Literal['assistant_transcript_final_text']]
+
+class RealtimeTranscriptEventAssistantTurnCompleted(TypedDict, total=False):
+    response_id: Required[str]
+    stop_reason: Required[Any]
+    type: Required[Literal['assistant_turn_completed']]
+    usage: Required[Any]
+
+class RealtimeTranscriptEventAssistantTurnInterrupted(TypedDict, total=False):
+    response_id: Required[str]
+    type: Required[Literal['assistant_turn_interrupted']]
+
+RealtimeTranscriptEvent = RealtimeTranscriptEventItemObserved | RealtimeTranscriptEventItemSkipped | RealtimeTranscriptEventUserTranscriptFinal | RealtimeTranscriptEventAssistantTextDelta | RealtimeTranscriptEventAssistantTranscriptDelta | RealtimeTranscriptEventAssistantTranscriptTruncated | RealtimeTranscriptEventAssistantTranscriptFinalText | RealtimeTranscriptEventAssistantTurnCompleted | RealtimeTranscriptEventAssistantTurnInterrupted
+
+# Provider-neutral role for a realtime transcript item.
+RealtimeTranscriptRole = Literal['user', 'assistant']
+
+# Wire mirror of [`meerkat_core::live_adapter::LiveDegradationReason`].
+#
+# Internally-tagged on `kind` (snake_case) — matches the core enum's serde
+# shape exactly. SDK consumers route on `kind` to distinguish the
+# non-payload variants from the typed `other { detail }` payload.
+class WireLiveDegradationReasonRateLimited(TypedDict, total=False):
+    kind: Required[Literal['rate_limited']]
+
+class WireLiveDegradationReasonProviderThrottled(TypedDict, total=False):
+    kind: Required[Literal['provider_throttled']]
+
+class WireLiveDegradationReasonNetworkUnstable(TypedDict, total=False):
+    kind: Required[Literal['network_unstable']]
+
+class WireLiveDegradationReasonOther(TypedDict, total=False):
+    detail: Required[str]
+    kind: Required[Literal['other']]
+
+WireLiveDegradationReason = WireLiveDegradationReasonRateLimited | WireLiveDegradationReasonProviderThrottled | WireLiveDegradationReasonNetworkUnstable | WireLiveDegradationReasonOther
+
+# Wire mirror of [`meerkat_core::live_adapter::LiveAdapterStatus`].
+#
+# Internally-tagged on `status` (snake_case). The `degraded` variant
+# references [`WireLiveDegradationReason`] so the typed reason is visible at
+# the SDK boundary.
+class WireLiveAdapterStatusIdle(TypedDict, total=False):
+    status: Required[Literal['idle']]
+
+class WireLiveAdapterStatusOpening(TypedDict, total=False):
+    status: Required[Literal['opening']]
+
+class WireLiveAdapterStatusReady(TypedDict, total=False):
+    status: Required[Literal['ready']]
+
+class WireLiveAdapterStatusDegraded(TypedDict, total=False):
+    reason: Required[WireLiveDegradationReason]
+    status: Required[Literal['degraded']]
+
+class WireLiveAdapterStatusClosing(TypedDict, total=False):
+    status: Required[Literal['closing']]
+
+class WireLiveAdapterStatusClosed(TypedDict, total=False):
+    status: Required[Literal['closed']]
+
+WireLiveAdapterStatus = WireLiveAdapterStatusIdle | WireLiveAdapterStatusOpening | WireLiveAdapterStatusReady | WireLiveAdapterStatusDegraded | WireLiveAdapterStatusClosing | WireLiveAdapterStatusClosed
+
+# Wire mirror of [`meerkat_core::live_adapter::LiveAdapterErrorCode`].
+#
+# Internally-tagged on `code` (snake_case). SDK consumers route on `code`
+# to distinguish payload-less variants from typed payload variants
+# (`config_rejected { reason }`, `other { raw }`). FIX-SDK-OBS: makes the
+# R5-9 `CommandRejected` observation's typed code visible at the SDK
+# boundary instead of a free-form blob.
+class WireLiveAdapterErrorCodeConnectionFailed(TypedDict, total=False):
+    code: Required[Literal['connection_failed']]
+
+class WireLiveAdapterErrorCodeConnectionLost(TypedDict, total=False):
+    code: Required[Literal['connection_lost']]
+
+class WireLiveAdapterErrorCodeConfigRejected(TypedDict, total=False):
+    code: Required[Literal['config_rejected']]
+    reason: Required[str]
+
+class WireLiveAdapterErrorCodeProviderError(TypedDict, total=False):
+    code: Required[Literal['provider_error']]
+
+class WireLiveAdapterErrorCodeAuthenticationFailed(TypedDict, total=False):
+    code: Required[Literal['authentication_failed']]
+
+class WireLiveAdapterErrorCodeInternalError(TypedDict, total=False):
+    code: Required[Literal['internal_error']]
+
+class WireLiveAdapterErrorCodeOther(TypedDict, total=False):
+    code: Required[Literal['other']]
+    raw: Required[str]
+
+WireLiveAdapterErrorCode = WireLiveAdapterErrorCodeConnectionFailed | WireLiveAdapterErrorCodeConnectionLost | WireLiveAdapterErrorCodeConfigRejected | WireLiveAdapterErrorCodeProviderError | WireLiveAdapterErrorCodeAuthenticationFailed | WireLiveAdapterErrorCodeInternalError | WireLiveAdapterErrorCodeOther
+
+# Wire mirror of [`meerkat_core::live_adapter::LiveAdapterObservation`].
+#
+# FIX-SDK-OBS: closes the R5-4 verifier gap. The core enum is the canonical
+# shape adapters emit, but it is not registered for schema emission and is
+# therefore invisible at the SDK boundary — browser/Python clients receive
+# observations as untyped JSON and cannot type-narrow on
+# `assistant_audio_chunk` (to read the new `item_id` / `response_id` /
+# `content_index` fields driving `live/truncate`) or on `command_rejected`
+# (a typed channel-survives error introduced in R5-9). The wire mirror
+# makes every variant visible to schema codegen and produces a discriminated
+# TypeScript union / typed Python `TypedDict` union.
+#
+# Serde shape mirrors the core enum exactly: internally-tagged on
+# `observation` (snake_case). Round-trip with the core type is byte-
+# identical (see `wire_live_adapter_observation_byte_compatible_with_core`).
+#
+# Field types reference other wire mirrors where they exist
+# ([`WireStopReason`], [`WireUsage`], [`WireLiveAdapterStatus`],
+# [`WireLiveAdapterErrorCode`]) and the canonical
+# [`RealtimeTranscriptEvent`] (which already derives `JsonSchema` and is
+# auto-promoted by the SDK codegen `Realtime*` allowlist rule).
+#
+# Audio data is base64-encoded on the wire (matches the core
+# [`LiveAdapterObservation::AssistantAudioChunk`] base64 mode); the wire
+# mirror carries `data` as a `String` so the schema emits `String` instead
+# of an opaque `Vec<u8>` JSON-array shape.
+class WireLiveAdapterObservationReady(TypedDict, total=False):
+    observation: Required[Literal['ready']]
+
+class WireLiveAdapterObservationUserTranscriptFinal(TypedDict, total=False):
+    content_index: NotRequired[int]
+    observation: Required[Literal['user_transcript_final']]
+    previous_item_id: NotRequired[str]
+    provider_item_id: NotRequired[str]
+    text: Required[str]
+
+class WireLiveAdapterObservationAssistantTextDelta(TypedDict, total=False):
+    content_index: NotRequired[int]
+    delta: Required[str]
+    delta_id: NotRequired[str]
+    observation: Required[Literal['assistant_text_delta']]
+    previous_item_id: NotRequired[str]
+    provider_item_id: NotRequired[str]
+    response_id: NotRequired[str]
+
+class WireLiveAdapterObservationAssistantTranscriptDelta(TypedDict, total=False):
+    content_index: NotRequired[int]
+    delta: Required[str]
+    delta_id: NotRequired[str]
+    observation: Required[Literal['assistant_transcript_delta']]
+    previous_item_id: NotRequired[str]
+    provider_item_id: NotRequired[str]
+    response_id: NotRequired[str]
+
+class WireLiveAdapterObservationAssistantAudioChunk(TypedDict, total=False):
+    channels: Required[int]
+    content_index: NotRequired[int]
+    data: Required[str]
+    item_id: NotRequired[str]
+    observation: Required[Literal['assistant_audio_chunk']]
+    response_id: NotRequired[str]
+    sample_rate_hz: Required[int]
+
+class WireLiveAdapterObservationAssistantTranscriptFinal(TypedDict, total=False):
+    content_index: NotRequired[int]
+    observation: Required[Literal['assistant_transcript_final']]
+    previous_item_id: NotRequired[str]
+    provider_item_id: Required[str]
+    response_id: NotRequired[str]
+    stop_reason: Required[Literal['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'content_filter', 'cancelled']]
+    text: Required[str]
+    usage: Required[Any]
+
+class WireLiveAdapterObservationAssistantTranscriptTruncated(TypedDict, total=False):
+    content_index: NotRequired[int]
+    observation: Required[Literal['assistant_transcript_truncated']]
+    previous_item_id: NotRequired[str]
+    provider_item_id: NotRequired[str]
+    response_id: NotRequired[str]
+    text: NotRequired[str]
+
+class WireLiveAdapterObservationRealtimeTranscript(TypedDict, total=False):
+    event: Required[RealtimeTranscriptEvent]
+    observation: Required[Literal['realtime_transcript']]
+
+class WireLiveAdapterObservationToolCallRequested(TypedDict, total=False):
+    arguments: Required[Any]
+    observation: Required[Literal['tool_call_requested']]
+    provider_call_id: Required[str]
+    tool_name: Required[str]
+
+class WireLiveAdapterObservationTurnInterrupted(TypedDict, total=False):
+    observation: Required[Literal['turn_interrupted']]
+
+class WireLiveAdapterObservationTurnCompleted(TypedDict, total=False):
+    observation: Required[Literal['turn_completed']]
+    response_id: NotRequired[str]
+    stop_reason: Required[Literal['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 'content_filter', 'cancelled']]
+    usage: Required[Any]
+
+class WireLiveAdapterObservationStatusChanged(TypedDict, total=False):
+    observation: Required[Literal['status_changed']]
+    status: Required[WireLiveAdapterStatus]
+
+class WireLiveAdapterObservationError(TypedDict, total=False):
+    code: Required[WireLiveAdapterErrorCode]
+    message: Required[str]
+    observation: Required[Literal['error']]
+
+class WireLiveAdapterObservationCommandRejected(TypedDict, total=False):
+    code: Required[WireLiveAdapterErrorCode]
+    message: Required[str]
+    observation: Required[Literal['command_rejected']]
+
+WireLiveAdapterObservation = WireLiveAdapterObservationReady | WireLiveAdapterObservationUserTranscriptFinal | WireLiveAdapterObservationAssistantTextDelta | WireLiveAdapterObservationAssistantTranscriptDelta | WireLiveAdapterObservationAssistantAudioChunk | WireLiveAdapterObservationAssistantTranscriptFinal | WireLiveAdapterObservationAssistantTranscriptTruncated | WireLiveAdapterObservationRealtimeTranscript | WireLiveAdapterObservationToolCallRequested | WireLiveAdapterObservationTurnInterrupted | WireLiveAdapterObservationTurnCompleted | WireLiveAdapterObservationStatusChanged | WireLiveAdapterObservationError | WireLiveAdapterObservationCommandRejected
+
 @dataclass
 class RuntimeAcceptResult:
     """Response payload for runtime-backed input submission."""

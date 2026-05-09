@@ -2626,6 +2626,45 @@ class MeerkatClient:
             {"channel_id": channel_id},
         )
 
+    @staticmethod
+    def parse_live_observation(raw: dict[str, Any]) -> dict[str, Any]:
+        """Type-narrow an inbound live-adapter observation against
+        :class:`meerkat.types.WireLiveAdapterObservation`.
+
+        Observations are streamed as JSON objects on the live-channel WS
+        transport returned by ``live/open``. Each object carries an
+        internally-tagged ``observation`` discriminator (``ready``,
+        ``assistant_audio_chunk``, ``command_rejected``, …). The Meerkat
+        SDK does not own the WS transport (the browser/Python client opens
+        the URL from ``LiveOpenResult.transport`` directly), so this helper
+        is a no-op cast that exists so callers can type-narrow inbound
+        frames against the regenerated ``WireLiveAdapterObservation``
+        TypedDict union without copying the discriminator wiring.
+
+        Example:
+            obs = MeerkatClient.parse_live_observation(json.loads(frame))
+            if obs["observation"] == "assistant_audio_chunk":
+                # Type-narrowed: obs["item_id"], obs["response_id"],
+                # obs["content_index"] are all known optional str / int.
+                truncate_at(obs.get("item_id"), obs.get("content_index"))
+            elif obs["observation"] == "command_rejected":
+                # Typed channel-survives error (R5-9).
+                handle_rejection(obs["code"], obs["message"])
+
+        FIX-SDK-OBS: closes the verifier gap that left
+        ``WireLiveAdapterObservation`` invisible at the SDK boundary.
+        Validation is deferred to the static type checker (mypy /
+        pyright); the helper raises ``ValueError`` only if the
+        ``observation`` discriminator is missing.
+        """
+        if not isinstance(raw, dict):
+            raise ValueError("live observation must be a JSON object")
+        if "observation" not in raw:
+            raise ValueError(
+                "live observation missing `observation` discriminator"
+            )
+        return raw
+
     async def mob_ensure_member(
         self, mob_id: str, spec: dict[str, Any]
     ) -> dict[str, Any]:

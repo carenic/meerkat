@@ -133,6 +133,15 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         // / `unknown` blobs inside `LiveOpenResult`.
         "WireLiveChannelCapabilities": schema_for!(crate::wire::WireLiveChannelCapabilities),
         "WireLiveContinuityMode": schema_for!(crate::wire::WireLiveContinuityMode),
+        // FIX-SDK-OBS: emit `WireLiveAdapterObservation` and its supporting
+        // typed wire mirrors so SDK codegen sees the discriminated union of
+        // adapter observations (R5-4 identity fields on
+        // `assistant_audio_chunk`, R5-9 `command_rejected` typed channel
+        // survives error) rather than treating them as opaque blobs.
+        "WireLiveAdapterObservation": schema_for!(crate::wire::WireLiveAdapterObservation),
+        "WireLiveAdapterStatus": schema_for!(crate::wire::WireLiveAdapterStatus),
+        "WireLiveDegradationReason": schema_for!(crate::wire::WireLiveDegradationReason),
+        "WireLiveAdapterErrorCode": schema_for!(crate::wire::WireLiveAdapterErrorCode),
         "RuntimeAcceptOutcomeType": schema_for!(crate::wire::RuntimeAcceptOutcomeType),
         "WireInputLifecycleState": schema_for!(crate::wire::WireInputLifecycleState),
         "WireInputStateHistoryEntry": schema_for!(crate::wire::WireInputStateHistoryEntry),

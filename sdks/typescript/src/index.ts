@@ -220,6 +220,29 @@ export type {
   WireLiveContinuityModeTranscriptOnly,
   WireLiveContinuityModeDegraded,
   WireLiveContinuityModeProviderNativeResume,
+  // FIX-SDK-OBS: typed live-adapter observation discriminated union and
+  // its supporting wire mirrors (status / degradation reason / error
+  // code). Closes the verifier gap that left the R5-4 audio identity
+  // fields and R5-9 `command_rejected` typed variant invisible at the
+  // SDK boundary.
+  WireLiveAdapterObservation,
+  WireLiveAdapterObservationReady,
+  WireLiveAdapterObservationUserTranscriptFinal,
+  WireLiveAdapterObservationAssistantTextDelta,
+  WireLiveAdapterObservationAssistantTranscriptDelta,
+  WireLiveAdapterObservationAssistantAudioChunk,
+  WireLiveAdapterObservationAssistantTranscriptFinal,
+  WireLiveAdapterObservationAssistantTranscriptTruncated,
+  WireLiveAdapterObservationRealtimeTranscript,
+  WireLiveAdapterObservationToolCallRequested,
+  WireLiveAdapterObservationTurnInterrupted,
+  WireLiveAdapterObservationTurnCompleted,
+  WireLiveAdapterObservationStatusChanged,
+  WireLiveAdapterObservationError,
+  WireLiveAdapterObservationCommandRejected,
+  WireLiveAdapterStatus,
+  WireLiveAdapterErrorCode,
+  WireLiveDegradationReason,
   ProviderCatalog,
   RealtimeAudioChunk,
   RealtimeCapabilities,

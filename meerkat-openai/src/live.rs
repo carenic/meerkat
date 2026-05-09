@@ -566,6 +566,39 @@ async fn configure_openai_live_session(
     Ok(())
 }
 
+/// R5-2 (FIX-OPENAI follow-up): build a `SessionUpdateConfig` with the
+/// live-channel modality invariant enforced — `output_modalities` is
+/// **always** `Some(OutputModalities::AudioText)`. Use this constructor
+/// for every `session.update` we emit on the live channel; never construct
+/// `SessionUpdateConfig` literally with `..Default::default()`, because
+/// the `Default` impl leaves `output_modalities = None`. OpenAI's session
+/// merge semantics preserve unset fields (so today's happy path is fine),
+/// but a future code path constructing a `SessionUpdateConfig` with
+/// default modality could silently revert the channel to audio-only and
+/// break the `text_out=true` capability advertisement.
+///
+/// `SessionUpdateConfig` is a foreign struct (from `oai-rt-rs`), so we
+/// cannot remove `Default::default()` directly — the constructor is the
+/// enforcement boundary instead. Keep all the other fields as explicit
+/// arguments so future field additions to `SessionUpdateConfig` surface
+/// as a compile error here, not a silent default at every call site.
+fn session_update_with_audio_text_modality(
+    instructions: Option<String>,
+    audio: Option<AudioConfig>,
+    tools: Option<Vec<Tool>>,
+) -> SessionUpdateConfig {
+    SessionUpdateConfig {
+        // R5-2 invariant: never `None`. The whole point of this
+        // constructor is to make the modality un-revertable from the
+        // call sites.
+        output_modalities: Some(OutputModalities::AudioText),
+        instructions,
+        audio,
+        tools,
+        ..SessionUpdateConfig::default()
+    }
+}
+
 fn openai_session_update(open_config: &RealtimeSessionOpenConfig) -> SessionUpdate {
     let turn_detection = match open_config.turning_mode {
         RealtimeTurningMode::ProviderManaged => Some(Nullable::Value(TurnDetection::ServerVad {
@@ -580,14 +613,17 @@ fn openai_session_update(open_config: &RealtimeSessionOpenConfig) -> SessionUpda
     };
 
     SessionUpdate {
-        config: SessionUpdateConfig {
-            // R5-2: live channel advertises `text_out=true` (Audio + Text
-            // continuity). `OutputModalities::Audio` would silence
-            // `ResponseOutputTextDelta` — making the capability advertisement
-            // a lie. `AudioText` instructs OpenAI Realtime to emit display
-            // text alongside the spoken transcript so both lanes survive.
-            output_modalities: Some(OutputModalities::AudioText),
-            audio: Some(AudioConfig {
+        // R5-2: live channel advertises `text_out=true` (Audio + Text
+        // continuity). `OutputModalities::Audio` would silence
+        // `ResponseOutputTextDelta` — making the capability advertisement
+        // a lie. The typed constructor pins `AudioText` so OpenAI
+        // Realtime emits display text alongside the spoken transcript.
+        config: session_update_with_audio_text_modality(
+            openai_realtime_instructions(
+                &open_config.seed_messages,
+                &open_config.runtime_system_context,
+            ),
+            Some(AudioConfig {
                 input: Some(InputAudioConfig {
                     format: Some(AudioFormat::pcm_24khz()),
                     turn_detection,
@@ -605,26 +641,27 @@ fn openai_session_update(open_config: &RealtimeSessionOpenConfig) -> SessionUpda
                     language: None,
                 }),
             }),
-            instructions: openai_realtime_instructions(
-                &open_config.seed_messages,
-                &open_config.runtime_system_context,
-            ),
-            tools: Some(openai_realtime_tools(&open_config.visible_tools)),
-            ..SessionUpdateConfig::default()
-        },
+            Some(openai_realtime_tools(&open_config.visible_tools)),
+        ),
     }
 }
 
 fn openai_projection_session_update(open_config: &RealtimeSessionOpenConfig) -> SessionUpdate {
     SessionUpdate {
-        config: SessionUpdateConfig {
-            instructions: openai_realtime_instructions(
+        // R5-2: even the projection refresh path must pin `AudioText`.
+        // OpenAI's session-merge semantics preserve unset fields — so
+        // omitting `output_modalities` here is happy-path safe today —
+        // but if the upstream session were ever opened with `Audio`
+        // (or future code regressed the open-time default), this seam
+        // would silently inherit it. Pin it via the typed constructor.
+        config: session_update_with_audio_text_modality(
+            openai_realtime_instructions(
                 &open_config.seed_messages,
                 &open_config.runtime_system_context,
             ),
-            tools: Some(openai_realtime_tools(&open_config.visible_tools)),
-            ..SessionUpdateConfig::default()
-        },
+            None,
+            Some(openai_realtime_tools(&open_config.visible_tools)),
+        ),
     }
 }
 
@@ -695,12 +732,18 @@ fn openai_refresh_session_update_from_snapshot(
     });
 
     SessionUpdate {
-        config: SessionUpdateConfig {
+        // R5-2 (FIX-OPENAI follow-up): the refresh-from-snapshot seam
+        // previously used `..SessionUpdateConfig::default()` and so
+        // emitted `output_modalities = None`. OpenAI preserves unset
+        // fields on merge, so happy-path was fine — but a future
+        // refresh-time invariant change (or upstream regression) could
+        // silently revert the channel modality. The typed constructor
+        // pins `AudioText` so the modality cannot drift.
+        config: session_update_with_audio_text_modality(
             instructions,
-            tools: Some(openai_realtime_tools(&snapshot.visible_tools)),
             audio,
-            ..SessionUpdateConfig::default()
-        },
+            Some(openai_realtime_tools(&snapshot.visible_tools)),
+        ),
     }
 }
 
@@ -2184,7 +2227,7 @@ impl RealtimeSession for OpenAiRealtimeSession {
                 }
                 Ok(())
             }
-            RealtimeInputChunk::VideoChunk(_) => Err(LlmError::InvalidRequest {
+            RealtimeInputChunk::VideoChunk(_) => Err(LlmError::InvalidInputShape {
                 message: "openai realtime video input is not supported by the current adapter"
                     .to_string(),
             }),
@@ -3090,96 +3133,52 @@ async fn openai_live_pump(
                     Some(LiveAdapterCommand::Close) | None => break,
                     Some(cmd) => {
                         if let Err(err) = execute_openai_live_command(&mut session, cmd).await {
-                            // R12: distinguish local-guard rejections from
-                            // provider-side outages. Every
-                            // `LlmError::InvalidRequest` produced by the
-                            // command-execution path is a *local* guard
-                            // rejection — the provider never saw the
-                            // request — so we map it to the typed
-                            // `ConfigRejected { reason }` rather than
-                            // collapsing it onto `ProviderError` (which
-                            // would force clients to parse English to
-                            // distinguish "local config rejected" from
-                            // "provider failed"). Every other error
-                            // variant remains on the `ProviderError`
-                            // path.
-                            //
-                            // ConfigRejected is therefore a SUPERSET of
-                            // "needs close + reopen": clients keying off
-                            // `ConfigRejected` for swap-detection must
-                            // additionally inspect the `reason` field
-                            // (or the `LiveAdapterObservation::Error`
-                            // message) to distinguish the swap subcases
-                            // from input-shape rejections.
-                            //
-                            // Current `LlmError::InvalidRequest` call sites
-                            // reachable from `execute_openai_live_command`
-                            // (all paths where ConfigRejected fires).
-                            // Line numbers verified at the time of writing;
-                            // grep `InvalidRequest` within the function body
-                            // if the file shifts. The five reachable sites
-                            // are:
-                            //   * model swap on Refresh (close+reopen
-                            //     needed) — first guard in the Refresh arm.
-                            //   * provider swap on Refresh (close+reopen
-                            //     needed) — second guard in the Refresh arm.
-                            //   * audio-rate / channel mismatch on Refresh
-                            //     (close+reopen needed) — third guard in
-                            //     the Refresh arm.
-                            //   * `LiveInputChunk::Image` on SendInput
-                            //     (T11; caller error, NOT a reopen signal —
-                            //     reason: "image_input_not_implemented").
-                            //   * `LiveInputChunk::VideoFrame` on SendInput
-                            //     (T11; caller error, NOT a reopen signal —
-                            //     reason: "video_frame_input_not_implemented").
-                            //   * unsupported `LiveAdapterCommand` variant
-                            //     catch-all (caller error, NOT a reopen
-                            //     signal).
-                            //
-                            // TODO(future): if downstream consumers grow a
-                            // need to branch on swap-vs-input-shape
-                            // without inspecting the reason string, split
-                            // `ConfigRejected` into typed sub-variants
-                            // (e.g. `ConfigRejected::Swap` vs
-                            // `ConfigRejected::UnsupportedInput`). On this
-                            // pass we keep the single variant and document
-                            // the breadth.
-                            // R5-9: classify the local guard rejection. Input-shape
-                            // rejections (Image / VideoFrame / unsupported chunk
-                            // variant on SendInput) are SCOPED command failures —
-                            // the channel must survive so the client can retry with
-                            // a supported shape. Model-swap / provider-swap /
-                            // audio-rate mismatches stay TERMINAL (close + reopen
-                            // is required). The classifier keys off the documented
-                            // reason strings emitted at the SendInput rejection
-                            // sites; everything else (including non-`InvalidRequest`)
-                            // remains a terminal `Error`.
+                            // R12 + R5-9 (FIX-OPENAI follow-up): classify the local
+                            // guard rejection by *variant*, not by reason
+                            // string. The producer now distinguishes:
+                            //   * `InvalidInputShape` — caller sent a
+                            //     request shape this provider does not
+                            //     support (image, video frame, unsupported
+                            //     chunk variant). Scoped, non-terminal:
+                            //     surface as `CommandRejected` so the
+                            //     channel survives and the client can retry.
+                            //   * `InvalidConfig` — provider-config
+                            //     rejection (model swap, provider swap,
+                            //     audio rate mismatch). Terminal on this
+                            //     channel: surface as `Error` so the
+                            //     close-and-reopen requirement is honored.
+                            //   * `InvalidRequest` (catch-all) — unknown
+                            //     `LiveAdapterCommand` variants etc.
+                            //     Surface as terminal `Error` (default to
+                            //     close-and-reopen for the unknown).
+                            //   * everything else — terminal `Error` with
+                            //     `ProviderError` code (real provider
+                            //     outage / network / etc.).
+                            // No string match — a future swap-rejection
+                            // message that incidentally contains
+                            // "image_input" cannot leak across the
+                            // scoped/terminal boundary.
                             let code = match &err {
-                                LlmError::InvalidRequest { message } => {
+                                LlmError::InvalidInputShape { message }
+                                | LlmError::InvalidConfig { message }
+                                | LlmError::InvalidRequest { message } => {
                                     LiveAdapterErrorCode::ConfigRejected {
                                         reason: message.clone(),
                                     }
                                 }
                                 _ => LiveAdapterErrorCode::ProviderError,
                             };
-                            let scoped_command_rejection = matches!(
-                                &err,
-                                LlmError::InvalidRequest { message }
-                                    if message == "image_input_not_implemented"
-                                        || message == "video_frame_input_not_implemented"
-                                        || message == "unsupported_input_chunk_variant"
-                                        || message.starts_with("openai realtime video input")
-                            );
-                            let obs = if scoped_command_rejection {
-                                LiveAdapterObservation::CommandRejected {
+                            let obs = match &err {
+                                LlmError::InvalidInputShape { .. } => {
+                                    LiveAdapterObservation::CommandRejected {
+                                        code,
+                                        message: err.to_string(),
+                                    }
+                                }
+                                _ => LiveAdapterObservation::Error {
                                     code,
                                     message: err.to_string(),
-                                }
-                            } else {
-                                LiveAdapterObservation::Error {
-                                    code,
-                                    message: err.to_string(),
-                                }
+                                },
                             };
                             // Command rejections / errors are control-lane;
                             // never drop. If the consumer has gone away,
@@ -3317,7 +3316,7 @@ async fn execute_openai_live_command(
             if let Some(current_model) = session.current_model_id.as_deref()
                 && current_model != snapshot.model_id
             {
-                return Err(LlmError::InvalidRequest {
+                return Err(LlmError::InvalidConfig {
                     message: format!(
                         "live adapter refresh: model swap from `{current_model}` to `{}` requires close + reopen \
                          (OpenAI Realtime does not accept a mutable `model` on session.update)",
@@ -3328,7 +3327,7 @@ async fn execute_openai_live_command(
             if let Some(current_provider) = session.current_provider_id.as_deref()
                 && current_provider != snapshot.provider_id
             {
-                return Err(LlmError::InvalidRequest {
+                return Err(LlmError::InvalidConfig {
                     message: format!(
                         "live adapter refresh: provider swap from `{current_provider}` to `{}` requires close + reopen",
                         snapshot.provider_id
@@ -3341,7 +3340,7 @@ async fn execute_openai_live_command(
                     || audio_cfg.input_channels != u16::from(OPENAI_REALTIME_AUDIO_CHANNELS)
                     || audio_cfg.output_channels != u16::from(OPENAI_REALTIME_AUDIO_CHANNELS))
             {
-                return Err(LlmError::InvalidRequest {
+                return Err(LlmError::InvalidConfig {
                     message: format!(
                         "live adapter refresh: audio config rate={}/{} ch={}/{} cannot be applied in place \
                          (OpenAI Realtime live session is fixed to pcm/{}Hz mono); close + reopen required",
@@ -3376,19 +3375,22 @@ async fn execute_openai_live_command(
                     use meerkat_contracts::RealtimeTextChunk;
                     RealtimeInputChunk::TextChunk(RealtimeTextChunk { text })
                 }
-                // T11: image / video-frame variants are typed at the seam
-                // but not yet supported by OpenAI Realtime. Reject with the
-                // documented `reason` strings; the pump (above) maps
-                // `LlmError::InvalidRequest` → `LiveAdapterErrorCode::
-                // ConfigRejected { reason }` so clients can route on the
-                // typed code without parsing English.
+                // T11 + R5-9 (FIX-OPENAI follow-up): image / video-frame
+                // variants are typed at the seam but not yet supported by
+                // OpenAI Realtime. Reject with the documented `reason`
+                // strings using the typed `LlmError::InvalidInputShape`
+                // variant — the pump (above) routes that variant to a
+                // scoped `LiveAdapterObservation::CommandRejected`
+                // (channel survives) rather than the terminal `Error`
+                // path. The classification is now structural — the pump
+                // never inspects the reason string.
                 LiveInputChunk::Image { .. } => {
-                    return Err(LlmError::InvalidRequest {
+                    return Err(LlmError::InvalidInputShape {
                         message: "image_input_not_implemented".to_string(),
                     });
                 }
                 LiveInputChunk::VideoFrame { .. } => {
-                    return Err(LlmError::InvalidRequest {
+                    return Err(LlmError::InvalidInputShape {
                         message: "video_frame_input_not_implemented".to_string(),
                     });
                 }
@@ -3397,7 +3399,7 @@ async fn execute_openai_live_command(
                 // capability; mirror the typed-rejection pattern with a
                 // generic reason rather than panicking.
                 _ => {
-                    return Err(LlmError::InvalidRequest {
+                    return Err(LlmError::InvalidInputShape {
                         message: "unsupported_input_chunk_variant".to_string(),
                     });
                 }
@@ -3624,6 +3626,55 @@ mod tests {
             "OpenAI Realtime item.id must be at most 32 bytes: {id}"
         );
         assert!(id.starts_with("mk_text_"));
+    }
+
+    /// R5-2 (FIX-OPENAI follow-up): the typed constructor for
+    /// `SessionUpdateConfig` MUST always set
+    /// `output_modalities = Some(OutputModalities::AudioText)` regardless
+    /// of which other fields the call site supplies. This is the
+    /// structural enforcement that replaces ad-hoc
+    /// `..SessionUpdateConfig::default()` literals (which leave
+    /// `output_modalities = None` and risk silently reverting the live
+    /// channel to audio-only on a future code path).
+    #[test]
+    fn session_update_constructor_always_sets_audio_text_modality() {
+        // No instructions, no audio, no tools — the constructor must
+        // still pin AudioText. This is the corner that
+        // `..SessionUpdateConfig::default()` would have failed.
+        let config = session_update_with_audio_text_modality(None, None, None);
+        assert_eq!(
+            config.output_modalities,
+            Some(OutputModalities::AudioText),
+            "constructor must pin AudioText even when every other field is None"
+        );
+
+        // With instructions and tools but no audio (the projection
+        // refresh shape).
+        let config = session_update_with_audio_text_modality(
+            Some("authoritative system context".to_string()),
+            None,
+            Some(Vec::new()),
+        );
+        assert_eq!(
+            config.output_modalities,
+            Some(OutputModalities::AudioText),
+            "projection-refresh shape must still pin AudioText"
+        );
+
+        // With every field populated (the open-time shape).
+        let config = session_update_with_audio_text_modality(
+            Some("hello".to_string()),
+            Some(AudioConfig {
+                input: None,
+                output: None,
+            }),
+            Some(Vec::new()),
+        );
+        assert_eq!(
+            config.output_modalities,
+            Some(OutputModalities::AudioText),
+            "open-time shape must still pin AudioText"
+        );
     }
 
     struct FakeOpenAiLiveSession {
@@ -5527,7 +5578,15 @@ mod tests {
                     Some(open_config.visible_tools.len())
                 );
                 assert!(session.config.audio.is_none());
-                assert!(session.config.output_modalities.is_none());
+                // R5-2 (FIX-OPENAI follow-up): the projection refresh
+                // path now pins `AudioText` via the typed constructor
+                // rather than relying on OpenAI's "unset = preserve"
+                // semantics. The modality is structural, not a
+                // happy-path inheritance.
+                assert_eq!(
+                    session.config.output_modalities,
+                    Some(OutputModalities::AudioText)
+                );
             }
             other => panic!("unexpected refresh event: {other:?}"),
         }

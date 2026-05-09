@@ -22,6 +22,10 @@ import type {
 import type {
   LiveInputChunkWire,
   LiveSendInputParams,
+  WireLiveAdapterErrorCode,
+  WireLiveAdapterObservation,
+  WireLiveAdapterObservationAssistantAudioChunk,
+  WireLiveAdapterObservationCommandRejected,
 } from "../src/index.js";
 import type {
   MobCreateParams,
@@ -710,3 +714,67 @@ void liveSendInputText;
 void liveSendInputImage;
 void liveSendInputVideoFrame;
 void liveSendInputUntyped;
+
+// FIX-SDK-OBS: `WireLiveAdapterObservation` is a discriminated union over
+// the `observation` tag. Browser/Node clients can type-narrow on each
+// variant and read R5-4 identity fields (`item_id`, `response_id`,
+// `content_index`) on `assistant_audio_chunk` and the typed `code`
+// payload on R5-9 `command_rejected` without parsing raw JSON.
+
+const liveObsAudio: WireLiveAdapterObservation = {
+  observation: "assistant_audio_chunk",
+  data: "AQID",
+  sample_rate_hz: 24_000,
+  channels: 1,
+  item_id: "item_audio",
+  response_id: "resp_audio",
+  content_index: 0,
+};
+const liveObsCommandRejected: WireLiveAdapterObservation = {
+  observation: "command_rejected",
+  code: { code: "config_rejected", reason: "image_input_not_implemented" },
+  message: "rejected",
+};
+const liveObsReady: WireLiveAdapterObservation = { observation: "ready" };
+const liveObsTurnInterrupted: WireLiveAdapterObservation = {
+  observation: "turn_interrupted",
+};
+
+// Type narrowing on the discriminator: each branch sees the right
+// payload without an `as` cast.
+function readAudioIdentity(
+  obs: WireLiveAdapterObservation,
+): { item_id?: string; response_id?: string; content_index?: number } | null {
+  if (obs.observation !== "assistant_audio_chunk") return null;
+  // Compile-time proof: `obs` is narrowed to the audio variant; the
+  // identity fields are visible without further type assertions.
+  const audio: WireLiveAdapterObservationAssistantAudioChunk = obs;
+  return {
+    item_id: audio.item_id,
+    response_id: audio.response_id,
+    content_index: audio.content_index,
+  };
+}
+
+function readRejectionCode(
+  obs: WireLiveAdapterObservation,
+): WireLiveAdapterErrorCode | null {
+  if (obs.observation !== "command_rejected") return null;
+  const rejected: WireLiveAdapterObservationCommandRejected = obs;
+  return rejected.code;
+}
+
+// `chunk: { foo: "bar" }` was the @ts-expect-error pattern for chunks; the
+// same constraint must hold for observations missing the discriminator.
+const liveObsUntyped: WireLiveAdapterObservation = {
+  // @ts-expect-error WireLiveAdapterObservation requires the typed `observation` tag.
+  observation: "not_a_real_variant",
+};
+
+void liveObsAudio;
+void liveObsCommandRejected;
+void liveObsReady;
+void liveObsTurnInterrupted;
+void liveObsUntyped;
+void readAudioIdentity;
+void readRejectionCode;

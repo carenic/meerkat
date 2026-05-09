@@ -325,6 +325,17 @@ def _promote_nested_schema_def(name: str) -> bool:
         # carries the typed discriminated-union shape into SDK codegen instead
         # of falling back to opaque `dict[str, Any]` / `Record<string, unknown>`.
         "LiveInputChunkWire",
+        # FIX-SDK-OBS: promote the live-adapter observation wire mirror and
+        # its supporting payload mirrors so SDK codegen produces a typed
+        # discriminated union (`WireLiveAdapterObservation`) rather than an
+        # opaque blob. Without this, browser/Python SDK clients cannot
+        # type-narrow on `assistant_audio_chunk` (R5-4 identity fields:
+        # `item_id` / `response_id` / `content_index`) or the R5-9
+        # `command_rejected` typed channel-survives error variant.
+        "WireLiveAdapterObservation",
+        "WireLiveAdapterStatus",
+        "WireLiveDegradationReason",
+        "WireLiveAdapterErrorCode",
         *MCP_CONFIG_HELPER_TYPES,
         *MCP_CONFIG_ALIAS_TYPES,
         *MOB_RPC_PROMOTED_SCHEMA_DEFS,
@@ -880,6 +891,42 @@ def generate_python_types(schemas: dict, output_dir: Path, *, has_comms: bool = 
     append_python_dataclass("LiveStatusResult", wire_schema, "Response payload for live/status.")
     append_python_dataclass("LiveSendInputParams", wire_schema, "Request payload for live/send_input.")
     append_python_dataclass("LiveTruncateParams", wire_schema, "Request payload for live/truncate.")
+    # FIX-SDK-OBS: typed wire mirrors for adapter observations and their
+    # tagged-payload helpers. Aliases (not dataclasses) because each is a
+    # discriminated union (internally tagged on `observation` / `status` /
+    # `code` / `kind`). `RealtimeTranscriptEvent` is referenced by the
+    # `realtime_transcript` variant payload; emit it explicitly so the
+    # generated reference resolves.
+    append_python_alias(
+        "RealtimeTranscriptEvent",
+        wire_schema,
+        "Provider-realtime transcript event (tagged on `type`).",
+    )
+    append_python_alias(
+        "RealtimeTranscriptRole",
+        wire_schema,
+        "Provider-neutral role for a realtime transcript item.",
+    )
+    append_python_alias(
+        "WireLiveDegradationReason",
+        wire_schema,
+        "Wire projection of LiveDegradationReason (tagged on `kind`).",
+    )
+    append_python_alias(
+        "WireLiveAdapterStatus",
+        wire_schema,
+        "Wire projection of LiveAdapterStatus (tagged on `status`).",
+    )
+    append_python_alias(
+        "WireLiveAdapterErrorCode",
+        wire_schema,
+        "Wire projection of LiveAdapterErrorCode (tagged on `code`).",
+    )
+    append_python_alias(
+        "WireLiveAdapterObservation",
+        wire_schema,
+        "Wire projection of LiveAdapterObservation (tagged on `observation`).",
+    )
     append_python_dataclass(
         "RuntimeAcceptResult",
         wire_schema,
@@ -1235,6 +1282,18 @@ def generate_typescript_types(schemas: dict, output_dir: Path, *, has_comms: boo
     append_typescript_interface("LiveSendInputParams", wire_schema)
     append_typescript_interface("LiveTruncateParams", wire_schema)
     append_typescript_alias("LiveInputChunkWire", wire_schema)
+    # FIX-SDK-OBS: typed adapter observation discriminated unions. Aliases
+    # because each is a serde-tagged enum. `RealtimeTranscriptEvent` is
+    # referenced by the `realtime_transcript` variant payload — it is
+    # auto-promoted by the `Realtime*` allowlist but the alias must be
+    # emitted explicitly for the generated TypeScript / Python references
+    # to resolve.
+    append_typescript_alias("RealtimeTranscriptEvent", wire_schema)
+    append_typescript_alias("RealtimeTranscriptRole", wire_schema)
+    append_typescript_alias("WireLiveDegradationReason", wire_schema)
+    append_typescript_alias("WireLiveAdapterStatus", wire_schema)
+    append_typescript_alias("WireLiveAdapterErrorCode", wire_schema)
+    append_typescript_alias("WireLiveAdapterObservation", wire_schema)
     append_typescript_interface("RuntimeAcceptResult", wire_schema)
     append_typescript_interface("WireInputStateHistoryEntry", wire_schema)
     append_typescript_interface("WireInputState", wire_schema)

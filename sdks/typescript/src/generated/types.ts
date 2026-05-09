@@ -1756,6 +1756,262 @@ export interface LiveInputChunkWireVideoFrame {
 
 export type LiveInputChunkWire = LiveInputChunkWireAudio | LiveInputChunkWireText | LiveInputChunkWireImage | LiveInputChunkWireVideoFrame;
 
+export interface RealtimeTranscriptEventItemObserved {
+  item_id: string;
+  previous_item_id?: string;
+  response_id?: string;
+  role: RealtimeTranscriptRole;
+  type: "item_observed";
+}
+
+export interface RealtimeTranscriptEventItemSkipped {
+  item_id: string;
+  previous_item_id?: string;
+  type: "item_skipped";
+}
+
+export interface RealtimeTranscriptEventUserTranscriptFinal {
+  content_index: number;
+  item_id: string;
+  previous_item_id?: string;
+  text: string;
+  type: "user_transcript_final";
+}
+
+export interface RealtimeTranscriptEventAssistantTextDelta {
+  content_index: number;
+  delta: string;
+  delta_id: string;
+  item_id: string;
+  previous_item_id?: string;
+  response_id: string;
+  type: "assistant_text_delta";
+}
+
+export interface RealtimeTranscriptEventAssistantTranscriptDelta {
+  content_index: number;
+  delta: string;
+  delta_id: string;
+  item_id: string;
+  previous_item_id?: string;
+  response_id: string;
+  type: "assistant_transcript_delta";
+}
+
+export interface RealtimeTranscriptEventAssistantTranscriptTruncated {
+  content_index: number;
+  item_id: string;
+  response_id: string;
+  text: string;
+  type: "assistant_transcript_truncated";
+}
+
+export interface RealtimeTranscriptEventAssistantTranscriptFinalText {
+  content_index: number;
+  item_id: string;
+  response_id: string;
+  text: string;
+  type: "assistant_transcript_final_text";
+}
+
+export interface RealtimeTranscriptEventAssistantTurnCompleted {
+  response_id: string;
+  stop_reason: unknown;
+  type: "assistant_turn_completed";
+  usage: unknown;
+}
+
+export interface RealtimeTranscriptEventAssistantTurnInterrupted {
+  response_id: string;
+  type: "assistant_turn_interrupted";
+}
+
+export type RealtimeTranscriptEvent = RealtimeTranscriptEventItemObserved | RealtimeTranscriptEventItemSkipped | RealtimeTranscriptEventUserTranscriptFinal | RealtimeTranscriptEventAssistantTextDelta | RealtimeTranscriptEventAssistantTranscriptDelta | RealtimeTranscriptEventAssistantTranscriptTruncated | RealtimeTranscriptEventAssistantTranscriptFinalText | RealtimeTranscriptEventAssistantTurnCompleted | RealtimeTranscriptEventAssistantTurnInterrupted;
+
+export type RealtimeTranscriptRole = "user" | "assistant";
+
+export interface WireLiveDegradationReasonRateLimited {
+  kind: "rate_limited";
+}
+
+export interface WireLiveDegradationReasonProviderThrottled {
+  kind: "provider_throttled";
+}
+
+export interface WireLiveDegradationReasonNetworkUnstable {
+  kind: "network_unstable";
+}
+
+export interface WireLiveDegradationReasonOther {
+  detail: string;
+  kind: "other";
+}
+
+export type WireLiveDegradationReason = WireLiveDegradationReasonRateLimited | WireLiveDegradationReasonProviderThrottled | WireLiveDegradationReasonNetworkUnstable | WireLiveDegradationReasonOther;
+
+export interface WireLiveAdapterStatusIdle {
+  status: "idle";
+}
+
+export interface WireLiveAdapterStatusOpening {
+  status: "opening";
+}
+
+export interface WireLiveAdapterStatusReady {
+  status: "ready";
+}
+
+export interface WireLiveAdapterStatusDegraded {
+  reason: WireLiveDegradationReason;
+  status: "degraded";
+}
+
+export interface WireLiveAdapterStatusClosing {
+  status: "closing";
+}
+
+export interface WireLiveAdapterStatusClosed {
+  status: "closed";
+}
+
+export type WireLiveAdapterStatus = WireLiveAdapterStatusIdle | WireLiveAdapterStatusOpening | WireLiveAdapterStatusReady | WireLiveAdapterStatusDegraded | WireLiveAdapterStatusClosing | WireLiveAdapterStatusClosed;
+
+export interface WireLiveAdapterErrorCodeConnectionFailed {
+  code: "connection_failed";
+}
+
+export interface WireLiveAdapterErrorCodeConnectionLost {
+  code: "connection_lost";
+}
+
+export interface WireLiveAdapterErrorCodeConfigRejected {
+  code: "config_rejected";
+  reason: string;
+}
+
+export interface WireLiveAdapterErrorCodeProviderError {
+  code: "provider_error";
+}
+
+export interface WireLiveAdapterErrorCodeAuthenticationFailed {
+  code: "authentication_failed";
+}
+
+export interface WireLiveAdapterErrorCodeInternalError {
+  code: "internal_error";
+}
+
+export interface WireLiveAdapterErrorCodeOther {
+  code: "other";
+  raw: string;
+}
+
+export type WireLiveAdapterErrorCode = WireLiveAdapterErrorCodeConnectionFailed | WireLiveAdapterErrorCodeConnectionLost | WireLiveAdapterErrorCodeConfigRejected | WireLiveAdapterErrorCodeProviderError | WireLiveAdapterErrorCodeAuthenticationFailed | WireLiveAdapterErrorCodeInternalError | WireLiveAdapterErrorCodeOther;
+
+export interface WireLiveAdapterObservationReady {
+  observation: "ready";
+}
+
+export interface WireLiveAdapterObservationUserTranscriptFinal {
+  content_index?: number;
+  observation: "user_transcript_final";
+  previous_item_id?: string;
+  provider_item_id?: string;
+  text: string;
+}
+
+export interface WireLiveAdapterObservationAssistantTextDelta {
+  content_index?: number;
+  delta: string;
+  delta_id?: string;
+  observation: "assistant_text_delta";
+  previous_item_id?: string;
+  provider_item_id?: string;
+  response_id?: string;
+}
+
+export interface WireLiveAdapterObservationAssistantTranscriptDelta {
+  content_index?: number;
+  delta: string;
+  delta_id?: string;
+  observation: "assistant_transcript_delta";
+  previous_item_id?: string;
+  provider_item_id?: string;
+  response_id?: string;
+}
+
+export interface WireLiveAdapterObservationAssistantAudioChunk {
+  channels: number;
+  content_index?: number;
+  data: string;
+  item_id?: string;
+  observation: "assistant_audio_chunk";
+  response_id?: string;
+  sample_rate_hz: number;
+}
+
+export interface WireLiveAdapterObservationAssistantTranscriptFinal {
+  content_index?: number;
+  observation: "assistant_transcript_final";
+  previous_item_id?: string;
+  provider_item_id: string;
+  response_id?: string;
+  stop_reason: "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "content_filter" | "cancelled";
+  text: string;
+  usage: unknown;
+}
+
+export interface WireLiveAdapterObservationAssistantTranscriptTruncated {
+  content_index?: number;
+  observation: "assistant_transcript_truncated";
+  previous_item_id?: string;
+  provider_item_id?: string;
+  response_id?: string;
+  text?: string;
+}
+
+export interface WireLiveAdapterObservationRealtimeTranscript {
+  event: RealtimeTranscriptEvent;
+  observation: "realtime_transcript";
+}
+
+export interface WireLiveAdapterObservationToolCallRequested {
+  arguments: unknown;
+  observation: "tool_call_requested";
+  provider_call_id: string;
+  tool_name: string;
+}
+
+export interface WireLiveAdapterObservationTurnInterrupted {
+  observation: "turn_interrupted";
+}
+
+export interface WireLiveAdapterObservationTurnCompleted {
+  observation: "turn_completed";
+  response_id?: string;
+  stop_reason: "end_turn" | "tool_use" | "max_tokens" | "stop_sequence" | "content_filter" | "cancelled";
+  usage: unknown;
+}
+
+export interface WireLiveAdapterObservationStatusChanged {
+  observation: "status_changed";
+  status: WireLiveAdapterStatus;
+}
+
+export interface WireLiveAdapterObservationError {
+  code: WireLiveAdapterErrorCode;
+  message: string;
+  observation: "error";
+}
+
+export interface WireLiveAdapterObservationCommandRejected {
+  code: WireLiveAdapterErrorCode;
+  message: string;
+  observation: "command_rejected";
+}
+
+export type WireLiveAdapterObservation = WireLiveAdapterObservationReady | WireLiveAdapterObservationUserTranscriptFinal | WireLiveAdapterObservationAssistantTextDelta | WireLiveAdapterObservationAssistantTranscriptDelta | WireLiveAdapterObservationAssistantAudioChunk | WireLiveAdapterObservationAssistantTranscriptFinal | WireLiveAdapterObservationAssistantTranscriptTruncated | WireLiveAdapterObservationRealtimeTranscript | WireLiveAdapterObservationToolCallRequested | WireLiveAdapterObservationTurnInterrupted | WireLiveAdapterObservationTurnCompleted | WireLiveAdapterObservationStatusChanged | WireLiveAdapterObservationError | WireLiveAdapterObservationCommandRejected;
+
 export interface RuntimeAcceptResult {
   existing_id?: string;
   input_id?: string;

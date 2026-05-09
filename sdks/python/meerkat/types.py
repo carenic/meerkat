@@ -85,6 +85,30 @@ from .generated.types import (
     WireLiveContinuityModeTranscriptOnly as WireLiveContinuityModeTranscriptOnly,
     WireLiveContinuityModeDegraded as WireLiveContinuityModeDegraded,
     WireLiveContinuityModeProviderNativeResume as WireLiveContinuityModeProviderNativeResume,
+    # FIX-SDK-OBS: typed live-adapter observation discriminated union and
+    # its supporting wire mirrors. Browser/Python clients can type-narrow
+    # on the `observation` discriminator and read R5-4 identity fields
+    # (`item_id`, `response_id`, `content_index`) on
+    # `assistant_audio_chunk` plus the R5-9 `command_rejected` typed
+    # channel-survives error variant.
+    WireLiveAdapterObservation as WireLiveAdapterObservation,
+    WireLiveAdapterObservationReady as WireLiveAdapterObservationReady,
+    WireLiveAdapterObservationUserTranscriptFinal as WireLiveAdapterObservationUserTranscriptFinal,
+    WireLiveAdapterObservationAssistantTextDelta as WireLiveAdapterObservationAssistantTextDelta,
+    WireLiveAdapterObservationAssistantTranscriptDelta as WireLiveAdapterObservationAssistantTranscriptDelta,
+    WireLiveAdapterObservationAssistantAudioChunk as WireLiveAdapterObservationAssistantAudioChunk,
+    WireLiveAdapterObservationAssistantTranscriptFinal as WireLiveAdapterObservationAssistantTranscriptFinal,
+    WireLiveAdapterObservationAssistantTranscriptTruncated as WireLiveAdapterObservationAssistantTranscriptTruncated,
+    WireLiveAdapterObservationRealtimeTranscript as WireLiveAdapterObservationRealtimeTranscript,
+    WireLiveAdapterObservationToolCallRequested as WireLiveAdapterObservationToolCallRequested,
+    WireLiveAdapterObservationTurnInterrupted as WireLiveAdapterObservationTurnInterrupted,
+    WireLiveAdapterObservationTurnCompleted as WireLiveAdapterObservationTurnCompleted,
+    WireLiveAdapterObservationStatusChanged as WireLiveAdapterObservationStatusChanged,
+    WireLiveAdapterObservationError as WireLiveAdapterObservationError,
+    WireLiveAdapterObservationCommandRejected as WireLiveAdapterObservationCommandRejected,
+    WireLiveAdapterStatus as WireLiveAdapterStatus,
+    WireLiveAdapterErrorCode as WireLiveAdapterErrorCode,
+    WireLiveDegradationReason as WireLiveDegradationReason,
     RealtimeAudioChunk as RealtimeAudioChunk,
     RealtimeCapabilities as RealtimeCapabilities,
     RealtimeInputChunk as RealtimeInputChunk,

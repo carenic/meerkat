@@ -16,8 +16,13 @@
 use serde::{Deserialize, Serialize};
 
 use meerkat_core::live_adapter::{
-    LiveAdapterStatus, LiveChannelCapabilities, LiveContinuityMode, LiveTransportBootstrap,
+    LiveAdapterErrorCode, LiveAdapterObservation, LiveAdapterStatus, LiveChannelCapabilities,
+    LiveContinuityMode, LiveDegradationReason, LiveTransportBootstrap,
 };
+use meerkat_core::realtime_transcript::RealtimeTranscriptEvent;
+use meerkat_core::types::Usage;
+
+use crate::wire::session::WireStopReason;
 
 /// Request payload for `live/open`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -311,6 +316,458 @@ pub struct LiveTruncateParams {
     pub audio_played_ms: u64,
 }
 
+// ---------------------------------------------------------------------------
+// FIX-SDK-OBS — typed wire mirror for `LiveAdapterObservation`
+// ---------------------------------------------------------------------------
+
+/// Wire mirror of [`meerkat_core::live_adapter::LiveDegradationReason`].
+///
+/// Internally-tagged on `kind` (snake_case) — matches the core enum's serde
+/// shape exactly. SDK consumers route on `kind` to distinguish the
+/// non-payload variants from the typed `other { detail }` payload.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WireLiveDegradationReason {
+    RateLimited,
+    ProviderThrottled,
+    NetworkUnstable,
+    Other { detail: String },
+}
+
+impl From<LiveDegradationReason> for WireLiveDegradationReason {
+    fn from(value: LiveDegradationReason) -> Self {
+        match value {
+            LiveDegradationReason::RateLimited => Self::RateLimited,
+            LiveDegradationReason::ProviderThrottled => Self::ProviderThrottled,
+            LiveDegradationReason::NetworkUnstable => Self::NetworkUnstable,
+            LiveDegradationReason::Other { detail } => Self::Other {
+                detail: detail.into_owned(),
+            },
+            // Core enum is `non_exhaustive`; debug-assert for new variants.
+            _ => {
+                debug_assert!(
+                    false,
+                    "WireLiveDegradationReason::from saw an unmapped \
+                     LiveDegradationReason variant; add an explicit arm in \
+                     meerkat-contracts/src/wire/live.rs."
+                );
+                Self::Other {
+                    detail: "unknown".to_string(),
+                }
+            }
+        }
+    }
+}
+
+/// Wire mirror of [`meerkat_core::live_adapter::LiveAdapterStatus`].
+///
+/// Internally-tagged on `status` (snake_case). The `degraded` variant
+/// references [`WireLiveDegradationReason`] so the typed reason is visible at
+/// the SDK boundary.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "status", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WireLiveAdapterStatus {
+    Idle,
+    Opening,
+    Ready,
+    Degraded { reason: WireLiveDegradationReason },
+    Closing,
+    Closed,
+}
+
+impl From<LiveAdapterStatus> for WireLiveAdapterStatus {
+    fn from(value: LiveAdapterStatus) -> Self {
+        match value {
+            LiveAdapterStatus::Idle => Self::Idle,
+            LiveAdapterStatus::Opening => Self::Opening,
+            LiveAdapterStatus::Ready => Self::Ready,
+            LiveAdapterStatus::Degraded { reason } => Self::Degraded {
+                reason: reason.into(),
+            },
+            LiveAdapterStatus::Closing => Self::Closing,
+            LiveAdapterStatus::Closed => Self::Closed,
+            _ => {
+                debug_assert!(
+                    false,
+                    "WireLiveAdapterStatus::from saw an unmapped \
+                     LiveAdapterStatus variant; add an explicit arm in \
+                     meerkat-contracts/src/wire/live.rs."
+                );
+                Self::Closed
+            }
+        }
+    }
+}
+
+/// Wire mirror of [`meerkat_core::live_adapter::LiveAdapterErrorCode`].
+///
+/// Internally-tagged on `code` (snake_case). SDK consumers route on `code`
+/// to distinguish payload-less variants from typed payload variants
+/// (`config_rejected { reason }`, `other { raw }`). FIX-SDK-OBS: makes the
+/// R5-9 `CommandRejected` observation's typed code visible at the SDK
+/// boundary instead of a free-form blob.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "code", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WireLiveAdapterErrorCode {
+    ConnectionFailed,
+    ConnectionLost,
+    ConfigRejected { reason: String },
+    ProviderError,
+    AuthenticationFailed,
+    InternalError,
+    Other { raw: String },
+}
+
+impl From<LiveAdapterErrorCode> for WireLiveAdapterErrorCode {
+    fn from(value: LiveAdapterErrorCode) -> Self {
+        match value {
+            LiveAdapterErrorCode::ConnectionFailed => Self::ConnectionFailed,
+            LiveAdapterErrorCode::ConnectionLost => Self::ConnectionLost,
+            LiveAdapterErrorCode::ConfigRejected { reason } => Self::ConfigRejected { reason },
+            LiveAdapterErrorCode::ProviderError => Self::ProviderError,
+            LiveAdapterErrorCode::AuthenticationFailed => Self::AuthenticationFailed,
+            LiveAdapterErrorCode::InternalError => Self::InternalError,
+            LiveAdapterErrorCode::Other { raw } => Self::Other { raw },
+            _ => {
+                debug_assert!(
+                    false,
+                    "WireLiveAdapterErrorCode::from saw an unmapped \
+                     LiveAdapterErrorCode variant; add an explicit arm in \
+                     meerkat-contracts/src/wire/live.rs."
+                );
+                Self::InternalError
+            }
+        }
+    }
+}
+
+impl From<WireLiveAdapterErrorCode> for LiveAdapterErrorCode {
+    fn from(value: WireLiveAdapterErrorCode) -> Self {
+        match value {
+            WireLiveAdapterErrorCode::ConnectionFailed => Self::ConnectionFailed,
+            WireLiveAdapterErrorCode::ConnectionLost => Self::ConnectionLost,
+            WireLiveAdapterErrorCode::ConfigRejected { reason } => Self::ConfigRejected { reason },
+            WireLiveAdapterErrorCode::ProviderError => Self::ProviderError,
+            WireLiveAdapterErrorCode::AuthenticationFailed => Self::AuthenticationFailed,
+            WireLiveAdapterErrorCode::InternalError => Self::InternalError,
+            WireLiveAdapterErrorCode::Other { raw } => Self::Other { raw },
+        }
+    }
+}
+
+/// Wire mirror of [`meerkat_core::live_adapter::LiveAdapterObservation`].
+///
+/// FIX-SDK-OBS: closes the R5-4 verifier gap. The core enum is the canonical
+/// shape adapters emit, but it is not registered for schema emission and is
+/// therefore invisible at the SDK boundary — browser/Python clients receive
+/// observations as untyped JSON and cannot type-narrow on
+/// `assistant_audio_chunk` (to read the new `item_id` / `response_id` /
+/// `content_index` fields driving `live/truncate`) or on `command_rejected`
+/// (a typed channel-survives error introduced in R5-9). The wire mirror
+/// makes every variant visible to schema codegen and produces a discriminated
+/// TypeScript union / typed Python `TypedDict` union.
+///
+/// Serde shape mirrors the core enum exactly: internally-tagged on
+/// `observation` (snake_case). Round-trip with the core type is byte-
+/// identical (see `wire_live_adapter_observation_byte_compatible_with_core`).
+///
+/// Field types reference other wire mirrors where they exist
+/// ([`WireStopReason`], [`WireUsage`], [`WireLiveAdapterStatus`],
+/// [`WireLiveAdapterErrorCode`]) and the canonical
+/// [`RealtimeTranscriptEvent`] (which already derives `JsonSchema` and is
+/// auto-promoted by the SDK codegen `Realtime*` allowlist rule).
+///
+/// Audio data is base64-encoded on the wire (matches the core
+/// [`LiveAdapterObservation::AssistantAudioChunk`] base64 mode); the wire
+/// mirror carries `data` as a `String` so the schema emits `String` instead
+/// of an opaque `Vec<u8>` JSON-array shape.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "observation", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WireLiveAdapterObservation {
+    Ready,
+    UserTranscriptFinal {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_index: Option<u32>,
+        text: String,
+    },
+    AssistantTextDelta {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_index: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delta_id: Option<String>,
+        delta: String,
+    },
+    AssistantTranscriptDelta {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_index: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        delta_id: Option<String>,
+        delta: String,
+    },
+    /// R5-4: identity fields (`response_id`, `item_id`, `content_index`)
+    /// propagate the source server-event identity so clients can attach a
+    /// playback cursor to a provider item without racing on the
+    /// transcript-delta arrival order.
+    AssistantAudioChunk {
+        /// Base64-encoded PCM payload. Matches the core
+        /// [`LiveAdapterObservation::AssistantAudioChunk`] serde shape.
+        data: String,
+        sample_rate_hz: u32,
+        channels: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_index: Option<u32>,
+    },
+    AssistantTranscriptFinal {
+        provider_item_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_index: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+        text: String,
+        stop_reason: WireStopReason,
+        // Core `Usage` does not have a registered schema mirror that the
+        // SDK codegen promotes; expose as opaque JSON in the schema layer
+        // (matches the `LiveOpenResult.transport: LiveTransportBootstrap`
+        // pattern). Real shape is `{input_tokens, output_tokens,
+        // cache_creation_tokens?, cache_read_tokens?}` per
+        // `meerkat_core::types::Usage`.
+        #[cfg_attr(feature = "schema", schemars(with = "serde_json::Value"))]
+        usage: Usage,
+    },
+    AssistantTranscriptTruncated {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        provider_item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        previous_item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_index: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+    },
+    /// Pass-through of a structured `RealtimeTranscriptEvent` from the
+    /// provider. The core type already derives `JsonSchema` and the SDK
+    /// codegen auto-promotes `Realtime*` schemas, so the typed shape lands
+    /// in generated SDK types without an additional wire mirror.
+    RealtimeTranscript {
+        event: RealtimeTranscriptEvent,
+    },
+    ToolCallRequested {
+        provider_call_id: String,
+        tool_name: String,
+        #[cfg_attr(feature = "schema", schemars(with = "serde_json::Value"))]
+        arguments: serde_json::Value,
+    },
+    /// Barge-in: the user interrupted the assistant mid-turn.
+    TurnInterrupted,
+    TurnCompleted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+        stop_reason: WireStopReason,
+        #[cfg_attr(feature = "schema", schemars(with = "serde_json::Value"))]
+        usage: Usage,
+    },
+    StatusChanged {
+        status: WireLiveAdapterStatus,
+    },
+    Error {
+        code: WireLiveAdapterErrorCode,
+        message: String,
+    },
+    /// R5-9: scoped command rejection. Channel survives — distinct from
+    /// terminal [`Self::Error`].
+    CommandRejected {
+        code: WireLiveAdapterErrorCode,
+        message: String,
+    },
+}
+
+impl From<LiveAdapterObservation> for WireLiveAdapterObservation {
+    fn from(value: LiveAdapterObservation) -> Self {
+        match value {
+            LiveAdapterObservation::Ready => Self::Ready,
+            LiveAdapterObservation::UserTranscriptFinal {
+                provider_item_id,
+                previous_item_id,
+                content_index,
+                text,
+            } => Self::UserTranscriptFinal {
+                provider_item_id,
+                previous_item_id,
+                content_index,
+                text,
+            },
+            LiveAdapterObservation::AssistantTextDelta {
+                provider_item_id,
+                previous_item_id,
+                content_index,
+                response_id,
+                delta_id,
+                delta,
+            } => Self::AssistantTextDelta {
+                provider_item_id,
+                previous_item_id,
+                content_index,
+                response_id,
+                delta_id,
+                delta,
+            },
+            LiveAdapterObservation::AssistantTranscriptDelta {
+                provider_item_id,
+                previous_item_id,
+                content_index,
+                response_id,
+                delta_id,
+                delta,
+            } => Self::AssistantTranscriptDelta {
+                provider_item_id,
+                previous_item_id,
+                content_index,
+                response_id,
+                delta_id,
+                delta,
+            },
+            LiveAdapterObservation::AssistantAudioChunk {
+                data,
+                sample_rate_hz,
+                channels,
+                response_id,
+                item_id,
+                content_index,
+            } => {
+                use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
+                Self::AssistantAudioChunk {
+                    data: BASE64_STANDARD.encode(&data),
+                    sample_rate_hz,
+                    channels,
+                    response_id,
+                    item_id,
+                    content_index,
+                }
+            }
+            LiveAdapterObservation::AssistantTranscriptFinal {
+                provider_item_id,
+                previous_item_id,
+                content_index,
+                response_id,
+                text,
+                stop_reason,
+                usage,
+            } => Self::AssistantTranscriptFinal {
+                provider_item_id,
+                previous_item_id,
+                content_index,
+                response_id,
+                text,
+                stop_reason: WireStopReason::from(stop_reason),
+                usage,
+            },
+            LiveAdapterObservation::AssistantTranscriptTruncated {
+                provider_item_id,
+                previous_item_id,
+                content_index,
+                response_id,
+                text,
+            } => Self::AssistantTranscriptTruncated {
+                provider_item_id,
+                previous_item_id,
+                content_index,
+                response_id,
+                text,
+            },
+            LiveAdapterObservation::RealtimeTranscript { event } => {
+                Self::RealtimeTranscript { event }
+            }
+            LiveAdapterObservation::ToolCallRequested {
+                provider_call_id,
+                tool_name,
+                arguments,
+            } => Self::ToolCallRequested {
+                provider_call_id,
+                tool_name,
+                arguments,
+            },
+            LiveAdapterObservation::TurnInterrupted => Self::TurnInterrupted,
+            LiveAdapterObservation::TurnCompleted {
+                response_id,
+                stop_reason,
+                usage,
+            } => Self::TurnCompleted {
+                response_id,
+                stop_reason: WireStopReason::from(stop_reason),
+                usage,
+            },
+            LiveAdapterObservation::StatusChanged { status } => Self::StatusChanged {
+                status: status.into(),
+            },
+            LiveAdapterObservation::Error { code, message } => Self::Error {
+                code: code.into(),
+                message,
+            },
+            LiveAdapterObservation::CommandRejected { code, message } => Self::CommandRejected {
+                code: code.into(),
+                message,
+            },
+            // Core enum is `non_exhaustive`; debug-assert for new variants.
+            _ => {
+                debug_assert!(
+                    false,
+                    "WireLiveAdapterObservation::from saw an unmapped \
+                     LiveAdapterObservation variant; add an explicit arm in \
+                     meerkat-contracts/src/wire/live.rs."
+                );
+                Self::TurnInterrupted
+            }
+        }
+    }
+}
+
+/// Bridge variant: the wire mirror does not duplicate
+/// [`meerkat_core::live_adapter::LiveAdapterStatus`] inside `Error.code`
+/// payloads, so the only `From<Wire... > -> Core` path that matters here is
+/// for the `Error` / `CommandRejected` branch (clients echoing typed errors
+/// back to the runtime). A full inverse is not required for the SDK
+/// observation surface — observations flow adapter -> wire -> SDK only —
+/// but `WireStopReason` and `WireUsage` already provide the inverse via
+/// their dedicated wire types in `wire/session.rs` and the helper above.
+//
+// (No `impl From<WireLiveAdapterObservation> for LiveAdapterObservation`
+// emitted: the wire-side observation is a downstream projection, never the
+// authority. Adding one would invite reverse-direction flows that bypass
+// the adapter contract; the round-trip *value* equality is asserted via
+// JSON in `wire_live_adapter_observation_round_trips_for_all_variants`.)
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::panic)]
 mod tests {
@@ -596,5 +1053,186 @@ mod tests {
         assert_eq!(j["continuity"]["mode"], "transcript_only");
         let back: LiveOpenResult = serde_json::from_value(j).expect("round-trip should succeed");
         assert_eq!(v, back);
+    }
+
+    // FIX-SDK-OBS — typed `LiveAdapterObservation` wire mirror.
+
+    #[test]
+    fn wire_live_adapter_observation_round_trips_for_all_variants() {
+        // Each typed variant survives serde round-trip with its
+        // discriminator and payload visible. Reads exercise the
+        // R5-4 identity fields on `assistant_audio_chunk` and the R5-9
+        // `command_rejected` typed error code.
+
+        let cases: Vec<WireLiveAdapterObservation> = vec![
+            WireLiveAdapterObservation::Ready,
+            WireLiveAdapterObservation::UserTranscriptFinal {
+                provider_item_id: Some("item_user_1".into()),
+                previous_item_id: None,
+                content_index: Some(0),
+                text: "hello".into(),
+            },
+            WireLiveAdapterObservation::AssistantTextDelta {
+                provider_item_id: Some("item_a".into()),
+                previous_item_id: None,
+                content_index: Some(0),
+                response_id: Some("resp_1".into()),
+                delta_id: Some("delta_1".into()),
+                delta: "hi".into(),
+            },
+            WireLiveAdapterObservation::AssistantTranscriptDelta {
+                provider_item_id: Some("item_b".into()),
+                previous_item_id: None,
+                content_index: Some(0),
+                response_id: Some("resp_1".into()),
+                delta_id: Some("delta_2".into()),
+                delta: "spoken".into(),
+            },
+            // R5-4: identity fields populated on the audio chunk so the
+            // wire mirror exposes them to SDK clients driving
+            // `live/truncate`.
+            WireLiveAdapterObservation::AssistantAudioChunk {
+                data: "AQID".into(),
+                sample_rate_hz: 24_000,
+                channels: 1,
+                response_id: Some("resp_audio".into()),
+                item_id: Some("item_audio".into()),
+                content_index: Some(0),
+            },
+            WireLiveAdapterObservation::AssistantTranscriptFinal {
+                provider_item_id: "item_final".into(),
+                previous_item_id: None,
+                content_index: Some(0),
+                response_id: Some("resp_final".into()),
+                text: "all done".into(),
+                stop_reason: WireStopReason::EndTurn,
+                usage: Usage {
+                    input_tokens: 5,
+                    output_tokens: 7,
+                    cache_creation_tokens: None,
+                    cache_read_tokens: None,
+                },
+            },
+            WireLiveAdapterObservation::AssistantTranscriptTruncated {
+                provider_item_id: Some("item_trunc".into()),
+                previous_item_id: None,
+                content_index: Some(0),
+                response_id: Some("resp_trunc".into()),
+                text: Some("partial".into()),
+            },
+            WireLiveAdapterObservation::ToolCallRequested {
+                provider_call_id: "call_1".into(),
+                tool_name: "lookup".into(),
+                arguments: serde_json::json!({"q": "weather"}),
+            },
+            WireLiveAdapterObservation::TurnInterrupted,
+            WireLiveAdapterObservation::TurnCompleted {
+                response_id: Some("resp_done".into()),
+                stop_reason: WireStopReason::EndTurn,
+                usage: Usage {
+                    input_tokens: 12,
+                    output_tokens: 34,
+                    cache_creation_tokens: Some(1),
+                    cache_read_tokens: Some(2),
+                },
+            },
+            WireLiveAdapterObservation::StatusChanged {
+                status: WireLiveAdapterStatus::Degraded {
+                    reason: WireLiveDegradationReason::RateLimited,
+                },
+            },
+            WireLiveAdapterObservation::Error {
+                code: WireLiveAdapterErrorCode::ConnectionLost,
+                message: "transport gone".into(),
+            },
+            // R5-9: typed `CommandRejected` is now a first-class wire variant.
+            WireLiveAdapterObservation::CommandRejected {
+                code: WireLiveAdapterErrorCode::ConfigRejected {
+                    reason: "image_input_not_implemented".into(),
+                },
+                message: "adapter rejected image".into(),
+            },
+        ];
+
+        for case in cases {
+            let j = serde_json::to_value(&case).expect("round-trip should succeed");
+            assert!(
+                j.get("observation").is_some(),
+                "missing `observation` discriminator on {case:?}"
+            );
+            let back: WireLiveAdapterObservation =
+                serde_json::from_value(j).expect("round-trip should succeed");
+            assert_eq!(case, back);
+        }
+    }
+
+    #[test]
+    fn wire_live_adapter_observation_assistant_audio_chunk_identity_fields_visible() {
+        // The R5-4 identity fields (`response_id`, `item_id`,
+        // `content_index`) appear flat on the JSON object so SDK
+        // consumers can drive `live/truncate` typed.
+        let v = WireLiveAdapterObservation::AssistantAudioChunk {
+            data: "AQID".into(),
+            sample_rate_hz: 24_000,
+            channels: 1,
+            response_id: Some("resp_audio".into()),
+            item_id: Some("item_audio".into()),
+            content_index: Some(2),
+        };
+        let j = serde_json::to_value(&v).expect("round-trip should succeed");
+        assert_eq!(j["observation"], "assistant_audio_chunk");
+        assert_eq!(j["item_id"], "item_audio");
+        assert_eq!(j["response_id"], "resp_audio");
+        assert_eq!(j["content_index"], 2);
+        assert_eq!(j["sample_rate_hz"], 24_000);
+        assert_eq!(j["channels"], 1);
+    }
+
+    #[test]
+    fn wire_live_adapter_observation_command_rejected_visible_as_typed_variant() {
+        let v = WireLiveAdapterObservation::CommandRejected {
+            code: WireLiveAdapterErrorCode::ConfigRejected {
+                reason: "video_frame_input_not_implemented".into(),
+            },
+            message: "rejected".into(),
+        };
+        let j = serde_json::to_value(&v).expect("round-trip should succeed");
+        assert_eq!(j["observation"], "command_rejected");
+        assert_eq!(j["code"]["code"], "config_rejected");
+        assert_eq!(j["code"]["reason"], "video_frame_input_not_implemented");
+    }
+
+    #[test]
+    fn wire_live_adapter_observation_byte_compatible_with_core_for_audio_chunk() {
+        // Wire mirror serializes byte-identical to the core enum for the
+        // R5-4 identity-bearing variant. Catches drift between the two
+        // shapes the moment a field is added to one and forgotten on the
+        // other.
+        let core = LiveAdapterObservation::AssistantAudioChunk {
+            data: vec![1, 2, 3],
+            sample_rate_hz: 24_000,
+            channels: 1,
+            response_id: Some("resp_audio".into()),
+            item_id: Some("item_audio".into()),
+            content_index: Some(2),
+        };
+        let wire: WireLiveAdapterObservation = core.clone().into();
+        let core_json = serde_json::to_value(&core).expect("round-trip should succeed");
+        let wire_json = serde_json::to_value(&wire).expect("round-trip should succeed");
+        assert_eq!(core_json, wire_json);
+    }
+
+    #[test]
+    fn wire_live_adapter_observation_byte_compatible_with_core_for_command_rejected() {
+        let core = LiveAdapterObservation::CommandRejected {
+            code: LiveAdapterErrorCode::ConfigRejected {
+                reason: "image_input_not_implemented".into(),
+            },
+            message: "rejected".into(),
+        };
+        let wire: WireLiveAdapterObservation = core.clone().into();
+        let core_json = serde_json::to_value(&core).expect("round-trip should succeed");
+        let wire_json = serde_json::to_value(&wire).expect("round-trip should succeed");
+        assert_eq!(core_json, wire_json);
     }
 }

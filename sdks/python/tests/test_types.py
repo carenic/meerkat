@@ -2885,3 +2885,51 @@ def test_generated_live_send_input_params_chunk_is_typed_union():
         params = LiveSendInputParams(channel_id="live_1", chunk=chunk)
         assert params.channel_id == "live_1"
         assert params.chunk is chunk
+
+
+def test_generated_wire_live_adapter_observation_is_typed_union():
+    """FIX-SDK-OBS: `WireLiveAdapterObservation` is a discriminated
+    union over the `observation` tag — not opaque `dict[str, Any]`.
+
+    Closes the verifier gap that left R5-4 identity fields (`item_id`,
+    `response_id`, `content_index` on `assistant_audio_chunk`) and the
+    R5-9 `command_rejected` typed channel-survives error invisible at
+    the SDK boundary. Browser/Python clients can now type-narrow on the
+    `observation` discriminator and read the typed payload fields with
+    static-checker support.
+    """
+    from typing import get_args, get_type_hints
+
+    from meerkat.types import (
+        WireLiveAdapterErrorCode,
+        WireLiveAdapterObservation,
+        WireLiveAdapterObservationAssistantAudioChunk,
+        WireLiveAdapterObservationCommandRejected,
+        WireLiveAdapterObservationError,
+        WireLiveAdapterObservationReady,
+        WireLiveAdapterObservationStatusChanged,
+        WireLiveAdapterObservationTurnInterrupted,
+    )
+
+    # The union must include every variant the adapter can emit.
+    union_members = set(get_args(WireLiveAdapterObservation))
+    assert WireLiveAdapterObservationReady in union_members
+    assert WireLiveAdapterObservationAssistantAudioChunk in union_members
+    assert WireLiveAdapterObservationCommandRejected in union_members
+    assert WireLiveAdapterObservationError in union_members
+    assert WireLiveAdapterObservationStatusChanged in union_members
+    assert WireLiveAdapterObservationTurnInterrupted in union_members
+    # Sanity: each variant is tagged on `observation` with the snake_case
+    # discriminator value.
+    audio_hints = get_type_hints(WireLiveAdapterObservationAssistantAudioChunk)
+    assert get_args(audio_hints["observation"]) == ("assistant_audio_chunk",)
+    rejected_hints = get_type_hints(WireLiveAdapterObservationCommandRejected)
+    assert get_args(rejected_hints["observation"]) == ("command_rejected",)
+    # R5-4: identity fields are visible (typed Optional[str] / int) at
+    # the SDK boundary so browser clients can drive `live/truncate`.
+    assert "item_id" in audio_hints
+    assert "response_id" in audio_hints
+    assert "content_index" in audio_hints
+    # R5-9: typed `code` field on the rejection variant — not a free-form
+    # blob.
+    assert rejected_hints["code"] == WireLiveAdapterErrorCode
