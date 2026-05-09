@@ -2305,6 +2305,10 @@ export class MeerkatClient {
     await this.request("live/truncate", params as unknown as Record<string, unknown>);
   }
 
+  async liveRefresh(params: LiveChannelParams): Promise<void> {
+    await this.request("live/refresh", params as unknown as Record<string, unknown>);
+  }
+
   // -- Auth + realm (Phase 4d) --------------------------------------------
   //
   // These wrappers cover the RPC catalog's auth/* and realm/* methods.

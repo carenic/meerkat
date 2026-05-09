@@ -504,6 +504,12 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
                 "LiveTruncateParams",
                 "Value",
             ),
+            RpcMethodDescriptor::typed(
+                "live/refresh",
+                "Re-seed an open live channel against the latest canonical session state without tearing the channel down",
+                "LiveChannelParams",
+                "Value",
+            ),
         ]);
     }
 
