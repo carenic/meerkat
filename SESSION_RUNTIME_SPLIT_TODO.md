@@ -213,12 +213,18 @@ self-verify.
   `meerkat::session_runtime::admission`. Re-export from
   `meerkat-rpc::session_runtime` for backward compatibility.
 
-- [ ] fix · [ ] verify · **W1-B.** Move `PendingPromotionCleanup`
+- [x] fix · [ ] verify · **W1-B.** Move `PendingPromotionCleanup`
   (struct + Drop impl + all 13 methods) from
   `meerkat-rpc/src/session_runtime.rs:828-1129` to
   `meerkat::session_runtime::staged_promotion`. The Drop impl spawns
   a tokio task — verify it still compiles in the new crate (tokio
   dep is already on `meerkat` facade).
+  *Note:* the destination module is gated on
+  `cfg(all(feature = "session-store", not(target_arch = "wasm32")))`
+  because `PersistentSessionService` and
+  `MachineSessionArchiveProtocol` are only compiled with that
+  feature. `meerkat-rpc` already enables `session-store` so the
+  re-export works unconditionally on its side.
 
 - [x] fix · [ ] verify · **W1-C.** Move `RuntimePreAdmission`,
   `RuntimePreAdmissionGuard`, `RuntimePreAdmissionEntry`,
