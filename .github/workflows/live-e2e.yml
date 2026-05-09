@@ -53,7 +53,7 @@ jobs:
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: ./.github/actions/setup-rust-ci
       - run: rustup target add --toolchain "${RUSTUP_TOOLCHAIN}" wasm32-unknown-unknown
       - uses: actions/setup-python@v5
         with:
@@ -76,7 +76,7 @@ jobs:
     runs-on: ${{ fromJSON(vars.MEERKAT_CI_RUNNER || '"ubuntu-latest"') }}
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@1.94.0
+      - uses: ./.github/actions/setup-rust-ci
       - run: rustup target add --toolchain "${RUSTUP_TOOLCHAIN}" wasm32-unknown-unknown
       - uses: actions/setup-python@v5
         with:

@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root="$(git rev-parse --show-toplevel)"
+cd "${root}"
+
+toolchain="${RUSTUP_TOOLCHAIN:-}"
+if [[ -z "${toolchain}" && -f rust-toolchain.toml ]]; then
+  toolchain="$(awk -F '"' '/^[[:space:]]*channel[[:space:]]*=/ { print $2; exit }' rust-toolchain.toml)"
+fi
+
+if [[ -z "${toolchain}" ]]; then
+  echo "error: RUSTUP_TOOLCHAIN is unset and rust-toolchain.toml has no channel" >&2
+  exit 1
+fi
+
+if ! command -v rustup >/dev/null 2>&1; then
+  echo "error: rustup is required to pin CI toolchain binaries" >&2
+  exit 1
+fi
+
+rustup component add --toolchain "${toolchain}" rustfmt clippy >/dev/null
+
+cargo_path="$(rustup which --toolchain "${toolchain}" cargo)"
+rustc_path="$(rustup which --toolchain "${toolchain}" rustc)"
+rustdoc_path="$(rustup which --toolchain "${toolchain}" rustdoc)"
+rustfmt_path="$(rustup which --toolchain "${toolchain}" rustfmt)"
+toolchain_bin="$(dirname "${cargo_path}")"
+
+echo "Pinned Rust toolchain: ${toolchain}"
+"${rustc_path}" -Vv
+
+if [[ -n "${GITHUB_PATH:-}" ]]; then
+  echo "${toolchain_bin}" >>"${GITHUB_PATH}"
+fi
+
+if [[ -n "${GITHUB_ENV:-}" ]]; then
+  {
+    echo "RUSTUP_TOOLCHAIN=${toolchain}"
+    echo "RUSTC=${rustc_path}"
+    echo "RUSTDOC=${rustdoc_path}"
+    echo "RUSTFMT=${rustfmt_path}"
+    echo "MEERKAT_RUST_TOOLCHAIN_BIN=${toolchain_bin}"
+  } >>"${GITHUB_ENV}"
+fi

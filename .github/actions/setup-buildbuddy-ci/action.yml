@@ -14,10 +14,12 @@ runs:
       if: ${{ inputs.profile == 'submitter' || inputs.profile == 'doctor' || inputs.profile == 'lint' || inputs.profile == 'sdk' || inputs.profile == 'rust' || inputs.profile == 'wasm' || inputs.profile == 'audit' || inputs.profile == 'native' || inputs.profile == 'full' }}
       uses: dtolnay/rust-toolchain@1.94.0
 
-    - name: Export pinned Rustup toolchain
+    - name: Pin Rust toolchain binaries
       if: ${{ inputs.profile == 'submitter' || inputs.profile == 'doctor' || inputs.profile == 'lint' || inputs.profile == 'sdk' || inputs.profile == 'rust' || inputs.profile == 'wasm' || inputs.profile == 'audit' || inputs.profile == 'native' || inputs.profile == 'full' }}
       shell: bash
-      run: echo "RUSTUP_TOOLCHAIN=1.94.0" >> "${GITHUB_ENV}"
+      env:
+        RUSTUP_TOOLCHAIN: 1.94.0
+      run: scripts/ci-pin-rust-toolchain-env
 
     - name: Add wasm32 target
       if: ${{ inputs.profile == 'wasm' || inputs.profile == 'full' }}

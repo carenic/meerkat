@@ -29,6 +29,11 @@ repo_key="${repo_slug}-$(hash_path "${git_common_dir}")"
 target_cache_schema="v4"
 toolchain_spec=""
 toolchain_key="${MEERKAT_RUST_TOOLCHAIN_ID:-}"
+toolchain_bin=""
+toolchain_cargo=""
+toolchain_rustc=""
+toolchain_rustdoc=""
+toolchain_rustfmt=""
 
 if [[ -n "${RUSTUP_TOOLCHAIN:-}" ]]; then
   toolchain_spec="${RUSTUP_TOOLCHAIN}"
@@ -48,6 +53,13 @@ if [[ -n "${toolchain_spec}" ]] && command -v rustup >/dev/null 2>&1; then
     rustc_host="$(awk -F ': ' '$1 == "host" { print $2; exit }' <<<"${rustc_verbose}")"
     rustc_commit="$(awk -F ': ' '$1 == "commit-hash" { print substr($2, 1, 10); exit }' <<<"${rustc_verbose}")"
     toolchain_key="${rustc_release:-${toolchain_key}}-${rustc_host:-unknown}-${rustc_commit:-unknown}"
+  fi
+  toolchain_cargo="$(rustup which --toolchain "${toolchain_spec}" cargo 2>/dev/null || true)"
+  toolchain_rustc="$(rustup which --toolchain "${toolchain_spec}" rustc 2>/dev/null || true)"
+  toolchain_rustdoc="$(rustup which --toolchain "${toolchain_spec}" rustdoc 2>/dev/null || true)"
+  toolchain_rustfmt="$(rustup which --toolchain "${toolchain_spec}" rustfmt 2>/dev/null || true)"
+  if [[ -n "${toolchain_cargo}" ]]; then
+    toolchain_bin="$(dirname "${toolchain_cargo}")"
   fi
 fi
 
@@ -109,6 +121,10 @@ if [[ "${1-}" == "--print-env" ]]; then
     "toolchain_spec=${toolchain_spec}" \
     "toolchain_key=${toolchain_key}" \
     "RUSTUP_TOOLCHAIN=${toolchain_spec}" \
+    "MEERKAT_RUST_TOOLCHAIN_BIN=${toolchain_bin}" \
+    "RUSTC=${toolchain_rustc}" \
+    "RUSTDOC=${toolchain_rustdoc}" \
+    "RUSTFMT=${toolchain_rustfmt}" \
     "lane_key=${lane_key}" \
     "CARGO_HOME=${CARGO_HOME}" \
     "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}"
@@ -131,6 +147,10 @@ if [[ "${1-}" == "--doctor" ]]; then
     "toolchain_spec=${toolchain_spec}" \
     "toolchain_key=${toolchain_key}" \
     "RUSTUP_TOOLCHAIN=${toolchain_spec}" \
+    "MEERKAT_RUST_TOOLCHAIN_BIN=${toolchain_bin}" \
+    "RUSTC=${toolchain_rustc}" \
+    "RUSTDOC=${toolchain_rustdoc}" \
+    "RUSTFMT=${toolchain_rustfmt}" \
     "lane_key=${lane_key}" \
     "CARGO_HOME=${CARGO_HOME}" \
     "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}"
@@ -141,10 +161,25 @@ cd "${workspace_root}"
 
 if [[ -n "${toolchain_spec}" ]]; then
   export RUSTUP_TOOLCHAIN="${toolchain_spec}"
+  if [[ -n "${toolchain_bin}" ]]; then
+    export PATH="${toolchain_bin}:${PATH}"
+    export MEERKAT_RUST_TOOLCHAIN_BIN="${toolchain_bin}"
+  fi
+  if [[ -n "${toolchain_rustc}" ]]; then
+    export RUSTC="${toolchain_rustc}"
+  fi
+  if [[ -n "${toolchain_rustdoc}" ]]; then
+    export RUSTDOC="${toolchain_rustdoc}"
+  fi
+  if [[ -n "${toolchain_rustfmt}" ]]; then
+    export RUSTFMT="${toolchain_rustfmt}"
+  fi
 fi
 
 if [[ -n "${CARGO_BIN:-}" ]]; then
   cargo_cmd=("${CARGO_BIN}")
+elif [[ -n "${toolchain_cargo}" ]]; then
+  cargo_cmd=("${toolchain_cargo}")
 elif [[ -n "${toolchain_spec}" ]] && command -v rustup >/dev/null 2>&1; then
   cargo_cmd=(rustup run "${toolchain_spec}" cargo)
 elif command -v cargo >/dev/null 2>&1; then
