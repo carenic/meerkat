@@ -2920,138 +2920,23 @@ impl SessionRuntime {
         session_id: SessionId,
         create_req: CreateSessionRequest,
         start_req: StartTurnRequest,
-        mut promotion_cleanup: PendingPromotionCleanup,
+        promotion_cleanup: PendingPromotionCleanup,
         machine_archived_resume_authorized: bool,
     ) -> ServiceStartTurnResultReceiver {
-        let service = Arc::clone(&self.service);
-        let staged_sessions = Arc::clone(&self.staged_sessions);
-        let runtime_adapter = Arc::clone(&self.runtime_adapter);
-        #[cfg(test)]
-        let pending_promotion_pre_turn_hook = Arc::clone(&self.pending_promotion_pre_turn_hook);
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let create_result = match (
-                promotion_cleanup.take_staged_capacity_admission(),
-                machine_archived_resume_authorized,
-            ) {
-                (Some(admission), true) => {
-                    service
-                        .create_session_with_reserved_machine_archived_resume_admission(
-                            create_req,
-                            admission,
-                            runtime_adapter.session_control_authority(),
-                        )
-                        .await
-                }
-                (Some(admission), false) => {
-                    service
-                        .create_session_with_reserved_admission(create_req, admission)
-                        .await
-                }
-                (None, true) => Err(SessionError::Agent(
-                    meerkat_core::error::AgentError::InternalError(format!(
-                        "machine-authorized archived resume for session {session_id} is missing a reserved staged admission"
-                    )),
-                )),
-                (None, false) => service.create_session(create_req).await,
-            };
-            match create_result {
-                Ok(_) => {
-                    promotion_cleanup.mark_materialized();
-                }
-                Err(err) => {
-                    if Self::is_archived_create_rejection(&err) {
-                        let _ = service.discard_live_session(&session_id).await;
-                        runtime_adapter.unregister_session(&session_id).await;
-                        promotion_cleanup.mark_materialized();
-                        let _ = promotion_cleanup.finish_now().await;
-                        promotion_cleanup.disarm();
-                        let _ = result_tx.send(Err(err));
-                        return;
-                    }
-                    if Self::pending_live_first_turn_is_still_deferred(&service, &session_id).await
-                    {
-                        promotion_cleanup.mark_materialized();
-                        Self::finish_pending_promotion_after_service_turn(
-                            Arc::clone(&service),
-                            staged_sessions,
-                            &session_id,
-                            "create_session",
-                        )
-                        .await;
-                    } else {
-                        let materialized_after_error =
-                            service.has_live_session(&session_id).await.unwrap_or(false);
-                        if materialized_after_error {
-                            promotion_cleanup.mark_materialized();
-                            Self::finish_pending_promotion_after_service_turn(
-                                Arc::clone(&service),
-                                staged_sessions,
-                                &session_id,
-                                "create_session",
-                            )
-                            .await;
-                        } else {
-                            if let Err(error) = promotion_cleanup
-                                .replenish_staged_capacity_admission(&service)
-                                .await
-                            {
-                                tracing::warn!(
-                                    session_id = %session_id,
-                                    error = %error,
-                                    "failed to replenish staged capacity after create_session error"
-                                );
-                            }
-                            promotion_cleanup.restore_now().await;
-                        }
-                    }
-                    promotion_cleanup.disarm();
-                    let _ = result_tx.send(Err(err));
-                    return;
-                }
-            }
-
-            #[cfg(test)]
-            Self::wait_pending_promotion_pre_turn_hook(&pending_promotion_pre_turn_hook).await;
-
-            let result = match service.reserve_runtime_turn_admission(&session_id).await {
-                Ok(admission) => service
-                    .run_machine_committed_live_turn(
-                        MachineServiceTurnCommitProtocol::from_machine(runtime_adapter.as_ref()),
-                        &session_id,
-                        start_req,
-                        admission,
-                    )
-                    .await
-                    .map_err(|(error, _admission)| error),
-                Err(error) => Err(error),
-            };
-            if Self::should_restore_pending_after_start_turn(&service, &session_id, &result).await {
-                let restore_result = promotion_cleanup
-                    .restore_after_materialized_failure(
-                        &service,
-                        MachineSessionArchiveProtocol::from_machine(runtime_adapter.as_ref()),
-                    )
-                    .await;
-                promotion_cleanup.disarm();
-                let _ = result_tx.send(match restore_result {
-                    Ok(()) => result,
-                    Err(error) => Err(error),
-                });
-                return;
-            }
-
-            Self::finish_pending_promotion_after_service_turn(
-                Arc::clone(&service),
-                staged_sessions,
-                &session_id,
-                "start_turn",
-            )
-            .await;
-            promotion_cleanup.disarm();
-            let _ = result_tx.send(result);
-        });
-        result_rx
+        let replay = self.replay_promoted_system_context_callback();
+        let pre_turn_hook = self.pending_promotion_pre_turn_hook_callback();
+        meerkat::session_runtime::staged_promotion::spawn_pending_create_and_start_turn_with_admission_guard(
+            Arc::clone(&self.service),
+            Arc::clone(&self.staged_sessions),
+            Arc::clone(&self.runtime_adapter),
+            replay,
+            pre_turn_hook,
+            session_id,
+            create_req,
+            start_req,
+            promotion_cleanup,
+            machine_archived_resume_authorized,
+        )
     }
 
     #[cfg(test)]
@@ -3114,167 +2999,29 @@ impl SessionRuntime {
         req: StartTurnRequest,
         boundary: RunApplyBoundary,
         contributing_input_ids: Vec<meerkat_core::InputId>,
-        mut promotion_cleanup: PendingPromotionCleanup,
+        promotion_cleanup: PendingPromotionCleanup,
         keep_alive: bool,
         machine_archived_resume_authorized: bool,
     ) -> ServiceApplyRuntimeTurnResultReceiver {
-        let service = Arc::clone(&self.service);
-        let staged_sessions = Arc::clone(&self.staged_sessions);
-        let runtime_adapter = Arc::clone(&self.runtime_adapter);
-        #[cfg(test)]
-        let pending_promotion_pre_turn_hook = Arc::clone(&self.pending_promotion_pre_turn_hook);
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let create_result = match (
-                promotion_cleanup.take_staged_capacity_admission(),
-                machine_archived_resume_authorized,
-            ) {
-                (Some(admission), true) => {
-                    service
-                        .create_session_with_reserved_machine_archived_resume_admission(
-                            create_req,
-                            admission,
-                            runtime_adapter.session_control_authority(),
-                        )
-                        .await
-                }
-                (Some(admission), false) => {
-                    service
-                        .create_session_with_reserved_admission(create_req, admission)
-                        .await
-                }
-                (None, true) => Err(SessionError::Agent(
-                    meerkat_core::error::AgentError::InternalError(format!(
-                        "machine-authorized archived resume for session {session_id} is missing a reserved staged admission"
-                    )),
-                )),
-                (None, false) => service.create_session(create_req).await,
-            };
-            match create_result {
-                Ok(_) => {
-                    promotion_cleanup.mark_materialized();
-                }
-                Err(err) => {
-                    if Self::is_archived_create_rejection(&err) {
-                        let _ = service.discard_live_session(&session_id).await;
-                        runtime_adapter.unregister_session(&session_id).await;
-                        promotion_cleanup.mark_materialized();
-                        let _ = promotion_cleanup.finish_now().await;
-                        promotion_cleanup.disarm();
-                        let _ = result_tx.send(Err(err));
-                        return;
-                    }
-                    if Self::pending_live_first_turn_is_still_deferred(&service, &session_id).await
-                    {
-                        promotion_cleanup.mark_materialized();
-                        Self::finish_pending_promotion_after_service_turn(
-                            Arc::clone(&service),
-                            staged_sessions,
-                            &session_id,
-                            "create_session",
-                        )
-                        .await;
-                    } else {
-                        let materialized_after_error =
-                            service.has_live_session(&session_id).await.unwrap_or(false);
-                        if materialized_after_error {
-                            promotion_cleanup.mark_materialized();
-                            Self::finish_pending_promotion_after_service_turn(
-                                Arc::clone(&service),
-                                staged_sessions,
-                                &session_id,
-                                "create_session",
-                            )
-                            .await;
-                        } else {
-                            if let Err(error) = promotion_cleanup
-                                .replenish_staged_capacity_admission(&service)
-                                .await
-                            {
-                                tracing::warn!(
-                                    session_id = %session_id,
-                                    error = %error,
-                                    "failed to replenish staged capacity after create_session error"
-                                );
-                            }
-                            promotion_cleanup.restore_now().await;
-                        }
-                    }
-                    promotion_cleanup.disarm();
-                    let _ = result_tx.send(Err(err));
-                    return;
-                }
-            }
-
-            #[cfg(test)]
-            Self::wait_pending_promotion_pre_turn_hook(&pending_promotion_pre_turn_hook).await;
-
-            let (turn_result_tx, turn_result_rx) = tokio::sync::oneshot::channel();
-            let service_for_turn = Arc::clone(&service);
-            let session_for_turn = session_id.clone();
-            tokio::spawn(async move {
-                let result = service_for_turn
-                    .apply_runtime_turn(
-                        &session_for_turn,
-                        run_id,
-                        req,
-                        boundary,
-                        contributing_input_ids,
-                    )
-                    .await;
-                let _ = turn_result_tx.send(result);
-            });
-
-            #[cfg(feature = "comms")]
-            {
-                // W2-G: never reconfigure a mob-owned drain during runtime
-                // materialization. See `start_turn_via_runtime`.
-                let owner = runtime_adapter.peer_ingress_owner(&session_id).await;
-                if !owner.is_mob_owned() {
-                    let comms_rt = service.comms_runtime(&session_id).await;
-                    let peer_ingress_enabled =
-                        keep_alive || runtime_adapter.session_has_comms(&session_id).await;
-                    runtime_adapter
-                        .update_peer_ingress_context(&session_id, peer_ingress_enabled, comms_rt)
-                        .await;
-                }
-            }
-
-            let result = turn_result_rx.await.unwrap_or_else(|_| {
-                Err(SessionError::Agent(
-                    meerkat_core::error::AgentError::InternalError(format!(
-                        "session service apply_runtime_turn task ended before reporting a result for {session_id}"
-                    )),
-                ))
-            });
-            if Self::should_restore_pending_after_apply_runtime_turn(&service, &session_id, &result)
-                .await
-            {
-                let restore_result = promotion_cleanup
-                    .restore_after_materialized_failure(
-                        &service,
-                        MachineSessionArchiveProtocol::from_machine(runtime_adapter.as_ref()),
-                    )
-                    .await;
-                promotion_cleanup.disarm();
-                let _ = result_tx.send(match restore_result {
-                    Ok(()) => result,
-                    Err(error) => Err(error),
-                });
-                return;
-            }
-
-            Self::finish_pending_promotion_after_service_turn(
-                Arc::clone(&service),
-                staged_sessions,
-                &session_id,
-                "apply_runtime_turn",
-            )
-            .await;
-            promotion_cleanup.disarm();
-            let _ = result_tx.send(result);
-        });
-        result_rx
+        let replay = self.replay_promoted_system_context_callback();
+        let comms_refresh = self.comms_context_refresh_callback(keep_alive);
+        let pre_turn_hook = self.pending_promotion_pre_turn_hook_callback();
+        meerkat::session_runtime::staged_promotion::spawn_pending_create_and_apply_runtime_turn_with_admission_guard(
+            Arc::clone(&self.service),
+            Arc::clone(&self.staged_sessions),
+            Arc::clone(&self.runtime_adapter),
+            replay,
+            comms_refresh,
+            pre_turn_hook,
+            session_id,
+            create_req,
+            run_id,
+            req,
+            boundary,
+            contributing_input_ids,
+            promotion_cleanup,
+            machine_archived_resume_authorized,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -3290,81 +3037,20 @@ impl SessionRuntime {
         admission: ActiveCapacityGuard,
         keep_alive: bool,
     ) -> ServiceApplyRuntimeTurnResultReceiver {
-        #[cfg(not(feature = "comms"))]
-        let _ = keep_alive;
-        let service = Arc::clone(&self.service);
-        let runtime_adapter = Arc::clone(&self.runtime_adapter);
-        let (result_tx, result_rx) = tokio::sync::oneshot::channel();
-        tokio::spawn(async move {
-            let result = match service
-                .create_session_with_reserved_admission(create_req, admission)
-                .await
-            {
-                Ok(_) => {
-                    let (turn_result_tx, turn_result_rx) = tokio::sync::oneshot::channel();
-                    let service_for_turn = Arc::clone(&service);
-                    let session_for_turn = session_id.clone();
-                    tokio::spawn(async move {
-                        let result = service_for_turn
-                            .apply_runtime_turn(
-                                &session_for_turn,
-                                run_id,
-                                req,
-                                boundary,
-                                contributing_input_ids,
-                            )
-                            .await;
-                        let _ = turn_result_tx.send(result);
-                    });
-
-                    #[cfg(feature = "comms")]
-                    {
-                        // W2-G: never reconfigure a mob-owned drain during recovery
-                        // materialization. See `start_turn_via_runtime`.
-                        let owner = runtime_adapter.peer_ingress_owner(&session_id).await;
-                        if !owner.is_mob_owned() {
-                            let comms_rt = service.comms_runtime(&session_id).await;
-                            let peer_ingress_enabled =
-                                keep_alive || runtime_adapter.session_has_comms(&session_id).await;
-                            runtime_adapter
-                                .update_peer_ingress_context(
-                                    &session_id,
-                                    peer_ingress_enabled,
-                                    comms_rt,
-                                )
-                                .await;
-                        }
-                    }
-
-                    let result = turn_result_rx.await.unwrap_or_else(|_| {
-                        Err(SessionError::Agent(
-                            meerkat_core::error::AgentError::InternalError(format!(
-                                "session service apply_runtime_turn task ended before reporting a result for {session_id}"
-                            )),
-                        ))
-                    });
-                    if Self::should_restore_pending_after_apply_runtime_turn(
-                        &service,
-                        &session_id,
-                        &result,
-                    )
-                    .await
-                    {
-                        let _ = service.discard_live_session(&session_id).await;
-                        runtime_adapter.unregister_session(&session_id).await;
-                    }
-                    result
-                }
-                Err(err) => {
-                    if !runtime_was_registered {
-                        runtime_adapter.unregister_session(&session_id).await;
-                    }
-                    Err(err)
-                }
-            };
-            let _ = result_tx.send(result);
-        });
-        result_rx
+        let comms_refresh = self.comms_context_refresh_callback(keep_alive);
+        meerkat::session_runtime::staged_promotion::spawn_recovered_create_and_apply_runtime_turn_with_admission_guard(
+            Arc::clone(&self.service),
+            Arc::clone(&self.runtime_adapter),
+            comms_refresh,
+            session_id,
+            create_req,
+            runtime_was_registered,
+            run_id,
+            req,
+            boundary,
+            contributing_input_ids,
+            admission,
+        )
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7024,6 +6710,100 @@ impl SessionRuntime {
             current_state,
         )
         .await
+    }
+
+    /// Build the surface-agnostic replay callback the staged-promotion
+    /// helpers use to replay system-context state after a successful turn.
+    /// The closure clones the persistent session service and translates
+    /// the RPC error to a string (for tracing).
+    fn replay_promoted_system_context_callback(
+        &self,
+    ) -> meerkat::session_runtime::staged_promotion::ReplayPromotedSystemContextFn {
+        let service = Arc::clone(&self.service);
+        Arc::new(move |session_id, starting, current| {
+            let service = Arc::clone(&service);
+            Box::pin(async move {
+                Self::replay_promoted_system_context_on_service(
+                    service,
+                    &session_id,
+                    &starting,
+                    &current,
+                )
+                .await
+                .map_err(|err| err.message)
+            })
+        })
+    }
+
+    /// Build the comms-context refresh callback fired after a staged
+    /// promotion materializes the live session. With the `comms` feature
+    /// enabled this re-syncs `update_peer_ingress_context`; otherwise it
+    /// is a no-op (preserving the original `let _ = keep_alive` shape).
+    fn comms_context_refresh_callback(
+        &self,
+        keep_alive: bool,
+    ) -> meerkat::session_runtime::staged_promotion::CommsContextRefreshFn {
+        #[cfg(feature = "comms")]
+        {
+            let service = Arc::clone(&self.service);
+            let runtime_adapter = Arc::clone(&self.runtime_adapter);
+            Arc::new(move |session_id| {
+                let service = Arc::clone(&service);
+                let runtime_adapter = Arc::clone(&runtime_adapter);
+                Box::pin(async move {
+                    // W2-G: never reconfigure a mob-owned drain during runtime
+                    // materialization. See `start_turn_via_runtime`.
+                    let owner = runtime_adapter.peer_ingress_owner(&session_id).await;
+                    if !owner.is_mob_owned() {
+                        let comms_rt = service.comms_runtime(&session_id).await;
+                        let peer_ingress_enabled =
+                            keep_alive || runtime_adapter.session_has_comms(&session_id).await;
+                        runtime_adapter
+                            .update_peer_ingress_context(
+                                &session_id,
+                                peer_ingress_enabled,
+                                comms_rt,
+                            )
+                            .await;
+                    }
+                })
+            })
+        }
+        #[cfg(not(feature = "comms"))]
+        {
+            let _ = keep_alive;
+            Arc::new(move |_session_id| Box::pin(async move {}))
+        }
+    }
+
+    /// Build the test-only pre-turn hook callback fired by the staged-
+    /// promotion helpers immediately before the apply/start turn dispatch.
+    /// Returns `None` when no hook is currently armed (or when the
+    /// `cfg(test)` field is not present in the build).
+    fn pending_promotion_pre_turn_hook_callback(
+        &self,
+    ) -> Option<meerkat::session_runtime::staged_promotion::PreTurnHookFn> {
+        #[cfg(test)]
+        {
+            let hook_slot = Arc::clone(&self.pending_promotion_pre_turn_hook);
+            let hook = hook_slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone()?;
+            return Some(Arc::new(move || {
+                let hook = Arc::clone(&hook);
+                Box::pin(async move {
+                    hook.reached_flag
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                    hook.reached.notify_waiters();
+                    hook.release.notified().await;
+                })
+            }));
+        }
+        #[cfg(not(test))]
+        {
+            None
+        }
     }
 
     async fn replay_promoted_system_context_on_service(

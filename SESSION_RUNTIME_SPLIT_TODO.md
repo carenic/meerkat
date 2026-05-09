@@ -309,7 +309,7 @@ self-verify.
   `meerkat::session_runtime::live_orchestration`. The `TurnOverrides`
   shim stays in `meerkat-rpc` (it's the RPC surface adapter).
 
-- [ ] fix · [ ] verify · **W2-D.** Move staged-session lifecycle
+- [x] fix · [ ] verify · **W2-D.** Move staged-session lifecycle
   helpers (`spawn_pending_create_and_apply_runtime_turn_with_admission_guard`,
   `await_service_apply_runtime_turn`,
   `await_service_apply_runtime_turn_with_recoverable_admission`,
