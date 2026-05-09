@@ -74,36 +74,9 @@ use meerkat::{
 use meerkat_core::ToolConfigChangeOperation;
 
 use meerkat::session_runtime::recovery::{parse_provider_override, unknown_provider_message};
-
-fn render_context_append_text(content: &CoreRenderable) -> String {
-    match content {
-        CoreRenderable::Text { text } => text.clone(),
-        CoreRenderable::Blocks { blocks } => meerkat_core::types::text_content(blocks),
-        CoreRenderable::Json { value } => {
-            serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
-        }
-        CoreRenderable::Reference { uri, label } => match label {
-            Some(label) if !label.trim().is_empty() => format!("[Reference] {label} ({uri})"),
-            _ => format!("[Reference] {uri}"),
-        },
-        _ => String::new(),
-    }
-}
-
-fn pending_system_context_appends(
-    appends: &[ConversationContextAppend],
-) -> Vec<PendingSystemContextAppend> {
-    let accepted_at = meerkat_core::time_compat::SystemTime::now();
-    appends
-        .iter()
-        .map(|append| PendingSystemContextAppend {
-            text: render_context_append_text(&append.content),
-            source: Some(append.key.clone()),
-            idempotency_key: Some(append.key.clone()),
-            accepted_at,
-        })
-        .collect()
-}
+use meerkat::session_runtime::staged_promotion::{
+    pending_system_context_appends, render_context_append_text,
+};
 
 const PENDING_SESSION_EVENT_CHANNEL_CAPACITY: usize = 128;
 const DEFAULT_RUNTIME_ARCHIVED_HISTORY_CAPACITY: usize = 1024;
@@ -2510,10 +2483,10 @@ impl SessionRuntime {
         service: &PersistentSessionService<FactoryAgentBuilder>,
         session_id: &SessionId,
     ) -> bool {
-        service
-            .live_deferred_first_turn_pending(session_id)
-            .await
-            .unwrap_or(false)
+        meerkat::session_runtime::staged_promotion::pending_live_first_turn_is_still_deferred(
+            service, session_id,
+        )
+        .await
     }
 
     #[cfg(test)]
@@ -2876,19 +2849,11 @@ impl SessionRuntime {
     pub(crate) fn is_pre_run_apply_runtime_turn_failure(
         result: &Result<CoreApplyOutput, SessionError>,
     ) -> bool {
-        matches!(
-            result,
-            Err(SessionError::Agent(
-                meerkat_core::error::AgentError::NoPendingBoundary
-            ))
-        ) || matches!(
-            result,
-            Ok(output) if matches!(output.terminal, Some(CoreApplyTerminal::NoPendingBoundary))
-        )
+        meerkat::session_runtime::staged_promotion::is_pre_run_apply_runtime_turn_failure(result)
     }
 
     fn is_archived_create_rejection(error: &SessionError) -> bool {
-        matches!(error, SessionError::NotFound { .. })
+        meerkat::session_runtime::staged_promotion::is_archived_create_rejection(error)
     }
 
     #[cfg(test)]
@@ -3449,16 +3414,16 @@ impl SessionRuntime {
         session_id: &SessionId,
         result_rx: ServiceApplyRuntimeTurnResultReceiver,
     ) -> Result<CoreApplyOutput, RpcError> {
-        result_rx
-            .await
-            .map_err(|_| RpcError {
-                code: error::INTERNAL_ERROR,
-                message: format!(
-                    "session service apply_runtime_turn task ended before reporting a result for {session_id}"
-                ),
-                data: None,
-            })?
-            .map_err(session_error_to_rpc)
+        meerkat::session_runtime::staged_promotion::await_service_apply_runtime_turn(
+            session_id, result_rx,
+        )
+        .await
+        .map_err(|err| RpcError {
+            code: error::INTERNAL_ERROR,
+            message: err.to_string(),
+            data: None,
+        })?
+        .map_err(session_error_to_rpc)
     }
 
     async fn await_service_apply_runtime_turn_with_recoverable_admission(
@@ -3471,11 +3436,13 @@ impl SessionRuntime {
         ),
         RpcError,
     > {
-        result_rx.await.map_err(|_| RpcError {
+        meerkat::session_runtime::staged_promotion::await_service_apply_runtime_turn_with_recoverable_admission(
+            session_id, result_rx,
+        )
+        .await
+        .map_err(|err| RpcError {
             code: error::INTERNAL_ERROR,
-            message: format!(
-                "session service apply_runtime_turn task ended before reporting a result for {session_id}"
-            ),
+            message: err.to_string(),
             data: None,
         })
     }
@@ -3486,27 +3453,23 @@ impl SessionRuntime {
         session_id: &SessionId,
         operation: &'static str,
     ) {
-        let Some((starting_system_context_state, current_system_context_state)) = staged_sessions
-            .take_promoting_system_context_state(session_id)
-            .await
-        else {
-            return;
-        };
-        if let Err(err) = Self::replay_promoted_system_context_on_service(
-            service,
+        let session_id_for_replay = session_id.clone();
+        meerkat::session_runtime::staged_promotion::finish_pending_promotion_after_service_turn(
+            staged_sessions.as_ref(),
             session_id,
-            &starting_system_context_state,
-            &current_system_context_state,
+            operation,
+            move |starting, current| async move {
+                Self::replay_promoted_system_context_on_service(
+                    service,
+                    &session_id_for_replay,
+                    &starting,
+                    &current,
+                )
+                .await
+                .map_err(|err| err.message)
+            },
         )
-        .await
-        {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %err.message,
-                operation,
-                "failed to replay promoted system-context state after service turn"
-            );
-        }
+        .await;
     }
 
     /// Persistent TokenStore used by OAuth-backed bindings (shared with

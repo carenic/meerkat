@@ -6,9 +6,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use meerkat_core::lifecycle::core_executor::{CoreApplyOutput, CoreApplyTerminal};
+use meerkat_core::lifecycle::run_primitive::{ConversationContextAppend, CoreRenderable};
 use meerkat_core::service::SessionError;
 use meerkat_core::types::SessionId;
-use meerkat_core::{ContentInput, Session, SessionLlmIdentity, SessionSystemContextState};
+use meerkat_core::{
+    ContentInput, PendingSystemContextAppend, Session, SessionLlmIdentity,
+    SessionSystemContextState,
+};
 
 use meerkat_session::{MachineSessionArchiveProtocol, PersistentSessionService};
 
@@ -16,6 +21,181 @@ use crate::session_runtime::admission::{
     ActiveCapacityGuard, StagedCapacityAdmissions, restore_staged_capacity_admission,
 };
 use crate::{AgentBuildConfig, FactoryAgentBuilder, PromotingSlot, StagedSessionRegistry};
+
+/// Render a [`CoreRenderable`] into the plain-text representation
+/// embedded in [`PendingSystemContextAppend::text`]. Mirrors the
+/// long-standing helper that lives next to
+/// `pending_system_context_appends`; pulled into a free function so the
+/// staged-promotion flow does not need to be re-imported by every
+/// surface that builds appends.
+#[must_use]
+pub fn render_context_append_text(content: &CoreRenderable) -> String {
+    match content {
+        CoreRenderable::Text { text } => text.clone(),
+        CoreRenderable::Blocks { blocks } => meerkat_core::types::text_content(blocks),
+        CoreRenderable::Json { value } => {
+            serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+        }
+        CoreRenderable::Reference { uri, label } => match label {
+            Some(label) if !label.trim().is_empty() => format!("[Reference] {label} ({uri})"),
+            _ => format!("[Reference] {uri}"),
+        },
+        _ => String::new(),
+    }
+}
+
+/// Convert a slice of [`ConversationContextAppend`] entries into the
+/// runtime-side [`PendingSystemContextAppend`] vector that staged
+/// promotion replays into the session service after a turn commits.
+#[must_use]
+pub fn pending_system_context_appends(
+    appends: &[ConversationContextAppend],
+) -> Vec<PendingSystemContextAppend> {
+    let accepted_at = meerkat_core::time_compat::SystemTime::now();
+    appends
+        .iter()
+        .map(|append| PendingSystemContextAppend {
+            text: render_context_append_text(&append.content),
+            source: Some(append.key.clone()),
+            idempotency_key: Some(append.key.clone()),
+            accepted_at,
+        })
+        .collect()
+}
+
+/// Awaiter result shape for the staged-session apply-runtime-turn
+/// helpers; surfaces translate `Err(StagedTaskJoinError)` onto their
+/// own wire error.
+#[derive(Debug, thiserror::Error)]
+#[error("session service apply_runtime_turn task ended before reporting a result for {session_id}")]
+pub struct StagedTaskJoinError {
+    /// Session id whose worker task vanished before reporting.
+    pub session_id: SessionId,
+}
+
+/// Type alias mirroring the receiver shape used by the staged-session
+/// promotion paths.
+pub type ServiceApplyRuntimeTurnResultReceiver =
+    tokio::sync::oneshot::Receiver<Result<CoreApplyOutput, SessionError>>;
+
+/// Type alias mirroring the receiver shape used by the staged-session
+/// promotion paths when an admission needs to be returned alongside the
+/// turn result.
+pub type RecoverableServiceApplyRuntimeTurnResultReceiver = tokio::sync::oneshot::Receiver<(
+    Result<CoreApplyOutput, SessionError>,
+    Option<ActiveCapacityGuard>,
+)>;
+
+/// Await the spawned `apply_runtime_turn` task and translate task-vanish
+/// errors into a typed [`StagedTaskJoinError`]. Surfaces map the inner
+/// `SessionError` onto their wire shape.
+pub async fn await_service_apply_runtime_turn(
+    session_id: &SessionId,
+    result_rx: ServiceApplyRuntimeTurnResultReceiver,
+) -> Result<Result<CoreApplyOutput, SessionError>, StagedTaskJoinError> {
+    result_rx.await.map_err(|_| StagedTaskJoinError {
+        session_id: session_id.clone(),
+    })
+}
+
+/// Variant of [`await_service_apply_runtime_turn`] that surfaces a
+/// recovered admission alongside the turn result.
+pub async fn await_service_apply_runtime_turn_with_recoverable_admission(
+    session_id: &SessionId,
+    result_rx: RecoverableServiceApplyRuntimeTurnResultReceiver,
+) -> Result<
+    (
+        Result<CoreApplyOutput, SessionError>,
+        Option<ActiveCapacityGuard>,
+    ),
+    StagedTaskJoinError,
+> {
+    result_rx.await.map_err(|_| StagedTaskJoinError {
+        session_id: session_id.clone(),
+    })
+}
+
+/// Pure predicate: did `apply_runtime_turn` fail before the
+/// runtime-driven turn boundary closed?
+///
+/// Either the dispatched [`SessionError`] is `Agent::NoPendingBoundary`
+/// (the boundary was never opened), or the [`CoreApplyOutput`] reached
+/// [`CoreApplyTerminal::NoPendingBoundary`] (the dispatcher commit
+/// raced ahead of the boundary close). Both shapes mean the session
+/// service surface saw the error before it had a chance to project the
+/// terminal state, so the caller must restore the staged slot.
+#[must_use]
+pub fn is_pre_run_apply_runtime_turn_failure(
+    result: &Result<CoreApplyOutput, SessionError>,
+) -> bool {
+    matches!(
+        result,
+        Err(SessionError::Agent(
+            meerkat_core::error::AgentError::NoPendingBoundary
+        ))
+    ) || matches!(
+        result,
+        Ok(output) if matches!(output.terminal, Some(CoreApplyTerminal::NoPendingBoundary))
+    )
+}
+
+/// Pure predicate: did the underlying `create_session` call reject
+/// because the session was archived?
+#[must_use]
+pub fn is_archived_create_rejection(error: &SessionError) -> bool {
+    matches!(error, SessionError::NotFound { .. })
+}
+
+/// Probe the persistent session service for a session that is still
+/// in `live_deferred_first_turn_pending` state. Used by the staged
+/// promotion paths to decide whether to restore the staged slot after
+/// a service-side error.
+pub async fn pending_live_first_turn_is_still_deferred(
+    service: &PersistentSessionService<FactoryAgentBuilder>,
+    session_id: &SessionId,
+) -> bool {
+    service
+        .live_deferred_first_turn_pending(session_id)
+        .await
+        .unwrap_or(false)
+}
+
+/// Replay any promoted system-context state captured during staged
+/// promotion back onto the session service after a successful turn.
+///
+/// `replay_promoted_system_context_on_service` is owned by SessionRuntime
+/// (it returns the RPC `RpcError`), so this helper takes a `replay`
+/// closure that the caller wires up with the right error mapping. The
+/// replay only fires when there's a pending promoting state to reap.
+///
+/// Surfaces that don't need a custom replay closure can pass a no-op,
+/// but the staged promotion paths in `meerkat-rpc` rely on the side
+/// effect — preserving the contract is the caller's responsibility.
+pub async fn finish_pending_promotion_after_service_turn<R, F, E>(
+    staged_sessions: &StagedSessionRegistry,
+    session_id: &SessionId,
+    operation: &'static str,
+    replay: R,
+) where
+    R: FnOnce(SessionSystemContextState, SessionSystemContextState) -> F,
+    F: std::future::Future<Output = Result<(), E>>,
+    E: std::fmt::Display,
+{
+    let Some((starting_system_context_state, current_system_context_state)) = staged_sessions
+        .take_promoting_system_context_state(session_id)
+        .await
+    else {
+        return;
+    };
+    if let Err(err) = replay(starting_system_context_state, current_system_context_state).await {
+        tracing::warn!(
+            session_id = %session_id,
+            error = %err,
+            operation,
+            "failed to replay promoted system-context state after service turn"
+        );
+    }
+}
 
 /// Cleanup mode for [`PendingPromotionCleanup`].
 ///
