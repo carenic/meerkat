@@ -31,7 +31,7 @@ worktree's WIP. Never drop, pop, or apply it.
 
 ## Phase 1 — Canonical transcript content (foundation)
 
-- [x] fix · [ ] verify · **T1.** Add `AssistantBlock::Transcript`
+- [x] fix · [x] verify · **T1.** Add `AssistantBlock::Transcript`
   variant. `[U]` Add to `meerkat-core/src/types.rs`:
   ```rust
   AssistantBlock::Transcript {
@@ -70,7 +70,7 @@ worktree's WIP. Never drop, pop, or apply it.
   arm). Source rearrangement after T1 shifted the blocks slightly;
   no behavioral change.
 
-- [x] fix · [ ] verify · **T2.** Projection / compaction must render
+- [x] fix · [x] verify · **T2.** Projection / compaction must render
   transcript blocks correctly. `[R]` Find every consumer of
   `AssistantBlock::Text` (grep workspace). For each:
   - Text-projection (`text_projection` / `MessageContent::as_text` /
@@ -115,7 +115,7 @@ worktree's WIP. Never drop, pop, or apply it.
   Source rearrangement during T1 doc-comment expansion shifted the
   blocks; no behavioral change.
 
-- [x] fix · [ ] verify · **T3.** Wire format + schema regen. `[R]`
+- [x] fix · [x] verify · **T3.** Wire format + schema regen. `[R]`
   Update `meerkat-contracts/src/wire/session.rs` so the new variant
   serializes distinctly. Run `make regen-schemas`. SDK generated types
   (Python, TypeScript, Web) must include the new variant. Verify each
@@ -181,7 +181,7 @@ worktree's WIP. Never drop, pop, or apply it.
     alongside the existing `Reasoning`+`Text` blocks, pinning the
     spoken-transcript variant through the JSON round-trip.
 
-- [x] fix · [ ] verify · **T4.** Delete
+- [x] fix · [x] verify · **T4.** Delete
   `LiveTransportBootstrap::Webrtc`. `[U]` Remove the variant from
   `meerkat-core/src/live_adapter.rs` (and `LiveIceServer` if not
   reused elsewhere — grep first). Keep the enum `#[non_exhaustive]`.
@@ -222,7 +222,7 @@ worktree's WIP. Never drop, pop, or apply it.
 
 ## Phase 2 — Typed lane split at the live boundary
 
-- [x] fix · [ ] verify · **T5.** Split `LiveAdapterObservation`
+- [x] fix · [x] verify · **T5.** Split `LiveAdapterObservation`
   output lanes. `[U+R]` Today many providers send multiple "output"
   events but the Observation collapses them onto one assistant text
   channel. Required typed variants (some already exist; confirm
@@ -254,7 +254,7 @@ worktree's WIP. Never drop, pop, or apply it.
   `observation: assistant_transcript_delta` snake_case tag and assert
   no collision with the text-delta tag.
 
-- [x] fix · [ ] verify · **T6.** Split `LiveProjectionSink` trait.
+- [x] fix · [x] verify · **T6.** Split `LiveProjectionSink` trait.
   `[U]` Currently `append_assistant_delta` / `append_assistant_final`
   cover all assistant output. Split:
   - `append_assistant_text_delta` / `append_assistant_text_final`
@@ -296,7 +296,7 @@ worktree's WIP. Never drop, pop, or apply it.
   (`meerkat-live/src/host.rs:2105-2135`) pins the host's
   observation→sink-method routing.
 
-- [x] fix · [ ] verify · **T7.** Barge-in truncation applies only to
+- [x] fix · [x] verify · **T7.** Barge-in truncation applies only to
   spoken-transcript / audio state. `[U]` `TurnInterrupted` →
   `signal_turn_interrupt` must drain only the transcript pending-turn
   buffer (and any audio playback state); the display-text buffer is
@@ -320,7 +320,7 @@ worktree's WIP. Never drop, pop, or apply it.
   `signal_turn_interrupt`, then drains via `signal_turn_completed`
   and asserts exactly one block of `AssistantBlock::Text` survives.
 
-- [x] fix · [ ] verify · **T8.** Capabilities matrix grows typed
+- [x] fix · [x] verify · **T8.** Capabilities matrix grows typed
   fields. `[U]` `LiveChannelCapabilities` (currently a struct of
   booleans?) becomes:
   ```rust
@@ -375,7 +375,7 @@ worktree's WIP. Never drop, pop, or apply it.
 
 ## Phase 3 — OpenAI mapping correctness
 
-- [x] fix · [ ] verify · **T9.** OpenAI translator routes each output
+- [x] fix · [x] verify · **T9.** OpenAI translator routes each output
   type to the correct lane. `[U]`
   - `ResponseOutputTextDelta` → `AssistantTextDelta` (display)
   - `ResponseOutputAudioTranscriptDelta` → `AssistantTranscriptDelta`
@@ -423,7 +423,7 @@ worktree's WIP. Never drop, pop, or apply it.
   (was `_into_text_deltas`) updated to assert against
   `OutputAudioTranscriptDeltaForItem`. All 203 realtime tests pass.
 
-- [x] fix · [ ] verify · **T10.** Projection sink no longer flushes
+- [x] fix · [x] verify · **T10.** Projection sink no longer flushes
   transcript-as-text. `[U]` `meerkat-rpc/src/live_projection_sink.rs`
   splits the assistant-final flush into two: text final flushes
   `AssistantBlock::Text`; transcript final flushes
@@ -495,7 +495,7 @@ worktree's WIP. Never drop, pop, or apply it.
 
 ## Phase 4 — Multimodal input + continuity
 
-- [x] fix · [ ] verify · **T11.** Extend `LiveInputChunk` /
+- [x] fix · [x] verify · **T11.** Extend `LiveInputChunk` /
   `LiveInputChunkWire` with typed image + video-frame variants. `[U]`
   ```rust
   LiveInputChunk::Audio { ... }    // existing
@@ -556,7 +556,7 @@ worktree's WIP. Never drop, pop, or apply it.
   (`meerkat-openai/src/live.rs:6889-7027`) drive each variant through
   the OpenAI adapter pump and assert the typed `ConfigRejected` reason.
 
-- [x] fix · [ ] verify · **T12.** `LiveContinuityMode::ProviderNativeResume`
+- [x] fix · [x] verify · **T12.** `LiveContinuityMode::ProviderNativeResume`
   variant added. `[R]` Today: `Fresh` / `TranscriptOnly` / `Degraded`.
   Add `ProviderNativeResume { provider_session_id: String }` for the
   future case where the provider gives us a session id to attach
@@ -652,7 +652,7 @@ fans `RealtimeTranscriptEvent::AssistantTurnInterrupted` to every
 in-flight provider response_id (discovered via a new
 `Session::in_flight_realtime_assistant_response_ids`).
 
-- [x] fix · [ ] verify · **CC2.** Production transcript commit path
+- [x] fix · [x] verify · **CC2.** Production transcript commit path
   is canonical via realtime-staging materializer. `[R]`
   - `meerkat-rpc/src/live_projection_sink.rs::SessionServiceProjectionSink::signal_turn_completed`
     now synthesizes `RealtimeTranscriptEvent::AssistantTurnCompleted`
@@ -685,7 +685,7 @@ in-flight provider response_id (discovered via a new
     `round4_cc2_assistant_turn_completed_after_transcript_deltas_materializes_transcript`
     (`meerkat-core/src/session.rs`).
 
-- [x] fix · [ ] verify · **CC3.** `pending_turns` is text-only;
+- [x] fix · [x] verify · **CC3.** `pending_turns` is text-only;
   `AssistantTextFinal` does not exist as a `LiveAdapterObservation`
   variant in this PR. `[R]` Per the architectural reconciliation in
   CC2, the buffered-final path is reserved for the display-text lane.
@@ -700,7 +700,7 @@ in-flight provider response_id (discovered via a new
   (`t10_signal_turn_completed_flushes_transcript_block_after_transcript_final_buffered`)
   are documented in-place where they used to live.
 
-- [x] fix · [ ] verify · **CC4.** Barge-in coordinates the two
+- [x] fix · [x] verify · **CC4.** Barge-in coordinates the two
   layers. `[R]`
   - `meerkat-core/src/session.rs::Session::in_flight_realtime_assistant_response_ids`
     enumerates distinct provider `response_id`s with at least one
@@ -772,7 +772,7 @@ to handcraft access to capability booleans (`image_in`, `video_in`,
 T8's "anticipate `gpt-realtime-2`" goal and T12's bare-string-→-tagged
 serde shape change were both invisible at the SDK boundary.
 
-- [x] fix · [ ] verify · **CC5.** Type the wire shape for
+- [x] fix · [x] verify · **CC5.** Type the wire shape for
   `LiveChannelCapabilities`. `[R]` Replace the opaque
   `serde_json::Value` projection on `LiveOpenResult.capabilities` with
   the typed `WireLiveChannelCapabilities` mirror (struct of typed
@@ -817,7 +817,7 @@ serde shape change were both invisible at the SDK boundary.
   `test_generated_live_open_result_references_typed_capabilities_and_continuity`
   (`sdks/python/tests/test_types.py`).
 
-- [x] fix · [ ] verify · **CC6.** Type the wire shape for
+- [x] fix · [x] verify · **CC6.** Type the wire shape for
   `LiveContinuityMode`. `[R]` Same pattern as CC5: typed
   `WireLiveContinuityMode` mirror (internally tagged on `mode`) on
   `LiveOpenResult.continuity`, with both-direction `From` conversions
@@ -923,7 +923,7 @@ no end-to-end test where text deltas + transcript deltas drive the
 production materializer through to ordered Text+Transcript blocks in
 canonical history.
 
-- [x] fix · [ ] verify · **CC7.** End-to-end mixed-response materialization
+- [x] fix · [x] verify · **CC7.** End-to-end mixed-response materialization
   pin. `[R]`
 
   **Architectural fix surfaced by the test:** the materializer at
