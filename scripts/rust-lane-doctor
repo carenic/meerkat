@@ -25,11 +25,18 @@ bad() {
 
 value_from_env() {
   local key="$1"
-  awk -F= -v key="${key}" '$1 == key { print substr($0, length(key) + 2) }'
+  local text="$2"
+  printf '%s\n' "${text}" | awk -F= -v key="${key}" '$1 == key { print substr($0, length(key) + 2) }'
+}
+
+contains_line() {
+  local needle="$1"
+  local text="$2"
+  [[ $'\n'"${text}"$'\n' == *$'\n'"${needle}"$'\n'* ]]
 }
 
 doctor_output="$(./scripts/repo-cargo --doctor 2>&1 || true)"
-if grep -q '^doctor=ok$' <<<"${doctor_output}"; then
+if contains_line "doctor=ok" "${doctor_output}"; then
   pass "repo-cargo doctor passes"
 else
   bad "repo-cargo doctor failed"
@@ -37,8 +44,9 @@ else
 fi
 
 default_env="$(./scripts/repo-cargo --print-env)"
-default_target="$(value_from_env CARGO_TARGET_DIR <<<"${default_env}")"
-default_home="$(value_from_env CARGO_HOME <<<"${default_env}")"
+default_target="$(value_from_env CARGO_TARGET_DIR "${default_env}")"
+default_home="$(value_from_env CARGO_HOME "${default_env}")"
+default_rustup_toolchain="$(value_from_env RUSTUP_TOOLCHAIN "${default_env}")"
 if [[ "${default_target}" == "${workspace_root}"* || "${default_home}" == "${workspace_root}"* ]]; then
   bad "Cargo cache paths resolve inside the repository"
 else
@@ -47,10 +55,10 @@ fi
 
 lane_a_env="$(RUST_LANE_ID=doctor-a ./scripts/repo-cargo --print-env)"
 lane_b_env="$(RUST_LANE_ID=doctor-b ./scripts/repo-cargo --print-env)"
-lane_a_target="$(value_from_env CARGO_TARGET_DIR <<<"${lane_a_env}")"
-lane_b_target="$(value_from_env CARGO_TARGET_DIR <<<"${lane_b_env}")"
-lane_a_home="$(value_from_env CARGO_HOME <<<"${lane_a_env}")"
-lane_b_home="$(value_from_env CARGO_HOME <<<"${lane_b_env}")"
+lane_a_target="$(value_from_env CARGO_TARGET_DIR "${lane_a_env}")"
+lane_b_target="$(value_from_env CARGO_TARGET_DIR "${lane_b_env}")"
+lane_a_home="$(value_from_env CARGO_HOME "${lane_a_env}")"
+lane_b_home="$(value_from_env CARGO_HOME "${lane_b_env}")"
 
 if [[ "${lane_a_target}" != "${lane_b_target}" ]]; then
   pass "RUST_LANE_ID creates distinct target directories"
@@ -59,7 +67,7 @@ else
 fi
 
 codex_agent_env="$(CODEX_AGENT_ID=doctor-codex-agent ./scripts/repo-cargo --print-env)"
-codex_agent_lane="$(value_from_env lane_key <<<"${codex_agent_env}")"
+codex_agent_lane="$(value_from_env lane_key "${codex_agent_env}")"
 if [[ "${codex_agent_lane}" == "doctor-codex-agent" ]]; then
   pass "CODEX_AGENT_ID creates a distinct same-worktree Cargo lane"
 else
@@ -67,7 +75,7 @@ else
 fi
 
 github_lane_env="$(GITHUB_JOB=fmt-lint GITHUB_RUN_ID=12345 GITHUB_RUN_ATTEMPT=2 ./scripts/repo-cargo --print-env)"
-github_lane="$(value_from_env lane_key <<<"${github_lane_env}")"
+github_lane="$(value_from_env lane_key "${github_lane_env}")"
 if [[ "${github_lane}" == "gha-12345-2-fmt-lint" ]]; then
   pass "GitHub Actions target lanes are isolated per run attempt"
 else
@@ -101,8 +109,8 @@ for (const pkg of metadata.packages.filter((p) => p.name === "rkat" || p.name ==
 }
 '
 )"
-if grep -q '^rkat-mini=false$' <<<"${mini_bin_test_flags}" &&
-  grep -q '^rkat-rpc-mini=false$' <<<"${mini_bin_test_flags}"; then
+if contains_line "rkat-mini=false" "${mini_bin_test_flags}" &&
+  contains_line "rkat-rpc-mini=false" "${mini_bin_test_flags}"; then
   pass "mini binary duplicate unit-test harnesses are disabled"
 else
   bad "mini binary duplicate unit-test harnesses are still enabled"
@@ -124,7 +132,7 @@ else
 fi
 
 raw_cargo_shell_hits="$(
-  rg -n '^\s*(cargo|exec cargo)\b|\bcargo run -p xtask\b' \
+  rg -n '^\s*(cargo|exec cargo)\s+(check|test|nextest|run|xtask|build|unit|int|e2e|clippy|fmt|machete)\b|\bcargo run -p xtask\b' \
     scripts specs \
     --glob '*.sh' \
     --glob '!scripts/repo-cargo' 2>/dev/null || true
@@ -158,6 +166,16 @@ else
   bad "Cargo or BuildBuddy CI Rust toolchain does not match rust-toolchain.toml"
 fi
 
+if [[ -n "${rust_channel}" ]] &&
+  [[ "${default_rustup_toolchain}" == "${rust_channel}" ]] &&
+  grep -Fq "RUSTUP_TOOLCHAIN: ${rust_channel}" .github/workflows/cargo.yml &&
+  grep -Fq "RUSTUP_TOOLCHAIN: ${rust_channel}" .github/workflows/buildbuddy.yml &&
+  grep -Fq "RUSTUP_TOOLCHAIN=${rust_channel}" .github/actions/setup-buildbuddy-ci/action.yml; then
+  pass "Cargo and BuildBuddy CI export the pinned Rustup toolchain"
+else
+  bad "Cargo or BuildBuddy CI can fall back to the runner Rustup default"
+fi
+
 if grep -q 'CARGO_HOME: /tmp/meerkat-cargo-home' .github/workflows/cargo.yml &&
   grep -q 'CARGO_HOME: /tmp/meerkat-cargo-home' .github/workflows/buildbuddy.yml; then
   pass "CI and BuildBuddy workflows keep repo-cargo Cargo home cacheable"
@@ -166,7 +184,7 @@ else
 fi
 
 selector_selftest_output="$(./scripts/rust-selector-selftest.mjs 2>&1 || true)"
-if grep -q '^rust selector selftest ok$' <<<"${selector_selftest_output}"; then
+if contains_line "rust selector selftest ok" "${selector_selftest_output}"; then
   pass "Rust selector module parser selftest passes"
 else
   bad "Rust selector module parser selftest failed"
@@ -175,9 +193,9 @@ fi
 
 agent_gate_probe="$(./scripts/agent-gate --dry-run --working-tree meerkat-runtime/src/input_ledger.rs 2>&1 || true)"
 if [[ -x scripts/agent-gate ]] &&
-  grep -q 'Cargo agent gate packages:' <<<"${agent_gate_probe}" &&
-  grep -q 'meerkat-runtime' <<<"${agent_gate_probe}" &&
-  ! grep -q 'BuildBuddy agent gate' <<<"${agent_gate_probe}"; then
+  [[ "${agent_gate_probe}" == *"Cargo agent gate packages:"* ]] &&
+  [[ "${agent_gate_probe}" == *"meerkat-runtime"* ]] &&
+  [[ "${agent_gate_probe}" != *"BuildBuddy agent gate"* ]]; then
   pass "agent-gate defaults to the Cargo changed-path gate"
 else
   bad "agent-gate default routing is not Cargo-first"

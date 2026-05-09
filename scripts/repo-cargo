@@ -101,17 +101,17 @@ if [[ "${GITHUB_ACTIONS:-}" == "true" && "${target_dir_was_set}" == "false" ]]; 
 fi
 
 if [[ "${1-}" == "--print-env" ]]; then
-  cat <<EOF
-repo_root=${repo_root}
-workspace_root=${workspace_root}
-repo_key=${repo_key}
-target_cache_schema=${target_cache_schema}
-toolchain_spec=${toolchain_spec}
-toolchain_key=${toolchain_key}
-lane_key=${lane_key}
-CARGO_HOME=${CARGO_HOME}
-CARGO_TARGET_DIR=${CARGO_TARGET_DIR}
-EOF
+  printf '%s\n' \
+    "repo_root=${repo_root}" \
+    "workspace_root=${workspace_root}" \
+    "repo_key=${repo_key}" \
+    "target_cache_schema=${target_cache_schema}" \
+    "toolchain_spec=${toolchain_spec}" \
+    "toolchain_key=${toolchain_key}" \
+    "RUSTUP_TOOLCHAIN=${toolchain_spec}" \
+    "lane_key=${lane_key}" \
+    "CARGO_HOME=${CARGO_HOME}" \
+    "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}"
   exit 0
 fi
 
@@ -122,22 +122,26 @@ if [[ "${1-}" == "--doctor" ]]; then
   fi
   [[ -w "${CARGO_HOME}" ]] || { echo "error: CARGO_HOME not writable" >&2; exit 1; }
   [[ -w "${CARGO_TARGET_DIR}" ]] || { echo "error: CARGO_TARGET_DIR not writable" >&2; exit 1; }
-  cat <<EOF
-doctor=ok
-repo_root=${repo_root}
-workspace_root=${workspace_root}
-repo_key=${repo_key}
-target_cache_schema=${target_cache_schema}
-toolchain_spec=${toolchain_spec}
-toolchain_key=${toolchain_key}
-lane_key=${lane_key}
-CARGO_HOME=${CARGO_HOME}
-CARGO_TARGET_DIR=${CARGO_TARGET_DIR}
-EOF
+  printf '%s\n' \
+    "doctor=ok" \
+    "repo_root=${repo_root}" \
+    "workspace_root=${workspace_root}" \
+    "repo_key=${repo_key}" \
+    "target_cache_schema=${target_cache_schema}" \
+    "toolchain_spec=${toolchain_spec}" \
+    "toolchain_key=${toolchain_key}" \
+    "RUSTUP_TOOLCHAIN=${toolchain_spec}" \
+    "lane_key=${lane_key}" \
+    "CARGO_HOME=${CARGO_HOME}" \
+    "CARGO_TARGET_DIR=${CARGO_TARGET_DIR}"
   exit 0
 fi
 
 cd "${workspace_root}"
+
+if [[ -n "${toolchain_spec}" ]]; then
+  export RUSTUP_TOOLCHAIN="${toolchain_spec}"
+fi
 
 if [[ -n "${CARGO_BIN:-}" ]]; then
   cargo_cmd=("${CARGO_BIN}")

@@ -21,6 +21,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_HOME: /tmp/meerkat-cargo-home
+  RUSTUP_TOOLCHAIN: 1.94.0
 
 jobs:
   fmt-lint:
@@ -251,7 +252,7 @@ jobs:
         uses: dtolnay/rust-toolchain@1.94.0
 
       - name: Add wasm32 target
-        run: rustup target add wasm32-unknown-unknown
+        run: rustup target add --toolchain "${RUSTUP_TOOLCHAIN}" wasm32-unknown-unknown
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
@@ -338,7 +339,7 @@ jobs:
         uses: dtolnay/rust-toolchain@1.94.0
 
       - name: Add wasm32 target
-        run: rustup target add wasm32-unknown-unknown
+        run: rustup target add --toolchain "${RUSTUP_TOOLCHAIN}" wasm32-unknown-unknown
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
@@ -395,7 +396,7 @@ jobs:
         uses: dtolnay/rust-toolchain@1.94.0
 
       - name: Add wasm32 target
-        run: rustup target add wasm32-unknown-unknown
+        run: rustup target add --toolchain "${RUSTUP_TOOLCHAIN}" wasm32-unknown-unknown
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
@@ -511,7 +512,7 @@ jobs:
         uses: dtolnay/rust-toolchain@1.94.0
 
       - name: Add wasm32 target
-        run: rustup target add wasm32-unknown-unknown
+        run: rustup target add --toolchain "${RUSTUP_TOOLCHAIN}" wasm32-unknown-unknown
 
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
