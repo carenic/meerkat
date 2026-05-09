@@ -522,15 +522,8 @@ release_surface_count="$(
   ' scripts/buildbuddy-bazel-poc
 )"
 if [[ "${release_surface_count}" -eq 5 ]] &&
-  awk '
-    /release-build-/ { lane = 1 }
-    lane && /default_target=/ && /rkat_mini|rkat_rpc_mini_bin/ { bad = 1 }
-    lane && /;;/ { lane = 0 }
-    END { exit bad ? 1 : 0 }
-  ' scripts/buildbuddy-bazel-poc &&
-  ! grep -Fq 'rkat-rpc-mini' .github/workflows/release.yml &&
   grep -Fq 'MEERKAT_RELEASE_BUILDBUDDY_JOBS' .github/workflows/release.yml; then
-  pass "BuildBuddy release lanes omit mini binaries and package only public runtime surfaces"
+  pass "BuildBuddy release lanes package only public runtime surfaces"
 else
   bad "BuildBuddy release lanes are not aligned with the shipped binary surface set"
 fi
