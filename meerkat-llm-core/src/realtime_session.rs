@@ -87,8 +87,18 @@ pub enum RealtimeSessionEvent {
         content_index: u32,
         delta: String,
     },
+    /// Streaming audio frame from the provider. R5-4: identity fields
+    /// (`response_id`, `item_id`, `content_index`) carry the source server
+    /// event's identity so the live-adapter translator can stamp the public
+    /// `LiveAdapterObservation::AssistantAudioChunk` and clients can attach a
+    /// playback cursor to a provider item without racing on transcript-delta
+    /// arrival order. All three are `Option` because not every provider
+    /// surfaces a content segment id and degraded paths may drop identity.
     OutputAudioChunk {
         chunk: RealtimeAudioChunk,
+        response_id: Option<String>,
+        item_id: Option<String>,
+        content_index: Option<u32>,
     },
     OutputVideoChunk {
         chunk: RealtimeVideoChunk,

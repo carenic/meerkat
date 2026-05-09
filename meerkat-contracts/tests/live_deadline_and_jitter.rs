@@ -80,6 +80,9 @@ impl ScriptedAdapter {
                     data: vec![i as u8],
                     sample_rate_hz: 24_000,
                     channels: 1,
+                    response_id: None,
+                    item_id: None,
+                    content_index: None,
                 };
                 if tx.send(chunk).await.is_err() {
                     return;
@@ -147,6 +150,7 @@ async fn realtime_deadline_and_jitter() {
                 data,
                 sample_rate_hz,
                 channels,
+                ..
             } => {
                 assert_eq!(
                     data,

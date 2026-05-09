@@ -112,6 +112,27 @@ pub enum RealtimeTranscriptEvent {
         content_index: u32,
         text: String,
     },
+    /// R5-7: provider supplied authoritative final transcript text for an
+    /// assistant output item, overriding any incomplete delta accumulation.
+    ///
+    /// Necessary for two cases:
+    ///   1. Final-only providers that emit a single `AssistantTranscriptFinal`
+    ///      observation without prior deltas.
+    ///   2. Recovery from delta loss (R5-1: lossy media lane back-pressure
+    ///      may drop transcript deltas; the final's text is the authoritative
+    ///      reconciliation).
+    ///
+    /// The materializer locates the staged item by
+    /// `(response_id, item_id, content_index)`, replaces its accumulated
+    /// content with `text`, and (if no item is staged yet) creates one on
+    /// the spoken lane. Flush still happens via `AssistantTurnCompleted`;
+    /// this variant only updates the staged content.
+    AssistantTranscriptFinalText {
+        response_id: String,
+        item_id: String,
+        content_index: u32,
+        text: String,
+    },
     /// Provider turn reached a terminal boundary. The session decides which
     /// staged assistant items, if any, are now canonical.
     AssistantTurnCompleted {

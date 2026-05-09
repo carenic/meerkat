@@ -210,12 +210,25 @@ pub enum LiveAdapterObservation {
         delta_id: Option<String>,
         delta: String,
     },
+    /// Streaming audio frame. R5-4: identity fields (`response_id`,
+    /// `item_id`, `content_index`) propagate the source server-event identity
+    /// the OpenAI realtime translator already records internally so clients
+    /// can attach a playback cursor to a provider item without racing on the
+    /// transcript-delta arrival order. All three are `Option` because not
+    /// every provider surfaces a content segment id and degraded paths may
+    /// drop response identity.
     AssistantAudioChunk {
         #[serde(with = "base64_bytes")]
         #[cfg_attr(feature = "schema", schemars(with = "String"))]
         data: Vec<u8>,
         sample_rate_hz: u32,
         channels: u16,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        content_index: Option<u32>,
     },
     AssistantTranscriptFinal {
         provider_item_id: String,
@@ -282,6 +295,17 @@ pub enum LiveAdapterObservation {
         status: LiveAdapterStatus,
     },
     Error {
+        code: LiveAdapterErrorCode,
+        message: String,
+    },
+    /// R5-9: scoped command rejection. The adapter rejected an in-flight
+    /// command (e.g. unsupported `LiveInputChunk` shape) but the channel
+    /// remains usable. Distinct from [`Self::Error`] — the host treats
+    /// `Error` as terminal (closes the channel) and `CommandRejected` as a
+    /// per-command failure (channel survives, client may retry with a
+    /// supported shape). Terminal failure paths (model swap, audio-rate
+    /// mismatch, provider outage) continue to use `Error`.
+    CommandRejected {
         code: LiveAdapterErrorCode,
         message: String,
     },
@@ -1242,6 +1266,26 @@ mod tests {
         assert_eq!(obs, deser);
     }
 
+    /// R5-9: `CommandRejected` is the scoped sibling of `Error`. Distinct
+    /// tag on the wire so the host can route command rejections without
+    /// closing the channel; round-trip preserves identity.
+    #[test]
+    fn observation_command_rejected_round_trips_with_distinct_tag() {
+        let obs = LiveAdapterObservation::CommandRejected {
+            code: LiveAdapterErrorCode::ConfigRejected {
+                reason: "image_input_not_implemented".into(),
+            },
+            message: "image_input_not_implemented".into(),
+        };
+        let json = serde_json::to_string(&obs).unwrap();
+        // Tag must distinguish scoped rejection from terminal Error so the
+        // host's classifier can route on the variant, not the message text.
+        assert!(json.contains("\"command_rejected\""), "got {json}");
+        assert!(!json.contains("\"observation\":\"error\""), "got {json}");
+        let deser: LiveAdapterObservation = serde_json::from_str(&json).unwrap();
+        assert_eq!(obs, deser);
+    }
+
     // -- Audio chunk binary fidelity --
 
     #[test]
@@ -1251,6 +1295,9 @@ mod tests {
             data: bytes.clone(),
             sample_rate_hz: 24000,
             channels: 1,
+            response_id: None,
+            item_id: None,
+            content_index: None,
         };
         let json = serde_json::to_string(&obs).unwrap();
         // Negative assertion: must NOT serialize as a JSON integer array.
@@ -1273,6 +1320,43 @@ mod tests {
             }
             other => panic!("expected AssistantAudioChunk, got {other:?}"),
         }
+    }
+
+    /// R5-4: identity fields (`response_id`, `item_id`, `content_index`) on
+    /// `AssistantAudioChunk` round-trip cleanly when populated and are
+    /// omitted from the wire form when absent.
+    #[test]
+    fn assistant_audio_chunk_carries_identity_fields_round_trip() {
+        let obs = LiveAdapterObservation::AssistantAudioChunk {
+            data: vec![1u8, 2, 3],
+            sample_rate_hz: 24_000,
+            channels: 1,
+            response_id: Some("resp_abc".to_string()),
+            item_id: Some("item_123".to_string()),
+            content_index: Some(0),
+        };
+        let json = serde_json::to_string(&obs).unwrap();
+        assert!(json.contains("\"response_id\":\"resp_abc\""), "got {json}");
+        assert!(json.contains("\"item_id\":\"item_123\""), "got {json}");
+        assert!(json.contains("\"content_index\":0"), "got {json}");
+        let deser: LiveAdapterObservation = serde_json::from_str(&json).unwrap();
+        assert_eq!(obs, deser);
+
+        // Skip-when-None: omitting identity must not bloat the wire.
+        let obs_anon = LiveAdapterObservation::AssistantAudioChunk {
+            data: vec![4u8, 5, 6],
+            sample_rate_hz: 24_000,
+            channels: 1,
+            response_id: None,
+            item_id: None,
+            content_index: None,
+        };
+        let json_anon = serde_json::to_string(&obs_anon).unwrap();
+        assert!(!json_anon.contains("response_id"), "got {json_anon}");
+        assert!(!json_anon.contains("item_id"), "got {json_anon}");
+        assert!(!json_anon.contains("content_index"), "got {json_anon}");
+        let deser_anon: LiveAdapterObservation = serde_json::from_str(&json_anon).unwrap();
+        assert_eq!(obs_anon, deser_anon);
     }
 
     #[test]

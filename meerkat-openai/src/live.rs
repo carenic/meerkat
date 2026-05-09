@@ -581,7 +581,12 @@ fn openai_session_update(open_config: &RealtimeSessionOpenConfig) -> SessionUpda
 
     SessionUpdate {
         config: SessionUpdateConfig {
-            output_modalities: Some(OutputModalities::Audio),
+            // R5-2: live channel advertises `text_out=true` (Audio + Text
+            // continuity). `OutputModalities::Audio` would silence
+            // `ResponseOutputTextDelta` — making the capability advertisement
+            // a lie. `AudioText` instructs OpenAI Realtime to emit display
+            // text alongside the spoken transcript so both lanes survive.
+            output_modalities: Some(OutputModalities::AudioText),
             audio: Some(AudioConfig {
                 input: Some(InputAudioConfig {
                     format: Some(AudioFormat::pcm_24khz()),
@@ -850,7 +855,11 @@ fn openai_audio_response_config() -> ResponseConfig {
     // semantics here.
     ResponseConfig {
         conversation: Some(ConversationMode::Auto),
-        output_modalities: Some(OutputModalities::Audio),
+        // R5-2: keep response-level modality in lock-step with session-level
+        // (`AudioText`). A response that drops back to `Audio` would silence
+        // `ResponseOutputTextDelta` for that response despite the live channel
+        // advertising `text_out=true`.
+        output_modalities: Some(OutputModalities::AudioText),
         audio: Some(AudioConfig {
             input: None,
             output: Some(OutputAudioConfig {
@@ -1895,6 +1904,7 @@ impl OpenAiRealtimeSession {
             ServerEvent::ResponseOutputAudioDelta {
                 response_id,
                 item_id,
+                content_index,
                 delta,
                 ..
             } => {
@@ -1911,6 +1921,9 @@ impl OpenAiRealtimeSession {
                         channels: OPENAI_REALTIME_AUDIO_CHANNELS,
                         data: delta,
                     },
+                    response_id: Some(response_id),
+                    item_id: Some(item_id),
+                    content_index: Some(content_index),
                 })
             }
             ServerEvent::ResponseFunctionCallArgumentsDone {
@@ -2969,6 +2982,16 @@ async fn openai_live_pump(
                             // `ConfigRejected::UnsupportedInput`). On this
                             // pass we keep the single variant and document
                             // the breadth.
+                            // R5-9: classify the local guard rejection. Input-shape
+                            // rejections (Image / VideoFrame / unsupported chunk
+                            // variant on SendInput) are SCOPED command failures —
+                            // the channel must survive so the client can retry with
+                            // a supported shape. Model-swap / provider-swap /
+                            // audio-rate mismatches stay TERMINAL (close + reopen
+                            // is required). The classifier keys off the documented
+                            // reason strings emitted at the SendInput rejection
+                            // sites; everything else (including non-`InvalidRequest`)
+                            // remains a terminal `Error`.
                             let code = match &err {
                                 LlmError::InvalidRequest { message } => {
                                     LiveAdapterErrorCode::ConfigRejected {
@@ -2977,12 +3000,26 @@ async fn openai_live_pump(
                                 }
                                 _ => LiveAdapterErrorCode::ProviderError,
                             };
-                            let _ = obs_tx
-                                .send(LiveAdapterObservation::Error {
+                            let scoped_command_rejection = matches!(
+                                &err,
+                                LlmError::InvalidRequest { message }
+                                    if message == "image_input_not_implemented"
+                                        || message == "video_frame_input_not_implemented"
+                                        || message == "unsupported_input_chunk_variant"
+                                        || message.starts_with("openai realtime video input")
+                            );
+                            let obs = if scoped_command_rejection {
+                                LiveAdapterObservation::CommandRejected {
                                     code,
                                     message: err.to_string(),
-                                })
-                                .await;
+                                }
+                            } else {
+                                LiveAdapterObservation::Error {
+                                    code,
+                                    message: err.to_string(),
+                                }
+                            };
+                            let _ = obs_tx.send(obs).await;
                         }
                     }
                 }
@@ -3284,13 +3321,21 @@ fn translate_realtime_event(event: RealtimeSessionEvent) -> LiveAdapterObservati
             delta_id: Some(delta_id),
             delta,
         },
-        RealtimeSessionEvent::OutputAudioChunk { chunk } => {
+        RealtimeSessionEvent::OutputAudioChunk {
+            chunk,
+            response_id,
+            item_id,
+            content_index,
+        } => {
             use base64::Engine;
             match base64::engine::general_purpose::STANDARD.decode(&chunk.data) {
                 Ok(data) => LiveAdapterObservation::AssistantAudioChunk {
                     data,
                     sample_rate_hz: chunk.sample_rate_hz,
                     channels: u16::from(chunk.channels),
+                    response_id,
+                    item_id,
+                    content_index,
                 },
                 Err(err) => LiveAdapterObservation::Error {
                     code: LiveAdapterErrorCode::ProviderError,
@@ -3498,7 +3543,10 @@ mod tests {
                 ..
             } => {
                 assert_eq!(response.conversation, Some(ConversationMode::Auto));
-                assert_eq!(response.output_modalities, Some(OutputModalities::Audio));
+                assert_eq!(
+                    response.output_modalities,
+                    Some(OutputModalities::AudioText)
+                );
                 assert_eq!(response.voice, None);
                 assert!(
                     matches!(
@@ -4603,7 +4651,7 @@ mod tests {
         ));
         assert!(matches!(
             session.next_event().await.expect("audio delta"),
-            Some(RealtimeSessionEvent::OutputAudioChunk { chunk }) if chunk.data == "AAEC"
+            Some(RealtimeSessionEvent::OutputAudioChunk { chunk, .. }) if chunk.data == "AAEC"
         ));
         assert!(matches!(
             session.next_event().await.expect("tool call"),
@@ -5411,7 +5459,7 @@ mod tests {
 
         assert!(matches!(
             session.next_event().await.expect("audio delta"),
-            Some(RealtimeSessionEvent::OutputAudioChunk { chunk }) if chunk.data == "AAEC"
+            Some(RealtimeSessionEvent::OutputAudioChunk { chunk, .. }) if chunk.data == "AAEC"
         ));
         assert!(matches!(
             session.next_event().await.expect("interrupted"),
@@ -5452,7 +5500,7 @@ mod tests {
 
         assert!(matches!(
             session.next_event().await.expect("audio delta"),
-            Some(RealtimeSessionEvent::OutputAudioChunk { chunk }) if chunk.data == "AAEC"
+            Some(RealtimeSessionEvent::OutputAudioChunk { chunk, .. }) if chunk.data == "AAEC"
         ));
         assert!(matches!(
             session.next_event().await.expect("interrupted"),
@@ -5778,7 +5826,7 @@ mod tests {
                 ClientEvent::SessionUpdate { session, .. }
                     if matches!(
                         session.config.output_modalities,
-                        Some(oai_rt_rs::protocol::models::OutputModalities::Audio)
+                        Some(oai_rt_rs::protocol::models::OutputModalities::AudioText)
                     )
             )
         }));
@@ -6941,12 +6989,14 @@ mod tests {
         .expect("error observation must arrive within 1s")
         .expect("adapter must yield Ok");
         match observation {
-            Some(LiveAdapterObservation::Error { code, message }) => match code {
+            // R5-9: input-shape rejections are SCOPED — channel survives —
+            // so the pump emits `CommandRejected`, not the terminal `Error`.
+            Some(LiveAdapterObservation::CommandRejected { code, message }) => match code {
                 LiveAdapterErrorCode::ConfigRejected { reason } => {
                     assert_eq!(reason, "image_input_not_implemented");
                     assert!(
                         message.contains("image_input_not_implemented"),
-                        "Error.message must mirror the typed reason, got {message}"
+                        "CommandRejected.message must mirror the typed reason, got {message}"
                     );
                 }
                 other => panic!(
@@ -6954,7 +7004,7 @@ mod tests {
                      with message {message}"
                 ),
             },
-            other => panic!("expected Error observation for image input, got {other:?}"),
+            other => panic!("expected CommandRejected observation for image input, got {other:?}"),
         }
 
         adapter.close().await.expect("close must succeed");
@@ -7006,12 +7056,14 @@ mod tests {
         .expect("error observation must arrive within 1s")
         .expect("adapter must yield Ok");
         match observation {
-            Some(LiveAdapterObservation::Error { code, message }) => match code {
+            // R5-9: video-frame rejection is scoped — see image-rejection
+            // counterpart for the same `CommandRejected` taxonomy.
+            Some(LiveAdapterObservation::CommandRejected { code, message }) => match code {
                 LiveAdapterErrorCode::ConfigRejected { reason } => {
                     assert_eq!(reason, "video_frame_input_not_implemented");
                     assert!(
                         message.contains("video_frame_input_not_implemented"),
-                        "Error.message must mirror the typed reason, got {message}"
+                        "CommandRejected.message must mirror the typed reason, got {message}"
                     );
                 }
                 other => panic!(
@@ -7019,7 +7071,9 @@ mod tests {
                      with message {message}"
                 ),
             },
-            other => panic!("expected Error observation for video-frame input, got {other:?}"),
+            other => {
+                panic!("expected CommandRejected observation for video-frame input, got {other:?}")
+            }
         }
 
         adapter.close().await.expect("close must succeed");
@@ -7210,10 +7264,20 @@ mod tests {
             LiveAdapterObservation::AssistantAudioChunk {
                 sample_rate_hz,
                 channels,
+                response_id,
+                item_id,
+                content_index,
                 ..
             } => {
                 assert_eq!(sample_rate_hz, OPENAI_REALTIME_AUDIO_SAMPLE_RATE_HZ);
                 assert_eq!(channels, u16::from(OPENAI_REALTIME_AUDIO_CHANNELS));
+                // R5-4: identity must propagate from `ResponseOutputAudioDelta`
+                // (response_id / item_id / content_index) through the
+                // intermediate `RealtimeSessionEvent::OutputAudioChunk` to
+                // the public `AssistantAudioChunk` observation.
+                assert_eq!(response_id.as_deref(), Some("resp_audio"));
+                assert_eq!(item_id.as_deref(), Some("item_audio"));
+                assert_eq!(content_index, Some(0));
             }
             other => {
                 panic!("ResponseOutputAudioDelta must map to AssistantAudioChunk, got {other:?}")

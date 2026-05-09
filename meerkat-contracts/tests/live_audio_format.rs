@@ -22,6 +22,9 @@ fn realtime_audio_format() {
         data: vec![1u8, 2, 3, 4, 5],
         sample_rate_hz: 24_000,
         channels: 1,
+        response_id: None,
+        item_id: None,
+        content_index: None,
     };
     let value = serde_json::to_value(&obs).unwrap();
 
@@ -47,6 +50,7 @@ fn realtime_audio_format() {
             data,
             sample_rate_hz,
             channels,
+            ..
         } => {
             assert_eq!(data, vec![1u8, 2, 3, 4, 5]);
             assert_eq!(sample_rate_hz, 24_000);
@@ -65,6 +69,9 @@ fn assistant_audio_chunk_carries_sample_rate_and_channels() {
         data: vec![0u8; 4],
         sample_rate_hz: 48_000,
         channels: 2,
+        response_id: None,
+        item_id: None,
+        content_index: None,
     };
     let value = serde_json::to_value(&obs).expect("audio chunk must serialize");
     assert_eq!(

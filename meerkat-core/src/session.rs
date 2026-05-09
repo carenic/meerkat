@@ -1059,6 +1059,52 @@ impl Session {
                     }
                 }
             }
+            RealtimeTranscriptEvent::AssistantTranscriptFinalText {
+                response_id,
+                item_id,
+                content_index,
+                text,
+            } => {
+                // R5-7: authoritative final text overrides any incomplete
+                // delta accumulation for this `(response_id, item_id,
+                // content_index)`. If no item is staged yet (final-only
+                // provider, or all deltas dropped), create one on the
+                // Spoken lane so the materializer flushes it as
+                // `AssistantBlock::Transcript`. Flush gating is unchanged:
+                // `AssistantTurnCompleted` still drives readiness.
+                let Some(response_id) = normalize_realtime_response_id(response_id) else {
+                    return RealtimeTranscriptApplyOutcome::default();
+                };
+                if state
+                    .discarded_assistant_response_ids
+                    .contains(&response_id)
+                {
+                    observe_realtime_skipped_item(&mut state, item_id, None);
+                    let outcome = self.materialize_realtime_transcript_ready_items(&mut state);
+                    self.store_realtime_transcript_state(&state);
+                    return outcome;
+                }
+                let response_completed = state.assistant_completions.contains_key(&response_id);
+                if let Some(item) = observe_realtime_item(
+                    &mut state,
+                    item_id,
+                    None,
+                    RealtimeTranscriptRole::Assistant,
+                    Some(response_id),
+                ) {
+                    // Spoken lane: this variant is the authoritative
+                    // transcript-final text path. Display-text finals come
+                    // through a different seam.
+                    promote_item_lane(item, TranscriptLane::Spoken);
+                    // Replace, not append: the final's text is authoritative
+                    // and supersedes any (possibly partial) accumulated
+                    // segment text.
+                    item.content_segments.insert(content_index, text);
+                    if response_completed && !item.text().is_empty() {
+                        item.ready = true;
+                    }
+                }
+            }
             RealtimeTranscriptEvent::AssistantTurnCompleted {
                 response_id,
                 stop_reason,
@@ -2483,6 +2529,120 @@ mod tests {
             &session.messages()[1],
             Message::BlockAssistant(assistant) if block_assistant_text(assistant) == "hi"
         ));
+    }
+
+    /// R5-7: `AssistantTranscriptFinalText` injects authoritative final text
+    /// into the staged item. Verifies the override semantics: a partial
+    /// delta is replaced, not concatenated, and the item promotes to the
+    /// Spoken lane so flush emits `AssistantBlock::Transcript`.
+    #[test]
+    fn realtime_transcript_final_text_overrides_partial_delta_and_promotes_to_spoken_lane() {
+        let mut session = Session::new();
+
+        // Partial delta accumulates "incom" — simulating delta loss before
+        // the final arrives.
+        assert!(
+            session
+                .append_realtime_transcript_event(
+                    RealtimeTranscriptEvent::AssistantTranscriptDelta {
+                        response_id: "resp_a".to_string(),
+                        delta_id: "evt_1".to_string(),
+                        item_id: "item_a".to_string(),
+                        previous_item_id: None,
+                        content_index: 0,
+                        delta: "incom".to_string(),
+                    }
+                )
+                .is_inert()
+        );
+
+        // Authoritative final text overrides the staged content.
+        assert!(
+            session
+                .append_realtime_transcript_event(
+                    RealtimeTranscriptEvent::AssistantTranscriptFinalText {
+                        response_id: "resp_a".to_string(),
+                        item_id: "item_a".to_string(),
+                        content_index: 0,
+                        text: "complete answer".to_string(),
+                    }
+                )
+                .is_inert()
+        );
+
+        // Turn completion drives the flush.
+        let outcome = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTurnCompleted {
+                response_id: "resp_a".to_string(),
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            },
+        );
+        assert!(!outcome.is_inert());
+
+        // Verify the materialized block has the final's authoritative text
+        // (not the partial "incom") and the Spoken lane.
+        assert_eq!(session.messages().len(), 1);
+        match &session.messages()[0] {
+            Message::BlockAssistant(assistant) => {
+                let mut found_transcript = false;
+                for block in &assistant.blocks {
+                    if let AssistantBlock::Transcript { text, .. } = block {
+                        assert_eq!(text, "complete answer");
+                        found_transcript = true;
+                    }
+                }
+                assert!(
+                    found_transcript,
+                    "AssistantTranscriptFinalText must promote to the Spoken lane and \
+                     materialize as AssistantBlock::Transcript"
+                );
+            }
+            other => unreachable!("expected BlockAssistant, got {other:?}"),
+        }
+    }
+
+    /// R5-7: `AssistantTranscriptFinalText` works for final-only providers
+    /// where no prior delta has staged an item.
+    #[test]
+    fn realtime_transcript_final_text_creates_item_when_no_delta_staged() {
+        let mut session = Session::new();
+
+        assert!(
+            session
+                .append_realtime_transcript_event(
+                    RealtimeTranscriptEvent::AssistantTranscriptFinalText {
+                        response_id: "resp_a".to_string(),
+                        item_id: "item_a".to_string(),
+                        content_index: 0,
+                        text: "spoken-final-only".to_string(),
+                    }
+                )
+                .is_inert()
+        );
+
+        let outcome = session.append_realtime_transcript_event(
+            RealtimeTranscriptEvent::AssistantTurnCompleted {
+                response_id: "resp_a".to_string(),
+                stop_reason: StopReason::EndTurn,
+                usage: Usage::default(),
+            },
+        );
+        assert!(!outcome.is_inert());
+
+        assert_eq!(session.messages().len(), 1);
+        match &session.messages()[0] {
+            Message::BlockAssistant(assistant) => {
+                let has_transcript = assistant.blocks.iter().any(|b| {
+                    matches!(b, AssistantBlock::Transcript { text, .. } if text == "spoken-final-only")
+                });
+                assert!(
+                    has_transcript,
+                    "final-only provider path must materialize as Transcript on the Spoken lane"
+                );
+            }
+            other => unreachable!("expected BlockAssistant, got {other:?}"),
+        }
     }
 
     #[test]
