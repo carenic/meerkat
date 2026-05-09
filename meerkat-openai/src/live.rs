@@ -2905,9 +2905,68 @@ async fn openai_live_pump(
                     Some(LiveAdapterCommand::Close) | None => break,
                     Some(cmd) => {
                         if let Err(err) = execute_openai_live_command(&mut session, cmd).await {
+                            // R12: distinguish local-guard rejections from
+                            // provider-side outages. Every
+                            // `LlmError::InvalidRequest` produced by the
+                            // command-execution path is a *local* guard
+                            // rejection — the provider never saw the
+                            // request — so we map it to the typed
+                            // `ConfigRejected { reason }` rather than
+                            // collapsing it onto `ProviderError` (which
+                            // would force clients to parse English to
+                            // distinguish "local config rejected" from
+                            // "provider failed"). Every other error
+                            // variant remains on the `ProviderError`
+                            // path.
+                            //
+                            // ConfigRejected is therefore a SUPERSET of
+                            // "needs close + reopen": clients keying off
+                            // `ConfigRejected` for swap-detection must
+                            // additionally inspect the `reason` field
+                            // (or the `LiveAdapterObservation::Error`
+                            // message) to distinguish the swap subcases
+                            // from input-shape rejections.
+                            //
+                            // Current `LlmError::InvalidRequest` call sites
+                            // reachable from `execute_openai_live_command`
+                            // (all paths where ConfigRejected fires).
+                            // Line numbers verified at the time of writing;
+                            // grep `InvalidRequest` within the function body
+                            // if the file shifts. The five reachable sites
+                            // are:
+                            //   * model swap on Refresh (close+reopen
+                            //     needed) — first guard in the Refresh arm.
+                            //   * provider swap on Refresh (close+reopen
+                            //     needed) — second guard in the Refresh arm.
+                            //   * audio-rate / channel mismatch on Refresh
+                            //     (close+reopen needed) — third guard in
+                            //     the Refresh arm.
+                            //   * unsupported `LiveInputChunk` variant on
+                            //     SendInput (caller error, NOT a reopen
+                            //     signal) — Video/Image guard.
+                            //   * unsupported `LiveAdapterCommand` variant
+                            //     catch-all (caller error, NOT a reopen
+                            //     signal).
+                            //
+                            // TODO(future): if downstream consumers grow a
+                            // need to branch on swap-vs-input-shape
+                            // without inspecting the reason string, split
+                            // `ConfigRejected` into typed sub-variants
+                            // (e.g. `ConfigRejected::Swap` vs
+                            // `ConfigRejected::UnsupportedInput`). On this
+                            // pass we keep the single variant and document
+                            // the breadth.
+                            let code = match &err {
+                                LlmError::InvalidRequest { message } => {
+                                    LiveAdapterErrorCode::ConfigRejected {
+                                        reason: message.clone(),
+                                    }
+                                }
+                                _ => LiveAdapterErrorCode::ProviderError,
+                            };
                             let _ = obs_tx
                                 .send(LiveAdapterObservation::Error {
-                                    code: LiveAdapterErrorCode::ProviderError,
+                                    code,
                                     message: err.to_string(),
                                 })
                                 .await;
@@ -2990,22 +3049,37 @@ async fn execute_openai_live_command(
                 .await
         }
         LiveAdapterCommand::Refresh { snapshot } => {
-            // R1: a snapshot-driven refresh must apply EVERY mutable
-            // field, not just `seed_messages`. Pre-R1 only
-            // `seed_history_projection` ran here, so a `config/patch`
-            // that flipped `model_id` / `provider_id` / `visible_tools`
-            // / `system_prompt` / `audio_config` left the hosted OpenAI
-            // realtime session running on stale state while RPC reported
-            // `refreshed: true`.
+            // R1 + R9: a snapshot-driven refresh applies the mutable
+            // configuration fields (instructions / tools / audio) on
+            // the already-open hosted session, but it must NOT replay
+            // the canonical history — `live_open_config_for_session`
+            // builds `seed_messages` from the full session transcript,
+            // so re-running `seed_history_projection` on every refresh
+            // would duplicate every prior turn into the provider's
+            // hosted conversation as fresh `conversation.item.create`
+            // events. After N refreshes the provider would carry N+1
+            // copies of the same transcript.
             //
             // Order matters: validate model/provider identity first
             // (model swaps require close + reopen — the OpenAI Realtime
             // API has no mutable `model` field on `session.update`),
-            // then issue a `session.update` with the new instructions /
-            // tools / audio config, then re-run
-            // `seed_history_projection` so newly-injected runtime
-            // context still lands as authoritative system instructions
-            // alongside the seed history.
+            // then issue a `session.update` carrying the new
+            // instructions / tools / audio config. That's it.
+            //
+            // Note: the snapshot's `runtime_system_context` is folded
+            // into the `instructions` payload by
+            // `apply_refresh_session_update_from_snapshot` via
+            // `openai_refresh_session_update_from_snapshot`, so newly-
+            // authoritative system context still reaches the provider
+            // — just as part of the session config, not as a stream of
+            // synthetic system items. Anything that genuinely needs to
+            // appear as an in-conversation item belongs to the
+            // session/inject_context → next-turn boundary, not to a
+            // live-adapter refresh.
+            //
+            // The Open arm (separate variant) keeps its
+            // `seed_history_projection` call; that's the single
+            // authoritative seed point.
             if let Some(current_model) = session.current_model_id.as_deref()
                 && current_model != snapshot.model_id
             {
@@ -3047,9 +3121,6 @@ async fn execute_openai_live_command(
             }
             session
                 .apply_refresh_session_update_from_snapshot(&snapshot)
-                .await?;
-            session
-                .seed_history_projection(&snapshot.seed_messages, &snapshot.runtime_system_context)
                 .await
         }
         LiveAdapterCommand::SendInput { chunk } => {
@@ -6359,19 +6430,50 @@ mod tests {
         adapter.close().await.expect("close must succeed");
     }
 
-    /// P1#5: `LiveAdapterCommand::Refresh { snapshot }` must re-run
-    /// `seed_history_projection` against the new snapshot's seed messages,
-    /// minting `ConversationItemCreate` events for every entry. This is the
-    /// path `live/refresh` exercises after a `config/patch`-driven model
-    /// switch or any other upstream snapshot drift; if a future refactor
-    /// silently turns Refresh into a no-op, the live adapter would keep
-    /// running against stale projection state.
+    /// R9: `LiveAdapterCommand::Refresh { snapshot }` MUST NOT replay
+    /// canonical history into the hosted OpenAI realtime conversation.
+    ///
+    /// Why this matters: `live_open_config_for_session` builds
+    /// `snapshot.seed_messages` from the *full* canonical session
+    /// transcript every time it's called. The original Refresh
+    /// implementation re-ran `seed_history_projection` after the
+    /// `session.update`, which minted a fresh
+    /// `conversation.item.create` event for every prior turn each time
+    /// `live/refresh` was invoked. After N refreshes the provider's
+    /// hosted conversation carried N+1 copies of the same transcript,
+    /// blowing up token bills, latency, and turn-detection state.
+    ///
+    /// The fix is to make Refresh config-only:
+    ///   - exactly one outbound `session.update` per refresh,
+    ///   - zero outbound `conversation.item.create` events,
+    ///   - regardless of how big `snapshot.seed_messages` /
+    ///     `snapshot.runtime_system_context` are.
+    ///
+    /// Re-seeding remains the responsibility of the `Open` arm (used
+    /// at adapter open time and for cross-session re-seed scenarios
+    /// per R2). Anything that genuinely needs to be injected as an
+    /// in-conversation item belongs to the
+    /// `session/inject_context` → next-turn boundary, NOT to a
+    /// live-adapter refresh.
+    ///
+    /// This test drives 3 consecutive Refreshes carrying non-empty
+    /// `seed_messages` AND `runtime_system_context` and asserts:
+    ///   - exactly 3 `SessionUpdate` events reached the provider,
+    ///   - exactly 0 `ConversationItemCreate` events reached the
+    ///     provider — even though every refresh's `seed_messages` is
+    ///     non-empty.
     #[tokio::test(flavor = "current_thread")]
-    async fn refresh_command_reseeds_provider_with_snapshot_messages() {
+    async fn refresh_command_does_not_replay_history() {
         use meerkat_core::live_adapter::LiveProjectionSnapshot;
+        use meerkat_core::session::PendingSystemContextAppend;
         use meerkat_core::types::SessionId;
         use meerkat_core::{AssistantMessage, Provider, StopReason, UserMessage, types};
+        use std::time::SystemTime;
 
+        // Non-empty seed: if the Refresh arm regressed and re-seeded,
+        // each of these would mint at least one
+        // `ConversationItemCreate` per refresh, so the assertion below
+        // would catch the bug immediately.
         let seed_messages = vec![
             Message::User(UserMessage::text("first turn")),
             Message::Assistant(AssistantMessage {
@@ -6382,27 +6484,27 @@ mod tests {
                 created_at: types::message_timestamp_now(),
             }),
         ];
-        let seed_event_count = openai_realtime_history_events(&seed_messages, &[]).len();
+        // Sanity check: this seed shape would produce > 0 mint events
+        // if the regression returned. Belt-and-braces against an empty
+        // seed accidentally passing the assertion below.
         assert!(
-            seed_event_count > 0,
-            "test setup: seed messages must produce at least one ConversationItemCreate"
+            !openai_realtime_history_events(&seed_messages, &[]).is_empty(),
+            "test setup: seed messages must produce at least one history event \
+             (otherwise the no-replay assertion below trivially holds)"
         );
 
-        // R1: Refresh now sends `session.update` first (so a snapshot
-        // with mutated tools / instructions / audio config actually
-        // applies) and then re-seeds history. Both phases must read
-        // their own server-event acks back from the raw session.
-        //
-        // We use a `ChannelOpenAiLiveSession` here instead of a
-        // pre-loaded `ParkingOpenAiLiveSession` queue: the pump's
-        // biased select runs an idle `next_event` poll between
-        // commands, so any event that's already sitting in a polled
-        // `VecDeque` would be silently consumed by that idle branch
-        // before the Refresh command ran. Pushing acks AFTER each
-        // outbound client event lands in `seen` keeps the pump
-        // synchronized with the Refresh execution path.
-        let total_outbound_count = seed_event_count + 1;
+        let runtime_system_context = vec![PendingSystemContextAppend {
+            text: "peer terminal: pty=42".to_string(),
+            source: Some("peer_terminal".to_string()),
+            idempotency_key: Some("k1".to_string()),
+            accepted_at: SystemTime::UNIX_EPOCH,
+        }];
 
+        // We use a `ChannelOpenAiLiveSession` so we can push the
+        // matching `SessionUpdated` ack AFTER the pump has emitted its
+        // `SessionUpdate`. A pre-queued `ParkingOpenAiLiveSession`
+        // would let the pump's idle `next_event` poll silently drain
+        // the ack between commands, ruining synchronization.
         let (server_tx, server_rx) =
             mpsc::unbounded_channel::<Result<Option<ServerEvent>, LlmError>>();
         let seen: Arc<Mutex<Vec<ClientEvent>>> = Arc::new(Mutex::new(Vec::new()));
@@ -6410,7 +6512,9 @@ mod tests {
             seen: Arc::clone(&seen),
             rx: tokio::sync::Mutex::new(server_rx),
         });
-        let session = OpenAiRealtimeSession::new(raw, RealtimeTurningMode::ExplicitCommit);
+        let mut session = OpenAiRealtimeSession::new(raw, RealtimeTurningMode::ExplicitCommit);
+        // Stamp identity so the model-swap guard sees a stable origin.
+        session.set_current_identity("gpt-realtime", Provider::OpenAI.as_str());
         let adapter = OpenAiLiveAdapter::new(session);
 
         // Drain initial Ready so the pump is in its select! loop.
@@ -6423,69 +6527,49 @@ mod tests {
         .expect("adapter must yield Ok");
         assert!(matches!(first, Some(LiveAdapterObservation::Ready)));
 
-        // Send `Refresh { snapshot }`. The pump dispatches into
-        // `execute_openai_live_command`, which (R1) sends a
-        // SessionUpdate first, awaits its ack, then re-runs
-        // `seed_history_projection` against the snapshot.
-        let snapshot = LiveProjectionSnapshot {
-            session_id: SessionId::new(),
-            snapshot_version: 9,
-            seed_messages: seed_messages.clone(),
-            visible_tools: Vec::new(),
-            system_prompt: None,
-            model_id: "gpt-realtime".to_string(),
-            provider_id: Provider::OpenAI.as_str().to_string(),
-            audio_config: None,
-            runtime_system_context: Vec::new(),
-        };
-        adapter
-            .send_command(LiveAdapterCommand::Refresh { snapshot })
-            .await
-            .expect("Refresh must dispatch");
+        const REFRESH_COUNT: usize = 3;
+        for refresh_index in 0..REFRESH_COUNT {
+            let snapshot = LiveProjectionSnapshot {
+                session_id: SessionId::new(),
+                snapshot_version: 9 + refresh_index as u64,
+                seed_messages: seed_messages.clone(),
+                visible_tools: Vec::new(),
+                system_prompt: Some(format!("instructions revision {refresh_index}")),
+                model_id: "gpt-realtime".to_string(),
+                provider_id: Provider::OpenAI.as_str().to_string(),
+                audio_config: None,
+                runtime_system_context: runtime_system_context.clone(),
+            };
+            adapter
+                .send_command(LiveAdapterCommand::Refresh { snapshot })
+                .await
+                .expect("Refresh must dispatch");
 
-        // Wait for the SessionUpdate to land, then push its ack.
-        wait_for_seen_count(&seen, 1).await;
-        server_tx
-            .send(Ok(Some(ServerEvent::SessionUpdated {
-                event_id: "evt_refresh_session_updated".to_string(),
-                session: sample_server_session("gpt-realtime"),
-            })))
-            .expect("server channel must accept SessionUpdated ack");
-
-        // Then wait for all N seed `ConversationItemCreate` events to
-        // land and push the matching N acks.
-        wait_for_seen_count(&seen, total_outbound_count).await;
-        for index in 0..seed_event_count {
+            // After dispatch, exactly ONE outbound event should land
+            // in `seen` per refresh: the `session.update`. If the
+            // regression returned, additional `conversation.item.create`
+            // events would land before / after the SessionUpdate; the
+            // final assertion below catches that. We push the matching
+            // ack AFTER the SessionUpdate is observed so the pump can
+            // return from `apply_refresh_session_update_from_snapshot`
+            // and accept the next Refresh.
+            wait_for_seen_count(&seen, refresh_index + 1).await;
             server_tx
-                .send(Ok(Some(ServerEvent::ConversationItemCreated {
-                    event_id: format!("evt_refresh_seed_ack_{index}"),
-                    previous_item_id: None,
-                    item: Item::Message {
-                        id: Some(format!("msg_refresh_seed_{index}")),
-                        status: None,
-                        phase: None,
-                        role: Role::System,
-                        content: vec![ContentPart::InputText {
-                            text: format!("ack {index}"),
-                        }],
-                    },
+                .send(Ok(Some(ServerEvent::SessionUpdated {
+                    event_id: format!("evt_refresh_session_updated_{refresh_index}"),
+                    session: sample_server_session("gpt-realtime"),
                 })))
-                .expect("server channel must accept seed ack");
+                .expect("server channel must accept SessionUpdated ack");
         }
 
-        // Yield long enough for the pump to drain the seed acks and
-        // return from `seed_history_projection`. After that point the
-        // `seen` log is complete.
-        for _ in 0..32 {
+        // Yield long enough for the pump to drain all three acks and
+        // return to its idle select. After that point the `seen` log
+        // is complete.
+        for _ in 0..64 {
             tokio::task::yield_now().await;
         }
         let recorded = seen.lock().await.clone();
 
-        assert_eq!(
-            recorded.len(),
-            total_outbound_count,
-            "Refresh must forward 1× SessionUpdate + every seed event to the provider"
-        );
         let mut create_count = 0_usize;
         let mut session_update_count = 0_usize;
         for event in &recorded {
@@ -6496,12 +6580,18 @@ mod tests {
             }
         }
         assert_eq!(
-            create_count, seed_event_count,
-            "every recorded Refresh seed event must be a ConversationItemCreate"
+            session_update_count, REFRESH_COUNT,
+            "Refresh must emit exactly one session.update per refresh; recorded {recorded:?}"
         );
         assert_eq!(
-            session_update_count, 1,
-            "Refresh must emit exactly one session.update before re-seeding"
+            create_count, 0,
+            "Refresh must NOT replay canonical history — \
+             zero `conversation.item.create` events expected, recorded {recorded:?}"
+        );
+        assert_eq!(
+            recorded.len(),
+            REFRESH_COUNT,
+            "Refresh must forward exactly {REFRESH_COUNT} session.update events and nothing else"
         );
 
         adapter.close().await.expect("close must succeed");
@@ -6694,9 +6784,13 @@ mod tests {
             .await
             .expect("Refresh must dispatch even though it'll fail downstream");
 
-        // The pump translates the typed `LlmError::InvalidRequest` into
-        // a `LiveAdapterObservation::Error` with `ProviderError` code +
-        // a message that names the swap.
+        // R12: the pump now maps the typed `LlmError::InvalidRequest`
+        // raised by the model-swap guard into a typed
+        // `LiveAdapterObservation::Error { code: ConfigRejected, .. }`,
+        // not the previous `ProviderError`. The `reason` carried inside
+        // ConfigRejected mirrors the message text the guard produced so
+        // clients gating on the typed code still get a human-readable
+        // explanation of the close-and-reopen requirement.
         let observation = tokio::time::timeout(
             std::time::Duration::from_secs(1),
             adapter.next_observation(),
@@ -6705,13 +6799,25 @@ mod tests {
         .expect("error observation must arrive within 1s")
         .expect("adapter must yield Ok");
         match observation {
-            Some(LiveAdapterObservation::Error { message, .. }) => {
+            Some(LiveAdapterObservation::Error { code, message }) => {
+                match code {
+                    LiveAdapterErrorCode::ConfigRejected { reason } => {
+                        assert!(
+                            reason.contains("model swap")
+                                && reason.contains("gpt-realtime-mini-v2")
+                                && reason.contains("close + reopen"),
+                            "ConfigRejected reason must name the swap target and direct \
+                             the caller to close + reopen, got: {reason}"
+                        );
+                    }
+                    other => panic!(
+                        "model-swap rejection must surface as ConfigRejected, \
+                         got code {other:?} with message {message}"
+                    ),
+                }
                 assert!(
-                    message.contains("model swap")
-                        && message.contains("gpt-realtime-mini-v2")
-                        && message.contains("close + reopen"),
-                    "model swap rejection must name the swap target and direct \
-                     the caller to close + reopen, got: {message}"
+                    message.contains("model swap"),
+                    "Error.message must still carry the human-readable swap text, got: {message}"
                 );
             }
             other => panic!("expected Error observation for model swap, got {other:?}"),

@@ -41,6 +41,7 @@ use std::time::Duration;
 use indexmap::IndexMap;
 use meerkat_core::AgentToolDispatcher;
 use meerkat_core::RealtimeTranscriptEvent;
+use meerkat_core::SessionLlmIdentity;
 use meerkat_core::live_adapter::{
     LiveAdapter, LiveAdapterCommand, LiveAdapterError, LiveAdapterErrorCode,
     LiveAdapterObservation, LiveAdapterStatus, LiveInputChunk, LiveToolResult,
@@ -369,6 +370,38 @@ struct ChannelState {
     /// When `Some`, the channel was closed and is retained until this instant
     /// (G42). Reads are still serviced; commands are rejected.
     retire_at: Option<std::time::Instant>,
+    /// R11: LLM identity the channel was opened with.
+    ///
+    /// Recorded by the surface (`live/open` handler) immediately after
+    /// `attach_adapter` so `propagate_config_to_live_channels` can detect a
+    /// model/provider swap on `config/patch`. The OpenAI realtime adapter
+    /// rejects model/provider drift via its R1 guard (the realtime
+    /// `session.update` event cannot change model). Without a recorded
+    /// identity here the runtime would unconditionally enqueue Refresh and
+    /// the channel would land in `ConfigRejected` error state instead of
+    /// closing cleanly so the SDK can reopen.
+    ///
+    /// `None` for channels opened before identity recording was wired
+    /// (degraded test configs, factory-less paths). On `None` the runtime
+    /// falls back to legacy Refresh routing.
+    bound_llm_identity: Option<SessionLlmIdentity>,
+    /// CC1 (R11 wire-signal): one-shot synthetic observation to deliver to
+    /// the next [`LiveAdapterHost::next_observation_raw`] caller before any
+    /// adapter poll happens.
+    ///
+    /// Populated by [`LiveAdapterHost::signal_terminal_error`] so a typed
+    /// terminal error (e.g. `ConfigRejected { reason: "model_swap: ..." }`)
+    /// flows through the same WS pump path as a provider-emitted Error
+    /// observation. Without this, runtime-side terminations only show up as
+    /// a TCP close from `close_channel`, which clients cannot distinguish
+    /// from a network drop.
+    ///
+    /// Single-slot by design: there's exactly one terminal moment per
+    /// channel; subsequent `signal_terminal_error` calls overwrite (the
+    /// channel is being torn down either way). Read priority — see
+    /// `next_observation_raw` — must come before `adapter_for` so the
+    /// synthetic obs survives a concurrent `close_channel`.
+    pending_synthetic_obs: Option<LiveAdapterObservation>,
 }
 
 /// Errors from the live adapter host.
@@ -600,6 +633,8 @@ impl LiveAdapterHost {
                 snapshot_version: 0,
                 adapter: None,
                 retire_at: None,
+                bound_llm_identity: None,
+                pending_synthetic_obs: None,
             },
         );
         inner.by_session.insert(session_id, channel_id.clone());
@@ -629,6 +664,49 @@ impl LiveAdapterHost {
         // Intentionally NOT setting status to Ready (F32). Driven by
         // adapter observations.
         Ok(())
+    }
+
+    /// R11: record the LLM identity the channel was opened with.
+    ///
+    /// Called by `live/open` after `attach_adapter` succeeds so
+    /// `propagate_config_to_live_channels` can detect a model / provider
+    /// swap on a later `config/patch` and route to a clean close (so the
+    /// SDK can reopen against the new identity) instead of issuing a
+    /// `Refresh` the OpenAI realtime adapter is forced to reject.
+    ///
+    /// Idempotent — calling twice replaces the recorded identity. A future
+    /// hot-swap path that mutates identity in place without closing would
+    /// rewrite via this same setter.
+    pub async fn set_channel_llm_identity(
+        &self,
+        channel_id: &LiveChannelId,
+        identity: SessionLlmIdentity,
+    ) -> Result<(), LiveAdapterHostError> {
+        let mut inner = self.inner.lock().await;
+        let channel = inner
+            .channels
+            .get_mut(channel_id)
+            .ok_or_else(|| LiveAdapterHostError::ChannelNotFound(channel_id.clone()))?;
+        channel.bound_llm_identity = Some(identity);
+        Ok(())
+    }
+
+    /// R11: read the LLM identity the channel was opened with.
+    ///
+    /// Returns `Ok(None)` when the channel was opened by a path that did
+    /// not record identity (degraded factory-less config in tests, or a
+    /// pre-R11 caller). The runtime treats `None` as "do not assume a
+    /// swap" and falls through to the legacy Refresh path.
+    pub async fn channel_llm_identity(
+        &self,
+        channel_id: &LiveChannelId,
+    ) -> Result<Option<SessionLlmIdentity>, LiveAdapterHostError> {
+        let inner = self.inner.lock().await;
+        inner
+            .channels
+            .get(channel_id)
+            .map(|ch| ch.bound_llm_identity.clone())
+            .ok_or_else(|| LiveAdapterHostError::ChannelNotFound(channel_id.clone()))
     }
 
     /// Send a command to the adapter on a channel.
@@ -719,6 +797,20 @@ impl LiveAdapterHost {
         &self,
         channel_id: &LiveChannelId,
     ) -> Result<Option<LiveAdapterObservation>, LiveAdapterHostError> {
+        // CC1: check for a one-shot synthetic observation pushed by
+        // `signal_terminal_error` before polling the adapter. This makes
+        // typed terminal errors (e.g. R11 model_swap → `ConfigRejected`)
+        // observable to the WS pump even if the underlying adapter has
+        // already been torn down by `close_channel` — the pending slot
+        // sits in `ChannelState`, not on the adapter.
+        {
+            let mut inner = self.inner.lock().await;
+            if let Some(channel) = inner.channels.get_mut(channel_id)
+                && let Some(obs) = channel.pending_synthetic_obs.take()
+            {
+                return Ok(Some(obs));
+            }
+        }
         let adapter = self
             .adapter_for(channel_id, /* require_ready = */ false)
             .await?;
@@ -1102,6 +1194,53 @@ impl LiveAdapterHost {
         Ok(Arc::clone(adapter))
     }
 
+    /// CC1 / R11 wire-signal: enqueue a synthetic terminal `Error`
+    /// observation on the channel and close the underlying adapter.
+    ///
+    /// The synthetic observation is queued on a per-channel one-shot slot
+    /// that [`Self::next_observation_raw`] inspects before polling the
+    /// adapter. The next read by the WS pump returns the synthetic Error,
+    /// which the pump forwards to the client and routes through
+    /// [`Self::apply_observation`] — yielding
+    /// [`ObservationOutcome::Terminal`] and a typed `terminal:<slug>` close
+    /// frame (slug derived from the serde tag, e.g. `config_rejected`).
+    ///
+    /// Use this when the runtime decides a channel must die for a typed
+    /// reason that the provider adapter never produced (e.g. model swap on
+    /// `config/patch`, where the OpenAI realtime adapter cannot rebind the
+    /// model in-place). Without this seam clients only see a TCP close
+    /// indistinguishable from a network drop.
+    ///
+    /// `message` defaults from the typed code: `ConfigRejected { reason }`
+    /// uses `reason` directly, other variants fall back to the serde tag.
+    /// The pending obs is enqueued FIRST, then `close_channel` is called —
+    /// this is safe because `next_observation_raw` checks the pending slot
+    /// before honoring `retire_at`, so the WS pump still sees the typed
+    /// signal even after the adapter has been released.
+    pub async fn signal_terminal_error(
+        &self,
+        channel_id: &LiveChannelId,
+        code: LiveAdapterErrorCode,
+    ) -> Result<(), LiveAdapterHostError> {
+        let message = match &code {
+            LiveAdapterErrorCode::ConfigRejected { reason } => reason.clone(),
+            other => format!("{other:?}"),
+        };
+        {
+            let mut inner = self.inner.lock().await;
+            let channel = inner
+                .channels
+                .get_mut(channel_id)
+                .ok_or_else(|| LiveAdapterHostError::ChannelNotFound(channel_id.clone()))?;
+            channel.pending_synthetic_obs = Some(LiveAdapterObservation::Error { code, message });
+        }
+        // Close the adapter so any in-flight provider activity is released.
+        // The pending synthetic obs survives this because
+        // `next_observation_raw` checks the pending slot before consulting
+        // `retire_at`.
+        self.close_channel(channel_id).await
+    }
+
     pub async fn close_channel(
         &self,
         channel_id: &LiveChannelId,
@@ -1369,6 +1508,102 @@ mod tests {
         let session_id = test_session_id();
         let ch = host.open_channel(session_id.clone()).await.unwrap();
         assert_eq!(host.channel_session(&ch).await.unwrap(), session_id);
+    }
+
+    /// CC1: `signal_terminal_error` must enqueue a synthetic `Error`
+    /// observation and close the underlying adapter. The pending obs must
+    /// be readable through `next_observation_raw` even after the channel
+    /// has transitioned to `Closed` (the slot lives on `ChannelState`, not
+    /// on the adapter), so the WS pump can forward it to the client and
+    /// derive a typed `terminal:config_rejected` close-frame reason.
+    #[tokio::test]
+    async fn signal_terminal_error_enqueues_synthetic_error_obs_and_closes_channel() {
+        let host = LiveAdapterHost::new();
+        let ch = host.open_channel(test_session_id()).await.unwrap();
+        host.attach_adapter(&ch, Arc::new(StubAdapter::new()))
+            .await
+            .unwrap();
+
+        let code = LiveAdapterErrorCode::ConfigRejected {
+            reason: "model_swap: gpt-realtime -> gpt-realtime-1.5".to_string(),
+        };
+        host.signal_terminal_error(&ch, code).await.unwrap();
+
+        // Channel transitions to Closed as part of the seam.
+        let status = host.channel_status(&ch).await.unwrap();
+        assert_eq!(status, LiveAdapterStatus::Closed);
+
+        // The pending synthetic obs is still readable post-close — the
+        // pending-slot check in `next_observation_raw` happens BEFORE the
+        // `adapter_for` retire-at gate.
+        let obs = host
+            .next_observation_raw(&ch)
+            .await
+            .expect("next_observation_raw should return synthetic obs even post-close")
+            .expect("synthetic obs must be Some");
+        match obs {
+            LiveAdapterObservation::Error { code, message } => match code {
+                LiveAdapterErrorCode::ConfigRejected { reason } => {
+                    assert!(reason.contains("model_swap"));
+                    assert_eq!(message, reason);
+                }
+                other => panic!("expected ConfigRejected, got {other:?}"),
+            },
+            other => panic!("expected Error observation, got {other:?}"),
+        }
+    }
+
+    /// CC1: applying the synthetic `Error` observation through
+    /// `apply_observation` must produce `ObservationOutcome::Terminal` with
+    /// the same `ConfigRejected` code, so the WS pump's `terminal:<slug>`
+    /// close-frame derivation in `transport.rs` picks up the typed reason
+    /// (slug `config_rejected`).
+    #[tokio::test]
+    async fn synthetic_terminal_error_routes_through_apply_observation_to_terminal_outcome() {
+        let host = LiveAdapterHost::new();
+        let ch = host.open_channel(test_session_id()).await.unwrap();
+        host.attach_adapter(&ch, Arc::new(StubAdapter::new()))
+            .await
+            .unwrap();
+
+        let code = LiveAdapterErrorCode::ConfigRejected {
+            reason: "model_swap: a -> b".to_string(),
+        };
+        host.signal_terminal_error(&ch, code).await.unwrap();
+
+        let obs = host.next_observation_raw(&ch).await.unwrap().unwrap();
+        let outcome = host.apply_observation(&ch, &obs).await.unwrap();
+        match outcome {
+            ObservationOutcome::Terminal { code } => match code {
+                LiveAdapterErrorCode::ConfigRejected { reason } => {
+                    assert_eq!(reason, "model_swap: a -> b");
+                }
+                other => panic!("expected ConfigRejected, got {other:?}"),
+            },
+            other => panic!("expected Terminal outcome, got {other:?}"),
+        }
+    }
+
+    /// CC1: `signal_terminal_error` on an unknown channel must surface
+    /// `ChannelNotFound`, mirroring the rest of the host's per-channel
+    /// surface. Without this, the runtime swap path could silently drop
+    /// the typed signal on a channel that was already reaped.
+    #[tokio::test]
+    async fn signal_terminal_error_on_missing_channel_returns_channel_not_found() {
+        let host = LiveAdapterHost::new();
+        let bogus = LiveChannelId::random_uuid();
+        let result = host
+            .signal_terminal_error(
+                &bogus,
+                LiveAdapterErrorCode::ConfigRejected {
+                    reason: "no channel".into(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(&result, Err(LiveAdapterHostError::ChannelNotFound(id)) if id == &bogus),
+            "expected ChannelNotFound for unknown channel, got {result:?}"
+        );
     }
 
     // -- Observation classification --

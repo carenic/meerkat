@@ -676,6 +676,15 @@ mod tests {
             }),
             "other"
         );
+        // R12: ConfigRejected must surface the typed slug so WS clients can
+        // distinguish a local-guard rejection from an upstream provider
+        // failure without parsing the close-frame reason text.
+        assert_eq!(
+            live_adapter_error_code_slug(&LiveAdapterErrorCode::ConfigRejected {
+                reason: "model swap requires close + reopen".into(),
+            }),
+            "config_rejected"
+        );
     }
 
     /// Adapter that never produces an observation — `next_observation` is

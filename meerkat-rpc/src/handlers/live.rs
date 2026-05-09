@@ -15,7 +15,7 @@ use meerkat_core::live_adapter::{
     LiveAdapterCommand, LiveChannelCapabilities, LiveContinuityMode, LiveInputChunk,
     LiveProjectionSnapshot, LiveTransportBootstrap,
 };
-use meerkat_core::types::SessionId;
+use meerkat_core::types::{Message, SessionId};
 use meerkat_live::{LiveAdapterHost, LiveAdapterHostError, LiveChannelId, LiveWsState};
 use serde::{Deserialize, Serialize};
 
@@ -39,6 +39,46 @@ use crate::session_runtime::{LiveOpenPrecheckError, SessionRuntime};
 /// rather than the source of truth.
 const LIVE_WS_DEFAULT_AUDIO_FORMAT: &str = "pcm_24k_mono";
 
+/// R10: extract the root system prompt from a projected `seed_messages`
+/// vector for use in `LiveProjectionSnapshot.system_prompt`.
+///
+/// `RealtimeSessionOpenConfig` does not yet model `system_prompt` as a
+/// typed field — the resolved root prompt is materialized into
+/// `seed_messages[0]` as a `Message::System` by `realtime_projection_messages`
+/// in `session_runtime.rs`. The OpenAI Refresh path needs the prompt as a
+/// distinct field so it can rebuild the realtime `session.update`
+/// instructions field correctly; without this extractor every refresh would
+/// wipe the system prompt because the history-event projector explicitly
+/// drops `Message::System` and `Message::SystemNotice` entries on the
+/// seed-events path.
+///
+/// **Why both `System` AND `SystemNotice` are valid lead messages.** The
+/// projector at `realtime_projection_messages` (`session_runtime.rs:435-444`)
+/// only rewrites `seed_messages[0]` when `realtime_projection_root_system_message`
+/// returns `Some` (i.e. the session has a resolved root system prompt or
+/// build instructions). When that returns `None`, the original first
+/// message is left in place — and the canonical session transcript can
+/// legitimately lead with a `Message::SystemNotice` (e.g. a runtime-injected
+/// `[SYSTEM NOTICE][MCP_PENDING]` notice from an idle pre-prompt session).
+/// Without honoring `SystemNotice` here, a refresh whose snapshot leads
+/// with one would silently emit empty instructions and wipe whatever the
+/// realtime provider had in its session-level `instructions` field.
+///
+/// We use `SystemNoticeMessage::rendered_text()` (the same projection the
+/// session_runtime root-system-message helper uses on line 405) so the
+/// provider sees the prefix-tagged form, not the raw body.
+///
+/// We deliberately consult only `seed_messages[0]` (matching the projector's
+/// invariant) and ignore any later `Message::System` / `Message::SystemNotice`
+/// entries that might appear in fragmented histories.
+fn extract_system_prompt_from_seed_messages(seed_messages: &[Message]) -> Option<String> {
+    match seed_messages.first()? {
+        Message::System(system) => Some(system.content.clone()),
+        Message::SystemNotice(notice) => Some(notice.rendered_text()),
+        _ => None,
+    }
+}
+
 /// A8: build a `LiveProjectionSnapshot` from the resolved
 /// `RealtimeSessionOpenConfig`. The snapshot is the canonical projection of
 /// Meerkat session state that the adapter sees via the host command path.
@@ -57,12 +97,19 @@ fn build_live_projection_snapshot(
         snapshot_version: 0,
         seed_messages: open_config.seed_messages.clone(),
         visible_tools: open_config.visible_tools.clone(),
-        // The system prompt is not directly modeled on
-        // `RealtimeSessionOpenConfig`; the live adapter consumes the typed
-        // `runtime_system_context` projection below as authoritative system
-        // instructions. Surfacing `system_prompt: None` here is honest —
-        // there is no separate top-of-session prompt field on the config.
-        system_prompt: None,
+        // R10: extract the root system prompt from the first
+        // `Message::System` entry in `seed_messages`.
+        // `RealtimeSessionOpenConfig` does not model `system_prompt` as a
+        // typed field today; `realtime_projection_messages` (in
+        // `session_runtime.rs`) guarantees that when a session has a
+        // resolved system prompt it sits at `seed_messages[0]` as a
+        // `Message::System`. Pre-fix this field was always `None`, which
+        // caused the OpenAI Refresh `session.update` instructions field to
+        // be built only from `runtime_system_context` and silently wipe
+        // the actual Meerkat system prompt on every refresh. The history-
+        // event projector explicitly drops `Message::System` so leaving
+        // this on the seed-history path alone loses it on refresh.
+        system_prompt: extract_system_prompt_from_seed_messages(&open_config.seed_messages),
         model_id: open_config.llm_identity.model.clone(),
         provider_id: open_config.llm_identity.provider.as_str().to_string(),
         // Audio config is not part of the open config today; the live
@@ -225,6 +272,30 @@ pub async fn handle_live_open(
                         id,
                         error::INTERNAL_ERROR,
                         format!("failed to attach adapter: {err}"),
+                    );
+                }
+                // R11: record the LLM identity the channel was opened with so
+                // `propagate_config_to_live_channels` can detect a later
+                // `config/patch` model/provider swap and route to a clean
+                // close instead of dispatching `Refresh` (which the OpenAI
+                // realtime adapter rejects via the R1 guard because
+                // `session.update` cannot change model). A failure here is
+                // logged but does not abort `live/open` — the worst-case
+                // fallthrough is the legacy Refresh-then-ConfigRejected path
+                // that R11 is designed to replace, not a correctness break
+                // on this open.
+                if let Err(err) = host
+                    .set_channel_llm_identity(&channel_id, open_config.llm_identity.clone())
+                    .await
+                {
+                    tracing::warn!(
+                        target: "meerkat_rpc::handlers::live",
+                        ?channel_id,
+                        ?session_id,
+                        ?err,
+                        "failed to record bound llm identity for live channel; \
+                         model-swap detection on config/patch will fall back \
+                         to legacy Refresh routing"
                     );
                 }
                 // R2: do NOT dispatch `LiveAdapterCommand::Open { snapshot }`
@@ -714,6 +785,77 @@ mod tests {
     {
         let s = serde_json::to_string(value).expect("serialize");
         serde_json::from_str(&s).expect("deserialize")
+    }
+
+    #[test]
+    fn extract_system_prompt_returns_first_system_message_content() {
+        // R10: when the canonical projection placed a `Message::System`
+        // at index 0 of the seed history (the realtime-projection invariant
+        // in `session_runtime.rs::realtime_projection_messages`), the
+        // snapshot builder must surface that prompt as the typed
+        // `system_prompt` field; otherwise the OpenAI Refresh
+        // `session.update` rebuilds instructions only from runtime context
+        // and wipes the actual Meerkat system prompt.
+        use meerkat_core::types::{Message, SystemMessage};
+
+        let messages = vec![
+            Message::System(SystemMessage::new("you are a helpful meerkat")),
+            Message::User(meerkat_core::types::UserMessage::text("hi".to_string())),
+        ];
+        assert_eq!(
+            super::extract_system_prompt_from_seed_messages(&messages),
+            Some("you are a helpful meerkat".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_system_prompt_returns_rendered_text_for_first_system_notice() {
+        // R10 (review-3 follow-up): when the canonical projection leaves a
+        // `Message::SystemNotice` at index 0 of the seed history (e.g. a
+        // pre-prompt session whose only lead message is a runtime-injected
+        // `[SYSTEM NOTICE][MCP_PENDING]` notice — `realtime_projection_messages`
+        // in `session_runtime.rs:435-444` does NOT rewrite the slot when
+        // `realtime_projection_root_system_message` returns `None`), the
+        // snapshot builder must surface the notice's *rendered* text as the
+        // typed `system_prompt` field. Without this arm, the OpenAI Refresh
+        // `session.update` rebuilds instructions only from
+        // `runtime_system_context` and silently wipes whatever instructions
+        // the realtime provider already had at session level. We use
+        // `rendered_text()` (prefix-tagged) to match the projection the
+        // session_runtime root-system helper itself emits on line 405.
+        use meerkat_core::types::{Message, SystemNoticeKind, SystemNoticeMessage};
+
+        let notice =
+            SystemNoticeMessage::new(SystemNoticeKind::McpPending, "stub server connecting");
+        let expected = notice.rendered_text();
+        let messages = vec![
+            Message::SystemNotice(notice),
+            Message::User(meerkat_core::types::UserMessage::text("hi".to_string())),
+        ];
+        assert_eq!(
+            super::extract_system_prompt_from_seed_messages(&messages),
+            Some(expected),
+        );
+    }
+
+    #[test]
+    fn extract_system_prompt_returns_none_when_no_system_message() {
+        // R10: a session without a resolved root system prompt still flows
+        // through this builder; the absence is honest and must surface as
+        // `None`, not as an empty string the adapter would have to guard
+        // against on the instruction-rebuild path.
+        use meerkat_core::types::{Message, UserMessage};
+
+        let messages = vec![Message::User(UserMessage::text("hi"))];
+        assert_eq!(
+            super::extract_system_prompt_from_seed_messages(&messages),
+            None
+        );
+        let empty: Vec<Message> = Vec::new();
+        assert_eq!(
+            super::extract_system_prompt_from_seed_messages(&empty),
+            None
+        );
     }
 
     #[test]
