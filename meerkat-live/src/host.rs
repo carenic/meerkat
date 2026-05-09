@@ -244,23 +244,61 @@ pub trait LiveProjectionSink: Send + Sync {
         identity: LiveTranscriptIdentity<'_>,
     ) -> Result<(), LiveProjectionError>;
 
-    /// Append a streaming assistant text delta to canonical session history.
-    async fn append_assistant_delta(
+    /// Append a streaming **display-text** delta (authored output) to
+    /// canonical session history. Flushed as `AssistantBlock::Text` at
+    /// turn boundary.
+    ///
+    /// T6: distinct from [`Self::append_assistant_transcript_delta`] —
+    /// display text is preserved across barge-in (the user is not
+    /// "speaking over" written output).
+    async fn append_assistant_text_delta(
         &self,
         session_id: &SessionId,
         delta: &str,
         identity: LiveTranscriptIdentity<'_>,
     ) -> Result<(), LiveProjectionError>;
 
-    /// Append a finalized assistant transcript (with stop reason + usage).
+    /// Append a streaming **spoken-transcript** delta (audio-derived
+    /// output) to canonical session history. Flushed as
+    /// `AssistantBlock::Transcript { source: Spoken, .. }` at turn
+    /// boundary.
     ///
-    /// R6: the trait passes `response_id` from
-    /// [`LiveAdapterObservation::AssistantTranscriptFinal`] through so the
-    /// sink can key its per-turn buffer on `(SessionId, response_id)`.
-    /// Without this an interrupted, stale, or overlapping `response.done`
-    /// would cause [`signal_turn_completed`] to flush the wrong buffered
-    /// transcript. `None` when the provider does not surface a response id.
-    async fn append_assistant_final(
+    /// T6: distinct from [`Self::append_assistant_text_delta`] — the
+    /// transcript lane is what the model *said*, not what it *wrote*, and
+    /// is dropped on barge-in (T7).
+    async fn append_assistant_transcript_delta(
+        &self,
+        session_id: &SessionId,
+        delta: &str,
+        identity: LiveTranscriptIdentity<'_>,
+    ) -> Result<(), LiveProjectionError>;
+
+    /// Append a finalized **display-text** assistant block (with stop
+    /// reason + usage). Flushed as `AssistantBlock::Text` when
+    /// [`Self::signal_turn_completed`] drains the per-response buffer.
+    ///
+    /// R6: the trait passes `response_id` through so the sink can key its
+    /// per-turn buffer on `(SessionId, response_id)` — a stale or
+    /// overlapping `response.done` cannot flush the wrong buffered final.
+    async fn append_assistant_text_final(
+        &self,
+        session_id: &SessionId,
+        text: &str,
+        identity: LiveTranscriptIdentity<'_>,
+        stop_reason: StopReason,
+        usage: Usage,
+        response_id: Option<&str>,
+    ) -> Result<(), LiveProjectionError>;
+
+    /// Append a finalized **spoken-transcript** assistant block (with stop
+    /// reason + usage). Flushed as
+    /// `AssistantBlock::Transcript { source: Spoken, .. }` when
+    /// [`Self::signal_turn_completed`] drains the per-response buffer.
+    ///
+    /// R6: same `(SessionId, response_id)` keying as the text-final
+    /// variant. T7: barge-in drains buffered transcript blocks but leaves
+    /// buffered text blocks untouched.
+    async fn append_assistant_transcript_final(
         &self,
         session_id: &SessionId,
         text: &str,
@@ -898,7 +936,37 @@ impl LiveAdapterHost {
                         response_id.as_deref(),
                         delta_id.as_deref(),
                     );
-                    sink.append_assistant_delta(&session_id, delta, identity)
+                    // T6: display text routes to the text lane; flushed as
+                    // AssistantBlock::Text.
+                    sink.append_assistant_text_delta(&session_id, delta, identity)
+                        .await?;
+                }
+                Ok(ObservationOutcome::TranscriptAppended)
+            }
+
+            (
+                ObservationRouting::AppendTranscript,
+                LiveAdapterObservation::AssistantTranscriptDelta {
+                    provider_item_id,
+                    previous_item_id,
+                    content_index,
+                    response_id,
+                    delta_id,
+                    delta,
+                    ..
+                },
+            ) => {
+                if let Some(sink) = &self.projection_sink {
+                    let identity = LiveTranscriptIdentity::assistant_delta(
+                        provider_item_id.as_deref(),
+                        previous_item_id.as_deref(),
+                        *content_index,
+                        response_id.as_deref(),
+                        delta_id.as_deref(),
+                    );
+                    // T6: spoken transcript routes to the transcript lane;
+                    // flushed as AssistantBlock::Transcript { source: Spoken }.
+                    sink.append_assistant_transcript_delta(&session_id, delta, identity)
                         .await?;
                 }
                 Ok(ObservationOutcome::TranscriptAppended)
@@ -925,8 +993,9 @@ impl LiveAdapterHost {
                         response_id.as_deref(),
                     );
                     // R6: forward the response_id so the sink keys its
-                    // per-turn buffer on (SessionId, response_id).
-                    sink.append_assistant_final(
+                    // per-turn buffer on (SessionId, response_id). T6:
+                    // spoken-transcript final routes to the transcript lane.
+                    sink.append_assistant_transcript_final(
                         &session_id,
                         text,
                         identity,
@@ -1301,6 +1370,11 @@ impl LiveAdapterHost {
                 ObservationRouting::AppendTranscript
             }
             LiveAdapterObservation::AssistantTextDelta { .. } => {
+                ObservationRouting::AppendTranscript
+            }
+            // T5/T6: spoken-transcript deltas route to the transcript lane,
+            // distinct from display-text deltas above.
+            LiveAdapterObservation::AssistantTranscriptDelta { .. } => {
                 ObservationRouting::AppendTranscript
             }
             LiveAdapterObservation::AssistantAudioChunk { .. } => ObservationRouting::Noop,
@@ -1927,10 +2001,13 @@ mod tests {
         };
         let outcome = host.apply_observation(&ch, &obs).await.unwrap();
         assert!(matches!(outcome, ObservationOutcome::TranscriptAppended));
-        let deltas = sink.assistant_deltas.lock().unwrap();
+        // T6: AssistantTextDelta routes to the text lane.
+        let deltas = sink.text_deltas.lock().unwrap();
         assert_eq!(deltas.len(), 1);
         assert_eq!(deltas[0].0, session_id);
         assert_eq!(deltas[0].1, "Hello");
+        // The transcript lane stays empty for a display-text observation.
+        assert!(sink.transcript_deltas.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1949,7 +2026,7 @@ mod tests {
             delta: "world".into(),
         };
         host.apply_observation(&ch, &obs).await.unwrap();
-        let deltas = sink.assistant_deltas.lock().unwrap();
+        let deltas = sink.text_deltas.lock().unwrap();
         let identity = &deltas[0].2;
         assert_eq!(identity.provider_item_id.as_deref(), Some("item_42"));
         assert_eq!(identity.previous_item_id.as_deref(), Some("item_41"));
@@ -1974,10 +2051,12 @@ mod tests {
             usage: Usage::default(),
         };
         host.apply_observation(&ch, &obs).await.unwrap();
-        let finals = sink.assistant_finals.lock().unwrap();
+        // T6: AssistantTranscriptFinal routes to the transcript lane.
+        let finals = sink.transcript_finals.lock().unwrap();
         assert_eq!(finals.len(), 1);
         assert_eq!(finals[0].0, session_id);
         assert_eq!(finals[0].1, "All done.");
+        assert!(sink.text_finals.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -1998,7 +2077,7 @@ mod tests {
             usage: Usage::default(),
         };
         host.apply_observation(&ch, &obs).await.unwrap();
-        let finals = sink.assistant_finals.lock().unwrap();
+        let finals = sink.transcript_finals.lock().unwrap();
         let identity = &finals[0].2;
         assert_eq!(identity.provider_item_id.as_deref(), Some("item_final"));
         assert_eq!(identity.previous_item_id.as_deref(), Some("item_prev"));
@@ -2020,6 +2099,39 @@ mod tests {
         host.apply_observation(&ch, &obs).await.unwrap();
         let turns = sink.turn_completed.lock().unwrap();
         assert_eq!(turns.len(), 1);
+    }
+
+    // -- T6: assistant_transcript_delta routes to transcript lane only --
+
+    #[tokio::test]
+    async fn assistant_transcript_delta_routes_to_transcript_lane() {
+        // T6: AssistantTranscriptDelta must reach the transcript-lane sink
+        // method, NOT the text-lane method. The host classification +
+        // apply_observation pair owns the dispatch; this test pins the
+        // routing so a future refactor cannot collapse the lanes back.
+        let sink = Arc::new(RecordingProjectionSink::default());
+        let host = LiveAdapterHost::new().with_projection_sink(Arc::clone(&sink) as _);
+        let session_id = test_session_id();
+        let ch = host.open_channel(session_id.clone()).await.unwrap();
+        let obs = LiveAdapterObservation::AssistantTranscriptDelta {
+            provider_item_id: Some("item_t".into()),
+            previous_item_id: None,
+            content_index: Some(0),
+            response_id: Some("resp_t".into()),
+            delta_id: Some("d_t".into()),
+            delta: "spoken word".into(),
+        };
+        let outcome = host.apply_observation(&ch, &obs).await.unwrap();
+        assert!(matches!(outcome, ObservationOutcome::TranscriptAppended));
+        let transcript_deltas = sink.transcript_deltas.lock().unwrap();
+        assert_eq!(transcript_deltas.len(), 1);
+        assert_eq!(transcript_deltas[0].0, session_id);
+        assert_eq!(transcript_deltas[0].1, "spoken word");
+        // The text lane MUST stay empty for a transcript observation.
+        assert!(
+            sink.text_deltas.lock().unwrap().is_empty(),
+            "AssistantTranscriptDelta must not reach the text-lane sink (T6)"
+        );
     }
 
     // -- P1#2: structured realtime transcript pass-through --
@@ -2074,8 +2186,10 @@ mod tests {
 
         // No legacy fallthrough: `Noop` would mean nothing else in the sink
         // moved either. Pin that by checking adjacent recorders are empty.
-        assert!(sink.assistant_deltas.lock().unwrap().is_empty());
-        assert!(sink.assistant_finals.lock().unwrap().is_empty());
+        assert!(sink.text_deltas.lock().unwrap().is_empty());
+        assert!(sink.transcript_deltas.lock().unwrap().is_empty());
+        assert!(sink.text_finals.lock().unwrap().is_empty());
+        assert!(sink.transcript_finals.lock().unwrap().is_empty());
         assert!(sink.user_transcripts.lock().unwrap().is_empty());
         assert!(sink.turn_completed.lock().unwrap().is_empty());
         assert!(sink.interrupts.lock().unwrap().is_empty());
@@ -2491,7 +2605,8 @@ mod tests {
         );
 
         // Projection sink saw no spurious tool-related projection.
-        assert_eq!(sink.assistant_finals.lock().unwrap().len(), 0);
+        assert_eq!(sink.text_finals.lock().unwrap().len(), 0);
+        assert_eq!(sink.transcript_finals.lock().unwrap().len(), 0);
         assert_eq!(sink.terminal_errors.lock().unwrap().len(), 0);
     }
 
@@ -2846,8 +2961,21 @@ mod tests {
     #[allow(clippy::type_complexity)]
     struct RecordingProjectionSink {
         user_transcripts: StdMutex<Vec<(SessionId, String, OwnedIdentity)>>,
-        assistant_deltas: StdMutex<Vec<(SessionId, String, OwnedIdentity)>>,
-        assistant_finals: StdMutex<
+        // T6: split text-lane and transcript-lane recording so tests can
+        // assert the host routed the right observation to the right method.
+        text_deltas: StdMutex<Vec<(SessionId, String, OwnedIdentity)>>,
+        transcript_deltas: StdMutex<Vec<(SessionId, String, OwnedIdentity)>>,
+        text_finals: StdMutex<
+            Vec<(
+                SessionId,
+                String,
+                OwnedIdentity,
+                StopReason,
+                Usage,
+                Option<String>,
+            )>,
+        >,
+        transcript_finals: StdMutex<
             Vec<(
                 SessionId,
                 String,
@@ -2889,13 +3017,13 @@ mod tests {
             Ok(())
         }
 
-        async fn append_assistant_delta(
+        async fn append_assistant_text_delta(
             &self,
             session_id: &SessionId,
             delta: &str,
             identity: LiveTranscriptIdentity<'_>,
         ) -> Result<(), LiveProjectionError> {
-            self.assistant_deltas.lock().unwrap().push((
+            self.text_deltas.lock().unwrap().push((
                 session_id.clone(),
                 delta.to_string(),
                 OwnedIdentity::from_borrowed(identity),
@@ -2903,7 +3031,21 @@ mod tests {
             Ok(())
         }
 
-        async fn append_assistant_final(
+        async fn append_assistant_transcript_delta(
+            &self,
+            session_id: &SessionId,
+            delta: &str,
+            identity: LiveTranscriptIdentity<'_>,
+        ) -> Result<(), LiveProjectionError> {
+            self.transcript_deltas.lock().unwrap().push((
+                session_id.clone(),
+                delta.to_string(),
+                OwnedIdentity::from_borrowed(identity),
+            ));
+            Ok(())
+        }
+
+        async fn append_assistant_text_final(
             &self,
             session_id: &SessionId,
             text: &str,
@@ -2912,7 +3054,27 @@ mod tests {
             usage: Usage,
             response_id: Option<&str>,
         ) -> Result<(), LiveProjectionError> {
-            self.assistant_finals.lock().unwrap().push((
+            self.text_finals.lock().unwrap().push((
+                session_id.clone(),
+                text.to_string(),
+                OwnedIdentity::from_borrowed(identity),
+                stop_reason,
+                usage,
+                response_id.map(|s| s.to_string()),
+            ));
+            Ok(())
+        }
+
+        async fn append_assistant_transcript_final(
+            &self,
+            session_id: &SessionId,
+            text: &str,
+            identity: LiveTranscriptIdentity<'_>,
+            stop_reason: StopReason,
+            usage: Usage,
+            response_id: Option<&str>,
+        ) -> Result<(), LiveProjectionError> {
+            self.transcript_finals.lock().unwrap().push((
                 session_id.clone(),
                 text.to_string(),
                 OwnedIdentity::from_borrowed(identity),

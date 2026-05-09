@@ -18020,6 +18020,13 @@
             "type": "object"
           }
         ]
+      },
+      "WireTranscriptSource": {
+        "description": "Wire projection of `meerkat_core::TranscriptSource`. Lane provenance\nfor spoken-transcript blocks. Single variant today; future-expandable.",
+        "enum": [
+          "spoken"
+        ],
+        "type": "string"
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -18049,6 +18056,45 @@
             },
             "required": [
               "text"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "block_type",
+          "data"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "Spoken-transcript output (provider audio output → text). Distinct\nfrom `Text` so callers can render or filter by lane provenance.",
+        "properties": {
+          "block_type": {
+            "const": "transcript",
+            "type": "string"
+          },
+          "data": {
+            "properties": {
+              "meta": {
+                "anyOf": [
+                  {
+                    "$ref": "#/$defs/WireProviderMeta"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "source": {
+                "$ref": "#/$defs/WireTranscriptSource"
+              },
+              "text": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "text",
+              "source"
             ],
             "type": "object"
           }
@@ -24278,6 +24324,45 @@
             "type": "object"
           },
           {
+            "description": "Spoken-transcript output (provider audio output → text). Distinct\nfrom `Text` so callers can render or filter by lane provenance.",
+            "properties": {
+              "block_type": {
+                "const": "transcript",
+                "type": "string"
+              },
+              "data": {
+                "properties": {
+                  "meta": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/$defs/WireProviderMeta"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "source": {
+                    "$ref": "#/$defs/WireTranscriptSource"
+                  },
+                  "text": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "text",
+                  "source"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "block_type",
+              "data"
+            ],
+            "type": "object"
+          },
+          {
             "properties": {
               "block_type": {
                 "const": "reasoning",
@@ -24918,6 +25003,13 @@
           }
         ],
         "description": "Wire-safe tool result content that handles both legacy string and array formats."
+      },
+      "WireTranscriptSource": {
+        "description": "Wire projection of `meerkat_core::TranscriptSource`. Lane provenance\nfor spoken-transcript blocks. Single variant today; future-expandable.",
+        "enum": [
+          "spoken"
+        ],
+        "type": "string"
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -25323,6 +25415,45 @@
                 },
                 "required": [
                   "text"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "block_type",
+              "data"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "Spoken-transcript output (provider audio output → text). Distinct\nfrom `Text` so callers can render or filter by lane provenance.",
+            "properties": {
+              "block_type": {
+                "const": "transcript",
+                "type": "string"
+              },
+              "data": {
+                "properties": {
+                  "meta": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/$defs/WireProviderMeta"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  },
+                  "source": {
+                    "$ref": "#/$defs/WireTranscriptSource"
+                  },
+                  "text": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "text",
+                  "source"
                 ],
                 "type": "object"
               }
@@ -25825,6 +25956,13 @@
           }
         ],
         "description": "Wire-safe tool result content that handles both legacy string and array formats."
+      },
+      "WireTranscriptSource": {
+        "description": "Wire projection of `meerkat_core::TranscriptSource`. Lane provenance\nfor spoken-transcript blocks. Single variant today; future-expandable.",
+        "enum": [
+          "spoken"
+        ],
+        "type": "string"
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",

@@ -98,6 +98,13 @@ fn project_realtime_assistant_blocks(blocks: &[AssistantBlock]) -> Vec<Assistant
         .filter_map(|block| match block {
             AssistantBlock::Text { text, .. } if text.is_empty() => None,
             AssistantBlock::Text { .. } | AssistantBlock::ToolUse { .. } => Some(block.clone()),
+            // Spoken transcripts replay back as plain text; provider sees
+            // the assistant's visible output regardless of capture lane.
+            AssistantBlock::Transcript { text, .. } if text.is_empty() => None,
+            AssistantBlock::Transcript { text, .. } => Some(AssistantBlock::Text {
+                text: text.clone(),
+                meta: None,
+            }),
             AssistantBlock::Reasoning { .. }
             | AssistantBlock::ServerToolContent { .. }
             | AssistantBlock::Image { .. } => None,

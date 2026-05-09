@@ -69,9 +69,16 @@ pub struct LiveStatusResult {
 
 /// Modality-tagged input chunk for `live/send_input`.
 ///
-/// Audio payloads are base64 strings (`data`) plus stamped sample-rate /
-/// channel metadata so the adapter layer can validate against the negotiated
-/// provider format.
+/// Audio / image / video-frame payloads are base64 strings (`data`); the
+/// modality-specific metadata (`sample_rate_hz` / `channels` for audio,
+/// `mime` for image, `codec` / `timestamp_ms` for video frames) lets the
+/// adapter validate against the negotiated provider format.
+///
+/// T11: `Image` and `VideoFrame` mirror the typed variants on
+/// [`meerkat_core::live_adapter::LiveInputChunk`]. Adapters that do not
+/// implement a variant must reject with a typed
+/// `LiveAdapterErrorCode::ConfigRejected` rather than collapsing onto a
+/// free-form provider error string.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -83,6 +90,15 @@ pub enum LiveInputChunkWire {
     },
     Text {
         text: String,
+    },
+    Image {
+        mime: String,
+        data: String,
+    },
+    VideoFrame {
+        codec: String,
+        data: String,
+        timestamp_ms: u64,
     },
 }
 
@@ -154,6 +170,44 @@ mod tests {
             },
         };
         let j = serde_json::to_value(&v).expect("round-trip should succeed");
+        let back: LiveSendInputParams =
+            serde_json::from_value(j).expect("round-trip should succeed");
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn live_send_input_params_image_chunk_round_trip() {
+        // T11: image variant must round-trip via the wire mirror.
+        let v = LiveSendInputParams {
+            channel_id: "live_1".into(),
+            chunk: LiveInputChunkWire::Image {
+                mime: "image/png".into(),
+                data: "iVBORw0KGgo=".into(),
+            },
+        };
+        let j = serde_json::to_value(&v).expect("round-trip should succeed");
+        assert_eq!(j["chunk"]["kind"], "image");
+        assert_eq!(j["chunk"]["mime"], "image/png");
+        let back: LiveSendInputParams =
+            serde_json::from_value(j).expect("round-trip should succeed");
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn live_send_input_params_video_frame_chunk_round_trip() {
+        // T11: video-frame variant must round-trip via the wire mirror.
+        let v = LiveSendInputParams {
+            channel_id: "live_1".into(),
+            chunk: LiveInputChunkWire::VideoFrame {
+                codec: "vp8".into(),
+                data: "AAECAwQ=".into(),
+                timestamp_ms: 1_234,
+            },
+        };
+        let j = serde_json::to_value(&v).expect("round-trip should succeed");
+        assert_eq!(j["chunk"]["kind"], "video_frame");
+        assert_eq!(j["chunk"]["codec"], "vp8");
+        assert_eq!(j["chunk"]["timestamp_ms"], 1_234);
         let back: LiveSendInputParams =
             serde_json::from_value(j).expect("round-trip should succeed");
         assert_eq!(v, back);

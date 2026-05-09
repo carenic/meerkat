@@ -467,7 +467,14 @@ class SessionToolResult:
 
 @dataclass(frozen=True, slots=True)
 class SessionAssistantBlock:
-    """Ordered block inside a block-assistant transcript message."""
+    """Ordered block inside a block-assistant transcript message.
+
+    `block_type` carries the lane discriminator (``text``, ``transcript``,
+    ``reasoning``, ``tool_use``, ``server_tool_content``, ``image``, ...).
+    For ``transcript`` blocks ``source`` records the originating lane
+    (today: ``spoken``); both ``text`` and ``transcript`` blocks expose
+    their rendered string in ``text``.
+    """
 
     block_type: str = ""
     text: str | None = None
@@ -481,6 +488,9 @@ class SessionAssistantBlock:
     height: int | None = None
     revised_prompt: dict[str, Any] | None = None
     meta: dict[str, Any] | None = None
+    # Lane provenance for ``transcript`` blocks (e.g. ``"spoken"``).
+    # ``None`` for non-transcript block types.
+    source: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

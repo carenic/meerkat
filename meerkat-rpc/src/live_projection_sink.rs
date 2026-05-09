@@ -40,27 +40,35 @@ use std::sync::Mutex as StdMutex;
 use async_trait::async_trait;
 use meerkat_core::RealtimeTranscriptEvent;
 use meerkat_core::live_adapter::LiveAdapterErrorCode;
-use meerkat_core::types::{AssistantBlock, ContentInput, SessionId, StopReason, Usage};
+use meerkat_core::types::{
+    AssistantBlock, ContentInput, SessionId, StopReason, TranscriptSource, Usage,
+};
 use meerkat_live::{LiveProjectionError, LiveProjectionSink, LiveTranscriptIdentity};
 
 use crate::session_runtime::SessionRuntime;
 
-/// Buffered assistant final transcript awaiting an authoritative
+/// One buffered assistant content fragment awaiting an authoritative
 /// `signal_turn_completed` flush.
 ///
-/// The provider stamps `AssistantTranscriptFinal` with sentinel
-/// `stop_reason`/`usage` because those facts only arrive atomically with
-/// `response.done` (mapped to `TurnCompleted`). We collect every final the
-/// turn produced and commit them as one canonical assistant message when the
-/// turn-completed signal supplies the real values (P1#1).
+/// T6/T10: typed lane discriminant so the same per-response buffer can
+/// hold display text and spoken transcript and flush them in
+/// arrival order as distinct `AssistantBlock` variants. Adjacent runs of
+/// the same lane collapse into one `AssistantBlock` at flush time so
+/// readers do not see one block per delta.
 #[derive(Debug, Clone)]
-struct PendingAssistantBlock {
-    text: String,
+enum PendingAssistantContent {
+    /// Display lane — flushes as `AssistantBlock::Text`.
+    Text(String),
+    /// Spoken-transcript lane — flushes as
+    /// `AssistantBlock::Transcript { source: TranscriptSource::Spoken, .. }`.
+    Transcript(String),
 }
 
 #[derive(Debug, Default)]
 struct PendingTurn {
-    blocks: Vec<PendingAssistantBlock>,
+    /// Lane-tagged content fragments in arrival order. Flush groups
+    /// consecutive same-lane fragments into a single `AssistantBlock`.
+    blocks: Vec<PendingAssistantContent>,
 }
 
 /// Bridges [`LiveProjectionSink`] callbacks into [`SessionRuntime`].
@@ -91,12 +99,12 @@ impl SessionServiceProjectionSink {
     }
 
     /// Push an assistant final onto the per-(session, response_id) buffer
-    /// (P1#1 + R6).
-    fn buffer_assistant_final(
+    /// (P1#1 + R6 + T6).
+    fn buffer_assistant_content(
         &self,
         session_id: &SessionId,
         response_id: Option<&str>,
-        text: String,
+        content: PendingAssistantContent,
     ) {
         let Ok(mut pending) = self.pending_turns.lock() else {
             // Lock poisoning here would mean a previous panic in this struct;
@@ -109,7 +117,7 @@ impl SessionServiceProjectionSink {
             .entry((session_id.clone(), response_id.map(|s| s.to_string())))
             .or_default()
             .blocks
-            .push(PendingAssistantBlock { text });
+            .push(content);
     }
 
     /// Drain the per-(session, response_id) buffer at turn-completed time.
@@ -127,17 +135,118 @@ impl SessionServiceProjectionSink {
             .unwrap_or_default()
     }
 
+    /// Drop only the **transcript** lane fragments from every buffered slot
+    /// for `session_id`, preserving display-text fragments in arrival order.
+    ///
+    /// T7: barge-in invalidates spoken-transcript and audio state but leaves
+    /// already-buffered display-text intact (the user did not speak over
+    /// written output). The text fragments survive until
+    /// `signal_turn_completed` flushes them as `AssistantBlock::Text`.
+    fn drop_transcript_lane_for_session(&self, session_id: &SessionId) {
+        let Ok(mut pending) = self.pending_turns.lock() else {
+            return;
+        };
+        pending.retain(|(sid, _resp), turn| {
+            if sid != session_id {
+                return true;
+            }
+            turn.blocks
+                .retain(|c| matches!(c, PendingAssistantContent::Text(_)));
+            // Keep the slot even if empty — a subsequent text final / turn-
+            // completion may still flush against this (session, response_id)
+            // key, and dropping the slot would lose the keying contract.
+            true
+        });
+    }
+
     /// Drain every buffered slot for `session_id` regardless of `response_id`.
     ///
-    /// Used on interrupt / terminal error: when the channel is torn down or
-    /// the in-flight turn is invalidated, every buffered final becomes
-    /// non-canonical, so the per-response keying does not need to be honoured
-    /// for cleanup.
+    /// Used on terminal error: when the channel is torn down every buffered
+    /// final becomes non-canonical, so the per-response keying does not
+    /// need to be honoured for cleanup.
     fn drain_all_pending_turns(&self, session_id: &SessionId) {
         let Ok(mut pending) = self.pending_turns.lock() else {
             return;
         };
         pending.retain(|(sid, _resp), _| sid != session_id);
+    }
+}
+
+/// Build the realtime-transcript event the production sink stages on the
+/// **display-text** lane. Extracted so unit tests can assert the exact
+/// event shape without spinning a full `SessionRuntime`.
+fn build_assistant_text_delta_event(
+    delta: &str,
+    identity: LiveTranscriptIdentity<'_>,
+) -> RealtimeTranscriptEvent {
+    RealtimeTranscriptEvent::AssistantTextDelta {
+        response_id: identity.response_id.unwrap_or_default().to_string(),
+        delta_id: identity.delta_id.unwrap_or_default().to_string(),
+        item_id: identity.provider_item_id.unwrap_or_default().to_string(),
+        previous_item_id: identity.previous_item_id.map(|s| s.to_string()),
+        content_index: identity.content_index.unwrap_or(0),
+        delta: delta.to_string(),
+    }
+}
+
+/// Build the realtime-transcript event the production sink stages on the
+/// **spoken-transcript** lane. Extracted so unit tests can pin the
+/// `AssistantTranscriptDelta` variant (T9/T10) without a full
+/// `SessionRuntime`.
+fn build_assistant_transcript_delta_event(
+    delta: &str,
+    identity: LiveTranscriptIdentity<'_>,
+) -> RealtimeTranscriptEvent {
+    RealtimeTranscriptEvent::AssistantTranscriptDelta {
+        response_id: identity.response_id.unwrap_or_default().to_string(),
+        delta_id: identity.delta_id.unwrap_or_default().to_string(),
+        item_id: identity.provider_item_id.unwrap_or_default().to_string(),
+        previous_item_id: identity.previous_item_id.map(|s| s.to_string()),
+        content_index: identity.content_index.unwrap_or(0),
+        delta: delta.to_string(),
+    }
+}
+
+/// Collapse arrival-order lane-tagged fragments into a minimal
+/// `AssistantBlock` sequence: consecutive `Text` fragments coalesce into one
+/// `AssistantBlock::Text`; consecutive `Transcript` fragments coalesce into
+/// one `AssistantBlock::Transcript { source: Spoken, .. }`. Inter-lane
+/// boundaries produce distinct blocks, preserving the order they were
+/// buffered.
+fn collapse_pending_blocks(buffered: Vec<PendingAssistantContent>) -> Vec<AssistantBlock> {
+    let mut out: Vec<AssistantBlock> = Vec::new();
+    let mut current: Option<PendingAssistantContent> = None;
+    for fragment in buffered {
+        match (current.as_mut(), &fragment) {
+            (Some(PendingAssistantContent::Text(buf)), PendingAssistantContent::Text(next)) => {
+                buf.push_str(next)
+            }
+            (
+                Some(PendingAssistantContent::Transcript(buf)),
+                PendingAssistantContent::Transcript(next),
+            ) => buf.push_str(next),
+            _ => {
+                if let Some(prev) = current.take() {
+                    out.push(pending_to_block(prev));
+                }
+                current = Some(fragment);
+            }
+        }
+    }
+    if let Some(prev) = current.take() {
+        out.push(pending_to_block(prev));
+    }
+    out
+}
+
+fn pending_to_block(fragment: PendingAssistantContent) -> AssistantBlock {
+    match fragment {
+        PendingAssistantContent::Text(text) => AssistantBlock::Text { text, meta: None },
+        PendingAssistantContent::Transcript(text) => AssistantBlock::Transcript {
+            text,
+            source: TranscriptSource::Spoken,
+            meta: None,
+        },
     }
 }
 
@@ -193,7 +302,7 @@ impl LiveProjectionSink for SessionServiceProjectionSink {
             .map_err(|err| session_error_to_projection(err, session_id))
     }
 
-    async fn append_assistant_delta(
+    async fn append_assistant_text_delta(
         &self,
         session_id: &SessionId,
         delta: &str,
@@ -202,15 +311,10 @@ impl LiveProjectionSink for SessionServiceProjectionSink {
         // A3 (deltas): route through the typed realtime-transcript seam so the
         // session's idempotent ordering / staging logic owns delta application.
         // A11: response_id / delta_id / previous_item_id / content_index are
-        // now plumbed end-to-end via `LiveTranscriptIdentity`.
-        let event = RealtimeTranscriptEvent::AssistantTextDelta {
-            response_id: identity.response_id.unwrap_or_default().to_string(),
-            delta_id: identity.delta_id.unwrap_or_default().to_string(),
-            item_id: identity.provider_item_id.unwrap_or_default().to_string(),
-            previous_item_id: identity.previous_item_id.map(|s| s.to_string()),
-            content_index: identity.content_index.unwrap_or(0),
-            delta: delta.to_string(),
-        };
+        // plumbed end-to-end via `LiveTranscriptIdentity`.
+        // T6: this lane is **display text** (`AssistantBlock::Text`); the
+        // spoken-transcript lane is `append_assistant_transcript_delta`.
+        let event = build_assistant_text_delta_event(delta, identity);
         self.runtime
             .append_realtime_transcript_event(session_id, event)
             .await
@@ -218,7 +322,30 @@ impl LiveProjectionSink for SessionServiceProjectionSink {
             .map_err(|err| session_error_to_projection(err, session_id))
     }
 
-    async fn append_assistant_final(
+    async fn append_assistant_transcript_delta(
+        &self,
+        session_id: &SessionId,
+        delta: &str,
+        identity: LiveTranscriptIdentity<'_>,
+    ) -> Result<(), LiveProjectionError> {
+        // T6/T9/T10: spoken-transcript delta lane. Routes through the
+        // dedicated `AssistantTranscriptDelta` realtime event so the
+        // staging site at `session.rs::append_realtime_transcript_event`
+        // tags the owning item with `TranscriptLane::Spoken`. The
+        // materializer at `session.rs::materialize_realtime_transcript_ready_items`
+        // then flushes `AssistantBlock::Transcript { source: Spoken, .. }`
+        // instead of `AssistantBlock::Text` — fixing the Phase-2 follow-up
+        // where transcript deltas were collapsing onto the display-text
+        // staging path.
+        let event = build_assistant_transcript_delta_event(delta, identity);
+        self.runtime
+            .append_realtime_transcript_event(session_id, event)
+            .await
+            .map(|_outcome| ())
+            .map_err(|err| session_error_to_projection(err, session_id))
+    }
+
+    async fn append_assistant_text_final(
         &self,
         session_id: &SessionId,
         text: &str,
@@ -227,19 +354,37 @@ impl LiveProjectionSink for SessionServiceProjectionSink {
         _usage: Usage,
         response_id: Option<&str>,
     ) -> Result<(), LiveProjectionError> {
-        // P1#1: do NOT commit canonical assistant output here. The provider
-        // stamps `AssistantTranscriptFinal` with sentinel `stop_reason` /
-        // `usage` because those facts only arrive atomically on
-        // `response.done` (mapped to `TurnCompleted`). Buffer the final and
-        // wait for `signal_turn_completed` to flush with the authoritative
-        // values. Multi-content-part finals push multiple blocks; one
-        // `append_external_assistant_output` flushes them as one assistant
-        // message at turn boundary.
-        //
-        // R6: bucket by `(SessionId, response_id)` so that two
-        // simultaneously-active responses do not pool into the same slot.
-        // `signal_turn_completed` drains the matching slot.
-        self.buffer_assistant_final(session_id, response_id, text.to_string());
+        // P1#1 + T6: buffer display-text final on the per-(session,
+        // response_id) slot. `signal_turn_completed` drains and flushes as
+        // `AssistantBlock::Text`. The display-text lane is preserved across
+        // barge-in (T7) — only the transcript lane drains.
+        self.buffer_assistant_content(
+            session_id,
+            response_id,
+            PendingAssistantContent::Text(text.to_string()),
+        );
+        Ok(())
+    }
+
+    async fn append_assistant_transcript_final(
+        &self,
+        session_id: &SessionId,
+        text: &str,
+        _identity: LiveTranscriptIdentity<'_>,
+        _stop_reason: StopReason,
+        _usage: Usage,
+        response_id: Option<&str>,
+    ) -> Result<(), LiveProjectionError> {
+        // P1#1 + T6: buffer spoken-transcript final on the per-(session,
+        // response_id) slot. `signal_turn_completed` drains and flushes as
+        // `AssistantBlock::Transcript { source: Spoken, .. }`. T7: barge-in
+        // (`signal_turn_interrupt`) drops these but keeps any buffered
+        // display-text fragments in arrival order.
+        self.buffer_assistant_content(
+            session_id,
+            response_id,
+            PendingAssistantContent::Transcript(text.to_string()),
+        );
         Ok(())
     }
 
@@ -289,10 +434,12 @@ impl LiveProjectionSink for SessionServiceProjectionSink {
         // path the user-facing `live/interrupt` RPC uses. Tolerate
         // `NotRunning` (typical when no turn is currently in flight) so that a
         // late provider-side interrupt does not poison the channel.
-        // R6: drop ALL buffered finals across every response_id slot for the
-        // session — interrupt invalidates the in-flight turn regardless of
-        // which response was active.
-        self.drain_all_pending_turns(session_id);
+        // T7: drop ONLY the spoken-transcript lane (and any audio playback
+        // state, future). Display-text finals are preserved — the user is
+        // not "speaking over" written output, so a barge-in does not
+        // invalidate buffered display-text. The next `signal_turn_completed`
+        // flushes the surviving text fragments as `AssistantBlock::Text`.
+        self.drop_transcript_lane_for_session(session_id);
         match self
             .runtime
             .interrupt_live_with_machine_authority(session_id)
@@ -313,22 +460,19 @@ impl LiveProjectionSink for SessionServiceProjectionSink {
     ) -> Result<(), LiveProjectionError> {
         // P1#1: flush the per-turn assistant final buffer with the
         // authoritative `stop_reason` / `usage` from `TurnCompleted`. This is
-        // the canonical commit seam — `append_assistant_final` is now a pure
-        // buffer operation. Orphan completions (no buffered final) still
-        // commit an empty assistant block, which is correct because no
-        // transcript was produced for the turn.
+        // the canonical commit seam — `append_assistant_*_final` are pure
+        // buffer operations. Orphan completions (no buffered final) still
+        // commit an empty assistant message, which is correct because no
+        // assistant output was produced for the turn.
         //
         // R6: drain by `(session_id, response_id)` so a stale or overlapping
         // `response.done` cannot flush the wrong buffered transcript.
+        // T6/T10: collapse arrival-order lane fragments — consecutive Text
+        // runs become one `AssistantBlock::Text`; consecutive Transcript
+        // runs become one `AssistantBlock::Transcript { source: Spoken }`.
+        // Inter-lane boundaries produce distinct ordered blocks.
         let pending = self.drain_pending_turn(session_id, response_id);
-        let blocks: Vec<AssistantBlock> = pending
-            .blocks
-            .into_iter()
-            .map(|b| AssistantBlock::Text {
-                text: b.text,
-                meta: None,
-            })
-            .collect();
+        let blocks = collapse_pending_blocks(pending.blocks);
         self.runtime
             .append_external_assistant_output(session_id, blocks, stop_reason, usage)
             .await
@@ -452,8 +596,10 @@ mod tests {
     #[derive(Default)]
     struct RecordingSink {
         user_transcripts: StdMutex<Vec<(SessionId, String, OwnedIdentity)>>,
-        assistant_deltas: StdMutex<Vec<(SessionId, String, OwnedIdentity)>>,
-        assistant_finals: StdMutex<Vec<(SessionId, String, OwnedIdentity)>>,
+        text_deltas: StdMutex<Vec<(SessionId, String, OwnedIdentity)>>,
+        transcript_deltas: StdMutex<Vec<(SessionId, String, OwnedIdentity)>>,
+        text_finals: StdMutex<Vec<(SessionId, String, OwnedIdentity)>>,
+        transcript_finals: StdMutex<Vec<(SessionId, String, OwnedIdentity)>>,
         truncations: StdMutex<Vec<CapturedTruncation>>,
         interrupts: StdMutex<Vec<SessionId>>,
         completed: StdMutex<Vec<SessionId>>,
@@ -475,20 +621,33 @@ mod tests {
             ));
             Ok(())
         }
-        async fn append_assistant_delta(
+        async fn append_assistant_text_delta(
             &self,
             session_id: &SessionId,
             delta: &str,
             identity: LiveTranscriptIdentity<'_>,
         ) -> Result<(), LiveProjectionError> {
-            self.assistant_deltas.lock().unwrap().push((
+            self.text_deltas.lock().unwrap().push((
                 session_id.clone(),
                 delta.to_string(),
                 OwnedIdentity::from_borrowed(identity),
             ));
             Ok(())
         }
-        async fn append_assistant_final(
+        async fn append_assistant_transcript_delta(
+            &self,
+            session_id: &SessionId,
+            delta: &str,
+            identity: LiveTranscriptIdentity<'_>,
+        ) -> Result<(), LiveProjectionError> {
+            self.transcript_deltas.lock().unwrap().push((
+                session_id.clone(),
+                delta.to_string(),
+                OwnedIdentity::from_borrowed(identity),
+            ));
+            Ok(())
+        }
+        async fn append_assistant_text_final(
             &self,
             session_id: &SessionId,
             text: &str,
@@ -497,7 +656,23 @@ mod tests {
             _usage: Usage,
             _response_id: Option<&str>,
         ) -> Result<(), LiveProjectionError> {
-            self.assistant_finals.lock().unwrap().push((
+            self.text_finals.lock().unwrap().push((
+                session_id.clone(),
+                text.to_string(),
+                OwnedIdentity::from_borrowed(identity),
+            ));
+            Ok(())
+        }
+        async fn append_assistant_transcript_final(
+            &self,
+            session_id: &SessionId,
+            text: &str,
+            identity: LiveTranscriptIdentity<'_>,
+            _stop_reason: StopReason,
+            _usage: Usage,
+            _response_id: Option<&str>,
+        ) -> Result<(), LiveProjectionError> {
+            self.transcript_finals.lock().unwrap().push((
                 session_id.clone(),
                 text.to_string(),
                 OwnedIdentity::from_borrowed(identity),
@@ -666,7 +841,7 @@ mod tests {
 
         host.apply_observation(&channel, &obs).await.unwrap();
 
-        let recorded = sink.assistant_deltas.lock().unwrap();
+        let recorded = sink.text_deltas.lock().unwrap();
         assert_eq!(recorded.len(), 1);
         assert_eq!(recorded[0].1, "partial");
         // A11: the assistant-delta identity tuple — including response_id and
@@ -787,7 +962,11 @@ mod tests {
     #[allow(clippy::type_complexity)]
     struct BufferingTestSink {
         calls: StdMutex<Vec<CapturedRuntimeCall>>,
-        pending: StdMutex<HashMap<(SessionId, Option<String>), Vec<String>>>,
+        // T6: lane-tagged buffer mirroring `SessionServiceProjectionSink`.
+        // Tests assert that the production sink groups consecutive same-
+        // lane fragments into one `AssistantBlock` while preserving inter-
+        // lane ordering.
+        pending: StdMutex<HashMap<(SessionId, Option<String>), Vec<PendingAssistantContent>>>,
     }
 
     impl BufferingTestSink {
@@ -829,7 +1008,7 @@ mod tests {
             }
         }
 
-        fn append_assistant_final(
+        fn append_assistant_text_final(
             &self,
             session_id: &SessionId,
             text: &str,
@@ -840,7 +1019,34 @@ mod tests {
                 .unwrap()
                 .entry((session_id.clone(), response_id.map(|s| s.to_string())))
                 .or_default()
-                .push(text.to_string());
+                .push(PendingAssistantContent::Text(text.to_string()));
+        }
+
+        fn append_assistant_transcript_final(
+            &self,
+            session_id: &SessionId,
+            text: &str,
+            response_id: Option<&str>,
+        ) {
+            self.pending
+                .lock()
+                .unwrap()
+                .entry((session_id.clone(), response_id.map(|s| s.to_string())))
+                .or_default()
+                .push(PendingAssistantContent::Transcript(text.to_string()));
+        }
+
+        /// T7 — drop only spoken-transcript fragments; preserve display
+        /// text in arrival order.
+        fn signal_turn_interrupt(&self, session_id: &SessionId) {
+            let mut pending = self.pending.lock().unwrap();
+            pending.retain(|(sid, _resp), turn| {
+                if sid != session_id {
+                    return true;
+                }
+                turn.retain(|c| matches!(c, PendingAssistantContent::Text(_)));
+                true
+            });
         }
 
         fn signal_turn_completed(
@@ -856,13 +1062,7 @@ mod tests {
                 .unwrap()
                 .remove(&(session_id.clone(), response_id.map(|s| s.to_string())))
                 .unwrap_or_default();
-            let blocks: Vec<AssistantBlock> = drained
-                .into_iter()
-                .map(|t| AssistantBlock::Text {
-                    text: t,
-                    meta: None,
-                })
-                .collect();
+            let blocks = collapse_pending_blocks(drained);
             self.calls
                 .lock()
                 .unwrap()
@@ -926,14 +1126,14 @@ mod tests {
 
         // Provider stamps `AssistantTranscriptFinal` with sentinel values
         // because stop_reason/usage only arrive atomically with `response.done`.
-        sink.append_assistant_final(&session_id, "the final text", Some("resp_1"));
+        sink.append_assistant_text_final(&session_id, "the final text", Some("resp_1"));
 
         // Under the broken behavior, this is where canonical history was
         // committed — with the sentinel. With the fix it's pure buffering, so
         // no runtime call happens yet.
         assert!(
             sink.calls.lock().unwrap().is_empty(),
-            "append_assistant_final must not commit canonical history; \
+            "append_assistant_text_final must not commit canonical history; \
              defer until signal_turn_completed delivers authoritative \
              stop_reason/usage (P1#1)"
         );
@@ -980,15 +1180,19 @@ mod tests {
 
     #[test]
     fn p1_1_multi_part_assistant_final_buffers_into_one_canonical_message() {
-        // P1#1 multi-content-part variant: provider emits multiple
+        // P1#1 + T6 multi-content-part variant: provider emits multiple
         // `AssistantTranscriptFinal` events for one logical turn (one per
-        // content part). The buffer must collect all blocks and flush them
-        // as ONE assistant message at turn-completed boundary.
+        // content part). The buffer collects all fragments and flushes them
+        // as ONE assistant message at turn-completed boundary. T6 changes
+        // the block shape: consecutive same-lane fragments now coalesce
+        // into a single `AssistantBlock` so readers do not see one block
+        // per delta. Both texts are display text → one coalesced
+        // `AssistantBlock::Text` containing both parts.
         let sink = BufferingTestSink::new();
         let session_id = test_session_id();
 
-        sink.append_assistant_final(&session_id, "part one", Some("resp_a"));
-        sink.append_assistant_final(&session_id, "part two", Some("resp_a"));
+        sink.append_assistant_text_final(&session_id, "part one ", Some("resp_a"));
+        sink.append_assistant_text_final(&session_id, "part two", Some("resp_a"));
 
         assert!(sink.calls.lock().unwrap().is_empty());
 
@@ -1003,7 +1207,16 @@ mod tests {
         assert_eq!(calls.len(), 1);
         match &calls[0] {
             CapturedRuntimeCall::ExternalAssistantOutput { blocks, .. } => {
-                assert_eq!(blocks.len(), 2);
+                // T6: same-lane consecutive fragments coalesce into ONE
+                // block. The committed text is the concatenation in
+                // arrival order.
+                assert_eq!(blocks.len(), 1);
+                match &blocks[0] {
+                    AssistantBlock::Text { text, .. } => {
+                        assert_eq!(text, "part one part two");
+                    }
+                    other => panic!("expected Text block, got {other:?}"),
+                }
             }
             other => panic!("expected one ExternalAssistantOutput, got {other:?}"),
         }
@@ -1040,8 +1253,8 @@ mod tests {
         let session_id = test_session_id();
 
         // Two responses interleaved on the same session.
-        sink.append_assistant_final(&session_id, "from resp_a", Some("resp_a"));
-        sink.append_assistant_final(&session_id, "from resp_b", Some("resp_b"));
+        sink.append_assistant_text_final(&session_id, "from resp_a", Some("resp_a"));
+        sink.append_assistant_text_final(&session_id, "from resp_b", Some("resp_b"));
 
         // Completion for resp_a flushes only the resp_a slot.
         sink.signal_turn_completed(
@@ -1081,6 +1294,119 @@ mod tests {
                 match &blocks[0] {
                     AssistantBlock::Text { text, .. } => assert_eq!(text, "from resp_b"),
                     other => panic!("expected text block, got {other:?}"),
+                }
+            }
+            other => panic!("expected ExternalAssistantOutput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn t7_barge_in_drops_only_transcript_lane_keeps_display_text() {
+        // T7 regression: barge-in (`signal_turn_interrupt`) must drain only
+        // the spoken-transcript fragments from the per-(session, response_id)
+        // buffer. Display-text fragments that already arrived survive and
+        // commit on the subsequent `signal_turn_completed`.
+        //
+        // Scenario:
+        //   1. Provider emits a display-text final (`AssistantBlock::Text`).
+        //   2. Provider emits a transcript final partway (`Transcript`).
+        //   3. User barges in -> `signal_turn_interrupt`.
+        //   4. `signal_turn_completed` arrives.
+        //   -> The committed assistant message contains exactly the
+        //      buffered text lane, no transcript block.
+        let sink = BufferingTestSink::new();
+        let session_id = test_session_id();
+
+        sink.append_assistant_text_final(&session_id, "written response", Some("resp_42"));
+        sink.append_assistant_transcript_final(
+            &session_id,
+            "spoken response (interrupted)",
+            Some("resp_42"),
+        );
+
+        // Pre-flush invariant: nothing committed yet.
+        assert!(sink.calls.lock().unwrap().is_empty());
+
+        // User barge-in.
+        sink.signal_turn_interrupt(&session_id);
+
+        // Drainage on completion flushes the surviving text fragment ONLY.
+        sink.signal_turn_completed(
+            &session_id,
+            StopReason::EndTurn,
+            real_usage(),
+            Some("resp_42"),
+        );
+
+        let calls = sink.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        match &calls[0] {
+            CapturedRuntimeCall::ExternalAssistantOutput { blocks, .. } => {
+                assert_eq!(
+                    blocks.len(),
+                    1,
+                    "barge-in must drop transcript blocks; only display-text survives \
+                     (got {blocks:?})"
+                );
+                match &blocks[0] {
+                    AssistantBlock::Text { text, .. } => {
+                        assert_eq!(text, "written response");
+                    }
+                    AssistantBlock::Transcript { .. } => {
+                        panic!(
+                            "barge-in left a Transcript block in the committed message; \
+                             T7 requires the transcript lane to be drained at \
+                             signal_turn_interrupt"
+                        );
+                    }
+                    other => panic!("expected Text block, got {other:?}"),
+                }
+            }
+            other => panic!("expected ExternalAssistantOutput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn t6_mixed_lane_finals_collapse_into_ordered_blocks() {
+        // T6 regression: arrival-order lane fragments must produce one
+        // `AssistantBlock::Text` per consecutive Text run and one
+        // `AssistantBlock::Transcript { source: Spoken }` per consecutive
+        // Transcript run. Inter-lane boundaries split the runs; same-lane
+        // adjacency coalesces text. This locks the design choice (Option
+        // A: typed enum buffer in arrival order) for the production sink.
+        let sink = BufferingTestSink::new();
+        let session_id = test_session_id();
+
+        sink.append_assistant_text_final(&session_id, "intro ", Some("r1"));
+        sink.append_assistant_text_final(&session_id, "more text ", Some("r1"));
+        sink.append_assistant_transcript_final(&session_id, "spoken aside", Some("r1"));
+        sink.append_assistant_text_final(&session_id, " after speech", Some("r1"));
+
+        sink.signal_turn_completed(&session_id, StopReason::EndTurn, real_usage(), Some("r1"));
+
+        let calls = sink.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        match &calls[0] {
+            CapturedRuntimeCall::ExternalAssistantOutput { blocks, .. } => {
+                assert_eq!(blocks.len(), 3, "lanes split: text, transcript, text");
+                match &blocks[0] {
+                    AssistantBlock::Text { text, .. } => {
+                        assert_eq!(text, "intro more text ");
+                    }
+                    other => panic!("expected coalesced Text block first, got {other:?}"),
+                }
+                match &blocks[1] {
+                    AssistantBlock::Transcript { text, source, .. } => {
+                        assert_eq!(text, "spoken aside");
+                        assert_eq!(*source, TranscriptSource::Spoken);
+                    }
+                    other => panic!("expected Transcript block second, got {other:?}"),
+                }
+                match &blocks[2] {
+                    AssistantBlock::Text { text, .. } => {
+                        assert_eq!(text, " after speech");
+                    }
+                    other => panic!("expected Text block third, got {other:?}"),
                 }
             }
             other => panic!("expected ExternalAssistantOutput, got {other:?}"),
@@ -1219,5 +1545,121 @@ mod tests {
         }
         // No runtime call was made — the inert fabricated-empty commit is gone.
         assert!(sink.calls.lock().unwrap().is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // T9/T10: production sink stages transcript-delta on the dedicated
+    // realtime-transcript variant.
+    //
+    // Pre-T9/T10 the spoken-transcript delta path was reusing
+    // `RealtimeTranscriptEvent::AssistantTextDelta`, which forced the
+    // session materializer to flush every assistant transcript as
+    // `AssistantBlock::Text`. The fix routes it through the new
+    // `AssistantTranscriptDelta` variant so the materializer (verified
+    // separately in `meerkat-core/src/session.rs` regression tests)
+    // can flip to `AssistantBlock::Transcript { source: Spoken }`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn t10_assistant_text_delta_helper_builds_text_delta_event() {
+        let identity = LiveTranscriptIdentity {
+            provider_item_id: Some("item_text"),
+            previous_item_id: Some("item_prev"),
+            content_index: Some(2),
+            response_id: Some("resp_text"),
+            delta_id: Some("delta_text"),
+        };
+        let event = build_assistant_text_delta_event("display fragment", identity);
+        match event {
+            RealtimeTranscriptEvent::AssistantTextDelta {
+                response_id,
+                delta_id,
+                item_id,
+                previous_item_id,
+                content_index,
+                delta,
+            } => {
+                assert_eq!(response_id, "resp_text");
+                assert_eq!(delta_id, "delta_text");
+                assert_eq!(item_id, "item_text");
+                assert_eq!(previous_item_id.as_deref(), Some("item_prev"));
+                assert_eq!(content_index, 2);
+                assert_eq!(delta, "display fragment");
+            }
+            other => panic!("display-text delta path must build AssistantTextDelta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn t10_assistant_transcript_delta_helper_builds_transcript_delta_event() {
+        // T10 acceptance: the spoken-transcript path no longer reuses
+        // `AssistantTextDelta`; the staged event is the dedicated
+        // `AssistantTranscriptDelta` variant so the materializer routes
+        // it to `AssistantBlock::Transcript`.
+        let identity = LiveTranscriptIdentity {
+            provider_item_id: Some("item_tx"),
+            previous_item_id: Some("item_prev"),
+            content_index: Some(0),
+            response_id: Some("resp_tx"),
+            delta_id: Some("delta_tx"),
+        };
+        let event = build_assistant_transcript_delta_event("spoken fragment", identity);
+        match event {
+            RealtimeTranscriptEvent::AssistantTranscriptDelta {
+                response_id,
+                delta_id,
+                item_id,
+                previous_item_id,
+                content_index,
+                delta,
+            } => {
+                assert_eq!(response_id, "resp_tx");
+                assert_eq!(delta_id, "delta_tx");
+                assert_eq!(item_id, "item_tx");
+                assert_eq!(previous_item_id.as_deref(), Some("item_prev"));
+                assert_eq!(content_index, 0);
+                assert_eq!(delta, "spoken fragment");
+            }
+            other => panic!(
+                "spoken-transcript delta path must build AssistantTranscriptDelta, got {other:?}"
+            ),
+        }
+    }
+
+    #[tokio::test]
+    async fn t10_signal_turn_completed_flushes_transcript_block_after_transcript_final_buffered() {
+        // T10 acceptance, end-to-end through the buffer: a buffered
+        // transcript final must flush as `AssistantBlock::Transcript`
+        // (not `AssistantBlock::Text`) when `signal_turn_completed`
+        // drains the per-(session, response_id) slot. Mirrors the
+        // production sink's `pending_to_block` dispatch.
+        let sink = BufferingTestSink::new();
+        let session_id = test_session_id();
+
+        sink.append_assistant_transcript_final(&session_id, "I said hi", Some("resp_spoken"));
+        sink.signal_turn_completed(
+            &session_id,
+            StopReason::EndTurn,
+            real_usage(),
+            Some("resp_spoken"),
+        );
+
+        let calls = sink.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1);
+        match &calls[0] {
+            CapturedRuntimeCall::ExternalAssistantOutput { blocks, .. } => {
+                assert_eq!(blocks.len(), 1);
+                match &blocks[0] {
+                    AssistantBlock::Transcript { text, source, .. } => {
+                        assert_eq!(text, "I said hi");
+                        assert_eq!(*source, TranscriptSource::Spoken);
+                    }
+                    other => panic!(
+                        "transcript final must flush as AssistantBlock::Transcript, got {other:?}"
+                    ),
+                }
+            }
+            other => panic!("expected ExternalAssistantOutput, got {other:?}"),
+        }
     }
 }

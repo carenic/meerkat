@@ -299,7 +299,7 @@ pub use types::{
     RunResult, SUPPORTED_VIDEO_MEDIA_TYPES, SecurityMode, SessionId, StopReason, SystemMessage,
     SystemNoticeKind, SystemNoticeMessage, ToolCall, ToolCallIter, ToolCallView, ToolDef,
     ToolIdentity, ToolName, ToolNameSet, ToolProvenance, ToolResult, ToolSourceId, ToolSourceKind,
-    Usage, UserMessage, VideoData, has_images, has_non_text_content, has_video,
+    TranscriptSource, Usage, UserMessage, VideoData, has_images, has_non_text_content, has_video,
     is_supported_video_media_type, validate_inline_video_blocks,
 };
 

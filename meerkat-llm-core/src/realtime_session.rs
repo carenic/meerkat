@@ -68,6 +68,25 @@ pub enum RealtimeSessionEvent {
         content_index: u32,
         delta: String,
     },
+    /// Spoken-transcript lane delta for an output item — text derived from
+    /// the provider's audio output (OpenAI realtime
+    /// `response.output_audio_transcript.delta`).
+    ///
+    /// T9/T10: distinct from [`Self::OutputTextDeltaForItem`] (display
+    /// text). The adapter forwards this to
+    /// `LiveAdapterObservation::AssistantTranscriptDelta`, which the
+    /// runtime materializes as
+    /// [`meerkat_core::types::AssistantBlock::Transcript`] with
+    /// `source: TranscriptSource::Spoken` rather than as authored display
+    /// text.
+    OutputAudioTranscriptDeltaForItem {
+        response_id: String,
+        delta_id: String,
+        item_id: String,
+        previous_item_id: Option<String>,
+        content_index: u32,
+        delta: String,
+    },
     OutputAudioChunk {
         chunk: RealtimeAudioChunk,
     },

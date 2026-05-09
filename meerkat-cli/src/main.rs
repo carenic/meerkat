@@ -8609,6 +8609,14 @@ async fn show_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()> {
                                 };
                                 println!("  {display_text}");
                             }
+                            meerkat_core::AssistantBlock::Transcript { text, .. } => {
+                                let display_text = if text.len() > 500 {
+                                    format!("{}...", truncate_str(text, 500))
+                                } else {
+                                    text.clone()
+                                };
+                                println!("  [transcript] {display_text}");
+                            }
                             meerkat_core::AssistantBlock::Reasoning { text, .. } => {
                                 let display_text = if text.len() > 200 {
                                     format!("{}...", truncate_str(text, 200))
