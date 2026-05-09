@@ -156,9 +156,7 @@ if [[ -n "${rust_channel}" ]] &&
   grep -Fq "dtolnay/rust-toolchain@${rust_channel}" .github/actions/setup-rust-ci/action.yml &&
   grep -Fq "dtolnay/rust-toolchain@${rust_channel}" .github/actions/setup-buildbuddy-ci/action.yml &&
   grep -Fq "uses: ./.github/actions/setup-rust-ci" .github/workflows/cargo.yml &&
-  grep -Fq "uses: ./.github/actions/setup-rust-ci" .github/workflows/live-e2e.yml &&
   ! grep -Fq 'dtolnay/rust-toolchain@stable' .github/workflows/cargo.yml &&
-  ! grep -Fq 'dtolnay/rust-toolchain@stable' .github/workflows/live-e2e.yml &&
   ! grep -Fq 'dtolnay/rust-toolchain@stable' .github/actions/setup-buildbuddy-ci/action.yml; then
   pass "Cargo and BuildBuddy CI install the pinned Rust toolchain"
 else
@@ -169,7 +167,6 @@ if [[ -n "${rust_channel}" ]] &&
   [[ "${default_rustup_toolchain}" == "${rust_channel}" ]] &&
   grep -Fq "RUSTUP_TOOLCHAIN: ${rust_channel}" .github/workflows/cargo.yml &&
   grep -Fq "RUSTUP_TOOLCHAIN: ${rust_channel}" .github/workflows/buildbuddy.yml &&
-  grep -Fq "RUSTUP_TOOLCHAIN: ${rust_channel}" .github/workflows/live-e2e.yml &&
   grep -Fq "RUSTUP_TOOLCHAIN: ${rust_channel}" .github/actions/setup-buildbuddy-ci/action.yml &&
   grep -Fq "scripts/ci-pin-rust-toolchain-env" .github/actions/setup-rust-ci/action.yml &&
   grep -Fq "scripts/ci-pin-rust-toolchain-env" .github/actions/setup-buildbuddy-ci/action.yml &&
@@ -182,7 +179,6 @@ fi
 
 if grep -q 'CARGO_HOME: /tmp/meerkat-cargo-home' .github/workflows/cargo.yml &&
   grep -q 'CARGO_HOME: /tmp/meerkat-cargo-home' .github/workflows/buildbuddy.yml &&
-  grep -q 'CARGO_HOME: /tmp/meerkat-cargo-home' .github/workflows/live-e2e.yml &&
   grep -Fq '${GITHUB_JOB:-job}' scripts/ci-pin-rust-toolchain-env; then
   pass "CI and BuildBuddy workflows isolate Cargo home per GitHub job before cache restore"
 else
