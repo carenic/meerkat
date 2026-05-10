@@ -576,16 +576,22 @@ pub struct LiveChannelCapabilities {
 }
 
 impl Default for LiveChannelCapabilities {
+    /// No-claim baseline: every capability defaults to `false`. Callers
+    /// must opt in to each capability they actually support. This makes
+    /// implicit "we support everything" advertisements impossible — every
+    /// `true` in the matrix has a named source. A provider integration
+    /// that forgets to claim a capability will appear narrow rather than
+    /// silently overstating support.
     fn default() -> Self {
         Self {
-            audio_in: true,
-            audio_out: true,
-            text_in: true,
-            text_out: true,
+            audio_in: false,
+            audio_out: false,
+            text_in: false,
+            text_out: false,
             image_in: false,
             video_in: false,
-            transcript_supported: true,
-            barge_in_supported: true,
+            transcript_supported: false,
+            barge_in_supported: false,
             provider_native_resume: false,
         }
     }
@@ -668,10 +674,11 @@ pub trait LiveAdapter: Send + Sync {
     /// P2#3: report the adapter's real capability set so `live/open` can
     /// truthfully advertise what the underlying provider supports.
     ///
-    /// The default impl returns the conservative-but-honest baseline used by
-    /// every realtime provider Meerkat ships today (text + audio in/out,
-    /// barge-in, transcripts; no provider-native resume yet). Providers that
-    /// expose narrower or richer capability sets should override this.
+    /// The default impl returns the no-claim baseline (every capability
+    /// `false`). Adapters MUST override this to opt in to the capabilities
+    /// they actually support — silence here means "I make no claims", not
+    /// "I support everything". Forgetting to override surfaces as a narrow
+    /// channel rather than a silently-overstated one.
     fn capabilities(&self) -> LiveChannelCapabilities {
         LiveChannelCapabilities::default()
     }
@@ -1614,7 +1621,20 @@ mod tests {
                 output_sample_rate_hz: 24000,
                 output_channels: 1,
             }),
-            capabilities: LiveChannelCapabilities::default(),
+            // Explicit capability set: no-claim baseline is `false` for
+            // every field, so the round-trip needs explicit `true`s to
+            // exercise the on-the-wire shape meaningfully.
+            capabilities: LiveChannelCapabilities {
+                audio_in: true,
+                audio_out: true,
+                text_in: true,
+                text_out: true,
+                image_in: false,
+                video_in: false,
+                transcript_supported: true,
+                barge_in_supported: true,
+                provider_native_resume: false,
+            },
             continuity: LiveContinuityMode::TranscriptOnly,
         };
         let json = serde_json::to_string(&resp).unwrap();
@@ -1629,14 +1649,17 @@ mod tests {
     // -- Capabilities default invariants --
 
     #[test]
-    fn default_capabilities_enable_core_features_but_not_provider_resume() {
+    fn default_capabilities_make_no_claims() {
+        // No-claim baseline: every capability defaults to `false`. Adapters
+        // must opt in explicitly — silence here means "no claim made", not
+        // "support everything".
         let caps = LiveChannelCapabilities::default();
-        assert!(caps.audio_in);
-        assert!(caps.audio_out);
-        assert!(caps.text_in);
-        assert!(caps.text_out);
-        assert!(caps.barge_in_supported);
-        assert!(caps.transcript_supported);
+        assert!(!caps.audio_in);
+        assert!(!caps.audio_out);
+        assert!(!caps.text_in);
+        assert!(!caps.text_out);
+        assert!(!caps.barge_in_supported);
+        assert!(!caps.transcript_supported);
         assert!(!caps.image_in);
         assert!(!caps.video_in);
         assert!(!caps.provider_native_resume);
