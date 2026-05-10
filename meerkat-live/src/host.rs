@@ -337,9 +337,19 @@ pub trait LiveProjectionSink: Send + Sync {
 
     /// Project a turn-interrupt fact through the same path the user-facing
     /// interrupt RPC uses.
+    ///
+    /// G4 (P1): `response_id` carries the in-flight provider response id from
+    /// [`LiveAdapterObservation::TurnInterrupted`]. When the barge-in arrives
+    /// before any transcript delta has been staged, the sink would otherwise
+    /// have nothing to bind the truncation to; with the response id plumbed
+    /// through, the sink can scope truncation to the right response. Optional
+    /// because not every adapter or interrupt source surfaces a response id
+    /// (synthetic interrupts, transcript-only providers, the user-facing
+    /// `live/interrupt` RPC).
     async fn signal_turn_interrupt(
         &self,
         session_id: &SessionId,
+        response_id: Option<&str>,
     ) -> Result<(), LiveProjectionError>;
 
     /// Mark the live turn complete in canonical session state.
@@ -1143,9 +1153,13 @@ impl LiveAdapterHost {
                     .await
             }
 
-            (ObservationRouting::SignalInterrupt, LiveAdapterObservation::TurnInterrupted) => {
+            (
+                ObservationRouting::SignalInterrupt,
+                LiveAdapterObservation::TurnInterrupted { response_id },
+            ) => {
                 if let Some(sink) = &self.projection_sink {
-                    sink.signal_turn_interrupt(&session_id).await?;
+                    sink.signal_turn_interrupt(&session_id, response_id.as_deref())
+                        .await?;
                 }
                 Ok(ObservationOutcome::InterruptSignalled)
             }
@@ -1514,7 +1528,7 @@ impl LiveAdapterHost {
                 provider_call_id: provider_call_id.clone(),
                 tool_name: tool_name.clone(),
             },
-            LiveAdapterObservation::TurnInterrupted => ObservationRouting::SignalInterrupt,
+            LiveAdapterObservation::TurnInterrupted { .. } => ObservationRouting::SignalInterrupt,
             LiveAdapterObservation::TurnCompleted { .. } => ObservationRouting::AppendTranscript,
             LiveAdapterObservation::StatusChanged { status } => {
                 ObservationRouting::UpdateStatus(status.clone())
@@ -1957,8 +1971,15 @@ mod tests {
     #[test]
     fn barge_in_observation_routes_to_interrupt() {
         let routing =
-            LiveAdapterHost::classify_observation(&LiveAdapterObservation::TurnInterrupted);
+            LiveAdapterHost::classify_observation(&LiveAdapterObservation::TurnInterrupted {
+                response_id: None,
+            });
         assert_eq!(routing, ObservationRouting::SignalInterrupt);
+        let routing_with_id =
+            LiveAdapterHost::classify_observation(&LiveAdapterObservation::TurnInterrupted {
+                response_id: Some("resp_42".into()),
+            });
+        assert_eq!(routing_with_id, ObservationRouting::SignalInterrupt);
     }
 
     #[test]
@@ -3074,13 +3095,22 @@ mod tests {
         let session_id = test_session_id();
         let ch = host.open_channel(session_id.clone()).await.unwrap();
         let outcome = host
-            .apply_observation(&ch, &LiveAdapterObservation::TurnInterrupted)
+            .apply_observation(
+                &ch,
+                &LiveAdapterObservation::TurnInterrupted {
+                    response_id: Some("resp_42".into()),
+                },
+            )
             .await
             .unwrap();
         assert!(matches!(outcome, ObservationOutcome::InterruptSignalled));
         let interrupts = sink.interrupts.lock().unwrap();
         assert_eq!(interrupts.len(), 1);
-        assert_eq!(interrupts[0], session_id);
+        assert_eq!(interrupts[0].0, session_id);
+        // G4 (P1): the in-flight response id is plumbed through to the sink
+        // so the truncation can be scoped to the specific response even when
+        // the barge-in lands before any transcript delta has been staged.
+        assert_eq!(interrupts[0].1.as_deref(), Some("resp_42"));
     }
 
     // -- A10: terminal error projection --
@@ -3371,7 +3401,7 @@ mod tests {
                 Option<String>,
             )>,
         >,
-        interrupts: StdMutex<Vec<SessionId>>,
+        interrupts: StdMutex<Vec<(SessionId, Option<String>)>>,
         turn_completed: StdMutex<Vec<(SessionId, StopReason, Usage, Option<String>)>>,
         terminal_errors: StdMutex<Vec<(SessionId, LiveAdapterErrorCode, String)>>,
         realtime_events: StdMutex<Vec<(SessionId, RealtimeTranscriptEvent)>>,
@@ -3484,8 +3514,12 @@ mod tests {
         async fn signal_turn_interrupt(
             &self,
             session_id: &SessionId,
+            response_id: Option<&str>,
         ) -> Result<(), LiveProjectionError> {
-            self.interrupts.lock().unwrap().push(session_id.clone());
+            self.interrupts
+                .lock()
+                .unwrap()
+                .push((session_id.clone(), response_id.map(|s| s.to_string())));
             Ok(())
         }
 

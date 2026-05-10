@@ -3596,7 +3596,16 @@ fn translate_realtime_event(event: RealtimeSessionEvent) -> LiveAdapterObservati
             stop_reason,
             usage,
         },
-        RealtimeSessionEvent::Interrupted { .. } => LiveAdapterObservation::TurnInterrupted,
+        RealtimeSessionEvent::Interrupted { response_id } => {
+            // G4 (P1): plumb the in-flight provider response id through so
+            // the projection sink can bind the truncation to the right
+            // response even when the barge-in lands before any transcript
+            // delta has been staged. `RealtimeSessionEvent::Interrupted`
+            // already carries `Option<String>`; pass it through so absent
+            // ids stay absent on the observation rather than being coerced
+            // into `Some("")`.
+            LiveAdapterObservation::TurnInterrupted { response_id }
+        }
         RealtimeSessionEvent::ToolCallRequested {
             call_id,
             tool_name,

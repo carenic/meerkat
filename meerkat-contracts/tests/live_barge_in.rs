@@ -12,12 +12,13 @@
 use meerkat_core::live_adapter::LiveAdapterObservation;
 
 /// `TurnInterrupted` is the canonical signal that the user has barged in on
-/// the assistant's current turn. The variant must remain unit-shaped (no
-/// payload) and serialize as a single-field JSON object tagged
-/// `"observation": "turn_interrupted"`.
+/// the assistant's current turn. The variant carries an optional
+/// `response_id` (G4 P1) so projection sinks can bind the truncation to the
+/// in-flight provider response even when the barge-in lands before any
+/// transcript delta has been staged.
 #[test]
 fn realtime_barge_in() {
-    let obs = LiveAdapterObservation::TurnInterrupted;
+    let obs = LiveAdapterObservation::TurnInterrupted { response_id: None };
     let value = serde_json::to_value(&obs).unwrap();
     assert_eq!(
         value.get("observation").and_then(serde_json::Value::as_str),
@@ -25,16 +26,16 @@ fn realtime_barge_in() {
         "TurnInterrupted observation tag must remain stable: {value}"
     );
 
-    // No payload fields — barge-in is currently signal-only. If a future
-    // change adds payload fields (e.g. cursor offsets), it must update this
-    // test deliberately.
+    // `response_id` defaults to `None` and is `skip_serializing_if`-elided —
+    // the unit-shaped wire form is preserved when no id is plumbed through.
     let object = value
         .as_object()
         .expect("TurnInterrupted must serialize as a JSON object");
     assert_eq!(
         object.len(),
         1,
-        "TurnInterrupted must currently carry exactly one field (`observation`); got {value}"
+        "TurnInterrupted with no response_id must serialize as a single-field \
+         JSON object (just the tag); got {value}"
     );
 }
 
@@ -42,17 +43,43 @@ fn realtime_barge_in() {
 /// variant.
 #[test]
 fn turn_interrupted_round_trips_through_serde_json() {
-    let obs = LiveAdapterObservation::TurnInterrupted;
+    let obs = LiveAdapterObservation::TurnInterrupted { response_id: None };
     let json = serde_json::to_string(&obs).unwrap();
     let back: LiveAdapterObservation = serde_json::from_str(&json).unwrap();
-    assert!(matches!(back, LiveAdapterObservation::TurnInterrupted));
+    assert!(matches!(
+        back,
+        LiveAdapterObservation::TurnInterrupted { response_id: None }
+    ));
 }
 
 /// Locally-confirmed wire literal — if this changes, every external client
 /// (Python/TS/Web SDK, MCP transcript consumers) must be updated in lockstep.
+/// `skip_serializing_if = "Option::is_none"` keeps the no-id wire form
+/// backwards-compatible with consumers compiled against the pre-G4 shape.
 #[test]
 fn turn_interrupted_wire_literal_is_pinned() {
-    let obs = LiveAdapterObservation::TurnInterrupted;
+    let obs = LiveAdapterObservation::TurnInterrupted { response_id: None };
     let json = serde_json::to_string(&obs).unwrap();
     assert_eq!(json, r#"{"observation":"turn_interrupted"}"#);
+}
+
+/// G4 (P1): when the in-flight response id is plumbed through, it round-trips
+/// through serde and shows up as a populated `response_id` field.
+#[test]
+fn turn_interrupted_carries_response_id() {
+    let obs = LiveAdapterObservation::TurnInterrupted {
+        response_id: Some("resp_42".into()),
+    };
+    let json = serde_json::to_string(&obs).unwrap();
+    assert_eq!(
+        json,
+        r#"{"observation":"turn_interrupted","response_id":"resp_42"}"#
+    );
+    let back: LiveAdapterObservation = serde_json::from_str(&json).unwrap();
+    assert!(matches!(
+        back,
+        LiveAdapterObservation::TurnInterrupted {
+            response_id: Some(ref id),
+        } if id == "resp_42"
+    ));
 }

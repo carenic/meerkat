@@ -431,6 +431,7 @@ impl LiveProjectionSink for SessionServiceProjectionSink {
     async fn signal_turn_interrupt(
         &self,
         session_id: &SessionId,
+        response_id: Option<&str>,
     ) -> Result<(), LiveProjectionError> {
         // A6: barge-in projects through the same machine-authority interrupt
         // path the user-facing `live/interrupt` RPC uses. Tolerate
@@ -448,27 +449,48 @@ impl LiveProjectionSink for SessionServiceProjectionSink {
         //       Display-text finals are preserved across barge-in (the user
         //       is not "speaking over" written output).
         //
-        // For (1) we discover every distinct in-flight provider response_id
-        // staged in session metadata and synthesize
-        // `RealtimeTranscriptEvent::AssistantTurnInterrupted` for each so
-        // the staging-layer's `discard_realtime_assistant_response` clears
-        // them. Without this, a subsequent `signal_turn_completed` for a
-        // *new* turn could still trigger materialization of the prior
-        // turn's deltas. (Today, OpenAI emits one in-flight response at a
-        // time, but the loop is correct for any provider that overlaps.)
-        // For (2) we leave the display-text buffer untouched.
-        let in_flight = match self
+        // For (1) we have two information sources and prefer the
+        // strongest:
+        //
+        //   * G4 (P1): the adapter's `LiveAdapterObservation::TurnInterrupted`
+        //     now carries the in-flight provider `response_id`. When present,
+        //     it is authoritative — even if the barge-in lands BEFORE any
+        //     transcript delta has been staged (so the staging metadata is
+        //     empty), we still synthesize `AssistantTurnInterrupted` against
+        //     the right response so the truncation seam knows which response
+        //     was cut.
+        //   * Fallback (legacy): when the observation does not carry a
+        //     response_id (synthetic interrupt, transcript-only adapters,
+        //     user-facing `live/interrupt` RPC), discover every distinct
+        //     in-flight provider response_id staged in session metadata and
+        //     synthesize `AssistantTurnInterrupted` for each so any staged
+        //     deltas are cleared.
+        //
+        // Both paths union (when the observation carries an id we still
+        // emit for any *additional* staged responses) so an adapter that
+        // overlaps responses is fully drained.
+        let mut response_ids: Vec<String> = Vec::new();
+        if let Some(rid) = response_id.filter(|s| !s.is_empty()) {
+            response_ids.push(rid.to_string());
+        }
+        match self
             .runtime
             .in_flight_realtime_assistant_response_ids(session_id)
             .await
         {
-            Ok(ids) => ids,
-            Err(meerkat_core::SessionError::NotFound { .. }) => Vec::new(),
-            Err(meerkat_core::SessionError::Unsupported(_)) => Vec::new(),
+            Ok(ids) => {
+                for id in ids {
+                    if !response_ids.contains(&id) {
+                        response_ids.push(id);
+                    }
+                }
+            }
+            Err(meerkat_core::SessionError::NotFound { .. }) => {}
+            Err(meerkat_core::SessionError::Unsupported(_)) => {}
             Err(err) => return Err(session_error_to_projection(err, session_id)),
-        };
-        for response_id in in_flight {
-            let event = RealtimeTranscriptEvent::AssistantTurnInterrupted { response_id };
+        }
+        for rid in response_ids {
+            let event = RealtimeTranscriptEvent::AssistantTurnInterrupted { response_id: rid };
             match self
                 .runtime
                 .append_realtime_transcript_event(session_id, event)
@@ -704,7 +726,7 @@ mod tests {
         text_finals: StdMutex<Vec<(SessionId, String, OwnedIdentity)>>,
         transcript_finals: StdMutex<Vec<(SessionId, String, OwnedIdentity)>>,
         truncations: StdMutex<Vec<CapturedTruncation>>,
-        interrupts: StdMutex<Vec<SessionId>>,
+        interrupts: StdMutex<Vec<(SessionId, Option<String>)>>,
         completed: StdMutex<Vec<SessionId>>,
         terminals: StdMutex<Vec<(SessionId, LiveAdapterErrorCode)>>,
     }
@@ -804,8 +826,12 @@ mod tests {
         async fn signal_turn_interrupt(
             &self,
             session_id: &SessionId,
+            response_id: Option<&str>,
         ) -> Result<(), LiveProjectionError> {
-            self.interrupts.lock().unwrap().push(session_id.clone());
+            self.interrupts
+                .lock()
+                .unwrap()
+                .push((session_id.clone(), response_id.map(|s| s.to_string())));
             Ok(())
         }
         async fn signal_turn_completed(
@@ -1002,13 +1028,23 @@ mod tests {
         let session_id = test_session_id();
         let channel = host.open_channel(session_id.clone()).await.unwrap();
 
-        host.apply_observation(&channel, &LiveAdapterObservation::TurnInterrupted)
-            .await
-            .unwrap();
+        host.apply_observation(
+            &channel,
+            &LiveAdapterObservation::TurnInterrupted {
+                response_id: Some("resp_barge".into()),
+            },
+        )
+        .await
+        .unwrap();
 
         let recorded = sink.interrupts.lock().unwrap();
         assert_eq!(recorded.len(), 1);
-        assert_eq!(recorded[0], session_id);
+        assert_eq!(recorded[0].0, session_id);
+        // G4 (P1): the in-flight response id is plumbed through the
+        // host -> sink seam so the truncation can be scoped to the right
+        // response even when the barge-in lands before any transcript
+        // delta has been staged.
+        assert_eq!(recorded[0].1.as_deref(), Some("resp_barge"));
     }
 
     #[tokio::test]
@@ -2355,15 +2391,21 @@ mod tests {
         )
         .await
         .unwrap();
-        host.apply_observation(&channel, &LiveAdapterObservation::TurnInterrupted)
-            .await
-            .unwrap();
+        host.apply_observation(
+            &channel,
+            &LiveAdapterObservation::TurnInterrupted {
+                response_id: Some("resp_mixed_2".into()),
+            },
+        )
+        .await
+        .unwrap();
 
         // The host invoked `signal_turn_interrupt` exactly once — no
         // signal_turn_completed leaked through.
         let interrupts = sink.interrupts.lock().unwrap();
         assert_eq!(interrupts.len(), 1, "barge-in: {interrupts:?}");
-        assert_eq!(interrupts[0], session_id);
+        assert_eq!(interrupts[0].0, session_id);
+        assert_eq!(interrupts[0].1.as_deref(), Some("resp_mixed_2"));
         assert!(
             sink.completed.lock().unwrap().is_empty(),
             "barge-in must not also signal_turn_completed"
