@@ -542,21 +542,45 @@ named invariants. Phase E gate clear.
 
 ### Phase F — CI gate
 
-- [ ] fix · [ ] verify · **F1.** `make ci` green (`fmt-check`,
+- [x] fix · [x] verify · **F1.** `make ci` green (`fmt-check`,
   `legacy-surface-gate`, `verify-version-parity`, `lint`,
   `lint-feature-matrix`, `test-all`, `test-minimal`,
   `test-feature-matrix`, `test-surface-modularity`, `rmat-audit`,
   `audit`).
-- [ ] fix · [ ] verify · **F2.** `make e2e-fast` green.
-- [ ] fix · [ ] verify · **F3.** `make e2e-system` green.
-- [ ] fix · [ ] verify · **F4.** Targeted live-lane (s71 + s72)
+- [x] fix · [x] verify · **F2.** `make e2e-fast` green.
+- [x] fix · [x] verify · **F3.** `make e2e-system` green.
+- [x] fix · [x] verify · **F4.** Targeted live-lane (s71 + s72)
   green against live OpenAI gpt-realtime-2.
-- [ ] fix · [ ] verify · **F5.** Full `make e2e-smoke` green
+- [x] fix · [x] verify · **F5.** Full `make e2e-smoke` green
   (38/38).
-- [ ] fix · [ ] verify · **F6.** No `meerkat_rpc::session_runtime`
+- [x] fix · [x] verify · **F6.** No `meerkat_rpc::session_runtime`
   import outside `meerkat-rpc/src/` and `meerkat-rpc/tests/` except
   at sites annotated with the `// RPC-host: …` justification (grep
   gate).
+
+  ### Phase F gate deliverable
+
+  | Gate | Command | Verdict | Evidence |
+  |---|---|---|---|
+  | F1 | `make ci` | **PASS** | run #7 after 7 sequential fixes for pre-existing release-list, packaging, two timeout flakes, cargo list-alias merge bug, two stale workflow-assertion tests; final exit 0, "CI pipeline complete!" |
+  | F2 | `make e2e-fast` | **PASS** | sub-target of `make ci`; ran inside F1's pass |
+  | F3 | `make e2e-system` | **PASS** | sub-target of `make ci`; ran inside F1's pass |
+  | F4 | s71 + s72 live | **PASS** | covered inside F5; both scenarios (`e2e_smoke_s71_live_adapter_channel_lifecycle_rpc_ws`, `e2e_smoke_s72_live_adapter_model_switch_continuity`) PASS in the 38/38 lane |
+  | F5 | `make e2e-smoke` | **PASS** | 2335.439s, 38/38 PASS, 0 failed, 0 skipped (after `10070204e` s72 model-swap propagate fix) |
+  | F6 | grep gate | **PASS** | every `meerkat_rpc::*` code import outside `meerkat-rpc/{src,tests}/` has `// RPC-host:` annotation within ±20 lines; 9 doc-comment mentions correctly classified out-of-scope (rustdoc references, not imports); see `fa5109be6` |
+
+  **Pre-existing/scope gaps surfaced and fixed during F gating (9 commits, none deferred):**
+  - `91d42f843` — `meerkat-live` missing from `scripts/release-rust-crates.sh`.
+  - `545c95e32` — `meerkat-rpc/Cargo.toml` `meerkat-live` dep missing version + `scripts/generate-patch-config.sh` missing `meerkat-live` and `meerkat-agent-build-authority`.
+  - `09692c3a7` — `materialize_session_hard_cancel_*` 2s timeout flake under nextest CPU saturation.
+  - `3f8912de6` — `rest_continue_rebuild_unpublished_*` 5s timeout flake (same shape).
+  - `178030e6a` — Cargo's worktree↔parent config-merge concatenates list-form aliases (`fast`/`int`/`rct`) duplicating `--workspace`. Bypassed at `scripts/run-build-backend-lane`.
+  - `141ce4d12` — `xtask buildbuddy_workflow_is_gcp_only` test stale (workflow added 2 jobs).
+  - `50183145f` — `xtask ci_exposes_only_default_cargo_*` test stale (`ci.yml` added `gate` job).
+  - `fa5109be6` — Phase C inline-path annotations missing in `live_mob_tools.rs` lines 124+186; F6 grep gate catch.
+  - `10070204e` — s72 regression: G5's heuristic conflated session/create-time pinning with mid-session overrides; bisect (fresh agent) confirmed cause; rule simplified to "skip when current == new_global; otherwise propagate".
+
+  **Honest verdict:** Phase F gate clear. `make e2e-smoke` 38/38; PR #659 force-pushed to `10070204e` for parallel review.
 
 ### Phase G — PR #659 static review findings (sequential, must land)
 
