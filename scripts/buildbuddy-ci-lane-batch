@@ -50,6 +50,7 @@ fi
 declare -a active_pids=()
 declare -A pid_lanes=()
 declare -A pid_logs=()
+next_lane=0
 watchdog_pid=""
 heartbeat_pid=""
 
@@ -82,16 +83,123 @@ remove_active_pid() {
   active_pids=("${remaining[@]}")
 }
 
+tail_line_count() {
+  local lines="${MEERKAT_BUILDBUDDY_BATCH_TAIL_LINES:-120}"
+  if ! [[ "${lines}" =~ ^[0-9]+$ ]] || ((lines < 1)); then
+    lines=120
+  fi
+  printf '%s' "${lines}"
+}
+
+print_log_tail() {
+  local title="$1"
+  local path="$2"
+  local lines="${3:-$(tail_line_count)}"
+  if [[ ! -f "${path}" ]]; then
+    return
+  fi
+
+  echo "::group::${title}" >&2
+  tail -"${lines}" "${path}" >&2 || true
+  echo "::endgroup::" >&2
+}
+
+print_lane_summary() {
+  local lane="$1"
+  local summary="${log_root}/${lane}/summary.tsv"
+  if [[ ! -f "${summary}" ]]; then
+    return
+  fi
+
+  echo "::group::BuildBuddy lane ${lane} summary" >&2
+  cat "${summary}" >&2 || true
+  echo "::endgroup::" >&2
+}
+
+print_lane_diagnostics() {
+  local lane="$1"
+  local wrapper_log="${2:-}"
+  local lines="${3:-$(tail_line_count)}"
+  local detail_log
+  local found_detail=0
+
+  if [[ -n "${wrapper_log}" ]]; then
+    print_log_tail "Batch wrapper for BuildBuddy lane ${lane}" "${wrapper_log}" "${lines}"
+  fi
+
+  print_lane_summary "${lane}"
+
+  shopt -s nullglob
+  for detail_log in "${log_root}/${lane}"/*.log; do
+    found_detail=1
+    print_log_tail "Detailed BuildBuddy log ${lane}/$(basename "${detail_log}")" "${detail_log}" "${lines}"
+  done
+  shopt -u nullglob
+
+  if [[ "${found_detail}" == "0" && -z "${wrapper_log}" ]]; then
+    echo "::warning::No BuildBuddy logs found for active lane ${lane} under ${log_root}." >&2
+  fi
+}
+
+lane_summary_succeeded() {
+  local lane="$1"
+  local summary="${log_root}/${lane}/summary.tsv"
+  [[ -f "${summary}" ]] || return 1
+
+  awk -F '\t' '
+    NR == 1 { next }
+    NF >= 2 {
+      rows += 1
+      if ($2 != "0") {
+        failed = 1
+      }
+    }
+    END {
+      exit (rows > 0 && failed != 1) ? 0 : 1
+    }
+  ' "${summary}"
+}
+
+reconcile_successful_active_lanes() {
+  local reason="$1"
+  local pids=("${active_pids[@]}")
+  local pid lane lane_log lane_status
+
+  for pid in "${pids[@]}"; do
+    lane="${pid_lanes[${pid}]:-unknown}"
+    lane_log="${pid_logs[${pid}]:-}"
+    if ! lane_summary_succeeded "${lane}"; then
+      continue
+    fi
+
+    echo "::notice::BuildBuddy lane ${lane} recorded a successful summary before ${reason}; reaping it instead of treating it as timed out." >&2
+    set +e
+    wait "${pid}"
+    lane_status="$?"
+    set -e
+
+    if [[ "${lane_status}" == "0" ]]; then
+      remove_active_pid "${pid}"
+      echo "BuildBuddy lane ${lane} passed."
+      if [[ -n "${lane_log}" && -f "${lane_log}" ]]; then
+        grep -E '^(PASS|SKIP) ' "${lane_log}" || tail -40 "${lane_log}" || true
+      fi
+    else
+      echo "::warning::BuildBuddy lane ${lane} had a successful summary but wrapper exited with ${lane_status}; keeping it active for diagnostics." >&2
+    fi
+  done
+}
+
+all_lanes_dispatched() {
+  ((next_lane >= ${#lanes[@]}))
+}
+
 print_active_tails() {
   local pid lane lane_log
   for pid in "${active_pids[@]}"; do
     lane="${pid_lanes[${pid}]:-unknown}"
     lane_log="${pid_logs[${pid}]:-}"
-    if [[ -n "${lane_log}" && -f "${lane_log}" ]]; then
-      echo "::group::Tail for active BuildBuddy lane ${lane}" >&2
-      tail -120 "${lane_log}" >&2 || true
-      echo "::endgroup::" >&2
-    fi
+    print_lane_diagnostics "${lane}" "${lane_log}"
   done
 }
 
@@ -100,11 +208,7 @@ print_active_tails_from_files() {
   shopt -s nullglob
   for active_file in "${log_root}"/active-*; do
     IFS=$'\t' read -r lane lane_log <"${active_file}" || true
-    if [[ -n "${lane_log:-}" && -f "${lane_log}" ]]; then
-      echo "::group::Tail for active BuildBuddy lane ${lane:-unknown}" >&2
-      tail -120 "${lane_log}" >&2 || true
-      echo "::endgroup::" >&2
-    fi
+    print_lane_diagnostics "${lane:-unknown}" "${lane_log:-}"
   done
   shopt -u nullglob
 }
@@ -140,6 +244,15 @@ terminate_batch() {
 
 deadline_batch() {
   trap - USR1
+  echo "::warning::BuildBuddy lane batch reached the GCP CI SLO deadline; reconciling active lane summaries before failing." >&2
+  reconcile_successful_active_lanes "the SLO deadline"
+  if all_lanes_dispatched && ((${#active_pids[@]} == 0)); then
+    echo "::notice::All BuildBuddy lanes completed successfully before the SLO watchdog was reaped; treating the batch as successful." >&2
+    cleanup_heartbeat
+    cleanup_watchdog
+    exit 0
+  fi
+
   echo "::error::BuildBuddy lane batch reached the GCP CI SLO deadline; dumping active lane logs." >&2
   print_active_tails
   kill_active_lanes
@@ -255,9 +368,7 @@ reap_one_lane() {
   fi
 
   echo "::error::BuildBuddy lane ${lane} failed with ${lane_status}." >&2
-  if [[ -n "${lane_log}" && -f "${lane_log}" ]]; then
-    tail -180 "${lane_log}" >&2 || true
-  fi
+  print_lane_diagnostics "${lane}" "${lane_log}" 180
   print_active_tails
   kill_active_lanes
   cleanup_heartbeat
@@ -267,7 +378,6 @@ reap_one_lane() {
 
 echo "Running ${#lanes[@]} BuildBuddy lanes with up to ${max_jobs} local submitters."
 
-next_lane=0
 while ((next_lane < ${#lanes[@]} || ${#active_pids[@]} > 0)); do
   while ((next_lane < ${#lanes[@]} && ${#active_pids[@]} < max_jobs)); do
     start_lane "${lanes[${next_lane}]}"
