@@ -426,6 +426,10 @@ if job_has_line .github/workflows/ci.yml cargo 'name: GHA Cargo' &&
   grep -Fq 'MEERKAT_BUILDBUDDY_BATCH_JOBS: ${{ inputs.batch_jobs || env.MEERKAT_BUILDBUDDY_BATCH_JOBS }}' .github/actions/run-buildbuddy-ci-lane-batch/action.yml &&
   grep -Fq 'Check GCP CI duration SLO' .github/workflows/buildbuddy.yml &&
   grep -Fq 'Active BuildBuddy lane heartbeat' scripts/buildbuddy-ci-lane-batch &&
+  grep -Fq 'Detailed BuildBuddy log' scripts/buildbuddy-ci-lane-batch &&
+  grep -Fq 'lane_summary_succeeded' scripts/buildbuddy-ci-lane-batch &&
+  grep -Fq 'reconciling active lane summaries before failing' scripts/buildbuddy-ci-lane-batch &&
+  grep -Fq 'All BuildBuddy lanes completed successfully before the SLO watchdog was reaped' scripts/buildbuddy-ci-lane-batch &&
   grep -Fq "inputs.profile == 'submitter' || inputs.profile == 'doctor'" .github/actions/setup-buildbuddy-ci/action.yml &&
   grep -Fq 'scripts/buildbuddy-ci-lane-batch' .github/actions/run-buildbuddy-ci-lane-batch/action.yml &&
   grep -Fq 'default_target="//..."' scripts/buildbuddy-bazel-poc &&
