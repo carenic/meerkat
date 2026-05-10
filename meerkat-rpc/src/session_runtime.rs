@@ -7552,7 +7552,7 @@ mod tests {
     /// reads. Without this round-trip the runtime cannot detect a swap.
     #[tokio::test]
     async fn r11_host_records_and_reads_back_bound_llm_identity() {
-        let host = meerkat_live::LiveAdapterHost::new();
+        let host = meerkat_live::LiveAdapterHost::new(Arc::new(meerkat_live::NoOpProjectionSink));
         let session_id = SessionId::new();
         let channel_id = host
             .open_channel(session_id.clone())
@@ -7595,7 +7595,7 @@ mod tests {
     /// no identity recorded" (fall through to legacy Refresh).
     #[tokio::test]
     async fn r11_channel_llm_identity_reports_channel_not_found_for_missing_channel() {
-        let host = meerkat_live::LiveAdapterHost::new();
+        let host = meerkat_live::LiveAdapterHost::new(Arc::new(meerkat_live::NoOpProjectionSink));
         let bogus = meerkat_live::LiveChannelId::random_uuid();
         let result = host.channel_llm_identity(&bogus).await;
         assert!(
@@ -19970,7 +19970,9 @@ mod tests {
             .await
             .expect("materialize session via first turn");
 
-        let host = Arc::new(meerkat_live::LiveAdapterHost::new());
+        let host = Arc::new(meerkat_live::LiveAdapterHost::new(Arc::new(
+            meerkat_live::NoOpProjectionSink,
+        )));
         runtime.set_live_adapter_host(Arc::clone(&host));
         let runtime = Arc::new(runtime);
 
@@ -20042,15 +20044,39 @@ mod tests {
             meerkat_core::live_adapter::LiveAdapterObservation::Error { code, message } => {
                 match code {
                     meerkat_core::live_adapter::LiveAdapterErrorCode::ConfigRejected { reason } => {
+                        // R5-2: identity-swap surfaces as the typed
+                        // `ChannelIdentitySwap { from_*, to_* }` variant.
+                        // The synthetic `Error.message` mirrors the reason's
+                        // `Display` projection (host.signal_terminal_error
+                        // contract), so the rendered text contains both model
+                        // ids and the `model_swap:` prefix.
+                        match &reason {
+                            meerkat_core::live_adapter::LiveConfigRejectionReason::ChannelIdentitySwap {
+                                from_model, to_model, ..
+                            } => {
+                                assert_eq!(
+                                    from_model, "gpt-realtime-prior",
+                                    "from_model must be the prior bound identity"
+                                );
+                                assert_eq!(
+                                    to_model, "gpt-realtime-2",
+                                    "to_model must be the resolved session identity"
+                                );
+                            }
+                            other => panic!(
+                                "R11/CC1: expected ChannelIdentitySwap reason, got {other:?}"
+                            ),
+                        }
+                        let rendered = reason.to_string();
                         assert!(
-                            reason.contains("model_swap")
-                                && reason.contains("gpt-realtime-2")
-                                && reason.contains("gpt-realtime-prior"),
-                            "ConfigRejected.reason must name swap + both model ids; got: {reason}"
+                            rendered.contains("model_swap")
+                                && rendered.contains("gpt-realtime-2")
+                                && rendered.contains("gpt-realtime-prior"),
+                            "Display projection must name swap + both model ids; got: {rendered}"
                         );
                         assert_eq!(
-                            message, reason,
-                            "Error.message must mirror ConfigRejected.reason"
+                            message, rendered,
+                            "Error.message must mirror ConfigRejected.reason Display"
                         );
                     }
                     other => {
@@ -20102,7 +20128,9 @@ mod tests {
             .await
             .expect("materialize session via first turn");
 
-        let host = Arc::new(meerkat_live::LiveAdapterHost::new());
+        let host = Arc::new(meerkat_live::LiveAdapterHost::new(Arc::new(
+            meerkat_live::NoOpProjectionSink,
+        )));
         runtime.set_live_adapter_host(Arc::clone(&host));
         let runtime = Arc::new(runtime);
 

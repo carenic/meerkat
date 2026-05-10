@@ -408,6 +408,117 @@ pub enum LiveProjectionError {
     Internal(String),
 }
 
+/// No-op projection sink for tests and degraded configurations that
+/// intentionally opt out of routing live observations to a canonical
+/// session owner.
+///
+/// R5-1 (P2 dogma): every [`LiveAdapterHost`] now carries a mandatory
+/// projection sink so a successful "transcript projected" outcome
+/// implies a real semantic owner. Callers that genuinely want
+/// projection to drop on the floor (host smoke tests, channel-id
+/// lifecycle tests, transport plumbing tests) opt in **explicitly**
+/// by constructing this sink — the lack of a sink is no longer a
+/// silent fail-open.
+///
+/// Marked `#[doc(hidden)]` to discourage non-test use; production
+/// surfaces (`rkat-rpc`) wire `SessionServiceProjectionSink` instead.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct NoOpProjectionSink;
+
+#[async_trait::async_trait]
+impl LiveProjectionSink for NoOpProjectionSink {
+    async fn append_user_transcript(
+        &self,
+        _session_id: &SessionId,
+        _text: &str,
+        _identity: LiveTranscriptIdentity<'_>,
+    ) -> Result<(), LiveProjectionError> {
+        Ok(())
+    }
+
+    async fn append_assistant_text_delta(
+        &self,
+        _session_id: &SessionId,
+        _delta: &str,
+        _identity: LiveTranscriptIdentity<'_>,
+    ) -> Result<(), LiveProjectionError> {
+        Ok(())
+    }
+
+    async fn append_assistant_transcript_delta(
+        &self,
+        _session_id: &SessionId,
+        _delta: &str,
+        _identity: LiveTranscriptIdentity<'_>,
+    ) -> Result<(), LiveProjectionError> {
+        Ok(())
+    }
+
+    async fn append_assistant_text_final(
+        &self,
+        _session_id: &SessionId,
+        _text: &str,
+        _identity: LiveTranscriptIdentity<'_>,
+        _stop_reason: StopReason,
+        _usage: Usage,
+        _response_id: Option<&str>,
+    ) -> Result<(), LiveProjectionError> {
+        Ok(())
+    }
+
+    async fn append_assistant_transcript_final(
+        &self,
+        _session_id: &SessionId,
+        _text: &str,
+        _identity: LiveTranscriptIdentity<'_>,
+        _stop_reason: StopReason,
+        _usage: Usage,
+        _response_id: Option<&str>,
+    ) -> Result<(), LiveProjectionError> {
+        Ok(())
+    }
+
+    async fn truncate_assistant_transcript(
+        &self,
+        _session_id: &SessionId,
+        _provider_item_id: Option<&str>,
+        _previous_item_id: Option<&str>,
+        _content_index: Option<u32>,
+        _response_id: Option<&str>,
+        _text: Option<&str>,
+    ) -> Result<(), LiveProjectionError> {
+        Ok(())
+    }
+
+    async fn signal_turn_interrupt(
+        &self,
+        _session_id: &SessionId,
+        _response_id: Option<&str>,
+    ) -> Result<(), LiveProjectionError> {
+        Ok(())
+    }
+
+    async fn signal_turn_completed(
+        &self,
+        _session_id: &SessionId,
+        _stop_reason: StopReason,
+        _usage: Usage,
+        _response_id: Option<&str>,
+    ) -> Result<(), LiveProjectionError> {
+        Ok(())
+    }
+
+    async fn signal_terminal_error(
+        &self,
+        _session_id: &SessionId,
+        _code: LiveAdapterErrorCode,
+        _message: &str,
+    ) -> Result<(), LiveProjectionError> {
+        Ok(())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Per-channel state
 // ---------------------------------------------------------------------------
@@ -528,11 +639,17 @@ pub struct LiveAdapterHost {
     // minted by `LiveChannelId::random_uuid()` so the per-process counter is
     // dead weight (and would imply a process-monotonic guarantee the new ids
     // intentionally do not provide).
-    /// Optional projection sink. When `None` (e.g. early-startup configs or
-    /// surfaces without a session service yet), `apply_observation` still
-    /// classifies and updates status but transcript/tool/interrupt routing
-    /// becomes a no-op with diagnostic logging.
-    projection_sink: Option<Arc<dyn LiveProjectionSink>>,
+    /// Mandatory projection sink (R5-1 P2 dogma).
+    ///
+    /// A successful [`ObservationOutcome::TranscriptAppended`] /
+    /// [`ObservationOutcome::InterruptSignalled`] / [`ObservationOutcome::Terminal`]
+    /// outcome implies a real semantic owner received the projection.
+    /// Surfaces that genuinely want projections to drop on the floor
+    /// (host smoke tests, channel-id lifecycle tests) opt in explicitly
+    /// by constructing the host with [`NoOpProjectionSink`] — the
+    /// lack of a sink is no longer a silent fail-open hidden in an
+    /// `Option`.
+    projection_sink: Arc<dyn LiveProjectionSink>,
     /// Late-bindable tool dispatcher.
     ///
     /// `Mutex<Option<...>>` rather than the prior plain `Option<...>` because
@@ -576,14 +693,21 @@ struct HostInner {
 }
 
 impl LiveAdapterHost {
+    /// Construct a new host with the given projection sink.
+    ///
+    /// R5-1 (P2 dogma): the sink is mandatory at construction so
+    /// "projection appended" success outcomes always imply a real
+    /// semantic owner. Tests / smoke configs that intentionally
+    /// drop projections opt in explicitly via
+    /// `LiveAdapterHost::new(Arc::new(NoOpProjectionSink))`.
     #[must_use]
-    pub fn new() -> Self {
+    pub fn new(projection_sink: Arc<dyn LiveProjectionSink>) -> Self {
         Self {
             inner: Mutex::new(HostInner {
                 channels: IndexMap::new(),
                 by_session: HashMap::new(),
             }),
-            projection_sink: None,
+            projection_sink,
             tool_dispatcher: std::sync::Mutex::new(None),
             tool_timeout: None,
         }
@@ -616,16 +740,6 @@ impl LiveAdapterHost {
     #[must_use]
     pub fn tool_timeout(&self) -> Option<Duration> {
         self.tool_timeout
-    }
-
-    /// Builder: install the canonical projection sink.
-    ///
-    /// Without a sink, transcript / interrupt / terminal routing is a no-op
-    /// (audited via `ObservationOutcome` so callers can detect the miswiring).
-    #[must_use]
-    pub fn with_projection_sink(mut self, sink: Arc<dyn LiveProjectionSink>) -> Self {
-        self.projection_sink = Some(sink);
-        self
     }
 
     /// Builder: install the agent tool dispatcher.
@@ -979,15 +1093,14 @@ impl LiveAdapterHost {
                     ..
                 },
             ) => {
-                if let Some(sink) = &self.projection_sink {
-                    let identity = LiveTranscriptIdentity::user(
-                        provider_item_id.as_deref(),
-                        previous_item_id.as_deref(),
-                        *content_index,
-                    );
-                    sink.append_user_transcript(&session_id, text, identity)
-                        .await?;
-                }
+                let identity = LiveTranscriptIdentity::user(
+                    provider_item_id.as_deref(),
+                    previous_item_id.as_deref(),
+                    *content_index,
+                );
+                self.projection_sink
+                    .append_user_transcript(&session_id, text, identity)
+                    .await?;
                 Ok(ObservationOutcome::TranscriptAppended)
             }
 
@@ -1003,19 +1116,18 @@ impl LiveAdapterHost {
                     ..
                 },
             ) => {
-                if let Some(sink) = &self.projection_sink {
-                    let identity = LiveTranscriptIdentity::assistant_delta(
-                        provider_item_id.as_deref(),
-                        previous_item_id.as_deref(),
-                        *content_index,
-                        response_id.as_deref(),
-                        delta_id.as_deref(),
-                    );
-                    // T6: display text routes to the text lane; flushed as
-                    // AssistantBlock::Text.
-                    sink.append_assistant_text_delta(&session_id, delta, identity)
-                        .await?;
-                }
+                let identity = LiveTranscriptIdentity::assistant_delta(
+                    provider_item_id.as_deref(),
+                    previous_item_id.as_deref(),
+                    *content_index,
+                    response_id.as_deref(),
+                    delta_id.as_deref(),
+                );
+                // T6: display text routes to the text lane; flushed as
+                // AssistantBlock::Text.
+                self.projection_sink
+                    .append_assistant_text_delta(&session_id, delta, identity)
+                    .await?;
                 Ok(ObservationOutcome::TranscriptAppended)
             }
 
@@ -1031,19 +1143,18 @@ impl LiveAdapterHost {
                     ..
                 },
             ) => {
-                if let Some(sink) = &self.projection_sink {
-                    let identity = LiveTranscriptIdentity::assistant_delta(
-                        provider_item_id.as_deref(),
-                        previous_item_id.as_deref(),
-                        *content_index,
-                        response_id.as_deref(),
-                        delta_id.as_deref(),
-                    );
-                    // T6: spoken transcript routes to the transcript lane;
-                    // flushed as AssistantBlock::Transcript { source: Spoken }.
-                    sink.append_assistant_transcript_delta(&session_id, delta, identity)
-                        .await?;
-                }
+                let identity = LiveTranscriptIdentity::assistant_delta(
+                    provider_item_id.as_deref(),
+                    previous_item_id.as_deref(),
+                    *content_index,
+                    response_id.as_deref(),
+                    delta_id.as_deref(),
+                );
+                // T6: spoken transcript routes to the transcript lane;
+                // flushed as AssistantBlock::Transcript { source: Spoken }.
+                self.projection_sink
+                    .append_assistant_transcript_delta(&session_id, delta, identity)
+                    .await?;
                 Ok(ObservationOutcome::TranscriptAppended)
             }
 
@@ -1060,17 +1171,17 @@ impl LiveAdapterHost {
                     ..
                 },
             ) => {
-                if let Some(sink) = &self.projection_sink {
-                    let identity = LiveTranscriptIdentity::assistant_final(
-                        provider_item_id,
-                        previous_item_id.as_deref(),
-                        *content_index,
-                        response_id.as_deref(),
-                    );
-                    // R6: forward the response_id so the sink keys its
-                    // per-turn buffer on (SessionId, response_id). T6:
-                    // spoken-transcript final routes to the transcript lane.
-                    sink.append_assistant_transcript_final(
+                let identity = LiveTranscriptIdentity::assistant_final(
+                    provider_item_id,
+                    previous_item_id.as_deref(),
+                    *content_index,
+                    response_id.as_deref(),
+                );
+                // R6: forward the response_id so the sink keys its
+                // per-turn buffer on (SessionId, response_id). T6:
+                // spoken-transcript final routes to the transcript lane.
+                self.projection_sink
+                    .append_assistant_transcript_final(
                         &session_id,
                         text,
                         identity,
@@ -1079,7 +1190,6 @@ impl LiveAdapterHost {
                         response_id.as_deref(),
                     )
                     .await?;
-                }
                 Ok(ObservationOutcome::TranscriptAppended)
             }
 
@@ -1093,8 +1203,8 @@ impl LiveAdapterHost {
                     text,
                 },
             ) => {
-                if let Some(sink) = &self.projection_sink {
-                    sink.truncate_assistant_transcript(
+                self.projection_sink
+                    .truncate_assistant_transcript(
                         &session_id,
                         provider_item_id.as_deref(),
                         previous_item_id.as_deref(),
@@ -1103,7 +1213,6 @@ impl LiveAdapterHost {
                         text.as_deref(),
                     )
                     .await?;
-                }
                 Ok(ObservationOutcome::TranscriptTruncated)
             }
 
@@ -1115,18 +1224,17 @@ impl LiveAdapterHost {
                     usage,
                 },
             ) => {
-                if let Some(sink) = &self.projection_sink {
-                    // R6: pass the response_id through so the sink can
-                    // drain the matching (SessionId, response_id) buffer
-                    // slot, not just by session_id.
-                    sink.signal_turn_completed(
+                // R6: pass the response_id through so the sink can
+                // drain the matching (SessionId, response_id) buffer
+                // slot, not just by session_id.
+                self.projection_sink
+                    .signal_turn_completed(
                         &session_id,
                         *stop_reason,
                         usage.clone(),
                         response_id.as_deref(),
                     )
                     .await?;
-                }
                 Ok(ObservationOutcome::TranscriptAppended)
             }
 
@@ -1135,9 +1243,9 @@ impl LiveAdapterHost {
             // staging machinery owns materialization. Mirrors the seam wave-3
             // wired up for assistant deltas.
             (ObservationRouting::AppendRealtimeTranscript { event }, _) => {
-                if let Some(sink) = &self.projection_sink {
-                    sink.append_realtime_transcript(&session_id, &event).await?;
-                }
+                self.projection_sink
+                    .append_realtime_transcript(&session_id, &event)
+                    .await?;
                 Ok(ObservationOutcome::TranscriptAppended)
             }
 
@@ -1157,10 +1265,9 @@ impl LiveAdapterHost {
                 ObservationRouting::SignalInterrupt,
                 LiveAdapterObservation::TurnInterrupted { response_id },
             ) => {
-                if let Some(sink) = &self.projection_sink {
-                    sink.signal_turn_interrupt(&session_id, response_id.as_deref())
-                        .await?;
-                }
+                self.projection_sink
+                    .signal_turn_interrupt(&session_id, response_id.as_deref())
+                    .await?;
                 Ok(ObservationOutcome::InterruptSignalled)
             }
 
@@ -1178,10 +1285,9 @@ impl LiveAdapterHost {
                         channel.retire_at = Some(std::time::Instant::now() + CLOSED_CHANNEL_TTL);
                     }
                 }
-                if let Some(sink) = &self.projection_sink {
-                    sink.signal_terminal_error(&session_id, code.clone(), message)
-                        .await?;
-                }
+                self.projection_sink
+                    .signal_terminal_error(&session_id, code.clone(), message)
+                    .await?;
                 Ok(ObservationOutcome::Terminal { code: code.clone() })
             }
 
@@ -1388,7 +1494,10 @@ impl LiveAdapterHost {
         code: LiveAdapterErrorCode,
     ) -> Result<(), LiveAdapterHostError> {
         let message = match &code {
-            LiveAdapterErrorCode::ConfigRejected { reason } => reason.clone(),
+            // R5-2: `reason` is a typed `LiveConfigRejectionReason`; render
+            // via `Display` (which preserves the human-readable swap/text
+            // contract callers previously read out of the `String` reason).
+            LiveAdapterErrorCode::ConfigRejected { reason } => reason.to_string(),
             other => format!("{other:?}"),
         };
         let synthetic = LiveAdapterObservation::Error {
@@ -1620,12 +1729,6 @@ impl LiveAdapterHost {
     }
 }
 
-impl Default for LiveAdapterHost {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 /// Helper: project a typed [`ToolResult`] from the agent dispatcher into
 /// the seam-owned [`LiveToolResult`]. The two carry the same structured
 /// content shape (`Vec<ContentBlock>`) so tool-result fidelity (text, image,
@@ -1666,21 +1769,76 @@ mod tests {
     /// asserted to produce a host with the timeout populated.
     #[test]
     fn tool_timeout_defaults_to_none_and_builder_sets_it() {
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         assert_eq!(host.tool_timeout(), None);
 
-        let host = LiveAdapterHost::new().with_tool_timeout(DEFAULT_LIVE_TOOL_TIMEOUT);
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink))
+            .with_tool_timeout(DEFAULT_LIVE_TOOL_TIMEOUT);
         assert_eq!(host.tool_timeout(), Some(DEFAULT_LIVE_TOOL_TIMEOUT));
         // Pin the canonical default value so accidental constant drift
         // is caught here rather than at integration time.
         assert_eq!(DEFAULT_LIVE_TOOL_TIMEOUT, Duration::from_secs(30));
     }
 
+    // -- R5-1 (P2 dogma): projection sink mandatory at construction --
+
+    /// R5-1 (P2 dogma): the projection sink is mandatory at host
+    /// construction. A successful `ObservationOutcome::TranscriptAppended`
+    /// must imply a real semantic owner received the projection — the
+    /// previous `Option<Arc<dyn LiveProjectionSink>>` permitted
+    /// "successful append with nobody to project to," which violates the
+    /// dogma that success outcomes are truthful completion.
+    ///
+    /// This test pins:
+    ///   1. A host built with the production-shape `RecordingProjectionSink`
+    ///      routes a `UserTranscriptFinal` observation to the sink and
+    ///      returns `TranscriptAppended` — the sink received exactly one
+    ///      append, confirming the success outcome corresponds to a real
+    ///      projection.
+    ///   2. A host built with the explicit-opt-out `NoOpProjectionSink`
+    ///      still classifies the same observation and returns
+    ///      `TranscriptAppended` (the no-op sink swallows the append by
+    ///      design). The intent of "dropping projections on the floor" is
+    ///      now visible in the call site (`Arc::new(NoOpProjectionSink)`)
+    ///      rather than hidden in `projection_sink: None`.
+    #[tokio::test]
+    async fn projection_sink_is_mandatory_at_construction() {
+        // Production shape: real sink routes the observation.
+        let recording = Arc::new(RecordingProjectionSink::default());
+        let host = LiveAdapterHost::new(Arc::clone(&recording) as _);
+        let session = test_session_id();
+        let ch = host.open_channel(session.clone()).await.unwrap();
+        let obs = LiveAdapterObservation::UserTranscriptFinal {
+            provider_item_id: Some("item-1".into()),
+            previous_item_id: None,
+            content_index: Some(0),
+            text: "hello".into(),
+        };
+        let outcome = host.apply_observation(&ch, &obs).await.unwrap();
+        assert!(matches!(outcome, ObservationOutcome::TranscriptAppended));
+        assert_eq!(
+            recording.user_transcripts.lock().unwrap().len(),
+            1,
+            "production-shape host must route user transcripts to the sink"
+        );
+
+        // Test opt-out shape: NoOpProjectionSink is the *explicit* way to
+        // request "drop projections on the floor". The success outcome is
+        // still TranscriptAppended (the routing happened; the sink chose
+        // to swallow it), but the lack of a semantic owner is now visible
+        // at the call site rather than hidden in `Option<_>`.
+        let noop_host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
+        let session2 = test_session_id();
+        let ch2 = noop_host.open_channel(session2).await.unwrap();
+        let outcome2 = noop_host.apply_observation(&ch2, &obs).await.unwrap();
+        assert!(matches!(outcome2, ObservationOutcome::TranscriptAppended));
+    }
+
     // -- Channel lifecycle --
 
     #[tokio::test]
     async fn open_channel_returns_unique_ids() {
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         let s1 = test_session_id();
         let s2 = test_session_id();
         let ch1 = host.open_channel(s1).await.unwrap();
@@ -1693,7 +1851,7 @@ mod tests {
         // G41 regression: the legacy `live_{N}` shape was process-monotonic
         // and collided across `rkat-rpc` restarts and across co-tenant host
         // instances. Channel ids must now be v4 UUIDs.
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         let ch1 = host.open_channel(test_session_id()).await.unwrap();
         let ch2 = host.open_channel(test_session_id()).await.unwrap();
 
@@ -1718,7 +1876,7 @@ mod tests {
 
     #[tokio::test]
     async fn open_channel_starts_in_opening_status() {
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         let ch = host.open_channel(test_session_id()).await.unwrap();
         let status = host.channel_status(&ch).await.unwrap();
         assert_eq!(status, LiveAdapterStatus::Opening);
@@ -1726,7 +1884,7 @@ mod tests {
 
     #[tokio::test]
     async fn duplicate_session_binding_rejected() {
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         let session_id = test_session_id();
         let _ch = host.open_channel(session_id.clone()).await.unwrap();
         let err = host.open_channel(session_id.clone()).await.unwrap_err();
@@ -1735,7 +1893,7 @@ mod tests {
 
     #[tokio::test]
     async fn close_channel_marks_closed_and_retains_for_status_reads() {
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         let ch = host.open_channel(test_session_id()).await.unwrap();
         host.close_channel(&ch).await.unwrap();
         // G42: post-close status is `Closed`, not `ChannelNotFound`.
@@ -1745,7 +1903,7 @@ mod tests {
 
     #[tokio::test]
     async fn close_channel_allows_rebinding_same_session() {
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         let session_id = test_session_id();
         let ch = host.open_channel(session_id.clone()).await.unwrap();
         host.close_channel(&ch).await.unwrap();
@@ -1760,7 +1918,7 @@ mod tests {
     /// create a duplicate active channel for the same session.
     #[tokio::test]
     async fn reap_of_retired_channel_preserves_rebound_session_mapping() {
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         let session_id = test_session_id();
 
         let ch_a = host.open_channel(session_id.clone()).await.unwrap();
@@ -1820,7 +1978,7 @@ mod tests {
     /// from the map entirely, so it must still not appear.
     #[tokio::test]
     async fn active_channels_excludes_retained_closed_channels() {
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         let s1 = test_session_id();
         let s2 = test_session_id();
 
@@ -1876,7 +2034,7 @@ mod tests {
 
     #[tokio::test]
     async fn channel_session_returns_bound_session() {
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         let session_id = test_session_id();
         let ch = host.open_channel(session_id.clone()).await.unwrap();
         assert_eq!(host.channel_session(&ch).await.unwrap(), session_id);
@@ -1890,14 +2048,17 @@ mod tests {
     /// derive a typed `terminal:config_rejected` close-frame reason.
     #[tokio::test]
     async fn signal_terminal_error_enqueues_synthetic_error_obs_and_closes_channel() {
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         let ch = host.open_channel(test_session_id()).await.unwrap();
         host.attach_adapter(&ch, Arc::new(StubAdapter::new()))
             .await
             .unwrap();
 
         let code = LiveAdapterErrorCode::ConfigRejected {
-            reason: "model_swap: gpt-realtime -> gpt-realtime-1.5".to_string(),
+            reason: meerkat_core::live_adapter::LiveConfigRejectionReason::RefreshModelSwap {
+                from_model: "gpt-realtime".to_string(),
+                to_model: "gpt-realtime-1.5".to_string(),
+            },
         };
         host.signal_terminal_error(&ch, code).await.unwrap();
 
@@ -1916,8 +2077,17 @@ mod tests {
         match obs {
             LiveAdapterObservation::Error { code, message } => match code {
                 LiveAdapterErrorCode::ConfigRejected { reason } => {
-                    assert!(reason.contains("model_swap"));
-                    assert_eq!(message, reason);
+                    assert!(matches!(
+                        reason,
+                        meerkat_core::live_adapter::LiveConfigRejectionReason::RefreshModelSwap {
+                            ref to_model,
+                            ..
+                        } if to_model == "gpt-realtime-1.5"
+                    ));
+                    // R5-2: synthetic Error.message mirrors the reason's
+                    // Display projection — the human-readable swap text
+                    // still appears in the rendered message.
+                    assert!(message.contains("close + reopen"));
                 }
                 other => panic!("expected ConfigRejected, got {other:?}"),
             },
@@ -1932,14 +2102,19 @@ mod tests {
     /// (slug `config_rejected`).
     #[tokio::test]
     async fn synthetic_terminal_error_routes_through_apply_observation_to_terminal_outcome() {
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         let ch = host.open_channel(test_session_id()).await.unwrap();
         host.attach_adapter(&ch, Arc::new(StubAdapter::new()))
             .await
             .unwrap();
 
         let code = LiveAdapterErrorCode::ConfigRejected {
-            reason: "model_swap: a -> b".to_string(),
+            reason: meerkat_core::live_adapter::LiveConfigRejectionReason::ChannelIdentitySwap {
+                from_model: "a".to_string(),
+                from_provider: meerkat_core::Provider::OpenAI,
+                to_model: "b".to_string(),
+                to_provider: meerkat_core::Provider::OpenAI,
+            },
         };
         host.signal_terminal_error(&ch, code).await.unwrap();
 
@@ -1948,7 +2123,12 @@ mod tests {
         match outcome {
             ObservationOutcome::Terminal { code } => match code {
                 LiveAdapterErrorCode::ConfigRejected { reason } => {
-                    assert_eq!(reason, "model_swap: a -> b");
+                    assert!(matches!(
+                        reason,
+                        meerkat_core::live_adapter::LiveConfigRejectionReason::ChannelIdentitySwap {
+                            ref from_model, ref to_model, ..
+                        } if from_model == "a" && to_model == "b"
+                    ));
                 }
                 other => panic!("expected ConfigRejected, got {other:?}"),
             },
@@ -1966,14 +2146,16 @@ mod tests {
     /// signal was lost — must not recur.
     #[tokio::test]
     async fn signal_terminal_error_delivers_synthetic_error_before_close_signal() {
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         let ch = host.open_channel(test_session_id()).await.unwrap();
         host.attach_adapter(&ch, Arc::new(StubAdapter::new()))
             .await
             .unwrap();
 
         let code = LiveAdapterErrorCode::ConfigRejected {
-            reason: "model_swap_test".to_string(),
+            reason: meerkat_core::live_adapter::LiveConfigRejectionReason::Other {
+                detail: "model_swap_test".to_string(),
+            },
         };
         host.signal_terminal_error(&ch, code).await.unwrap();
 
@@ -1986,7 +2168,14 @@ mod tests {
         match first {
             LiveAdapterObservation::Error { code, message } => match code {
                 LiveAdapterErrorCode::ConfigRejected { reason } => {
-                    assert_eq!(reason, "model_swap_test");
+                    // R5-2: `Other.detail` is the diagnostic catch-all and
+                    // its `Display` projection equals the detail text, so
+                    // the synthetic `Error.message` matches verbatim.
+                    assert!(matches!(
+                        &reason,
+                        meerkat_core::live_adapter::LiveConfigRejectionReason::Other { detail }
+                            if detail == "model_swap_test"
+                    ));
                     assert_eq!(message, "model_swap_test");
                 }
                 other => unreachable!("expected ConfigRejected, got {other:?}"),
@@ -2001,13 +2190,15 @@ mod tests {
     /// the typed signal on a channel that was already reaped.
     #[tokio::test]
     async fn signal_terminal_error_on_missing_channel_returns_channel_not_found() {
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         let bogus = LiveChannelId::random_uuid();
         let result = host
             .signal_terminal_error(
                 &bogus,
                 LiveAdapterErrorCode::ConfigRejected {
-                    reason: "no channel".into(),
+                    reason: meerkat_core::live_adapter::LiveConfigRejectionReason::Other {
+                        detail: "no channel".into(),
+                    },
                 },
             )
             .await;
@@ -2154,7 +2345,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_status_update_changes_channel_status() {
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         let ch = host.open_channel(test_session_id()).await.unwrap();
         host.apply_status_update(&ch, LiveAdapterStatus::Ready)
             .await
@@ -2169,7 +2360,7 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_version_increments_monotonically() {
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         let ch = host.open_channel(test_session_id()).await.unwrap();
         let v1 = host.next_snapshot_version(&ch).await.unwrap();
         let v2 = host.next_snapshot_version(&ch).await.unwrap();
@@ -2181,7 +2372,7 @@ mod tests {
 
     #[tokio::test]
     async fn active_channels_lists_open_channels() {
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         let ch1 = host.open_channel(test_session_id()).await.unwrap();
         let ch2 = host.open_channel(test_session_id()).await.unwrap();
         let active = host.active_channels().await;
@@ -2194,7 +2385,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_input_without_adapter_returns_error() {
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         let ch = host.open_channel(test_session_id()).await.unwrap();
         let err = host
             .send_input(&ch, LiveInputChunk::Text { text: "hi".into() })
@@ -2209,7 +2400,7 @@ mod tests {
     async fn attach_adapter_does_not_assert_ready() {
         // F32: attach leaves status Opening; only `Ready` observation
         // promotes the channel.
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         let ch = host.open_channel(test_session_id()).await.unwrap();
         assert_eq!(
             host.channel_status(&ch).await.unwrap(),
@@ -2229,7 +2420,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_input_rejected_when_not_ready() {
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         let ch = host.open_channel(test_session_id()).await.unwrap();
         host.attach_adapter(&ch, Arc::new(StubAdapter::new()))
             .await
@@ -2249,7 +2440,7 @@ mod tests {
 
     #[tokio::test]
     async fn send_input_accepts_when_ready() {
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         let ch = host.open_channel(test_session_id()).await.unwrap();
         host.attach_adapter(&ch, Arc::new(StubAdapter::new()))
             .await
@@ -2272,7 +2463,7 @@ mod tests {
         // `LiveAdapterObservation::Error` to the consumer instead of an
         // `AdapterError` propagation. This lets the WS pump close with
         // a typed reason and reuses R5-3's synthetic-error seam.
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         let ch = host.open_channel(test_session_id()).await.unwrap();
         host.attach_adapter(&ch, Arc::new(ErroringAdapter))
             .await
@@ -2325,7 +2516,7 @@ mod tests {
     /// follow-up command can be sent on the same channel.
     #[tokio::test]
     async fn command_rejected_routes_non_terminally_and_preserves_channel() {
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         let ch = host.open_channel(test_session_id()).await.unwrap();
         host.attach_adapter(&ch, Arc::new(StubAdapter::new()))
             .await
@@ -2336,7 +2527,8 @@ mod tests {
 
         let obs = LiveAdapterObservation::CommandRejected {
             code: LiveAdapterErrorCode::ConfigRejected {
-                reason: "image_input_not_implemented".into(),
+                reason:
+                    meerkat_core::live_adapter::LiveConfigRejectionReason::ImageInputNotImplemented,
             },
             message: "image_input_not_implemented".into(),
         };
@@ -2345,7 +2537,9 @@ mod tests {
             ObservationOutcome::CommandRejected { code, message } => {
                 assert!(matches!(
                     code,
-                    LiveAdapterErrorCode::ConfigRejected { ref reason } if reason == "image_input_not_implemented"
+                    LiveAdapterErrorCode::ConfigRejected {
+                        reason: meerkat_core::live_adapter::LiveConfigRejectionReason::ImageInputNotImplemented,
+                    }
                 ));
                 assert_eq!(message, "image_input_not_implemented");
             }
@@ -2380,7 +2574,7 @@ mod tests {
     /// `SessionAlreadyBound` indefinitely.
     #[tokio::test]
     async fn adapter_err_releases_session_for_rebind() {
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         let session_id = test_session_id();
         let ch1 = host.open_channel(session_id.clone()).await.unwrap();
         host.attach_adapter(&ch1, Arc::new(ErroringAdapter))
@@ -2415,7 +2609,7 @@ mod tests {
     #[tokio::test]
     async fn user_transcript_observation_appends_to_sink() {
         let sink = Arc::new(RecordingProjectionSink::default());
-        let host = LiveAdapterHost::new().with_projection_sink(Arc::clone(&sink) as _);
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as _);
         let session_id = test_session_id();
         let ch = host.open_channel(session_id.clone()).await.unwrap();
         let obs = LiveAdapterObservation::UserTranscriptFinal {
@@ -2438,7 +2632,7 @@ mod tests {
         // A11 contract: every identity field carried by
         // `LiveAdapterObservation::UserTranscriptFinal` must reach the sink.
         let sink = Arc::new(RecordingProjectionSink::default());
-        let host = LiveAdapterHost::new().with_projection_sink(Arc::clone(&sink) as _);
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as _);
         let session_id = test_session_id();
         let ch = host.open_channel(session_id.clone()).await.unwrap();
         let obs = LiveAdapterObservation::UserTranscriptFinal {
@@ -2462,7 +2656,7 @@ mod tests {
     #[tokio::test]
     async fn assistant_text_delta_observation_appends_to_sink() {
         let sink = Arc::new(RecordingProjectionSink::default());
-        let host = LiveAdapterHost::new().with_projection_sink(Arc::clone(&sink) as _);
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as _);
         let session_id = test_session_id();
         let ch = host.open_channel(session_id.clone()).await.unwrap();
         let obs = LiveAdapterObservation::AssistantTextDelta {
@@ -2489,7 +2683,7 @@ mod tests {
         // A11 contract: every identity field on `AssistantTextDelta` —
         // including `response_id` and `delta_id` — must reach the sink.
         let sink = Arc::new(RecordingProjectionSink::default());
-        let host = LiveAdapterHost::new().with_projection_sink(Arc::clone(&sink) as _);
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as _);
         let ch = host.open_channel(test_session_id()).await.unwrap();
         let obs = LiveAdapterObservation::AssistantTextDelta {
             provider_item_id: Some("item_42".into()),
@@ -2512,7 +2706,7 @@ mod tests {
     #[tokio::test]
     async fn assistant_transcript_final_observation_calls_sink() {
         let sink = Arc::new(RecordingProjectionSink::default());
-        let host = LiveAdapterHost::new().with_projection_sink(Arc::clone(&sink) as _);
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as _);
         let session_id = test_session_id();
         let ch = host.open_channel(session_id.clone()).await.unwrap();
         let obs = LiveAdapterObservation::AssistantTranscriptFinal {
@@ -2539,7 +2733,7 @@ mod tests {
         // previous_item_id, content_index, response_id. delta_id is not
         // applicable to a final.
         let sink = Arc::new(RecordingProjectionSink::default());
-        let host = LiveAdapterHost::new().with_projection_sink(Arc::clone(&sink) as _);
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as _);
         let ch = host.open_channel(test_session_id()).await.unwrap();
         let obs = LiveAdapterObservation::AssistantTranscriptFinal {
             provider_item_id: "item_final".into(),
@@ -2563,7 +2757,7 @@ mod tests {
     #[tokio::test]
     async fn turn_completed_observation_signals_sink() {
         let sink = Arc::new(RecordingProjectionSink::default());
-        let host = LiveAdapterHost::new().with_projection_sink(Arc::clone(&sink) as _);
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as _);
         let ch = host.open_channel(test_session_id()).await.unwrap();
         let obs = LiveAdapterObservation::TurnCompleted {
             response_id: None,
@@ -2584,7 +2778,7 @@ mod tests {
         // apply_observation pair owns the dispatch; this test pins the
         // routing so a future refactor cannot collapse the lanes back.
         let sink = Arc::new(RecordingProjectionSink::default());
-        let host = LiveAdapterHost::new().with_projection_sink(Arc::clone(&sink) as _);
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as _);
         let session_id = test_session_id();
         let ch = host.open_channel(session_id.clone()).await.unwrap();
         let obs = LiveAdapterObservation::AssistantTranscriptDelta {
@@ -2622,7 +2816,7 @@ mod tests {
     async fn realtime_transcript_observation_routes_to_append_realtime_transcript() {
         use meerkat_core::RealtimeTranscriptRole;
         let sink = Arc::new(RecordingProjectionSink::default());
-        let host = LiveAdapterHost::new().with_projection_sink(Arc::clone(&sink) as _);
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as _);
         let session_id = test_session_id();
         let ch = host.open_channel(session_id.clone()).await.unwrap();
 
@@ -2675,7 +2869,7 @@ mod tests {
         // through to `Noop` — also reaches the sink. (Different inner variant
         // shape: stop_reason + usage, not item identity.)
         let sink = Arc::new(RecordingProjectionSink::default());
-        let host = LiveAdapterHost::new().with_projection_sink(Arc::clone(&sink) as _);
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as _);
         let ch = host.open_channel(test_session_id()).await.unwrap();
         let event = RealtimeTranscriptEvent::AssistantTurnCompleted {
             response_id: "resp_complete".into(),
@@ -2699,8 +2893,7 @@ mod tests {
         let sink = Arc::new(RecordingProjectionSink::default());
         let dispatcher = Arc::new(RecordingDispatcher::default());
         let adapter = Arc::new(RecordingAdapter::default());
-        let host = LiveAdapterHost::new()
-            .with_projection_sink(Arc::clone(&sink) as _)
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as _)
             .with_tool_dispatcher(Arc::clone(&dispatcher) as _);
         let ch = host.open_channel(test_session_id()).await.unwrap();
         host.attach_adapter(&ch, Arc::clone(&adapter) as _)
@@ -2739,7 +2932,7 @@ mod tests {
     #[tokio::test]
     async fn tool_call_skipped_when_no_dispatcher_wired() {
         let sink = Arc::new(RecordingProjectionSink::default());
-        let host = LiveAdapterHost::new().with_projection_sink(Arc::clone(&sink) as _);
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as _);
         let ch = host.open_channel(test_session_id()).await.unwrap();
         let obs = LiveAdapterObservation::ToolCallRequested {
             provider_call_id: "call_99".into(),
@@ -2772,7 +2965,7 @@ mod tests {
         let sink = Arc::new(RecordingProjectionSink::default());
         let adapter = Arc::new(RecordingAdapter::default());
         // No dispatcher installed.
-        let host = LiveAdapterHost::new().with_projection_sink(Arc::clone(&sink) as _);
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as _);
         let ch = host.open_channel(test_session_id()).await.unwrap();
         host.attach_adapter(&ch, Arc::clone(&adapter) as _)
             .await
@@ -2835,7 +3028,7 @@ mod tests {
         let sink = Arc::new(RecordingProjectionSink::default());
         let dispatcher = Arc::new(RecordingDispatcher::default());
         let adapter = Arc::new(RecordingAdapter::default());
-        let host = LiveAdapterHost::new().with_projection_sink(Arc::clone(&sink) as _);
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as _);
         let ch = host.open_channel(test_session_id()).await.unwrap();
         host.attach_adapter(&ch, Arc::clone(&adapter) as _)
             .await
@@ -2888,8 +3081,7 @@ mod tests {
         let first = Arc::new(RecordingDispatcher::default());
         let second = Arc::new(RecordingDispatcher::default());
         let adapter = Arc::new(RecordingAdapter::default());
-        let host = LiveAdapterHost::new()
-            .with_projection_sink(Arc::clone(&sink) as _)
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as _)
             .with_tool_dispatcher(Arc::clone(&first) as _);
         let ch = host.open_channel(test_session_id()).await.unwrap();
         host.attach_adapter(&ch, Arc::clone(&adapter) as _)
@@ -2916,8 +3108,7 @@ mod tests {
         let sink = Arc::new(RecordingProjectionSink::default());
         let dispatcher = Arc::new(FailingDispatcher);
         let adapter = Arc::new(RecordingAdapter::default());
-        let host = LiveAdapterHost::new()
-            .with_projection_sink(Arc::clone(&sink) as _)
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as _)
             .with_tool_dispatcher(Arc::clone(&dispatcher) as _);
         let ch = host.open_channel(test_session_id()).await.unwrap();
         host.attach_adapter(&ch, Arc::clone(&adapter) as _)
@@ -3016,8 +3207,7 @@ mod tests {
         let sink = Arc::new(RecordingProjectionSink::default());
         let dispatcher = Arc::new(SlowDispatcher::new(dispatcher_sleep));
         let adapter = Arc::new(RecordingAdapter::default());
-        let host = LiveAdapterHost::new()
-            .with_projection_sink(Arc::clone(&sink) as _)
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as _)
             .with_tool_dispatcher(Arc::clone(&dispatcher) as _)
             .with_tool_timeout(timeout);
         let ch = host.open_channel(test_session_id()).await.unwrap();
@@ -3095,8 +3285,7 @@ mod tests {
         let sink = Arc::new(RecordingProjectionSink::default());
         let dispatcher = Arc::new(SlowDispatcher::new(dispatcher_sleep));
         let adapter = Arc::new(RecordingAdapter::default());
-        let host = LiveAdapterHost::new()
-            .with_projection_sink(Arc::clone(&sink) as _)
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as _)
             .with_tool_dispatcher(Arc::clone(&dispatcher) as _)
             .with_tool_timeout(timeout);
         let ch = host.open_channel(test_session_id()).await.unwrap();
@@ -3141,8 +3330,7 @@ mod tests {
         let sink = Arc::new(RecordingProjectionSink::default());
         let dispatcher = Arc::new(RecordingDispatcher::default());
         let adapter = Arc::new(RecordingAdapter::default());
-        let host = LiveAdapterHost::new()
-            .with_projection_sink(Arc::clone(&sink) as _)
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as _)
             .with_tool_dispatcher(Arc::clone(&dispatcher) as _);
         let ch = host.open_channel(test_session_id()).await.unwrap();
         host.attach_adapter(&ch, Arc::clone(&adapter) as _)
@@ -3168,7 +3356,7 @@ mod tests {
     #[tokio::test]
     async fn barge_in_observation_calls_signal_interrupt() {
         let sink = Arc::new(RecordingProjectionSink::default());
-        let host = LiveAdapterHost::new().with_projection_sink(Arc::clone(&sink) as _);
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as _);
         let session_id = test_session_id();
         let ch = host.open_channel(session_id.clone()).await.unwrap();
         let outcome = host
@@ -3195,7 +3383,7 @@ mod tests {
     #[tokio::test]
     async fn terminal_error_observation_marks_channel_closed_and_signals_sink() {
         let sink = Arc::new(RecordingProjectionSink::default());
-        let host = LiveAdapterHost::new().with_projection_sink(Arc::clone(&sink) as _);
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as _);
         let session_id = test_session_id();
         let ch = host.open_channel(session_id.clone()).await.unwrap();
         let obs = LiveAdapterObservation::Error {
@@ -3229,7 +3417,7 @@ mod tests {
         // Verifies that the reverse map honors the same invariant as the
         // prior linear scan: a closed-but-not-yet-reaped channel does not
         // block re-binding the same session.
-        let host = LiveAdapterHost::new();
+        let host = LiveAdapterHost::new(Arc::new(NoOpProjectionSink));
         let s = test_session_id();
         let ch = host.open_channel(s.clone()).await.unwrap();
         host.close_channel(&ch).await.unwrap();

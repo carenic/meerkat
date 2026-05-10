@@ -12,7 +12,8 @@ use meerkat_client::realtime_session::RealtimeSessionFactory;
 use meerkat_client::realtime_session::RealtimeSessionOpenConfig;
 use meerkat_contracts::{
     LiveChannelParams, LiveCommitInputParams, LiveInputChunkWire, LiveOpenParams, LiveOpenResult,
-    LiveSendInputParams, LiveStatusResult, LiveTruncateParams, RealtimeTurningMode,
+    LiveRefreshResult, LiveSendInputParams, LiveStatusResult, LiveTruncateParams,
+    RealtimeTurningMode,
 };
 use meerkat_core::live_adapter::{
     LiveAdapterCommand, LiveChannelCapabilities, LiveContinuityMode, LiveInputChunk,
@@ -577,12 +578,19 @@ pub async fn handle_live_refresh(
         .send_command(&channel_id, LiveAdapterCommand::Refresh { snapshot })
         .await
     {
-        // R7: `refresh_enqueued` (not `refreshed`) — the host has accepted
-        // the command onto the adapter's mpsc queue, but the adapter pump
-        // applies it asynchronously. The realtime stream is the source of
-        // truth for the actual outcome (failures appear as `Error`
-        // observations). See doc-comment on `handle_live_refresh`.
-        Ok(()) => RpcResponse::success(id, serde_json::json!({"refresh_enqueued": true})),
+        // R7 + R4-5: typed `LiveRefreshResult { status: queued,
+        // refresh_enqueued: true }`. The host has accepted the command
+        // onto the adapter's mpsc queue, but the adapter pump applies it
+        // asynchronously — the realtime stream is the source of truth for
+        // the actual outcome (failures appear as `Error` observations).
+        // The `refresh_enqueued` field is preserved for back-compat with
+        // R7-era clients; new code should route on the typed `status`
+        // discriminator. See doc-comment on `handle_live_refresh`.
+        Ok(()) => {
+            let body = serde_json::to_value(LiveRefreshResult::queued())
+                .unwrap_or_else(|_| serde_json::json!({"refresh_enqueued": true}));
+            RpcResponse::success(id, body)
+        }
         Err(LiveAdapterHostError::ChannelNotFound(_)) => RpcResponse::error(
             id,
             error::INVALID_PARAMS,
@@ -1306,7 +1314,9 @@ mod tests {
         use meerkat_core::types::SessionId;
         use std::sync::Arc;
 
-        let host = meerkat_live::LiveAdapterHost::new();
+        let host = meerkat_live::LiveAdapterHost::new(std::sync::Arc::new(
+            meerkat_live::NoOpProjectionSink,
+        ));
         let session_id = SessionId::new();
         let channel_id = host
             .open_channel(session_id.clone())
@@ -1378,7 +1388,9 @@ mod tests {
         use meerkat_core::types::SessionId;
         use std::sync::Arc;
 
-        let host = meerkat_live::LiveAdapterHost::new();
+        let host = meerkat_live::LiveAdapterHost::new(std::sync::Arc::new(
+            meerkat_live::NoOpProjectionSink,
+        ));
         let session_id = SessionId::new();
         let channel_id = host
             .open_channel(session_id.clone())
@@ -1413,20 +1425,35 @@ mod tests {
     // ---------------------------------------------------------------------
 
     /// R7: reconstruct the success-reply shape `handle_live_refresh` emits
-    /// on the host-accepted path. The reply must be `{"refresh_enqueued":
-    /// true}` and must NOT contain a `refreshed` key.
+    /// on the host-accepted path. The reply must carry `refresh_enqueued:
+    /// true` (back-compat) and must NOT contain a `refreshed` key.
+    ///
+    /// R4-5 (P3): the same payload now also carries the typed
+    /// `status: "queued"` discriminator from `LiveRefreshResult`.
     #[test]
     fn live_refresh_success_reply_is_refresh_enqueued_not_refreshed() {
-        // Mirror of the json! literal in `handle_live_refresh`'s Ok arm.
-        let reply = serde_json::json!({"refresh_enqueued": true});
+        // Mirror of the typed payload `handle_live_refresh`'s Ok arm now
+        // emits — `LiveRefreshResult::queued()` round-trips through the same
+        // serde shape the handler ships on the wire.
+        let reply = serde_json::to_value(LiveRefreshResult::queued())
+            .expect("LiveRefreshResult must round-trip through serde");
         assert_eq!(
             reply.get("refresh_enqueued"),
-            Some(&serde_json::json!(true))
+            Some(&serde_json::json!(true)),
+            "back-compat `refresh_enqueued: true` must remain on the wire"
         );
         assert!(
             reply.get("refreshed").is_none(),
             "post-R7 reply must not advertise `refreshed: true` — the adapter \
              pump is async and the field name was a lie about completion timing"
+        );
+        // R4-5 (P3): typed status discriminator coexists with the legacy
+        // boolean. New SDK code routes on `status` and treats unknown
+        // variants as "outcome unknown — observe the realtime stream".
+        assert_eq!(
+            reply.get("status"),
+            Some(&serde_json::Value::String("queued".into())),
+            "typed `status: queued` must be present alongside the legacy field"
         );
     }
 
@@ -1445,7 +1472,9 @@ mod tests {
     async fn host_next_snapshot_version_is_strictly_monotonic_per_channel() {
         use meerkat_core::types::SessionId;
 
-        let host = meerkat_live::LiveAdapterHost::new();
+        let host = meerkat_live::LiveAdapterHost::new(std::sync::Arc::new(
+            meerkat_live::NoOpProjectionSink,
+        ));
         let session_id = SessionId::new();
         let channel_id = host.open_channel(session_id).await.expect("open_channel");
         let v1 = host.next_snapshot_version(&channel_id).await.expect("v1");
@@ -1467,7 +1496,9 @@ mod tests {
         use meerkat_core::types::SessionId;
         use std::sync::Arc;
 
-        let host = meerkat_live::LiveAdapterHost::new();
+        let host = meerkat_live::LiveAdapterHost::new(std::sync::Arc::new(
+            meerkat_live::NoOpProjectionSink,
+        ));
         let session_id = SessionId::new();
         let channel_id = host
             .open_channel(session_id.clone())

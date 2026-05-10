@@ -925,8 +925,7 @@ mod tests {
     #[tokio::test]
     async fn user_transcript_final_records_user_message() {
         let sink: Arc<RecordingSink> = Arc::new(RecordingSink::default());
-        let host = LiveAdapterHost::new()
-            .with_projection_sink(Arc::clone(&sink) as Arc<dyn LiveProjectionSink>);
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as Arc<dyn LiveProjectionSink>);
         let session_id = test_session_id();
         let channel = host.open_channel(session_id.clone()).await.unwrap();
 
@@ -954,8 +953,7 @@ mod tests {
     #[tokio::test]
     async fn assistant_delta_records_delta_append_with_full_identity() {
         let sink: Arc<RecordingSink> = Arc::new(RecordingSink::default());
-        let host = LiveAdapterHost::new()
-            .with_projection_sink(Arc::clone(&sink) as Arc<dyn LiveProjectionSink>);
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as Arc<dyn LiveProjectionSink>);
         let session_id = test_session_id();
         let channel = host.open_channel(session_id.clone()).await.unwrap();
 
@@ -989,8 +987,7 @@ mod tests {
         let sink: Arc<RecordingSink> = Arc::new(RecordingSink::default());
         let dispatcher: Arc<RecordingDispatcher> = Arc::new(RecordingDispatcher::default());
         let adapter: Arc<RecordingAdapter> = Arc::new(RecordingAdapter::default());
-        let host = LiveAdapterHost::new()
-            .with_projection_sink(Arc::clone(&sink) as Arc<dyn LiveProjectionSink>)
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as Arc<dyn LiveProjectionSink>)
             .with_tool_dispatcher(Arc::clone(&dispatcher) as Arc<dyn AgentToolDispatcher>);
         let session_id = test_session_id();
         let channel = host.open_channel(session_id.clone()).await.unwrap();
@@ -1023,8 +1020,7 @@ mod tests {
     #[tokio::test]
     async fn turn_interrupted_signals_interrupt() {
         let sink: Arc<RecordingSink> = Arc::new(RecordingSink::default());
-        let host = LiveAdapterHost::new()
-            .with_projection_sink(Arc::clone(&sink) as Arc<dyn LiveProjectionSink>);
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as Arc<dyn LiveProjectionSink>);
         let session_id = test_session_id();
         let channel = host.open_channel(session_id.clone()).await.unwrap();
 
@@ -1053,8 +1049,7 @@ mod tests {
         // non-empty response_id must reach the sink with the real id, not
         // be silently dropped via fabricated empty values.
         let sink: Arc<RecordingSink> = Arc::new(RecordingSink::default());
-        let host = LiveAdapterHost::new()
-            .with_projection_sink(Arc::clone(&sink) as Arc<dyn LiveProjectionSink>);
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as Arc<dyn LiveProjectionSink>);
         let session_id = test_session_id();
         let channel = host.open_channel(session_id.clone()).await.unwrap();
 
@@ -2223,8 +2218,7 @@ mod tests {
     #[tokio::test]
     async fn round4_cc7_host_apply_observation_routes_mixed_response_through_split_lanes() {
         let sink: Arc<RecordingSink> = Arc::new(RecordingSink::default());
-        let host = LiveAdapterHost::new()
-            .with_projection_sink(Arc::clone(&sink) as Arc<dyn LiveProjectionSink>);
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as Arc<dyn LiveProjectionSink>);
         let session_id = test_session_id();
         let channel = host.open_channel(session_id.clone()).await.unwrap();
 
@@ -2360,8 +2354,7 @@ mod tests {
         // lives in the session.rs CC7 sibling test; here we only assert
         // the host's barge-in routing reaches the sink.
         let sink: Arc<RecordingSink> = Arc::new(RecordingSink::default());
-        let host = LiveAdapterHost::new()
-            .with_projection_sink(Arc::clone(&sink) as Arc<dyn LiveProjectionSink>);
+        let host = LiveAdapterHost::new(Arc::clone(&sink) as Arc<dyn LiveProjectionSink>);
         let session_id = test_session_id();
         let channel = host.open_channel(session_id.clone()).await.unwrap();
 

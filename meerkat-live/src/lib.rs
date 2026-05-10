@@ -12,8 +12,8 @@ pub mod transport;
 
 pub use host::{
     DEFAULT_LIVE_TOOL_TIMEOUT, LiveAdapterHost, LiveAdapterHostError, LiveChannelId,
-    LiveProjectionError, LiveProjectionSink, LiveTranscriptIdentity, ObservationOutcome,
-    ObservationRouting, ToolDispatchSkipReason,
+    LiveProjectionError, LiveProjectionSink, LiveTranscriptIdentity, NoOpProjectionSink,
+    ObservationOutcome, ObservationRouting, ToolDispatchSkipReason,
 };
 pub use transport::{LIVE_WS_PATH, LiveWsState, live_ws_router, serve_live_ws_listener};
 

@@ -689,7 +689,17 @@ impl MethodRouter {
             #[cfg(feature = "mob")]
             closed_mob_streams: Arc::new(Mutex::new(ClosedStreamSet::new())),
             runtime_adapter,
-            live_adapter_host: Arc::new(meerkat_live::LiveAdapterHost::new()),
+            // R5-1 (P2 dogma): the live host now requires a projection sink at
+            // construction. This default RpcRouter wiring path predates any
+            // attached `LiveWsState` (which carries the canonical
+            // `SessionServiceProjectionSink`); a `with_live_ws` call replaces
+            // this placeholder host with the real one. Until then, no
+            // observations can be applied (the host has no adapter / channel),
+            // so installing `NoOpProjectionSink` is safe — it cannot mask a
+            // semantic owner because there is no traffic to project.
+            live_adapter_host: Arc::new(meerkat_live::LiveAdapterHost::new(Arc::new(
+                meerkat_live::NoOpProjectionSink,
+            ))),
             live_ws_state: None,
             live_ws_base_url: None,
             live_session_factory: None,
@@ -998,7 +1008,17 @@ impl MethodRouter {
             active_mob_streams: Arc::new(Mutex::new(HashMap::new())),
             closed_mob_streams: Arc::new(Mutex::new(ClosedStreamSet::new())),
             runtime_adapter,
-            live_adapter_host: Arc::new(meerkat_live::LiveAdapterHost::new()),
+            // R5-1 (P2 dogma): the live host now requires a projection sink at
+            // construction. This default RpcRouter wiring path predates any
+            // attached `LiveWsState` (which carries the canonical
+            // `SessionServiceProjectionSink`); a `with_live_ws` call replaces
+            // this placeholder host with the real one. Until then, no
+            // observations can be applied (the host has no adapter / channel),
+            // so installing `NoOpProjectionSink` is safe — it cannot mask a
+            // semantic owner because there is no traffic to project.
+            live_adapter_host: Arc::new(meerkat_live::LiveAdapterHost::new(Arc::new(
+                meerkat_live::NoOpProjectionSink,
+            ))),
             live_ws_state: None,
             live_ws_base_url: None,
             live_session_factory: None,

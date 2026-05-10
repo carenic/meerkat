@@ -494,6 +494,7 @@ pub async fn serve_live_ws_listener(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::host::NoOpProjectionSink;
 
     #[test]
     fn token_string_accepts_url_safe_alphabet() {
@@ -524,7 +525,7 @@ mod tests {
 
     #[tokio::test]
     async fn mint_and_consume_token() {
-        let host = Arc::new(LiveAdapterHost::new());
+        let host = Arc::new(LiveAdapterHost::new(Arc::new(NoOpProjectionSink)));
         let state = LiveWsState::new(host);
         let channel_id = LiveChannelId::new("test_ch");
         let token = state.mint_token(channel_id.clone()).await;
@@ -542,7 +543,7 @@ mod tests {
 
     #[tokio::test]
     async fn consume_unknown_token_returns_not_found() {
-        let host = Arc::new(LiveAdapterHost::new());
+        let host = Arc::new(LiveAdapterHost::new(Arc::new(NoOpProjectionSink)));
         let state = LiveWsState::new(host);
         let any_channel = LiveChannelId::new("any");
         assert_eq!(
@@ -556,7 +557,7 @@ mod tests {
 
     #[tokio::test]
     async fn consume_malformed_token_returns_not_found() {
-        let host = Arc::new(LiveAdapterHost::new());
+        let host = Arc::new(LiveAdapterHost::new(Arc::new(NoOpProjectionSink)));
         let state = LiveWsState::new(host);
         let any_channel = LiveChannelId::new("any");
         // Spaces are not URL-safe; treated as not-found rather than crashing.
@@ -572,7 +573,7 @@ mod tests {
     #[tokio::test]
     async fn consume_token_with_wrong_channel_rejects() {
         // G38: token minted for channel A must not redeem for channel B.
-        let host = Arc::new(LiveAdapterHost::new());
+        let host = Arc::new(LiveAdapterHost::new(Arc::new(NoOpProjectionSink)));
         let state = LiveWsState::new(host);
         let channel_a = LiveChannelId::new("ch_a");
         let channel_b = LiveChannelId::new("ch_b");
@@ -599,7 +600,7 @@ mod tests {
 
     #[tokio::test]
     async fn token_expires_after_ttl_and_is_reaped() {
-        let host = Arc::new(LiveAdapterHost::new());
+        let host = Arc::new(LiveAdapterHost::new(Arc::new(NoOpProjectionSink)));
         let state = LiveWsState::with_token_ttl(host, Duration::from_millis(50));
         let channel_id = LiveChannelId::new("ttl_ch");
         let token = state.mint_token(channel_id.clone()).await;
@@ -629,7 +630,7 @@ mod tests {
 
     #[tokio::test]
     async fn unrelated_mint_reaps_expired_tokens() {
-        let host = Arc::new(LiveAdapterHost::new());
+        let host = Arc::new(LiveAdapterHost::new(Arc::new(NoOpProjectionSink)));
         let state = LiveWsState::with_token_ttl(host, Duration::from_millis(40));
         let _stale = state.mint_token(LiveChannelId::new("stale")).await;
         assert_eq!(state.pending_token_count().await, 1);
@@ -653,7 +654,7 @@ mod tests {
         // on `next_observation_raw` (pending forever) until the client sends
         // Close. The test no longer relies on any server-initiated close
         // frame as a success signal.
-        let host = Arc::new(LiveAdapterHost::new());
+        let host = Arc::new(LiveAdapterHost::new(Arc::new(NoOpProjectionSink)));
         let session_id = meerkat_core::types::SessionId::new();
         let channel_id = host.open_channel(session_id).await.unwrap();
         host.attach_adapter(&channel_id, Arc::new(IdleAdapter))
@@ -713,9 +714,14 @@ mod tests {
         // R12: ConfigRejected must surface the typed slug so WS clients can
         // distinguish a local-guard rejection from an upstream provider
         // failure without parsing the close-frame reason text.
+        // R5-2: `reason` is now a typed `LiveConfigRejectionReason`; the
+        // slug routes on the outer `code` discriminator and is independent
+        // of the inner reason variant.
         assert_eq!(
             live_adapter_error_code_slug(&LiveAdapterErrorCode::ConfigRejected {
-                reason: "model swap requires close + reopen".into(),
+                reason: meerkat_core::live_adapter::LiveConfigRejectionReason::Other {
+                    detail: "model swap requires close + reopen".into(),
+                },
             }),
             "config_rejected"
         );
@@ -808,7 +814,7 @@ mod tests {
     async fn websocket_closes_on_terminal_observation_with_typed_reason() {
         use meerkat_core::live_adapter::{LiveAdapterErrorCode, LiveAdapterObservation};
 
-        let host = Arc::new(LiveAdapterHost::new());
+        let host = Arc::new(LiveAdapterHost::new(Arc::new(NoOpProjectionSink)));
         let session_id = meerkat_core::types::SessionId::new();
         let channel_id = host.open_channel(session_id).await.unwrap();
         host.attach_adapter(
@@ -881,7 +887,7 @@ mod tests {
     async fn websocket_forwards_command_rejected_without_closing() {
         use meerkat_core::live_adapter::{LiveAdapterErrorCode, LiveAdapterObservation};
 
-        let host = Arc::new(LiveAdapterHost::new());
+        let host = Arc::new(LiveAdapterHost::new(Arc::new(NoOpProjectionSink)));
         let session_id = meerkat_core::types::SessionId::new();
         let channel_id = host.open_channel(session_id).await.unwrap();
         host.attach_adapter(
@@ -889,7 +895,7 @@ mod tests {
             Arc::new(ScriptedAdapter::new(
                 LiveAdapterObservation::CommandRejected {
                     code: LiveAdapterErrorCode::ConfigRejected {
-                        reason: "image_input_not_implemented".into(),
+                        reason: meerkat_core::live_adapter::LiveConfigRejectionReason::ImageInputNotImplemented,
                     },
                     message: "image_input_not_implemented".into(),
                 },
@@ -954,7 +960,7 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_rejects_invalid_token() {
-        let host = Arc::new(LiveAdapterHost::new());
+        let host = Arc::new(LiveAdapterHost::new(Arc::new(NoOpProjectionSink)));
         let state = Arc::new(LiveWsState::new(host));
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -985,7 +991,7 @@ mod tests {
         // G38 end-to-end: token minted for channel A is presented with
         // channel B in the WS upgrade — handler must refuse with
         // `invalid_token` and close.
-        let host = Arc::new(LiveAdapterHost::new());
+        let host = Arc::new(LiveAdapterHost::new(Arc::new(NoOpProjectionSink)));
         let session_a = meerkat_core::types::SessionId::new();
         let session_b = meerkat_core::types::SessionId::new();
         let channel_a = host.open_channel(session_a).await.unwrap();
@@ -1038,7 +1044,7 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_rejects_binary_without_format() {
-        let host = Arc::new(LiveAdapterHost::new());
+        let host = Arc::new(LiveAdapterHost::new(Arc::new(NoOpProjectionSink)));
         let session_id = meerkat_core::types::SessionId::new();
         let channel_id = host.open_channel(session_id).await.unwrap();
         // Attach an idle adapter so the observation arm of the pump's
@@ -1091,7 +1097,7 @@ mod tests {
 
     #[tokio::test]
     async fn websocket_closes_on_invalid_text_frame() {
-        let host = Arc::new(LiveAdapterHost::new());
+        let host = Arc::new(LiveAdapterHost::new(Arc::new(NoOpProjectionSink)));
         let session_id = meerkat_core::types::SessionId::new();
         let channel_id = host.open_channel(session_id).await.unwrap();
         // See `websocket_rejects_binary_without_format` for why the test
@@ -1208,7 +1214,7 @@ mod tests {
         use meerkat_core::live_adapter::LiveAdapterObservation;
         use meerkat_core::types::{StopReason, Usage};
 
-        let host = Arc::new(LiveAdapterHost::new());
+        let host = Arc::new(LiveAdapterHost::new(Arc::new(NoOpProjectionSink)));
         let session_id = meerkat_core::types::SessionId::new();
         let channel_id = host.open_channel(session_id).await.unwrap();
         host.attach_adapter(

@@ -361,8 +361,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         // hold a live provider's turn indefinitely (dogma: the adapter
         // cannot stall canonical session lifecycle).
         let host = std::sync::Arc::new(
-            meerkat_live::LiveAdapterHost::new()
-                .with_projection_sink(projection_sink)
+            meerkat_live::LiveAdapterHost::new(projection_sink)
                 .with_tool_timeout(meerkat_live::DEFAULT_LIVE_TOOL_TIMEOUT),
         );
         let ws_state = std::sync::Arc::new(meerkat_live::LiveWsState::new(host));
