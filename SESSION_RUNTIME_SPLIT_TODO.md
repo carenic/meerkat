@@ -301,7 +301,7 @@ self-verify.
   shims remain RPC-typed (RpcError) and translate via a new
   `recovery_error_to_rpc` adapter.
 
-- [ ] fix · [ ] verify · **W2-C.** Move LLM hot-swap surface
+- [x] fix · [ ] verify · **W2-C.** Move LLM hot-swap surface
   (`hot_swap_llm_client_on_idle_session`, `hot_swap_llm_client`
   minus its `TurnOverrides` parameter shim,
   `derive_reconfigured_visibility_state`, `rollback_idle_hot_swap_failure`,

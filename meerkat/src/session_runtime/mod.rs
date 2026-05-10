@@ -13,6 +13,8 @@
 pub mod admission;
 pub mod errors;
 pub mod live_orchestration;
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+pub mod llm_reconfigure;
 pub mod recovery;
 pub mod runtime_state;
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
