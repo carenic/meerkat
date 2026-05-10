@@ -10593,6 +10593,11 @@ async fn run_rpc_surface<R, W>(
 ) -> anyhow::Result<String>
 where
     R: AsyncBufRead + Unpin,
+    // RPC-host: deploy_mob inline-hosts an RpcServer for the deployed mob session.
+    // `TransportWriter` is the trait bound carrying the RPC-wire write half
+    // (writes framed `RpcResponse`/`RpcNotification` JSON-RPC envelopes — see
+    // `meerkat-rpc/src/transport.rs`). Lifting this would require duplicating
+    // the RPC wire framer; this site legitimately owns the RPC-host role.
     W: meerkat_rpc::transport::TransportWriter,
 {
     let (manifest, persistence) = create_persistence_bundle(scope).await?;
@@ -10642,6 +10647,13 @@ where
         paths.root.join("config_state.json"),
     ));
     let max_sessions = config.max_sessions();
+    // RPC-host: this `SessionRuntime` is the backing runtime for the inline
+    // RpcServer constructed below at `RpcServer::new_with_skill_runtime_and_mob_state`.
+    // `SessionRuntime::new_with_config_store` is the RPC-host constructor —
+    // it owns the JSON-RPC dispatch loop, callback channel, and notification
+    // fan-out. `NotificationSink` (next line) wraps `mpsc::Sender<RpcNotification>`
+    // (RPC wire type — see `meerkat-rpc/src/router.rs`). Both are RPC-host
+    // contracts and not lift candidates.
     let mut runtime = meerkat_rpc::session_runtime::SessionRuntime::new_with_config_store(
         factory,
         config.clone(),
@@ -10697,6 +10709,14 @@ where
         let mcp_external_tools = mcp_external_tools.clone();
         move || {
             let tx = runtime.callback_request_tx()?;
+            // RPC-host: `CallbackToolDispatcher::new` takes a callback request
+            // channel typed as `mpsc::Sender<(RpcRequest, oneshot::Sender<RpcResponse>)>`
+            // plus an `RpcId` counter (see `meerkat-rpc/src/callback_dispatcher.rs`).
+            // Both are JSON-RPC wire types — the dispatcher round-trips tool
+            // calls back through the hosted RpcServer's connected client.
+            // Lifting would require rebuilding the JSON-RPC request/response
+            // pair on a non-RPC channel; this site legitimately owns the
+            // RPC-host role.
             let callback_tools: Arc<dyn meerkat_core::AgentToolDispatcher> = Arc::new(
                 meerkat_rpc::callback_dispatcher::CallbackToolDispatcher::new(
                     runtime.registered_tools(),
@@ -10770,6 +10790,14 @@ where
     )
         as Arc<dyn meerkat_core::service::MobToolsFactory>);
 
+    // RPC-host: this is the canonical RPC-host marker for `deploy_mob` —
+    // the function inline-hosts a full `RpcServer` over the supplied
+    // reader/writer for the lifetime of the deployed mob session.
+    // `RpcServer::new_with_skill_runtime_and_mob_state` owns the JSON-RPC
+    // method router (`meerkat-rpc/src/server.rs`), wires `RpcRequest` →
+    // method dispatch and emits `RpcNotification`s back to the connected
+    // client. By definition this cannot be lifted — `deploy_mob`'s job
+    // *is* to be an RPC host.
     let mut server = meerkat_rpc::server::RpcServer::new_with_skill_runtime_and_mob_state(
         reader,
         writer,
