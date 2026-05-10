@@ -177,6 +177,40 @@ pub fn live_channel_requires_close_for_identity_change(
     }
 }
 
+/// G5 (P1): decide whether `propagate_config_to_live_channels` should
+/// hot-swap a given session to the new global model.
+///
+/// The rule is:
+///
+/// - If the caller did not supply a `prior_global_model`, skip the
+///   hot-swap (we cannot tell tracking from override apart).
+/// - If the session's current model already equals the new global, the
+///   hot-swap would be a no-op — skip it (the per-channel Refresh
+///   fan-out below still runs).
+/// - If the session's current model equals the prior global, the
+///   session was tracking the global → propagate (return `true`).
+/// - Otherwise the session has diverged from the prior global (a
+///   per-session override is in force) → skip to preserve the override.
+///
+/// The "prior global" baseline is the only signal we have for
+/// distinguishing tracking sessions from overridden ones at the moment
+/// the global config has just been mutated; the alternative
+/// (unconditionally broadcasting the new global) trampoles overrides.
+#[must_use]
+pub fn should_apply_global_model_hot_swap(
+    current_session_model: &str,
+    prior_global_model: Option<&str>,
+    new_global_model: &str,
+) -> bool {
+    let Some(prior) = prior_global_model else {
+        return false;
+    };
+    if current_session_model == new_global_model {
+        return false;
+    }
+    current_session_model == prior
+}
+
 /// Build the projection-root system message for a realtime session. The
 /// content is the union of the resolved `system_prompt` (or the first
 /// existing `System`/`SystemNotice` lead) and any session-build
@@ -318,6 +352,7 @@ mod orchestrator {
         build_live_projection_snapshot_for_runtime,
         live_channel_requires_close_for_identity_change, precheck_identity,
         realtime_projection_messages, realtime_projection_runtime_system_context,
+        should_apply_global_model_hot_swap,
     };
 
     use crate::service_factory::FactoryAgentBuilder;
@@ -651,7 +686,27 @@ mod orchestrator {
         /// longer realtime-capable, or if the model/provider was
         /// swapped) to every active live channel. Best-effort:
         /// per-channel errors are swallowed via tracing.
-        pub async fn propagate_config_to_live_channels(&self) {
+        ///
+        /// G5 (P1): `prior_global_model` is the global agent model that
+        /// was in effect *before* the config change that triggered this
+        /// propagation. It is the only signal we have for distinguishing
+        /// a session that was tracking the global from one that carries
+        /// a per-session model override. The hot-swap to the new global
+        /// model is applied **only** to sessions whose current model
+        /// equals `prior_global_model` — sessions whose current model
+        /// differs are assumed to have an override (set via
+        /// `TurnOverrides`, a session-scoped `config/patch`, or an
+        /// open-time identity selection) and MUST NOT be trampled.
+        ///
+        /// When `prior_global_model` is `None` the caller does not know
+        /// the prior baseline; we conservatively skip the global
+        /// hot-swap entirely (preserving overrides at the cost of
+        /// leaving any stale-tracking sessions stale until they next
+        /// reconnect or take a turn). The downstream
+        /// `live_open_config_for_session` + identity-swap-detection
+        /// logic still runs for every channel so model/provider swaps
+        /// caused by other paths still surface as `ConfigRejected`.
+        pub async fn propagate_config_to_live_channels(&self, prior_global_model: Option<&str>) {
             let Some(host) = self.host.as_ref() else {
                 return;
             };
@@ -670,6 +725,39 @@ mod orchestrator {
             {
                 let new_global_model = snapshot.config.agent.model.clone();
                 for session_id in &unique_sessions {
+                    let current_model =
+                        match self.service.live_session_llm_identity(session_id).await {
+                            Ok(identity) => identity.model,
+                            Err(err) => {
+                                tracing::debug!(
+                                    target: "meerkat::session_runtime::live_orchestration",
+                                    ?session_id,
+                                    ?err,
+                                    "live identity lookup failed during config \
+                                     propagation; skipping global hot-swap"
+                                );
+                                continue;
+                            }
+                        };
+                    // G5 (P1): preserve per-session overrides. The pure
+                    // helper encodes the rule (see its doc-comment) so
+                    // it can be unit-tested in isolation.
+                    if !should_apply_global_model_hot_swap(
+                        &current_model,
+                        prior_global_model,
+                        &new_global_model,
+                    ) {
+                        tracing::debug!(
+                            target: "meerkat::session_runtime::live_orchestration",
+                            ?session_id,
+                            current_model = %current_model,
+                            prior_global_model = ?prior_global_model,
+                            new_global_model = %new_global_model,
+                            "skipping global hot-swap on config propagation \
+                             (override or already-synced)"
+                        );
+                        continue;
+                    }
                     let request = SessionLlmReconfigureRequest {
                         model: Some(new_global_model.clone()),
                         provider: None,

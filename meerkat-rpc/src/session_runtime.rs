@@ -3740,12 +3740,21 @@ impl SessionRuntime {
 
     /// Phase 4 R1: thin RPC shim — delegates to
     /// `LiveOrchestrator::propagate_config_to_live_channels`.
-    pub async fn propagate_config_to_live_channels(&self) {
+    ///
+    /// G5 (P1): `prior_global_model` is the global agent model that was
+    /// in effect *before* the config change that triggered the call. It
+    /// is the only available signal for distinguishing a session that
+    /// was tracking the global from a session carrying a per-session
+    /// override (set via `TurnOverrides`, session-scoped `config/patch`,
+    /// or open-time identity). When the caller cannot supply the prior
+    /// baseline, pass `None` — the orchestrator then skips the global
+    /// hot-swap entirely (the conservative path that preserves overrides).
+    pub async fn propagate_config_to_live_channels(&self, prior_global_model: Option<&str>) {
         let snapshot = self.realm_context_snapshot();
         let cleanup = self.archive_runtime_cleanup();
         let host = self.llm_reconfigure_host();
         self.live_orchestrator(&snapshot, cleanup, &host)
-            .propagate_config_to_live_channels()
+            .propagate_config_to_live_channels(prior_global_model)
             .await;
     }
 
@@ -19994,7 +20003,11 @@ mod tests {
             .await
             .expect("set_channel_llm_identity");
 
-        runtime.propagate_config_to_live_channels().await;
+        // G5 (P1): R11 exercises the host-side identity-swap detection
+        // (bound vs. resolved), not the global hot-swap path. Pass None
+        // so the global-hot-swap loop short-circuits and the model-swap
+        // close branch runs against the identity we just set.
+        runtime.propagate_config_to_live_channels(None).await;
 
         // R11 assertion: NO Refresh command was dispatched on the
         // model-swap path. The channel was closed instead.
@@ -20122,7 +20135,9 @@ mod tests {
             .await
             .expect("set_channel_llm_identity");
 
-        runtime.propagate_config_to_live_channels().await;
+        // G5 (P1): see sibling test for rationale. None preserves the
+        // pre-G5 behavior the R11 sibling assertion needs.
+        runtime.propagate_config_to_live_channels(None).await;
 
         // CC2: precheck must succeed (gpt-realtime-2 is realtime + OpenAI),
         // so the no-swap branch must dispatch exactly one Refresh and leave

@@ -276,6 +276,11 @@ pub async fn handle_patch(
             Ok(snapshot) => snapshot.config,
             Err(e) => return runtime_error_to_response(id, e),
         };
+        // G5 (P1): capture the prior global model BEFORE committing the
+        // patch so `propagate_config_to_live_channels` can distinguish
+        // sessions tracking the global from those carrying per-session
+        // overrides.
+        let prior_global_model = current.agent.model.clone();
         let preview = match apply_patch_preview(&current, patch.clone()) {
             Ok(config) => config,
             Err(err) => {
@@ -320,7 +325,12 @@ pub async fn handle_patch(
                 // new resolution is no longer realtime-capable) command to
                 // every active live channel so adapters re-seed against
                 // canonical state. No-op when no live host is attached.
-                runtime.propagate_config_to_live_channels().await;
+                //
+                // G5 (P1): pass the prior global model so per-session
+                // overrides are not trampled by the global broadcast.
+                runtime
+                    .propagate_config_to_live_channels(Some(&prior_global_model))
+                    .await;
                 RpcResponse::success(id, config_response_body(snapshot))
             }
             Err(e) => runtime_error_to_response(id, e),
@@ -337,6 +347,10 @@ pub async fn handle_patch(
             Ok(config) => config,
             Err(e) => return RpcResponse::error(id, error::INTERNAL_ERROR, e.to_string()),
         };
+        // G5 (P1): capture the prior global model BEFORE the patch so
+        // override detection can distinguish tracking sessions from
+        // overridden sessions.
+        let prior_global_model = current.agent.model.clone();
         let preview = match apply_patch_preview(&current, patch.clone()) {
             Ok(config) => config,
             Err(err) => {
@@ -358,7 +372,11 @@ pub async fn handle_patch(
             Ok(config) => {
                 runtime.set_skill_identity_registry(registry);
                 // P1#5: propagate to live channels. See doc-comment above.
-                runtime.propagate_config_to_live_channels().await;
+                // G5 (P1): pass the prior global model so per-session
+                // overrides are not trampled.
+                runtime
+                    .propagate_config_to_live_channels(Some(&prior_global_model))
+                    .await;
                 RpcResponse::success(
                     id,
                     config_response_body(snapshot_from_store(config, config_store)),

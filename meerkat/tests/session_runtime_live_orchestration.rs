@@ -28,7 +28,7 @@
 use meerkat::session_runtime::errors::LiveOpenPrecheckError;
 use meerkat::session_runtime::live_orchestration::{
     apply_precheck_gates, extract_system_prompt_from_seed_messages_runtime,
-    live_channel_requires_close_for_identity_change,
+    live_channel_requires_close_for_identity_change, should_apply_global_model_hot_swap,
 };
 use meerkat_core::types::{Message, SystemMessage, SystemNoticeKind, SystemNoticeMessage};
 use meerkat_core::{Provider, SessionLlmIdentity};
@@ -128,6 +128,71 @@ fn live_channel_no_close_when_no_bound_identity() {
     };
     assert!(!live_channel_requires_close_for_identity_change(
         None, &next
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// G5 (P1) regression: `should_apply_global_model_hot_swap` is the pure
+// rule that decides whether `propagate_config_to_live_channels` should
+// hot-swap a session to the new global model. The cases pin the
+// override-preserving behavior the orchestrator relies on.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn g5_hot_swap_skips_when_prior_global_unknown() {
+    // Caller did not supply a prior baseline → conservative skip
+    // (we cannot tell tracking from override apart).
+    assert!(!should_apply_global_model_hot_swap(
+        "gpt-realtime-2",
+        None,
+        "gpt-realtime-3"
+    ));
+}
+
+#[test]
+fn g5_hot_swap_skips_when_session_already_matches_new_global() {
+    // Session model already equals new global → hot-swap would be a
+    // no-op; the per-channel Refresh fan-out below still runs.
+    assert!(!should_apply_global_model_hot_swap(
+        "gpt-realtime-3",
+        Some("gpt-realtime-2"),
+        "gpt-realtime-3"
+    ));
+}
+
+#[test]
+fn g5_hot_swap_propagates_when_session_was_tracking_prior_global() {
+    // Session was tracking the prior global → safe to retarget to the
+    // new global because there's no per-session override in force.
+    assert!(should_apply_global_model_hot_swap(
+        "gpt-realtime-2",
+        Some("gpt-realtime-2"),
+        "gpt-realtime-3"
+    ));
+}
+
+#[test]
+fn g5_hot_swap_skips_when_session_diverged_from_prior_global() {
+    // Session model differs from BOTH the prior and the new global →
+    // a per-session override is in force (set via TurnOverrides,
+    // session-scoped patch, or open-time identity). MUST NOT trample.
+    assert!(!should_apply_global_model_hot_swap(
+        "gpt-realtime-prior-override",
+        Some("gpt-realtime-2"),
+        "gpt-realtime-3"
+    ));
+}
+
+#[test]
+fn g5_hot_swap_skips_when_override_happens_to_match_new_global() {
+    // Edge: the override target coincides with the new global. The
+    // session was overridden (current != prior), so we skip — the
+    // identity already matches the new global anyway, so the skip is
+    // semantically equivalent to a no-op hot-swap.
+    assert!(!should_apply_global_model_hot_swap(
+        "gpt-realtime-3",
+        Some("gpt-realtime-2"),
+        "gpt-realtime-3"
     ));
 }
 
@@ -348,7 +413,7 @@ mod orchestrator_e2e {
         let fx = build_fixture();
         let orch = orchestrator(&fx);
         // Reaches the early-return branch and does not panic.
-        orch.propagate_config_to_live_channels().await;
+        orch.propagate_config_to_live_channels(None).await;
     }
 
     /// `precheck_live_open` must reject a deferred staged session whose
