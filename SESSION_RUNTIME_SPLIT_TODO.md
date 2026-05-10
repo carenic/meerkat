@@ -266,7 +266,7 @@ self-verify.
 
 ### Phase 2 — Wave 2: surface-agnostic methods (parallel by area)
 
-- [ ] fix · [ ] verify · **W2-A.** Move live-channel orchestration
+- [x] fix · [ ] verify · **W2-A.** Move live-channel orchestration
   methods (`precheck_identity`, `apply_precheck_gates`,
   `precheck_live_open`, `recover_live_session_for_realtime_open`,
   `materialize_staged_session_for_realtime_open`,
