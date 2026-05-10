@@ -847,7 +847,9 @@ mod orchestrator {
                         ?precheck_err,
                         "closing live channel: new resolution not realtime-capable"
                     );
-                    let reason = format!("non_realtime_resolution: {precheck_err:?}");
+                    let reason = meerkat_core::live_adapter::LiveConfigRejectionReason::NonRealtimeResolution {
+                        detail: format!("{precheck_err:?}"),
+                    };
                     let _ = host
                         .signal_terminal_error(
                             &channel_id,
@@ -907,11 +909,13 @@ mod orchestrator {
                         "closing live channel: config patch swapped \
                          model/provider; SDK must reopen against new identity"
                     );
-                    let reason = format!(
-                        "model_swap: {old} -> {new}",
-                        old = prev.model,
-                        new = open_config.llm_identity.model,
-                    );
+                    let reason =
+                        meerkat_core::live_adapter::LiveConfigRejectionReason::ChannelIdentitySwap {
+                            from_model: prev.model.clone(),
+                            from_provider: prev.provider,
+                            to_model: open_config.llm_identity.model.clone(),
+                            to_provider: open_config.llm_identity.provider,
+                        };
                     if let Err(err) = host
                         .signal_terminal_error(
                             &channel_id,

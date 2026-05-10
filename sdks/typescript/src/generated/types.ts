@@ -1924,7 +1924,7 @@ export interface WireLiveAdapterErrorCodeConnectionLost {
 
 export interface WireLiveAdapterErrorCodeConfigRejected {
   code: "config_rejected";
-  reason: string;
+  reason: Record<string, unknown>;
 }
 
 export interface WireLiveAdapterErrorCodeProviderError {

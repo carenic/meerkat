@@ -3026,8 +3026,8 @@ fn map_openai_live_server_error(error: OpenAiServerError) -> LlmError {
 
 use meerkat_core::live_adapter::{
     LiveAdapter, LiveAdapterCommand, LiveAdapterError, LiveAdapterErrorCode,
-    LiveAdapterObservation, LiveAdapterStatus, LiveChannelCapabilities, LiveInputChunk,
-    LiveResponseModality,
+    LiveAdapterObservation, LiveAdapterStatus, LiveChannelCapabilities, LiveConfigRejectionReason,
+    LiveInputChunk, LiveResponseModality,
 };
 use meerkat_core::types::ToolResult as CoreToolResult;
 use std::sync::Mutex as StdMutex;
@@ -3462,12 +3462,29 @@ async fn openai_live_pump(
                             // message that incidentally contains
                             // "image_input" cannot leak across the
                             // scoped/terminal boundary.
+                            // R5-2 (P2 dogma): `ConfigRejected.reason` is a
+                            // typed `LiveConfigRejectionReason`. The
+                            // `InvalidInputShape` arm classifies on the
+                            // closed token set the producer emits via
+                            // `classify_invalid_input_shape` (exact equality,
+                            // not substring). The `InvalidConfig`/
+                            // `InvalidRequest` arms collapse onto
+                            // `Other { detail }` since no caller routes on
+                            // their text today; lifting them onto typed
+                            // variants is left to follow-up work that
+                            // restructures the producer side.
                             let code = match &err {
-                                LlmError::InvalidInputShape { message }
-                                | LlmError::InvalidConfig { message }
+                                LlmError::InvalidInputShape { message } => {
+                                    LiveAdapterErrorCode::ConfigRejected {
+                                        reason: classify_invalid_input_shape(message),
+                                    }
+                                }
+                                LlmError::InvalidConfig { message }
                                 | LlmError::InvalidRequest { message } => {
                                     LiveAdapterErrorCode::ConfigRejected {
-                                        reason: message.clone(),
+                                        reason: LiveConfigRejectionReason::Other {
+                                            detail: message.clone(),
+                                        },
                                     }
                                 }
                                 _ => LiveAdapterErrorCode::ProviderError,
@@ -3498,6 +3515,34 @@ async fn openai_live_pump(
     }
 
     let _ = <OpenAiRealtimeSession as RealtimeSession>::close(&mut session).await;
+}
+
+/// R5-2 (P2 dogma): map an `LlmError::InvalidInputShape { message }`
+/// emitted by `execute_openai_live_command` onto the typed
+/// `LiveConfigRejectionReason`. The producer (the `SendInput` arm of
+/// `execute_openai_live_command`) emits exactly three stable tokens on
+/// the message field — `image_input_not_implemented`,
+/// `video_frame_input_not_implemented`, and
+/// `unsupported_input_chunk_variant` — each of which has a typed sibling
+/// here. The classifier uses **exact equality** on the closed token set
+/// (it does not substring-match), so a future provider error message
+/// that incidentally contains `"image_input"` cannot leak across the
+/// typed boundary. Any unknown token falls back to
+/// [`LiveConfigRejectionReason::UnsupportedInputChunkVariant`] (the
+/// catch-all for input-shape rejections in this surface) rather than
+/// dropping into the diagnostic `Other`, since the variant set here is
+/// exhaustively owned by the producer.
+fn classify_invalid_input_shape(message: &str) -> LiveConfigRejectionReason {
+    match message {
+        "image_input_not_implemented" => LiveConfigRejectionReason::ImageInputNotImplemented,
+        "video_frame_input_not_implemented" => {
+            LiveConfigRejectionReason::VideoFrameInputNotImplemented
+        }
+        "unsupported_input_chunk_variant" => {
+            LiveConfigRejectionReason::UnsupportedInputChunkVariant
+        }
+        _ => LiveConfigRejectionReason::UnsupportedInputChunkVariant,
+    }
 }
 
 /// Execute a `LiveAdapterCommand` against the inner realtime session.
@@ -7734,13 +7779,28 @@ mod tests {
             Some(LiveAdapterObservation::Error { code, message }) => {
                 match code {
                     LiveAdapterErrorCode::ConfigRejected { reason } => {
-                        assert!(
-                            reason.contains("model swap")
-                                && reason.contains("gpt-realtime-mini-v2")
-                                && reason.contains("close + reopen"),
-                            "ConfigRejected reason must name the swap target and direct \
-                             the caller to close + reopen, got: {reason}"
-                        );
+                        // R5-2: refresh-time model-swap surfaces through
+                        // `LlmError::InvalidConfig`, which the pump bins
+                        // into `Other { detail }`. The detail preserves the
+                        // human-readable swap text the producer emits, so
+                        // SDK consumers that observe `Other` still see the
+                        // swap target in `detail` for diagnostics.
+                        match &reason {
+                            LiveConfigRejectionReason::Other { detail } => {
+                                assert!(
+                                    detail.contains("model swap")
+                                        && detail.contains("gpt-realtime-mini-v2")
+                                        && detail.contains("close + reopen"),
+                                    "ConfigRejected.Other.detail must name the swap \
+                                     target and direct the caller to close + reopen, \
+                                     got: {detail}"
+                                );
+                            }
+                            other => panic!(
+                                "refresh-time model swap must currently bin to \
+                                 LiveConfigRejectionReason::Other, got: {other:?}"
+                            ),
+                        }
                     }
                     other => panic!(
                         "model-swap rejection must surface as ConfigRejected, \
@@ -7823,7 +7883,12 @@ mod tests {
             // so the pump emits `CommandRejected`, not the terminal `Error`.
             Some(LiveAdapterObservation::CommandRejected { code, message }) => match code {
                 LiveAdapterErrorCode::ConfigRejected { reason } => {
-                    assert_eq!(reason, "image_input_not_implemented");
+                    // R5-2: image input rejection surfaces as the typed
+                    // `ImageInputNotImplemented` variant.
+                    assert!(matches!(
+                        reason,
+                        LiveConfigRejectionReason::ImageInputNotImplemented
+                    ));
                     assert!(
                         message.contains("image_input_not_implemented"),
                         "CommandRejected.message must mirror the typed reason, got {message}"
@@ -7890,7 +7955,12 @@ mod tests {
             // counterpart for the same `CommandRejected` taxonomy.
             Some(LiveAdapterObservation::CommandRejected { code, message }) => match code {
                 LiveAdapterErrorCode::ConfigRejected { reason } => {
-                    assert_eq!(reason, "video_frame_input_not_implemented");
+                    // R5-2: video-frame input rejection surfaces as the
+                    // typed `VideoFrameInputNotImplemented` variant.
+                    assert!(matches!(
+                        reason,
+                        LiveConfigRejectionReason::VideoFrameInputNotImplemented
+                    ));
                     assert!(
                         message.contains("video_frame_input_not_implemented"),
                         "CommandRejected.message must mirror the typed reason, got {message}"
@@ -8316,7 +8386,9 @@ mod tests {
 
         let synthetic = LiveAdapterObservation::Error {
             code: LiveAdapterErrorCode::ConfigRejected {
-                reason: "model_swap_test".into(),
+                reason: LiveConfigRejectionReason::Other {
+                    detail: "model_swap_test".into(),
+                },
             },
             message: "model_swap_test".into(),
         };

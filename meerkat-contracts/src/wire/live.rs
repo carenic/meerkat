@@ -15,9 +15,11 @@
 
 use serde::{Deserialize, Serialize};
 
+use meerkat_core::Provider;
 use meerkat_core::live_adapter::{
     LiveAdapterErrorCode, LiveAdapterObservation, LiveAdapterStatus, LiveChannelCapabilities,
-    LiveContinuityMode, LiveDegradationReason, LiveResponseModality, LiveTransportBootstrap,
+    LiveConfigRejectionReason, LiveContinuityMode, LiveDegradationReason, LiveResponseModality,
+    LiveTransportBootstrap,
 };
 use meerkat_core::realtime_transcript::RealtimeTranscriptEvent;
 use meerkat_core::types::Usage;
@@ -654,6 +656,11 @@ impl From<LiveAdapterStatus> for WireLiveAdapterStatus {
 /// (`config_rejected { reason }`, `other { raw }`). FIX-SDK-OBS: makes the
 /// R5-9 `CommandRejected` observation's typed code visible at the SDK
 /// boundary instead of a free-form blob.
+///
+/// R5-2 (P2 dogma): `config_rejected.reason` is now a typed
+/// [`WireLiveConfigRejectionReason`] mirror so SDK consumers route on the
+/// variant rather than parsing English from the previous free-form
+/// `String`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "code", rename_all = "snake_case")]
@@ -661,11 +668,158 @@ impl From<LiveAdapterStatus> for WireLiveAdapterStatus {
 pub enum WireLiveAdapterErrorCode {
     ConnectionFailed,
     ConnectionLost,
-    ConfigRejected { reason: String },
+    ConfigRejected {
+        reason: WireLiveConfigRejectionReason,
+    },
     ProviderError,
     AuthenticationFailed,
     InternalError,
-    Other { raw: String },
+    Other {
+        raw: String,
+    },
+}
+
+/// Wire mirror of
+/// [`meerkat_core::live_adapter::LiveConfigRejectionReason`]. R5-2 (P2
+/// dogma): pins the typed semantic-routing variants on the wire so SDKs
+/// can distinguish a runtime-side identity swap from an adapter-side
+/// input-modality rejection without string parsing.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WireLiveConfigRejectionReason {
+    ChannelIdentitySwap {
+        from_model: String,
+        from_provider: Provider,
+        to_model: String,
+        to_provider: Provider,
+    },
+    NonRealtimeResolution {
+        detail: String,
+    },
+    ImageInputNotImplemented,
+    VideoFrameInputNotImplemented,
+    UnsupportedInputChunkVariant,
+    RefreshModelSwap {
+        from_model: String,
+        to_model: String,
+    },
+    RefreshProviderSwap {
+        from_provider: String,
+        to_provider: String,
+    },
+    RefreshAudioConfigMismatch {
+        detail: String,
+    },
+    Other {
+        detail: String,
+    },
+}
+
+impl From<LiveConfigRejectionReason> for WireLiveConfigRejectionReason {
+    fn from(value: LiveConfigRejectionReason) -> Self {
+        match value {
+            LiveConfigRejectionReason::ChannelIdentitySwap {
+                from_model,
+                from_provider,
+                to_model,
+                to_provider,
+            } => Self::ChannelIdentitySwap {
+                from_model,
+                from_provider,
+                to_model,
+                to_provider,
+            },
+            LiveConfigRejectionReason::NonRealtimeResolution { detail } => {
+                Self::NonRealtimeResolution { detail }
+            }
+            LiveConfigRejectionReason::ImageInputNotImplemented => Self::ImageInputNotImplemented,
+            LiveConfigRejectionReason::VideoFrameInputNotImplemented => {
+                Self::VideoFrameInputNotImplemented
+            }
+            LiveConfigRejectionReason::UnsupportedInputChunkVariant => {
+                Self::UnsupportedInputChunkVariant
+            }
+            LiveConfigRejectionReason::RefreshModelSwap {
+                from_model,
+                to_model,
+            } => Self::RefreshModelSwap {
+                from_model,
+                to_model,
+            },
+            LiveConfigRejectionReason::RefreshProviderSwap {
+                from_provider,
+                to_provider,
+            } => Self::RefreshProviderSwap {
+                from_provider,
+                to_provider,
+            },
+            LiveConfigRejectionReason::RefreshAudioConfigMismatch { detail } => {
+                Self::RefreshAudioConfigMismatch { detail }
+            }
+            LiveConfigRejectionReason::Other { detail } => Self::Other { detail },
+            _ => {
+                debug_assert!(
+                    false,
+                    "WireLiveConfigRejectionReason::from saw an unmapped \
+                     LiveConfigRejectionReason variant; add an explicit arm \
+                     in meerkat-contracts/src/wire/live.rs."
+                );
+                Self::Other {
+                    detail: "unknown_live_config_rejection_reason".to_string(),
+                }
+            }
+        }
+    }
+}
+
+impl From<WireLiveConfigRejectionReason> for LiveConfigRejectionReason {
+    fn from(value: WireLiveConfigRejectionReason) -> Self {
+        match value {
+            WireLiveConfigRejectionReason::ChannelIdentitySwap {
+                from_model,
+                from_provider,
+                to_model,
+                to_provider,
+            } => Self::ChannelIdentitySwap {
+                from_model,
+                from_provider,
+                to_model,
+                to_provider,
+            },
+            WireLiveConfigRejectionReason::NonRealtimeResolution { detail } => {
+                Self::NonRealtimeResolution { detail }
+            }
+            WireLiveConfigRejectionReason::ImageInputNotImplemented => {
+                Self::ImageInputNotImplemented
+            }
+            WireLiveConfigRejectionReason::VideoFrameInputNotImplemented => {
+                Self::VideoFrameInputNotImplemented
+            }
+            WireLiveConfigRejectionReason::UnsupportedInputChunkVariant => {
+                Self::UnsupportedInputChunkVariant
+            }
+            WireLiveConfigRejectionReason::RefreshModelSwap {
+                from_model,
+                to_model,
+            } => Self::RefreshModelSwap {
+                from_model,
+                to_model,
+            },
+            WireLiveConfigRejectionReason::RefreshProviderSwap {
+                from_provider,
+                to_provider,
+            } => Self::RefreshProviderSwap {
+                from_provider,
+                to_provider,
+            },
+            WireLiveConfigRejectionReason::RefreshAudioConfigMismatch { detail } => {
+                Self::RefreshAudioConfigMismatch { detail }
+            }
+            WireLiveConfigRejectionReason::Other { detail } => Self::Other { detail },
+        }
+    }
 }
 
 impl From<LiveAdapterErrorCode> for WireLiveAdapterErrorCode {
@@ -673,7 +827,9 @@ impl From<LiveAdapterErrorCode> for WireLiveAdapterErrorCode {
         match value {
             LiveAdapterErrorCode::ConnectionFailed => Self::ConnectionFailed,
             LiveAdapterErrorCode::ConnectionLost => Self::ConnectionLost,
-            LiveAdapterErrorCode::ConfigRejected { reason } => Self::ConfigRejected { reason },
+            LiveAdapterErrorCode::ConfigRejected { reason } => Self::ConfigRejected {
+                reason: reason.into(),
+            },
             LiveAdapterErrorCode::ProviderError => Self::ProviderError,
             LiveAdapterErrorCode::AuthenticationFailed => Self::AuthenticationFailed,
             LiveAdapterErrorCode::InternalError => Self::InternalError,
@@ -696,7 +852,9 @@ impl From<WireLiveAdapterErrorCode> for LiveAdapterErrorCode {
         match value {
             WireLiveAdapterErrorCode::ConnectionFailed => Self::ConnectionFailed,
             WireLiveAdapterErrorCode::ConnectionLost => Self::ConnectionLost,
-            WireLiveAdapterErrorCode::ConfigRejected { reason } => Self::ConfigRejected { reason },
+            WireLiveAdapterErrorCode::ConfigRejected { reason } => Self::ConfigRejected {
+                reason: reason.into(),
+            },
             WireLiveAdapterErrorCode::ProviderError => Self::ProviderError,
             WireLiveAdapterErrorCode::AuthenticationFailed => Self::AuthenticationFailed,
             WireLiveAdapterErrorCode::InternalError => Self::InternalError,
@@ -1461,7 +1619,7 @@ mod tests {
             // R5-9: typed `CommandRejected` is now a first-class wire variant.
             WireLiveAdapterObservation::CommandRejected {
                 code: WireLiveAdapterErrorCode::ConfigRejected {
-                    reason: "image_input_not_implemented".into(),
+                    reason: WireLiveConfigRejectionReason::ImageInputNotImplemented,
                 },
                 message: "adapter rejected image".into(),
             },
@@ -1505,14 +1663,18 @@ mod tests {
     fn wire_live_adapter_observation_command_rejected_visible_as_typed_variant() {
         let v = WireLiveAdapterObservation::CommandRejected {
             code: WireLiveAdapterErrorCode::ConfigRejected {
-                reason: "video_frame_input_not_implemented".into(),
+                reason: WireLiveConfigRejectionReason::VideoFrameInputNotImplemented,
             },
             message: "rejected".into(),
         };
         let j = serde_json::to_value(&v).expect("round-trip should succeed");
         assert_eq!(j["observation"], "command_rejected");
         assert_eq!(j["code"]["code"], "config_rejected");
-        assert_eq!(j["code"]["reason"], "video_frame_input_not_implemented");
+        // R5-2: `reason` is the typed enum, internally tagged on `kind`.
+        assert_eq!(
+            j["code"]["reason"]["kind"],
+            "video_frame_input_not_implemented"
+        );
     }
 
     #[test]
@@ -1539,7 +1701,7 @@ mod tests {
     fn wire_live_adapter_observation_byte_compatible_with_core_for_command_rejected() {
         let core = LiveAdapterObservation::CommandRejected {
             code: LiveAdapterErrorCode::ConfigRejected {
-                reason: "image_input_not_implemented".into(),
+                reason: LiveConfigRejectionReason::ImageInputNotImplemented,
             },
             message: "rejected".into(),
         };

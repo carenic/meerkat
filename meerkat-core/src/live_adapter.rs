@@ -11,6 +11,7 @@ use std::borrow::Cow;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::provider::Provider;
 use crate::realtime_transcript::RealtimeTranscriptEvent;
 use crate::session::PendingSystemContextAppend;
 use crate::types::{ContentBlock, Message, SessionId, StopReason, ToolDef, Usage};
@@ -420,8 +421,13 @@ pub enum LiveAdapterErrorCode {
     /// and the caller must close + reopen the channel. Clients that
     /// previously had to parse English from `ProviderError` messages can now
     /// route on the typed code.
+    ///
+    /// R5-2 (P2 dogma): the carried reason is a typed
+    /// [`LiveConfigRejectionReason`], not a free-form `String`. Callers
+    /// route on the variant; the variant's `Display` impl produces a
+    /// human-readable summary for logs / WS close-frame `message` fields.
     ConfigRejected {
-        reason: String,
+        reason: LiveConfigRejectionReason,
     },
     ProviderError,
     AuthenticationFailed,
@@ -430,6 +436,134 @@ pub enum LiveAdapterErrorCode {
     Other {
         raw: String,
     },
+}
+
+/// Typed semantic reasons a [`LiveAdapterErrorCode::ConfigRejected`] is
+/// raised. R5-2 (P2 dogma): replaces the previous free-form `String` so
+/// downstream consumers can route on the variant rather than parsing
+/// English from a diagnostic blob.
+///
+/// Variants split into:
+///
+/// * **Runtime-side identity gates** (the runtime detected the live
+///   channel's bound identity diverges from the session's resolved
+///   identity, or a per-session post-`config/patch` precheck failed):
+///   [`Self::ChannelIdentitySwap`], [`Self::NonRealtimeResolution`].
+/// * **Adapter-side input-shape gates** (the adapter cannot deliver the
+///   requested input modality on the bound provider):
+///   [`Self::ImageInputNotImplemented`],
+///   [`Self::VideoFrameInputNotImplemented`],
+///   [`Self::UnsupportedInputChunkVariant`].
+/// * **Adapter-side refresh gates** (the adapter rejected an in-place
+///   `session.update`-style refresh because the snapshot mutated a field
+///   the provider session cannot rebind in place):
+///   [`Self::RefreshModelSwap`], [`Self::RefreshProviderSwap`],
+///   [`Self::RefreshAudioConfigMismatch`].
+/// * **Diagnostic catch-all**: [`Self::Other`] for one-off explanations
+///   not yet worth typing. New routing-relevant cases must add a typed
+///   variant rather than leaning on [`Self::Other`].
+///
+/// Wire shape: internally tagged on `kind` (snake_case) so SDK consumers
+/// can route on the discriminator. `#[non_exhaustive]` so future variants
+/// don't break existing callers.
+#[cfg_attr(feature = "schema", derive(JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum LiveConfigRejectionReason {
+    /// Runtime detected the live channel's bound LLM identity diverges
+    /// from the session's resolved identity (typically after a global
+    /// `config/patch` model/provider swap). The channel cannot rebind
+    /// in place; the SDK must close + reopen against the new identity.
+    ChannelIdentitySwap {
+        from_model: String,
+        from_provider: Provider,
+        to_model: String,
+        to_provider: Provider,
+    },
+    /// Per-session post-`config/patch` precheck rejected the channel
+    /// because the new resolved model is not realtime-capable, or the
+    /// new provider has no live adapter implementation. `detail` is a
+    /// best-effort projection of the underlying
+    /// `LiveOpenPrecheckError` for logs.
+    NonRealtimeResolution { detail: String },
+    /// Adapter rejected a `LiveInputChunk::Image` because the bound
+    /// provider does not support image input on its realtime surface.
+    ImageInputNotImplemented,
+    /// Adapter rejected a `LiveInputChunk::VideoFrame` because the bound
+    /// provider does not support video-frame input on its realtime
+    /// surface.
+    VideoFrameInputNotImplemented,
+    /// Adapter rejected a future `LiveInputChunk` variant the bound
+    /// provider does not yet implement. `LiveInputChunk` is
+    /// `#[non_exhaustive]`; this variant covers the same shape on the
+    /// rejection side.
+    UnsupportedInputChunkVariant,
+    /// Adapter-side `Refresh` rejected because the snapshot's model
+    /// differs from the bound model — provider session.update cannot
+    /// remap model in place; close + reopen required.
+    RefreshModelSwap {
+        from_model: String,
+        to_model: String,
+    },
+    /// Adapter-side `Refresh` rejected because the snapshot's provider
+    /// differs from the bound provider — close + reopen required.
+    RefreshProviderSwap {
+        from_provider: String,
+        to_provider: String,
+    },
+    /// Adapter-side `Refresh` rejected because the snapshot's audio
+    /// config cannot be applied in place (e.g. OpenAI Realtime's session
+    /// is fixed to pcm/24kHz mono). `detail` carries the offending
+    /// rate/channel projection for logs.
+    RefreshAudioConfigMismatch { detail: String },
+    /// Diagnostic catch-all for free-form explanations not yet worth
+    /// typing. Add a typed variant before reaching for this; callers
+    /// must not pattern-match on `detail` for routing.
+    Other { detail: String },
+}
+
+impl std::fmt::Display for LiveConfigRejectionReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::ChannelIdentitySwap {
+                from_model,
+                from_provider,
+                to_model,
+                to_provider,
+            } => {
+                write!(
+                    f,
+                    "model_swap: {from_model} ({from_provider:?}) -> {to_model} ({to_provider:?})"
+                )
+            }
+            Self::NonRealtimeResolution { detail } => {
+                write!(f, "non_realtime_resolution: {detail}")
+            }
+            Self::ImageInputNotImplemented => f.write_str("image_input_not_implemented"),
+            Self::VideoFrameInputNotImplemented => f.write_str("video_frame_input_not_implemented"),
+            Self::UnsupportedInputChunkVariant => f.write_str("unsupported_input_chunk_variant"),
+            Self::RefreshModelSwap {
+                from_model,
+                to_model,
+            } => write!(
+                f,
+                "live adapter refresh: model swap from `{from_model}` to `{to_model}` requires close + reopen \
+                 (provider session.update cannot rebind model in place)"
+            ),
+            Self::RefreshProviderSwap {
+                from_provider,
+                to_provider,
+            } => write!(
+                f,
+                "live adapter refresh: provider swap from `{from_provider}` to `{to_provider}` requires close + reopen"
+            ),
+            Self::RefreshAudioConfigMismatch { detail } => {
+                write!(f, "live adapter refresh: audio config mismatch ({detail})")
+            }
+            Self::Other { detail } => f.write_str(detail),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1392,7 +1526,7 @@ mod tests {
     fn observation_command_rejected_round_trips_with_distinct_tag() {
         let obs = LiveAdapterObservation::CommandRejected {
             code: LiveAdapterErrorCode::ConfigRejected {
-                reason: "image_input_not_implemented".into(),
+                reason: LiveConfigRejectionReason::ImageInputNotImplemented,
             },
             message: "image_input_not_implemented".into(),
         };
@@ -1744,27 +1878,87 @@ mod tests {
 
     #[test]
     fn adapter_error_code_config_rejected_round_trips() {
-        // R12: ConfigRejected carries a free-form reason string but routes
-        // distinctly from ProviderError so callers can act on the typed code
-        // without parsing English from the message field.
+        // R12 + R5-2: ConfigRejected carries a typed
+        // `LiveConfigRejectionReason` and routes distinctly from
+        // ProviderError so callers can act on the typed code (and now the
+        // typed reason variant) without parsing English from the message
+        // field.
         let code = LiveAdapterErrorCode::ConfigRejected {
-            reason: "model swap from gpt-realtime to gpt-realtime-mini-v2 \
-                     requires close + reopen"
-                .to_string(),
+            reason: LiveConfigRejectionReason::RefreshModelSwap {
+                from_model: "gpt-realtime".to_string(),
+                to_model: "gpt-realtime-mini-v2".to_string(),
+            },
         };
         let json = serde_json::to_string(&code).unwrap();
         assert!(
             json.contains("\"code\":\"config_rejected\""),
             "ConfigRejected must serialize with the snake_case tag, got {json}"
         );
-        assert!(json.contains("close + reopen"));
+        assert!(
+            json.contains("\"kind\":\"refresh_model_swap\""),
+            "reason must serialize with its typed kind discriminator, got {json}"
+        );
         let deser: LiveAdapterErrorCode = serde_json::from_str(&json).unwrap();
         assert_eq!(code, deser);
         match deser {
             LiveAdapterErrorCode::ConfigRejected { reason } => {
-                assert!(reason.contains("close + reopen"));
+                assert!(matches!(
+                    reason,
+                    LiveConfigRejectionReason::RefreshModelSwap { ref to_model, .. }
+                        if to_model == "gpt-realtime-mini-v2"
+                ));
+                // Display impl preserves the human-readable swap text used
+                // by `signal_terminal_error` to populate `Error.message`.
+                assert!(format!("{reason}").contains("close + reopen"));
             }
             other => panic!("expected ConfigRejected, got {other:?}"),
+        }
+    }
+
+    /// R5-2 (P2 dogma): every typed `LiveConfigRejectionReason` variant
+    /// round-trips through JSON byte-identical and preserves variant
+    /// identity after deserialization. This is the structural gate that
+    /// pins the wire-visible discriminator (`kind`) on every variant.
+    #[test]
+    fn config_rejection_reason_round_trips_each_typed_variant() {
+        let cases = vec![
+            LiveConfigRejectionReason::ChannelIdentitySwap {
+                from_model: "gpt-realtime".into(),
+                from_provider: Provider::OpenAI,
+                to_model: "gpt-realtime-2".into(),
+                to_provider: Provider::OpenAI,
+            },
+            LiveConfigRejectionReason::NonRealtimeResolution {
+                detail: "ModelNotRealtime { model: \"gpt-5.4\", provider: \"openai\" }".into(),
+            },
+            LiveConfigRejectionReason::ImageInputNotImplemented,
+            LiveConfigRejectionReason::VideoFrameInputNotImplemented,
+            LiveConfigRejectionReason::UnsupportedInputChunkVariant,
+            LiveConfigRejectionReason::RefreshModelSwap {
+                from_model: "gpt-realtime".into(),
+                to_model: "gpt-realtime-2".into(),
+            },
+            LiveConfigRejectionReason::RefreshProviderSwap {
+                from_provider: "openai".into(),
+                to_provider: "anthropic".into(),
+            },
+            LiveConfigRejectionReason::RefreshAudioConfigMismatch {
+                detail: "rate=16000/16000 ch=1/1 cannot be applied in place".into(),
+            },
+            LiveConfigRejectionReason::Other {
+                detail: "diagnostic catch-all".into(),
+            },
+        ];
+        for case in cases {
+            let json = serde_json::to_string(&case).unwrap();
+            assert!(
+                json.contains("\"kind\":\""),
+                "reason must carry a `kind` discriminator, got {json}"
+            );
+            let back: LiveConfigRejectionReason = serde_json::from_str(&json).unwrap();
+            assert_eq!(case, back, "round-trip must preserve identity");
+            // Display never panics and always produces non-empty text.
+            assert!(!format!("{case}").is_empty());
         }
     }
 

@@ -1762,6 +1762,11 @@ WireLiveAdapterStatus = WireLiveAdapterStatusIdle | WireLiveAdapterStatusOpening
 # (`config_rejected { reason }`, `other { raw }`). FIX-SDK-OBS: makes the
 # R5-9 `CommandRejected` observation's typed code visible at the SDK
 # boundary instead of a free-form blob.
+#
+# R5-2 (P2 dogma): `config_rejected.reason` is now a typed
+# [`WireLiveConfigRejectionReason`] mirror so SDK consumers route on the
+# variant rather than parsing English from the previous free-form
+# `String`.
 class WireLiveAdapterErrorCodeConnectionFailed(TypedDict, total=False):
     code: Required[Literal['connection_failed']]
 
@@ -1770,7 +1775,7 @@ class WireLiveAdapterErrorCodeConnectionLost(TypedDict, total=False):
 
 class WireLiveAdapterErrorCodeConfigRejected(TypedDict, total=False):
     code: Required[Literal['config_rejected']]
-    reason: Required[str]
+    reason: Required[dict[str, Any]]
 
 class WireLiveAdapterErrorCodeProviderError(TypedDict, total=False):
     code: Required[Literal['provider_error']]

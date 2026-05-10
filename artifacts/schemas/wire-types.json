@@ -22829,8 +22829,178 @@
     "type": "object"
   },
   "WireLiveAdapterErrorCode": {
+    "$defs": {
+      "Provider": {
+        "description": "Supported LLM providers.",
+        "enum": [
+          "anthropic",
+          "open_a_i",
+          "gemini",
+          "self_hosted",
+          "other"
+        ],
+        "type": "string"
+      },
+      "WireLiveConfigRejectionReason": {
+        "description": "Wire mirror of\n[`meerkat_core::live_adapter::LiveConfigRejectionReason`]. R5-2 (P2\ndogma): pins the typed semantic-routing variants on the wire so SDKs\ncan distinguish a runtime-side identity swap from an adapter-side\ninput-modality rejection without string parsing.",
+        "oneOf": [
+          {
+            "properties": {
+              "from_model": {
+                "type": "string"
+              },
+              "from_provider": {
+                "$ref": "#/$defs/Provider"
+              },
+              "kind": {
+                "const": "channel_identity_swap",
+                "type": "string"
+              },
+              "to_model": {
+                "type": "string"
+              },
+              "to_provider": {
+                "$ref": "#/$defs/Provider"
+              }
+            },
+            "required": [
+              "kind",
+              "from_model",
+              "from_provider",
+              "to_model",
+              "to_provider"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "detail": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "non_realtime_resolution",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "image_input_not_implemented",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "video_frame_input_not_implemented",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "unsupported_input_chunk_variant",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "from_model": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "refresh_model_swap",
+                "type": "string"
+              },
+              "to_model": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "from_model",
+              "to_model"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "from_provider": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "refresh_provider_swap",
+                "type": "string"
+              },
+              "to_provider": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "from_provider",
+              "to_provider"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "detail": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "refresh_audio_config_mismatch",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "detail": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "other",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "detail"
+            ],
+            "type": "object"
+          }
+        ]
+      }
+    },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "description": "Wire mirror of [`meerkat_core::live_adapter::LiveAdapterErrorCode`].\n\nInternally-tagged on `code` (snake_case). SDK consumers route on `code`\nto distinguish payload-less variants from typed payload variants\n(`config_rejected { reason }`, `other { raw }`). FIX-SDK-OBS: makes the\nR5-9 `CommandRejected` observation's typed code visible at the SDK\nboundary instead of a free-form blob.",
+    "description": "Wire mirror of [`meerkat_core::live_adapter::LiveAdapterErrorCode`].\n\nInternally-tagged on `code` (snake_case). SDK consumers route on `code`\nto distinguish payload-less variants from typed payload variants\n(`config_rejected { reason }`, `other { raw }`). FIX-SDK-OBS: makes the\nR5-9 `CommandRejected` observation's typed code visible at the SDK\nboundary instead of a free-form blob.\n\nR5-2 (P2 dogma): `config_rejected.reason` is now a typed\n[`WireLiveConfigRejectionReason`] mirror so SDK consumers route on the\nvariant rather than parsing English from the previous free-form\n`String`.",
     "oneOf": [
       {
         "properties": {
@@ -22863,7 +23033,7 @@
             "type": "string"
           },
           "reason": {
-            "type": "string"
+            "$ref": "#/$defs/WireLiveConfigRejectionReason"
           }
         },
         "required": [
@@ -22929,6 +23099,17 @@
   },
   "WireLiveAdapterObservation": {
     "$defs": {
+      "Provider": {
+        "description": "Supported LLM providers.",
+        "enum": [
+          "anthropic",
+          "open_a_i",
+          "gemini",
+          "self_hosted",
+          "other"
+        ],
+        "type": "string"
+      },
       "RealtimeTranscriptEvent": {
         "description": "A typed, identity-bearing realtime transcript event consumed by the session.",
         "oneOf": [
@@ -23289,7 +23470,7 @@
         "type": "object"
       },
       "WireLiveAdapterErrorCode": {
-        "description": "Wire mirror of [`meerkat_core::live_adapter::LiveAdapterErrorCode`].\n\nInternally-tagged on `code` (snake_case). SDK consumers route on `code`\nto distinguish payload-less variants from typed payload variants\n(`config_rejected { reason }`, `other { raw }`). FIX-SDK-OBS: makes the\nR5-9 `CommandRejected` observation's typed code visible at the SDK\nboundary instead of a free-form blob.",
+        "description": "Wire mirror of [`meerkat_core::live_adapter::LiveAdapterErrorCode`].\n\nInternally-tagged on `code` (snake_case). SDK consumers route on `code`\nto distinguish payload-less variants from typed payload variants\n(`config_rejected { reason }`, `other { raw }`). FIX-SDK-OBS: makes the\nR5-9 `CommandRejected` observation's typed code visible at the SDK\nboundary instead of a free-form blob.\n\nR5-2 (P2 dogma): `config_rejected.reason` is now a typed\n[`WireLiveConfigRejectionReason`] mirror so SDK consumers route on the\nvariant rather than parsing English from the previous free-form\n`String`.",
         "oneOf": [
           {
             "properties": {
@@ -23322,7 +23503,7 @@
                 "type": "string"
               },
               "reason": {
-                "type": "string"
+                "$ref": "#/$defs/WireLiveConfigRejectionReason"
               }
             },
             "required": [
@@ -23461,6 +23642,163 @@
             },
             "required": [
               "status"
+            ],
+            "type": "object"
+          }
+        ]
+      },
+      "WireLiveConfigRejectionReason": {
+        "description": "Wire mirror of\n[`meerkat_core::live_adapter::LiveConfigRejectionReason`]. R5-2 (P2\ndogma): pins the typed semantic-routing variants on the wire so SDKs\ncan distinguish a runtime-side identity swap from an adapter-side\ninput-modality rejection without string parsing.",
+        "oneOf": [
+          {
+            "properties": {
+              "from_model": {
+                "type": "string"
+              },
+              "from_provider": {
+                "$ref": "#/$defs/Provider"
+              },
+              "kind": {
+                "const": "channel_identity_swap",
+                "type": "string"
+              },
+              "to_model": {
+                "type": "string"
+              },
+              "to_provider": {
+                "$ref": "#/$defs/Provider"
+              }
+            },
+            "required": [
+              "kind",
+              "from_model",
+              "from_provider",
+              "to_model",
+              "to_provider"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "detail": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "non_realtime_resolution",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "image_input_not_implemented",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "video_frame_input_not_implemented",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "kind": {
+                "const": "unsupported_input_chunk_variant",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "from_model": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "refresh_model_swap",
+                "type": "string"
+              },
+              "to_model": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "from_model",
+              "to_model"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "from_provider": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "refresh_provider_swap",
+                "type": "string"
+              },
+              "to_provider": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "from_provider",
+              "to_provider"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "detail": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "refresh_audio_config_mismatch",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "detail"
+            ],
+            "type": "object"
+          },
+          {
+            "properties": {
+              "detail": {
+                "type": "string"
+              },
+              "kind": {
+                "const": "other",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind",
+              "detail"
             ],
             "type": "object"
           }
