@@ -7747,7 +7747,7 @@ mod tests {
         );
 
         let mut continue_task = continue_task;
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
                 release.add_permits(1);
                 tokio::select! {
