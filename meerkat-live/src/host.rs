@@ -1566,7 +1566,18 @@ impl LiveAdapterHost {
             .collect();
         for id in to_drop {
             if let Some(ch) = inner.channels.shift_remove(&id) {
-                inner.by_session.remove(&ch.session_id);
+                // G1 (P1): only clear the reverse mapping if it still
+                // points at the channel being reaped. After close + rebind,
+                // `by_session[S]` already names the new channel, and an
+                // unconditional remove would strand the rebound channel
+                // (subsequent opens for S would then create duplicates).
+                if inner
+                    .by_session
+                    .get(&ch.session_id)
+                    .is_some_and(|current| current == &id)
+                {
+                    inner.by_session.remove(&ch.session_id);
+                }
             }
         }
     }
@@ -1682,6 +1693,63 @@ mod tests {
         host.close_channel(&ch).await.unwrap();
         let ch2 = host.open_channel(session_id).await.unwrap();
         assert_ne!(ch, ch2);
+    }
+
+    /// G1 (P1) regression: after close+rebind, the reap of the retired
+    /// channel must NOT clear `by_session[S]` — that mapping now points at
+    /// the rebound channel B. Previously the reap unconditionally executed
+    /// `by_session.remove(S)`, stranding B and allowing a third open to
+    /// create a duplicate active channel for the same session.
+    #[tokio::test]
+    async fn reap_of_retired_channel_preserves_rebound_session_mapping() {
+        let host = LiveAdapterHost::new();
+        let session_id = test_session_id();
+
+        let ch_a = host.open_channel(session_id.clone()).await.unwrap();
+        host.close_channel(&ch_a).await.unwrap();
+        let ch_b = host.open_channel(session_id.clone()).await.unwrap();
+        assert_ne!(ch_a, ch_b);
+
+        // Force-expire A's retire window so the reaper drops A on the next
+        // sweep. B remains active (no `retire_at` set).
+        {
+            let mut inner = host.inner.lock().await;
+            if let Some(channel) = inner.channels.get_mut(&ch_a) {
+                channel.retire_at =
+                    Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+            }
+        }
+
+        // `active_channels` invokes the reaper. Post-reap: B is still
+        // active and `by_session[S]` still names B.
+        let active = host.active_channels().await;
+        assert_eq!(active, vec![ch_b.clone()]);
+        {
+            let inner = host.inner.lock().await;
+            assert_eq!(
+                inner.by_session.get(&session_id),
+                Some(&ch_b),
+                "reap of retired A must not clear B's reverse mapping"
+            );
+            assert!(
+                !inner.channels.contains_key(&ch_a),
+                "retired channel A must be dropped"
+            );
+            assert!(
+                inner.channels.contains_key(&ch_b),
+                "rebound channel B must remain"
+            );
+        }
+
+        // A subsequent open for the same session must be rejected (B is
+        // still bound) — the pre-fix bug allowed it to succeed and create
+        // a duplicate active channel.
+        let err = host.open_channel(session_id.clone()).await.unwrap_err();
+        assert!(
+            matches!(err, LiveAdapterHostError::SessionAlreadyBound(id) if id == session_id),
+            "after reap, third open for session must still see B as bound"
+        );
+        assert_eq!(host.active_channels().await.len(), 1);
     }
 
     #[tokio::test]
