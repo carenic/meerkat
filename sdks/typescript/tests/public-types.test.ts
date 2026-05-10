@@ -732,7 +732,15 @@ const liveObsAudio: WireLiveAdapterObservation = {
 };
 const liveObsCommandRejected: WireLiveAdapterObservation = {
   observation: "command_rejected",
-  code: { code: "config_rejected", reason: "image_input_not_implemented" },
+  // R5-2: `reason` is the typed `WireLiveConfigRejectionReason` mirror,
+  // internally tagged on `kind`. SDK codegen currently widens it to
+  // `Record<string, unknown>` because the discriminated union isn't
+  // followed across schema references; the runtime shape still matches
+  // the wire enum's `#[serde(tag = "kind", rename_all = "snake_case")]`.
+  code: {
+    code: "config_rejected",
+    reason: { kind: "image_input_not_implemented" },
+  },
   message: "rejected",
 };
 const liveObsReady: WireLiveAdapterObservation = { observation: "ready" };
