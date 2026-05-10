@@ -85,7 +85,7 @@ self-verify.
 
 ### Phase A — Audit (sequential, must land before any phase)
 
-- [ ] fix · [ ] verify · **A1.** Map every `meerkat_rpc::*` import
+- [x] fix · [ ] verify · **A1.** Map every `meerkat_rpc::*` import
   outside `meerkat-rpc/src/`. Sources to scan:
   - `meerkat-cli/src/main.rs`
   - `examples/035-mdm-tux-rs/src/bin/*.rs`
@@ -113,6 +113,45 @@ self-verify.
 
   Audit deliverable: a markdown table appended to this TODO, plus a
   per-classification count.
+
+  ### A1 audit deliverable
+
+  Scan command:
+  `grep -rnE "use meerkat_rpc::|meerkat_rpc::" --include="*.rs" -- meerkat-cli examples tests/integration meerkat-rest meerkat-mcp-server sdks`
+
+  18 hits across 5 files. Counts: **(R) 17** · **(L) 1** · **(I) 0**.
+
+  | # | File:line | Symbol | Purpose | Class |
+  |---|---|---|---|---|
+  | 1 | `meerkat-cli/src/main.rs:10596` | `meerkat_rpc::transport::TransportWriter` | Trait bound on the `deploy_mob` flow's transport writer; flow inline-hosts an `RpcServer`. | (R) |
+  | 2 | `meerkat-cli/src/main.rs:10645` | `meerkat_rpc::session_runtime::SessionRuntime::new_with_config_store` | Constructs the `SessionRuntime` that backs the inline `RpcServer` at line 10774. | (R) |
+  | 3 | `meerkat-cli/src/main.rs:10651` | `meerkat_rpc::router::NotificationSink::noop` | Required by `SessionRuntime::new_with_config_store`; `NotificationSink` carries `mpsc::Sender<RpcNotification>` (RPC wire type). | (R) |
+  | 4 | `meerkat-cli/src/main.rs:10657` | `meerkat_rpc::session_runtime::SessionRuntime::build_skill_identity_registry` | Static helper (W3-A delegate to `meerkat::session_runtime::runtime_state::build_skill_identity_registry`). The upstream version exists; the CLI calls the RPC-side delegate. | (L) |
+  | 5 | `meerkat-cli/src/main.rs:10702` | `meerkat_rpc::callback_dispatcher::CallbackToolDispatcher::new` | RPC-shape: signature uses `mpsc::Sender<(RpcRequest, oneshot::Sender<RpcResponse>)>` and `RpcId` directly (verified at `meerkat-rpc/src/callback_dispatcher.rs:32,46,53,67,92`). | (R) |
+  | 6 | `meerkat-cli/src/main.rs:10774` | `meerkat_rpc::server::RpcServer::new_with_skill_runtime_and_mob_state` | The actual `RpcServer` construction — the canonical RPC-host marker. | (R) |
+  | 7 | `examples/035-mdm-tux-rs/src/bin/kennel.rs:203` | `meerkat_rpc::session_runtime::SessionRuntime::new` | Backs `meerkat_rpc::serve_tcp` at line 235 — flow inline-hosts a TCP RPC server. | (R) |
+  | 8 | `examples/035-mdm-tux-rs/src/bin/kennel.rs:208` | `meerkat_rpc::router::NotificationSink::noop` | Required by `SessionRuntime::new`. (R) per #3. | (R) |
+  | 9 | `examples/035-mdm-tux-rs/src/bin/kennel.rs:235` | `meerkat_rpc::serve_tcp` | TCP RPC server entry point — canonical RPC-host marker. | (R) |
+  | 10 | `examples/035-mdm-tux-rs/src/bin/target.rs:661` | `meerkat_rpc::session_runtime::SessionRuntime::new` | Backs `meerkat_rpc::serve_tcp` at line 676. | (R) |
+  | 11 | `examples/035-mdm-tux-rs/src/bin/target.rs:666` | `meerkat_rpc::router::NotificationSink::noop` | (R) per #3. | (R) |
+  | 12 | `examples/035-mdm-tux-rs/src/bin/target.rs:676` | `meerkat_rpc::serve_tcp` | TCP RPC server entry point. | (R) |
+  | 13 | `examples/035-mdm-tux-rs/src/bin/target.rs:1383` | `meerkat_rpc::session_runtime::SessionRuntime::new` | Backs `meerkat_rpc::serve_tcp` at line 1411. | (R) |
+  | 14 | `examples/035-mdm-tux-rs/src/bin/target.rs:1388` | `meerkat_rpc::router::NotificationSink::noop` | (R) per #3. | (R) |
+  | 15 | `examples/035-mdm-tux-rs/src/bin/target.rs:1411` | `meerkat_rpc::serve_tcp` | TCP RPC server entry point. | (R) |
+  | 16 | `tests/integration/tests/e2e_auth_lane.rs:42` | `meerkat_rpc::protocol::{RpcId, RpcRequest}` | Test directly constructs `RpcRequest` and dispatches via `MethodRouter::method_call(...)` — exercises the RPC method-call surface end-to-end without TCP/stdio transport. | (R) |
+  | 17 | `tests/integration/tests/e2e_auth_lane.rs:43` | `meerkat_rpc::router::{MethodRouter, NotificationSink}` | (R) per #16; `MethodRouter` is the RPC dispatch surface. | (R) |
+  | 18 | `tests/integration/tests/e2e_auth_lane.rs:44` | `meerkat_rpc::session_runtime::SessionRuntime` | Backs the `MethodRouter`. (R) per #16. | (R) |
+  | 19 | `tests/integration/tests/live_mob_tools.rs:20-22, 114, 173` | `meerkat_rpc::protocol::{RpcId, RpcRequest, RpcResponse, RpcNotification}` + `router::{MethodRouter, NotificationSink}` + `session_runtime::SessionRuntime` | Same RPC method-call exercise pattern as #16-18. (R) en bloc. | (R) |
+
+  Negative findings (also part of A1):
+  - `meerkat-rest/src/`: zero `meerkat_rpc::*` imports.
+  - `meerkat-mcp-server/src/`: zero `meerkat_rpc::*` imports.
+  - `sdks/`: zero `meerkat_rpc::*` imports (SDK code is generated against the contract crate, not RPC).
+
+  Conclusion: every non-RPC surface that imports `meerkat_rpc::*` does so because it is **inline-hosting an `RpcServer`** (CLI `deploy_mob`, both `035-tux` binaries) or **driving the `MethodRouter` directly to test RPC behaviour end-to-end** (the two integration tests). One callsite (#4 `build_skill_identity_registry`) is an (L) — already lifted to `meerkat::session_runtime::runtime_state` in W3-A; the CLI still goes through the RPC delegate. The (L) callsite gets switched in **C-cli-deploy-mob**; everything else gets a `// RPC-host: …` annotation in **C-cli-deploy-mob** / **C-examples-035-tux** / **C-tests-integration**.
+
+  Phase B is therefore reduced to one item:
+  - **B-skill-identity** (lift already done; switch CLI callsite). B-callback-dispatcher and B-notification-sink are reclassified as (R) and dropped — both are RPC-shape per their public signatures.
 
 ### Phase B — Lift dependencies upstream (parallel by area)
 
@@ -244,6 +283,146 @@ Likely sub-findings:
   at sites annotated with the `// RPC-host: …` justification (grep
   gate).
 
+### Phase G — PR #659 static review findings (sequential, must land)
+
+External static review of PR #659 surfaced 12 findings against the
+live-adapter MVP and the SessionRuntime split. Each must land a fix
+OR a typed invariant argument committed at the relevant code site.
+"Static review only, no tests run" applies to the reviewer's
+methodology — every fix here gets test coverage in the same commit.
+
+**P1 (must-fix Block) — 5 items**
+
+- [ ] fix · [ ] verify · **G1 (P1).** [`meerkat-live/src/host.rs:1568`]
+  retired-channel reap can delete the active `by_session` entry
+  after a rebind. Sequence: close channel A, open channel B for
+  the same session before A's TTL expires; A's reap runs
+  `by_session.remove(session_id)` and drops B's reverse mapping.
+  A later open then creates duplicate active channels for one
+  session. Fix: reap must check whether the current `by_session`
+  entry still maps to channel A's id before removing — do not
+  remove if it points at a different channel. Regression test:
+  open A → close A → open B for same session → wait for A's TTL →
+  assert `by_session(session) == B.channel_id` and exactly one
+  active channel.
+
+- [ ] fix · [ ] verify · **G2 (P1).** [`meerkat-live/src/transport.rs:325`]
+  WebSocket loop uses `tokio::select! { biased; }` with inbound
+  client frames before observations. Continuous mic audio can
+  starve `Ready`, assistant output, tool / error observations,
+  and full-duplex text/audio while speaking. Binary `send_input`
+  failures at line 367 are also logged-only — early audio drops
+  silently. Fix: drop `biased` (tokio fair scheduling) OR explicit
+  fairness budget; surface binary `send_input` errors back to the
+  client. Regression: stress test with continuous mic input that
+  asserts a `TurnCompleted` observation arrives within bounded time.
+
+- [ ] fix · [ ] verify · **G3 (P1).** [`meerkat-openai/src/live.rs:3155`]
+  OpenAI live pump has the same biased-command-first shape. A
+  backlog of audio `SendInput` commands can starve provider events
+  including assistant audio/text, tool calls, transcript finals,
+  terminal errors. Fix: drop `biased` or alternate fairly between
+  `cmd_rx` and `session.next_event()`. Regression test: queue a
+  burst of audio commands and assert a queued provider event
+  drains in the same yield window.
+
+- [ ] fix · [ ] verify · **G4 (P1).** [`meerkat-openai/src/live.rs:3572`]
+  `RealtimeSessionEvent::Interrupted { response_id }` is translated
+  to payloadless `TurnInterrupted`, dropping the `response_id`.
+  The projection sink at
+  [`meerkat-rpc/src/live_projection_sink.rs:460`] then has to infer
+  affected responses from staged transcript state. Barge-in before
+  transcript staging means canonical truncation/interruption can
+  miss the actual provider response. Fix: add `response_id:
+  Option<String>` to `LiveAdapterObservation::TurnInterrupted` and
+  thread it through the projection sink. Regression: barge-in
+  before any transcript delta arrives — assert the projection sink
+  records the truncation against the right response.
+
+- [ ] fix · [ ] verify · **G5 (P1).** [`meerkat/src/session_runtime/live_orchestration.rs:671`]
+  `propagate_config_to_live_channels` hot-swaps every live session
+  to the current global model on any config patch. That mutates or
+  closes sessions intentionally opened with another model and makes
+  live identity follow global config rather than the bound
+  session/provider identity. The hot-swap addition was made to
+  satisfy s72; the s72 contract should be sharpened: only sessions
+  whose **resolved** model matches the **previous** global default
+  should follow on a config change — sessions opened with explicit
+  per-session model overrides stay pinned. Fix: gate the hot-swap
+  on `session.model == previous_default_model` (record the
+  previous default at the propagate-call boundary OR record per-
+  session "follow_global" flag at create time). Update s72 to
+  exercise a session that was opened with the new default
+  explicitly — verify it still gets swapped — AND a session
+  opened with an explicit override — verify it stays pinned.
+
+**P2 (concern, fix in this PR) — 4 items**
+
+- [ ] fix · [ ] verify · **G6 (P2).** [`meerkat-rpc/src/main.rs:359`]
+  Production `rkat-rpc` builds `LiveAdapterHost` without calling
+  `with_tool_timeout`. `DEFAULT_LIVE_TOOL_TIMEOUT` exists and
+  tests cover the path, but the production server skips it — a
+  hung dispatcher can strand provider tool calls indefinitely.
+  Fix: wire `with_tool_timeout(DEFAULT_LIVE_TOOL_TIMEOUT)` into
+  the `RpcServer` build path. Regression: test against a stub
+  tool that never returns; assert the channel surfaces a typed
+  timeout observation within bounded time.
+
+- [ ] fix · [ ] verify · **G7 (P2).** [`meerkat-live/src/host.rs:1550`]
+  `active_channels()` returns retained-but-closed channels until
+  TTL expiry. Callers like `propagate_config_to_live_channels`
+  treat those as live and may enqueue refresh/hot-swap work
+  against closed channels. Fix: filter by `status != Closed` (or
+  similar) inside `active_channels()`, OR introduce
+  `live_channels()` distinct from `retained_channels()`. Update
+  every caller that meant "currently live" to use the filtered
+  view.
+
+- [ ] fix · [ ] verify · **G8 (P2).** [`meerkat-contracts/src/wire/live.rs:41`]
+  `LiveOpenResult.transport` is typed as schema `Value`; SDK
+  codegen produces `unknown` in TS at
+  [`sdks/typescript/src/generated/types.ts:1704`] and `Any` in
+  Python. Weakens the transport bootstrap seam exactly where
+  WebRTC signaling will need a typed discriminated contract. Fix:
+  promote `transport` to a tagged union (`Websocket { url, token }`,
+  future `Webrtc { … }`). Regenerate SDK types via `make
+  regen-schemas`. Verify SDK round-trip in regression test.
+
+- [ ] fix · [ ] verify · **G9 (P2).** [`meerkat-openai/src/live.rs:3071`]
+  OpenAI live channel advertises `text_out: true` (per the
+  `gpt-realtime-2` capability decision Luka pushed back on), but
+  the command surface has no display-text / sideband response
+  request path. Session updates pin audio output at
+  [`meerkat-openai/src/live.rs:596`]. Text can flow if the
+  provider emits it, but clients cannot intentionally request
+  persistent non-spoken assistant output. Either: (a) add a
+  `LiveAdapterCommand::RequestTextResponse { … }` variant that
+  triggers a `response.create` with `output_modalities=Text`, OR
+  (b) downgrade the advertisement to `text_out: false` and
+  document that the channel surfaces text as a side effect of
+  audio transcription. Recommend (a) — the user's earlier
+  pushback was that the model supports text and should expose it.
+
+**P3 (note, fix in this PR or follow-up if cosmetic) — 3 items**
+
+- [ ] fix · [ ] verify · **G10 (P3).** [`meerkat-core/src/live_adapter.rs:110`]
+  `Refresh` doc comment still says OpenAI re-runs
+  `seed_history_projection`, but the implementation explicitly
+  avoids replaying seed history. Stale comment. Fix: update doc
+  to reflect the no-replay invariant.
+
+- [ ] fix · [ ] verify · **G11 (P3).** [`meerkat-core/src/live_adapter.rs:552`]
+  Default `LiveChannelCapabilities` are optimistic: audio/text/
+  barge-in default to true. A future adapter that forgets to
+  override will over-advertise. Fix: flip defaults to `false`
+  (no-claim baseline); each adapter explicitly opts in.
+
+- [ ] fix · [ ] verify · **G12 (P3).** [`README.md:227`] and
+  [`.claude/skills/meerkat-platform/SKILL.md:130`] reference
+  deleted realtime APIs (`realtime/open_info`,
+  `session/realtime_attachment_status`). Fix: update both to the
+  live-adapter MVP surface.
+
 ## Counts
 
 - **Phase A (Audit):** 1 item (A1)
@@ -253,7 +432,8 @@ Likely sub-findings:
 - **Phase D (Cargo.toml):** 4 items (D1–D4)
 - **Phase E (Verify):** 5 adversarial passes (V1–V5)
 - **Phase F (CI gate):** 6 gates (F1–F6)
-- **Total actionable:** ≥18 items + audit additions
+- **Phase G (review findings):** 12 items (G1–G12; 5 P1 + 4 P2 + 3 P3)
+- **Total actionable:** ≥30 items + audit additions
 
 ## Done definition
 
