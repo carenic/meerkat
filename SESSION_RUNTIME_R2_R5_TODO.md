@@ -1185,3 +1185,50 @@ honestly justified against their named invariants.
 - **Verdict.** PASS.
 
 **Phase R4+R5 summary.** R4-1 PASS / R4-2 PASS / R4-3 PASS / R4-4 PASS / R4-5 PASS / R5-1 PASS / R5-2 PASS / R5-2-fu PASS / R5-3 PASS / Cross-cutting PASS. Ten verdicts, zero findings each. Explicit confirmation: R5-2's commit message "follow-up" deferral for typed Refresh* producers is fully closed by R5-2-followup `4e3c73e18` — `classify_command_error` routes each typed `OpenAiLiveCommandError::Refresh*` directly to the matching `LiveConfigRejectionReason::Refresh*` variant, and the only remaining production `LiveConfigRejectionReason::Other` construction in OpenAI live is the non-refresh `Llm(InvalidConfig|InvalidRequest)` catch-all at `meerkat-openai/src/live.rs:3651` (with `non_refresh_other_error_still_routes_to_other` regression test pinning that boundary).
+
+### Phase R6 verifier deliverable
+
+#### R6-1 (P1) — `bc6a3a6c2`
+- **Invariant.** After OpenAI pump emits terminal `StatusChanged{Closed}` and exits, `next_observation()` returns `None`; adapter-side `control_tx` lives in `Arc<StdMutex<Option<...>>>` slot the pump `take()`s on exit; remaining injection callers see typed `LiveAdapterError::Closed`; WS loop in `transport.rs` no longer parks on EOF.
+- **Method.** Read commit diff (`meerkat-openai/src/live.rs` only). Confirmed `OpenAiLiveAdapter.control_tx: Arc<StdMutex<Option<mpsc::Sender<...>>>>` (line 3082+ in diff). `openai_live_pump` takes `adapter_control_slot: Arc<StdMutex<Option<...>>>` and `guard.take()`s it after emitting terminal observation (line 3525+). `inject_observation` clones the sender out of the mutex BEFORE await (no std-mutex held across await), returns `Closed` if slot is `None`. Confirmed WS loop EOF handling at `meerkat-live/src/transport.rs:477` (`Ok(None) => break`). Regression test `adapter_eof_propagates_after_pump_close` at `meerkat-openai/src/live.rs` end of `mod tests`: drives EOF via `server_tx.send(Ok(None))`, asserts terminal `StatusChanged{Closed}`, then `Ok(None)` within 2s timeout.
+- **Findings.** Zero.
+- **Verdict.** PASS.
+
+#### R6-2 (P2) — `4d29abc2e`
+- **Invariant.** WS pump routes observations through `WireLiveAdapterObservation::from(obs)` BEFORE serializing; future core variants emit `observation: "unknown"` not raw new tag.
+- **Method.** Read `meerkat-live/src/transport.rs:418-434` post-edit: `let wire_obs = WireLiveAdapterObservation::from(obs.clone()); ... serde_json::to_string(&wire_obs)`. Regression test `websocket_forwards_observation_through_wire_mirror` at end of mod tests deserializes forwarded JSON as `WireLiveAdapterObservation` (panics on raw-tag leak from future core variants).
+- **Findings.** Zero.
+- **Verdict.** PASS.
+
+#### R6-3 (P2) — `3a9898c3b`
+- **Invariant.** `LiveStatusResult.status: WireLiveAdapterStatus` (typed mirror with R5-3 `Unknown { debug }`); handler converts core → wire; SDK emits discriminated union (TS) / typed dict (Python), no `unknown` / `Any`.
+- **Method.** Read `meerkat-contracts/src/wire/live.rs:511-516`: `pub status: WireLiveAdapterStatus` (no `schemars(with = Value)` shroud). Read `meerkat-rpc/src/handlers/live.rs:438-446`: `status: WireLiveAdapterStatus::from(status)`. Read `sdks/typescript/src/generated/types.ts:1735+`: `status: WireLiveAdapterStatus`. Read `sdks/python/meerkat/generated/types.py:1548+`: `status: WireLiveAdapterStatus` (was `Any`). Regression `live_status_result_serializes_typed_status_discriminator` asserts `j["status"]["status"] == "ready"` and byte-identity with old core projection.
+- **Findings.** Zero.
+- **Verdict.** PASS.
+
+#### R6-4 (P2) — `57f8d726c`
+- **Invariant.** `live/send_input` with audio chunk metadata mismatching PCM 24k mono (`sample_rate_hz != 24000` OR `channels != 1`) returns typed `LiveConfigRejectionReason::AudioInputFormatMismatch { expected_*, actual_* }` BEFORE bytes reach provider buffer; negative-byte assertion: no `InputAudioBufferAppend` ever fires.
+- **Method.** Read `meerkat-core/src/live_adapter.rs:518+`: typed `AudioInputFormatMismatch { expected_sample_rate_hz, expected_channels, actual_sample_rate_hz, actual_channels }` variant added. Read `meerkat-openai/src/live.rs` SendInput dispatcher gate at line 137+ (in diff): `if sample_rate_hz != expected_rate || channels != expected_channels { return Err(OpenAiLiveCommandError::AudioInputFormatMismatch{...}); }` BEFORE base64-encode and provider append. Three regression tests: `send_input_rejects_mismatched_sample_rate_with_typed_format_mismatch`, `send_input_rejects_mismatched_channels_with_typed_format_mismatch` (both assert `!seen.iter().any(InputAudioBufferAppend)`), `send_input_accepts_pcm_24k_mono_unchanged`. Wire mirror added at `WireLiveConfigRejectionReason` (line 855+).
+- **Findings.** Zero.
+- **Verdict.** PASS.
+
+#### R6-5 (P3 dogma) — `49e5aadb1`
+- **Invariant.** `WireLiveConfigRejectionReason` has `Unknown { debug }` (`#[non_exhaustive]` already inherited); `From<LiveConfigRejectionReason>` wildcard emits `Unknown { debug: format!(...) }`, not `Other { detail: "unknown_..." }`; reverse is `TryFrom` returning `WireConversionError::ConfigRejectionReason { debug }`.
+- **Method.** Read `meerkat-contracts/src/wire/live.rs:850+`: `Unknown { debug: String }` variant added with non-exhaustive doc. `From<LiveConfigRejectionReason>` wildcard at line 915+ emits `Self::Unknown { debug: format!("{other:?}") }` with debug-assert. Reverse at line 925+ is `impl TryFrom<WireLiveConfigRejectionReason> for LiveConfigRejectionReason` with explicit `Unknown { debug } => Err(WireConversionError::ConfigRejectionReason { debug })`. `WireConversionError::ConfigRejectionReason { debug }` variant added (line 48 in diff). Three regression tests: `unknown_config_rejection_reason_does_not_become_other`, `known_config_rejection_reason_variants_never_serialize_as_unknown`, `config_rejection_reason_round_trips_through_core`.
+- **Findings.** Zero.
+- **Verdict.** PASS.
+
+#### R6-6 (P3 dogma) — `90852534a`
+- **Invariant.** `LiveProjectionSink::append_realtime_transcript` no longer has default `Ok(())`; every implementor (`NoOpProjectionSink`, `RecordingProjectionSink`, `SessionServiceProjectionSink`, `RecordingSink` in rpc tests) provides explicit body.
+- **Method.** Read `meerkat-live/src/host.rs:384-400` post-edit: trait method has no body, ends `-> Result<(), LiveProjectionError>;`. Verified all 4 implementors override at: `meerkat-live/src/host.rs:392` (trait), `:526` (NoOp explicit `Ok(())`), `:3875` (RecordingProjectionSink), `meerkat-rpc/src/live_projection_sink.rs:631` (SessionServiceProjectionSink real impl), `:866` (RecordingSink explicit `Ok(())` — the previously-silent case). Regression test `noop_projection_sink_explicitly_accepts_realtime_transcript` pins that `apply_observation` returns `TranscriptAppended` and trait method is callable on impl directly.
+- **Findings.** Zero.
+- **Verdict.** PASS.
+
+#### Cross-cutting
+
+- **Invariants.** Test discipline (every runtime-code commit ships regression test); wire stability (`#[non_exhaustive]` preserved, byte-compat for known variants); schema freshness; zero deferral; no future-variant fallthrough to `Other`.
+- **Method.** Per-commit `+#[test]`/`+#[tokio::test]` count: bc6a3a6c2 (1), 4d29abc2e (1), 3a9898c3b (1), 57f8d726c (3), 49e5aadb1 (3), 90852534a (1). `make verify-version-parity` PASS at 0.6.4. `git status` clean — no untracked schema drift. Grep for `+.*(// TODO|// FIXME|#\[ignore\])` across all 6 R6 commits: zero hits. Grep `LiveConfigRejectionReason::Other` workspace-wide: 14 hits — all either tests, doc-comments, or the legitimate `Llm(InvalidConfig|InvalidRequest)` diagnostic pass-through at `meerkat-openai/src/live.rs:3746`. ZERO future-variant fallthrough sites. Format-args inline: no `format!("{}", x)` style introduced. `./scripts/repo-cargo check -p meerkat-contracts -p meerkat-live -p meerkat-openai -p meerkat-rpc` PASS.
+- **Findings.** Zero.
+- **Verdict.** PASS.
+
+**Phase R6 summary.** R6-1 PASS / R6-2 PASS / R6-3 PASS / R6-4 PASS / R6-5 PASS / R6-6 PASS / Cross-cutting PASS. Seven verdicts, zero findings each. Explicit confirmation: R6-5 actually closed the typed-route-as-detail-string gap — workspace-wide grep of `LiveConfigRejectionReason::Other` shows zero future-variant fallthrough constructions; the `From<LiveConfigRejectionReason> for WireLiveConfigRejectionReason` wildcard now routes to `Unknown { debug }` (not `Other { detail: "unknown_..." }`), and the only remaining production `Other` site (`meerkat-openai/src/live.rs:3746`) is the explicit `Llm(InvalidConfig|InvalidRequest)` diagnostic pass-through which the invariant whitelist allows (genuinely-diagnostic free-form text from inner LlmError).
