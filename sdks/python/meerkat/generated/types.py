@@ -1605,6 +1605,43 @@ realtime adapter today)."""
     response_modality: Optional[WireLiveResponseModality] = None
 
 
+# Status of a `live/refresh` request relative to the adapter pump.
+#
+# R4-5 (P3): the refresh path is asynchronous — `LiveAdapterHost::send_command`
+# returns when the command has been queued on the adapter's mpsc channel,
+# not when the adapter pump has applied the resulting `session.update`. The
+# realtime stream is the source of truth for the actual refresh outcome
+# (failures surface as `LiveAdapterObservation::Error`).
+#
+# Today every refresh path is `Queued`. The enum is `#[non_exhaustive]` so
+# a future revision can add `AppliedSync` (e.g. when a oneshot ack from the
+# adapter pump back through the command channel lands, or when a refresh
+# is detected as a no-op against the currently-applied snapshot) without
+# breaking the wire shape. SDK consumers route on the string value and
+# treat unknown values as "outcome unknown — observe the realtime stream".
+#
+# Serializes as a plain string (no envelope) so [`LiveRefreshResult`] can
+# place this typed status alongside the back-compat `refresh_enqueued`
+# boolean as ordinary sibling fields, which keeps SDK codegen on the
+# simple-struct path.
+LiveRefreshStatus = Literal['queued']
+
+@dataclass
+class LiveRefreshResult:
+    """Response payload for `live/refresh`.
+
+R4-5 (P3): replaces the previous untyped `{"refresh_enqueued": true}`
+JSON blob. The boolean `refresh_enqueued` field is preserved for back-
+compat (legacy clients that pattern-match on it stay on the green path)
+alongside the typed `status` discriminator. New code should route on
+`status`.
+
+See [`LiveRefreshStatus`] for the variant set and the contract on
+asynchronous adapter-pump application."""
+    refresh_enqueued: bool
+    status: Literal['queued']
+
+
 # A typed, identity-bearing realtime transcript event consumed by the session.
 class RealtimeTranscriptEventItemObserved(TypedDict, total=False):
     item_id: Required[str]

@@ -133,6 +133,13 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         // instead of falling back to the opaque `LiveChannelParams` shape.
         "LiveCommitInputParams": schema_for!(crate::wire::LiveCommitInputParams),
         "WireLiveResponseModality": schema_for!(crate::wire::WireLiveResponseModality),
+        // R4-5 (P3): emit the typed `live/refresh` result so SDK codegen
+        // produces a typed shape (TypedDict / interface) carrying both the
+        // typed `LiveRefreshStatus` discriminator and the legacy
+        // `refresh_enqueued: true` back-compat field, instead of falling
+        // back to opaque `Value` / `Any` / `unknown`.
+        "LiveRefreshResult": schema_for!(crate::wire::LiveRefreshResult),
+        "LiveRefreshStatus": schema_for!(crate::wire::LiveRefreshStatus),
         // CC5/CC6: emit the typed wire mirrors at the top level so SDK
         // codegen produces named typed shapes (TypedDict / interface /
         // discriminated union) instead of inlining them as anonymous `Any`

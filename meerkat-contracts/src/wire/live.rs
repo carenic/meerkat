@@ -435,6 +435,68 @@ pub struct LiveStatusResult {
     pub status: LiveAdapterStatus,
 }
 
+/// Status of a `live/refresh` request relative to the adapter pump.
+///
+/// R4-5 (P3): the refresh path is asynchronous — `LiveAdapterHost::send_command`
+/// returns when the command has been queued on the adapter's mpsc channel,
+/// not when the adapter pump has applied the resulting `session.update`. The
+/// realtime stream is the source of truth for the actual refresh outcome
+/// (failures surface as `LiveAdapterObservation::Error`).
+///
+/// Today every refresh path is `Queued`. The enum is `#[non_exhaustive]` so
+/// a future revision can add `AppliedSync` (e.g. when a oneshot ack from the
+/// adapter pump back through the command channel lands, or when a refresh
+/// is detected as a no-op against the currently-applied snapshot) without
+/// breaking the wire shape. SDK consumers route on the string value and
+/// treat unknown values as "outcome unknown — observe the realtime stream".
+///
+/// Serializes as a plain string (no envelope) so [`LiveRefreshResult`] can
+/// place this typed status alongside the back-compat `refresh_enqueued`
+/// boolean as ordinary sibling fields, which keeps SDK codegen on the
+/// simple-struct path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum LiveRefreshStatus {
+    /// The host has accepted the refresh command onto the adapter's mpsc
+    /// queue. The adapter pump applies the `session.update` asynchronously;
+    /// callers that need the actual outcome must observe the adapter's
+    /// realtime stream.
+    Queued,
+}
+
+/// Response payload for `live/refresh`.
+///
+/// R4-5 (P3): replaces the previous untyped `{"refresh_enqueued": true}`
+/// JSON blob. The boolean `refresh_enqueued` field is preserved for back-
+/// compat (legacy clients that pattern-match on it stay on the green path)
+/// alongside the typed `status` discriminator. New code should route on
+/// `status`.
+///
+/// See [`LiveRefreshStatus`] for the variant set and the contract on
+/// asynchronous adapter-pump application.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct LiveRefreshResult {
+    /// Typed refresh status. Today: always [`LiveRefreshStatus::Queued`].
+    pub status: LiveRefreshStatus,
+    /// Back-compat mirror of the legacy untyped reply field. Always `true`
+    /// when paired with `status: queued`. New code should route on `status`.
+    pub refresh_enqueued: bool,
+}
+
+impl LiveRefreshResult {
+    /// Construct a `Queued` result — the only outcome the host's
+    /// `send_command` path produces today.
+    pub fn queued() -> Self {
+        Self {
+            status: LiveRefreshStatus::Queued,
+            refresh_enqueued: true,
+        }
+    }
+}
+
 /// Modality-tagged input chunk for `live/send_input`.
 ///
 /// Audio / image / video-frame payloads are base64 strings (`data`); the
@@ -1691,5 +1753,42 @@ mod tests {
         let back: LiveCommitInputParams =
             serde_json::from_value(j).expect("round-trip should succeed");
         assert_eq!(v, back);
+    }
+
+    /// R4-5 (P3): the typed `LiveRefreshResult` round-trips through JSON
+    /// preserving both the new typed `status` discriminator and the legacy
+    /// `refresh_enqueued: true` back-compat field. The `status: queued`
+    /// shape mirrors the only outcome `LiveAdapterHost::send_command`
+    /// produces today.
+    #[test]
+    fn live_refresh_result_queued_round_trip() {
+        let v = LiveRefreshResult::queued();
+        let j = serde_json::to_value(&v).expect("round-trip should succeed");
+        assert_eq!(j["status"], "queued");
+        assert_eq!(j["refresh_enqueued"], serde_json::Value::Bool(true));
+        let back: LiveRefreshResult = serde_json::from_value(j).expect("round-trip should succeed");
+        assert_eq!(v, back);
+    }
+
+    /// R4-5 (P3): legacy clients that pattern-match on the old untyped
+    /// `{"refresh_enqueued": true}` shape continue to see the field, and
+    /// new clients that route on `status` see the typed variant. Both
+    /// surfaces are byte-coexistent on the same payload.
+    #[test]
+    fn live_refresh_result_back_compat_field_present() {
+        let v = LiveRefreshResult::queued();
+        let j = serde_json::to_value(&v).expect("round-trip should succeed");
+        // Legacy: callers checking the boolean directly still pass.
+        assert_eq!(
+            j.get("refresh_enqueued"),
+            Some(&serde_json::Value::Bool(true)),
+            "back-compat `refresh_enqueued: true` must remain on the wire"
+        );
+        // New: typed status discriminator is also present.
+        assert_eq!(
+            j.get("status"),
+            Some(&serde_json::Value::String("queued".into())),
+            "typed `status: queued` must be present alongside the legacy field"
+        );
     }
 }

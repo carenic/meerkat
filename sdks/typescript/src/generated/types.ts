@@ -1760,6 +1760,13 @@ export interface LiveCommitInputParams {
   response_modality?: WireLiveResponseModality;
 }
 
+export type LiveRefreshStatus = "queued";
+
+export interface LiveRefreshResult {
+  refresh_enqueued: boolean;
+  status: "queued";
+}
+
 export interface LiveInputChunkWireAudio {
   channels: number;
   data: string;

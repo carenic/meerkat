@@ -494,7 +494,7 @@ pub fn rpc_method_catalog(options: RpcMethodCatalogOptions) -> Vec<RpcMethodDesc
                 "live/refresh",
                 "Apply mutable session config (instructions/tools/audio) to an open live channel via a single session.update; does NOT replay history. Identity swaps (model/provider) require close + reopen.",
                 "LiveChannelParams",
-                "Value",
+                "LiveRefreshResult",
             ),
         ]);
     }

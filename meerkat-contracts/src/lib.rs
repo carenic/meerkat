@@ -132,6 +132,8 @@ pub use wire::{
     LiveInputChunkWire,
     LiveOpenParams,
     LiveOpenResult,
+    LiveRefreshResult,
+    LiveRefreshStatus,
     LiveSendInputParams,
     LiveStatusResult,
     LiveTruncateParams,

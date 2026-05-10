@@ -2933,3 +2933,69 @@ def test_generated_wire_live_adapter_observation_is_typed_union():
     # R5-9: typed `code` field on the rejection variant — not a free-form
     # blob.
     assert rejected_hints["code"] == WireLiveAdapterErrorCode
+
+
+@pytest.mark.asyncio
+async def test_client_live_refresh_returns_typed_result():
+    """R4-5 (P3): `live_refresh` must return a typed
+    :class:`LiveRefreshResult` carrying both the typed ``status``
+    discriminator and the legacy ``refresh_enqueued`` boolean.
+
+    The wire payload mirrors the server-side `handle_live_refresh` Ok arm:
+    ``{"status": "queued", "refresh_enqueued": true}`` (from
+    `LiveRefreshResult::queued()`). Both fields must round-trip into the
+    typed dataclass at the SDK boundary so callers can route on
+    ``status`` (forward-compatible enum) without dropping back-compat with
+    R7-era clients that pattern-match on ``refresh_enqueued``.
+    """
+    from meerkat.generated.types import LiveRefreshResult
+
+    client = MeerkatClient()
+
+    captured: list[tuple[str, dict[str, object]]] = []
+
+    async def fake_request(method, params):
+        captured.append((method, params))
+        # Mirror exactly what `handle_live_refresh` ships on the wire after
+        # `host.send_command` accepts the queued command.
+        return {"status": "queued", "refresh_enqueued": True}
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    result = await client.live_refresh("live_channel_42")
+
+    assert captured == [("live/refresh", {"channel_id": "live_channel_42"})]
+    assert isinstance(result, LiveRefreshResult)
+    # New typed routing surface.
+    assert result.status == "queued"
+    # Back-compat field for R7-era clients.
+    assert result.refresh_enqueued is True
+
+
+@pytest.mark.asyncio
+async def test_client_live_refresh_preserves_unknown_status():
+    """R4-5 (P3): the wire enum is open (`#[non_exhaustive]`) so a future
+    server may return a previously-unknown ``status`` value (e.g.
+    ``applied_sync``). The Python SDK must surface the raw string rather
+    than coercing it back to ``"queued"`` — coercion would silently lie
+    about the refresh outcome to forward-compatible clients that route on
+    the discriminator.
+    """
+    from meerkat.generated.types import LiveRefreshResult
+
+    client = MeerkatClient()
+
+    async def fake_request(method, params):
+        # Simulate a future-server reply that this SDK build does not yet
+        # know about. The typed-status field is `Literal['queued']` today,
+        # but the runtime payload must round-trip the unknown variant
+        # untouched.
+        return {"status": "applied_sync", "refresh_enqueued": True}
+
+    client._request = fake_request  # type: ignore[method-assign]
+
+    result = await client.live_refresh("live_channel_43")
+
+    assert isinstance(result, LiveRefreshResult)
+    assert result.status == "applied_sync"  # type: ignore[comparison-overlap]
+    assert result.refresh_enqueued is True

@@ -30,7 +30,7 @@ import tempfile
 import warnings
 import zipfile
 from pathlib import Path
-from typing import Any, Literal, NotRequired, TypedDict
+from typing import Any, Literal, NotRequired, TypedDict, cast
 from urllib.error import URLError
 import urllib.request
 
@@ -38,6 +38,8 @@ from .errors import CapabilityUnavailableError, MeerkatError
 from .events import Usage, parse_event
 from .generated.types import CONTRACT_VERSION
 from .generated.types import (
+    LiveRefreshResult,
+    LiveRefreshStatus,
     McpServerConfig,
     MobDefinitionInput,
     MobSpawnManyFailedResult,
@@ -2629,7 +2631,7 @@ class MeerkatClient:
             },
         )
 
-    async def live_refresh(self, channel_id: str) -> dict[str, Any]:
+    async def live_refresh(self, channel_id: str) -> LiveRefreshResult:
         """Apply mutable session config (instructions / tools / audio) to an
         open live channel. Wraps ``live/refresh``.
 
@@ -2645,15 +2647,24 @@ class MeerkatClient:
         OpenAI Realtime API does not accept a mutable ``model`` on
         ``session.update``.
 
-        Returns a dict with a ``refresh_enqueued: bool`` field. Refresh
-        completion is asynchronous (the adapter pump applies the
-        ``session.update`` after the host accepts the queued command); the
-        realtime stream is the source of truth for the actual outcome
-        (failures surface as ``LiveAdapterObservation::Error``).
+        R4-5 (P3): the result is a typed
+        :class:`meerkat.generated.types.LiveRefreshResult` carrying both the
+        typed ``status`` discriminator (today: always ``"queued"``; the
+        wire enum is open so future variants like ``applied_sync`` can land
+        without breaking the shape) and the legacy ``refresh_enqueued: True``
+        back-compat boolean. Refresh completion is asynchronous (the adapter
+        pump applies the ``session.update`` after the host accepts the
+        queued command); the realtime stream is the source of truth for the
+        actual outcome (failures surface as
+        :class:`meerkat.types.WireLiveAdapterObservation` ``error``).
         """
-        return await self._request(
+        raw = await self._request(
             "live/refresh",
             {"channel_id": channel_id},
+        )
+        return LiveRefreshResult(
+            refresh_enqueued=bool(raw.get("refresh_enqueued", False)),
+            status=cast("LiveRefreshStatus", raw.get("status", "queued")),
         )
 
     @staticmethod

@@ -78,10 +78,10 @@ pub use image_generation::{
 };
 pub use live::{
     LiveChannelParams, LiveCommitInputParams, LiveInputChunkWire, LiveOpenParams, LiveOpenResult,
-    LiveSendInputParams, LiveStatusResult, LiveTruncateParams, WireLiveAdapterErrorCode,
-    WireLiveAdapterObservation, WireLiveAdapterStatus, WireLiveChannelCapabilities,
-    WireLiveContinuityMode, WireLiveDegradationReason, WireLiveResponseModality,
-    WireLiveTransportBootstrap,
+    LiveRefreshResult, LiveRefreshStatus, LiveSendInputParams, LiveStatusResult,
+    LiveTruncateParams, WireLiveAdapterErrorCode, WireLiveAdapterObservation,
+    WireLiveAdapterStatus, WireLiveChannelCapabilities, WireLiveContinuityMode,
+    WireLiveDegradationReason, WireLiveResponseModality, WireLiveTransportBootstrap,
 };
 pub use mcp_live::{
     McpAddParams, McpLiveOpResponse, McpLiveOpStatus, McpLiveOperation, McpReloadParams,

@@ -9165,6 +9165,50 @@
     "title": "LiveOpenResult",
     "type": "object"
   },
+  "LiveRefreshResult": {
+    "$defs": {
+      "LiveRefreshStatus": {
+        "description": "Status of a `live/refresh` request relative to the adapter pump.\n\nR4-5 (P3): the refresh path is asynchronous — `LiveAdapterHost::send_command`\nreturns when the command has been queued on the adapter's mpsc channel,\nnot when the adapter pump has applied the resulting `session.update`. The\nrealtime stream is the source of truth for the actual refresh outcome\n(failures surface as `LiveAdapterObservation::Error`).\n\nToday every refresh path is `Queued`. The enum is `#[non_exhaustive]` so\na future revision can add `AppliedSync` (e.g. when a oneshot ack from the\nadapter pump back through the command channel lands, or when a refresh\nis detected as a no-op against the currently-applied snapshot) without\nbreaking the wire shape. SDK consumers route on the string value and\ntreat unknown values as \"outcome unknown — observe the realtime stream\".\n\nSerializes as a plain string (no envelope) so [`LiveRefreshResult`] can\nplace this typed status alongside the back-compat `refresh_enqueued`\nboolean as ordinary sibling fields, which keeps SDK codegen on the\nsimple-struct path.",
+        "oneOf": [
+          {
+            "const": "queued",
+            "description": "The host has accepted the refresh command onto the adapter's mpsc\nqueue. The adapter pump applies the `session.update` asynchronously;\ncallers that need the actual outcome must observe the adapter's\nrealtime stream.",
+            "type": "string"
+          }
+        ]
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Response payload for `live/refresh`.\n\nR4-5 (P3): replaces the previous untyped `{\"refresh_enqueued\": true}`\nJSON blob. The boolean `refresh_enqueued` field is preserved for back-\ncompat (legacy clients that pattern-match on it stay on the green path)\nalongside the typed `status` discriminator. New code should route on\n`status`.\n\nSee [`LiveRefreshStatus`] for the variant set and the contract on\nasynchronous adapter-pump application.",
+    "properties": {
+      "refresh_enqueued": {
+        "description": "Back-compat mirror of the legacy untyped reply field. Always `true`\nwhen paired with `status: queued`. New code should route on `status`.",
+        "type": "boolean"
+      },
+      "status": {
+        "$ref": "#/$defs/LiveRefreshStatus",
+        "description": "Typed refresh status. Today: always [`LiveRefreshStatus::Queued`]."
+      }
+    },
+    "required": [
+      "status",
+      "refresh_enqueued"
+    ],
+    "title": "LiveRefreshResult",
+    "type": "object"
+  },
+  "LiveRefreshStatus": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Status of a `live/refresh` request relative to the adapter pump.\n\nR4-5 (P3): the refresh path is asynchronous — `LiveAdapterHost::send_command`\nreturns when the command has been queued on the adapter's mpsc channel,\nnot when the adapter pump has applied the resulting `session.update`. The\nrealtime stream is the source of truth for the actual refresh outcome\n(failures surface as `LiveAdapterObservation::Error`).\n\nToday every refresh path is `Queued`. The enum is `#[non_exhaustive]` so\na future revision can add `AppliedSync` (e.g. when a oneshot ack from the\nadapter pump back through the command channel lands, or when a refresh\nis detected as a no-op against the currently-applied snapshot) without\nbreaking the wire shape. SDK consumers route on the string value and\ntreat unknown values as \"outcome unknown — observe the realtime stream\".\n\nSerializes as a plain string (no envelope) so [`LiveRefreshResult`] can\nplace this typed status alongside the back-compat `refresh_enqueued`\nboolean as ordinary sibling fields, which keeps SDK codegen on the\nsimple-struct path.",
+    "oneOf": [
+      {
+        "const": "queued",
+        "description": "The host has accepted the refresh command onto the adapter's mpsc\nqueue. The adapter pump applies the `session.update` asynchronously;\ncallers that need the actual outcome must observe the adapter's\nrealtime stream.",
+        "type": "string"
+      }
+    ],
+    "title": "LiveRefreshStatus"
+  },
   "LiveSendInputParams": {
     "$defs": {
       "LiveInputChunkWire": {

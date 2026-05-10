@@ -47,6 +47,7 @@ import {
   type LiveCommitInputParams,
   type LiveOpenParams,
   type LiveOpenResult,
+  type LiveRefreshResult,
   type LiveSendInputParams,
   type LiveStatusResult,
   type LiveTruncateParams,
@@ -2366,8 +2367,35 @@ export class MeerkatClient {
     await this.request("live/truncate", params as unknown as Record<string, unknown>);
   }
 
-  async liveRefresh(params: LiveChannelParams): Promise<void> {
-    await this.request("live/refresh", params as unknown as Record<string, unknown>);
+  /**
+   * Apply mutable session config (instructions / tools / audio) to an open
+   * live channel. Wraps `live/refresh`.
+   *
+   * **Does NOT replay canonical history.** Refresh enqueues a single
+   * `session.update` carrying the latest projection snapshot's mutable
+   * config fields. History seeding is owned by `live/open`; refresh is
+   * config-only by design.
+   *
+   * **Identity changes require close + reopen.** Refresh validates that
+   * `model_id` and `provider_id` match the channel's currently-open
+   * identity and rejects swaps with a typed adapter-level error.
+   *
+   * R4-5 (P3): the result is a typed `LiveRefreshResult` carrying both the
+   * typed `status` discriminator (today: always `"queued"`; the wire enum
+   * is open so future variants like `applied_sync` can land without breaking
+   * the shape) and the legacy `refresh_enqueued: true` back-compat boolean.
+   * The host's `send_command` returns when the command has been queued on
+   * the adapter's mpsc channel; the adapter pump applies the
+   * `session.update` asynchronously, and the realtime stream is the source
+   * of truth for the actual outcome (failures surface as
+   * `WireLiveAdapterObservation::Error`).
+   */
+  async liveRefresh(params: LiveChannelParams): Promise<LiveRefreshResult> {
+    const result = await this.request(
+      "live/refresh",
+      params as unknown as Record<string, unknown>,
+    );
+    return result as unknown as LiveRefreshResult;
   }
 
   /**
