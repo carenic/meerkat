@@ -3741,14 +3741,15 @@ impl SessionRuntime {
     /// Phase 4 R1: thin RPC shim — delegates to
     /// `LiveOrchestrator::propagate_config_to_live_channels`.
     ///
-    /// G5 (P1): `prior_global_model` is the global agent model that was
-    /// in effect *before* the config change that triggered the call. It
-    /// is the only available signal for distinguishing a session that
-    /// was tracking the global from a session carrying a per-session
-    /// override (set via `TurnOverrides`, session-scoped `config/patch`,
-    /// or open-time identity). When the caller cannot supply the prior
-    /// baseline, pass `None` — the orchestrator then skips the global
-    /// hot-swap entirely (the conservative path that preserves overrides).
+    /// `prior_global_model` is retained on the signature for handler
+    /// compatibility but the orchestrator no longer consults it. The
+    /// hot-swap rule is now: skip when the session's current model
+    /// already equals the new global; otherwise propagate. See
+    /// `should_apply_global_model_hot_swap` for the rationale (s72
+    /// regression fix: a session that pinned a model at `session/create`
+    /// against a different global must still re-resolve when the global
+    /// is patched, so the next `live/open` precheck enforces B19 against
+    /// the new resolution).
     pub async fn propagate_config_to_live_channels(&self, prior_global_model: Option<&str>) {
         let snapshot = self.realm_context_snapshot();
         let cleanup = self.archive_runtime_cleanup();

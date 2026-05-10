@@ -132,17 +132,30 @@ fn live_channel_no_close_when_no_bound_identity() {
 }
 
 // ---------------------------------------------------------------------------
-// G5 (P1) regression: `should_apply_global_model_hot_swap` is the pure
-// rule that decides whether `propagate_config_to_live_channels` should
-// hot-swap a session to the new global model. The cases pin the
-// override-preserving behavior the orchestrator relies on.
+// `should_apply_global_model_hot_swap` is the pure rule that decides
+// whether `propagate_config_to_live_channels` should hot-swap a session
+// to the new global model. The rule is now:
+//
+//   Skip when current_session_model == new_global_model (no-op);
+//   otherwise propagate.
+//
+// `prior_global_model` is no longer consulted — the original G5 (P1)
+// rule attempted to preserve "per-session overrides" by skipping when
+// `current` differed from `prior_global`, but that heuristic conflated
+// "user pinned at session/create" with "user reconfigured mid-session"
+// and broke the s72 e2e contract (a session created with an explicit
+// realtime model against a non-realtime global must still re-resolve
+// to the new non-realtime global so the next live/open precheck rejects
+// via B19).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn g5_hot_swap_skips_when_prior_global_unknown() {
-    // Caller did not supply a prior baseline → conservative skip
-    // (we cannot tell tracking from override apart).
-    assert!(!should_apply_global_model_hot_swap(
+fn hot_swap_propagates_when_prior_global_unknown_and_models_differ() {
+    // s72 regression: even without a prior baseline, the new global
+    // differs from the session's current model → propagate. The earlier
+    // "skip when prior is None" rule left stale-tracking sessions
+    // stranded; the new rule trusts the new global as authoritative.
+    assert!(should_apply_global_model_hot_swap(
         "gpt-realtime-2",
         None,
         "gpt-realtime-3"
@@ -150,7 +163,7 @@ fn g5_hot_swap_skips_when_prior_global_unknown() {
 }
 
 #[test]
-fn g5_hot_swap_skips_when_session_already_matches_new_global() {
+fn hot_swap_skips_when_session_already_matches_new_global() {
     // Session model already equals new global → hot-swap would be a
     // no-op; the per-channel Refresh fan-out below still runs.
     assert!(!should_apply_global_model_hot_swap(
@@ -158,12 +171,17 @@ fn g5_hot_swap_skips_when_session_already_matches_new_global() {
         Some("gpt-realtime-2"),
         "gpt-realtime-3"
     ));
+    // Same outcome regardless of prior-baseline knowledge.
+    assert!(!should_apply_global_model_hot_swap(
+        "gpt-realtime-3",
+        None,
+        "gpt-realtime-3"
+    ));
 }
 
 #[test]
-fn g5_hot_swap_propagates_when_session_was_tracking_prior_global() {
-    // Session was tracking the prior global → safe to retarget to the
-    // new global because there's no per-session override in force.
+fn hot_swap_propagates_when_session_was_tracking_prior_global() {
+    // Session was tracking the prior global → safe to retarget.
     assert!(should_apply_global_model_hot_swap(
         "gpt-realtime-2",
         Some("gpt-realtime-2"),
@@ -172,11 +190,13 @@ fn g5_hot_swap_propagates_when_session_was_tracking_prior_global() {
 }
 
 #[test]
-fn g5_hot_swap_skips_when_session_diverged_from_prior_global() {
-    // Session model differs from BOTH the prior and the new global →
-    // a per-session override is in force (set via TurnOverrides,
-    // session-scoped patch, or open-time identity). MUST NOT trample.
-    assert!(!should_apply_global_model_hot_swap(
+fn hot_swap_propagates_when_session_diverged_from_prior_global() {
+    // s72 regression: session model differs from both the prior and the
+    // new global. The original G5 rule treated this as an "override" and
+    // skipped — that broke s72, where the test creates a session with
+    // an explicit realtime model against a non-realtime global. The
+    // new rule treats the global as authoritative for any value mismatch.
+    assert!(should_apply_global_model_hot_swap(
         "gpt-realtime-prior-override",
         Some("gpt-realtime-2"),
         "gpt-realtime-3"
@@ -184,11 +204,9 @@ fn g5_hot_swap_skips_when_session_diverged_from_prior_global() {
 }
 
 #[test]
-fn g5_hot_swap_skips_when_override_happens_to_match_new_global() {
-    // Edge: the override target coincides with the new global. The
-    // session was overridden (current != prior), so we skip — the
-    // identity already matches the new global anyway, so the skip is
-    // semantically equivalent to a no-op hot-swap.
+fn hot_swap_skips_when_session_already_matches_new_global_after_divergence() {
+    // Edge: the per-session model coincides with the new global. The
+    // hot-swap is a no-op regardless of prior baseline.
     assert!(!should_apply_global_model_hot_swap(
         "gpt-realtime-3",
         Some("gpt-realtime-2"),

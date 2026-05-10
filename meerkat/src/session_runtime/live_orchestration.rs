@@ -177,38 +177,46 @@ pub fn live_channel_requires_close_for_identity_change(
     }
 }
 
-/// G5 (P1): decide whether `propagate_config_to_live_channels` should
-/// hot-swap a given session to the new global model.
+/// Decide whether `propagate_config_to_live_channels` should hot-swap a
+/// given session's live LLM identity to the new global model.
 ///
 /// The rule is:
 ///
-/// - If the caller did not supply a `prior_global_model`, skip the
-///   hot-swap (we cannot tell tracking from override apart).
 /// - If the session's current model already equals the new global, the
 ///   hot-swap would be a no-op — skip it (the per-channel Refresh
 ///   fan-out below still runs).
-/// - If the session's current model equals the prior global, the
-///   session was tracking the global → propagate (return `true`).
-/// - Otherwise the session has diverged from the prior global (a
-///   per-session override is in force) → skip to preserve the override.
+/// - Otherwise propagate the new global to the session. A `config/patch`
+///   that mutates `agent.model` is a global policy change and the live
+///   path must reflect it, including for sessions that pinned a model at
+///   `session/create` time (s72: a session created with an explicit
+///   `model: "gpt-realtime-2"` against a non-realtime global must still
+///   re-resolve to the new non-realtime global so the next `live/open`
+///   precheck rejects via B19).
 ///
-/// The "prior global" baseline is the only signal we have for
-/// distinguishing tracking sessions from overridden ones at the moment
-/// the global config has just been mutated; the alternative
-/// (unconditionally broadcasting the new global) trampoles overrides.
+/// G5 (P1) revisited: the original G5 rule attempted to preserve
+/// "per-session overrides" by skipping when `current_session_model`
+/// differed from `prior_global_model`. That heuristic conflated two
+/// distinct cases — (a) a session that explicitly chose its initial
+/// model via `CreateSessionRequest.model` while the global differed, and
+/// (b) a session that was later reconfigured via `llm_reconfigure`. Both
+/// cases produced `current != prior_global`, but only (b) carries a
+/// "sticky override" intent. Without a typed override marker on
+/// `SessionMetadata` we cannot disambiguate; broadcasting the new global
+/// is the correct default for `config/patch agent.model` because that
+/// patch is itself a global policy change. Sessions that need a sticky
+/// override should issue a session-scoped reconfigure after the patch.
+///
+/// `prior_global_model` is retained on the public signature so existing
+/// callers (the RPC config/patch handler) don't have to be re-plumbed,
+/// but it is no longer consulted: the rule now depends only on the
+/// session's current model and the new global model.
 #[must_use]
 pub fn should_apply_global_model_hot_swap(
     current_session_model: &str,
-    prior_global_model: Option<&str>,
+    _prior_global_model: Option<&str>,
     new_global_model: &str,
 ) -> bool {
-    let Some(prior) = prior_global_model else {
-        return false;
-    };
-    if current_session_model == new_global_model {
-        return false;
-    }
-    current_session_model == prior
+    current_session_model != new_global_model
 }
 
 /// Build the projection-root system message for a realtime session. The
@@ -687,25 +695,21 @@ mod orchestrator {
         /// swapped) to every active live channel. Best-effort:
         /// per-channel errors are swallowed via tracing.
         ///
-        /// G5 (P1): `prior_global_model` is the global agent model that
-        /// was in effect *before* the config change that triggered this
-        /// propagation. It is the only signal we have for distinguishing
-        /// a session that was tracking the global from one that carries
-        /// a per-session model override. The hot-swap to the new global
-        /// model is applied **only** to sessions whose current model
-        /// equals `prior_global_model` — sessions whose current model
-        /// differs are assumed to have an override (set via
-        /// `TurnOverrides`, a session-scoped `config/patch`, or an
-        /// open-time identity selection) and MUST NOT be trampled.
+        /// G5 (P1) revisited: a `config/patch agent.model` is a global
+        /// policy change. Every session whose current live identity
+        /// differs from the new global is hot-swapped to the new global
+        /// (see [`should_apply_global_model_hot_swap`]). This includes
+        /// sessions that pinned a model at `session/create` time —
+        /// without a typed override marker on `SessionMetadata` we
+        /// cannot reliably distinguish "user pinned at create" from
+        /// "user reconfigured mid-session", and treating the global as
+        /// authoritative is the correct default for an explicit global
+        /// policy change. Sessions that need a sticky override should
+        /// issue a session-scoped reconfigure after the patch.
         ///
-        /// When `prior_global_model` is `None` the caller does not know
-        /// the prior baseline; we conservatively skip the global
-        /// hot-swap entirely (preserving overrides at the cost of
-        /// leaving any stale-tracking sessions stale until they next
-        /// reconnect or take a turn). The downstream
-        /// `live_open_config_for_session` + identity-swap-detection
-        /// logic still runs for every channel so model/provider swaps
-        /// caused by other paths still surface as `ConfigRejected`.
+        /// `prior_global_model` is retained on the signature so the
+        /// `config/patch` handler does not have to be re-plumbed, but
+        /// it is no longer consulted by the hot-swap rule.
         pub async fn propagate_config_to_live_channels(&self, prior_global_model: Option<&str>) {
             let Some(host) = self.host.as_ref() else {
                 return;
@@ -739,9 +743,11 @@ mod orchestrator {
                                 continue;
                             }
                         };
-                    // G5 (P1): preserve per-session overrides. The pure
-                    // helper encodes the rule (see its doc-comment) so
-                    // it can be unit-tested in isolation.
+                    // G5 revisited: skip only when the swap would be a
+                    // no-op (`current_model == new_global_model`). The
+                    // pure helper encodes the rule so it can be
+                    // unit-tested in isolation; see its doc-comment for
+                    // the s72 regression rationale.
                     if !should_apply_global_model_hot_swap(
                         &current_model,
                         prior_global_model,

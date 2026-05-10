@@ -276,10 +276,12 @@ pub async fn handle_patch(
             Ok(snapshot) => snapshot.config,
             Err(e) => return runtime_error_to_response(id, e),
         };
-        // G5 (P1): capture the prior global model BEFORE committing the
-        // patch so `propagate_config_to_live_channels` can distinguish
-        // sessions tracking the global from those carrying per-session
-        // overrides.
+        // Capture the prior global model BEFORE committing the patch.
+        // G5 revisited: the orchestrator no longer consults the prior
+        // baseline (the divergence heuristic broke s72 — see
+        // `should_apply_global_model_hot_swap` for the rationale), but
+        // the value is still threaded through for tracing/telemetry and
+        // signature stability with the rpc shim.
         let prior_global_model = current.agent.model.clone();
         let preview = match apply_patch_preview(&current, patch.clone()) {
             Ok(config) => config,
@@ -326,8 +328,9 @@ pub async fn handle_patch(
                 // every active live channel so adapters re-seed against
                 // canonical state. No-op when no live host is attached.
                 //
-                // G5 (P1): pass the prior global model so per-session
-                // overrides are not trampled by the global broadcast.
+                // G5 revisited: the prior global model is forwarded for
+                // signature stability but the orchestrator's hot-swap
+                // rule no longer consults it.
                 runtime
                     .propagate_config_to_live_channels(Some(&prior_global_model))
                     .await;
@@ -347,9 +350,10 @@ pub async fn handle_patch(
             Ok(config) => config,
             Err(e) => return RpcResponse::error(id, error::INTERNAL_ERROR, e.to_string()),
         };
-        // G5 (P1): capture the prior global model BEFORE the patch so
-        // override detection can distinguish tracking sessions from
-        // overridden sessions.
+        // Capture the prior global model BEFORE the patch. G5 revisited:
+        // the orchestrator no longer consults this baseline, but it is
+        // still threaded through for signature stability with the rpc
+        // shim. See `should_apply_global_model_hot_swap` for the rule.
         let prior_global_model = current.agent.model.clone();
         let preview = match apply_patch_preview(&current, patch.clone()) {
             Ok(config) => config,
@@ -372,8 +376,9 @@ pub async fn handle_patch(
             Ok(config) => {
                 runtime.set_skill_identity_registry(registry);
                 // P1#5: propagate to live channels. See doc-comment above.
-                // G5 (P1): pass the prior global model so per-session
-                // overrides are not trampled.
+                // G5 revisited: prior_global_model is threaded for
+                // signature stability only; the orchestrator's hot-swap
+                // rule no longer consults it.
                 runtime
                     .propagate_config_to_live_channels(Some(&prior_global_model))
                     .await;
