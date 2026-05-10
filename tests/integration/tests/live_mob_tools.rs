@@ -17,6 +17,16 @@ use meerkat_core::types::SessionId;
 use meerkat_core::{ConfigRuntime, MemoryConfigStore};
 use meerkat_mob::MobId;
 use meerkat_mob_mcp::MobMcpState;
+// RPC-host: this integration test directly drives the JSON-RPC dispatch surface
+// (MethodRouter::method_call with RpcRequest/RpcResponse) to exercise RPC method
+// behaviour end-to-end without TCP/stdio transport. Wire types
+// (RpcId/RpcRequest/RpcResponse/RpcNotification) are inherently RPC-shape;
+// SessionRuntime + NotificationSink back the dispatcher. Lifting these would
+// remove the test's reason for existing — it asserts the agent mob tool surface
+// (#191) over RPC dispatch with real LLM calls, not the upstream
+// session_runtime semantics. Inline `meerkat_rpc::protocol::RpcNotification`
+// (notification channel) and `meerkat_rpc::protocol::RpcResponse` (dispatch
+// result) references below carry the same rationale.
 use meerkat_rpc::protocol::{RpcId, RpcRequest};
 use meerkat_rpc::router::{MethodRouter, NotificationSink};
 use meerkat_rpc::session_runtime::SessionRuntime;
