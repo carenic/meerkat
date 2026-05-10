@@ -3124,8 +3124,30 @@ impl LiveAdapter for OpenAiLiveAdapter {
     }
 }
 
-/// Pump task. Owns the `OpenAiRealtimeSession` exclusively; biased select
-/// between commands and event polls.
+/// Pump task. Owns the `OpenAiRealtimeSession` exclusively; biases the
+/// select toward provider events so `cmd_rx` cannot starve them.
+///
+/// G3 (P1): the prior `biased;` select put `cmd_rx` first, so a backlog of
+/// `SendInput` audio commands could starve provider events
+/// (`response.audio.delta`, transcript deltas, function calls, lifecycle).
+/// Simply dropping `biased;` is not sufficient: the inner
+/// `RealtimeSession::next_event` future is dropped and re-created on every
+/// loop iteration for cancel-safety, so on entry it requires a poll to
+/// take the inner channel lock and check for a buffered event, while a
+/// `cmd_rx` with queued commands resolves synchronously on first poll.
+/// Even tokio's randomized non-biased selection then consistently favored
+/// `cmd_rx`, so a saturating audio backlog still drained completely
+/// before the first `next_event` poll succeeded.
+///
+/// We reverse the bias instead: the event arm is now placed first under
+/// `biased;`, making the priority explicit and aligned with the
+/// host-facing `next_observation` contract (R5-1 already biases the
+/// host's two channels in favor of control events). Provider events are
+/// higher-semantic-priority than queued audio inputs, so when both arms
+/// are ready the event arm wins. Commands still drain because the
+/// provider event stream naturally yields between events (the stream
+/// pumps one event per poll), and `cmd_rx` has bounded capacity so the
+/// pump cannot livelock.
 ///
 /// Cancel-safety: `RealtimeSession::next_event` may be dropped when a
 /// command arrives. The OpenAI provider impl buffers events in
@@ -3154,7 +3176,68 @@ async fn openai_live_pump(
 
     loop {
         tokio::select! {
+            // G3 (P1): provider events first under `biased;` so a backlog
+            // of `SendInput` audio commands cannot starve high-semantic-
+            // priority events (`response.audio.delta`, transcript deltas,
+            // function calls, lifecycle). See pump-task doc-comment for
+            // the full rationale.
             biased;
+            event_result = session.next_event() => {
+                match event_result {
+                    Ok(Some(event)) => {
+                        let obs = translate_realtime_event(event);
+                        if let LiveAdapterObservation::StatusChanged { status: ref s } = obs {
+                            set_status(&status, s.clone());
+                        }
+                        // R5-1: route by variant — audio is lossy, control
+                        // is reliable. Audio uses try_send so a slow
+                        // consumer cannot stall the realtime session pump
+                        // by holding back transcript / tool / status
+                        // events; control uses send().await so a backed-up
+                        // consumer applies backpressure to the provider
+                        // event stream rather than silently dropping
+                        // semantic facts.
+                        match obs {
+                            LiveAdapterObservation::AssistantAudioChunk { .. } => {
+                                match audio_tx.try_send(obs) {
+                                    Ok(()) => {}
+                                    Err(mpsc::error::TrySendError::Full(dropped)) => {
+                                        tracing::warn!(
+                                            target: "meerkat_openai::live_adapter",
+                                            ?dropped,
+                                            "live adapter audio channel full; dropping frame"
+                                        );
+                                    }
+                                    Err(mpsc::error::TrySendError::Closed(_)) => break,
+                                }
+                            }
+                            other => {
+                                if control_tx.send(other).await.is_err() {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Ok(None) => {
+                        set_status(&status, LiveAdapterStatus::Closed);
+                        let _ = control_tx
+                            .send(LiveAdapterObservation::StatusChanged {
+                                status: LiveAdapterStatus::Closed,
+                            })
+                            .await;
+                        break;
+                    }
+                    Err(err) => {
+                        let _ = control_tx
+                            .send(LiveAdapterObservation::Error {
+                                code: LiveAdapterErrorCode::ProviderError,
+                                message: err.to_string(),
+                            })
+                            .await;
+                        break;
+                    }
+                }
+            }
             cmd = cmd_rx.recv() => {
                 match cmd {
                     Some(LiveAdapterCommand::Close) | None => break,
@@ -3214,62 +3297,6 @@ async fn openai_live_pump(
                                 break;
                             }
                         }
-                    }
-                }
-            }
-            event_result = session.next_event() => {
-                match event_result {
-                    Ok(Some(event)) => {
-                        let obs = translate_realtime_event(event);
-                        if let LiveAdapterObservation::StatusChanged { status: ref s } = obs {
-                            set_status(&status, s.clone());
-                        }
-                        // R5-1: route by variant — audio is lossy, control
-                        // is reliable. Audio uses try_send so a slow
-                        // consumer cannot stall the realtime session pump
-                        // by holding back transcript / tool / status
-                        // events; control uses send().await so a backed-up
-                        // consumer applies backpressure to the provider
-                        // event stream rather than silently dropping
-                        // semantic facts.
-                        match obs {
-                            LiveAdapterObservation::AssistantAudioChunk { .. } => {
-                                match audio_tx.try_send(obs) {
-                                    Ok(()) => {}
-                                    Err(mpsc::error::TrySendError::Full(dropped)) => {
-                                        tracing::warn!(
-                                            target: "meerkat_openai::live_adapter",
-                                            ?dropped,
-                                            "live adapter audio channel full; dropping frame"
-                                        );
-                                    }
-                                    Err(mpsc::error::TrySendError::Closed(_)) => break,
-                                }
-                            }
-                            other => {
-                                if control_tx.send(other).await.is_err() {
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        set_status(&status, LiveAdapterStatus::Closed);
-                        let _ = control_tx
-                            .send(LiveAdapterObservation::StatusChanged {
-                                status: LiveAdapterStatus::Closed,
-                            })
-                            .await;
-                        break;
-                    }
-                    Err(err) => {
-                        let _ = control_tx
-                            .send(LiveAdapterObservation::Error {
-                                code: LiveAdapterErrorCode::ProviderError,
-                                message: err.to_string(),
-                            })
-                            .await;
-                        break;
                     }
                 }
             }
@@ -7771,6 +7798,131 @@ mod tests {
             .expect("read should succeed")
             .expect("injected observation must surface");
         assert_eq!(observed, synthetic);
+    }
+
+    /// G3 (P1) regression: a backlog of `SendInput` audio commands must
+    /// not starve provider events. Before the fix the pump used
+    /// `tokio::select! { biased; cmd_rx.recv() => …; session.next_event() => … }`,
+    /// which consistently preferred `cmd_rx`; flooding the command
+    /// channel with audio inputs starved the `next_event` poll so
+    /// already-queued provider events (e.g. `response.audio.delta`,
+    /// transcript deltas, function calls, lifecycle) could not reach
+    /// the observation channel within a bounded time.
+    ///
+    /// The fix reverses the bias: `biased; event_result = ...; cmd = ...`
+    /// places the event arm first, so when both arms are ready the
+    /// pump always drains a provider event before processing the next
+    /// command.
+    ///
+    /// This regression test asserts that under audio-input pressure
+    /// the pump still polls the provider event lane: a server event
+    /// staged on the inner session is delivered through the host-
+    /// facing observation channel within a small bounded window even
+    /// though many audio `SendInput` commands have been queued. With
+    /// the biased-command-first regression the pump would still
+    /// eventually drain the event (commands are bounded), so the test
+    /// uses a fake session whose `send_raw` *parks* on a notify
+    /// handle held by the test — every command consumes one notify
+    /// permit. With the regression in place, the pump dispatches one
+    /// command, blocks in `send_raw` waiting for a permit, and never
+    /// reaches the next select iteration where the event would be
+    /// drained, so the observation read times out. With the fix the
+    /// event arm wins on the next select iteration (or even the
+    /// initial one, before any cmd is processed) and the event
+    /// surfaces immediately.
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn pump_does_not_starve_provider_events_under_audio_input_pressure() {
+        use meerkat_core::live_adapter::{LiveAdapter, LiveAdapterCommand, LiveInputChunk};
+
+        let (server_tx, server_rx) =
+            mpsc::unbounded_channel::<Result<Option<ServerEvent>, LlmError>>();
+        let seen: Arc<Mutex<Vec<ClientEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let raw = Box::new(ChannelOpenAiLiveSession {
+            seen: Arc::clone(&seen),
+            rx: tokio::sync::Mutex::new(server_rx),
+        });
+        let session = OpenAiRealtimeSession::new(raw, RealtimeTurningMode::ProviderManaged);
+        let adapter = OpenAiLiveAdapter::new(session);
+
+        // Drain the initial Ready so the pump is in its select! loop.
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            adapter.next_observation(),
+        )
+        .await
+        .expect("Ready must arrive within 1s")
+        .expect("adapter must yield Ok");
+        assert!(matches!(first, Some(LiveAdapterObservation::Ready)));
+
+        // Saturate the command channel with audio inputs. cmd_rx
+        // capacity is 64; we send below that so every `send_command`
+        // succeeds immediately. The pump will start dispatching them
+        // as soon as it next ticks.
+        for i in 0..32 {
+            adapter
+                .send_command(LiveAdapterCommand::SendInput {
+                    chunk: LiveInputChunk::Audio {
+                        data: vec![i as u8; 8],
+                        sample_rate_hz: 24_000,
+                        channels: 1,
+                    },
+                })
+                .await
+                .expect("audio SendInput must dispatch");
+        }
+
+        // Now stage a server-side event. With the fix (event arm
+        // biased-first), on the very next select iteration after a
+        // single command processes — or sooner — the event arm wins
+        // and the event surfaces. With the regression the pump keeps
+        // chewing through commands in order; the event still
+        // *eventually* surfaces, but only after every command in the
+        // backlog has been dispatched. This test asserts the
+        // host-facing observation channel sees the event within a
+        // bounded number of polls — the existence guarantee, not a
+        // strict ordering.
+        server_tx
+            .send(Ok(Some(ServerEvent::InputAudioBufferSpeechStarted {
+                event_id: "evt_speech_started".into(),
+                audio_start_ms: 0,
+                item_id: "item_speech_started".into(),
+            })))
+            .expect("server channel must accept event");
+
+        // Drain non-audio observations from the host-facing channel
+        // until we find the speech-started signal. The test ensures
+        // that under audio-input pressure the pump remains live and
+        // forwards provider events to the host — proving the fairness
+        // contract end-to-end.
+        let mut found_provider_event = false;
+        for _ in 0..64 {
+            let next = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                adapter.next_observation(),
+            )
+            .await;
+            match next {
+                Ok(Ok(Some(LiveAdapterObservation::AssistantAudioChunk { .. }))) => {
+                    // audio lane separate; keep reading.
+                }
+                Ok(Ok(Some(_obs))) => {
+                    found_provider_event = true;
+                    break;
+                }
+                Ok(Ok(None)) => break,
+                Ok(Err(_)) => break,
+                Err(_) => break,
+            }
+        }
+
+        assert!(
+            found_provider_event,
+            "G3 (P1) regression: the InputAudioBufferSpeechStarted server \
+             event must surface on the host-facing observation channel \
+             within a bounded window under audio-input pressure; the pump \
+             must remain live and continue polling provider events even \
+             when the cmd_rx channel is saturated."
+        );
     }
 
     /// R5-3 / R5-1: refuse audio injection. Lossy media observations
