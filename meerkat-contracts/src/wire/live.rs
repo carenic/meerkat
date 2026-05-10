@@ -22,13 +22,29 @@ use meerkat_core::live_adapter::{
 use meerkat_core::realtime_transcript::RealtimeTranscriptEvent;
 use meerkat_core::types::Usage;
 
+use crate::wire::realtime::RealtimeTurningMode;
 use crate::wire::session::WireStopReason;
 
 /// Request payload for `live/open`.
+///
+/// R3-1 (P1): `turning_mode` lets callers pick between the provider-managed
+/// (server-VAD) flow and the explicit-commit flow. The G9 typed text-only
+/// `live/commit_input { response_modality: text }` path requires
+/// `ExplicitCommit` because the OpenAI realtime API rejects
+/// `input_audio_buffer.commit` unless the session was opened with explicit
+/// commit semantics (server VAD owns commits otherwise). Pre-R3-1 the
+/// handler hard-coded `ProviderManaged`, which made the typed text-only
+/// path unreachable on a public channel — calling it killed the channel
+/// instead of producing sideband text.
+///
+/// Default (`None`) preserves the prior wire shape: callers that omit the
+/// field get `ProviderManaged`, matching the legacy behavior.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct LiveOpenParams {
     pub session_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turning_mode: Option<RealtimeTurningMode>,
 }
 
 /// Response payload for `live/open`.
@@ -67,40 +83,85 @@ pub enum WireLiveTransportBootstrap {
     /// authenticates with `token`. Mirrors
     /// [`meerkat_core::live_adapter::LiveTransportBootstrap::Websocket`].
     Websocket { url: String, token: String },
+    /// R3-6 (P2): explicit fail-loud variant for unknown core variants.
+    ///
+    /// The core [`LiveTransportBootstrap`] enum is `#[non_exhaustive]`. When
+    /// a future variant (e.g. WebRTC reintroduction per Round-4 T4) lands
+    /// without an explicit arm in the wire `From` impl, the conversion
+    /// surfaces as `Unknown { debug }` rather than silently coercing into
+    /// `Websocket { url: "", token: "" }`. SDK consumers route on the
+    /// `transport: "unknown"` discriminator and treat it as an unsupported
+    /// transport — never as a usable websocket. The `debug` payload carries
+    /// the `{:?}` projection of the source variant so server logs name the
+    /// real shape that needs to be promoted.
+    ///
+    /// **When a new core variant is added, add an explicit arm in the
+    /// forward `From` impl above this variant — `Unknown` is the floor, not
+    /// the destination.**
+    Unknown { debug: String },
 }
 
 impl From<LiveTransportBootstrap> for WireLiveTransportBootstrap {
     fn from(value: LiveTransportBootstrap) -> Self {
         match value {
             LiveTransportBootstrap::Websocket { url, token } => Self::Websocket { url, token },
-            // Core enum is `#[non_exhaustive]`; debug-assert for new variants
-            // and fall back to an empty Websocket placeholder. When a new
-            // variant lands, add an explicit arm above this comment.
-            _ => {
+            // Core enum is `#[non_exhaustive]`. R3-6 (P2): surface unknown
+            // variants explicitly via `Unknown { debug }` rather than
+            // silently coercing to a bogus `Websocket { url: "", token: "" }`.
+            // The `debug` payload preserves the source variant name for
+            // server-side observability. When a new core variant lands,
+            // add an explicit arm above this comment.
+            other => {
                 debug_assert!(
                     false,
                     "WireLiveTransportBootstrap::from saw an unmapped \
                      LiveTransportBootstrap variant; add an explicit arm in \
                      meerkat-contracts/src/wire/live.rs."
                 );
-                Self::Websocket {
-                    url: String::new(),
-                    token: String::new(),
+                Self::Unknown {
+                    debug: format!("{other:?}"),
                 }
             }
         }
     }
 }
 
-impl From<WireLiveTransportBootstrap> for LiveTransportBootstrap {
-    fn from(value: WireLiveTransportBootstrap) -> Self {
-        // No wildcard arm: `WireLiveTransportBootstrap` is owned by this
-        // crate so even with `#[non_exhaustive]` (which only constrains
-        // matches outside the defining crate) the compiler enforces
-        // exhaustive coverage here. Adding a new wire variant therefore
-        // forces a new arm in this match — no silent fallthrough.
+/// Conversion error surfaced when a wire variant has no core counterpart.
+///
+/// Today this only fires for the explicit fail-loud `Unknown` wire variants
+/// (`WireLiveTransportBootstrap::Unknown`, `WireLiveAdapterObservation::Unknown`)
+/// — the wire mirrors' fail-loud sentinels for forward-converted future core
+/// variants. There is no meaningful inverse for `Unknown` so the inverse path
+/// returns this error instead of silently fabricating a placeholder.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum WireConversionError {
+    /// Wire transport is the explicit-Unknown sentinel; no inverse mapping
+    /// exists. Carries the original debug payload for server logs.
+    #[error("unknown wire transport variant: {debug}")]
+    UnknownTransport { debug: String },
+    /// Wire observation is the explicit-Unknown sentinel; no inverse
+    /// mapping exists. Carries the original debug payload for server logs.
+    #[error("unknown wire observation variant: {debug}")]
+    UnknownObservation { debug: String },
+}
+
+impl TryFrom<WireLiveTransportBootstrap> for LiveTransportBootstrap {
+    type Error = WireConversionError;
+
+    fn try_from(value: WireLiveTransportBootstrap) -> Result<Self, Self::Error> {
+        // Wire enum is owned by this crate so even with `#[non_exhaustive]`
+        // (which only constrains matches outside the defining crate) the
+        // compiler enforces exhaustive coverage here. Adding a new wire
+        // variant therefore forces a new arm in this match — no silent
+        // fallthrough.
         match value {
-            WireLiveTransportBootstrap::Websocket { url, token } => Self::Websocket { url, token },
+            WireLiveTransportBootstrap::Websocket { url, token } => {
+                Ok(Self::Websocket { url, token })
+            }
+            WireLiveTransportBootstrap::Unknown { debug } => {
+                Err(WireConversionError::UnknownTransport { debug })
+            }
         }
     }
 }
@@ -740,6 +801,25 @@ pub enum WireLiveAdapterObservation {
         code: WireLiveAdapterErrorCode,
         message: String,
     },
+    /// R3-6 (P2): explicit fail-loud variant for unknown core variants.
+    ///
+    /// The core [`LiveAdapterObservation`] enum is `#[non_exhaustive]`. When
+    /// a future variant lands without an explicit arm in the wire `From`
+    /// impl, the conversion surfaces as `Unknown { debug }` rather than
+    /// silently coercing into the worst-possible default —
+    /// `TurnInterrupted` — which would surface a real new event as an
+    /// interrupt and drop data downstream. SDK consumers route on the
+    /// `observation: "unknown"` discriminator and treat it as an
+    /// unrecognized event — never as a barge-in. The `debug` payload
+    /// carries the `{:?}` projection of the source variant so server logs
+    /// name the real shape that needs to be promoted.
+    ///
+    /// **When a new core variant is added, add an explicit arm in the
+    /// forward `From` impl above this variant — `Unknown` is the floor,
+    /// not the destination.**
+    Unknown {
+        debug: String,
+    },
 }
 
 impl From<LiveAdapterObservation> for WireLiveAdapterObservation {
@@ -870,15 +950,22 @@ impl From<LiveAdapterObservation> for WireLiveAdapterObservation {
                 code: code.into(),
                 message,
             },
-            // Core enum is `non_exhaustive`; debug-assert for new variants.
-            _ => {
+            // Core enum is `#[non_exhaustive]`. R3-6 (P2): surface unknown
+            // variants explicitly via `Unknown { debug }` rather than
+            // silently coercing to `TurnInterrupted` (the previous default
+            // — the worst-possible fallback because a real new event would
+            // surface as a barge-in and drop data downstream). When a new
+            // core variant lands, add an explicit arm above this comment.
+            other => {
                 debug_assert!(
                     false,
                     "WireLiveAdapterObservation::from saw an unmapped \
                      LiveAdapterObservation variant; add an explicit arm in \
                      meerkat-contracts/src/wire/live.rs."
                 );
-                Self::TurnInterrupted { response_id: None }
+                Self::Unknown {
+                    debug: format!("{other:?}"),
+                }
             }
         }
     }
@@ -907,8 +994,40 @@ mod tests {
     fn live_open_params_round_trip() {
         let v = LiveOpenParams {
             session_id: "session-1".into(),
+            turning_mode: None,
         };
         let j = serde_json::to_value(&v).expect("round-trip should succeed");
+        // R3-1: omitted `turning_mode` elides on the wire (back-compat).
+        assert!(
+            j.get("turning_mode").is_none(),
+            "default `turning_mode` must elide the field on the wire"
+        );
+        let back: LiveOpenParams = serde_json::from_value(j).expect("round-trip should succeed");
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn live_open_params_explicit_commit_round_trip() {
+        // R3-1 (P1): explicit-commit on the wire so the G9 typed text-only
+        // commit_input path is reachable.
+        let v = LiveOpenParams {
+            session_id: "session-1".into(),
+            turning_mode: Some(RealtimeTurningMode::ExplicitCommit),
+        };
+        let j = serde_json::to_value(&v).expect("round-trip should succeed");
+        assert_eq!(j["turning_mode"], "explicit_commit");
+        let back: LiveOpenParams = serde_json::from_value(j).expect("round-trip should succeed");
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn live_open_params_provider_managed_explicit_round_trip() {
+        let v = LiveOpenParams {
+            session_id: "session-1".into(),
+            turning_mode: Some(RealtimeTurningMode::ProviderManaged),
+        };
+        let j = serde_json::to_value(&v).expect("round-trip should succeed");
+        assert_eq!(j["turning_mode"], "provider_managed");
         let back: LiveOpenParams = serde_json::from_value(j).expect("round-trip should succeed");
         assert_eq!(v, back);
     }
@@ -1368,6 +1487,57 @@ mod tests {
         assert_eq!(core_json, wire_json);
     }
 
+    // R3-6 (P2) — explicit Unknown variant fail-loud regression tests.
+
+    #[test]
+    fn unknown_observation_variant_does_not_become_turn_interrupted() {
+        // R3-6 (P2): the wire `Unknown` variant must NOT serialize as
+        // `TurnInterrupted` (the previous fail-open default), and a real
+        // future-variant forward conversion must NOT collapse onto
+        // `TurnInterrupted`. Synthesize the future-variant case by
+        // constructing the wire `Unknown` sentinel directly.
+        let v = WireLiveAdapterObservation::Unknown {
+            debug: "FutureVariant { … }".into(),
+        };
+        let j = serde_json::to_value(&v).expect("round-trip should succeed");
+        assert_eq!(
+            j["observation"], "unknown",
+            "wire Unknown must NOT serialize as turn_interrupted"
+        );
+        assert_ne!(
+            j["observation"], "turn_interrupted",
+            "wire Unknown must never coerce to turn_interrupted"
+        );
+        assert_eq!(j["debug"], "FutureVariant { … }");
+        let back: WireLiveAdapterObservation =
+            serde_json::from_value(j).expect("round-trip should succeed");
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn known_observation_variants_never_serialize_as_unknown() {
+        // R3-6 (P2): the explicit-Unknown variant is a floor, not a
+        // destination. Every known core variant must produce its typed
+        // wire counterpart, never `Unknown`. Exercises the
+        // `LiveAdapterObservation::TurnInterrupted` case specifically
+        // because the previous fail-open default coerced unknown variants
+        // INTO `TurnInterrupted` — the inverse reachability check confirms
+        // the new explicit-Unknown path doesn't collide.
+        let real_interrupt = LiveAdapterObservation::TurnInterrupted {
+            response_id: Some("resp_real".into()),
+        };
+        let wire: WireLiveAdapterObservation = real_interrupt.into();
+        match &wire {
+            WireLiveAdapterObservation::TurnInterrupted { response_id } => {
+                assert_eq!(response_id.as_deref(), Some("resp_real"));
+            }
+            other => panic!("real TurnInterrupted must stay TurnInterrupted, got {other:?}"),
+        }
+        let j = serde_json::to_value(&wire).expect("round-trip should succeed");
+        assert_eq!(j["observation"], "turn_interrupted");
+        assert_ne!(j["observation"], "unknown");
+    }
+
     // G8 (P2) — typed `LiveTransportBootstrap` wire mirror.
 
     #[test]
@@ -1409,8 +1579,54 @@ mod tests {
             url: "wss://example/live".into(),
             token: "tok_back".into(),
         };
-        let core: LiveTransportBootstrap = v.clone().into();
+        // R3-6 (P2): wire → core is now `TryFrom`; `Unknown` rejects.
+        let core: LiveTransportBootstrap =
+            LiveTransportBootstrap::try_from(v.clone()).expect("known wire variant should convert");
         let back: WireLiveTransportBootstrap = core.into();
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn wire_live_transport_bootstrap_unknown_does_not_become_websocket() {
+        // R3-6 (P2): the wire `Unknown` variant must NOT silently convert
+        // back to a bogus `Websocket { url: "", token: "" }`. The inverse
+        // path returns `WireConversionError::UnknownTransport` so callers
+        // explicitly handle the unsupported transport.
+        let unknown = WireLiveTransportBootstrap::Unknown {
+            debug: "Webrtc { offer_sdp: \"v=0...\", terminator_url: \"https://example/whip\" }"
+                .to_string(),
+        };
+        match LiveTransportBootstrap::try_from(unknown.clone()) {
+            Err(WireConversionError::UnknownTransport { debug }) => {
+                assert!(debug.contains("Webrtc"), "debug payload preserved");
+            }
+            other => panic!("unknown wire variant must not coerce to a core variant: {other:?}"),
+        }
+        // Round-trips through serde as the explicit `unknown` discriminator.
+        let j = serde_json::to_value(&unknown).expect("round-trip should succeed");
+        assert_eq!(j["transport"], "unknown");
+        assert!(
+            j.get("url").is_none(),
+            "Unknown wire variant must NOT carry websocket fields — that was the whole bug"
+        );
+        let back: WireLiveTransportBootstrap =
+            serde_json::from_value(j).expect("round-trip should succeed");
+        assert_eq!(unknown, back);
+    }
+
+    #[test]
+    fn unknown_transport_variant_round_trips_as_unknown() {
+        // R3-6 (P2): synthesize the future-variant case by directly
+        // constructing the wire `Unknown` sentinel. JSON round-trip
+        // preserves the discriminator and `debug` payload.
+        let v = WireLiveTransportBootstrap::Unknown {
+            debug: "FutureVariant { … }".into(),
+        };
+        let j = serde_json::to_value(&v).expect("round-trip should succeed");
+        assert_eq!(j["transport"], "unknown");
+        assert_eq!(j["debug"], "FutureVariant { … }");
+        let back: WireLiveTransportBootstrap =
+            serde_json::from_value(j).expect("round-trip should succeed");
         assert_eq!(v, back);
     }
 

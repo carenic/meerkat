@@ -1420,8 +1420,22 @@ class RealtimeVideoChunk:
 
 @dataclass
 class LiveOpenParams:
-    """Request payload for `live/open`."""
+    """Request payload for `live/open`.
+
+R3-1 (P1): `turning_mode` lets callers pick between the provider-managed
+(server-VAD) flow and the explicit-commit flow. The G9 typed text-only
+`live/commit_input { response_modality: text }` path requires
+`ExplicitCommit` because the OpenAI realtime API rejects
+`input_audio_buffer.commit` unless the session was opened with explicit
+commit semantics (server VAD owns commits otherwise). Pre-R3-1 the
+handler hard-coded `ProviderManaged`, which made the typed text-only
+path unreachable on a public channel — calling it killed the channel
+instead of producing sideband text.
+
+Default (`None`) preserves the prior wire shape: callers that omit the
+field get `ProviderManaged`, matching the legacy behavior."""
     session_id: str
+    turning_mode: Optional[RealtimeTurningMode] = None
 
 
 @dataclass
@@ -1493,7 +1507,11 @@ class WireLiveTransportBootstrapWebsocket(TypedDict, total=False):
     transport: Required[Literal['websocket']]
     url: Required[str]
 
-WireLiveTransportBootstrap = WireLiveTransportBootstrapWebsocket
+class WireLiveTransportBootstrapUnknown(TypedDict, total=False):
+    debug: Required[str]
+    transport: Required[Literal['unknown']]
+
+WireLiveTransportBootstrap = WireLiveTransportBootstrapWebsocket | WireLiveTransportBootstrapUnknown
 
 @dataclass
 class LiveOpenResult:
@@ -1847,7 +1865,11 @@ class WireLiveAdapterObservationCommandRejected(TypedDict, total=False):
     message: Required[str]
     observation: Required[Literal['command_rejected']]
 
-WireLiveAdapterObservation = WireLiveAdapterObservationReady | WireLiveAdapterObservationUserTranscriptFinal | WireLiveAdapterObservationAssistantTextDelta | WireLiveAdapterObservationAssistantTranscriptDelta | WireLiveAdapterObservationAssistantAudioChunk | WireLiveAdapterObservationAssistantTranscriptFinal | WireLiveAdapterObservationAssistantTranscriptTruncated | WireLiveAdapterObservationRealtimeTranscript | WireLiveAdapterObservationToolCallRequested | WireLiveAdapterObservationTurnInterrupted | WireLiveAdapterObservationTurnCompleted | WireLiveAdapterObservationStatusChanged | WireLiveAdapterObservationError | WireLiveAdapterObservationCommandRejected
+class WireLiveAdapterObservationUnknown(TypedDict, total=False):
+    debug: Required[str]
+    observation: Required[Literal['unknown']]
+
+WireLiveAdapterObservation = WireLiveAdapterObservationReady | WireLiveAdapterObservationUserTranscriptFinal | WireLiveAdapterObservationAssistantTextDelta | WireLiveAdapterObservationAssistantTranscriptDelta | WireLiveAdapterObservationAssistantAudioChunk | WireLiveAdapterObservationAssistantTranscriptFinal | WireLiveAdapterObservationAssistantTranscriptTruncated | WireLiveAdapterObservationRealtimeTranscript | WireLiveAdapterObservationToolCallRequested | WireLiveAdapterObservationTurnInterrupted | WireLiveAdapterObservationTurnCompleted | WireLiveAdapterObservationStatusChanged | WireLiveAdapterObservationError | WireLiveAdapterObservationCommandRejected | WireLiveAdapterObservationUnknown
 
 @dataclass
 class RuntimeAcceptResult:

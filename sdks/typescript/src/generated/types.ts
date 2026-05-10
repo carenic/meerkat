@@ -1670,6 +1670,7 @@ export interface RealtimeVideoChunk {
 
 export interface LiveOpenParams {
   session_id: string;
+  turning_mode?: RealtimeTurningMode;
 }
 
 export interface WireLiveChannelCapabilities {
@@ -1709,7 +1710,12 @@ export interface WireLiveTransportBootstrapWebsocket {
   url: string;
 }
 
-export type WireLiveTransportBootstrap = WireLiveTransportBootstrapWebsocket;
+export interface WireLiveTransportBootstrapUnknown {
+  debug: string;
+  transport: "unknown";
+}
+
+export type WireLiveTransportBootstrap = WireLiveTransportBootstrapWebsocket | WireLiveTransportBootstrapUnknown;
 
 export interface LiveOpenResult {
   capabilities: WireLiveChannelCapabilities;
@@ -2036,7 +2042,12 @@ export interface WireLiveAdapterObservationCommandRejected {
   observation: "command_rejected";
 }
 
-export type WireLiveAdapterObservation = WireLiveAdapterObservationReady | WireLiveAdapterObservationUserTranscriptFinal | WireLiveAdapterObservationAssistantTextDelta | WireLiveAdapterObservationAssistantTranscriptDelta | WireLiveAdapterObservationAssistantAudioChunk | WireLiveAdapterObservationAssistantTranscriptFinal | WireLiveAdapterObservationAssistantTranscriptTruncated | WireLiveAdapterObservationRealtimeTranscript | WireLiveAdapterObservationToolCallRequested | WireLiveAdapterObservationTurnInterrupted | WireLiveAdapterObservationTurnCompleted | WireLiveAdapterObservationStatusChanged | WireLiveAdapterObservationError | WireLiveAdapterObservationCommandRejected;
+export interface WireLiveAdapterObservationUnknown {
+  debug: string;
+  observation: "unknown";
+}
+
+export type WireLiveAdapterObservation = WireLiveAdapterObservationReady | WireLiveAdapterObservationUserTranscriptFinal | WireLiveAdapterObservationAssistantTextDelta | WireLiveAdapterObservationAssistantTranscriptDelta | WireLiveAdapterObservationAssistantAudioChunk | WireLiveAdapterObservationAssistantTranscriptFinal | WireLiveAdapterObservationAssistantTranscriptTruncated | WireLiveAdapterObservationRealtimeTranscript | WireLiveAdapterObservationToolCallRequested | WireLiveAdapterObservationTurnInterrupted | WireLiveAdapterObservationTurnCompleted | WireLiveAdapterObservationStatusChanged | WireLiveAdapterObservationError | WireLiveAdapterObservationCommandRejected | WireLiveAdapterObservationUnknown;
 
 export interface RuntimeAcceptResult {
   existing_id?: string;

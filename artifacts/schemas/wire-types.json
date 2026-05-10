@@ -8947,11 +8947,31 @@
     "title": "LiveInputChunkWire"
   },
   "LiveOpenParams": {
+    "$defs": {
+      "RealtimeTurningMode": {
+        "description": "Turning mode for a provider realtime session.",
+        "enum": [
+          "provider_managed",
+          "explicit_commit"
+        ],
+        "type": "string"
+      }
+    },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "description": "Request payload for `live/open`.",
+    "description": "Request payload for `live/open`.\n\nR3-1 (P1): `turning_mode` lets callers pick between the provider-managed\n(server-VAD) flow and the explicit-commit flow. The G9 typed text-only\n`live/commit_input { response_modality: text }` path requires\n`ExplicitCommit` because the OpenAI realtime API rejects\n`input_audio_buffer.commit` unless the session was opened with explicit\ncommit semantics (server VAD owns commits otherwise). Pre-R3-1 the\nhandler hard-coded `ProviderManaged`, which made the typed text-only\npath unreachable on a public channel — calling it killed the channel\ninstead of producing sideband text.\n\nDefault (`None`) preserves the prior wire shape: callers that omit the\nfield get `ProviderManaged`, matching the legacy behavior.",
     "properties": {
       "session_id": {
         "type": "string"
+      },
+      "turning_mode": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/RealtimeTurningMode"
+          },
+          {
+            "type": "null"
+          }
+        ]
       }
     },
     "required": [
@@ -9097,6 +9117,23 @@
               "transport",
               "url",
               "token"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "R3-6 (P2): explicit fail-loud variant for unknown core variants.\n\nThe core [`LiveTransportBootstrap`] enum is `#[non_exhaustive]`. When\na future variant (e.g. WebRTC reintroduction per Round-4 T4) lands\nwithout an explicit arm in the wire `From` impl, the conversion\nsurfaces as `Unknown { debug }` rather than silently coercing into\n`Websocket { url: \"\", token: \"\" }`. SDK consumers route on the\n`transport: \"unknown\"` discriminator and treat it as an unsupported\ntransport — never as a usable websocket. The `debug` payload carries\nthe `{:?}` projection of the source variant so server logs name the\nreal shape that needs to be promoted.\n\n**When a new core variant is added, add an explicit arm in the\nforward `From` impl above this variant — `Unknown` is the floor, not\nthe destination.**",
+            "properties": {
+              "debug": {
+                "type": "string"
+              },
+              "transport": {
+                "const": "unknown",
+                "type": "string"
+              }
+            },
+            "required": [
+              "transport",
+              "debug"
             ],
             "type": "object"
           }
@@ -23881,6 +23918,23 @@
           "message"
         ],
         "type": "object"
+      },
+      {
+        "description": "R3-6 (P2): explicit fail-loud variant for unknown core variants.\n\nThe core [`LiveAdapterObservation`] enum is `#[non_exhaustive]`. When\na future variant lands without an explicit arm in the wire `From`\nimpl, the conversion surfaces as `Unknown { debug }` rather than\nsilently coercing into the worst-possible default —\n`TurnInterrupted` — which would surface a real new event as an\ninterrupt and drop data downstream. SDK consumers route on the\n`observation: \"unknown\"` discriminator and treat it as an\nunrecognized event — never as a barge-in. The `debug` payload\ncarries the `{:?}` projection of the source variant so server logs\nname the real shape that needs to be promoted.\n\n**When a new core variant is added, add an explicit arm in the\nforward `From` impl above this variant — `Unknown` is the floor,\nnot the destination.**",
+        "properties": {
+          "debug": {
+            "type": "string"
+          },
+          "observation": {
+            "const": "unknown",
+            "type": "string"
+          }
+        },
+        "required": [
+          "observation",
+          "debug"
+        ],
+        "type": "object"
       }
     ],
     "title": "WireLiveAdapterObservation"
@@ -24259,6 +24313,23 @@
           "transport",
           "url",
           "token"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "R3-6 (P2): explicit fail-loud variant for unknown core variants.\n\nThe core [`LiveTransportBootstrap`] enum is `#[non_exhaustive]`. When\na future variant (e.g. WebRTC reintroduction per Round-4 T4) lands\nwithout an explicit arm in the wire `From` impl, the conversion\nsurfaces as `Unknown { debug }` rather than silently coercing into\n`Websocket { url: \"\", token: \"\" }`. SDK consumers route on the\n`transport: \"unknown\"` discriminator and treat it as an unsupported\ntransport — never as a usable websocket. The `debug` payload carries\nthe `{:?}` projection of the source variant so server logs name the\nreal shape that needs to be promoted.\n\n**When a new core variant is added, add an explicit arm in the\nforward `From` impl above this variant — `Unknown` is the floor, not\nthe destination.**",
+        "properties": {
+          "debug": {
+            "type": "string"
+          },
+          "transport": {
+            "const": "unknown",
+            "type": "string"
+          }
+        },
+        "required": [
+          "transport",
+          "debug"
         ],
         "type": "object"
       }
