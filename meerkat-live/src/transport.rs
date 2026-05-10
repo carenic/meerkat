@@ -320,10 +320,20 @@ async fn handle_live_socket(
 
     tracing::info!(channel = %channel_id, "live WebSocket connected");
 
-    loop {
-        tokio::select! {
-            biased;
+    // G2 (P1): the observation future MUST be pinned across `select!`
+    // iterations. Recreating it inline as `next_observation_raw(&channel_id)
+    // => …` made it cancel-on-loss, so under continuous inbound mic audio
+    // the recv arm wins every iteration and the observation future never
+    // accumulates enough poll progress to resolve — a starvation regression
+    // distinct from `biased;` ordering. We box+pin once and re-arm only
+    // after an observation is consumed (or an error tears the loop down).
+    let mut observation_fut = Box::pin(state.host.next_observation_raw(&channel_id));
 
+    loop {
+        // No `biased;` — fair scheduling prevents continuous mic-audio inbound
+        // frames from starving the observation arm (assistant output, tool
+        // observations, terminal close).
+        tokio::select! {
             client_msg = socket.recv() => {
                 match client_msg {
                     Some(Ok(WsMessage::Text(text))) => {
@@ -366,6 +376,8 @@ async fn handle_live_socket(
                         };
                         if let Err(err) = state.host.send_input(&channel_id, chunk).await {
                             tracing::warn!(channel = %channel_id, error = %err, "binary send_input failed");
+                            let err_json = serde_json::json!({"error": err.to_string()}).to_string();
+                            let _ = socket.send(WsMessage::Text(err_json.into())).await;
                         }
                     }
                     Some(Ok(WsMessage::Close(_))) | None => break,
@@ -388,7 +400,12 @@ async fn handle_live_socket(
                 }
             }
 
-            observation = state.host.next_observation_raw(&channel_id) => {
+            observation = &mut observation_fut => {
+                // Re-arm the pinned observation future for the next loop
+                // iteration before processing this one — the new future
+                // must already be pinned by the time the next select!
+                // iteration polls it.
+                observation_fut = Box::pin(state.host.next_observation_raw(&channel_id));
                 // Wave-3 RPC pump migration: split the convenience wrapper
                 // into `next_observation_raw` + `apply_observation` so the
                 // pump can react to the typed `ObservationOutcome` —
@@ -1118,5 +1135,167 @@ mod tests {
         assert!(saw_close, "expected close frame for invalid JSON");
 
         server_handle.abort();
+    }
+
+    /// Adapter that delivers a single scripted observation after a short
+    /// internal delay, then idles. Used to exercise the WS pump select!
+    /// arms under inbound mic-audio saturation: a `biased;` arm ordering
+    /// would let inbound binary frames starve the observation arm so the
+    /// `TurnCompleted` never reaches the client.
+    struct DelayedObservationAdapter {
+        observation: tokio::sync::Mutex<Option<meerkat_core::live_adapter::LiveAdapterObservation>>,
+        delay: Duration,
+    }
+
+    impl DelayedObservationAdapter {
+        fn new(
+            observation: meerkat_core::live_adapter::LiveAdapterObservation,
+            delay: Duration,
+        ) -> Self {
+            Self {
+                observation: tokio::sync::Mutex::new(Some(observation)),
+                delay,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_core::live_adapter::LiveAdapter for DelayedObservationAdapter {
+        async fn send_command(
+            &self,
+            _command: meerkat_core::live_adapter::LiveAdapterCommand,
+        ) -> Result<(), meerkat_core::live_adapter::LiveAdapterError> {
+            Ok(())
+        }
+
+        async fn next_observation(
+            &self,
+        ) -> Result<
+            Option<meerkat_core::live_adapter::LiveAdapterObservation>,
+            meerkat_core::live_adapter::LiveAdapterError,
+        > {
+            // Drop-safe: sleep BEFORE consuming the observation slot. The WS
+            // pump's `select!` polls this future every loop iteration and
+            // drops it whenever the other arm wins; consuming first would
+            // lose the scripted observation if the future is dropped during
+            // the sleep.
+            tokio::time::sleep(self.delay).await;
+            let mut slot = self.observation.lock().await;
+            if let Some(obs) = slot.take() {
+                Ok(Some(obs))
+            } else {
+                std::future::pending().await
+            }
+        }
+
+        fn status(&self) -> meerkat_core::live_adapter::LiveAdapterStatus {
+            meerkat_core::live_adapter::LiveAdapterStatus::Ready
+        }
+
+        async fn close(&self) -> Result<(), meerkat_core::live_adapter::LiveAdapterError> {
+            Ok(())
+        }
+    }
+
+    /// G2 (P1) regression: a `biased;` ordering in the WS pump's `select!`
+    /// causes continuous inbound mic audio to starve the observation arm,
+    /// so server-side observations (assistant output, `TurnCompleted`,
+    /// errors) never reach the client. With fair scheduling, even under
+    /// saturating binary input the observation arm must be picked within
+    /// a bounded timeout.
+    #[tokio::test]
+    async fn observation_arm_not_starved_by_saturating_mic_audio() {
+        use meerkat_core::live_adapter::LiveAdapterObservation;
+        use meerkat_core::types::{StopReason, Usage};
+
+        let host = Arc::new(LiveAdapterHost::new());
+        let session_id = meerkat_core::types::SessionId::new();
+        let channel_id = host.open_channel(session_id).await.unwrap();
+        host.attach_adapter(
+            &channel_id,
+            Arc::new(DelayedObservationAdapter::new(
+                LiveAdapterObservation::TurnCompleted {
+                    response_id: Some("resp_1".into()),
+                    stop_reason: StopReason::EndTurn,
+                    usage: Usage::default(),
+                },
+                Duration::from_millis(50),
+            )),
+        )
+        .await
+        .unwrap();
+        host.apply_status_update(
+            &channel_id,
+            meerkat_core::live_adapter::LiveAdapterStatus::Ready,
+        )
+        .await
+        .unwrap();
+
+        let state = Arc::new(LiveWsState::new(host));
+        let token = state.mint_token(channel_id.clone()).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ws_state = Arc::clone(&state);
+        let server_handle =
+            tokio::spawn(async move { serve_live_ws_listener(listener, ws_state).await });
+
+        let url = format!(
+            "ws://{addr}{LIVE_WS_PATH}?token={token}&channel={channel_id}&format=pcm_24k_mono"
+        );
+        let (ws_stream, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        use futures::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let (mut write, mut read) = ws_stream.split();
+
+        // Saturator: continuously push binary mic frames as fast as the
+        // socket accepts them. Models the real-world condition where a
+        // browser tab streams microphone audio at ~50 frames/sec and the
+        // server-side select! must still poll the observation arm.
+        let saturator = tokio::spawn(async move {
+            let frame = vec![0u8; 960]; // ~20ms @ 24 kHz / 16-bit / mono
+            loop {
+                if write
+                    .send(Message::Binary(frame.clone().into()))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+                // Yield without sleeping — the test wants the saturator to
+                // win the recv arm whenever scheduling is biased.
+                tokio::task::yield_now().await;
+            }
+        });
+
+        // Bounded timeout: under fair scheduling + a pinned observation
+        // future, the `TurnCompleted` JSON forwarded by the observation
+        // arm must reach the client well within the bound. 1500 ms is
+        // generous; the regression (biased ordering and/or recreating
+        // the observation future inside the select! arm) typically
+        // misses it indefinitely.
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+        let mut saw_turn_completed = false;
+        while let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) {
+            match tokio::time::timeout(remaining, read.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    if text.contains("turn_completed") || text.contains("\"resp_1\"") {
+                        saw_turn_completed = true;
+                        break;
+                    }
+                }
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) | Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        saturator.abort();
+        server_handle.abort();
+
+        assert!(
+            saw_turn_completed,
+            "observation arm starved by mic-audio saturation — biased ordering or unpinned observation future regression"
+        );
     }
 }
