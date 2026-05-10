@@ -1,0 +1,128 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+usage() {
+  cat <<'USAGE'
+usage:
+  scripts/buildbuddy-edge-changes [BASE_SHA HEAD_SHA]
+  scripts/buildbuddy-edge-changes --paths-from-stdin
+
+Prints GitHub-output-compatible booleans for expensive GCP BuildBuddy edge
+lanes. With no reliable base revision, every edge lane is enabled.
+USAGE
+}
+
+wasm_changed=false
+sdk_changed=false
+minimal_changed=false
+feature_changed=false
+audit_changed=false
+
+mark_all() {
+  wasm_changed=true
+  sdk_changed=true
+  minimal_changed=true
+  feature_changed=true
+  audit_changed=true
+}
+
+mark_path() {
+  local path="$1"
+
+  case "${path}" in
+    Cargo.toml|Cargo.lock|rust-toolchain.toml|MODULE.bazel|.bazelrc)
+      mark_all
+      return
+      ;;
+    .github/workflows/ci.yml|.github/workflows/buildbuddy.yml|.github/actions/run-buildbuddy-ci-lane-batch/*|.github/actions/setup-buildbuddy-ci/*|scripts/buildbuddy-*|tools/buildbuddy/*)
+      mark_all
+      return
+      ;;
+    deny.toml)
+      audit_changed=true
+      ;;
+  esac
+
+  case "${path}" in
+    meerkat-web-runtime/*|meerkat-cli/src/web_runtime_template/*)
+      wasm_changed=true
+      ;;
+    meerkat/*|meerkat-anthropic/*|meerkat-auth-core/*|meerkat-client/*|meerkat-comms/*|meerkat-contracts/*|meerkat-core/*|meerkat-gemini/*|meerkat-hooks/*|meerkat-llm-core/*|meerkat-machine-derive/*|meerkat-machine-dsl/*|meerkat-machine-dsl-core/*|meerkat-machine-kernels/*|meerkat-machine-schema/*|meerkat-mob/*|meerkat-mob-mcp/*|meerkat-mob-pack/*|meerkat-models/*|meerkat-openai/*|meerkat-providers/*|meerkat-runtime/*|meerkat-schedule/*|meerkat-session/*|meerkat-skills/*|meerkat-store/*|meerkat-tools/*)
+      wasm_changed=true
+      ;;
+  esac
+
+  case "${path}" in
+    sdks/*|tools/sdk-builder/*|tools/sdk-codegen/*)
+      sdk_changed=true
+      ;;
+    meerkat-rpc/*|meerkat-client/*|meerkat-contracts/*|meerkat-core/*|meerkat-llm-core/*|meerkat-models/*)
+      sdk_changed=true
+      ;;
+  esac
+
+  case "${path}" in
+    meerkat/*|meerkat-client/*|meerkat-core/*|meerkat-store/*|meerkat-tools/*)
+      minimal_changed=true
+      ;;
+  esac
+
+  case "${path}" in
+    scripts/run-surface-feature-matrix|meerkat/*|meerkat-comms/*|meerkat-gemini/*|meerkat-mob/*|meerkat-mob-mcp/*|meerkat-openai/*|meerkat-providers/*|meerkat-tools/*)
+      feature_changed=true
+      ;;
+  esac
+}
+
+emit_outputs() {
+  local changed=false
+  if [[ "${wasm_changed}" == "true" ||
+    "${sdk_changed}" == "true" ||
+    "${minimal_changed}" == "true" ||
+    "${feature_changed}" == "true" ||
+    "${audit_changed}" == "true" ]]; then
+    changed=true
+  fi
+
+  printf 'changed=%s\n' "${changed}"
+  printf 'wasm_changed=%s\n' "${wasm_changed}"
+  printf 'sdk_changed=%s\n' "${sdk_changed}"
+  printf 'minimal_changed=%s\n' "${minimal_changed}"
+  printf 'feature_changed=%s\n' "${feature_changed}"
+  printf 'audit_changed=%s\n' "${audit_changed}"
+}
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+  usage
+  exit 0
+fi
+
+if [[ "${1:-}" == "--paths-from-stdin" ]]; then
+  while IFS= read -r path; do
+    [[ -n "${path}" ]] || continue
+    mark_path "${path}"
+  done
+  emit_outputs
+  exit 0
+fi
+
+base_sha="${1:-${BASE_SHA:-}}"
+head_sha="${2:-${HEAD_SHA:-HEAD}}"
+
+if [[ -z "${base_sha}" || "${base_sha}" == "0000000000000000000000000000000000000000" ]]; then
+  echo "No reliable diff base; running all WASM/SDK/feature/audit edge lanes." >&2
+  mark_all
+  emit_outputs
+  exit 0
+fi
+
+if ! git cat-file -e "${base_sha}^{commit}" 2>/dev/null; then
+  git fetch --no-tags --depth=1 origin "${base_sha}" >&2 || true
+fi
+
+while IFS= read -r path; do
+  [[ -n "${path}" ]] || continue
+  mark_path "${path}"
+done < <(git diff --name-only "${base_sha}" "${head_sha}" --)
+
+emit_outputs

@@ -297,13 +297,17 @@ fn gcp_feature_matrix_lane_fans_out_remote_cargo_actions() {
     );
     assert!(
         workflow.contains("group: gcp-sdk-suites\n          profile: submitter")
-            && workflow.contains("group: gcp-wasm-compile\n          profile: submitter")
-            && workflow.contains("group: gcp-feature-audit\n          profile: submitter"),
-        "GCP WASM/SDK/feature submitters should stay split into separate visible jobs"
+            && workflow.contains("group: gcp-wasm-check\n          profile: submitter")
+            && workflow.contains("group: gcp-minimal-feature\n          profile: submitter")
+            && workflow.contains("group: gcp-feature-matrix\n          profile: submitter")
+            && workflow.contains("group: gcp-security-audit\n          profile: submitter"),
+        "GCP WASM/SDK/feature/audit submitters should stay split into separate visible jobs"
     );
     assert!(
-        !workflow.contains("group: gcp-wasm-feature\n          profile: submitter"),
-        "GCP WASM/SDK/feature submitters must not collapse back into one serial batch"
+        !workflow.contains("group: gcp-wasm-feature\n          profile: submitter")
+            && !workflow.contains("group: gcp-wasm-compile\n          profile: submitter")
+            && !workflow.contains("group: gcp-feature-audit\n          profile: submitter"),
+        "GCP WASM/SDK/feature/audit submitters must not collapse back into serial batches"
     );
 }
 

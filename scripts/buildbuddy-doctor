@@ -404,40 +404,59 @@ if job_has_line .github/workflows/ci.yml cargo 'name: GHA Cargo' &&
   job_has_line .github/workflows/buildbuddy.yml governance-submit 'name: Governance submitter' &&
   job_has_line .github/workflows/buildbuddy.yml wasm-feature-changes 'name: WASM, SDK, and feature change detection' &&
   job_has_line .github/workflows/buildbuddy.yml wasm-sdk-submit 'name: SDK suites submitter' &&
-  job_has_line .github/workflows/buildbuddy.yml wasm-compile-submit 'name: WASM and minimal feature submitter' &&
-  job_has_line .github/workflows/buildbuddy.yml wasm-feature-submit 'name: Feature matrix and audit submitter' &&
+  job_has_line .github/workflows/buildbuddy.yml wasm-check-submit 'name: WASM check submitter' &&
+  job_has_line .github/workflows/buildbuddy.yml minimal-feature-submit 'name: Minimal feature submitter' &&
+  job_has_line .github/workflows/buildbuddy.yml feature-submit 'name: Feature matrix submitter' &&
+  job_has_line .github/workflows/buildbuddy.yml audit-submit 'name: Security audit submitter' &&
   job_has_line .github/workflows/buildbuddy.yml native-submit 'needs: [control-plane-up, executors-up, prebuild-submit]' &&
   job_has_line .github/workflows/buildbuddy.yml governance-submit 'needs: [control-plane-up, executors-up]' &&
   job_has_line .github/workflows/buildbuddy.yml wasm-feature-changes 'needs: [control-plane-up]' &&
   job_has_line .github/workflows/buildbuddy.yml wasm-sdk-submit 'needs: [control-plane-up, executors-up, wasm-feature-changes]' &&
-  job_has_line .github/workflows/buildbuddy.yml wasm-compile-submit 'needs: [control-plane-up, executors-up, wasm-feature-changes]' &&
-  job_has_line .github/workflows/buildbuddy.yml wasm-feature-submit 'needs: [control-plane-up, executors-up, wasm-feature-changes]' &&
+  job_has_line .github/workflows/buildbuddy.yml wasm-check-submit 'needs: [control-plane-up, executors-up, wasm-feature-changes]' &&
+  job_has_line .github/workflows/buildbuddy.yml minimal-feature-submit 'needs: [control-plane-up, executors-up, wasm-feature-changes]' &&
+  job_has_line .github/workflows/buildbuddy.yml feature-submit 'needs: [control-plane-up, executors-up, wasm-feature-changes]' &&
+  job_has_line .github/workflows/buildbuddy.yml audit-submit 'needs: [control-plane-up, executors-up, wasm-feature-changes]' &&
   job_has_line .github/workflows/buildbuddy.yml native-submit 'CI_STARTED_AT_EPOCH:' &&
   job_has_line .github/workflows/buildbuddy.yml governance-submit 'CI_STARTED_AT_EPOCH:' &&
   job_has_line .github/workflows/buildbuddy.yml wasm-sdk-submit 'CI_STARTED_AT_EPOCH:' &&
-  job_has_line .github/workflows/buildbuddy.yml wasm-compile-submit 'CI_STARTED_AT_EPOCH:' &&
-  job_has_line .github/workflows/buildbuddy.yml wasm-feature-submit 'CI_STARTED_AT_EPOCH:' &&
+  job_has_line .github/workflows/buildbuddy.yml wasm-check-submit 'CI_STARTED_AT_EPOCH:' &&
+  job_has_line .github/workflows/buildbuddy.yml minimal-feature-submit 'CI_STARTED_AT_EPOCH:' &&
+  job_has_line .github/workflows/buildbuddy.yml feature-submit 'CI_STARTED_AT_EPOCH:' &&
+  job_has_line .github/workflows/buildbuddy.yml audit-submit 'CI_STARTED_AT_EPOCH:' &&
   job_has_line .github/workflows/buildbuddy.yml native-submit 'group: gcp' &&
   job_has_line .github/workflows/buildbuddy.yml native-submit 'batch_jobs: "2"' &&
   ! job_has_line .github/workflows/buildbuddy.yml native-submit 'fmt-static' &&
   job_has_line .github/workflows/buildbuddy.yml governance-submit 'group: gcp-governance' &&
   job_has_line .github/workflows/buildbuddy.yml wasm-sdk-submit 'group: gcp-sdk-suites' &&
-  job_has_line .github/workflows/buildbuddy.yml wasm-compile-submit 'group: gcp-wasm-compile' &&
-  job_has_line .github/workflows/buildbuddy.yml wasm-feature-submit 'group: gcp-feature-audit' &&
+  job_has_line .github/workflows/buildbuddy.yml wasm-check-submit 'group: gcp-wasm-check' &&
+  job_has_line .github/workflows/buildbuddy.yml minimal-feature-submit 'group: gcp-minimal-feature' &&
+  job_has_line .github/workflows/buildbuddy.yml feature-submit 'group: gcp-feature-matrix' &&
+  job_has_line .github/workflows/buildbuddy.yml audit-submit 'group: gcp-security-audit' &&
   job_has_line .github/workflows/buildbuddy.yml governance-submit 'Detect machine-authority changes' &&
   job_has_line .github/workflows/buildbuddy.yml wasm-feature-changes 'Detect WASM, SDK, feature, or audit changes' &&
+  job_has_line .github/workflows/buildbuddy.yml wasm-feature-changes 'wasm_changed:' &&
+  job_has_line .github/workflows/buildbuddy.yml wasm-feature-changes 'sdk_changed:' &&
+  job_has_line .github/workflows/buildbuddy.yml wasm-feature-changes 'minimal_changed:' &&
+  job_has_line .github/workflows/buildbuddy.yml wasm-feature-changes 'feature_changed:' &&
+  job_has_line .github/workflows/buildbuddy.yml wasm-feature-changes 'audit_changed:' &&
+  job_has_line .github/workflows/buildbuddy.yml wasm-feature-changes 'scripts/buildbuddy-edge-changes' &&
   job_has_line .github/workflows/buildbuddy.yml wasm-sdk-submit 'sdk-suites' &&
-  job_has_line .github/workflows/buildbuddy.yml wasm-compile-submit 'wasm-check' &&
-  job_has_line .github/workflows/buildbuddy.yml wasm-compile-submit 'test-minimal' &&
-  job_has_line .github/workflows/buildbuddy.yml wasm-feature-submit 'test-feature-matrix-lib' &&
-  job_has_line .github/workflows/buildbuddy.yml wasm-feature-submit 'test-feature-matrix-surface-checks' &&
-  job_has_line .github/workflows/buildbuddy.yml wasm-feature-submit 'audit' &&
+  job_has_line .github/workflows/buildbuddy.yml wasm-check-submit 'wasm-check' &&
+  ! job_has_line .github/workflows/buildbuddy.yml wasm-check-submit 'test-minimal' &&
+  job_has_line .github/workflows/buildbuddy.yml minimal-feature-submit 'test-minimal' &&
+  job_has_line .github/workflows/buildbuddy.yml feature-submit 'test-feature-matrix-lib' &&
+  job_has_line .github/workflows/buildbuddy.yml feature-submit 'test-feature-matrix-surface-checks' &&
+  job_has_line .github/workflows/buildbuddy.yml audit-submit 'audit' &&
   ! ./scripts/machine-authority-changed MODULE.bazel.lock >/dev/null 2>&1 &&
   ! job_has_line .github/workflows/buildbuddy.yml wasm-feature-changes 'MODULE.bazel.lock' &&
   ! job_has_line .github/workflows/buildbuddy.yml governance-submit "steps.machine-changes.outputs.changed != 'true'" &&
-  ! job_has_line .github/workflows/buildbuddy.yml wasm-feature-submit 'seam-inventory' &&
-  ! job_has_line .github/workflows/buildbuddy.yml wasm-feature-submit 'rmat-audit' &&
-  ! job_has_line .github/workflows/buildbuddy.yml wasm-feature-submit 'machine-authority' &&
+  ! job_has_line .github/workflows/buildbuddy.yml feature-submit 'audit' &&
+  ! job_has_line .github/workflows/buildbuddy.yml audit-submit 'test-feature-matrix-lib' &&
+  ! job_has_line .github/workflows/buildbuddy.yml wasm-check-submit 'sdk-suites' &&
+  ! job_has_line .github/workflows/buildbuddy.yml minimal-feature-submit 'wasm-check' &&
+  ! job_has_line .github/workflows/buildbuddy.yml feature-submit 'seam-inventory' &&
+  ! job_has_line .github/workflows/buildbuddy.yml feature-submit 'rmat-audit' &&
+  ! job_has_line .github/workflows/buildbuddy.yml feature-submit 'machine-authority' &&
   grep -Fq 'MEERKAT_BUILDBUDDY_BATCH_JOBS' .github/workflows/buildbuddy.yml &&
   grep -Fq 'MEERKAT_BUILDBUDDY_BATCH_JOBS: ${{ inputs.batch_jobs || env.MEERKAT_BUILDBUDDY_BATCH_JOBS }}' .github/actions/run-buildbuddy-ci-lane-batch/action.yml &&
   grep -Fq 'Check GCP CI duration SLO' .github/workflows/buildbuddy.yml &&
@@ -450,16 +469,39 @@ if job_has_line .github/workflows/ci.yml cargo 'name: GHA Cargo' &&
   grep -Fq 'scripts/buildbuddy-ci-lane-batch' .github/actions/run-buildbuddy-ci-lane-batch/action.yml &&
   job_has_line .github/workflows/buildbuddy.yml executors-down '- wasm-feature-changes' &&
   job_has_line .github/workflows/buildbuddy.yml executors-down '- wasm-sdk-submit' &&
-  job_has_line .github/workflows/buildbuddy.yml executors-down '- wasm-compile-submit' &&
+  job_has_line .github/workflows/buildbuddy.yml executors-down '- wasm-check-submit' &&
+  job_has_line .github/workflows/buildbuddy.yml executors-down '- minimal-feature-submit' &&
+  job_has_line .github/workflows/buildbuddy.yml executors-down '- feature-submit' &&
+  job_has_line .github/workflows/buildbuddy.yml executors-down '- audit-submit' &&
   job_has_line .github/workflows/buildbuddy.yml gate '- wasm-feature-changes' &&
   job_has_line .github/workflows/buildbuddy.yml gate '- wasm-sdk-submit' &&
-  job_has_line .github/workflows/buildbuddy.yml gate '- wasm-compile-submit' &&
+  job_has_line .github/workflows/buildbuddy.yml gate '- wasm-check-submit' &&
+  job_has_line .github/workflows/buildbuddy.yml gate '- minimal-feature-submit' &&
+  job_has_line .github/workflows/buildbuddy.yml gate '- feature-submit' &&
+  job_has_line .github/workflows/buildbuddy.yml gate '- audit-submit' &&
   grep -Fq 'default_target="//..."' scripts/buildbuddy-bazel-poc &&
   grep -Fq -- '--build_tag_filters=-local,-manual,-e2e,-system,-live,-slow,-required-feature,-trybuild,-snapshot,-fixture,-cargo-equivalent,-requires-network' scripts/buildbuddy-bazel-poc &&
   job_has_line .github/workflows/buildbuddy.yml gate 'runs-on: ubuntu-latest'; then
   pass "GCP BuildBuddy CI uses a broad Bazel-native prebuild plus path-aware edge lanes"
 else
   bad "GCP BuildBuddy CI is not using the broad-prebuild/path-aware edge-lane shape"
+fi
+
+sdk_only="$(printf 'sdks/typescript/src/runtime.ts\n' | scripts/buildbuddy-edge-changes --paths-from-stdin)"
+wasm_only="$(printf 'meerkat-web-runtime/src/lib.rs\n' | scripts/buildbuddy-edge-changes --paths-from-stdin)"
+feature_only="$(printf 'scripts/run-surface-feature-matrix\n' | scripts/buildbuddy-edge-changes --paths-from-stdin)"
+audit_only="$(printf 'deny.toml\n' | scripts/buildbuddy-edge-changes --paths-from-stdin)"
+if grep -Fq 'sdk_changed=true' <<<"${sdk_only}" &&
+  grep -Fq 'wasm_changed=false' <<<"${sdk_only}" &&
+  grep -Fq 'wasm_changed=true' <<<"${wasm_only}" &&
+  grep -Fq 'sdk_changed=false' <<<"${wasm_only}" &&
+  grep -Fq 'feature_changed=true' <<<"${feature_only}" &&
+  grep -Fq 'wasm_changed=false' <<<"${feature_only}" &&
+  grep -Fq 'audit_changed=true' <<<"${audit_only}" &&
+  grep -Fq 'wasm_changed=false' <<<"${audit_only}"; then
+  pass "BuildBuddy edge lane detector keeps WASM separate from SDK, feature, and audit-only changes"
+else
+  bad "BuildBuddy edge lane detector is over-triggering WASM edge lanes"
 fi
 
 if grep -Fq 'full-fresh' .github/workflows/buildbuddy.yml &&

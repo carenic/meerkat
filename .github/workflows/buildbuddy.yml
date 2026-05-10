@@ -376,7 +376,12 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     outputs:
-      changed: ${{ steps.wasm-feature-changes.outputs.changed }}
+      changed: ${{ steps.edge-changes.outputs.changed }}
+      wasm_changed: ${{ steps.edge-changes.outputs.wasm_changed }}
+      sdk_changed: ${{ steps.edge-changes.outputs.sdk_changed }}
+      minimal_changed: ${{ steps.edge-changes.outputs.minimal_changed }}
+      feature_changed: ${{ steps.edge-changes.outputs.feature_changed }}
+      audit_changed: ${{ steps.edge-changes.outputs.audit_changed }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -384,43 +389,17 @@ jobs:
           fetch-depth: 1
 
       - name: Detect WASM, SDK, feature, or audit changes
-        id: wasm-feature-changes
+        id: edge-changes
         shell: bash
         env:
           BASE_SHA: ${{ inputs.machine_authority_base_sha || '' }}
           HEAD_SHA: ${{ inputs.machine_authority_head_sha || github.sha }}
-        run: |
-          changed=true
-          if [[ -n "${BASE_SHA}" && "${BASE_SHA}" != "0000000000000000000000000000000000000000" ]]; then
-            if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
-              git fetch --no-tags --depth=1 origin "${BASE_SHA}" || true
-            fi
-            changed=false
-            while IFS= read -r path; do
-              case "${path}" in
-                Cargo.toml|Cargo.lock|MODULE.bazel|.bazelrc)
-                  changed=true
-                  break
-                  ;;
-                meerkat-web-runtime/*|meerkat-cli/src/web_runtime_template/*|sdks/*|tools/sdk-builder/*|tools/sdk-codegen/*|tools/buildbuddy/*)
-                  changed=true
-                  break
-                  ;;
-                scripts/run-surface-feature-matrix)
-                  changed=true
-                  break
-                  ;;
-              esac
-            done < <(git diff --name-only "${BASE_SHA}" "${HEAD_SHA}" --)
-          else
-            echo "No reliable diff base; running WASM/SDK/feature/audit lanes."
-          fi
-          echo "changed=${changed}" >> "${GITHUB_OUTPUT}"
+        run: scripts/buildbuddy-edge-changes "${BASE_SHA}" "${HEAD_SHA}" >> "${GITHUB_OUTPUT}"
 
   wasm-sdk-submit:
     name: SDK suites submitter
     needs: [control-plane-up, executors-up, wasm-feature-changes]
-    if: ${{ needs.wasm-feature-changes.outputs.changed == 'true' }}
+    if: ${{ needs.wasm-feature-changes.outputs.sdk_changed == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -442,10 +421,10 @@ jobs:
           lanes: |
             sdk-suites
 
-  wasm-compile-submit:
-    name: WASM and minimal feature submitter
+  wasm-check-submit:
+    name: WASM check submitter
     needs: [control-plane-up, executors-up, wasm-feature-changes]
-    if: ${{ needs.wasm-feature-changes.outputs.changed == 'true' }}
+    if: ${{ needs.wasm-feature-changes.outputs.wasm_changed == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -461,17 +440,16 @@ jobs:
 
       - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
         with:
-          group: gcp-wasm-compile
+          group: gcp-wasm-check
           profile: submitter
           mode: ${{ inputs.mode || 'full-fresh' }}
           lanes: |
             wasm-check
-            test-minimal
 
-  wasm-feature-submit:
-    name: Feature matrix and audit submitter
+  minimal-feature-submit:
+    name: Minimal feature submitter
     needs: [control-plane-up, executors-up, wasm-feature-changes]
-    if: ${{ needs.wasm-feature-changes.outputs.changed == 'true' }}
+    if: ${{ needs.wasm-feature-changes.outputs.minimal_changed == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     env:
@@ -487,12 +465,61 @@ jobs:
 
       - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
         with:
-          group: gcp-feature-audit
+          group: gcp-minimal-feature
+          profile: submitter
+          mode: ${{ inputs.mode || 'full-fresh' }}
+          lanes: |
+            test-minimal
+
+  feature-submit:
+    name: Feature matrix submitter
+    needs: [control-plane-up, executors-up, wasm-feature-changes]
+    if: ${{ needs.wasm-feature-changes.outputs.feature_changed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      BUILDBUDDY_GRPC_URL: ${{ needs.control-plane-up.outputs.grpc_url }}
+      BUILDBUDDY_HTTP_URL: ${{ needs.control-plane-up.outputs.http_url }}
+      BUILDBUDDY_ENDPOINT: ${{ needs.control-plane-up.outputs.grpc_url }}
+      CI_STARTED_AT_EPOCH: ${{ needs.control-plane-up.outputs.started_at_epoch }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
+        with:
+          group: gcp-feature-matrix
           profile: submitter
           mode: ${{ inputs.mode || 'full-fresh' }}
           lanes: |
             test-feature-matrix-lib
             test-feature-matrix-surface-checks
+
+  audit-submit:
+    name: Security audit submitter
+    needs: [control-plane-up, executors-up, wasm-feature-changes]
+    if: ${{ needs.wasm-feature-changes.outputs.audit_changed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      BUILDBUDDY_GRPC_URL: ${{ needs.control-plane-up.outputs.grpc_url }}
+      BUILDBUDDY_HTTP_URL: ${{ needs.control-plane-up.outputs.http_url }}
+      BUILDBUDDY_ENDPOINT: ${{ needs.control-plane-up.outputs.grpc_url }}
+      CI_STARTED_AT_EPOCH: ${{ needs.control-plane-up.outputs.started_at_epoch }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
+        with:
+          group: gcp-security-audit
+          profile: submitter
+          mode: ${{ inputs.mode || 'full-fresh' }}
+          lanes: |
             audit
 
   executors-down:
@@ -506,8 +533,10 @@ jobs:
       - governance-submit
       - wasm-feature-changes
       - wasm-sdk-submit
-      - wasm-compile-submit
-      - wasm-feature-submit
+      - wasm-check-submit
+      - minimal-feature-submit
+      - feature-submit
+      - audit-submit
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
@@ -563,8 +592,10 @@ jobs:
       - governance-submit
       - wasm-feature-changes
       - wasm-sdk-submit
-      - wasm-compile-submit
-      - wasm-feature-submit
+      - wasm-check-submit
+      - minimal-feature-submit
+      - feature-submit
+      - audit-submit
       - executors-down
     runs-on: ubuntu-latest
     timeout-minutes: 10
