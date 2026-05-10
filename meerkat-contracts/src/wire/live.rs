@@ -33,23 +33,76 @@ pub struct LiveOpenParams {
 
 /// Response payload for `live/open`.
 ///
-/// `capabilities` and `continuity` are typed wire-side mirrors of the core
-/// `LiveChannelCapabilities` / `LiveContinuityMode` so SDK codegen sees the
-/// real shape (typed booleans, internally-tagged variant payloads) instead
-/// of an opaque JSON blob. CC5/CC6 (PR #650 verifier follow-up).
-///
-/// `transport` remains an opaque `serde_json::Value` schema projection: the
-/// transport-bootstrap shape is provider-pluggable and the typed wire mirror
-/// is tracked separately (Round-4 follow-up T4 reintroduces WebRTC with a
-/// real signaling shape).
+/// `capabilities`, `continuity`, and `transport` are typed wire-side mirrors
+/// of the core `LiveChannelCapabilities` / `LiveContinuityMode` /
+/// `LiveTransportBootstrap` so SDK codegen sees the real shape (typed
+/// booleans, internally-tagged variant payloads, discriminated transport
+/// union) instead of an opaque JSON blob. CC5/CC6 (PR #650 verifier
+/// follow-up); G8 (P2): `transport` typed-mirror.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct LiveOpenResult {
     pub channel_id: String,
-    #[cfg_attr(feature = "schema", schemars(with = "serde_json::Value"))]
-    pub transport: LiveTransportBootstrap,
+    pub transport: WireLiveTransportBootstrap,
     pub capabilities: WireLiveChannelCapabilities,
     pub continuity: WireLiveContinuityMode,
+}
+
+/// Wire projection of [`meerkat_core::live_adapter::LiveTransportBootstrap`].
+///
+/// Internally-tagged on `transport` (snake_case) — matches the core enum's
+/// serde shape exactly so the wire payload is byte-identical. G8 (P2):
+/// closes the typed-surface gap that left `transport: unknown` in TS and
+/// `Any` in Python at the SDK boundary.
+///
+/// The core enum is `#[non_exhaustive]`; new transports (e.g. WebRTC
+/// reintroduction per Round-4 T4) appear here as additional typed variants
+/// rather than as a free-form JSON blob.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "transport", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum WireLiveTransportBootstrap {
+    /// WebSocket bootstrap: client opens a WS connection to `url` and
+    /// authenticates with `token`. Mirrors
+    /// [`meerkat_core::live_adapter::LiveTransportBootstrap::Websocket`].
+    Websocket { url: String, token: String },
+}
+
+impl From<LiveTransportBootstrap> for WireLiveTransportBootstrap {
+    fn from(value: LiveTransportBootstrap) -> Self {
+        match value {
+            LiveTransportBootstrap::Websocket { url, token } => Self::Websocket { url, token },
+            // Core enum is `#[non_exhaustive]`; debug-assert for new variants
+            // and fall back to an empty Websocket placeholder. When a new
+            // variant lands, add an explicit arm above this comment.
+            _ => {
+                debug_assert!(
+                    false,
+                    "WireLiveTransportBootstrap::from saw an unmapped \
+                     LiveTransportBootstrap variant; add an explicit arm in \
+                     meerkat-contracts/src/wire/live.rs."
+                );
+                Self::Websocket {
+                    url: String::new(),
+                    token: String::new(),
+                }
+            }
+        }
+    }
+}
+
+impl From<WireLiveTransportBootstrap> for LiveTransportBootstrap {
+    fn from(value: WireLiveTransportBootstrap) -> Self {
+        // No wildcard arm: `WireLiveTransportBootstrap` is owned by this
+        // crate so even with `#[non_exhaustive]` (which only constrains
+        // matches outside the defining crate) the compiler enforces
+        // exhaustive coverage here. Adding a new wire variant therefore
+        // forces a new arm in this match — no silent fallthrough.
+        match value {
+            WireLiveTransportBootstrap::Websocket { url, token } => Self::Websocket { url, token },
+        }
+    }
 }
 
 /// Wire projection of [`meerkat_core::live_adapter::LiveChannelCapabilities`].
@@ -590,7 +643,15 @@ pub enum WireLiveAdapterObservation {
         arguments: serde_json::Value,
     },
     /// Barge-in: the user interrupted the assistant mid-turn.
-    TurnInterrupted,
+    ///
+    /// G4 (P1): `response_id` carries the in-flight provider response id so
+    /// downstream consumers can scope the truncation to the right response
+    /// even when the interrupt arrives before any transcript delta has been
+    /// staged.
+    TurnInterrupted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+    },
     TurnCompleted {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         response_id: Option<String>,
@@ -718,7 +779,9 @@ impl From<LiveAdapterObservation> for WireLiveAdapterObservation {
                 tool_name,
                 arguments,
             },
-            LiveAdapterObservation::TurnInterrupted => Self::TurnInterrupted,
+            LiveAdapterObservation::TurnInterrupted { response_id } => {
+                Self::TurnInterrupted { response_id }
+            }
             LiveAdapterObservation::TurnCompleted {
                 response_id,
                 stop_reason,
@@ -747,7 +810,7 @@ impl From<LiveAdapterObservation> for WireLiveAdapterObservation {
                      LiveAdapterObservation variant; add an explicit arm in \
                      meerkat-contracts/src/wire/live.rs."
                 );
-                Self::TurnInterrupted
+                Self::TurnInterrupted { response_id: None }
             }
         }
     }
@@ -1028,7 +1091,7 @@ mod tests {
         // SDK codegen sees real shapes, not `serde_json::Value`.
         let v = LiveOpenResult {
             channel_id: "live_1".into(),
-            transport: LiveTransportBootstrap::Websocket {
+            transport: WireLiveTransportBootstrap::Websocket {
                 url: "wss://example/live".into(),
                 token: "tok".into(),
             },
@@ -1124,7 +1187,9 @@ mod tests {
                 tool_name: "lookup".into(),
                 arguments: serde_json::json!({"q": "weather"}),
             },
-            WireLiveAdapterObservation::TurnInterrupted,
+            WireLiveAdapterObservation::TurnInterrupted {
+                response_id: Some("resp_interrupt".into()),
+            },
             WireLiveAdapterObservation::TurnCompleted {
                 response_id: Some("resp_done".into()),
                 stop_reason: WireStopReason::EndTurn,
@@ -1233,5 +1298,51 @@ mod tests {
         let core_json = serde_json::to_value(&core).expect("round-trip should succeed");
         let wire_json = serde_json::to_value(&wire).expect("round-trip should succeed");
         assert_eq!(core_json, wire_json);
+    }
+
+    // G8 (P2) — typed `LiveTransportBootstrap` wire mirror.
+
+    #[test]
+    fn wire_live_transport_bootstrap_websocket_round_trip() {
+        let v = WireLiveTransportBootstrap::Websocket {
+            url: "wss://example/live".into(),
+            token: "tok_abc".into(),
+        };
+        let j = serde_json::to_value(&v).expect("round-trip should succeed");
+        // Internally-tagged on `transport` (snake_case), payload fields
+        // flat alongside the discriminator — matches the core enum's serde
+        // shape exactly.
+        assert_eq!(j["transport"], "websocket");
+        assert_eq!(j["url"], "wss://example/live");
+        assert_eq!(j["token"], "tok_abc");
+        let back: WireLiveTransportBootstrap =
+            serde_json::from_value(j).expect("round-trip should succeed");
+        assert_eq!(v, back);
+    }
+
+    #[test]
+    fn wire_live_transport_bootstrap_byte_compatible_with_core() {
+        // Wire mirror serializes byte-identical to the core enum. Catches
+        // drift the moment a field is added to one and forgotten on the
+        // other.
+        let core = LiveTransportBootstrap::Websocket {
+            url: "wss://example/live".into(),
+            token: "tok_xyz".into(),
+        };
+        let wire: WireLiveTransportBootstrap = core.clone().into();
+        let core_json = serde_json::to_value(&core).expect("round-trip should succeed");
+        let wire_json = serde_json::to_value(&wire).expect("round-trip should succeed");
+        assert_eq!(core_json, wire_json);
+    }
+
+    #[test]
+    fn wire_live_transport_bootstrap_round_trips_through_core() {
+        let v = WireLiveTransportBootstrap::Websocket {
+            url: "wss://example/live".into(),
+            token: "tok_back".into(),
+        };
+        let core: LiveTransportBootstrap = v.clone().into();
+        let back: WireLiveTransportBootstrap = core.into();
+        assert_eq!(v, back);
     }
 }

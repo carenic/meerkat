@@ -80,7 +80,7 @@ pub use live::{
     LiveChannelParams, LiveInputChunkWire, LiveOpenParams, LiveOpenResult, LiveSendInputParams,
     LiveStatusResult, LiveTruncateParams, WireLiveAdapterErrorCode, WireLiveAdapterObservation,
     WireLiveAdapterStatus, WireLiveChannelCapabilities, WireLiveContinuityMode,
-    WireLiveDegradationReason,
+    WireLiveDegradationReason, WireLiveTransportBootstrap,
 };
 pub use mcp_live::{
     McpAddParams, McpLiveOpResponse, McpLiveOpStatus, McpLiveOperation, McpReloadParams,

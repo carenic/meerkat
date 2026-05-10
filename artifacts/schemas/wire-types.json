@@ -6681,6 +6681,15 @@
       {
         "additionalProperties": false,
         "properties": {
+          "blocks": {
+            "items": {
+              "$ref": "#/$defs/ContentBlock"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "handling_mode": {
             "anyOf": [
               {
@@ -9009,10 +9018,36 @@
             "type": "object"
           }
         ]
+      },
+      "WireLiveTransportBootstrap": {
+        "description": "Wire projection of [`meerkat_core::live_adapter::LiveTransportBootstrap`].\n\nInternally-tagged on `transport` (snake_case) — matches the core enum's\nserde shape exactly so the wire payload is byte-identical. G8 (P2):\ncloses the typed-surface gap that left `transport: unknown` in TS and\n`Any` in Python at the SDK boundary.\n\nThe core enum is `#[non_exhaustive]`; new transports (e.g. WebRTC\nreintroduction per Round-4 T4) appear here as additional typed variants\nrather than as a free-form JSON blob.",
+        "oneOf": [
+          {
+            "description": "WebSocket bootstrap: client opens a WS connection to `url` and\nauthenticates with `token`. Mirrors\n[`meerkat_core::live_adapter::LiveTransportBootstrap::Websocket`].",
+            "properties": {
+              "token": {
+                "type": "string"
+              },
+              "transport": {
+                "const": "websocket",
+                "type": "string"
+              },
+              "url": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "transport",
+              "url",
+              "token"
+            ],
+            "type": "object"
+          }
+        ]
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "description": "Response payload for `live/open`.\n\n`capabilities` and `continuity` are typed wire-side mirrors of the core\n`LiveChannelCapabilities` / `LiveContinuityMode` so SDK codegen sees the\nreal shape (typed booleans, internally-tagged variant payloads) instead\nof an opaque JSON blob. CC5/CC6 (PR #650 verifier follow-up).\n\n`transport` remains an opaque `serde_json::Value` schema projection: the\ntransport-bootstrap shape is provider-pluggable and the typed wire mirror\nis tracked separately (Round-4 follow-up T4 reintroduces WebRTC with a\nreal signaling shape).",
+    "description": "Response payload for `live/open`.\n\n`capabilities`, `continuity`, and `transport` are typed wire-side mirrors\nof the core `LiveChannelCapabilities` / `LiveContinuityMode` /\n`LiveTransportBootstrap` so SDK codegen sees the real shape (typed\nbooleans, internally-tagged variant payloads, discriminated transport\nunion) instead of an opaque JSON blob. CC5/CC6 (PR #650 verifier\nfollow-up); G8 (P2): `transport` typed-mirror.",
     "properties": {
       "capabilities": {
         "$ref": "#/$defs/WireLiveChannelCapabilities"
@@ -9023,7 +9058,9 @@
       "continuity": {
         "$ref": "#/$defs/WireLiveContinuityMode"
       },
-      "transport": true
+      "transport": {
+        "$ref": "#/$defs/WireLiveTransportBootstrap"
+      }
     },
     "required": [
       "channel_id",
@@ -23689,11 +23726,17 @@
         "type": "object"
       },
       {
-        "description": "Barge-in: the user interrupted the assistant mid-turn.",
+        "description": "Barge-in: the user interrupted the assistant mid-turn.\n\nG4 (P1): `response_id` carries the in-flight provider response id so\ndownstream consumers can scope the truncation to the right response\neven when the interrupt arrives before any transcript delta has been\nstaged.",
         "properties": {
           "observation": {
             "const": "turn_interrupted",
             "type": "string"
+          },
+          "response_id": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -24103,6 +24146,34 @@
       }
     ],
     "title": "WireLiveDegradationReason"
+  },
+  "WireLiveTransportBootstrap": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "description": "Wire projection of [`meerkat_core::live_adapter::LiveTransportBootstrap`].\n\nInternally-tagged on `transport` (snake_case) — matches the core enum's\nserde shape exactly so the wire payload is byte-identical. G8 (P2):\ncloses the typed-surface gap that left `transport: unknown` in TS and\n`Any` in Python at the SDK boundary.\n\nThe core enum is `#[non_exhaustive]`; new transports (e.g. WebRTC\nreintroduction per Round-4 T4) appear here as additional typed variants\nrather than as a free-form JSON blob.",
+    "oneOf": [
+      {
+        "description": "WebSocket bootstrap: client opens a WS connection to `url` and\nauthenticates with `token`. Mirrors\n[`meerkat_core::live_adapter::LiveTransportBootstrap::Websocket`].",
+        "properties": {
+          "token": {
+            "type": "string"
+          },
+          "transport": {
+            "const": "websocket",
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "transport",
+          "url",
+          "token"
+        ],
+        "type": "object"
+      }
+    ],
+    "title": "WireLiveTransportBootstrap"
   },
   "WireLoginReady": {
     "$defs": {

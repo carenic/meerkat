@@ -369,6 +369,10 @@ pub async fn handle_live_open(
         ),
         token: token_str,
     };
+    // G8 (P2): project the core typed transport into the wire mirror at
+    // the boundary so SDK codegen sees a typed discriminated union instead
+    // of `unknown` / `Any`. The wire ↔ core `From` impls are byte-compatible.
+    let transport: meerkat_contracts::WireLiveTransportBootstrap = transport.into();
 
     // P2#3: capabilities now reflect the adapter's real `capabilities()`
     // (queried in the factory branch above). Without a factory the
@@ -814,7 +818,7 @@ mod tests {
 
     use super::*;
     use meerkat_core::live_adapter::{
-        LiveAdapterStatus, LiveChannelCapabilities, LiveContinuityMode, LiveTransportBootstrap,
+        LiveAdapterStatus, LiveChannelCapabilities, LiveContinuityMode,
     };
 
     fn round_trip<T>(value: &T) -> T
@@ -912,7 +916,7 @@ mod tests {
         // not an opaque JSON blob.
         let v = LiveOpenResult {
             channel_id: "live_42".into(),
-            transport: LiveTransportBootstrap::Websocket {
+            transport: meerkat_contracts::WireLiveTransportBootstrap::Websocket {
                 url: "ws://x/y?token=t&format=pcm_24k_mono".into(),
                 token: "t".into(),
             },

@@ -1285,6 +1285,7 @@ export interface CommsCommandPeerRequest {
 }
 
 export interface CommsCommandPeerResponse {
+  blocks?: ContentBlock[];
   handling_mode?: HandlingMode;
   in_reply_to: string;
   kind: "peer_response";
@@ -1542,6 +1543,7 @@ export interface CommsSendParamsPeerRequest {
 }
 
 export interface CommsSendParamsPeerResponse {
+  blocks?: ContentBlock[];
   handling_mode?: HandlingMode;
   in_reply_to: string;
   kind: "peer_response";
@@ -1701,11 +1703,19 @@ export interface WireLiveContinuityModeProviderNativeResume {
 
 export type WireLiveContinuityMode = WireLiveContinuityModeFresh | WireLiveContinuityModeTranscriptOnly | WireLiveContinuityModeDegraded | WireLiveContinuityModeProviderNativeResume;
 
+export interface WireLiveTransportBootstrapWebsocket {
+  token: string;
+  transport: "websocket";
+  url: string;
+}
+
+export type WireLiveTransportBootstrap = WireLiveTransportBootstrapWebsocket;
+
 export interface LiveOpenResult {
   capabilities: WireLiveChannelCapabilities;
   channel_id: string;
   continuity: WireLiveContinuityMode;
-  transport: unknown;
+  transport: WireLiveTransportBootstrap;
 }
 
 export interface LiveChannelParams {
@@ -1984,6 +1994,7 @@ export interface WireLiveAdapterObservationToolCallRequested {
 
 export interface WireLiveAdapterObservationTurnInterrupted {
   observation: "turn_interrupted";
+  response_id?: string;
 }
 
 export interface WireLiveAdapterObservationTurnCompleted {

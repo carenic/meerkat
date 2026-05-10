@@ -321,6 +321,10 @@ def _promote_nested_schema_def(name: str) -> bool:
         # the schema-local `$defs` as anonymous `dict[str, Any]` / `unknown`.
         "WireLiveChannelCapabilities",
         "WireLiveContinuityMode",
+        # G8 (P2): promote `WireLiveTransportBootstrap` so `LiveOpenResult.transport`
+        # carries the typed discriminated-union shape into SDK codegen instead
+        # of falling back to `Record<string, unknown>` / `dict[str, Any]`.
+        "WireLiveTransportBootstrap",
         # R5-10: promote `LiveInputChunkWire` so `LiveSendInputParams.chunk`
         # carries the typed discriminated-union shape into SDK codegen instead
         # of falling back to opaque `dict[str, Any]` / `Record<string, unknown>`.
@@ -886,6 +890,12 @@ def generate_python_types(schemas: dict, output_dir: Path, *, has_comms: bool = 
         wire_schema,
         "Wire projection of LiveContinuityMode (internally-tagged on `mode`).",
     )
+    # G8 (P2): typed wire mirror for `LiveOpenResult.transport`.
+    append_python_alias(
+        "WireLiveTransportBootstrap",
+        wire_schema,
+        "Wire projection of LiveTransportBootstrap (internally-tagged on `transport`).",
+    )
     append_python_dataclass("LiveOpenResult", wire_schema, "Response payload for live/open.")
     append_python_dataclass("LiveChannelParams", wire_schema, "Request payload for live/{status,close,commit_input,interrupt}.")
     append_python_dataclass("LiveStatusResult", wire_schema, "Response payload for live/status.")
@@ -1276,6 +1286,9 @@ def generate_typescript_types(schemas: dict, output_dir: Path, *, has_comms: boo
     # for the bool matrix, discriminated union on `mode` for continuity).
     append_typescript_interface("WireLiveChannelCapabilities", wire_schema)
     append_typescript_alias("WireLiveContinuityMode", wire_schema)
+    # G8 (P2): typed wire mirror for `LiveOpenResult.transport`
+    # (discriminated union on `transport`).
+    append_typescript_alias("WireLiveTransportBootstrap", wire_schema)
     append_typescript_interface("LiveOpenResult", wire_schema)
     append_typescript_interface("LiveChannelParams", wire_schema)
     append_typescript_interface("LiveStatusResult", wire_schema)

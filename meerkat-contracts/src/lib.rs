@@ -321,6 +321,7 @@ pub use wire::{
     WireLiveChannelCapabilities,
     WireLiveContinuityMode,
     WireLiveDegradationReason,
+    WireLiveTransportBootstrap,
     WireLoginReady,
     WireLoginStart,
     WireMemberRef,

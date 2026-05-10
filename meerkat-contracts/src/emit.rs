@@ -133,6 +133,11 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         // / `unknown` blobs inside `LiveOpenResult`.
         "WireLiveChannelCapabilities": schema_for!(crate::wire::WireLiveChannelCapabilities),
         "WireLiveContinuityMode": schema_for!(crate::wire::WireLiveContinuityMode),
+        // G8 (P2): emit `WireLiveTransportBootstrap` at the top level so
+        // SDK codegen produces a typed discriminated union (TS) /
+        // tagged-variant TypedDict (Python) for `LiveOpenResult.transport`
+        // instead of `unknown` / `Any`.
+        "WireLiveTransportBootstrap": schema_for!(crate::wire::WireLiveTransportBootstrap),
         // FIX-SDK-OBS: emit `WireLiveAdapterObservation` and its supporting
         // typed wire mirrors so SDK codegen sees the discriminated union of
         // adapter observations (R5-4 identity fields on

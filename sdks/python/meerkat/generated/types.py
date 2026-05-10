@@ -1478,23 +1478,37 @@ class WireLiveContinuityModeProviderNativeResume(TypedDict, total=False):
 
 WireLiveContinuityMode = WireLiveContinuityModeFresh | WireLiveContinuityModeTranscriptOnly | WireLiveContinuityModeDegraded | WireLiveContinuityModeProviderNativeResume
 
+# Wire projection of [`meerkat_core::live_adapter::LiveTransportBootstrap`].
+#
+# Internally-tagged on `transport` (snake_case) — matches the core enum's
+# serde shape exactly so the wire payload is byte-identical. G8 (P2):
+# closes the typed-surface gap that left `transport: unknown` in TS and
+# `Any` in Python at the SDK boundary.
+#
+# The core enum is `#[non_exhaustive]`; new transports (e.g. WebRTC
+# reintroduction per Round-4 T4) appear here as additional typed variants
+# rather than as a free-form JSON blob.
+class WireLiveTransportBootstrapWebsocket(TypedDict, total=False):
+    token: Required[str]
+    transport: Required[Literal['websocket']]
+    url: Required[str]
+
+WireLiveTransportBootstrap = WireLiveTransportBootstrapWebsocket
+
 @dataclass
 class LiveOpenResult:
     """Response payload for `live/open`.
 
-`capabilities` and `continuity` are typed wire-side mirrors of the core
-`LiveChannelCapabilities` / `LiveContinuityMode` so SDK codegen sees the
-real shape (typed booleans, internally-tagged variant payloads) instead
-of an opaque JSON blob. CC5/CC6 (PR #650 verifier follow-up).
-
-`transport` remains an opaque `serde_json::Value` schema projection: the
-transport-bootstrap shape is provider-pluggable and the typed wire mirror
-is tracked separately (Round-4 follow-up T4 reintroduces WebRTC with a
-real signaling shape)."""
+`capabilities`, `continuity`, and `transport` are typed wire-side mirrors
+of the core `LiveChannelCapabilities` / `LiveContinuityMode` /
+`LiveTransportBootstrap` so SDK codegen sees the real shape (typed
+booleans, internally-tagged variant payloads, discriminated transport
+union) instead of an opaque JSON blob. CC5/CC6 (PR #650 verifier
+follow-up); G8 (P2): `transport` typed-mirror."""
     capabilities: WireLiveChannelCapabilities
     channel_id: str
     continuity: WireLiveContinuityMode
-    transport: Any
+    transport: WireLiveTransportBootstrap
 
 
 @dataclass
@@ -1777,6 +1791,7 @@ class WireLiveAdapterObservationToolCallRequested(TypedDict, total=False):
 
 class WireLiveAdapterObservationTurnInterrupted(TypedDict, total=False):
     observation: Required[Literal['turn_interrupted']]
+    response_id: NotRequired[str]
 
 class WireLiveAdapterObservationTurnCompleted(TypedDict, total=False):
     observation: Required[Literal['turn_completed']]
@@ -2701,6 +2716,7 @@ class CommsCommandPeerRequest(TypedDict, total=False):
     to: Required[PeerId]
 
 class CommsCommandPeerResponse(TypedDict, total=False):
+    blocks: NotRequired[list[ContentBlock]]
     handling_mode: NotRequired[HandlingMode]
     in_reply_to: Required[str]
     kind: Required[Literal['peer_response']]
@@ -2965,6 +2981,7 @@ class CommsSendParamsPeerRequest(TypedDict, total=False):
     to: Required[PeerId]
 
 class CommsSendParamsPeerResponse(TypedDict, total=False):
+    blocks: NotRequired[list[ContentBlock]]
     handling_mode: NotRequired[HandlingMode]
     in_reply_to: Required[str]
     kind: Required[Literal['peer_response']]

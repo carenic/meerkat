@@ -1502,6 +1502,15 @@
       {
         "additionalProperties": false,
         "properties": {
+          "blocks": {
+            "items": {
+              "$ref": "#/$defs/ContentBlock"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
           "handling_mode": {
             "anyOf": [
               {
