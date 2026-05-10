@@ -8794,7 +8794,7 @@
   "LiveCommitInputParams": {
     "$defs": {
       "WireLiveResponseModality": {
-        "description": "Wire projection of [`meerkat_core::live_adapter::LiveResponseModality`].\n\nInternally-tagged on `modality` (snake_case) — matches the core enum's\nserde shape exactly so the wire payload is byte-identical. G9: closes\nthe typed-surface gap so SDK clients can pick `audio` vs `text` on a\nper-response basis without round-tripping through a free-form string.\n\nThe core enum is `#[non_exhaustive]`; new modalities (e.g. structured\noutput, image) appear here as additional typed variants.",
+        "description": "Wire projection of [`meerkat_core::live_adapter::LiveResponseModality`].\n\nInternally-tagged on `modality` (snake_case) — matches the core enum's\nserde shape exactly so the wire payload is byte-identical. G9: closes\nthe typed-surface gap so SDK clients can pick `audio` vs `text` on a\nper-response basis without round-tripping through a free-form string.\n\nThe core enum is `#[non_exhaustive]`; new modalities (e.g. structured\noutput, image) appear here as additional typed variants.\n\nR5-3 (P3): no longer `Copy` because `Unknown { debug: String }` carries\nan owned payload. The enum is small and conversions across the boundary\nmove-or-clone, so the loss of `Copy` is not material at call sites.",
         "oneOf": [
           {
             "description": "Spoken-audio plus the audio-derived transcript.",
@@ -8819,6 +8819,23 @@
             },
             "required": [
               "modality"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "R5-3 (P3): explicit fail-loud variant for unknown core variants.\n\nThe core [`LiveResponseModality`] enum is `#[non_exhaustive]`. When\na future modality (e.g. structured output, image) lands without an\nexplicit arm in the wire `From` impl, the conversion surfaces as\n`Unknown { debug }` rather than silently coercing to `Audio` — a\n\"plausible lie\" that would route a future text/structured response\nthrough the audio playback path and drop content. SDK consumers\nroute on the `modality: \"unknown\"` discriminator and treat it as an\nunsupported modality — never as `Audio`.\n\n**When a new core variant is added, add an explicit arm in the\nforward `From` impl above this variant — `Unknown` is the floor,\nnot the destination.**",
+            "properties": {
+              "debug": {
+                "type": "string"
+              },
+              "modality": {
+                "const": "unknown",
+                "type": "string"
+              }
+            },
+            "required": [
+              "modality",
+              "debug"
             ],
             "type": "object"
           }
@@ -9091,6 +9108,23 @@
             "required": [
               "mode",
               "provider_session_id"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "R5-3 (P3): explicit fail-loud variant for unknown core variants.\n\nThe core [`LiveContinuityMode`] enum is `#[non_exhaustive]`. When a\nfuture variant lands without an explicit arm in the wire `From`\nimpl, the conversion surfaces as `Unknown { debug }` rather than\nsilently coercing into `Fresh` — a \"plausible lie\" that would tell\nSDK consumers a brand-new live channel exists when in reality the\nserver emitted a continuity mode the client does not yet\nunderstand. SDK consumers route on the `mode: \"unknown\"`\ndiscriminator and treat it as unrecognized — never as `Fresh`.\n\n**When a new core variant is added, add an explicit arm in the\nforward `From` impl above this variant — `Unknown` is the floor,\nnot the destination.**",
+            "properties": {
+              "debug": {
+                "type": "string"
+              },
+              "mode": {
+                "const": "unknown",
+                "type": "string"
+              }
+            },
+            "required": [
+              "mode",
+              "debug"
             ],
             "type": "object"
           }
@@ -23093,6 +23127,23 @@
           "raw"
         ],
         "type": "object"
+      },
+      {
+        "description": "R5-3 (P3): explicit fail-loud variant for unknown core variants.\n\nThe core [`LiveAdapterErrorCode`] enum is `#[non_exhaustive]`. When\na future error code lands without an explicit arm in the wire\n`From` impl, the conversion surfaces as `Unknown { debug }` rather\nthan silently coercing to `InternalError` — a \"plausible lie\" that\nwould attribute every future-variant failure to an internal-server\nbug and mask real provider/transport classification. SDK consumers\nroute on the `code: \"unknown\"` discriminator and treat it as an\nunrecognized error class — never as `InternalError`.\n\n**When a new core variant is added, add an explicit arm in the\nforward `From` impl above this variant — `Unknown` is the floor,\nnot the destination.**",
+        "properties": {
+          "code": {
+            "const": "unknown",
+            "type": "string"
+          },
+          "debug": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "debug"
+        ],
+        "type": "object"
       }
     ],
     "title": "WireLiveAdapterErrorCode"
@@ -23563,6 +23614,23 @@
               "raw"
             ],
             "type": "object"
+          },
+          {
+            "description": "R5-3 (P3): explicit fail-loud variant for unknown core variants.\n\nThe core [`LiveAdapterErrorCode`] enum is `#[non_exhaustive]`. When\na future error code lands without an explicit arm in the wire\n`From` impl, the conversion surfaces as `Unknown { debug }` rather\nthan silently coercing to `InternalError` — a \"plausible lie\" that\nwould attribute every future-variant failure to an internal-server\nbug and mask real provider/transport classification. SDK consumers\nroute on the `code: \"unknown\"` discriminator and treat it as an\nunrecognized error class — never as `InternalError`.\n\n**When a new core variant is added, add an explicit arm in the\nforward `From` impl above this variant — `Unknown` is the floor,\nnot the destination.**",
+            "properties": {
+              "code": {
+                "const": "unknown",
+                "type": "string"
+              },
+              "debug": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "debug"
+            ],
+            "type": "object"
           }
         ]
       },
@@ -23642,6 +23710,23 @@
             },
             "required": [
               "status"
+            ],
+            "type": "object"
+          },
+          {
+            "description": "R5-3 (P3): explicit fail-loud variant for unknown core variants.\n\nThe core [`LiveAdapterStatus`] enum is `#[non_exhaustive]`. When a\nfuture status lands without an explicit arm in the wire `From`\nimpl, the conversion surfaces as `Unknown { debug }` rather than\nsilently coercing to `Closed` — a \"plausible lie\" that would tell\nSDK consumers a healthy channel was torn down. SDK consumers route\non the `status: \"unknown\"` discriminator and treat it as an\nunrecognized status — never as `Closed`.\n\n**When a new core variant is added, add an explicit arm in the\nforward `From` impl above this variant — `Unknown` is the floor,\nnot the destination.**",
+            "properties": {
+              "debug": {
+                "type": "string"
+              },
+              "status": {
+                "const": "unknown",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "debug"
             ],
             "type": "object"
           }
@@ -24459,6 +24544,23 @@
           "status"
         ],
         "type": "object"
+      },
+      {
+        "description": "R5-3 (P3): explicit fail-loud variant for unknown core variants.\n\nThe core [`LiveAdapterStatus`] enum is `#[non_exhaustive]`. When a\nfuture status lands without an explicit arm in the wire `From`\nimpl, the conversion surfaces as `Unknown { debug }` rather than\nsilently coercing to `Closed` — a \"plausible lie\" that would tell\nSDK consumers a healthy channel was torn down. SDK consumers route\non the `status: \"unknown\"` discriminator and treat it as an\nunrecognized status — never as `Closed`.\n\n**When a new core variant is added, add an explicit arm in the\nforward `From` impl above this variant — `Unknown` is the floor,\nnot the destination.**",
+        "properties": {
+          "debug": {
+            "type": "string"
+          },
+          "status": {
+            "const": "unknown",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "debug"
+        ],
+        "type": "object"
       }
     ],
     "title": "WireLiveAdapterStatus"
@@ -24577,6 +24679,23 @@
           "provider_session_id"
         ],
         "type": "object"
+      },
+      {
+        "description": "R5-3 (P3): explicit fail-loud variant for unknown core variants.\n\nThe core [`LiveContinuityMode`] enum is `#[non_exhaustive]`. When a\nfuture variant lands without an explicit arm in the wire `From`\nimpl, the conversion surfaces as `Unknown { debug }` rather than\nsilently coercing into `Fresh` — a \"plausible lie\" that would tell\nSDK consumers a brand-new live channel exists when in reality the\nserver emitted a continuity mode the client does not yet\nunderstand. SDK consumers route on the `mode: \"unknown\"`\ndiscriminator and treat it as unrecognized — never as `Fresh`.\n\n**When a new core variant is added, add an explicit arm in the\nforward `From` impl above this variant — `Unknown` is the floor,\nnot the destination.**",
+        "properties": {
+          "debug": {
+            "type": "string"
+          },
+          "mode": {
+            "const": "unknown",
+            "type": "string"
+          }
+        },
+        "required": [
+          "mode",
+          "debug"
+        ],
+        "type": "object"
       }
     ],
     "title": "WireLiveContinuityMode"
@@ -24642,7 +24761,7 @@
   },
   "WireLiveResponseModality": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "description": "Wire projection of [`meerkat_core::live_adapter::LiveResponseModality`].\n\nInternally-tagged on `modality` (snake_case) — matches the core enum's\nserde shape exactly so the wire payload is byte-identical. G9: closes\nthe typed-surface gap so SDK clients can pick `audio` vs `text` on a\nper-response basis without round-tripping through a free-form string.\n\nThe core enum is `#[non_exhaustive]`; new modalities (e.g. structured\noutput, image) appear here as additional typed variants.",
+    "description": "Wire projection of [`meerkat_core::live_adapter::LiveResponseModality`].\n\nInternally-tagged on `modality` (snake_case) — matches the core enum's\nserde shape exactly so the wire payload is byte-identical. G9: closes\nthe typed-surface gap so SDK clients can pick `audio` vs `text` on a\nper-response basis without round-tripping through a free-form string.\n\nThe core enum is `#[non_exhaustive]`; new modalities (e.g. structured\noutput, image) appear here as additional typed variants.\n\nR5-3 (P3): no longer `Copy` because `Unknown { debug: String }` carries\nan owned payload. The enum is small and conversions across the boundary\nmove-or-clone, so the loss of `Copy` is not material at call sites.",
     "oneOf": [
       {
         "description": "Spoken-audio plus the audio-derived transcript.",
@@ -24667,6 +24786,23 @@
         },
         "required": [
           "modality"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "R5-3 (P3): explicit fail-loud variant for unknown core variants.\n\nThe core [`LiveResponseModality`] enum is `#[non_exhaustive]`. When\na future modality (e.g. structured output, image) lands without an\nexplicit arm in the wire `From` impl, the conversion surfaces as\n`Unknown { debug }` rather than silently coercing to `Audio` — a\n\"plausible lie\" that would route a future text/structured response\nthrough the audio playback path and drop content. SDK consumers\nroute on the `modality: \"unknown\"` discriminator and treat it as an\nunsupported modality — never as `Audio`.\n\n**When a new core variant is added, add an explicit arm in the\nforward `From` impl above this variant — `Unknown` is the floor,\nnot the destination.**",
+        "properties": {
+          "debug": {
+            "type": "string"
+          },
+          "modality": {
+            "const": "unknown",
+            "type": "string"
+          }
+        },
+        "required": [
+          "modality",
+          "debug"
         ],
         "type": "object"
       }

@@ -130,9 +130,11 @@ impl From<LiveTransportBootstrap> for WireLiveTransportBootstrap {
 
 /// Conversion error surfaced when a wire variant has no core counterpart.
 ///
-/// Today this only fires for the explicit fail-loud `Unknown` wire variants
-/// (`WireLiveTransportBootstrap::Unknown`, `WireLiveAdapterObservation::Unknown`)
-/// — the wire mirrors' fail-loud sentinels for forward-converted future core
+/// Fires for the explicit fail-loud `Unknown` wire variants —
+/// `WireLiveTransportBootstrap::Unknown`, `WireLiveAdapterObservation::Unknown`,
+/// `WireLiveContinuityMode::Unknown`, `WireLiveResponseModality::Unknown`,
+/// `WireLiveAdapterStatus::Unknown`, `WireLiveAdapterErrorCode::Unknown`. These
+/// are the wire mirrors' fail-loud sentinels for forward-converted future core
 /// variants. There is no meaningful inverse for `Unknown` so the inverse path
 /// returns this error instead of silently fabricating a placeholder.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -146,6 +148,22 @@ pub enum WireConversionError {
     /// mapping exists. Carries the original debug payload for server logs.
     #[error("unknown wire observation variant: {debug}")]
     UnknownObservation { debug: String },
+    /// Wire continuity mode is the explicit-Unknown sentinel; no inverse
+    /// mapping exists. Carries the original debug payload for server logs.
+    #[error("unknown wire continuity-mode variant: {debug}")]
+    UnknownContinuity { debug: String },
+    /// Wire response modality is the explicit-Unknown sentinel; no inverse
+    /// mapping exists. Carries the original debug payload for server logs.
+    #[error("unknown wire response-modality variant: {debug}")]
+    UnknownResponseModality { debug: String },
+    /// Wire adapter status is the explicit-Unknown sentinel; no inverse
+    /// mapping exists. Carries the original debug payload for server logs.
+    #[error("unknown wire adapter-status variant: {debug}")]
+    UnknownStatus { debug: String },
+    /// Wire adapter error-code is the explicit-Unknown sentinel; no inverse
+    /// mapping exists. Carries the original debug payload for server logs.
+    #[error("unknown wire adapter-error-code variant: {debug}")]
+    UnknownErrorCode { debug: String },
 }
 
 impl TryFrom<WireLiveTransportBootstrap> for LiveTransportBootstrap {
@@ -293,6 +311,21 @@ pub enum WireLiveContinuityMode {
     /// preserves provider-native state across reconnects. No provider
     /// Meerkat ships today returns a usable resume id.
     ProviderNativeResume { provider_session_id: String },
+    /// R5-3 (P3): explicit fail-loud variant for unknown core variants.
+    ///
+    /// The core [`LiveContinuityMode`] enum is `#[non_exhaustive]`. When a
+    /// future variant lands without an explicit arm in the wire `From`
+    /// impl, the conversion surfaces as `Unknown { debug }` rather than
+    /// silently coercing into `Fresh` — a "plausible lie" that would tell
+    /// SDK consumers a brand-new live channel exists when in reality the
+    /// server emitted a continuity mode the client does not yet
+    /// understand. SDK consumers route on the `mode: "unknown"`
+    /// discriminator and treat it as unrecognized — never as `Fresh`.
+    ///
+    /// **When a new core variant is added, add an explicit arm in the
+    /// forward `From` impl above this variant — `Unknown` is the floor,
+    /// not the destination.**
+    Unknown { debug: String },
 }
 
 impl From<LiveContinuityMode> for WireLiveContinuityMode {
@@ -306,46 +339,48 @@ impl From<LiveContinuityMode> for WireLiveContinuityMode {
             } => Self::ProviderNativeResume {
                 provider_session_id,
             },
-            // CC6: `LiveContinuityMode` is `non_exhaustive`, so the
-            // compiler requires a wildcard. Same compromise as
-            // `WireTranscriptSource::from` (`wire/session.rs`):
-            // `meerkat-contracts` does not depend on `tracing`, the no-panic
-            // rule forbids `unreachable!()`, and a `TryFrom` would force
-            // every call site to handle a variant we don't yet have. Use
-            // `debug_assert!(false, ...)` so debug/CI builds fail loudly
-            // when a new variant lands without an explicit arm; release
-            // builds fall back to `Fresh` (the lowest-fidelity variant)
-            // rather than producing UB. **When a new variant is added, add
-            // an explicit arm above this comment.**
-            _ => {
+            // Core enum is `#[non_exhaustive]`. R5-3 (P3): surface unknown
+            // variants explicitly via `Unknown { debug }` rather than
+            // silently coercing to `Fresh` (the previous fail-open default
+            // — a plausible lie that would mask a real continuity-mode
+            // change as a brand-new channel). When a new core variant
+            // lands, add an explicit arm above this comment.
+            other => {
                 debug_assert!(
                     false,
                     "WireLiveContinuityMode::from saw an unmapped \
                      LiveContinuityMode variant; add an explicit arm in \
                      meerkat-contracts/src/wire/live.rs."
                 );
-                Self::Fresh
+                Self::Unknown {
+                    debug: format!("{other:?}"),
+                }
             }
         }
     }
 }
 
-impl From<WireLiveContinuityMode> for LiveContinuityMode {
-    fn from(value: WireLiveContinuityMode) -> Self {
+impl TryFrom<WireLiveContinuityMode> for LiveContinuityMode {
+    type Error = WireConversionError;
+
+    fn try_from(value: WireLiveContinuityMode) -> Result<Self, Self::Error> {
         // No wildcard arm: `WireLiveContinuityMode` is owned by this crate
         // so even with `#[non_exhaustive]` (which only constrains matches
         // outside the defining crate) the compiler enforces exhaustive
         // coverage here. Adding a new wire variant therefore forces a new
         // arm in this match — no silent fallthrough.
         match value {
-            WireLiveContinuityMode::Fresh => Self::Fresh,
-            WireLiveContinuityMode::TranscriptOnly => Self::TranscriptOnly,
-            WireLiveContinuityMode::Degraded => Self::Degraded,
+            WireLiveContinuityMode::Fresh => Ok(Self::Fresh),
+            WireLiveContinuityMode::TranscriptOnly => Ok(Self::TranscriptOnly),
+            WireLiveContinuityMode::Degraded => Ok(Self::Degraded),
             WireLiveContinuityMode::ProviderNativeResume {
                 provider_session_id,
-            } => Self::ProviderNativeResume {
+            } => Ok(Self::ProviderNativeResume {
                 provider_session_id,
-            },
+            }),
+            WireLiveContinuityMode::Unknown { debug } => {
+                Err(WireConversionError::UnknownContinuity { debug })
+            }
         }
     }
 }
@@ -373,7 +408,11 @@ pub struct LiveChannelParams {
 ///
 /// The core enum is `#[non_exhaustive]`; new modalities (e.g. structured
 /// output, image) appear here as additional typed variants.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+///
+/// R5-3 (P3): no longer `Copy` because `Unknown { debug: String }` carries
+/// an owned payload. The enum is small and conversions across the boundary
+/// move-or-clone, so the loss of `Copy` is not material at call sites.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "modality", rename_all = "snake_case")]
 #[non_exhaustive]
@@ -382,6 +421,21 @@ pub enum WireLiveResponseModality {
     Audio,
     /// Display text only — no audio output, no transcript.
     Text,
+    /// R5-3 (P3): explicit fail-loud variant for unknown core variants.
+    ///
+    /// The core [`LiveResponseModality`] enum is `#[non_exhaustive]`. When
+    /// a future modality (e.g. structured output, image) lands without an
+    /// explicit arm in the wire `From` impl, the conversion surfaces as
+    /// `Unknown { debug }` rather than silently coercing to `Audio` — a
+    /// "plausible lie" that would route a future text/structured response
+    /// through the audio playback path and drop content. SDK consumers
+    /// route on the `modality: "unknown"` discriminator and treat it as an
+    /// unsupported modality — never as `Audio`.
+    ///
+    /// **When a new core variant is added, add an explicit arm in the
+    /// forward `From` impl above this variant — `Unknown` is the floor,
+    /// not the destination.**
+    Unknown { debug: String },
 }
 
 impl From<LiveResponseModality> for WireLiveResponseModality {
@@ -389,26 +443,40 @@ impl From<LiveResponseModality> for WireLiveResponseModality {
         match value {
             LiveResponseModality::Audio => Self::Audio,
             LiveResponseModality::Text => Self::Text,
-            // Core enum is `#[non_exhaustive]`. Debug-assert on unmapped
-            // variants and fall back to the audio-first default.
-            _ => {
+            // Core enum is `#[non_exhaustive]`. R5-3 (P3): surface unknown
+            // variants explicitly via `Unknown { debug }` rather than
+            // silently coercing to `Audio` (the previous fail-open default
+            // — a plausible lie that would route a future text/structured
+            // response through the audio playback path). When a new core
+            // variant lands, add an explicit arm above this comment.
+            other => {
                 debug_assert!(
                     false,
                     "WireLiveResponseModality::from saw an unmapped \
                      LiveResponseModality variant; add an explicit arm in \
                      meerkat-contracts/src/wire/live.rs."
                 );
-                Self::Audio
+                Self::Unknown {
+                    debug: format!("{other:?}"),
+                }
             }
         }
     }
 }
 
-impl From<WireLiveResponseModality> for LiveResponseModality {
-    fn from(value: WireLiveResponseModality) -> Self {
+impl TryFrom<WireLiveResponseModality> for LiveResponseModality {
+    type Error = WireConversionError;
+
+    fn try_from(value: WireLiveResponseModality) -> Result<Self, Self::Error> {
+        // No wildcard arm: `WireLiveResponseModality` is owned by this
+        // crate so even with `#[non_exhaustive]` the compiler enforces
+        // exhaustive coverage here.
         match value {
-            WireLiveResponseModality::Audio => Self::Audio,
-            WireLiveResponseModality::Text => Self::Text,
+            WireLiveResponseModality::Audio => Ok(Self::Audio),
+            WireLiveResponseModality::Text => Ok(Self::Text),
+            WireLiveResponseModality::Unknown { debug } => {
+                Err(WireConversionError::UnknownResponseModality { debug })
+            }
         }
     }
 }
@@ -620,9 +688,27 @@ pub enum WireLiveAdapterStatus {
     Idle,
     Opening,
     Ready,
-    Degraded { reason: WireLiveDegradationReason },
+    Degraded {
+        reason: WireLiveDegradationReason,
+    },
     Closing,
     Closed,
+    /// R5-3 (P3): explicit fail-loud variant for unknown core variants.
+    ///
+    /// The core [`LiveAdapterStatus`] enum is `#[non_exhaustive]`. When a
+    /// future status lands without an explicit arm in the wire `From`
+    /// impl, the conversion surfaces as `Unknown { debug }` rather than
+    /// silently coercing to `Closed` — a "plausible lie" that would tell
+    /// SDK consumers a healthy channel was torn down. SDK consumers route
+    /// on the `status: "unknown"` discriminator and treat it as an
+    /// unrecognized status — never as `Closed`.
+    ///
+    /// **When a new core variant is added, add an explicit arm in the
+    /// forward `From` impl above this variant — `Unknown` is the floor,
+    /// not the destination.**
+    Unknown {
+        debug: String,
+    },
 }
 
 impl From<LiveAdapterStatus> for WireLiveAdapterStatus {
@@ -636,18 +722,35 @@ impl From<LiveAdapterStatus> for WireLiveAdapterStatus {
             },
             LiveAdapterStatus::Closing => Self::Closing,
             LiveAdapterStatus::Closed => Self::Closed,
-            _ => {
+            // Core enum is `#[non_exhaustive]`. R5-3 (P3): surface unknown
+            // variants explicitly via `Unknown { debug }` rather than
+            // silently coercing to `Closed` (the previous fail-open default
+            // — a plausible lie that would tell consumers a healthy
+            // channel was torn down). When a new core variant lands, add
+            // an explicit arm above this comment.
+            other => {
                 debug_assert!(
                     false,
                     "WireLiveAdapterStatus::from saw an unmapped \
                      LiveAdapterStatus variant; add an explicit arm in \
                      meerkat-contracts/src/wire/live.rs."
                 );
-                Self::Closed
+                Self::Unknown {
+                    debug: format!("{other:?}"),
+                }
             }
         }
     }
 }
+
+// (No `impl From/TryFrom<WireLiveAdapterStatus> for LiveAdapterStatus`
+// emitted: like `WireLiveAdapterObservation`, the wire-side adapter status
+// is a downstream projection — never authority. The `Unknown` arm exists
+// so future core variants surface explicitly on the forward path; the
+// `WireConversionError::UnknownStatus` variant is reserved for a future
+// caller that needs to construct a typed inverse and will materialize the
+// reverse impl alongside the dependent `From<WireLiveDegradationReason>`
+// addition. No production code calls the inverse today.)
 
 /// Wire mirror of [`meerkat_core::live_adapter::LiveAdapterErrorCode`].
 ///
@@ -676,6 +779,23 @@ pub enum WireLiveAdapterErrorCode {
     InternalError,
     Other {
         raw: String,
+    },
+    /// R5-3 (P3): explicit fail-loud variant for unknown core variants.
+    ///
+    /// The core [`LiveAdapterErrorCode`] enum is `#[non_exhaustive]`. When
+    /// a future error code lands without an explicit arm in the wire
+    /// `From` impl, the conversion surfaces as `Unknown { debug }` rather
+    /// than silently coercing to `InternalError` — a "plausible lie" that
+    /// would attribute every future-variant failure to an internal-server
+    /// bug and mask real provider/transport classification. SDK consumers
+    /// route on the `code: "unknown"` discriminator and treat it as an
+    /// unrecognized error class — never as `InternalError`.
+    ///
+    /// **When a new core variant is added, add an explicit arm in the
+    /// forward `From` impl above this variant — `Unknown` is the floor,
+    /// not the destination.**
+    Unknown {
+        debug: String,
     },
 }
 
@@ -834,31 +954,48 @@ impl From<LiveAdapterErrorCode> for WireLiveAdapterErrorCode {
             LiveAdapterErrorCode::AuthenticationFailed => Self::AuthenticationFailed,
             LiveAdapterErrorCode::InternalError => Self::InternalError,
             LiveAdapterErrorCode::Other { raw } => Self::Other { raw },
-            _ => {
+            // Core enum is `#[non_exhaustive]`. R5-3 (P3): surface unknown
+            // variants explicitly via `Unknown { debug }` rather than
+            // silently coercing to `InternalError` (the previous fail-open
+            // default — a plausible lie that would attribute every
+            // future-variant failure to an internal-server bug). When a
+            // new core variant lands, add an explicit arm above this
+            // comment.
+            other => {
                 debug_assert!(
                     false,
                     "WireLiveAdapterErrorCode::from saw an unmapped \
                      LiveAdapterErrorCode variant; add an explicit arm in \
                      meerkat-contracts/src/wire/live.rs."
                 );
-                Self::InternalError
+                Self::Unknown {
+                    debug: format!("{other:?}"),
+                }
             }
         }
     }
 }
 
-impl From<WireLiveAdapterErrorCode> for LiveAdapterErrorCode {
-    fn from(value: WireLiveAdapterErrorCode) -> Self {
+impl TryFrom<WireLiveAdapterErrorCode> for LiveAdapterErrorCode {
+    type Error = WireConversionError;
+
+    fn try_from(value: WireLiveAdapterErrorCode) -> Result<Self, Self::Error> {
+        // No wildcard arm: `WireLiveAdapterErrorCode` is owned by this
+        // crate so even with `#[non_exhaustive]` the compiler enforces
+        // exhaustive coverage here.
         match value {
-            WireLiveAdapterErrorCode::ConnectionFailed => Self::ConnectionFailed,
-            WireLiveAdapterErrorCode::ConnectionLost => Self::ConnectionLost,
-            WireLiveAdapterErrorCode::ConfigRejected { reason } => Self::ConfigRejected {
+            WireLiveAdapterErrorCode::ConnectionFailed => Ok(Self::ConnectionFailed),
+            WireLiveAdapterErrorCode::ConnectionLost => Ok(Self::ConnectionLost),
+            WireLiveAdapterErrorCode::ConfigRejected { reason } => Ok(Self::ConfigRejected {
                 reason: reason.into(),
-            },
-            WireLiveAdapterErrorCode::ProviderError => Self::ProviderError,
-            WireLiveAdapterErrorCode::AuthenticationFailed => Self::AuthenticationFailed,
-            WireLiveAdapterErrorCode::InternalError => Self::InternalError,
-            WireLiveAdapterErrorCode::Other { raw } => Self::Other { raw },
+            }),
+            WireLiveAdapterErrorCode::ProviderError => Ok(Self::ProviderError),
+            WireLiveAdapterErrorCode::AuthenticationFailed => Ok(Self::AuthenticationFailed),
+            WireLiveAdapterErrorCode::InternalError => Ok(Self::InternalError),
+            WireLiveAdapterErrorCode::Other { raw } => Ok(Self::Other { raw }),
+            WireLiveAdapterErrorCode::Unknown { debug } => {
+                Err(WireConversionError::UnknownErrorCode { debug })
+            }
         }
     }
 }
@@ -1486,7 +1623,10 @@ mod tests {
                 provider_session_id: "sess_back".into(),
             },
         ] {
-            let core: LiveContinuityMode = v.clone().into();
+            let core: LiveContinuityMode = v
+                .clone()
+                .try_into()
+                .expect("known wire variants must convert to core");
             let back: WireLiveContinuityMode = core.into();
             assert_eq!(v, back);
         }
@@ -1863,7 +2003,7 @@ mod tests {
             WireLiveResponseModality::Audio,
             WireLiveResponseModality::Text,
         ] {
-            let j = serde_json::to_value(v).expect("round-trip should succeed");
+            let j = serde_json::to_value(&v).expect("round-trip should succeed");
             assert!(
                 j.get("modality").is_some(),
                 "missing `modality` discriminator"
@@ -1879,7 +2019,7 @@ mod tests {
         for core in [LiveResponseModality::Audio, LiveResponseModality::Text] {
             let wire: WireLiveResponseModality = core.into();
             let core_json = serde_json::to_value(core).expect("round-trip should succeed");
-            let wire_json = serde_json::to_value(wire).expect("round-trip should succeed");
+            let wire_json = serde_json::to_value(&wire).expect("round-trip should succeed");
             assert_eq!(core_json, wire_json);
         }
     }
@@ -1952,5 +2092,116 @@ mod tests {
             Some(&serde_json::Value::String("queued".into())),
             "typed `status: queued` must be present alongside the legacy field"
         );
+    }
+
+    // R5-3 (P3) — explicit Unknown variant fail-loud regression tests for
+    // continuity / response_modality / status / error_code wire mirrors.
+
+    #[test]
+    fn unknown_continuity_does_not_become_fresh() {
+        // R5-3 (P3): the wire `Unknown` variant must NOT convert back to
+        // `Fresh` (the previous fail-open default). The inverse path
+        // returns `WireConversionError::UnknownContinuity` so callers
+        // route on the typed error rather than silently fabricating a
+        // fresh-channel placeholder.
+        let unknown = WireLiveContinuityMode::Unknown {
+            debug: "FutureContinuity { … }".into(),
+        };
+        match LiveContinuityMode::try_from(unknown.clone()) {
+            Err(WireConversionError::UnknownContinuity { debug }) => {
+                assert!(
+                    debug.contains("FutureContinuity"),
+                    "debug payload preserved"
+                );
+            }
+            other => panic!("unknown wire variant must not coerce to a core variant: {other:?}"),
+        }
+        // Round-trips through serde as the explicit `unknown` discriminator.
+        let j = serde_json::to_value(&unknown).expect("round-trip should succeed");
+        assert_eq!(j["mode"], "unknown");
+        assert_ne!(j["mode"], "fresh", "Unknown must never serialize as fresh");
+        assert!(
+            j.get("provider_session_id").is_none(),
+            "Unknown wire variant must NOT carry resume fields"
+        );
+        let back: WireLiveContinuityMode =
+            serde_json::from_value(j).expect("round-trip should succeed");
+        assert_eq!(unknown, back);
+    }
+
+    #[test]
+    fn unknown_response_modality_does_not_become_audio() {
+        // R5-3 (P3): the wire `Unknown` variant must NOT convert back to
+        // `Audio` (the previous fail-open default that would route a
+        // future text/structured response through the audio playback path
+        // and drop content).
+        let unknown = WireLiveResponseModality::Unknown {
+            debug: "Structured { … }".into(),
+        };
+        match LiveResponseModality::try_from(unknown.clone()) {
+            Err(WireConversionError::UnknownResponseModality { debug }) => {
+                assert!(debug.contains("Structured"), "debug payload preserved");
+            }
+            other => panic!("unknown wire variant must not coerce to a core variant: {other:?}"),
+        }
+        let j = serde_json::to_value(&unknown).expect("round-trip should succeed");
+        assert_eq!(j["modality"], "unknown");
+        assert_ne!(
+            j["modality"], "audio",
+            "Unknown must never serialize as audio"
+        );
+        let back: WireLiveResponseModality =
+            serde_json::from_value(j).expect("round-trip should succeed");
+        assert_eq!(unknown, back);
+    }
+
+    #[test]
+    fn unknown_status_does_not_become_closed() {
+        // R5-3 (P3): the wire `Unknown` variant must NOT serialize as
+        // `closed` (the previous fail-open default — a plausible lie that
+        // would tell consumers a healthy channel was torn down). No
+        // inverse `From/TryFrom` is emitted today (matches the
+        // `WireLiveAdapterObservation` precedent — wire-side status is a
+        // downstream projection, never authority); the regression
+        // assertion lives at the serialization layer.
+        let unknown = WireLiveAdapterStatus::Unknown {
+            debug: "Reconnecting { … }".into(),
+        };
+        let j = serde_json::to_value(&unknown).expect("round-trip should succeed");
+        assert_eq!(j["status"], "unknown");
+        assert_ne!(
+            j["status"], "closed",
+            "Unknown must never serialize as closed"
+        );
+        assert_eq!(j["debug"], "Reconnecting { … }");
+        let back: WireLiveAdapterStatus =
+            serde_json::from_value(j).expect("round-trip should succeed");
+        assert_eq!(unknown, back);
+    }
+
+    #[test]
+    fn unknown_error_code_does_not_become_internal_error() {
+        // R5-3 (P3): the wire `Unknown` variant must NOT convert back to
+        // `InternalError` (the previous fail-open default that would
+        // attribute every future-variant failure to an internal-server
+        // bug and mask real provider/transport classification).
+        let unknown = WireLiveAdapterErrorCode::Unknown {
+            debug: "QuotaExhausted { … }".into(),
+        };
+        match LiveAdapterErrorCode::try_from(unknown.clone()) {
+            Err(WireConversionError::UnknownErrorCode { debug }) => {
+                assert!(debug.contains("QuotaExhausted"), "debug payload preserved");
+            }
+            other => panic!("unknown wire variant must not coerce to a core variant: {other:?}"),
+        }
+        let j = serde_json::to_value(&unknown).expect("round-trip should succeed");
+        assert_eq!(j["code"], "unknown");
+        assert_ne!(
+            j["code"], "internal_error",
+            "Unknown must never serialize as internal_error"
+        );
+        let back: WireLiveAdapterErrorCode =
+            serde_json::from_value(j).expect("round-trip should succeed");
+        assert_eq!(unknown, back);
     }
 }

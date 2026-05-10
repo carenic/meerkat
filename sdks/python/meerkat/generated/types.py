@@ -1490,7 +1490,11 @@ class WireLiveContinuityModeProviderNativeResume(TypedDict, total=False):
     mode: Required[Literal['provider_native_resume']]
     provider_session_id: Required[str]
 
-WireLiveContinuityMode = WireLiveContinuityModeFresh | WireLiveContinuityModeTranscriptOnly | WireLiveContinuityModeDegraded | WireLiveContinuityModeProviderNativeResume
+class WireLiveContinuityModeUnknown(TypedDict, total=False):
+    debug: Required[str]
+    mode: Required[Literal['unknown']]
+
+WireLiveContinuityMode = WireLiveContinuityModeFresh | WireLiveContinuityModeTranscriptOnly | WireLiveContinuityModeDegraded | WireLiveContinuityModeProviderNativeResume | WireLiveContinuityModeUnknown
 
 # Wire projection of [`meerkat_core::live_adapter::LiveTransportBootstrap`].
 #
@@ -1585,13 +1589,21 @@ cursor in here when they want to truncate."""
 #
 # The core enum is `#[non_exhaustive]`; new modalities (e.g. structured
 # output, image) appear here as additional typed variants.
+#
+# R5-3 (P3): no longer `Copy` because `Unknown { debug: String }` carries
+# an owned payload. The enum is small and conversions across the boundary
+# move-or-clone, so the loss of `Copy` is not material at call sites.
 class WireLiveResponseModalityAudio(TypedDict, total=False):
     modality: Required[Literal['audio']]
 
 class WireLiveResponseModalityText(TypedDict, total=False):
     modality: Required[Literal['text']]
 
-WireLiveResponseModality = WireLiveResponseModalityAudio | WireLiveResponseModalityText
+class WireLiveResponseModalityUnknown(TypedDict, total=False):
+    debug: Required[str]
+    modality: Required[Literal['unknown']]
+
+WireLiveResponseModality = WireLiveResponseModalityAudio | WireLiveResponseModalityText | WireLiveResponseModalityUnknown
 
 @dataclass
 class LiveCommitInputParams:
@@ -1753,7 +1765,11 @@ class WireLiveAdapterStatusClosing(TypedDict, total=False):
 class WireLiveAdapterStatusClosed(TypedDict, total=False):
     status: Required[Literal['closed']]
 
-WireLiveAdapterStatus = WireLiveAdapterStatusIdle | WireLiveAdapterStatusOpening | WireLiveAdapterStatusReady | WireLiveAdapterStatusDegraded | WireLiveAdapterStatusClosing | WireLiveAdapterStatusClosed
+class WireLiveAdapterStatusUnknown(TypedDict, total=False):
+    debug: Required[str]
+    status: Required[Literal['unknown']]
+
+WireLiveAdapterStatus = WireLiveAdapterStatusIdle | WireLiveAdapterStatusOpening | WireLiveAdapterStatusReady | WireLiveAdapterStatusDegraded | WireLiveAdapterStatusClosing | WireLiveAdapterStatusClosed | WireLiveAdapterStatusUnknown
 
 # Wire mirror of [`meerkat_core::live_adapter::LiveAdapterErrorCode`].
 #
@@ -1790,7 +1806,11 @@ class WireLiveAdapterErrorCodeOther(TypedDict, total=False):
     code: Required[Literal['other']]
     raw: Required[str]
 
-WireLiveAdapterErrorCode = WireLiveAdapterErrorCodeConnectionFailed | WireLiveAdapterErrorCodeConnectionLost | WireLiveAdapterErrorCodeConfigRejected | WireLiveAdapterErrorCodeProviderError | WireLiveAdapterErrorCodeAuthenticationFailed | WireLiveAdapterErrorCodeInternalError | WireLiveAdapterErrorCodeOther
+class WireLiveAdapterErrorCodeUnknown(TypedDict, total=False):
+    code: Required[Literal['unknown']]
+    debug: Required[str]
+
+WireLiveAdapterErrorCode = WireLiveAdapterErrorCodeConnectionFailed | WireLiveAdapterErrorCodeConnectionLost | WireLiveAdapterErrorCodeConfigRejected | WireLiveAdapterErrorCodeProviderError | WireLiveAdapterErrorCodeAuthenticationFailed | WireLiveAdapterErrorCodeInternalError | WireLiveAdapterErrorCodeOther | WireLiveAdapterErrorCodeUnknown
 
 # Wire mirror of [`meerkat_core::live_adapter::LiveAdapterObservation`].
 #

@@ -1702,7 +1702,12 @@ export interface WireLiveContinuityModeProviderNativeResume {
   provider_session_id: string;
 }
 
-export type WireLiveContinuityMode = WireLiveContinuityModeFresh | WireLiveContinuityModeTranscriptOnly | WireLiveContinuityModeDegraded | WireLiveContinuityModeProviderNativeResume;
+export interface WireLiveContinuityModeUnknown {
+  debug: string;
+  mode: "unknown";
+}
+
+export type WireLiveContinuityMode = WireLiveContinuityModeFresh | WireLiveContinuityModeTranscriptOnly | WireLiveContinuityModeDegraded | WireLiveContinuityModeProviderNativeResume | WireLiveContinuityModeUnknown;
 
 export interface WireLiveTransportBootstrapWebsocket {
   token: string;
@@ -1753,7 +1758,12 @@ export interface WireLiveResponseModalityText {
   modality: "text";
 }
 
-export type WireLiveResponseModality = WireLiveResponseModalityAudio | WireLiveResponseModalityText;
+export interface WireLiveResponseModalityUnknown {
+  debug: string;
+  modality: "unknown";
+}
+
+export type WireLiveResponseModality = WireLiveResponseModalityAudio | WireLiveResponseModalityText | WireLiveResponseModalityUnknown;
 
 export interface LiveCommitInputParams {
   channel_id: string;
@@ -1912,7 +1922,12 @@ export interface WireLiveAdapterStatusClosed {
   status: "closed";
 }
 
-export type WireLiveAdapterStatus = WireLiveAdapterStatusIdle | WireLiveAdapterStatusOpening | WireLiveAdapterStatusReady | WireLiveAdapterStatusDegraded | WireLiveAdapterStatusClosing | WireLiveAdapterStatusClosed;
+export interface WireLiveAdapterStatusUnknown {
+  debug: string;
+  status: "unknown";
+}
+
+export type WireLiveAdapterStatus = WireLiveAdapterStatusIdle | WireLiveAdapterStatusOpening | WireLiveAdapterStatusReady | WireLiveAdapterStatusDegraded | WireLiveAdapterStatusClosing | WireLiveAdapterStatusClosed | WireLiveAdapterStatusUnknown;
 
 export interface WireLiveAdapterErrorCodeConnectionFailed {
   code: "connection_failed";
@@ -1944,7 +1959,12 @@ export interface WireLiveAdapterErrorCodeOther {
   raw: string;
 }
 
-export type WireLiveAdapterErrorCode = WireLiveAdapterErrorCodeConnectionFailed | WireLiveAdapterErrorCodeConnectionLost | WireLiveAdapterErrorCodeConfigRejected | WireLiveAdapterErrorCodeProviderError | WireLiveAdapterErrorCodeAuthenticationFailed | WireLiveAdapterErrorCodeInternalError | WireLiveAdapterErrorCodeOther;
+export interface WireLiveAdapterErrorCodeUnknown {
+  code: "unknown";
+  debug: string;
+}
+
+export type WireLiveAdapterErrorCode = WireLiveAdapterErrorCodeConnectionFailed | WireLiveAdapterErrorCodeConnectionLost | WireLiveAdapterErrorCodeConfigRejected | WireLiveAdapterErrorCodeProviderError | WireLiveAdapterErrorCodeAuthenticationFailed | WireLiveAdapterErrorCodeInternalError | WireLiveAdapterErrorCodeOther | WireLiveAdapterErrorCodeUnknown;
 
 export interface WireLiveAdapterObservationReady {
   observation: "ready";

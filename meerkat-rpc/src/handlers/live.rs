@@ -730,7 +730,21 @@ pub async fn handle_live_commit_input(
         Err(resp) => return resp,
     };
     let channel_id = LiveChannelId::new(&parsed.channel_id);
-    let response_modality = parsed.response_modality.map(Into::into);
+    // R5-3 (P3): the wire mirror is `TryFrom`-only. The `Unknown` sentinel
+    // is the explicit fail-loud variant for a future core-side modality
+    // the client doesn't yet understand; reject the request rather than
+    // silently coerce it.
+    let response_modality = match parsed.response_modality.map(TryInto::try_into) {
+        Some(Ok(modality)) => Some(modality),
+        Some(Err(err)) => {
+            return RpcResponse::error(
+                id,
+                error::INVALID_PARAMS,
+                format!("invalid response_modality: {err}"),
+            );
+        }
+        None => None,
+    };
 
     match host
         .send_command(
