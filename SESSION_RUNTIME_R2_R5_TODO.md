@@ -1045,3 +1045,78 @@ is present at HEAD.
 G6 PASS / G7 PASS / G8 PASS / G9 PASS / G10 PASS / G11 PASS / G12 PASS
 / Cross-cutting PASS. Thirteen verdicts, zero findings each, all
 honestly justified against their named invariants.
+
+### Phase R3 verifier deliverable
+
+#### R3-1 (P1) — `live/open` honors `turning_mode`; `ExplicitCommit` reaches G9 typed text path
+
+- **Invariant.** `live/open` accepts an optional `turning_mode`; `Some(ExplicitCommit)` threads through to `live_open_config_for_session`. Default (`None`) preserves prior `ProviderManaged` behavior.
+- **Method.** Read `meerkat-rpc/src/handlers/live.rs` diff in `574c58c6f`; grepped `LiveOpenParams` in `meerkat-contracts/src/wire/live.rs` (line 44) — `turning_mode: Option<RealtimeTurningMode>` with `#[serde(default, skip_serializing_if = "Option::is_none")]`. Confirmed handler uses `parsed.turning_mode.unwrap_or(RealtimeTurningMode::ProviderManaged)`. Verified `live_open_params_explicit_commit_roundtrip` test added.
+- **Findings.** Zero. Default behavior preserved (omitted field elides on wire, deserializes to `None`, handler unwraps to `ProviderManaged`); `ExplicitCommit` round-trips and threads through to `live_open_config_for_session` cleanly.
+- **Verdict.** PASS.
+
+#### R3-2 (P1) — `config/patch` only fans out propagation when a model-affecting field changed
+
+- **Invariant.** `propagate_config_to_live_channels` is called from `config/patch` only when `should_fire_live_propagation(prior, new)` returns true (today: `prior.agent.model != new.agent.model`).
+- **Method.** Read `should_fire_live_propagation` at `meerkat/src/session_runtime/live_orchestration.rs:252` — single-field predicate on `agent.model`. Grepped `meerkat-rpc/src/handlers/config.rs` — both runtime-backed (line 380) and store-backed (line 434) `config/patch` branches gate `propagate_config_to_live_channels` behind `should_fire_live_propagation`. Confirmed regression tests `should_fire_live_propagation_returns_false_for_unrelated_field_change` and `..._returns_false_when_agent_model_unchanged` in `meerkat/tests/session_runtime_live_orchestration.rs`.
+- **Findings.** Zero. Patches that don't mutate `agent.model` short-circuit the orchestrator fan-out as required.
+- **Verdict.** PASS.
+
+#### R3-3 (P1) — TS smoke scenario 59 no longer references deleted `RealtimeChannel`/`openInfo`
+
+- **Invariant.** `sdks/typescript/tests/e2e_smoke.test.mjs` does not import `RealtimeChannel` or call `openInfo()`; scenario 59 carries an explicit skip marker pointing at I53. `tsc --noEmit` clean.
+- **Method.** Grepped `RealtimeChannel\|openInfo` across `sdks/typescript/src` and `sdks/typescript/tests` — only references are inside comments (line 598 + skip marker line 607 in the test file; one comment in `types.test.js`). Ran `npx tsc --noEmit -p tests/tsconfig.json` — no output (clean).
+- **Findings.** Zero. Scenario 59 is an explicit `{ skip: "RealtimeChannel removed in live-adapter MVP; replacement TS live_* WS helper pending I53" }`, no live import.
+- **Verdict.** PASS.
+
+#### R3-4 (P2) — `config/set` also fans out propagation on model-affecting change
+
+- **Invariant.** `config/set` calls `propagate_config_to_live_channels` iff `should_fire_live_propagation(prior, new)` returns true (closes the set/patch asymmetry).
+- **Method.** Same grep as R3-2; `config/set` branches at `meerkat-rpc/src/handlers/config.rs:249` (runtime-backed) and `:276` (store-backed) both gate on `should_fire_live_propagation` with `prior_global_model` correctly captured before commit.
+- **Findings.** Zero. Set/patch are now symmetric — same predicate, same fan-out.
+- **Verdict.** PASS.
+
+#### R3-5 (P2) — `audio_output_active` / `text_output_active` split; barge-in scoped to audio
+
+- **Invariant.** `response_output_active` decomposes into `audio_output_active` + `text_output_active`; user-speech barge-in (`InputAudioBufferSpeechStarted`, `InputAudioBufferCommitted`) gates on `audio_output_active` only; text-only responses survive user audio overlap.
+- **Method.** Grepped `audio_output_active|text_output_active|any_response_output_active` in `meerkat-openai/src/live.rs` — fields at lines 1225-1226, helpers `mark_audio_output_active`/`mark_text_output_active`/`clear_response_output_active` at 1406-1425, `any_response_output_active()` at 1396 used by the suppression guard. Barge-in branches at lines 1755 + 1787 gate on `self.audio_output_active && !self.response_interrupt_emitted`. Regression tests `provider_neutral_session_text_only_response_survives_user_speech_barge_in` (line 6262) and `..._audio_response_is_interrupted_by_user_speech` (line 6330) confirmed present.
+- **Findings.** Zero. The text-survives / audio-interrupts cases are both covered by named regression tests; the suppression guard reads via `any_response_output_active()` so the modality-agnostic check still fires.
+- **Verdict.** PASS.
+
+#### R3-6 (P2) — explicit `Unknown { debug }` variants on wire mirrors; reverse direction is `TryFrom`
+
+- **Invariant.** `From<core> for Wire` impls for `LiveTransportBootstrap` and `LiveAdapterObservation` emit `Unknown { debug: format!("{:?}", other) }` for unknown core variants instead of fabricating `Websocket{url:"",token:""}` / `TurnInterrupted{response_id:None}`. Reverse is `TryFrom` returning `WireConversionError::UnknownTransport`/`UnknownObservation`. SDK codegen reflects the new variant.
+- **Method.** Read `meerkat-contracts/src/wire/live.rs`: `WireLiveTransportBootstrap::Unknown { debug: String }` at line 101; forward `From` constructs `Self::Unknown { ... }` at line 121; `TryFrom<WireLiveTransportBootstrap> for LiveTransportBootstrap` at line 149 returns `Err(WireConversionError::UnknownTransport)` for `Unknown`. Same shape on observation at lines 820 and 966. SDK codegen verified: `WireLiveTransportBootstrapUnknown` (line 1713) and `WireLiveAdapterObservationUnknown` (line 2045) present in `sdks/typescript/src/generated/types.ts`. Four regression tests added (`unknown_transport_variant_round_trips_as_unknown`, etc.).
+- **Findings.** Zero. Fail-loud sentinel variant in both directions; SDKs see explicit `transport: "unknown"` / `observation: "unknown"` discriminator.
+- **Verdict.** PASS.
+
+#### R3-7 (P3) — meerkat-architecture skill docs scrubbed of deleted RPC methods
+
+- **Invariant.** `.claude/skills/meerkat-architecture/SKILL.md` does not advertise `session/realtime_attachment_status` or `realtime/open_info` as current surfaces; `realtime-attachment.md` reference removed; the 8 `live/*` method names match `meerkat-rpc/src/router.rs`.
+- **Method.** Grepped `session/realtime_attachment_status|realtime/open_info|realtime-attachment.md` in `SKILL.md` — only matches are in the explicit "has been removed" past-tense paragraph (lines 84-88). Confirmed `live/*` arms in `meerkat-rpc/src/router.rs` (lines 1477-1524): open, status, close, refresh, send_input, commit_input, interrupt, truncate — 8 arms. SKILL.md lines 94-99 enumerate the same 8 method names.
+- **Findings.** Zero. Past-tense references are correct migration context, not advertised surfaces; live/* list matches router exactly.
+- **Verdict.** PASS.
+
+#### R3-8 (P3) — Python smoke scenarios 57/58/64 migrated off "live helpers pending" skip
+
+- **Invariant.** `sdks/python/tests/test_e2e_smoke.py` contains no "live helpers pending" skip; migrated scenarios call typed `live_*` helpers from `client.py` and assert `METHOD_NOT_FOUND` (smoke harness lacks `--live-ws`). `py_compile` clean.
+- **Method.** Grepped `live helpers pending|pytest.skip` — only remaining `pytest.skip` is the unrelated mob-capability check at line 398. Confirmed scenarios 57/58/64 call `client.live_open`, `client.live_status`, `client.live_close`, `client.live_send_input_text`, `client.live_commit_input`, `client.live_interrupt` and assert `exc_info.value.code in {"METHOD_NOT_FOUND", "-32601"}`. Confirmed all 11 `live_*` helpers exist in `sdks/python/meerkat/client.py:2454-2632`. Ran `python3 -m py_compile sdks/python/tests/test_e2e_smoke.py` — clean.
+- **Findings.** Zero. Skip marker gone; scenarios assert the negative-path contract through the typed helpers.
+- **Verdict.** PASS.
+
+#### Cross-cutting — test discipline + wire stability + schema freshness + zero deferral
+
+- **Invariants.**
+  - *Test discipline*: every R3 commit changing runtime code includes a regression test.
+  - *Wire stability*: new `Option<...>` fields use `#[serde(default, skip_serializing_if = "Option::is_none")]`.
+  - *Schema freshness*: `make verify-version-parity` and `make verify-schema-freshness` are no-op.
+  - *No new TODO/FIXME/#[ignore]* introduced by R3 commits.
+- **Method.** Per-commit `+#[test]`/`+#[tokio::test]` count via `git show <sha> | grep -E`. Grepped added lines across all 7 R3 commits for `// TODO|// FIXME|#\[ignore\]|# TODO|# FIXME` — zero hits. Read `LiveOpenParams.turning_mode` serde attrs (line 46-47). Ran `make verify-version-parity` (all checks PASS) and `make verify-schema-freshness` (all 8 schema files OK).
+- **Findings.** Zero.
+  - Test discipline: 574c58c6f (3 new tests), a75e1d3c4 (4), 0be646130 (6). Doc-only commits (74a72e133, 9b75c291f, 0b0d059c7, b9df9c91b — the last is test-migration only) don't require new tests.
+  - Wire stability: `LiveOpenParams.turning_mode` carries `#[serde(default, skip_serializing_if = "Option::is_none")]`; default `None` elides on wire (verified by `live_open_params_roundtrip` JSON-key assertion at `meerkat-contracts/src/wire/live.rs:1002`).
+  - Schema freshness: version-parity OK at 0.6.4 across Cargo/Python/TS/Web; schema-freshness reports all 8 artifacts OK.
+  - Zero deferral: no new `// TODO`, `// FIXME`, `#[ignore]`, `# TODO`, or `# FIXME` lines added across the 7 R3 commits.
+- **Verdict.** PASS.
+
+**Phase R3 summary.** R3-1 PASS / R3-2 PASS / R3-3 PASS / R3-4 PASS / R3-5 PASS / R3-6 PASS / R3-7 PASS / R3-8 PASS / Cross-cutting PASS. Nine verdicts, zero findings each, every zero-finding verdict cited against its named invariant.
