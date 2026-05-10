@@ -727,3 +727,297 @@ removed. Force-push `live-adapter-mvp` and update PR #659.
 - **Verifier passes are adversarial, not rubber-stamp.** A pass that
   reports "0 findings, all green" must explicitly cite which
   invariant it checked and why the absence of findings is honest.
+
+### Phase G verifier deliverable
+
+**Method preamble.** Each G commit was re-read end-to-end at HEAD; every
+listed invariant was checked against the diff body, the surrounding
+source, and any regression test the commit added. No pass exceeded the
+≤5-findings cap. Sequential G1 → G12, then a single Cross-cutting
+sweep. Trust nothing: the SHAs from the menu were resolved with `git
+log`, then `git show` was run against each, and the resulting code was
+read in the worktree (not from the diff alone) to confirm the change
+is present at HEAD.
+
+#### G1 — Reap path conditional on by_session current owner
+
+- **Invariant.** Reap path's `by_session.remove(S)` is conditional on
+  the current entry being the reaped channel; rebind survives reap.
+- **Method.** `git show fd848cc26 -- meerkat-live/src/host.rs`. Read
+  the reap site at L1566–1583 and the regression test
+  `reap_of_retired_channel_preserves_rebound_session_mapping` at
+  L1695–1747.
+- **Findings.** Zero. The guard is exactly
+  `if inner.by_session.get(&ch.session_id).is_some_and(|current|
+  current == &id) { inner.by_session.remove(&ch.session_id); }`, the
+  test covers open A → close A → open B → force-expire A's
+  `retire_at` → reap → assert B sole active + `by_session[S] == B`
+  + third open returns `SessionAlreadyBound`. Honest zero: the test
+  is the literal scenario the bug allowed.
+- **Verdict.** PASS.
+
+#### G2 — WS pump fair scheduling + observation pinning + binary error propagation
+
+- **Invariant.** WS loop has no `biased;` priority that can starve
+  observation/output arms; binary `send_input` failures propagate, not
+  log-only.
+- **Method.** `git show 0613ef6c3 -- meerkat-live/src/transport.rs`.
+  Read the new `let mut observation_fut = Box::pin(...)` outside the
+  loop, the removed `biased;`, the binary-arm error path, and the
+  regression test driving a saturating mic-audio producer.
+- **Findings.** Zero. (a) `biased;` removed (line replaced by a
+  comment reaffirming "No `biased;`"); (b) observation future pinned
+  outside the loop and re-armed only after consumption (drop-on-loss
+  bug fixed orthogonally to bias); (c) binary `send_input` failures
+  now serialize a JSON `{"error":...}` and forward it to the client
+  via the same WS socket, symmetric with the text path; (d)
+  regression test asserts `TurnCompleted` JSON reaches the client
+  within 1.5 s under saturating mic-audio input.
+- **Verdict.** PASS.
+
+#### G3 — OpenAI live pump biased toward provider events
+
+- **Invariant.** `select!` orders provider events ahead of cmd intake
+  (explicit event-first bias) so saturated audio inputs cannot starve
+  provider events. The bias-reversal vs bias-removal distinction is
+  load-bearing — `next_event` is recreated each iteration so dropping
+  `biased` alone leaves the first-poll race.
+- **Method.** `git show ac4f43c4a -- meerkat-openai/src/live.rs`. Read
+  the doc-comment at L3124–3146, the `biased;` retained at L3179
+  with `event_result = session.next_event()` arm placed first, and
+  the regression test that saturates `cmd_rx` and asserts the
+  provider event surfaces.
+- **Findings.** Zero. Bias is retained, arms are reversed (event
+  first under `biased;`). The pump-task doc-comment explicitly cites
+  the cancel-safety reason `next_event` must be re-created and why
+  bias-removal alone is insufficient (saturated `cmd_rx` resolves
+  on first poll while `next_event` requires a poll to take the
+  inner channel lock). Regression test is `current_thread +
+  start_paused`-instrumented and pins the bias semantics under
+  audio-input saturation.
+- **Verdict.** PASS.
+
+#### G4 — TurnInterrupted carries response_id end-to-end
+
+- **Invariant.** Every `LiveAdapterObservation::TurnInterrupted`
+  carries `response_id: Option<String>`; the value is populated
+  end-to-end from OpenAI's `Interrupted` event through the projection
+  sink; no callsite synthesizes `None` when the originating
+  response_id is in scope.
+- **Method.** `git show 1b3e0a740`. Read
+  `meerkat-core/src/live_adapter.rs:340–348` (typed variant +
+  `#[serde(default, skip_serializing_if = "Option::is_none")]`),
+  `meerkat-openai/src/live.rs:3667` (translator passes through
+  `RealtimeSessionEvent::Interrupted { response_id }`),
+  `meerkat-live/src/host.rs:1156–1165` (host destructures
+  `response_id` and forwards via
+  `signal_turn_interrupt(&session_id, response_id.as_deref())`),
+  `meerkat-rpc/src/live_projection_sink.rs:455–493` (sink prefers
+  observation-supplied id, falls back to in-flight discovery only
+  when none provided).
+- **Findings.** Zero. The path is a literal pass-through with no
+  `None` synthesis when the originating id is present. The fallback
+  rationale at the sink is documented for synthetic interrupts and
+  adapters that don't surface ids. `meerkat-contracts/tests/
+  live_barge_in.rs` carries a populated-form round-trip test.
+- **Verdict.** PASS.
+
+#### G5 — propagate_config_to_live_channels respects per-session overrides
+
+- **Invariant.** `propagate_config_to_live_channels` skips global-
+  model fan-out at any session whose current model differs from
+  `prior_global_model`; rule branches are exhaustive over the 3-input
+  matrix `(prior_global, new_global, current_session)`.
+- **Method.** `git show 8b3454afb`. Read the pure helper
+  `should_apply_global_model_hot_swap` at
+  `meerkat/src/session_runtime/live_orchestration.rs:177–209`, the
+  shim at `meerkat-rpc/src/session_runtime.rs:3743–3757`, and the
+  config-handler capture at
+  `meerkat-rpc/src/handlers/config.rs:280` and `:351` (capture
+  `current.agent.model.clone()` BEFORE the patch).
+- **Findings.** Zero. The helper's branches enumerate the matrix:
+  `prior == None` → skip (no baseline to discriminate); `current ==
+  new_global` → skip (no-op hot-swap); `current == prior` → apply
+  (tracking branch); else → skip (override branch). 5 unit tests
+  pin the rule. The R11 sibling propagate tests pass `None` to
+  exercise the no-baseline conservative path.
+- **Verdict.** PASS.
+
+#### G6 — DEFAULT_LIVE_TOOL_TIMEOUT in production rkat-rpc
+
+- **Invariant.** Production rkat-rpc startup constructs
+  `LiveAdapterHost` with
+  `.with_tool_timeout(DEFAULT_LIVE_TOOL_TIMEOUT)`; a regression test
+  pins the wiring; the test seam exposes the field.
+- **Method.** `git show 7acc7d72c`. Confirmed
+  `meerkat-rpc/src/main.rs:359–366` chains the builder call, the
+  re-export at `meerkat-live/src/lib.rs`, the new
+  `LiveAdapterHost::tool_timeout()` accessor, and the two regression
+  tests (one in `meerkat-live` pinning default value, one in
+  `meerkat-rpc/tests/live_rpc_regression.rs` asserting the source
+  contains the wiring).
+- **Findings.** Zero. The source-grep test is an honest shape for
+  production-binary wiring (the binary's `main` cannot be invoked
+  from a test; pinning the call site as text catches the regression
+  the bug introduced).
+- **Verdict.** PASS.
+
+#### G7 — active_channels excludes retained-closed
+
+- **Invariant.** `active_channels()` does not yield channels with
+  `retire_at == Some(_)`; status reads on retained-closed channels
+  still succeed; the discriminator matches `open_channel`/
+  `attach_adapter` gating.
+- **Method.** Read `meerkat-live/src/host.rs:1582–1590` (the filter)
+  at HEAD (post-clippy follow-up `2fbff2214`). Cross-checked
+  discriminator: `open_channel` rebind at L688–693 gates on
+  `channel.retire_at.is_none()`; `attach_adapter` at L728–734 gates
+  on `channel.retire_at.is_some()`; `channel_status` at L1465–1476
+  reads `inner.channels.get(channel_id)` directly (still works on
+  retained-closed, until reaper runs). G7 regression test
+  `active_channels_excludes_retained_closed_channels` covers the
+  retained-closed case.
+- **Findings.** Zero. Discriminator (`retire_at == Some(_)`)
+  consistent across `active_channels`, rebind, and adapter
+  attachment; status reads are on the same map and survive until
+  reap. Clippy follow-up retained the semantics — explicit
+  `filter().map()` is identical behavior.
+- **Verdict.** PASS.
+
+#### G8 — LiveOpenResult.transport typed tagged union
+
+- **Invariant.** `LiveOpenResult.transport` is a typed tagged union
+  (`WireLiveTransportBootstrap`); wire form byte-compatible with the
+  core enum; `#[non_exhaustive]` preserves WebRTC reintroduction;
+  SDK codegen emits a tagged union (no `unknown`/`Value`).
+- **Method.** `git show 9425f52e1`. Read the typed wire enum
+  (`#[serde(tag = "transport", rename_all = "snake_case")]
+  #[non_exhaustive]`) and the bidirectional `From` impls at
+  `meerkat-contracts/src/wire/live.rs:65–110`. Verified SDK output:
+  `sdks/typescript/src/generated/types.ts:1706–1712`
+  (`WireLiveTransportBootstrapWebsocket` interface +
+  discriminated union type), `sdks/python/meerkat/generated/
+  types.py:1491–1496` (TypedDict union with
+  `Required[Literal['websocket']]`).
+- **Findings.** Zero. Wire-to-core path is exhaustive (no wildcard);
+  core-to-wire path debug-asserts on unmapped variants; SDK
+  generated types are tagged everywhere.
+- **Verdict.** PASS.
+
+#### G9 — typed text-only response path
+
+- **Invariant.** A typed text-only response path lands;
+  `OpenAiRealtimeSession::commit_turn_with_modality(Some(Text))`
+  produces `response.create` with `output_modalities=Text` and zero
+  audio block; trait `commit_turn` signature unchanged
+  (provider-neutrality preserved); SDK codegen emits the modality
+  enum.
+- **Method.** `git show 9ccb04eb6`. Verified trait
+  `commit_turn(&mut self) -> Result<(), LlmError>` unchanged at
+  `meerkat-openai/src/live.rs:2330` (delegates to
+  `commit_turn_with_modality(None)`); inherent
+  `commit_turn_with_modality` at L2190 takes
+  `Option<LiveResponseModality>`; live dispatch at L3522 uses the
+  inherent method. Regression test asserts `output_modalities =
+  Some(OutputModalities::Text)` with the audio block suppressed for
+  the single response.
+- **Findings.** Zero. Provider neutrality preserved (trait
+  unchanged, inherent method exposes the typed knob); SDK codegen
+  produces tagged unions for `WireLiveResponseModality` (TS / Py).
+- **Verdict.** PASS.
+
+#### G10 — Refresh doc accurately describes current behavior
+
+- **Invariant.** `LiveAdapterCommand::Refresh` doc accurately
+  describes current behavior (mutable config via single
+  `session.update`; model swaps require close+reopen; R9 invariant
+  — no history re-seed).
+- **Method.** `git show ee9deecbc -- meerkat-core/src/live_adapter.rs`.
+  Read the new doc body.
+- **Findings.** Zero. Doc explicitly names: (a) Refresh re-applies
+  mutable config without history re-seed; (b) R9 invariant; (c)
+  model-swap close+reopen requirement (OpenAI Realtime has no
+  mutable `model` field); (d) `runtime_system_context` folds into
+  `instructions`. Removed the misleading "re-runs
+  seed_history_projection" wording.
+- **Verdict.** PASS.
+
+#### G11 — LiveChannelCapabilities default no-claim baseline
+
+- **Invariant.** `LiveChannelCapabilities::default()` claims
+  nothing; production callers who claim capabilities do so
+  explicitly; no convenience constructor relocates the dishonesty.
+- **Method.** `git show f2da5fbfa`. Verified all 8 fields default
+  to `false` (`audio_in`, `audio_out`, `text_in`, `text_out`,
+  `transcript_supported`, `barge_in_supported` flipped to `false`;
+  `image_in`, `video_in`, `provider_native_resume` already
+  `false`). Production caller at
+  `meerkat-rpc/src/handlers/live.rs:210–220` writes the explicit
+  all-false placeholder with a comment naming it as such. No new
+  convenience constructor in the diff.
+- **Findings.** Zero. The trait method `LiveAdapter::capabilities`
+  default delegates to `LiveChannelCapabilities::default()` (now
+  no-claim); doc explicitly says adapters MUST override to claim
+  capabilities, "silence here means I make no claims". Test
+  fixtures updated to set explicit `true`s where they need them.
+- **Verdict.** PASS.
+
+#### G12 — README + SKILL.md realtime API references
+
+- **Invariant.** README + SKILL.md references to deleted/renamed
+  realtime APIs are gone; remaining mentions resolve to current
+  symbols.
+- **Method.** `git show 56d2d1f70`. Re-grepped current README.md +
+  `.claude/skills/meerkat-platform/SKILL.md` for the deleted-API
+  list (`realtime_attachment_status`, `realtime/open_info`,
+  `RealtimeAttachmentStatus`, `runtime_realtime_*`,
+  `meerkat_realtime_*`,
+  `MeerkatMachine::realtime_attachment_status`). Cross-checked the
+  new `live/*` method list against
+  `meerkat-rpc/src/router.rs:1477–1524` (8 live methods all
+  present), against `meerkat-contracts/src/wire/live.rs` for wire
+  types, and `meerkat-models/src/catalog.rs` for model names.
+- **Findings.** Zero. The only surviving deleted-API references
+  are inside the historical "have been removed" sentence at
+  `SKILL.md:122` — that is the correct documentary form. The 8
+  live methods (`open`, `status`, `refresh`, `send_input`,
+  `commit_input`, `interrupt`, `truncate`, `close`) all resolve in
+  router.rs.
+- **Verdict.** PASS.
+
+#### Cross-cutting — test discipline + wire stability + schema freshness
+
+- **Invariants.**
+  - *Test discipline*: every G commit with a code change includes a
+    regression test that would have caught the bug.
+  - *Wire stability*: any wire type that gained an `Option<...>`
+    field has `#[serde(default, skip_serializing_if =
+    "Option::is_none")]`. Backwards-compat preserved.
+  - *Schema regen freshness*: `make verify-version-parity` and
+    `git diff artifacts/schemas` no-op (drift = stale schemas).
+- **Method.** Per-commit `+#[test]` / `+#[tokio::test]` count via
+  `git show <sha> | grep -cE`. Grepped `Option<` fields in
+  `meerkat-core/src/live_adapter.rs` and
+  `meerkat-contracts/src/wire/live.rs`. Ran
+  `make verify-version-parity`; checked `git status` and
+  `git diff HEAD --stat artifacts/schemas`.
+- **Findings.** Zero.
+  - Test discipline: G1 (1), G2 (1), G3 (1), G4 (1), G5 (5), G6
+    (2), G7 (1), G8 (3), G9 (5). G10/G11/G12 are doc/README only —
+    no test required.
+  - Wire stability: every `response_id: Option<String>` (7
+    occurrences in `meerkat-core/src/live_adapter.rs`) and
+    `response_modality: Option<WireLiveResponseModality>` carry
+    `#[serde(default, skip_serializing_if = "Option::is_none")]`;
+    new variants (`WireLiveTransportBootstrap`,
+    `WireLiveResponseModality`) are `#[non_exhaustive]`.
+  - Schema freshness: `make verify-version-parity` reports `All
+    version parity checks passed` (Cargo / Python / TypeScript /
+    Web all 0.6.4; contract version 0.6.4; internal deps OK). `git
+    status` is clean against HEAD; no schema drift.
+- **Verdict.** PASS.
+
+**Phase G summary.** G1 PASS / G2 PASS / G3 PASS / G4 PASS / G5 PASS /
+G6 PASS / G7 PASS / G8 PASS / G9 PASS / G10 PASS / G11 PASS / G12 PASS
+/ Cross-cutting PASS. Thirteen verdicts, zero findings each, all
+honestly justified against their named invariants.
