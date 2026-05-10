@@ -10653,16 +10653,15 @@ where
     let session_service = runtime.session_service();
     let runtime_adapter = runtime.runtime_adapter();
     let default_user_root = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    let identity_registry =
-        meerkat_rpc::session_runtime::SessionRuntime::build_skill_identity_registry(
-            &config,
-            scope.context_root.as_deref(),
-            scope
-                .user_config_root
-                .as_deref()
-                .or(default_user_root.as_deref()),
-        )
-        .map_err(|err| anyhow::anyhow!("failed to build skill identity registry: {err}"))?;
+    let identity_registry = meerkat::session_runtime::runtime_state::build_skill_identity_registry(
+        &config,
+        scope.context_root.as_deref(),
+        scope
+            .user_config_root
+            .as_deref()
+            .or(default_user_root.as_deref()),
+    )
+    .map_err(|err| anyhow::anyhow!("failed to build skill identity registry: {err}"))?;
     runtime.set_skill_identity_roots(
         scope.context_root.clone(),
         scope.user_config_root.clone().or(default_user_root),
