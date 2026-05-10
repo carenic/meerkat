@@ -439,6 +439,15 @@ mod builder {
             self
         }
 
+        /// Pre-populate the skill-identity context root.
+        #[must_use]
+        pub fn with_skill_identity_context_root(self, path: PathBuf) -> Self {
+            if let Ok(mut slot) = self.skill_identity_context_root.write() {
+                *slot = Some(path);
+            }
+            self
+        }
+
         /// Reuse an existing skill-identity user-root slot.
         #[must_use]
         pub fn with_skill_identity_user_root_slot(
@@ -446,6 +455,15 @@ mod builder {
             slot: Arc<StdRwLock<Option<PathBuf>>>,
         ) -> Self {
             self.skill_identity_user_root = slot;
+            self
+        }
+
+        /// Pre-populate the skill-identity user root.
+        #[must_use]
+        pub fn with_skill_identity_user_root(self, path: PathBuf) -> Self {
+            if let Ok(mut slot) = self.skill_identity_user_root.write() {
+                *slot = Some(path);
+            }
             self
         }
 
