@@ -598,6 +598,16 @@ impl LiveAdapterHost {
         self
     }
 
+    /// Read the configured per-tool-call dispatch timeout.
+    ///
+    /// `None` indicates the host runs with unbounded await behavior. Surfaces
+    /// (notably `rkat-rpc`) MUST install [`DEFAULT_LIVE_TOOL_TIMEOUT`] at
+    /// startup; this accessor is the test seam that pins that contract.
+    #[must_use]
+    pub fn tool_timeout(&self) -> Option<Duration> {
+        self.tool_timeout
+    }
+
     /// Builder: install the canonical projection sink.
     ///
     /// Without a sink, transcript / interrupt / terminal routing is a no-op
@@ -1616,6 +1626,27 @@ mod tests {
 
     fn test_session_id() -> SessionId {
         SessionId::new()
+    }
+
+    // -- Tool timeout accessor (G6 regression) --
+
+    /// G6 (P2): production rkat-rpc startup MUST install
+    /// [`DEFAULT_LIVE_TOOL_TIMEOUT`] on the live host. The binary's
+    /// build pattern is not directly testable, so the host exposes
+    /// [`LiveAdapterHost::tool_timeout`] as a stable accessor; this test
+    /// pins both the default-`None` behavior and the builder wiring so
+    /// the production callsite (meerkat-rpc/src/main.rs) can be
+    /// asserted to produce a host with the timeout populated.
+    #[test]
+    fn tool_timeout_defaults_to_none_and_builder_sets_it() {
+        let host = LiveAdapterHost::new();
+        assert_eq!(host.tool_timeout(), None);
+
+        let host = LiveAdapterHost::new().with_tool_timeout(DEFAULT_LIVE_TOOL_TIMEOUT);
+        assert_eq!(host.tool_timeout(), Some(DEFAULT_LIVE_TOOL_TIMEOUT));
+        // Pin the canonical default value so accidental constant drift
+        // is caught here rather than at integration time.
+        assert_eq!(DEFAULT_LIVE_TOOL_TIMEOUT, Duration::from_secs(30));
     }
 
     // -- Channel lifecycle --
