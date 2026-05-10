@@ -143,27 +143,27 @@ pub enum WireConversionError {
     /// Wire transport is the explicit-Unknown sentinel; no inverse mapping
     /// exists. Carries the original debug payload for server logs.
     #[error("unknown wire transport variant: {debug}")]
-    UnknownTransport { debug: String },
+    Transport { debug: String },
     /// Wire observation is the explicit-Unknown sentinel; no inverse
     /// mapping exists. Carries the original debug payload for server logs.
     #[error("unknown wire observation variant: {debug}")]
-    UnknownObservation { debug: String },
+    Observation { debug: String },
     /// Wire continuity mode is the explicit-Unknown sentinel; no inverse
     /// mapping exists. Carries the original debug payload for server logs.
     #[error("unknown wire continuity-mode variant: {debug}")]
-    UnknownContinuity { debug: String },
+    Continuity { debug: String },
     /// Wire response modality is the explicit-Unknown sentinel; no inverse
     /// mapping exists. Carries the original debug payload for server logs.
     #[error("unknown wire response-modality variant: {debug}")]
-    UnknownResponseModality { debug: String },
+    ResponseModality { debug: String },
     /// Wire adapter status is the explicit-Unknown sentinel; no inverse
     /// mapping exists. Carries the original debug payload for server logs.
     #[error("unknown wire adapter-status variant: {debug}")]
-    UnknownStatus { debug: String },
+    Status { debug: String },
     /// Wire adapter error-code is the explicit-Unknown sentinel; no inverse
     /// mapping exists. Carries the original debug payload for server logs.
     #[error("unknown wire adapter-error-code variant: {debug}")]
-    UnknownErrorCode { debug: String },
+    ErrorCode { debug: String },
 }
 
 impl TryFrom<WireLiveTransportBootstrap> for LiveTransportBootstrap {
@@ -180,7 +180,7 @@ impl TryFrom<WireLiveTransportBootstrap> for LiveTransportBootstrap {
                 Ok(Self::Websocket { url, token })
             }
             WireLiveTransportBootstrap::Unknown { debug } => {
-                Err(WireConversionError::UnknownTransport { debug })
+                Err(WireConversionError::Transport { debug })
             }
         }
     }
@@ -379,7 +379,7 @@ impl TryFrom<WireLiveContinuityMode> for LiveContinuityMode {
                 provider_session_id,
             }),
             WireLiveContinuityMode::Unknown { debug } => {
-                Err(WireConversionError::UnknownContinuity { debug })
+                Err(WireConversionError::Continuity { debug })
             }
         }
     }
@@ -475,7 +475,7 @@ impl TryFrom<WireLiveResponseModality> for LiveResponseModality {
             WireLiveResponseModality::Audio => Ok(Self::Audio),
             WireLiveResponseModality::Text => Ok(Self::Text),
             WireLiveResponseModality::Unknown { debug } => {
-                Err(WireConversionError::UnknownResponseModality { debug })
+                Err(WireConversionError::ResponseModality { debug })
             }
         }
     }
@@ -747,7 +747,7 @@ impl From<LiveAdapterStatus> for WireLiveAdapterStatus {
 // emitted: like `WireLiveAdapterObservation`, the wire-side adapter status
 // is a downstream projection — never authority. The `Unknown` arm exists
 // so future core variants surface explicitly on the forward path; the
-// `WireConversionError::UnknownStatus` variant is reserved for a future
+// `WireConversionError::Status` variant is reserved for a future
 // caller that needs to construct a typed inverse and will materialize the
 // reverse impl alongside the dependent `From<WireLiveDegradationReason>`
 // addition. No production code calls the inverse today.)
@@ -994,7 +994,7 @@ impl TryFrom<WireLiveAdapterErrorCode> for LiveAdapterErrorCode {
             WireLiveAdapterErrorCode::InternalError => Ok(Self::InternalError),
             WireLiveAdapterErrorCode::Other { raw } => Ok(Self::Other { raw }),
             WireLiveAdapterErrorCode::Unknown { debug } => {
-                Err(WireConversionError::UnknownErrorCode { debug })
+                Err(WireConversionError::ErrorCode { debug })
             }
         }
     }
@@ -1954,14 +1954,14 @@ mod tests {
     fn wire_live_transport_bootstrap_unknown_does_not_become_websocket() {
         // R3-6 (P2): the wire `Unknown` variant must NOT silently convert
         // back to a bogus `Websocket { url: "", token: "" }`. The inverse
-        // path returns `WireConversionError::UnknownTransport` so callers
+        // path returns `WireConversionError::Transport` so callers
         // explicitly handle the unsupported transport.
         let unknown = WireLiveTransportBootstrap::Unknown {
             debug: "Webrtc { offer_sdp: \"v=0...\", terminator_url: \"https://example/whip\" }"
                 .to_string(),
         };
         match LiveTransportBootstrap::try_from(unknown.clone()) {
-            Err(WireConversionError::UnknownTransport { debug }) => {
+            Err(WireConversionError::Transport { debug }) => {
                 assert!(debug.contains("Webrtc"), "debug payload preserved");
             }
             other => panic!("unknown wire variant must not coerce to a core variant: {other:?}"),
@@ -2101,14 +2101,14 @@ mod tests {
     fn unknown_continuity_does_not_become_fresh() {
         // R5-3 (P3): the wire `Unknown` variant must NOT convert back to
         // `Fresh` (the previous fail-open default). The inverse path
-        // returns `WireConversionError::UnknownContinuity` so callers
+        // returns `WireConversionError::Continuity` so callers
         // route on the typed error rather than silently fabricating a
         // fresh-channel placeholder.
         let unknown = WireLiveContinuityMode::Unknown {
             debug: "FutureContinuity { … }".into(),
         };
         match LiveContinuityMode::try_from(unknown.clone()) {
-            Err(WireConversionError::UnknownContinuity { debug }) => {
+            Err(WireConversionError::Continuity { debug }) => {
                 assert!(
                     debug.contains("FutureContinuity"),
                     "debug payload preserved"
@@ -2139,7 +2139,7 @@ mod tests {
             debug: "Structured { … }".into(),
         };
         match LiveResponseModality::try_from(unknown.clone()) {
-            Err(WireConversionError::UnknownResponseModality { debug }) => {
+            Err(WireConversionError::ResponseModality { debug }) => {
                 assert!(debug.contains("Structured"), "debug payload preserved");
             }
             other => panic!("unknown wire variant must not coerce to a core variant: {other:?}"),
@@ -2189,7 +2189,7 @@ mod tests {
             debug: "QuotaExhausted { … }".into(),
         };
         match LiveAdapterErrorCode::try_from(unknown.clone()) {
-            Err(WireConversionError::UnknownErrorCode { debug }) => {
+            Err(WireConversionError::ErrorCode { debug }) => {
                 assert!(debug.contains("QuotaExhausted"), "debug payload preserved");
             }
             other => panic!("unknown wire variant must not coerce to a core variant: {other:?}"),
