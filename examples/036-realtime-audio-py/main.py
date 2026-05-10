@@ -27,7 +27,7 @@ from uuid import uuid4
 from meerkat import MeerkatClient, LiveChannel
 
 
-DEFAULT_LIVE_MODEL = "gpt-realtime-1.5"
+DEFAULT_LIVE_MODEL = "gpt-realtime-2"
 DEFAULT_HELPER_MODEL = "gpt-5.5"
 HOST_IDENTITY = "voice-host"
 
