@@ -6308,8 +6308,7 @@ mod tests {
             .expect("speech-started should still surface a turn boundary");
         assert!(
             matches!(after_speech, Some(RealtimeSessionEvent::TurnStarted)),
-            "text-only response must survive user-speech barge-in (got {:?})",
-            after_speech
+            "text-only response must survive user-speech barge-in (got {after_speech:?})"
         );
 
         // The text response keeps emitting deltas through and after the
