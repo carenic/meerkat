@@ -1074,7 +1074,7 @@ impl MethodRouter {
                 history.session_ref = self
                     .runtime
                     .realm_id()
-                    .map(|realm| meerkat_contracts::format_session_ref(realm, session_id));
+                    .map(|realm| meerkat_contracts::format_session_ref(&realm, session_id));
                 Some(RpcResponse::success(id, history))
             }
             Err(meerkat_core::service::SessionError::NotFound { .. }) => None,
@@ -1572,7 +1572,7 @@ impl MethodRouter {
                     info.session_ref = self
                         .runtime
                         .realm_id()
-                        .map(|realm| meerkat_contracts::format_session_ref(realm, &session_id));
+                        .map(|realm| meerkat_contracts::format_session_ref(&realm, &session_id));
                     RpcResponse::success(id, info)
                 } else {
                     RpcResponse::error(
@@ -1587,10 +1587,9 @@ impl MethodRouter {
                 match self.mob_state.session_service().read(&session_id).await {
                     Ok(view) => {
                         let mut info: meerkat_contracts::WireSessionInfo = view.state.into();
-                        info.session_ref = self
-                            .runtime
-                            .realm_id()
-                            .map(|realm| meerkat_contracts::format_session_ref(realm, &session_id));
+                        info.session_ref = self.runtime.realm_id().map(|realm| {
+                            meerkat_contracts::format_session_ref(&realm, &session_id)
+                        });
                         RpcResponse::success(id, info)
                     }
                     Err(err) => RpcResponse::error(id, error::SESSION_NOT_FOUND, err.to_string()),
@@ -1639,7 +1638,7 @@ impl MethodRouter {
                     history.session_ref = self
                         .runtime
                         .realm_id()
-                        .map(|realm| meerkat_contracts::format_session_ref(realm, &session_id));
+                        .map(|realm| meerkat_contracts::format_session_ref(&realm, &session_id));
                     RpcResponse::success(id, history)
                 } else {
                     RpcResponse::error(
@@ -1711,7 +1710,7 @@ impl MethodRouter {
             {
                 Ok(mut result) => {
                     result.session_ref = self.runtime.realm_id().map(|realm| {
-                        meerkat_contracts::format_session_ref(realm, &result.session_id)
+                        meerkat_contracts::format_session_ref(&realm, &result.session_id)
                     });
                     RpcResponse::success(id, result)
                 }
@@ -1766,7 +1765,7 @@ impl MethodRouter {
             {
                 Ok(mut result) => {
                     result.session_ref = self.runtime.realm_id().map(|realm| {
-                        meerkat_contracts::format_session_ref(realm, &result.session_id)
+                        meerkat_contracts::format_session_ref(&realm, &result.session_id)
                     });
                     RpcResponse::success(id, result)
                 }

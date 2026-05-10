@@ -1237,9 +1237,14 @@ pub struct SessionRuntime {
     default_llm_client: Arc<StdRwLock<Option<Arc<dyn LlmClient>>>>,
     /// Default wrapper applied after all session LLM clients reach the agent boundary.
     agent_llm_client_decorator: Arc<StdRwLock<Option<meerkat_core::AgentLlmClientDecorator>>>,
-    realm_id: Option<meerkat_core::connection::RealmId>,
-    instance_id: Option<String>,
-    backend: Option<String>,
+    /// Phase 4 R1: slot-shared with the inner [`MeerkatSessionRuntime`].
+    /// Reads / writes go through the slot rather than a write-mirrored
+    /// local copy.
+    realm_id: Arc<StdRwLock<Option<meerkat_core::connection::RealmId>>>,
+    /// Phase 4 R1: slot-shared with the inner [`MeerkatSessionRuntime`].
+    instance_id: Arc<StdRwLock<Option<String>>>,
+    /// Phase 4 R1: slot-shared with the inner [`MeerkatSessionRuntime`].
+    backend: Arc<StdRwLock<Option<String>>>,
     config_runtime: Arc<StdRwLock<Option<Arc<meerkat_core::ConfigRuntime>>>>,
     runtime_adapter: Arc<MeerkatMachine>,
     /// Notification sink for event forwarding to the RPC transport.
@@ -1344,6 +1349,20 @@ fn approval_service_from_persistence(
             meerkat_core::ApprovalService::new()
         }
     }
+}
+
+/// Snapshot of the slot-shared realm/instance/backend triple.
+///
+/// Phase 4 R1: the realm context is held inside the inner
+/// `MeerkatSessionRuntime` behind `Arc<RwLock<Option<...>>>` slots so
+/// every surface observes the same value. `recovery_context()` and the
+/// `LiveOrchestrator<'a>` borrow shape both want
+/// `Option<&'a RealmId>` / `Option<&'a str>`, so callers stash the
+/// owned read into a local binding that lives for the borrow.
+struct RealmContextSnapshot {
+    realm_id: Option<meerkat_core::connection::RealmId>,
+    instance_id: Option<String>,
+    backend: Option<String>,
 }
 
 impl SessionRuntime {
@@ -1499,7 +1518,8 @@ impl SessionRuntime {
     }
 
     async fn live_session_is_stale(&self, session_id: &SessionId) -> Result<bool, RpcError> {
-        let recovery_ctx = self.recovery_context();
+        let snapshot = self.realm_context_snapshot();
+        let recovery_ctx = self.recovery_context(&snapshot);
         self.runtime_state_ops()
             .live_session_is_stale(session_id, &recovery_ctx)
             .await
@@ -1611,6 +1631,9 @@ impl SessionRuntime {
         let skill_identity_context_root = Arc::new(StdRwLock::new(None));
         let skill_identity_user_root = Arc::new(StdRwLock::new(None));
         let live_adapter_host = Arc::new(StdRwLock::new(None));
+        let realm_id = Arc::new(StdRwLock::new(None));
+        let instance_id = Arc::new(StdRwLock::new(None));
+        let backend = Arc::new(StdRwLock::new(None));
         let inner = Arc::new(
             meerkat::session_runtime::SessionRuntimeBuilder::new(
                 Arc::clone(&service),
@@ -1621,6 +1644,9 @@ impl SessionRuntime {
             .with_live_adapter_host_slot(Arc::clone(&live_adapter_host))
             .with_config_runtime_slot(Arc::clone(&config_runtime))
             .with_default_llm_client_slot(Arc::clone(&default_llm_client))
+            .with_realm_id_slot(Arc::clone(&realm_id))
+            .with_instance_id_slot(Arc::clone(&instance_id))
+            .with_backend_slot(Arc::clone(&backend))
             .with_skill_identity_registry_slot(Arc::clone(&skill_identity_registry))
             .with_skill_identity_context_root_slot(Arc::clone(&skill_identity_context_root))
             .with_skill_identity_user_root_slot(Arc::clone(&skill_identity_user_root))
@@ -1650,9 +1676,9 @@ impl SessionRuntime {
             max_sessions,
             default_llm_client,
             agent_llm_client_decorator: Arc::clone(&builder_agent_llm_client_decorator_slot),
-            realm_id: None,
-            instance_id: None,
-            backend: None,
+            realm_id,
+            instance_id,
+            backend,
             config_runtime,
             runtime_adapter,
             notification_sink: StdRwLock::new(notification_sink),
@@ -1733,6 +1759,9 @@ impl SessionRuntime {
         let skill_identity_context_root = Arc::new(StdRwLock::new(None));
         let skill_identity_user_root = Arc::new(StdRwLock::new(None));
         let live_adapter_host = Arc::new(StdRwLock::new(None));
+        let realm_id = Arc::new(StdRwLock::new(None));
+        let instance_id = Arc::new(StdRwLock::new(None));
+        let backend = Arc::new(StdRwLock::new(None));
         let inner = Arc::new(
             meerkat::session_runtime::SessionRuntimeBuilder::new(
                 Arc::clone(&service),
@@ -1743,6 +1772,9 @@ impl SessionRuntime {
             .with_live_adapter_host_slot(Arc::clone(&live_adapter_host))
             .with_config_runtime_slot(Arc::clone(&config_runtime))
             .with_default_llm_client_slot(Arc::clone(&default_llm_client))
+            .with_realm_id_slot(Arc::clone(&realm_id))
+            .with_instance_id_slot(Arc::clone(&instance_id))
+            .with_backend_slot(Arc::clone(&backend))
             .with_skill_identity_registry_slot(Arc::clone(&skill_identity_registry))
             .with_skill_identity_context_root_slot(Arc::clone(&skill_identity_context_root))
             .with_skill_identity_user_root_slot(Arc::clone(&skill_identity_user_root))
@@ -1772,9 +1804,9 @@ impl SessionRuntime {
             max_sessions,
             default_llm_client,
             agent_llm_client_decorator: Arc::clone(&builder_agent_llm_client_decorator_slot),
-            realm_id: None,
-            instance_id: None,
-            backend: None,
+            realm_id,
+            instance_id,
+            backend,
             config_runtime,
             runtime_adapter,
             notification_sink: StdRwLock::new(notification_sink),
@@ -1800,15 +1832,16 @@ impl SessionRuntime {
     }
 
     /// Attach realm context defaults used for session metadata.
+    ///
+    /// Phase 4 R1: writes through the slot-shared inner runtime; both
+    /// the RPC SessionRuntime and `MeerkatSessionRuntime` observe the
+    /// same `Arc<RwLock<...>>` so a single write is enough.
     pub fn set_realm_context(
-        &mut self,
+        &self,
         realm_id: Option<meerkat_core::connection::RealmId>,
         instance_id: Option<String>,
         backend: Option<String>,
     ) {
-        self.realm_id = realm_id.clone();
-        self.instance_id = instance_id.clone();
-        self.backend = backend.clone();
         self.inner.set_realm_context(realm_id, instance_id, backend);
     }
 
@@ -1859,8 +1892,23 @@ impl SessionRuntime {
     }
 
     /// Active realm id for this runtime, if configured.
-    pub fn realm_id(&self) -> Option<&meerkat_core::connection::RealmId> {
-        self.realm_id.as_ref()
+    ///
+    /// Phase 4 R1: routed through the slot-shared inner runtime so the
+    /// RPC accessor and `MeerkatSessionRuntime::realm_id()` are
+    /// guaranteed to observe the same value. Returns the owned variant
+    /// because the slot read clones internally.
+    pub fn realm_id(&self) -> Option<meerkat_core::connection::RealmId> {
+        self.inner.realm_id()
+    }
+
+    /// Active instance id for this runtime, if configured.
+    pub fn instance_id(&self) -> Option<String> {
+        self.inner.instance_id()
+    }
+
+    /// Active backend label for this runtime, if configured.
+    pub fn backend(&self) -> Option<String> {
+        self.inner.backend()
     }
 
     /// Attach config runtime for generation stamping.
@@ -2730,9 +2778,9 @@ impl SessionRuntime {
         let mut build = build_config.to_session_build_options();
         build.realm_id = build
             .realm_id
-            .or_else(|| self.realm_id.as_ref().map(ToString::to_string));
-        build.instance_id = build.instance_id.or_else(|| self.instance_id.clone());
-        build.backend = build.backend.or_else(|| self.backend.clone());
+            .or_else(|| self.inner.realm_id().map(|r| r.to_string()));
+        build.instance_id = build.instance_id.or_else(|| self.inner.instance_id());
+        build.backend = build.backend.or_else(|| self.inner.backend());
         build.config_generation = build.config_generation.or(runtime_generation);
 
         let (prompt, deferred_prompt_policy) = match deferred_prompt {
@@ -3043,11 +3091,30 @@ impl SessionRuntime {
         }
     }
 
+    /// Snapshot of the slot-shared realm/instance/backend triple. The
+    /// `RecoveryContext` borrows from this scratch struct so the slot
+    /// reads happen once at the call site without the borrow checker
+    /// rejecting temporary owned values.
+    fn realm_context_snapshot(&self) -> RealmContextSnapshot {
+        RealmContextSnapshot {
+            realm_id: self.inner.realm_id(),
+            instance_id: self.inner.instance_id(),
+            backend: self.inner.backend(),
+        }
+    }
+
     /// Build a [`RecoveryContext`] borrowing this runtime's resolved
     /// state. Used by the `recovered_create_request*` shims and any
     /// surface that wants direct access to the surface-agnostic
     /// recovery flow without an RPC translation.
-    fn recovery_context(&self) -> meerkat::session_runtime::recovery::RecoveryContext<'_> {
+    ///
+    /// Takes a `&RealmContextSnapshot` because the surface-agnostic
+    /// `RecoveryContext` borrows the realm triple; callers stash the
+    /// snapshot in a local binding that outlives the context.
+    fn recovery_context<'a>(
+        &'a self,
+        snapshot: &'a RealmContextSnapshot,
+    ) -> meerkat::session_runtime::recovery::RecoveryContext<'a> {
         let agent_llm_client_decorator = {
             self.agent_llm_client_decorator
                 .read()
@@ -3057,9 +3124,9 @@ impl SessionRuntime {
         meerkat::session_runtime::recovery::RecoveryContext {
             service: &self.service,
             runtime_adapter: &self.runtime_adapter,
-            realm_id: self.realm_id.as_ref(),
-            instance_id: self.instance_id.as_deref(),
-            backend: self.backend.as_deref(),
+            realm_id: snapshot.realm_id.as_ref(),
+            instance_id: snapshot.instance_id.as_deref(),
+            backend: snapshot.backend.as_deref(),
             default_llm_client: self.default_llm_client(),
             agent_llm_client_decorator,
             external_tools: self.recovery_external_tools(),
@@ -3073,7 +3140,8 @@ impl SessionRuntime {
         session: Session,
         overrides: SurfaceSessionRecoveryOverrides,
     ) -> Result<RecoveredCreateRequest, RpcError> {
-        self.recovery_context()
+        let snapshot = self.realm_context_snapshot();
+        self.recovery_context(&snapshot)
             .recovered_create_request(session_id, session, overrides)
             .await
             .map_err(Self::recovery_error_to_rpc)
@@ -3086,7 +3154,8 @@ impl SessionRuntime {
         overrides: SurfaceSessionRecoveryOverrides,
         binding_mode: RecoveryRuntimeBindingMode,
     ) -> Result<RecoveredCreateRequest, RpcError> {
-        self.recovery_context()
+        let snapshot = self.realm_context_snapshot();
+        self.recovery_context(&snapshot)
             .recovered_create_request_with_runtime_binding_mode(
                 session_id,
                 session,
@@ -5254,9 +5323,9 @@ impl SessionRuntime {
             let mut build = build_config.to_session_build_options();
             build.realm_id = build
                 .realm_id
-                .or_else(|| self.realm_id.as_ref().map(ToString::to_string));
-            build.instance_id = build.instance_id.or_else(|| self.instance_id.clone());
-            build.backend = build.backend.or_else(|| self.backend.clone());
+                .or_else(|| self.inner.realm_id().map(|r| r.to_string()));
+            build.instance_id = build.instance_id.or_else(|| self.inner.instance_id());
+            build.backend = build.backend.or_else(|| self.inner.backend());
             build.config_generation = build.config_generation.or(runtime_generation);
             let event_tx = self
                 .pending_session_event_fanout_tx(session_id, event_tx)
@@ -5650,9 +5719,9 @@ impl SessionRuntime {
             let mut build = build_config.to_session_build_options();
             build.realm_id = build
                 .realm_id
-                .or_else(|| self.realm_id.as_ref().map(ToString::to_string));
-            build.instance_id = build.instance_id.or_else(|| self.instance_id.clone());
-            build.backend = build.backend.or_else(|| self.backend.clone());
+                .or_else(|| self.inner.realm_id().map(|r| r.to_string()));
+            build.instance_id = build.instance_id.or_else(|| self.inner.instance_id());
+            build.backend = build.backend.or_else(|| self.inner.backend());
             build.config_generation = build.config_generation.or(runtime_generation);
             let initial_turn_provider_hint = build_config
                 .provider
@@ -6455,7 +6524,8 @@ impl SessionRuntime {
         &self,
         session_id: &SessionId,
     ) -> Result<Option<Session>, RpcError> {
-        self.recovery_context()
+        let snapshot = self.realm_context_snapshot();
+        self.recovery_context(&snapshot)
             .load_persisted_session(session_id)
             .await
             .map_err(session_error_to_rpc)
