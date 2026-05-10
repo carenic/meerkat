@@ -370,16 +370,13 @@ jobs:
             rmat-audit
             machine-authority
 
-  wasm-feature-submit:
-    name: WASM and feature submitter
-    needs: [control-plane-up, executors-up]
+  wasm-feature-changes:
+    name: WASM, SDK, and feature change detection
+    needs: [control-plane-up]
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    env:
-      BUILDBUDDY_GRPC_URL: ${{ needs.control-plane-up.outputs.grpc_url }}
-      BUILDBUDDY_HTTP_URL: ${{ needs.control-plane-up.outputs.http_url }}
-      BUILDBUDDY_ENDPOINT: ${{ needs.control-plane-up.outputs.grpc_url }}
-      CI_STARTED_AT_EPOCH: ${{ needs.control-plane-up.outputs.started_at_epoch }}
+    outputs:
+      changed: ${{ steps.wasm-feature-changes.outputs.changed }}
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -420,16 +417,80 @@ jobs:
           fi
           echo "changed=${changed}" >> "${GITHUB_OUTPUT}"
 
-      - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
-        if: ${{ steps.wasm-feature-changes.outputs.changed == 'true' }}
+  wasm-sdk-submit:
+    name: SDK suites submitter
+    needs: [control-plane-up, executors-up, wasm-feature-changes]
+    if: ${{ needs.wasm-feature-changes.outputs.changed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      BUILDBUDDY_GRPC_URL: ${{ needs.control-plane-up.outputs.grpc_url }}
+      BUILDBUDDY_HTTP_URL: ${{ needs.control-plane-up.outputs.http_url }}
+      BUILDBUDDY_ENDPOINT: ${{ needs.control-plane-up.outputs.grpc_url }}
+      CI_STARTED_AT_EPOCH: ${{ needs.control-plane-up.outputs.started_at_epoch }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
         with:
-          group: gcp-wasm-feature
+          fetch-depth: 1
+
+      - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
+        with:
+          group: gcp-sdk-suites
           profile: submitter
           mode: ${{ inputs.mode || 'full-fresh' }}
           lanes: |
             sdk-suites
+
+  wasm-compile-submit:
+    name: WASM and minimal feature submitter
+    needs: [control-plane-up, executors-up, wasm-feature-changes]
+    if: ${{ needs.wasm-feature-changes.outputs.changed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      BUILDBUDDY_GRPC_URL: ${{ needs.control-plane-up.outputs.grpc_url }}
+      BUILDBUDDY_HTTP_URL: ${{ needs.control-plane-up.outputs.http_url }}
+      BUILDBUDDY_ENDPOINT: ${{ needs.control-plane-up.outputs.grpc_url }}
+      CI_STARTED_AT_EPOCH: ${{ needs.control-plane-up.outputs.started_at_epoch }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
+        with:
+          group: gcp-wasm-compile
+          profile: submitter
+          mode: ${{ inputs.mode || 'full-fresh' }}
+          lanes: |
             wasm-check
             test-minimal
+
+  wasm-feature-submit:
+    name: Feature matrix and audit submitter
+    needs: [control-plane-up, executors-up, wasm-feature-changes]
+    if: ${{ needs.wasm-feature-changes.outputs.changed == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      BUILDBUDDY_GRPC_URL: ${{ needs.control-plane-up.outputs.grpc_url }}
+      BUILDBUDDY_HTTP_URL: ${{ needs.control-plane-up.outputs.http_url }}
+      BUILDBUDDY_ENDPOINT: ${{ needs.control-plane-up.outputs.grpc_url }}
+      CI_STARTED_AT_EPOCH: ${{ needs.control-plane-up.outputs.started_at_epoch }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - uses: ./.github/actions/run-buildbuddy-ci-lane-batch
+        with:
+          group: gcp-feature-audit
+          profile: submitter
+          mode: ${{ inputs.mode || 'full-fresh' }}
+          lanes: |
             test-feature-matrix-lib
             test-feature-matrix-surface-checks
             audit
@@ -443,6 +504,9 @@ jobs:
       - static-submit
       - native-submit
       - governance-submit
+      - wasm-feature-changes
+      - wasm-sdk-submit
+      - wasm-compile-submit
       - wasm-feature-submit
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -497,6 +561,9 @@ jobs:
       - static-submit
       - native-submit
       - governance-submit
+      - wasm-feature-changes
+      - wasm-sdk-submit
+      - wasm-compile-submit
       - wasm-feature-submit
       - executors-down
     runs-on: ubuntu-latest
