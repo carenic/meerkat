@@ -219,6 +219,43 @@ pub fn should_apply_global_model_hot_swap(
     current_session_model != new_global_model
 }
 
+/// R3-2-4 (P1+P2): pure rule deciding whether a `config/set` or
+/// `config/patch` commit should fan out
+/// `propagate_config_to_live_channels` to active live channels.
+///
+/// **Field set consulted by the propagate body** (verified against
+/// [`super::orchestrator::LiveOrchestrator::propagate_config_to_live_channels`]
+/// at the time of writing):
+///
+/// - `agent.model` — read as `new_global_model` and threaded into the
+///   per-session hot-swap rule via [`should_apply_global_model_hot_swap`].
+///   This is the ONLY `Config` field the propagate path currently
+///   consults. Per-session live identity is re-resolved via
+///   `live_session_llm_identity` (session-bound state, not config),
+///   and the per-channel `Refresh` snapshot is rebuilt from the
+///   session, not the config.
+///
+/// If the propagate body grows to consult additional fields (e.g.
+/// `agent.provider`, realtime audio defaults, tool catalog scopes),
+/// extend this helper AND the regression tests in
+/// `meerkat/tests/session_runtime_live_orchestration.rs`. Keeping the
+/// predicate field set in lock-step with the propagate body is the
+/// whole point of the helper: an under-fired propagate (P2) leaves
+/// live channels stale; an over-fired propagate (P1) retargets or
+/// closes channels for unrelated config edits.
+///
+/// Returns `true` iff a propagate-affecting field actually changed.
+/// `false` short-circuits the orchestrator fan-out — the per-session
+/// hot-swap loop and per-channel Refresh dispatch are skipped, which
+/// is correct: there is nothing to propagate.
+#[must_use]
+pub fn should_fire_live_propagation(
+    prior: &meerkat_core::config::Config,
+    new: &meerkat_core::config::Config,
+) -> bool {
+    prior.agent.model != new.agent.model
+}
+
 /// Build the projection-root system message for a realtime session. The
 /// content is the union of the resolved `system_prompt` (or the first
 /// existing `System`/`SystemNotice` lead) and any session-build

@@ -29,6 +29,7 @@ use meerkat::session_runtime::errors::LiveOpenPrecheckError;
 use meerkat::session_runtime::live_orchestration::{
     apply_precheck_gates, extract_system_prompt_from_seed_messages_runtime,
     live_channel_requires_close_for_identity_change, should_apply_global_model_hot_swap,
+    should_fire_live_propagation,
 };
 use meerkat_core::types::{Message, SystemMessage, SystemNoticeKind, SystemNoticeMessage};
 use meerkat_core::{Provider, SessionLlmIdentity};
@@ -212,6 +213,74 @@ fn hot_swap_skips_when_session_already_matches_new_global_after_divergence() {
         Some("gpt-realtime-2"),
         "gpt-realtime-3"
     ));
+}
+
+// ---------------------------------------------------------------------------
+// `should_fire_live_propagation` is the symmetric gate that both
+// `config/set` and `config/patch` consult before fanning out to
+// `propagate_config_to_live_channels`.
+//
+// Findings R3-2-4 (P1+P2):
+//   - `config/patch` over-applied (fired on every patch, regardless of
+//     which fields changed).
+//   - `config/set` under-applied (never fired at all).
+// Both now route through this helper.
+//
+// Field set consulted (verified against the propagate body): `agent.model`.
+// If the propagate body grows, extend the helper AND these tests in
+// lock-step.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn should_fire_live_propagation_returns_false_for_unrelated_field_change() {
+    // P1 regression: tools/skills/anything-else patch must NOT trigger
+    // a live-channel fan-out. Mutating an unrelated field on the config
+    // (here: `max_tokens`) must leave the predicate false.
+    let prior = meerkat_core::config::Config::default();
+    let mut new = prior.clone();
+    new.max_tokens = prior.max_tokens.saturating_add(1);
+    assert_ne!(prior.max_tokens, new.max_tokens);
+    assert_eq!(prior.agent.model, new.agent.model);
+    assert!(!should_fire_live_propagation(&prior, &new));
+}
+
+#[test]
+fn should_fire_live_propagation_returns_true_when_agent_model_changes() {
+    // The canonical positive case: a `config/patch agent.model` (or a
+    // `config/set` that swaps the model) must fan out so live channels
+    // re-resolve and either Refresh or Close.
+    let prior = meerkat_core::config::Config::default();
+    let mut new = prior.clone();
+    new.agent.model = "gpt-realtime-3".to_string();
+    assert_ne!(prior.agent.model, new.agent.model);
+    assert!(should_fire_live_propagation(&prior, &new));
+}
+
+#[test]
+fn should_fire_live_propagation_returns_false_when_agent_model_unchanged() {
+    // Identity case: nothing changed → no propagate. The per-session
+    // hot-swap loop and per-channel Refresh are entirely skipped.
+    let prior = meerkat_core::config::Config::default();
+    let new = prior.clone();
+    assert!(!should_fire_live_propagation(&prior, &new));
+}
+
+#[test]
+fn should_fire_live_propagation_only_consults_agent_model_today() {
+    // Pin the field set: if someone wires in a new propagate-affecting
+    // field without updating the helper, this test still passes (the
+    // helper correctly returns false on the model-equality case), but
+    // adding the new field to the helper without updating its
+    // doc-comment will be caught by the assertion below — flipping
+    // `agent.system_prompt` (a non-propagate-affecting field today)
+    // must NOT fire propagation. If the propagate body grows to
+    // consult `agent.system_prompt`, update the helper AND replace
+    // this assertion with the matching positive case.
+    let prior = meerkat_core::config::Config::default();
+    let mut new = prior.clone();
+    new.agent.system_prompt = Some("flipped".to_string());
+    assert_eq!(prior.agent.model, new.agent.model);
+    assert!(!should_fire_live_propagation(&prior, &new));
 }
 
 #[test]
