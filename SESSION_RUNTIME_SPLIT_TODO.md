@@ -462,35 +462,35 @@ self-verify.
 
 ### Phase 5 — Meta-level adversarial verification
 
-- [ ] fix · [ ] verify · **V1.** **Lane-collapse hunt.** For every
+- [x] fix · [x] verify · **V1.** **Lane-collapse hunt.** For every
   method moved in Waves 2-3, enumerate every typed-concept boundary
   it crosses (provider lane, modality lane, transcript lane,
   display-text lane, control vs lossy channel). Confirm none of the
   moves silently collapsed two lanes into one. Report ≤5
   highest-risk suspicions; do not enumerate exhaustively.
 
-- [ ] fix · [ ] verify · **V2.** **Identity-loss hunt.** Audit every
+- [x] fix · [x] verify · **V2.** **Identity-loss hunt.** Audit every
   cross-crate boundary the moves introduced. For each, list the
   identity types crossing it (`SessionId`, `LiveChannelId`,
   `RealmId`, `SessionLlmIdentity`, `bound_llm_identity`, `RunId`,
   `OperationId`, …). Confirm no `Option<…>`-flatten or `to_string()`
   conversion lost identity. Report ≤5.
 
-- [ ] fix · [ ] verify · **V3.** **Unhappy-path hunt.** For each
+- [x] fix · [x] verify · **V3.** **Unhappy-path hunt.** For each
   moved method that returns `Result<…, …>`, trace every `Err` arm
   through the new crate. Verify cleanup runs (`PendingPromotionCleanup`
   drop, `RuntimePreAdmissionRegistration` drop,
   `cleanup_recovered_runtime_if_new`). Audit `?` propagation that
   bypasses Drop guards. Report ≤5.
 
-- [ ] fix · [ ] verify · **V4.** **Two-path duplication hunt.**
+- [x] fix · [x] verify · **V4.** **Two-path duplication hunt.**
   After all waves land, for each typed concept owned by
   `MeerkatSessionRuntime` (live identity, staged identity,
   bound channel identity, resolved-from-config identity), confirm
   there is exactly one read site and one write site — no shadow
   copy in `meerkat-rpc::SessionRuntime` that could drift. Report ≤5.
 
-- [ ] fix · [ ] verify · **V5.** **Surface-symmetry audit.** Walk
+- [x] fix · [x] verify · **V5.** **Surface-symmetry audit.** Walk
   every public method on `MeerkatSessionRuntime`. For each, confirm
   it could legitimately be called from the Rust SDK, REST handler,
   CLI subcommand, and embedded `examples/*` — i.e., it does not
