@@ -41,6 +41,7 @@ use axum::extract::ws::{CloseFrame, Message as WsMessage, WebSocket, close_code}
 use axum::extract::{Query, State, WebSocketUpgrade};
 use axum::response::IntoResponse;
 use axum::routing::get;
+use meerkat_contracts::WireLiveAdapterObservation;
 use meerkat_core::live_adapter::LiveInputChunk;
 use tokio::sync::Mutex;
 use uuid::Uuid;
@@ -413,9 +414,20 @@ async fn handle_live_socket(
                 // with a stable typed reason string clients can key on.
                 match observation {
                     Ok(Some(obs)) => {
+                        // R6-2 (P2): route the WS write through the typed
+                        // wire mirror at the public boundary so future core
+                        // variants surface as `observation: "unknown"`
+                        // (R3-6's fail-loud sentinel) rather than leaking
+                        // raw new tags at this seam. The conversion is
+                        // total (every core variant has an explicit arm)
+                        // and byte-compatible for known variants — see
+                        // `wire_live_adapter_observation_byte_compatible_with_core_for_audio_chunk`
+                        // / `_command_rejected` in
+                        // `meerkat-contracts/src/wire/live.rs`.
+                        let wire_obs = WireLiveAdapterObservation::from(obs.clone());
                         // Forward to the client first so it sees the terminal
                         // observation alongside the close frame.
-                        let send_ok = match serde_json::to_string(&obs) {
+                        let send_ok = match serde_json::to_string(&wire_obs) {
                             Ok(json) => socket.send(WsMessage::Text(json.into())).await.is_ok(),
                             Err(_) => true,
                         };
@@ -1303,5 +1315,82 @@ mod tests {
             saw_turn_completed,
             "observation arm starved by mic-audio saturation — biased ordering or unpinned observation future regression"
         );
+    }
+
+    /// R6-2 (P2): the WS pump serializes observations through the typed
+    /// `WireLiveAdapterObservation` mirror (not the raw core enum) at the
+    /// public boundary. Verifies the forwarded JSON deserializes as
+    /// `WireLiveAdapterObservation` — a future core variant added without
+    /// an explicit forward arm in the wire `From` impl will surface as
+    /// the `observation: "unknown"` sentinel rather than leaking a raw
+    /// new tag through this seam.
+    #[tokio::test]
+    async fn websocket_forwards_observation_through_wire_mirror() {
+        use meerkat_contracts::WireLiveAdapterObservation;
+        use meerkat_core::live_adapter::LiveAdapterObservation;
+
+        let host = Arc::new(LiveAdapterHost::new(Arc::new(NoOpProjectionSink)));
+        let session_id = meerkat_core::types::SessionId::new();
+        let channel_id = host.open_channel(session_id).await.unwrap();
+        host.attach_adapter(
+            &channel_id,
+            Arc::new(ScriptedAdapter::new(LiveAdapterObservation::Ready)),
+        )
+        .await
+        .unwrap();
+        host.apply_status_update(
+            &channel_id,
+            meerkat_core::live_adapter::LiveAdapterStatus::Ready,
+        )
+        .await
+        .unwrap();
+
+        let state = Arc::new(LiveWsState::new(host));
+        let token = state.mint_token(channel_id.clone()).await;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let ws_state = Arc::clone(&state);
+        let server_handle =
+            tokio::spawn(async move { serve_live_ws_listener(listener, ws_state).await });
+
+        let url = format!("ws://{addr}{LIVE_WS_PATH}?token={token}&channel={channel_id}");
+        let (ws_stream, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        use futures::StreamExt;
+        use tokio_tungstenite::tungstenite::Message;
+        let (_write, mut read) = ws_stream.split();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_millis(1500);
+        let mut typed_observation = None;
+        while let Some(remaining) = deadline.checked_duration_since(tokio::time::Instant::now()) {
+            match tokio::time::timeout(remaining, read.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => {
+                    // The WS write must produce JSON that deserializes as
+                    // the typed wire mirror. Routing through the raw core
+                    // type would be byte-equal today but would silently
+                    // bypass the `Unknown { debug }` floor for future core
+                    // variants.
+                    match serde_json::from_str::<WireLiveAdapterObservation>(&text) {
+                        Ok(obs) => {
+                            typed_observation = Some(obs);
+                            break;
+                        }
+                        Err(err) => panic!(
+                            "WS forwarded JSON must deserialize as WireLiveAdapterObservation; got error {err} on payload: {text}"
+                        ),
+                    }
+                }
+                Ok(Some(Ok(_))) => continue,
+                Ok(Some(Err(_))) | Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+
+        server_handle.abort();
+
+        match typed_observation {
+            Some(WireLiveAdapterObservation::Ready) => {}
+            other => panic!("expected wire-mirror Ready, got {other:?}"),
+        }
     }
 }
