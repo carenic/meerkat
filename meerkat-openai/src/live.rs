@@ -3082,7 +3082,19 @@ pub struct OpenAiLiveAdapter {
     /// queued in the host's `pending_synthetic_obs` slot cannot wake an
     /// in-flight `next_observation()` read, and the consumer sees a
     /// generic close instead of the typed reason.
-    control_tx: mpsc::Sender<LiveAdapterObservation>,
+    ///
+    /// R6-1 (P1, Shape A): wrapped in `Arc<StdMutex<Option<...>>>` so the
+    /// pump task (which holds an `Arc` clone of the same slot) can drop
+    /// the adapter-side sender after it has emitted its terminal
+    /// `StatusChanged{Closed}` and exits. Once the pump's own local
+    /// `control_tx` clone goes out of scope (pump function return) AND
+    /// the adapter's clone has been taken here by the pump, the channel
+    /// is fully closed and `control_rx.recv()` returns `None`. That, in
+    /// turn, lets `next_observation()` propagate adapter EOF to the WS
+    /// loop instead of parking forever on a half-closed channel.
+    /// Synthetic injection callers who fire after the pump has exited
+    /// get a typed `LiveAdapterError::Closed`.
+    control_tx: Arc<StdMutex<Option<mpsc::Sender<LiveAdapterObservation>>>>,
 }
 
 impl OpenAiLiveAdapter {
@@ -3115,7 +3127,7 @@ impl OpenAiLiveAdapter {
             closed: AtomicBool::new(false),
             status,
             pump_handle: StdMutex::new(None),
-            control_tx: control_tx.clone(),
+            control_tx: Arc::new(StdMutex::new(Some(control_tx.clone()))),
         };
         (adapter, control_tx, audio_tx, cmd_rx)
     }
@@ -3134,12 +3146,20 @@ impl OpenAiLiveAdapter {
         let (control_tx, control_rx) = mpsc::channel(256);
         let (audio_tx, audio_rx) = mpsc::channel(64);
         let status = Arc::new(StdMutex::new(LiveAdapterStatus::Opening));
+        // R6-1 (P1, Shape A): the adapter-side `control_tx` clone lives in
+        // a shared `Arc<StdMutex<Option<...>>>` slot so the pump can drop
+        // it on exit. Without this, the adapter retains the only remaining
+        // sender, `control_rx.recv()` never returns `None`, and an
+        // in-flight `next_observation()` parks forever after the pump has
+        // emitted its terminal `StatusChanged{Closed}`.
+        let adapter_control_slot = Arc::new(StdMutex::new(Some(control_tx.clone())));
         let pump_handle = tokio::spawn(openai_live_pump(
             session,
             cmd_rx,
-            control_tx.clone(),
+            control_tx,
             audio_tx,
             Arc::clone(&status),
+            Arc::clone(&adapter_control_slot),
         ));
         Self {
             cmd_tx,
@@ -3148,7 +3168,7 @@ impl OpenAiLiveAdapter {
             closed: AtomicBool::new(false),
             status,
             pump_handle: StdMutex::new(Some(pump_handle)),
-            control_tx,
+            control_tx: adapter_control_slot,
         }
     }
 }
@@ -3311,7 +3331,21 @@ impl LiveAdapter for OpenAiLiveAdapter {
                         .into(),
             });
         }
-        self.control_tx
+        // R6-1 (P1, Shape A): clone out the sender under the lock and
+        // release the std-mutex BEFORE awaiting the channel send. Holding
+        // the std-mutex across an await is unsound. If the slot is `None`
+        // the pump has already exited and dropped its clone, so report a
+        // typed `Closed` to the caller — the host already tolerates this
+        // path (`let _ = adapter.inject_observation(...)`) and falls back
+        // to its `pending_synthetic_obs` slot for the consumer wake-up.
+        let sender = match self.control_tx.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let Some(sender) = sender else {
+            return Err(LiveAdapterError::Closed);
+        };
+        sender
             .send(observation)
             .await
             .map_err(|_| LiveAdapterError::Closed)
@@ -3353,6 +3387,7 @@ async fn openai_live_pump(
     control_tx: mpsc::Sender<LiveAdapterObservation>,
     audio_tx: mpsc::Sender<LiveAdapterObservation>,
     status: Arc<StdMutex<LiveAdapterStatus>>,
+    adapter_control_slot: Arc<StdMutex<Option<mpsc::Sender<LiveAdapterObservation>>>>,
 ) {
     // R5-1: route observations by variant. Audio chunks are lossy
     // (try_send + drop on full); everything else is reliable
@@ -3487,6 +3522,22 @@ async fn openai_live_pump(
                     }
                 }
             }
+        }
+    }
+
+    // R6-1 (P1, Shape A): drop the adapter-side `control_tx` clone now
+    // that the pump has emitted its terminal observation (or hit a
+    // consumer-gone error). Combined with `control_tx` going out of
+    // scope at function return, this leaves zero remaining senders so
+    // `control_rx.recv()` in `next_observation` returns `None` and the
+    // WS loop sees adapter EOF instead of parking on a half-closed
+    // channel forever.
+    match adapter_control_slot.lock() {
+        Ok(mut guard) => {
+            guard.take();
+        }
+        Err(poisoned) => {
+            poisoned.into_inner().take();
         }
     }
 
@@ -8973,5 +9024,108 @@ mod tests {
             }
             other => unreachable!("expected TransportError, got {other:?}"),
         }
+    }
+
+    /// R6-1 (P1) regression: when the realtime session emits a clean
+    /// EOF (`next_event` returns `Ok(None)`), the pump must (a) emit
+    /// the terminal `StatusChanged{Closed}` observation AND (b) cause
+    /// `next_observation()` to subsequently return `Ok(None)` so the
+    /// WS loop in `meerkat-live::transport` sees adapter EOF and tears
+    /// down the socket. Before the Shape A fix the adapter retained
+    /// the only remaining `control_tx` clone (for `inject_observation`),
+    /// so `control_rx.recv()` never returned `None` and the WS loop
+    /// parked on the half-closed channel forever — re-arming another
+    /// `next_observation` after each non-terminal `StatusChanged`
+    /// without ever reaching adapter EOF.
+    ///
+    /// The fix moves the adapter-side `control_tx` into a shared
+    /// `Arc<StdMutex<Option<...>>>` slot the pump takes on exit;
+    /// once both the pump's local clone (function return) and the
+    /// adapter-side clone (taken by the pump) are dropped, the
+    /// channel closes and `next_observation` propagates `None`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn adapter_eof_propagates_after_pump_close() {
+        use meerkat_core::live_adapter::LiveAdapter;
+
+        // Drive a fake OpenAI session that closes its server-event
+        // stream cleanly after the pump consumes one event. Closing
+        // the unbounded channel makes `rx.recv()` return `None`, which
+        // `ChannelOpenAiLiveSession::next_event` translates into the
+        // "park forever" parking branch — that's the WRONG path for
+        // this test. We instead push an explicit `Ok(None)` onto the
+        // channel; the fake's `next_event` returns it as-is, the pump
+        // hits its `Ok(None)` arm, sends `StatusChanged{Closed}`, and
+        // breaks out of the select loop.
+        let (server_tx, server_rx) =
+            mpsc::unbounded_channel::<Result<Option<ServerEvent>, LlmError>>();
+        let seen: Arc<Mutex<Vec<ClientEvent>>> = Arc::new(Mutex::new(Vec::new()));
+        let raw = Box::new(ChannelOpenAiLiveSession {
+            seen: Arc::clone(&seen),
+            rx: tokio::sync::Mutex::new(server_rx),
+        });
+        let session = OpenAiRealtimeSession::new(raw, RealtimeTurningMode::ProviderManaged);
+        let adapter = OpenAiLiveAdapter::new(session);
+
+        // Drain the initial Ready so the pump is in its select! loop.
+        let first = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            adapter.next_observation(),
+        )
+        .await
+        .expect("Ready must arrive within 1s")
+        .expect("adapter must yield Ok")
+        .expect("first observation must be Some");
+        assert!(matches!(first, LiveAdapterObservation::Ready));
+
+        // Signal clean provider EOF — the pump should translate this
+        // into a terminal `StatusChanged{Closed}` and exit.
+        server_tx
+            .send(Ok(None))
+            .expect("server channel must accept EOF");
+        // Drop the producer side too so the fake's `recv()` returns
+        // `None` if the pump tries to poll again after EOF (defensive).
+        drop(server_tx);
+
+        // Next observation must be the terminal Closed status.
+        let terminal = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            adapter.next_observation(),
+        )
+        .await
+        .expect("terminal status must arrive within 2s")
+        .expect("adapter must yield Ok")
+        .expect("terminal observation must be Some");
+        assert!(
+            matches!(
+                terminal,
+                LiveAdapterObservation::StatusChanged {
+                    status: LiveAdapterStatus::Closed
+                }
+            ),
+            "expected terminal StatusChanged{{Closed}}, got {terminal:?}"
+        );
+
+        // R6-1: after the terminal status, the adapter must propagate
+        // EOF on the next `next_observation()` call. Without the Shape A
+        // fix this call would park forever (the adapter retained the
+        // only remaining `control_tx` clone), and the timeout would
+        // fire. With the fix, the pump dropped the adapter-side clone
+        // before exiting; the pump's own clone went out of scope at
+        // function return; `control_rx.recv()` returns `None`; and
+        // `next_observation` returns `Ok(None)`.
+        let eof = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            adapter.next_observation(),
+        )
+        .await
+        .expect(
+            "R6-1: next_observation must return EOF within 2s after pump close; \
+             without the Shape A fix the adapter retains control_tx and parks forever",
+        )
+        .expect("adapter must yield Ok at EOF");
+        assert!(
+            eof.is_none(),
+            "R6-1: next_observation must return None after pump EOF, got {eof:?}"
+        );
     }
 }
