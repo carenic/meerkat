@@ -10,17 +10,29 @@
 //!
 //! See `SESSION_RUNTIME_SPLIT_TODO.md` for the migration plan.
 
+// Most of the session runtime requires async-sync primitives (`tokio::sync::Mutex`,
+// `Notify`, `broadcast`) and `tokio::spawn` for Drop guards — none of which
+// `tokio_with_wasm` exposes. The WASM SDK reaches the runtime via a different
+// surface (`meerkat-web-runtime`), so gating these modules off wasm32 keeps the
+// facade compiling for both targets without leaking unused async primitives
+// into the wasm bundle. `errors` and the small `SessionState`/`SessionInfo`
+// shells stay available everywhere because they're surface-agnostic data.
+#[cfg(not(target_arch = "wasm32"))]
 pub mod admission;
 pub mod errors;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod live_orchestration;
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
 pub mod llm_reconfigure;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod recovery;
+#[cfg(not(target_arch = "wasm32"))]
 pub mod runtime_state;
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
 pub mod staged_promotion;
 
 pub use errors::LiveOpenPrecheckError;
+#[cfg(not(target_arch = "wasm32"))]
 pub use runtime_state::{SessionInfo, SessionState};
 
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]

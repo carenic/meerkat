@@ -246,7 +246,7 @@ impl Drop for RuntimeRegistrationLockLease {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if locks
             .get(&self.session_id)
-            .is_some_and(|registered| registered.ptr_eq(&this_lock))
+            .is_some_and(|registered: &Weak<Mutex<()>>| registered.ptr_eq(&this_lock))
         {
             locks.remove(&self.session_id);
         }
