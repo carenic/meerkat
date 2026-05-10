@@ -701,6 +701,7 @@ pub enum WireLiveDegradationReason {
     ProviderThrottled,
     NetworkUnstable,
     Other { detail: String },
+    Unknown { debug: String },
 }
 
 impl From<LiveDegradationReason> for WireLiveDegradationReason {
@@ -712,17 +713,34 @@ impl From<LiveDegradationReason> for WireLiveDegradationReason {
             LiveDegradationReason::Other { detail } => Self::Other {
                 detail: detail.into_owned(),
             },
-            // Core enum is `non_exhaustive`; debug-assert for new variants.
-            _ => {
+            other => {
                 debug_assert!(
                     false,
                     "WireLiveDegradationReason::from saw an unmapped \
-                     LiveDegradationReason variant; add an explicit arm in \
+                     LiveDegradationReason variant: {other:?}; add an explicit arm in \
                      meerkat-contracts/src/wire/live.rs."
                 );
-                Self::Other {
-                    detail: "unknown".to_string(),
+                Self::Unknown {
+                    debug: format!("{other:?}"),
                 }
+            }
+        }
+    }
+}
+
+impl TryFrom<WireLiveDegradationReason> for LiveDegradationReason {
+    type Error = WireConversionError;
+
+    fn try_from(value: WireLiveDegradationReason) -> Result<Self, Self::Error> {
+        match value {
+            WireLiveDegradationReason::RateLimited => Ok(Self::RateLimited),
+            WireLiveDegradationReason::ProviderThrottled => Ok(Self::ProviderThrottled),
+            WireLiveDegradationReason::NetworkUnstable => Ok(Self::NetworkUnstable),
+            WireLiveDegradationReason::Other { detail } => Ok(Self::Other {
+                detail: detail.into(),
+            }),
+            WireLiveDegradationReason::Unknown { debug } => {
+                Err(WireConversionError::DegradationReason { debug })
             }
         }
     }

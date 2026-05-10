@@ -466,6 +466,7 @@ pub enum WireAssistantBlock {
         revised_prompt: meerkat_core::RevisedPromptDisposition,
         meta: meerkat_core::ProviderImageMetadata,
     },
+    #[serde(other)]
     Unknown,
 }
 
