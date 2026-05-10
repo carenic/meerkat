@@ -1131,6 +1131,10 @@ fn should_suppress_openai_active_response_error(
     awaiting_provider_response_after_commit: bool,
     provider_response_acknowledged_without_progress: bool,
 ) -> bool {
+    // R3-5 (P2): `response_output_active` is the OR of the audio + text
+    // bits — the OpenAI realtime "active response in progress" guard is
+    // about a server-side response of *any* modality being active, so the
+    // suppression decision composes both bits at the call site.
     openai_response_already_active_message(message)
         && (provider_response_nudge_inflight
             || response_output_active
@@ -1205,7 +1209,21 @@ pub struct OpenAiRealtimeSession {
     /// next response that may already be active by the time the command drains.
     pending_interrupted_response_cancel: Option<String>,
     pending_response_cancel_event_ids: BTreeSet<String>,
-    response_output_active: bool,
+    /// R3-5 (P2): split `response_output_active` into modality-specific
+    /// bits. Pre-R3-5 a single bit gated *both* spoken-audio output and
+    /// display-text output — which made any active text response look
+    /// like an audio response to the user-speech barge-in path.
+    /// Consequence: an agent emitting sideband text (e.g. via the G9
+    /// typed `live/commit_input { response_modality: text }` path) had
+    /// its text stream cancelled the moment the user started speaking,
+    /// even though spoken audio was not the modality the user was
+    /// interrupting. The two bits decouple barge-in semantics: only
+    /// `audio_output_active` interacts with the speech-VAD interrupt
+    /// path. The "active response in progress" guard composes the two
+    /// bits via [`Self::any_response_output_active`] because that guard
+    /// is about a server-side response of any modality being active.
+    audio_output_active: bool,
+    text_output_active: bool,
     response_interrupt_emitted: bool,
     response_tool_call_observed: bool,
     awaiting_provider_response_after_commit: bool,
@@ -1265,7 +1283,8 @@ impl OpenAiRealtimeSession {
             active_response_id: None,
             pending_interrupted_response_cancel: None,
             pending_response_cancel_event_ids: BTreeSet::new(),
-            response_output_active: false,
+            audio_output_active: false,
+            text_output_active: false,
             response_interrupt_emitted: false,
             response_tool_call_observed: false,
             awaiting_provider_response_after_commit: false,
@@ -1370,11 +1389,40 @@ impl OpenAiRealtimeSession {
         Ok(())
     }
 
-    fn mark_response_output_active(&mut self) {
-        if !self.response_output_active {
+    /// R3-5 (P2): combined view of "is any output active" — used by
+    /// the OpenAI "active response in progress" suppression guard,
+    /// which is provider-modality-agnostic: any active server-side
+    /// response causes the rejection regardless of audio vs text.
+    fn any_response_output_active(&self) -> bool {
+        self.audio_output_active || self.text_output_active
+    }
+
+    /// R3-5 (P2): mark the audio output bit. The barge-in latch
+    /// (`response_interrupt_emitted`) is intentionally tied to the
+    /// audio modality only — user speech only interrupts spoken
+    /// audio, so a fresh audio output transition is the right place
+    /// to clear the latch. A text-only response does not interact
+    /// with the latch.
+    fn mark_audio_output_active(&mut self) {
+        if !self.audio_output_active {
             self.response_interrupt_emitted = false;
         }
-        self.response_output_active = true;
+        self.audio_output_active = true;
+    }
+
+    /// R3-5 (P2): mark the text output bit. Display text emission is
+    /// independent of audio barge-in, so this does not touch the
+    /// audio-tied `response_interrupt_emitted` latch.
+    fn mark_text_output_active(&mut self) {
+        self.text_output_active = true;
+    }
+
+    /// R3-5 (P2): clear both modality bits. Used on response-terminal
+    /// boundaries (`response.done`, `response.cancelled`, channel
+    /// close) where the entire server-side response has gone away.
+    fn clear_response_output_active(&mut self) {
+        self.audio_output_active = false;
+        self.text_output_active = false;
     }
 
     fn previous_item_id_for(&self, item_id: &str) -> Option<String> {
@@ -1556,7 +1604,9 @@ impl OpenAiRealtimeSession {
         content_index: u32,
         delta: String,
     ) -> RealtimeSessionEvent {
-        self.mark_response_output_active();
+        // R3-5 (P2): spoken-audio transcript stream is a witness for
+        // active audio output (it travels alongside the audio chunks).
+        self.mark_audio_output_active();
         self.note_response_for_item(&response_id, item_id);
         let key = openai_output_audio_transcript_key(item_id, content_index);
         self.pending_output_audio_transcripts
@@ -1603,7 +1653,9 @@ impl OpenAiRealtimeSession {
         content_index: u32,
         transcript: String,
     ) -> Option<RealtimeSessionEvent> {
-        self.mark_response_output_active();
+        // R3-5 (P2): see `note_output_audio_transcript_delta` — same
+        // audio-modality lane.
+        self.mark_audio_output_active();
         self.note_response_for_item(&response_id, item_id);
         let key = openai_output_audio_transcript_key(item_id, content_index);
         let seen = self
@@ -1694,9 +1746,17 @@ impl OpenAiRealtimeSession {
                 })
             }
             ServerEvent::InputAudioBufferSpeechStarted { .. } => {
-                if self.response_output_active && !self.response_interrupt_emitted {
+                // R3-5 (P2): only spoken-audio output is interrupted by
+                // user-speech barge-in. A pure text-only response (G9
+                // sideband-text path) keeps emitting through the user's
+                // speech — that's exactly the "sideband text" use case
+                // the typed `live/commit_input { response_modality:
+                // text }` path enables. Pre-R3-5 a single
+                // `response_output_active` bit gated both modalities,
+                // so user speech also cancelled active text responses.
+                if self.audio_output_active && !self.response_interrupt_emitted {
                     let response_id = self.active_response_id.clone();
-                    self.response_output_active = false;
+                    self.audio_output_active = false;
                     self.response_interrupt_emitted = true;
                     self.remember_interrupted_response_cancel_target(response_id.as_deref());
                     self.pending_events
@@ -1724,7 +1784,7 @@ impl OpenAiRealtimeSession {
                     "input_audio_buffer.committed awaiting_after_commit={}",
                     self.awaiting_provider_response_after_commit
                 ));
-                if self.response_output_active && !self.response_interrupt_emitted {
+                if self.audio_output_active && !self.response_interrupt_emitted {
                     let response_id = self.active_response_id.clone();
                     // Provider-normalization fallback:
                     // OpenAI can occasionally surface the next committed user
@@ -1734,7 +1794,12 @@ impl OpenAiRealtimeSession {
                     // the prior response was interrupted, so preserve the
                     // product contract by synthesizing the same normalized
                     // sequence we would have emitted on `speech_started`.
-                    self.response_output_active = false;
+                    //
+                    // R3-5 (P2): only the audio modality is interrupted
+                    // by user speech; a concurrently-active text-only
+                    // response (G9 sideband-text) survives the
+                    // user-audio commit boundary and keeps streaming.
+                    self.audio_output_active = false;
                     self.response_interrupt_emitted = true;
                     self.remember_interrupted_response_cancel_target(response_id.as_deref());
                     self.pending_events
@@ -1770,13 +1835,13 @@ impl OpenAiRealtimeSession {
                     // as the new turn's completion or it will collapse turn
                     // boundaries and let higher layers believe the new turn is
                     // already terminal.
-                    self.response_output_active = false;
+                    self.clear_response_output_active();
                     self.response_interrupt_emitted = false;
                     self.response_tool_call_observed = false;
                     return Ok(None);
                 }
                 self.note_provider_response_progressed();
-                self.response_output_active = false;
+                self.clear_response_output_active();
                 let interrupt_already_emitted =
                     std::mem::replace(&mut self.response_interrupt_emitted, false);
                 let observed_tool_call = std::mem::take(&mut self.response_tool_call_observed);
@@ -1818,12 +1883,12 @@ impl OpenAiRealtimeSession {
             ServerEvent::ResponseCancelled { response, .. } => {
                 if self.awaiting_provider_response_after_commit {
                     trace_openai_realtime_lifecycle("response.cancelled suppressed_while_awaiting");
-                    self.response_output_active = false;
+                    self.clear_response_output_active();
                     self.response_tool_call_observed = false;
                     return Ok(None);
                 }
                 self.note_provider_response_progressed();
-                self.response_output_active = false;
+                self.clear_response_output_active();
                 self.response_tool_call_observed = false;
                 trace_openai_realtime_lifecycle("response.cancelled surfaced");
                 if self.response_interrupt_emitted {
@@ -1899,7 +1964,12 @@ impl OpenAiRealtimeSession {
                 if self.should_suppress_mcp_echoed_text(&delta) {
                     None
                 } else {
-                    self.mark_response_output_active();
+                    // R3-5 (P2): display-text deltas mark the text
+                    // modality bit only. Pre-R3-5 this set the shared
+                    // `response_output_active` and made user-speech
+                    // barge-in interrupt active text responses, killing
+                    // the G9 sideband-text use-case.
+                    self.mark_text_output_active();
                     self.note_response_for_item(&response_id, &item_id);
                     Some(RealtimeSessionEvent::OutputTextDeltaForItem {
                         response_id,
@@ -1992,7 +2062,8 @@ impl OpenAiRealtimeSession {
                     return Ok(None);
                 }
                 self.note_provider_response_progressed();
-                self.mark_response_output_active();
+                // R3-5 (P2): audio chunks witness active audio output.
+                self.mark_audio_output_active();
                 self.note_response_for_item(&response_id, &item_id);
                 Some(RealtimeSessionEvent::OutputAudioChunk {
                     chunk: RealtimeAudioChunk {
@@ -2075,7 +2146,7 @@ impl OpenAiRealtimeSession {
                 let suppress = should_suppress_openai_active_response_error(
                     &error.message,
                     self.provider_response_nudge_inflight,
-                    self.response_output_active,
+                    self.any_response_output_active(),
                     self.awaiting_provider_response_after_commit,
                     self.provider_response_acknowledged_without_progress,
                 );
@@ -2083,7 +2154,7 @@ impl OpenAiRealtimeSession {
                     "server_event",
                     &error.message,
                     self.provider_response_nudge_inflight,
-                    self.response_output_active,
+                    self.any_response_output_active(),
                     self.awaiting_provider_response_after_commit,
                     self.provider_response_acknowledged_without_progress,
                     suppress,
@@ -2433,7 +2504,7 @@ impl RealtimeSession for OpenAiRealtimeSession {
                                 let suppress = should_suppress_openai_active_response_error(
                                     &message,
                                     self.provider_response_nudge_inflight,
-                                    self.response_output_active,
+                                    self.any_response_output_active(),
                                     self.awaiting_provider_response_after_commit,
                                     self.provider_response_acknowledged_without_progress,
                                 );
@@ -2441,7 +2512,7 @@ impl RealtimeSession for OpenAiRealtimeSession {
                                     "raw_timeout_branch",
                                     &message,
                                     self.provider_response_nudge_inflight,
-                                    self.response_output_active,
+                                    self.any_response_output_active(),
                                     self.awaiting_provider_response_after_commit,
                                     self.provider_response_acknowledged_without_progress,
                                     suppress,
@@ -2505,7 +2576,7 @@ impl RealtimeSession for OpenAiRealtimeSession {
                                     let suppress = should_suppress_openai_active_response_error(
                                         &message,
                                         self.provider_response_nudge_inflight,
-                                        self.response_output_active,
+                                        self.any_response_output_active(),
                                         self.awaiting_provider_response_after_commit,
                                         self.provider_response_acknowledged_without_progress,
                                     );
@@ -2513,7 +2584,7 @@ impl RealtimeSession for OpenAiRealtimeSession {
                                         "response_create",
                                         &message,
                                         self.provider_response_nudge_inflight,
-                                        self.response_output_active,
+                                        self.any_response_output_active(),
                                         self.awaiting_provider_response_after_commit,
                                         self.provider_response_acknowledged_without_progress,
                                         suppress,
@@ -2540,7 +2611,7 @@ impl RealtimeSession for OpenAiRealtimeSession {
                             let suppress = should_suppress_openai_active_response_error(
                                 &message,
                                 self.provider_response_nudge_inflight,
-                                self.response_output_active,
+                                self.any_response_output_active(),
                                 self.awaiting_provider_response_after_commit,
                                 self.provider_response_acknowledged_without_progress,
                             );
@@ -2548,7 +2619,7 @@ impl RealtimeSession for OpenAiRealtimeSession {
                                 "raw_next_event",
                                 &message,
                                 self.provider_response_nudge_inflight,
-                                self.response_output_active,
+                                self.any_response_output_active(),
                                 self.awaiting_provider_response_after_commit,
                                 self.provider_response_acknowledged_without_progress,
                                 suppress,
@@ -2583,7 +2654,8 @@ impl RealtimeSession for OpenAiRealtimeSession {
         self.pending_text_suppressions.clear();
         self.pending_interrupted_response_cancel = None;
         self.pending_response_cancel_event_ids.clear();
-        self.response_output_active = false;
+        // R3-5 (P2): clear both modality bits on close.
+        self.clear_response_output_active();
         self.response_interrupt_emitted = false;
         self.response_tool_call_observed = false;
         self.awaiting_provider_response_after_commit = false;
@@ -4837,18 +4909,28 @@ mod tests {
 
     #[tokio::test]
     async fn provider_neutral_session_delayed_interrupt_targets_interrupted_response() {
+        // R3-5 (P2): user-speech barge-in is audio-modality-scoped.
+        // Pre-R3-5 this test fed `OutputTextDelta` because a single
+        // `response_output_active` bit gated both modalities; now only
+        // `OutputAudioDelta` (or `OutputAudioTranscriptDelta`) drives
+        // the audio bit that the speech-started barge-in path consumes.
+        // The contract under test — that a delayed `interrupt()` targets
+        // the response that user speech interrupted, not whatever
+        // response is active at the time of the call — is unchanged;
+        // we just exercise it through the audio-modality lane that
+        // actually triggers the barge-in path under the new semantics.
         let seen = Arc::new(Mutex::new(Vec::new()));
         let mut session = OpenAiRealtimeSession::new(
             Box::new(FakeOpenAiLiveSession {
                 seen: Arc::clone(&seen),
                 next_events: Arc::new(Mutex::new(VecDeque::from(vec![
-                    Ok(Some(ServerEvent::ResponseOutputTextDelta {
+                    Ok(Some(ServerEvent::ResponseOutputAudioDelta {
                         event_id: "evt_loop_delta".to_string(),
                         response_id: "resp_loop".to_string(),
                         item_id: "item_loop".to_string(),
                         output_index: 0,
                         content_index: 0,
-                        delta: "Looping now".to_string(),
+                        delta: "AAEC".to_string(),
                     })),
                     Ok(Some(ServerEvent::InputAudioBufferSpeechStarted {
                         event_id: "evt_speech_started".to_string(),
@@ -4866,9 +4948,8 @@ mod tests {
         );
 
         assert!(matches!(
-            session.next_event().await.expect("text delta"),
-            Some(RealtimeSessionEvent::OutputTextDeltaForItem { delta, .. })
-                if delta == "Looping now"
+            session.next_event().await.expect("audio delta"),
+            Some(RealtimeSessionEvent::OutputAudioChunk { .. })
         ));
         assert!(matches!(
             session.next_event().await.expect("interrupted"),
@@ -6167,6 +6248,119 @@ mod tests {
             Some(RealtimeSessionEvent::OutputTextDeltaForItem { delta, .. }) if delta == "birch seventeen"
         ));
         assert_eq!(session.next_event().await.expect("eof"), None);
+    }
+
+    /// R3-5 (P2): user-speech barge-in must not interrupt a text-only
+    /// (sideband-text) response. Pre-R3-5 a single `response_output_active`
+    /// bit gated audio + text, so user speech cancelled active text
+    /// responses too — making the G9 typed `commit_input
+    /// { response_modality: text }` path unusable in any session that also
+    /// streams user audio. This test feeds a text delta, then a
+    /// speech-started event, and asserts the channel does NOT emit
+    /// `Interrupted` and continues to surface text deltas afterwards.
+    #[tokio::test]
+    async fn provider_neutral_session_text_only_response_survives_user_speech_barge_in() {
+        let mut session = OpenAiRealtimeSession::new(
+            Box::new(FakeOpenAiLiveSession {
+                seen: Arc::new(Mutex::new(Vec::new())),
+                next_events: Arc::new(Mutex::new(VecDeque::from(vec![
+                    Ok(Some(ServerEvent::ResponseOutputTextDelta {
+                        event_id: "evt_text_1".to_string(),
+                        response_id: "resp_text".to_string(),
+                        item_id: "item_text".to_string(),
+                        output_index: 0,
+                        content_index: 0,
+                        delta: "side".to_string(),
+                    })),
+                    Ok(Some(ServerEvent::InputAudioBufferSpeechStarted {
+                        event_id: "evt_speech_started".to_string(),
+                        audio_start_ms: 0,
+                        item_id: "item_user".to_string(),
+                    })),
+                    Ok(Some(ServerEvent::ResponseOutputTextDelta {
+                        event_id: "evt_text_2".to_string(),
+                        response_id: "resp_text".to_string(),
+                        item_id: "item_text".to_string(),
+                        output_index: 0,
+                        content_index: 0,
+                        delta: "band".to_string(),
+                    })),
+                    Ok(None),
+                ]))),
+            }),
+            RealtimeTurningMode::ExplicitCommit,
+        );
+
+        // First text delta arrives.
+        assert!(matches!(
+            session.next_event().await.expect("first text delta"),
+            Some(RealtimeSessionEvent::OutputTextDeltaForItem { delta, .. })
+                if delta == "side"
+        ));
+
+        // User speech-started must NOT emit `Interrupted` because the
+        // active response is text-only (audio_output_active = false).
+        // The barge-in path falls through to the no-op branch which
+        // surfaces a bare `TurnStarted` for new-turn signalling.
+        let after_speech = session
+            .next_event()
+            .await
+            .expect("speech-started should still surface a turn boundary");
+        assert!(
+            matches!(after_speech, Some(RealtimeSessionEvent::TurnStarted)),
+            "text-only response must survive user-speech barge-in (got {:?})",
+            after_speech
+        );
+
+        // The text response keeps emitting deltas through and after the
+        // user-audio overlap — that's the sideband-text use case the
+        // G9 typed path enables.
+        assert!(matches!(
+            session.next_event().await.expect("second text delta"),
+            Some(RealtimeSessionEvent::OutputTextDeltaForItem { delta, .. })
+                if delta == "band"
+        ));
+    }
+
+    /// R3-5 (P2): control case for the barge-in split — an active
+    /// audio-modality response must still be interrupted by user speech
+    /// (the spoken-conversation contract is unchanged). Pairs with
+    /// `provider_neutral_session_text_only_response_survives_user_speech_barge_in`.
+    #[tokio::test]
+    async fn provider_neutral_session_audio_response_is_interrupted_by_user_speech() {
+        let mut session = OpenAiRealtimeSession::new(
+            Box::new(FakeOpenAiLiveSession {
+                seen: Arc::new(Mutex::new(Vec::new())),
+                next_events: Arc::new(Mutex::new(VecDeque::from(vec![
+                    Ok(Some(ServerEvent::ResponseOutputAudioDelta {
+                        event_id: "evt_audio_1".to_string(),
+                        response_id: "resp_audio".to_string(),
+                        item_id: "item_audio".to_string(),
+                        output_index: 0,
+                        content_index: 0,
+                        delta: "AAEC".to_string(),
+                    })),
+                    Ok(Some(ServerEvent::InputAudioBufferSpeechStarted {
+                        event_id: "evt_speech_started".to_string(),
+                        audio_start_ms: 0,
+                        item_id: "item_user".to_string(),
+                    })),
+                    Ok(None),
+                ]))),
+            }),
+            RealtimeTurningMode::ProviderManaged,
+        );
+
+        assert!(matches!(
+            session.next_event().await.expect("audio chunk"),
+            Some(RealtimeSessionEvent::OutputAudioChunk { .. })
+        ));
+        assert!(matches!(
+            session.next_event().await.expect("interrupted"),
+            Some(RealtimeSessionEvent::Interrupted {
+                response_id: Some(response_id),
+            }) if response_id == "resp_audio"
+        ));
     }
 
     #[tokio::test]

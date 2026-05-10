@@ -246,8 +246,19 @@ pub async fn handle_live_open(
             return RpcResponse::error(id, code, message);
         }
 
+        // R3-1 (P1): honor the caller's optional `turning_mode` override.
+        // Default = `ProviderManaged` (back-compat with pre-R3-1 callers).
+        // Callers that need the G9 typed text-only `live/commit_input`
+        // path must pass `ExplicitCommit` here — the OpenAI realtime API
+        // rejects `input_audio_buffer.commit` unless the session was
+        // opened in explicit-commit mode, and the rejected commit
+        // surfaces as a terminal `LiveAdapterObservation::Error` that
+        // closes the channel.
+        let turning_mode = parsed
+            .turning_mode
+            .unwrap_or(RealtimeTurningMode::ProviderManaged);
         let open_config = match runtime
-            .live_open_config_for_session(&session_id, RealtimeTurningMode::ProviderManaged)
+            .live_open_config_for_session(&session_id, turning_mode)
             .await
         {
             Ok(config) => config,
@@ -912,6 +923,18 @@ mod tests {
     fn live_open_params_roundtrip() {
         let v = LiveOpenParams {
             session_id: "sess-123".into(),
+            turning_mode: None,
+        };
+        assert_eq!(round_trip(&v), v);
+    }
+
+    #[test]
+    fn live_open_params_explicit_commit_roundtrip() {
+        // R3-1 (P1): explicit-commit on the wire so the G9 typed text-only
+        // commit_input path is reachable.
+        let v = LiveOpenParams {
+            session_id: "sess-123".into(),
+            turning_mode: Some(RealtimeTurningMode::ExplicitCommit),
         };
         assert_eq!(round_trip(&v), v);
     }
