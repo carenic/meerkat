@@ -169,6 +169,13 @@ pub enum WireConversionError {
     /// server logs.
     #[error("unknown wire config-rejection-reason variant: {debug}")]
     ConfigRejectionReason { debug: String },
+    /// Wire transcript-source is the explicit-Unknown sentinel; no inverse
+    /// mapping exists. Carries the original debug payload for server logs.
+    /// R7-4 (P3 dogma): mirrors the live-wire `Unknown` pattern for
+    /// `WireTranscriptSource` so future core variants are not silently
+    /// misattributed as `Spoken`.
+    #[error("unknown wire transcript-source variant: {debug}")]
+    TranscriptSource { debug: String },
 }
 
 impl TryFrom<WireLiveTransportBootstrap> for LiveTransportBootstrap {
