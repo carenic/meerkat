@@ -32,6 +32,49 @@ fn empty_ledger_has_no_admissions() {
 }
 
 #[test]
+fn runtime_pre_admission_registration_calls_restore_on_drop_and_disarms() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use meerkat::session_runtime::admission::{
+        RuntimePreAdmissionRegistration, RuntimePreAdmissionRestore,
+    };
+    use meerkat_core::InputId;
+
+    struct CountingRestore {
+        calls: AtomicUsize,
+    }
+
+    impl RuntimePreAdmissionRestore for CountingRestore {
+        fn restore_or_release(&self, _session_id: &SessionId, _input_id: &InputId) {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    let restore = Arc::new(CountingRestore {
+        calls: AtomicUsize::new(0),
+    });
+
+    // Armed: drop should fire restore once.
+    {
+        let _registration = RuntimePreAdmissionRegistration::new(
+            Arc::clone(&restore) as Arc<dyn RuntimePreAdmissionRestore>,
+            SessionId::new(),
+            InputId::new(),
+        );
+    }
+    assert_eq!(restore.calls.load(Ordering::SeqCst), 1);
+
+    // Disarmed: drop should not fire restore.
+    let registration = RuntimePreAdmissionRegistration::new(
+        Arc::clone(&restore) as Arc<dyn RuntimePreAdmissionRestore>,
+        SessionId::new(),
+        InputId::new(),
+    );
+    registration.disarm();
+    assert_eq!(restore.calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
 fn staged_admission_restore_holds_session_id() {
     let ledger = empty_ledger();
     let session = SessionId::new();

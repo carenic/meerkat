@@ -108,80 +108,57 @@ pub(crate) use meerkat::session_runtime::admission::{
 
 pub(crate) use meerkat::session_runtime::admission::{
     RuntimePreAdmission, RuntimePreAdmissionEntry, RuntimePreAdmissionGuard,
-    RuntimeRegistrationLockLease, StagedAdmissionRestore, StagedArchiveRollbackGuard,
+    RuntimePreAdmissionRegistration, RuntimePreAdmissionRestore, RuntimeRegistrationLockLease,
+    StagedAdmissionRestore, StagedArchiveRollbackGuard,
 };
 pub(crate) use meerkat::session_runtime::recovery::{
     RecoveredCreateRequest, RecoveryRuntimeBindingMode,
 };
 
 pub(crate) use meerkat::session_runtime::runtime_state::{
+    ArchiveRuntimeCleanup, ArchiveRuntimeMcpState, ArchiveRuntimeMobState,
     PendingSessionEventStreamDrop, PendingSessionEventStreams,
 };
 
-#[derive(Clone)]
-struct ArchiveRuntimeCleanup {
-    runtime_adapter: Arc<MeerkatMachine>,
-    pending_session_event_streams:
-        Option<Arc<Mutex<HashMap<SessionId, PendingSessionEventStreams>>>>,
-    #[cfg(feature = "mcp")]
-    mcp_sessions: Option<Arc<RwLock<std::collections::HashMap<SessionId, SessionMcpState>>>>,
-    #[cfg(feature = "mob")]
-    mob_state: Option<Arc<meerkat_mob_mcp::MobMcpState>>,
+/// RPC-side adapter implementing [`ArchiveRuntimeMcpState`] for the
+/// per-session MCP adapter map. Cleanup removes the entry and shuts
+/// down the adapter, identical to the previous inlined logic.
+#[cfg(feature = "mcp")]
+struct RpcMcpStateAdapter {
+    sessions: Arc<RwLock<std::collections::HashMap<SessionId, SessionMcpState>>>,
 }
 
-impl ArchiveRuntimeCleanup {
-    async fn has_retained_mob_cleanup(&self, session_id: &SessionId) -> bool {
-        #[cfg(feature = "mob")]
-        if let Some(mob_state) = self.mob_state.as_ref()
-            && mob_state
-                .has_bridge_session_scoped_mobs(&session_id.to_string())
-                .await
-        {
-            return true;
-        }
-
-        #[cfg(not(feature = "mob"))]
-        let _ = session_id;
-
-        false
-    }
-
-    async fn archive_service(
-        &self,
-        service: &PersistentSessionService<FactoryAgentBuilder>,
-        session_id: &SessionId,
-    ) -> Result<(), SessionError> {
-        service
-            .archive_with_machine_protocol(
-                session_id,
-                MachineSessionArchiveProtocol::from_machine(self.runtime_adapter.as_ref()),
-            )
-            .await
-    }
-
-    async fn run(&self, session_id: &SessionId) -> Result<(), SessionError> {
-        self.runtime_adapter.unregister_session(session_id).await;
-        if let Some(streams) = self.pending_session_event_streams.as_ref() {
-            streams.lock().await.remove(session_id);
-        }
-        #[cfg(feature = "mcp")]
-        if let Some(mcp_sessions) = self.mcp_sessions.as_ref()
-            && let Some(state) = mcp_sessions.write().await.remove(session_id)
-        {
+#[cfg(feature = "mcp")]
+#[async_trait::async_trait]
+impl ArchiveRuntimeMcpState for RpcMcpStateAdapter {
+    async fn cleanup(&self, session_id: &SessionId) {
+        if let Some(state) = self.sessions.write().await.remove(session_id) {
             state.adapter.shutdown().await;
         }
-        #[cfg(feature = "mob")]
-        if let Some(mob_state) = self.mob_state.as_ref() {
-            mob_state
-                .destroy_bridge_session_mobs(&session_id.to_string())
-                .await
-                .map_err(|error| {
-                    error.into_session_error("mob cleanup during archive incomplete")
-                })?;
-        }
-        #[cfg(feature = "comms")]
-        self.runtime_adapter.abort_comms_drain(session_id).await;
-        Ok(())
+    }
+}
+
+/// RPC-side adapter implementing [`ArchiveRuntimeMobState`] on top of
+/// `meerkat_mob_mcp::MobMcpState`. Mirrors the previous inlined logic.
+#[cfg(feature = "mob")]
+struct RpcMobStateAdapter {
+    state: Arc<meerkat_mob_mcp::MobMcpState>,
+}
+
+#[cfg(feature = "mob")]
+#[async_trait::async_trait]
+impl ArchiveRuntimeMobState for RpcMobStateAdapter {
+    async fn cleanup(&self, session_id: &SessionId) -> Result<(), SessionError> {
+        self.state
+            .destroy_bridge_session_mobs(&session_id.to_string())
+            .await
+            .map_err(|error| error.into_session_error("mob cleanup during archive incomplete"))
+    }
+
+    async fn has_retained_cleanup(&self, session_id: &SessionId) -> bool {
+        self.state
+            .has_bridge_session_scoped_mobs(&session_id.to_string())
+            .await
     }
 }
 
@@ -198,16 +175,14 @@ use meerkat::session_runtime::live_orchestration::{
     builtin_tool_visibility_witness, exported_tool_visibility_state,
 };
 
-// W1-C deferred: `RuntimePreAdmissionRegistration` holds an
-// `Arc<SessionRuntime>` and dispatches a method on it from Drop, so it
-// can't move to `meerkat::session_runtime::admission` without either a
-// trait abstraction or pulling `SessionRuntime` itself upstream — out
-// of scope for Wave 1's pure-type-move charter. Tracked in W3.
-struct RuntimePreAdmissionRegistration {
-    runtime: Arc<SessionRuntime>,
-    session_id: SessionId,
-    input_id: InputId,
-    release_on_drop: bool,
+// W3-A: `RuntimePreAdmissionRegistration` lives in
+// `meerkat::session_runtime::admission` behind a
+// `RuntimePreAdmissionRestore` trait. RPC's `SessionRuntime` implements
+// the trait below.
+impl RuntimePreAdmissionRestore for SessionRuntime {
+    fn restore_or_release(&self, session_id: &SessionId, input_id: &InputId) {
+        self.restore_or_release_runtime_pre_admission(session_id, input_id);
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -222,30 +197,6 @@ struct PendingPromotionPreTurnHook {
     reached_flag: std::sync::atomic::AtomicBool,
     reached: Notify,
     release: Notify,
-}
-
-impl RuntimePreAdmissionRegistration {
-    fn new(runtime: Arc<SessionRuntime>, session_id: SessionId, input_id: InputId) -> Self {
-        Self {
-            runtime,
-            session_id,
-            input_id,
-            release_on_drop: true,
-        }
-    }
-
-    fn disarm(mut self) {
-        self.release_on_drop = false;
-    }
-}
-
-impl Drop for RuntimePreAdmissionRegistration {
-    fn drop(&mut self) {
-        if self.release_on_drop {
-            self.runtime
-                .restore_or_release_runtime_pre_admission(&self.session_id, &self.input_id);
-        }
-    }
 }
 
 async fn await_guarded_session_cleanup(
@@ -413,10 +364,17 @@ impl RpcMobSessionService {
         ArchiveRuntimeCleanup {
             runtime_adapter: Arc::clone(&self.runtime_adapter),
             pending_session_event_streams: None,
-            #[cfg(feature = "mcp")]
-            mcp_sessions: None,
+            mcp_state: None,
             #[cfg(feature = "mob")]
-            mob_state: self.mob_state.read().ok().and_then(|slot| slot.clone()),
+            mob_state: self.mob_state.read().ok().and_then(|slot| {
+                slot.as_ref().map(|state| {
+                    Arc::new(RpcMobStateAdapter {
+                        state: Arc::clone(state),
+                    }) as Arc<dyn ArchiveRuntimeMobState>
+                })
+            }),
+            #[cfg(not(feature = "mob"))]
+            mob_state: None,
         }
     }
 
@@ -1192,11 +1150,9 @@ fn profile_to_capability_surface(
 // RPC keeps a type alias so existing call sites still resolve.
 pub(crate) use meerkat::session_runtime::llm_reconfigure::SessionRuntimeLlmReconfigureHost;
 
-#[derive(Clone)]
-struct SkillIdentityRegistryState {
-    generation: u64,
-    registry: SourceIdentityRegistry,
-}
+// W3-A: `SkillIdentityRegistryState` and `build_skill_identity_registry`
+// moved to `meerkat::session_runtime::runtime_state`.
+pub(crate) use meerkat::session_runtime::runtime_state::SkillIdentityRegistryState;
 
 #[cfg(feature = "mcp")]
 struct SessionMcpState {
@@ -2029,7 +1985,7 @@ impl SessionRuntime {
     ) -> Result<RuntimePreAdmissionRegistration, RpcError> {
         self.insert_runtime_pre_admission(session_id.clone(), input_id.clone(), admission)?;
         Ok(RuntimePreAdmissionRegistration::new(
-            Arc::clone(self),
+            Arc::clone(self) as Arc<dyn RuntimePreAdmissionRestore>,
             session_id,
             input_id,
         ))
@@ -2626,9 +2582,17 @@ impl SessionRuntime {
             runtime_adapter: Arc::clone(&self.runtime_adapter),
             pending_session_event_streams: Some(Arc::clone(&self.pending_session_event_streams)),
             #[cfg(feature = "mcp")]
-            mcp_sessions: Some(Arc::clone(&self.mcp_sessions)),
+            mcp_state: Some(Arc::new(RpcMcpStateAdapter {
+                sessions: Arc::clone(&self.mcp_sessions),
+            }) as Arc<dyn ArchiveRuntimeMcpState>),
+            #[cfg(not(feature = "mcp"))]
+            mcp_state: None,
             #[cfg(feature = "mob")]
-            mob_state: self.mob_state(),
+            mob_state: self.mob_state().map(|state| {
+                Arc::new(RpcMobStateAdapter { state }) as Arc<dyn ArchiveRuntimeMobState>
+            }),
+            #[cfg(not(feature = "mob"))]
+            mob_state: None,
         }
     }
 
@@ -5345,21 +5309,19 @@ impl SessionRuntime {
     }
 
     /// Build a source identity registry from runtime config.
+    ///
+    /// W3-A: thin RPC delegate to
+    /// [`meerkat::session_runtime::runtime_state::build_skill_identity_registry`].
     pub fn build_skill_identity_registry(
         config: &Config,
         context_root: Option<&std::path::Path>,
         user_root: Option<&std::path::Path>,
     ) -> Result<SourceIdentityRegistry, SkillError> {
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            let _ = (context_root, user_root);
-            config.skills.build_source_identity_registry()
-        }
-        #[cfg(target_arch = "wasm32")]
-        {
-            let _ = (context_root, user_root);
-            config.skills.build_source_identity_registry()
-        }
+        meerkat::session_runtime::runtime_state::build_skill_identity_registry(
+            config,
+            context_root,
+            user_root,
+        )
     }
 
     /// Create a new session with the given build configuration.

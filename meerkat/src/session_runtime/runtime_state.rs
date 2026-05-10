@@ -3,22 +3,24 @@
 //! Populated by W1-E (`PendingSessionEventStreams`,
 //! `PendingSessionEventStreamDrop`), W2-E (`SessionInfo`,
 //! `SessionState` enums + state observers), and W3-A (skill-identity
-//! registry plumbing).
+//! registry plumbing + `ArchiveRuntimeCleanup`).
 //!
-//! `ArchiveRuntimeCleanup` deliberately stays in `meerkat-rpc` until
-//! W3-A: its fields reference `SessionMcpState` (RPC-private) and
-//! `meerkat_mob_mcp::MobMcpState` (a crate `meerkat` does not yet
-//! depend on). Moving it now would require generics + trait bounds
-//! (behaviour-changing) or new `meerkat` deps; either is broader than
-//! Wave 1's "pure type move" charter. Tracked in W3-A.
+//! `ArchiveRuntimeCleanup` lives here in trait-shaped form: the MCP
+//! and Mob cleanup hooks are abstracted behind
+//! [`ArchiveRuntimeMcpState`] and [`ArchiveRuntimeMobState`] so the
+//! struct does not need to depend on `meerkat-mob-mcp` (which the
+//! `meerkat` facade does not pull in) or know about the RPC-private
+//! `SessionMcpState`. Surfaces wire their own implementations.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use meerkat_core::EventEnvelope;
 use meerkat_core::event::AgentEvent;
+use meerkat_core::skills::{SkillError, SourceIdentityRegistry};
 use meerkat_core::types::SessionId;
-use tokio::sync::{Notify, broadcast};
+use tokio::sync::{Mutex, Notify, broadcast};
 
 /// Observable lifecycle state of a session.
 ///
@@ -93,6 +95,159 @@ pub struct PendingSessionEventStreamDrop {
 impl Drop for PendingSessionEventStreamDrop {
     fn drop(&mut self) {
         self.receiver_dropped.notify_one();
+    }
+}
+
+/// Skill-identity registry slot held by the session runtime.
+///
+/// `generation` is a monotone version stamp that lets the runtime guard
+/// against stale writes after a config reload races a still-in-flight
+/// builder. Surfaces inject the latest registry into
+/// `ContextWindowBuilder` per-session via the runtime accessor.
+#[derive(Clone, Default)]
+pub struct SkillIdentityRegistryState {
+    /// Monotonic generation counter; writes only land if their
+    /// generation is `>=` the currently-stored generation.
+    pub generation: u64,
+    /// The active registry projected onto agents.
+    pub registry: SourceIdentityRegistry,
+}
+
+/// Build a `SourceIdentityRegistry` from runtime config.
+///
+/// Surface-agnostic: surfaces (RPC, REST, CLI, embedded examples) call
+/// this from their config-load path and feed the result into a
+/// runtime accessor. Identical body to the original RPC-side helper.
+#[allow(clippy::missing_errors_doc)]
+pub fn build_skill_identity_registry(
+    config: &meerkat_core::Config,
+    context_root: Option<&std::path::Path>,
+    user_root: Option<&std::path::Path>,
+) -> Result<SourceIdentityRegistry, SkillError> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let _ = (context_root, user_root);
+        config.skills.build_source_identity_registry()
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = (context_root, user_root);
+        config.skills.build_source_identity_registry()
+    }
+}
+
+/// Per-surface MCP cleanup hook used by [`ArchiveRuntimeCleanup`].
+///
+/// Surfaces that own MCP session adapters (e.g. `meerkat-rpc`) implement
+/// this to shutdown their adapter when a session is archived. The
+/// trait is intentionally narrow: `cleanup` is the only side-effect the
+/// archive flow needs.
+#[async_trait]
+pub trait ArchiveRuntimeMcpState: Send + Sync {
+    /// Tear down the MCP adapter (and any per-session lifecycle plumbing)
+    /// for `session_id`. Implementations are expected to be idempotent —
+    /// a missing entry is a no-op.
+    async fn cleanup(&self, session_id: &SessionId);
+}
+
+/// Per-surface Mob cleanup hook used by [`ArchiveRuntimeCleanup`].
+///
+/// `meerkat-rpc` (the only surface today that wires mob orchestration)
+/// implements this on top of `meerkat_mob_mcp::MobMcpState`. The trait
+/// keeps `meerkat` from depending on `meerkat-mob-mcp`.
+#[async_trait]
+pub trait ArchiveRuntimeMobState: Send + Sync {
+    /// Drop session-scoped mob state. The result is propagated by
+    /// [`ArchiveRuntimeCleanup::run`].
+    async fn cleanup(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), meerkat_core::service::SessionError>;
+
+    /// Whether session-scoped mob state still exists for `session_id`
+    /// after the service-side archive failed. The archive flow uses
+    /// this to distinguish "session never existed" from "session is
+    /// retained for follow-up cleanup".
+    async fn has_retained_cleanup(&self, session_id: &SessionId) -> bool;
+}
+
+/// Surface-agnostic archive cleanup orchestrator.
+///
+/// Composes the runtime adapter, the per-session pending event-stream
+/// map, and the optional MCP / Mob cleanup hooks. Surfaces build one of
+/// these per archive call and either invoke `archive_service` followed
+/// by `run`, or just `run` when the service step has already happened.
+#[derive(Clone)]
+pub struct ArchiveRuntimeCleanup {
+    /// Runtime adapter; used to unregister the session and abort comms
+    /// drain.
+    pub runtime_adapter: Arc<meerkat_runtime::MeerkatMachine>,
+    /// Per-session pending event streams. `None` for surfaces that
+    /// don't track them (e.g. mob session service flows).
+    pub pending_session_event_streams:
+        Option<Arc<Mutex<HashMap<SessionId, PendingSessionEventStreams>>>>,
+    /// Optional MCP cleanup hook; surfaces implement
+    /// [`ArchiveRuntimeMcpState`] for their adapter map.
+    pub mcp_state: Option<Arc<dyn ArchiveRuntimeMcpState>>,
+    /// Optional Mob cleanup hook; surfaces implement
+    /// [`ArchiveRuntimeMobState`] for their `MobMcpState` wrapper.
+    pub mob_state: Option<Arc<dyn ArchiveRuntimeMobState>>,
+}
+
+impl ArchiveRuntimeCleanup {
+    /// Whether the mob cleanup hook reports retained per-session state
+    /// after the service-side archive returned `NotFound`. Used by the
+    /// archive flow to decide whether to surface the not-found error or
+    /// treat the archive as a benign no-op.
+    pub async fn has_retained_mob_cleanup(&self, session_id: &SessionId) -> bool {
+        if let Some(mob_state) = self.mob_state.as_ref()
+            && mob_state.has_retained_cleanup(session_id).await
+        {
+            return true;
+        }
+        false
+    }
+
+    /// Run the durable-store archive step. Surfaces that already
+    /// archived through the service skip this and call [`run`]
+    /// directly.
+    #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+    pub async fn archive_service(
+        &self,
+        service: &crate::PersistentSessionService<crate::service_factory::FactoryAgentBuilder>,
+        session_id: &SessionId,
+    ) -> Result<(), meerkat_core::service::SessionError> {
+        service
+            .archive_with_machine_protocol(
+                session_id,
+                meerkat_session::MachineSessionArchiveProtocol::from_machine(
+                    self.runtime_adapter.as_ref(),
+                ),
+            )
+            .await
+    }
+
+    /// Run the per-surface cleanup steps that follow a successful
+    /// archive: unregister from the runtime adapter, drop pending event
+    /// streams, tear down MCP adapters, destroy mob state, abort comms
+    /// drain.
+    pub async fn run(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), meerkat_core::service::SessionError> {
+        self.runtime_adapter.unregister_session(session_id).await;
+        if let Some(streams) = self.pending_session_event_streams.as_ref() {
+            streams.lock().await.remove(session_id);
+        }
+        if let Some(mcp_state) = self.mcp_state.as_ref() {
+            mcp_state.cleanup(session_id).await;
+        }
+        if let Some(mob_state) = self.mob_state.as_ref() {
+            mob_state.cleanup(session_id).await?;
+        }
+        #[cfg(feature = "comms")]
+        self.runtime_adapter.abort_comms_drain(session_id).await;
+        Ok(())
     }
 }
 

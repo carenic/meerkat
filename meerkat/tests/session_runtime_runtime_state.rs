@@ -78,3 +78,80 @@ fn session_info_holds_session_id_state_and_labels() {
     assert_eq!(info.state, SessionState::Idle);
     assert_eq!(info.labels, labels);
 }
+
+#[test]
+fn skill_identity_registry_state_default_is_empty_generation_zero() {
+    use meerkat::session_runtime::runtime_state::SkillIdentityRegistryState;
+
+    let state = SkillIdentityRegistryState::default();
+    assert_eq!(state.generation, 0);
+}
+
+#[test]
+fn build_skill_identity_registry_returns_default_for_empty_skills_config() {
+    use meerkat::session_runtime::runtime_state::build_skill_identity_registry;
+    use meerkat_core::Config;
+
+    let config = Config::default();
+    let registry =
+        build_skill_identity_registry(&config, None, None).expect("default config builds clean");
+    // Default config has no remaps; resulting registry is empty.
+    let _ = registry;
+}
+
+#[tokio::test]
+async fn archive_runtime_cleanup_dispatches_to_trait_hooks() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use meerkat::session_runtime::runtime_state::{
+        ArchiveRuntimeCleanup, ArchiveRuntimeMcpState, ArchiveRuntimeMobState,
+    };
+    use meerkat_core::service::SessionError;
+    use meerkat_core::types::SessionId;
+    use meerkat_runtime::MeerkatMachine;
+
+    struct McpStub {
+        ran: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ArchiveRuntimeMcpState for McpStub {
+        async fn cleanup(&self, _session_id: &SessionId) {
+            self.ran.store(true, Ordering::SeqCst);
+        }
+    }
+
+    struct MobStub {
+        ran: Arc<AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl ArchiveRuntimeMobState for MobStub {
+        async fn cleanup(&self, _session_id: &SessionId) -> Result<(), SessionError> {
+            self.ran.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn has_retained_cleanup(&self, _session_id: &SessionId) -> bool {
+            false
+        }
+    }
+
+    let mcp_ran = Arc::new(AtomicBool::new(false));
+    let mob_ran = Arc::new(AtomicBool::new(false));
+    let runtime_adapter = Arc::new(MeerkatMachine::ephemeral());
+    let cleanup = ArchiveRuntimeCleanup {
+        runtime_adapter,
+        pending_session_event_streams: None,
+        mcp_state: Some(Arc::new(McpStub {
+            ran: Arc::clone(&mcp_ran),
+        })),
+        mob_state: Some(Arc::new(MobStub {
+            ran: Arc::clone(&mob_ran),
+        })),
+    };
+    let session_id = SessionId::new();
+    cleanup.run(&session_id).await.expect("cleanup runs");
+    assert!(mcp_ran.load(Ordering::SeqCst));
+    assert!(mob_ran.load(Ordering::SeqCst));
+}

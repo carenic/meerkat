@@ -292,3 +292,67 @@ impl Drop for StagedArchiveRollbackGuard {
         });
     }
 }
+
+/// Per-surface hook that releases or restores the runtime
+/// pre-admission tracked under `(session_id, input_id)` when its
+/// [`RuntimePreAdmissionRegistration`] guard goes out of scope.
+///
+/// Surfaces (RPC today; REST/CLI/embedded examples later) implement
+/// this on top of their own `runtime_pre_admissions` map. The trait
+/// keeps [`RuntimePreAdmissionRegistration`] from depending on a
+/// concrete `SessionRuntime` type.
+pub trait RuntimePreAdmissionRestore: Send + Sync {
+    /// Release the admission entry for `(session_id, input_id)`. Drop
+    /// semantics call this when `release_on_drop` was not disarmed.
+    /// Implementations must be idempotent — a missing entry is a
+    /// no-op.
+    fn restore_or_release(&self, session_id: &SessionId, input_id: &InputId);
+}
+
+/// RAII guard around a runtime pre-admission registration.
+///
+/// While alive, it holds onto the `(session_id, input_id)` slot in the
+/// surface's pre-admission map; on Drop, it asks the surface (via
+/// [`RuntimePreAdmissionRestore`]) to release or restore the slot.
+/// `disarm` consumes the guard without firing the Drop release —
+/// callers do this once the admission has been promoted into a
+/// long-lived owner (e.g. handed to the runtime executor task).
+pub struct RuntimePreAdmissionRegistration {
+    runtime: Arc<dyn RuntimePreAdmissionRestore>,
+    session_id: SessionId,
+    input_id: InputId,
+    release_on_drop: bool,
+}
+
+impl RuntimePreAdmissionRegistration {
+    /// Build a new registration. The `runtime` parameter is the
+    /// surface's own pre-admission ledger; surfaces wrap themselves in
+    /// an `Arc<dyn RuntimePreAdmissionRestore>` and pass it in.
+    pub fn new(
+        runtime: Arc<dyn RuntimePreAdmissionRestore>,
+        session_id: SessionId,
+        input_id: InputId,
+    ) -> Self {
+        Self {
+            runtime,
+            session_id,
+            input_id,
+            release_on_drop: true,
+        }
+    }
+
+    /// Suppress Drop-time release. Call after the admission has been
+    /// transferred to its long-lived owner.
+    pub fn disarm(mut self) {
+        self.release_on_drop = false;
+    }
+}
+
+impl Drop for RuntimePreAdmissionRegistration {
+    fn drop(&mut self) {
+        if self.release_on_drop {
+            self.runtime
+                .restore_or_release(&self.session_id, &self.input_id);
+        }
+    }
+}

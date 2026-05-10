@@ -344,11 +344,17 @@ self-verify.
 
 ### Phase 3 — Wave 3: builder + skill-identity + config plumbing
 
-- [ ] fix · [ ] verify · **W3-A.** Move `SkillIdentityRegistryState`,
-  `skill_identity_registry`, `set_skill_identity_registry_for_generation`,
-  `build_skill_identity_registry` to
-  `meerkat::session_runtime::runtime_state`. Already pure session
-  glue; only used to inject SkillSource into ContextWindowBuilder.
+- [x] fix · [ ] verify · **W3-A.** Move `SkillIdentityRegistryState`,
+  `build_skill_identity_registry`, plus the W1-E-deferred
+  `ArchiveRuntimeCleanup` (now generalized via two thin traits
+  `ArchiveRuntimeMcpState` and `ArchiveRuntimeMobState`) and the
+  W1-C-deferred `RuntimePreAdmissionRegistration` (generalized via a
+  thin trait `RuntimePreAdmissionRestore`) to
+  `meerkat::session_runtime::runtime_state` and `admission`. RPC
+  implements the traits and constructs the moved types directly.
+  Three regression tests exercise the new shapes
+  (`session_runtime_runtime_state.rs`,
+  `session_runtime_admission.rs`).
 
 - [ ] fix · [ ] verify · **W3-B.** Move `config_runtime`, `realm_id`,
   `instance_id`, `backend`, `default_llm_client`,
