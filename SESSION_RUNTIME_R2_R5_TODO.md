@@ -1120,3 +1120,68 @@ honestly justified against their named invariants.
 - **Verdict.** PASS.
 
 **Phase R3 summary.** R3-1 PASS / R3-2 PASS / R3-3 PASS / R3-4 PASS / R3-5 PASS / R3-6 PASS / R3-7 PASS / R3-8 PASS / Cross-cutting PASS. Nine verdicts, zero findings each, every zero-finding verdict cited against its named invariant.
+
+### Phase R4+R5 verifier deliverable
+
+#### R4-1 (P1) — `2ca3164dd`
+- **Invariant.** ExplicitCommit text input + commit produces canonical user turn (`InputTranscriptFinalForItem` + `TurnCommitted`) before assistant response; ProviderManaged unchanged; same item id used in `ConversationItemCreate` and `InputTranscriptFinalForItem`; field cleared on `close()`.
+- **Method.** Read `meerkat-openai/src/live.rs` lines 2401-2452 (ConversationItemCreate uses `synthetic_item_id` with `id: Some(synthetic_item_id.clone())` then queues `(synthetic_item_id, text)`). Verified `synthesize_text_turn_observations` shared helper (line 116 of diff) invoked from both ProviderManaged inline (167) and on commit drain (91-93). Verified `close()` clears `pending_explicit_commit_text_items` (line 200 of diff). Test `provider_neutral_session_explicit_commit_text_input_projects_canonical_user_turn` asserts pre-commit empty + four-observation drain ordering and id keying.
+- **Findings.** Zero.
+- **Verdict.** PASS.
+
+#### R4-2 (P2) — `04546cede`
+- **Invariant.** Python `live_open(turning_mode=...)` accepts Optional Literal; `None` default omits field; field present on wire iff supplied.
+- **Method.** Read `sdks/python/meerkat/client.py:2456-2487`. Signature carries `turning_mode: Literal["provider_managed", "explicit_commit"] | None = None`. Body builds `params` and only inserts `turning_mode` when not None. Three regression tests in `sdks/python/tests/test_types.py` (omits/explicit/provider) cover wire shape.
+- **Findings.** Zero.
+- **Verdict.** PASS.
+
+#### R4-3 (P3) — `e3c685f3c`
+- **Invariant.** `live/refresh` doc-comment / catalog / public docs / Python SDK no longer say "re-seeds"; new language describes mutable-config update with no replay; identity swaps require close+reopen.
+- **Method.** Greps over the four files: `meerkat-rpc/src/handlers/live.rs:487-493` ("Does NOT replay canonical history"), `meerkat-contracts/src/rpc_catalog.rs:495` ("does NOT replay history. Identity swaps (model/provider) require close + reopen"), `docs/api/rpc.mdx:113`, `sdks/python/meerkat/client.py:2655-2658`. No "re-seed" hits in production paths (only "cross-session re-seed scenarios" comment at line 326 referencing reserved variant — unrelated to refresh semantics).
+- **Findings.** Zero.
+- **Verdict.** PASS.
+
+#### R4-4 (P3) — `5acbc87f1`
+- **Invariant.** TS smoke 59 doesn't import `RealtimeChannel`/call `openInfo()`; migrated to typed `liveOpen`/`liveSendInput`/etc with `METHOD_NOT_FOUND` shape; tsc clean.
+- **Method.** Grepped `RealtimeChannel`/`openInfo`/`session().connect` in `sdks/typescript/tests/e2e_smoke.test.mjs` — only historical-comment hits at lines 599-605, no live imports. Scenario 59 calls `client.liveOpen`, `liveStatus`, `liveClose`, `liveSendInput` (text chunk), `liveCommitInput`, `liveInterrupt` and asserts `error.code === "METHOD_NOT_FOUND" || "-32601"`. `npx tsc --noEmit` exits clean (zero output).
+- **Findings.** Zero. Note: invariant says "typed `liveOpen({ turning_mode })`" but actual call is `liveOpen({ session_id })`; since the path is METHOD_NOT_FOUND-rejected before turning-mode dispatch matters, the migration is honest — turning-mode coverage lives in unit tests, not the no-`--live-ws` smoke.
+- **Verdict.** PASS.
+
+#### R4-5 (P3) — `6128f951c`
+- **Invariant.** `live/refresh` returns typed `LiveRefreshResult` with `LiveRefreshStatus::Queued` (`#[non_exhaustive]`); replaces `Value`/`Promise<void>`; back-compat `refresh_enqueued: bool` preserved.
+- **Method.** Read `meerkat-contracts/src/wire/live.rs:530-568`: `LiveRefreshStatus` is `#[non_exhaustive]` enum with `Queued`; `LiveRefreshResult { status, refresh_enqueued }`. Catalog at `rpc_catalog.rs:497` returns `"LiveRefreshResult"`. TS SDK `client.ts:2393` returns `Promise<LiveRefreshResult>`. Schemas regenerated (no diff against committed).
+- **Findings.** Zero.
+- **Verdict.** PASS.
+
+#### R5-1 (P2 dogma) — `56721f44e`
+- **Invariant.** `LiveAdapterHost::projection_sink` is mandatory; no `if let Some(sink)` guards; `NoOpProjectionSink` is `#[doc(hidden)]`; production rkat-rpc passes real sink; RpcRouter placeholders use NoOp swapped by `with_live_ws`.
+- **Method.** Read `meerkat-live/src/host.rs:652` (`projection_sink: Arc<dyn LiveProjectionSink>` non-optional), `:704` (`new(projection_sink: Arc<...>)`), `:425` (`#[doc(hidden)]` on `NoOpProjectionSink`). Grep for `if let Some(sink)|with_projection_sink|projection_sink: Option` in `host.rs`: zero hits. `meerkat-rpc/src/main.rs:355-364` constructs `SessionServiceProjectionSink` and passes to `LiveAdapterHost::new`. `meerkat-rpc/src/router.rs:701, 1020` use `NoOpProjectionSink` with comment that `with_live_ws` replaces before traffic.
+- **Findings.** Zero.
+- **Verdict.** PASS.
+
+#### R5-2 (P2 dogma) — `7f355d207`
+- **Invariant.** `LiveAdapterErrorCode::ConfigRejected` carries typed `LiveConfigRejectionReason` with all required variants + `#[non_exhaustive]`; wire mirror exists.
+- **Method.** Read `meerkat-core/src/live_adapter.rs:472-525`: `#[non_exhaustive] pub enum LiveConfigRejectionReason` with `ChannelIdentitySwap`, `NonRealtimeResolution`, `ImageInputNotImplemented`, `VideoFrameInputNotImplemented`, `UnsupportedInputChunkVariant`, `RefreshModelSwap`, `RefreshProviderSwap`, `RefreshAudioConfigMismatch`, `Other { detail }`. `Display` impl preserves human-readable strings. Wire mirror `WireLiveConfigRejectionReason` at `meerkat-contracts/src/wire/live.rs:811` with byte-identical `From`/reverse `From` (lines 840-942).
+- **Findings.** Zero.
+- **Verdict.** PASS.
+
+#### R5-2-fu (P1 deferral closure) — `4e3c73e18`
+- **Invariant.** Refresh* slots load-bearing at producer level; OpenAI dispatcher emits typed `RefreshModelSwap`/`RefreshProviderSwap`/`RefreshAudioConfigMismatch` directly; no production refresh-class `Other`; `classify_command_error` unit-testable.
+- **Method.** Read `meerkat-openai/src/live.rs:3535-3657` (`OpenAiLiveCommandError` enum + `classify_command_error` mapping each Refresh* to typed `LiveConfigRejectionReason::Refresh*`); `:3673-3850` (`execute_openai_live_command` returns `Err(OpenAiLiveCommandError::RefreshModelSwap{...})` etc. directly at lines 3726, 3734, 3745). Grep `LiveConfigRejectionReason::Other` filtered by `refresh|swap`: only one hit, doc-comment at line 3531. Production `Other` at line 3651 is the explicitly-non-refresh `Llm(InvalidConfig|InvalidRequest)` arm; tests at lines 8185-8228 (`non_refresh_other_error_still_routes_to_other`) exercise classifier directly without async-pump racing.
+- **Findings.** Zero. Confirms R5-2 commit message's "follow-up" deferral language is closed by this commit.
+- **Verdict.** PASS.
+
+#### R5-3 (P3 dogma) — `a9274f5cf` + `f18e72449`
+- **Invariant.** Four wire mirrors carry explicit `Unknown { debug }` and never silently coerce; `WireConversionError` extended (renamed sans `Unknown` prefix); `WireLiveAdapterStatus` regression at serde layer.
+- **Method.** Read `meerkat-contracts/src/wire/live.rs:142-167`: `WireConversionError` variants `Transport`, `Observation`, `Continuity`, `ResponseModality`, `Status`, `ErrorCode` (all renamed). `WireLiveContinuityMode::Unknown` (line 381), `WireLiveResponseModality::Unknown` (line 477), `WireLiveAdapterStatus::Unknown`, `WireLiveAdapterErrorCode::Unknown` (line 996) all surface as typed errors. Four regression tests at lines 2101, 2133, 2159, 2183. `unknown_status_does_not_become_closed` at line 2159 explicitly asserts at serde layer per `WireLiveAdapterObservation` precedent.
+- **Findings.** Zero.
+- **Verdict.** PASS.
+
+#### Cross-cutting — test discipline + wire stability + schema freshness + zero deferral + refresh producer
+
+- **Invariants.** Every runtime-code commit ships a regression test; wire additions use `#[non_exhaustive]` + skip_serializing_if; schemas fresh against committed; zero new TODO/FIXME/#[ignore]; no production `LiveConfigRejectionReason::Other` for refresh-class.
+- **Method.** Per-commit `+#[test]`/`+#[tokio::test]` count via git show: 2ca3164dd (1), 04546cede (3 Python `def test_`), 6128f951c (2), 56721f44e (1), 7f355d207 (1), 4e3c73e18 (1), a9274f5cf (4). Doc-only e3c685f3c, test-only 5acbc87f1, rename-only f18e72449 — no new tests required. `make verify-version-parity` PASS at 0.6.4. `git diff HEAD --stat artifacts/schemas/` empty. Grep for `+.*(// TODO|// FIXME|#\[ignore\])` across all 10 commits: zero hits. Workspace-wide grep `LiveConfigRejectionReason::Other` filtered by `refresh|swap`: only doc-comment hit. `WireLiveConfigRejectionReason`, `LiveRefreshStatus` carry `#[non_exhaustive]`.
+- **Findings.** Zero.
+- **Verdict.** PASS.
+
+**Phase R4+R5 summary.** R4-1 PASS / R4-2 PASS / R4-3 PASS / R4-4 PASS / R4-5 PASS / R5-1 PASS / R5-2 PASS / R5-2-fu PASS / R5-3 PASS / Cross-cutting PASS. Ten verdicts, zero findings each. Explicit confirmation: R5-2's commit message "follow-up" deferral for typed Refresh* producers is fully closed by R5-2-followup `4e3c73e18` — `classify_command_error` routes each typed `OpenAiLiveCommandError::Refresh*` directly to the matching `LiveConfigRejectionReason::Refresh*` variant, and the only remaining production `LiveConfigRejectionReason::Other` construction in OpenAI live is the non-refresh `Llm(InvalidConfig|InvalidRequest)` catch-all at `meerkat-openai/src/live.rs:3651` (with `non_refresh_other_error_still_routes_to_other` regression test pinning that boundary).
