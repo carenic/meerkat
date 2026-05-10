@@ -243,7 +243,14 @@ export type {
   WireLiveAdapterObservationCommandRejected,
   WireLiveAdapterStatus,
   WireLiveAdapterErrorCode,
+  WireLiveConfigRejectionReason,
   WireLiveDegradationReason,
+  // R7-1 (P2): typed `WireAssistantBlock` discriminated union — variants
+  // (Transcript, Text, Reasoning, ...) now emit typed inline `data` shapes
+  // rather than `Record<string, unknown>`, so SDK consumers can read
+  // transcript `text` / `source` and route on `block_type` without parsing
+  // raw JSON.
+  WireAssistantBlock,
   ProviderCatalog,
   RealtimeAudioChunk,
   RealtimeCapabilities,

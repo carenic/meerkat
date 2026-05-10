@@ -1780,6 +1780,72 @@ class WireLiveAdapterStatusUnknown(TypedDict, total=False):
 
 WireLiveAdapterStatus = WireLiveAdapterStatusIdle | WireLiveAdapterStatusOpening | WireLiveAdapterStatusReady | WireLiveAdapterStatusDegraded | WireLiveAdapterStatusClosing | WireLiveAdapterStatusClosed | WireLiveAdapterStatusUnknown
 
+# Wire mirror of
+# [`meerkat_core::live_adapter::LiveConfigRejectionReason`]. R5-2 (P2
+# dogma): pins the typed semantic-routing variants on the wire so SDKs
+# can distinguish a runtime-side identity swap from an adapter-side
+# input-modality rejection without string parsing.
+#
+# R6-5 (P3 dogma): closes the last typed-route-as-detail-string gap. The
+# previous wildcard fallback collapsed future core variants into
+# `Other { detail: "unknown_live_config_rejection_reason" }`, which SDK
+# consumers had to pattern-match on the English `detail` to route — the
+# exact "typed route becomes detail string" antipattern R3-6 + R5-3
+# closed for transport / observation / continuity / modality / status /
+# error_code. Future core variants now surface as `Unknown { debug }`
+# with the `{:?}` projection of the source variant preserved for
+# server-side observability.
+class WireLiveConfigRejectionReasonChannelIdentitySwap(TypedDict, total=False):
+    from_model: Required[str]
+    from_provider: Required[Any]
+    kind: Required[Literal['channel_identity_swap']]
+    to_model: Required[str]
+    to_provider: Required[Any]
+
+class WireLiveConfigRejectionReasonNonRealtimeResolution(TypedDict, total=False):
+    detail: Required[str]
+    kind: Required[Literal['non_realtime_resolution']]
+
+class WireLiveConfigRejectionReasonImageInputNotImplemented(TypedDict, total=False):
+    kind: Required[Literal['image_input_not_implemented']]
+
+class WireLiveConfigRejectionReasonVideoFrameInputNotImplemented(TypedDict, total=False):
+    kind: Required[Literal['video_frame_input_not_implemented']]
+
+class WireLiveConfigRejectionReasonUnsupportedInputChunkVariant(TypedDict, total=False):
+    kind: Required[Literal['unsupported_input_chunk_variant']]
+
+class WireLiveConfigRejectionReasonRefreshModelSwap(TypedDict, total=False):
+    from_model: Required[str]
+    kind: Required[Literal['refresh_model_swap']]
+    to_model: Required[str]
+
+class WireLiveConfigRejectionReasonRefreshProviderSwap(TypedDict, total=False):
+    from_provider: Required[str]
+    kind: Required[Literal['refresh_provider_swap']]
+    to_provider: Required[str]
+
+class WireLiveConfigRejectionReasonRefreshAudioConfigMismatch(TypedDict, total=False):
+    detail: Required[str]
+    kind: Required[Literal['refresh_audio_config_mismatch']]
+
+class WireLiveConfigRejectionReasonAudioInputFormatMismatch(TypedDict, total=False):
+    actual_channels: Required[int]
+    actual_sample_rate_hz: Required[int]
+    expected_channels: Required[int]
+    expected_sample_rate_hz: Required[int]
+    kind: Required[Literal['audio_input_format_mismatch']]
+
+class WireLiveConfigRejectionReasonOther(TypedDict, total=False):
+    detail: Required[str]
+    kind: Required[Literal['other']]
+
+class WireLiveConfigRejectionReasonUnknown(TypedDict, total=False):
+    debug: Required[str]
+    kind: Required[Literal['unknown']]
+
+WireLiveConfigRejectionReason = WireLiveConfigRejectionReasonChannelIdentitySwap | WireLiveConfigRejectionReasonNonRealtimeResolution | WireLiveConfigRejectionReasonImageInputNotImplemented | WireLiveConfigRejectionReasonVideoFrameInputNotImplemented | WireLiveConfigRejectionReasonUnsupportedInputChunkVariant | WireLiveConfigRejectionReasonRefreshModelSwap | WireLiveConfigRejectionReasonRefreshProviderSwap | WireLiveConfigRejectionReasonRefreshAudioConfigMismatch | WireLiveConfigRejectionReasonAudioInputFormatMismatch | WireLiveConfigRejectionReasonOther | WireLiveConfigRejectionReasonUnknown
+
 # Wire mirror of [`meerkat_core::live_adapter::LiveAdapterErrorCode`].
 #
 # Internally-tagged on `code` (snake_case). SDK consumers route on `code`
@@ -1800,7 +1866,7 @@ class WireLiveAdapterErrorCodeConnectionLost(TypedDict, total=False):
 
 class WireLiveAdapterErrorCodeConfigRejected(TypedDict, total=False):
     code: Required[Literal['config_rejected']]
-    reason: Required[dict[str, Any]]
+    reason: Required[WireLiveConfigRejectionReason]
 
 class WireLiveAdapterErrorCodeProviderError(TypedDict, total=False):
     code: Required[Literal['provider_error']]
@@ -2730,6 +2796,26 @@ WireStopReason = Literal['end_turn', 'tool_use', 'max_tokens', 'stop_sequence', 
 
 # Wire-safe tool result content that handles both legacy string and array formats.
 WireToolResultContent = str | list[WireContentBlock]
+
+# Wire projection of `meerkat_core::TranscriptSource`. Lane provenance
+# for spoken-transcript blocks.
+#
+# R7-4 (P3 dogma): the previous shape used a wildcard arm in
+# `From<TranscriptSource>` that fell through to `Spoken`, silently
+# misattributing future core variants as user-spoken transcript. The
+# fix mirrors the live-wire pattern from R5-3 / R6-5 — future core
+# variants surface as `Unknown { debug }` (a fail-loud sentinel), and
+# the reverse direction is `TryFrom` returning
+# `WireConversionError::TranscriptSource { debug }` for the `Unknown`
+# case rather than fabricating a typed `Spoken`.
+class WireTranscriptSourceSpoken(TypedDict, total=False):
+    kind: Required[Literal['spoken']]
+
+class WireTranscriptSourceUnknown(TypedDict, total=False):
+    debug: Required[str]
+    kind: Required[Literal['unknown']]
+
+WireTranscriptSource = WireTranscriptSourceSpoken | WireTranscriptSourceUnknown
 
 # Transcript block inside a block-assistant message.
 #

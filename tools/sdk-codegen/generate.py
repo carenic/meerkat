@@ -344,6 +344,20 @@ def _promote_nested_schema_def(name: str) -> bool:
         "WireLiveAdapterStatus",
         "WireLiveDegradationReason",
         "WireLiveAdapterErrorCode",
+        # R7-2 (P2): promote `WireLiveConfigRejectionReason` so the typed
+        # `config_rejected.reason` discriminated-union shape lands in SDK
+        # codegen as a named reference (typed union of the R5-2 / R6-4 / R6-5
+        # variants) instead of being widened to `Record<string, unknown>` /
+        # `dict[str, Any]`. The reason type is registered as a schema-local
+        # `$defs` entry under `WireLiveAdapterErrorCode` and was previously
+        # treated as a private nested type by the codegen, erasing its shape.
+        "WireLiveConfigRejectionReason",
+        # R7-1 (P2): promote `WireTranscriptSource` so the typed `source`
+        # field on `WireAssistantBlock::Transcript`'s inline `data` shape
+        # lands as a named reference. Without this, schema-local resolution
+        # widens it to `Record<string, unknown>` and SDK consumers cannot
+        # narrow on the typed `kind: "spoken" | "unknown"` lane provenance.
+        "WireTranscriptSource",
         *MCP_CONFIG_HELPER_TYPES,
         *MCP_CONFIG_ALIAS_TYPES,
         *MOB_RPC_PROMOTED_SCHEMA_DEFS,
@@ -542,8 +556,21 @@ def _typescript_type_from_schema(
     root: dict[str, Any],
     field_schema: Any,
     local_defs: set[str] | None = None,
+    *,
+    inline_objects: bool = False,
 ) -> tuple[str, bool]:
-    """Return (typescript_type, optional)."""
+    """Return (typescript_type, optional).
+
+    When `inline_objects` is True, anonymous JSON-schema objects that declare
+    `properties` are emitted as inline structural TypeScript object types
+    (`{ field: type; ... }`) rather than widened to `Record<string, unknown>`.
+    This preserves typed-narrowing for discriminated-union variant payloads
+    whose `data` shape is described inline in the schema (e.g. R7-1
+    `AssistantBlock::Transcript`'s `{ text, source, meta }`). The flag does
+    NOT propagate recursively — only the immediate level is inlined; nested
+    anonymous objects keep the existing widening behavior to bound the
+    blast radius.
+    """
     if field_schema is True:
         return ("unknown", False)
     if field_schema is False or not isinstance(field_schema, dict):
@@ -622,6 +649,25 @@ def _typescript_type_from_schema(
                 (field_name, value_schema), = properties.items()
                 value_type, _ = _typescript_type_from_schema(root, value_schema)
                 return (f"{{ {field_name}: {value_type} }}", optional)
+            # R7-1 (P2): when the caller is emitting a discriminated-union
+            # variant payload (`inline_objects=True`), inline the typed
+            # property shape rather than widening to `Record<string, unknown>`.
+            # This restores type-narrowing for `AssistantBlock::Transcript`
+            # (and the other `WireAssistantBlock` variants whose `data` shape
+            # is described inline in the schema). The inline emission only
+            # applies to the immediate object level — nested anonymous
+            # objects inside the inlined fields keep the existing widening
+            # behavior.
+            if inline_objects and isinstance(properties, dict) and properties:
+                required_set = set(field_schema.get("required", []) or [])
+                inline_parts: list[str] = []
+                for inline_field, inline_schema in properties.items():
+                    inline_type, inline_optional = _typescript_type_from_schema(
+                        root, inline_schema, local_defs
+                    )
+                    suffix = "" if (inline_field in required_set and not inline_optional) else "?"
+                    inline_parts.append(f"{inline_field}{suffix}: {inline_type}")
+                return (f"{{ {'; '.join(inline_parts)} }}", optional)
             return ("Record<string, unknown>", optional)
         case _:
             return ("unknown", optional)
@@ -958,6 +1004,14 @@ def generate_python_types(schemas: dict, output_dir: Path, *, has_comms: bool = 
         wire_schema,
         "Wire projection of LiveAdapterStatus (tagged on `status`).",
     )
+    # R7-2 (P2): typed wire mirror for `WireLiveAdapterErrorCode::ConfigRejected.reason`.
+    # Emit the named alias before `WireLiveAdapterErrorCode` so the generated
+    # `config_rejected` variant references the typed discriminated union by name.
+    append_python_alias(
+        "WireLiveConfigRejectionReason",
+        wire_schema,
+        "Wire projection of LiveConfigRejectionReason (tagged on `kind`).",
+    )
     append_python_alias(
         "WireLiveAdapterErrorCode",
         wire_schema,
@@ -1043,6 +1097,14 @@ def generate_python_types(schemas: dict, output_dir: Path, *, has_comms: bool = 
     append_python_alias("WireInputLifecycleState", wire_schema, "Public input lifecycle state projection used by RPC surfaces.")
     append_python_alias("WireStopReason", wire_schema, "Canonical stop reason for transcript messages.")
     append_python_alias("WireToolResultContent", wire_schema, "Wire-safe tool result content.")
+    # R7-1 (P2): emit `WireTranscriptSource` alias before `WireAssistantBlock`
+    # so the generated `Transcript` variant's inline `data.source` field
+    # references the typed `kind`-tagged union by name.
+    append_python_alias(
+        "WireTranscriptSource",
+        wire_schema,
+        "Wire projection of TranscriptSource (tagged on `kind`).",
+    )
     append_python_alias("WireAssistantBlock", wire_schema, "Block assistant transcript item.")
     append_python_alias("WireImageOperationPhase", wire_schema, "Machine-owned image operation phase.")
     append_python_alias("WireModelTier", schemas.get("models", {}), "Wire-level model recommendation tier.")
@@ -1238,10 +1300,18 @@ def generate_typescript_types(schemas: dict, output_dir: Path, *, has_comms: boo
                 local_variant_defs = set(variant.get("$defs", {}).keys()) | local_defs
                 types_content += f"\nexport interface {variant_name} {{\n"
                 for field_name, field_schema in properties.items():
+                    # R7-1 (P2): inline anonymous-object payload schemas so
+                    # discriminated-union variant data shapes (e.g.
+                    # `WireAssistantBlock::Transcript`'s `data: { text,
+                    # source, meta }`) emit a typed structural shape rather
+                    # than `Record<string, unknown>`. Only the immediate
+                    # variant-field level is inlined; nested anonymous
+                    # objects inside the inlined shape still widen.
                     field_type, _ = _typescript_type_from_schema(
                         schema_root,
                         field_schema,
                         local_variant_defs,
+                        inline_objects=True,
                     )
                     optional = "" if field_name in required else "?"
                     types_content += f"  {field_name}{optional}: {field_type};\n"
@@ -1347,6 +1417,10 @@ def generate_typescript_types(schemas: dict, output_dir: Path, *, has_comms: boo
     append_typescript_alias("RealtimeTranscriptRole", wire_schema)
     append_typescript_alias("WireLiveDegradationReason", wire_schema)
     append_typescript_alias("WireLiveAdapterStatus", wire_schema)
+    # R7-2 (P2): typed wire mirror for `WireLiveAdapterErrorCode::ConfigRejected.reason`.
+    # Emit the named alias before `WireLiveAdapterErrorCode` so the generated
+    # `config_rejected` variant references the typed union by name.
+    append_typescript_alias("WireLiveConfigRejectionReason", wire_schema)
     append_typescript_alias("WireLiveAdapterErrorCode", wire_schema)
     append_typescript_alias("WireLiveAdapterObservation", wire_schema)
     append_typescript_interface("RuntimeAcceptResult", wire_schema)
@@ -1386,6 +1460,10 @@ def generate_typescript_types(schemas: dict, output_dir: Path, *, has_comms: boo
     append_typescript_interface("WireAuthStatus", wire_schema)
     append_typescript_interface("WireAuthStatusDetail", wire_schema)
     append_typescript_alias("WireAuthError", wire_schema)
+    # R7-1 (P2): emit `WireTranscriptSource` alias before `WireAssistantBlock`
+    # so the generated `Transcript` variant references the typed `kind`-tagged
+    # union by name.
+    append_typescript_alias("WireTranscriptSource", wire_schema)
     append_typescript_alias("WireAssistantBlock", wire_schema)
     append_typescript_alias("WireImageOperationPhase", wire_schema)
 

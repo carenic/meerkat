@@ -22,10 +22,12 @@ import type {
 import type {
   LiveInputChunkWire,
   LiveSendInputParams,
+  WireAssistantBlock,
   WireLiveAdapterErrorCode,
   WireLiveAdapterObservation,
   WireLiveAdapterObservationAssistantAudioChunk,
   WireLiveAdapterObservationCommandRejected,
+  WireLiveConfigRejectionReason,
 } from "../src/index.js";
 import type {
   MobCreateParams,
@@ -732,11 +734,11 @@ const liveObsAudio: WireLiveAdapterObservation = {
 };
 const liveObsCommandRejected: WireLiveAdapterObservation = {
   observation: "command_rejected",
-  // R5-2: `reason` is the typed `WireLiveConfigRejectionReason` mirror,
-  // internally tagged on `kind`. SDK codegen currently widens it to
-  // `Record<string, unknown>` because the discriminated union isn't
-  // followed across schema references; the runtime shape still matches
-  // the wire enum's `#[serde(tag = "kind", rename_all = "snake_case")]`.
+  // R7-2 (P2): `reason` is now emitted as the typed
+  // `WireLiveConfigRejectionReason` discriminated union (tagged on
+  // `kind`) rather than `Record<string, unknown>`. SDK codegen follows
+  // the schema-local `$defs` reference into a named union so consumers
+  // route on `kind` without parsing raw JSON.
   code: {
     code: "config_rejected",
     reason: { kind: "image_input_not_implemented" },
@@ -786,3 +788,138 @@ void liveObsTurnInterrupted;
 void liveObsUntyped;
 void readAudioIdentity;
 void readRejectionCode;
+
+// =============================================================================
+// R7-2 (P2) regression: `WireLiveConfigRejectionReason` lands as a typed
+// discriminated union (tagged on `kind`) at the SDK boundary, NOT
+// `Record<string, unknown>`. Each variant is constructible with its typed
+// payload, and the union slots into `WireLiveAdapterErrorCodeConfigRejected.reason`
+// without `as` casts. This pins the codegen contract: schema-local `$defs`
+// referenced by promoted typed enums must be followed across the ref so SDK
+// consumers can route on `kind` without parsing English from a wildcard.
+// =============================================================================
+
+const reasonChannelIdentitySwap: WireLiveConfigRejectionReason = {
+  kind: "channel_identity_swap",
+  from_model: "gpt-5.4",
+  from_provider: "openai",
+  to_model: "gemini-3.1-flash-lite",
+  to_provider: "gemini",
+};
+const reasonNonRealtime: WireLiveConfigRejectionReason = {
+  kind: "non_realtime_resolution",
+  detail: "no realtime adapter available",
+};
+const reasonImageInput: WireLiveConfigRejectionReason = {
+  kind: "image_input_not_implemented",
+};
+const reasonVideoFrameInput: WireLiveConfigRejectionReason = {
+  kind: "video_frame_input_not_implemented",
+};
+const reasonUnsupportedChunk: WireLiveConfigRejectionReason = {
+  kind: "unsupported_input_chunk_variant",
+};
+const reasonRefreshModelSwap: WireLiveConfigRejectionReason = {
+  kind: "refresh_model_swap",
+  from_model: "gpt-5.4",
+  to_model: "gpt-5.4-mini",
+};
+const reasonRefreshProviderSwap: WireLiveConfigRejectionReason = {
+  kind: "refresh_provider_swap",
+  from_provider: "openai",
+  to_provider: "gemini",
+};
+const reasonRefreshAudioMismatch: WireLiveConfigRejectionReason = {
+  kind: "refresh_audio_config_mismatch",
+  detail: "mismatched sample rate",
+};
+const reasonAudioFormatMismatch: WireLiveConfigRejectionReason = {
+  kind: "audio_input_format_mismatch",
+  expected_sample_rate_hz: 24_000,
+  expected_channels: 1,
+  actual_sample_rate_hz: 48_000,
+  actual_channels: 2,
+};
+const reasonOther: WireLiveConfigRejectionReason = {
+  kind: "other",
+  detail: "freeform escape hatch",
+};
+const reasonUnknown: WireLiveConfigRejectionReason = {
+  kind: "unknown",
+  debug: "future_core_variant_x",
+};
+
+// Each variant slots into the typed `config_rejected` error code without
+// `as` casts, proving the discriminated union is followed across the
+// schema reference.
+const errorCodeWithReason: WireLiveAdapterErrorCode = {
+  code: "config_rejected",
+  reason: reasonAudioFormatMismatch,
+};
+
+// Type narrowing on `kind` exposes the variant-specific payload fields.
+function readRejectionDetail(reason: WireLiveConfigRejectionReason): string {
+  switch (reason.kind) {
+    case "channel_identity_swap":
+      return `${reason.from_model} -> ${reason.to_model}`;
+    case "non_realtime_resolution":
+    case "refresh_audio_config_mismatch":
+    case "other":
+      return reason.detail;
+    case "audio_input_format_mismatch":
+      return `${reason.actual_sample_rate_hz}Hz`;
+    case "refresh_model_swap":
+      return `${reason.from_model} -> ${reason.to_model}`;
+    case "refresh_provider_swap":
+      return `${reason.from_provider} -> ${reason.to_provider}`;
+    case "image_input_not_implemented":
+    case "video_frame_input_not_implemented":
+    case "unsupported_input_chunk_variant":
+      return reason.kind;
+    case "unknown":
+      return reason.debug;
+    default:
+      return "exhaustive";
+  }
+}
+
+void reasonChannelIdentitySwap;
+void reasonNonRealtime;
+void reasonImageInput;
+void reasonVideoFrameInput;
+void reasonUnsupportedChunk;
+void reasonRefreshModelSwap;
+void reasonRefreshProviderSwap;
+void reasonRefreshAudioMismatch;
+void reasonAudioFormatMismatch;
+void reasonOther;
+void reasonUnknown;
+void errorCodeWithReason;
+void readRejectionDetail;
+
+// =============================================================================
+// R7-1 (P2) regression: `WireAssistantBlock::Transcript`'s inline `data`
+// shape lands as a typed structural object (with `text`, `source`, optional
+// `meta`), NOT `Record<string, unknown>`. SDK consumers can read transcript
+// `text` and route on the `source` lane without ad-hoc JSON parsing. This
+// pins the codegen contract: discriminated-union variant payloads with
+// inline anonymous-object schemas are emitted as inline structural types.
+// =============================================================================
+
+const transcriptBlock: WireAssistantBlock = {
+  block_type: "transcript",
+  data: {
+    text: "Hello, world.",
+    source: { kind: "spoken" },
+  },
+};
+
+function readTranscriptText(block: WireAssistantBlock): string | null {
+  if (block.block_type !== "transcript") return null;
+  // Compile-time proof: `block.data.text` is `string`, `block.data.source`
+  // is `"spoken"` — both visible without further type assertions.
+  return block.data.text;
+}
+
+void transcriptBlock;
+void readTranscriptText;

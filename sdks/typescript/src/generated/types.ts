@@ -1929,6 +1929,68 @@ export interface WireLiveAdapterStatusUnknown {
 
 export type WireLiveAdapterStatus = WireLiveAdapterStatusIdle | WireLiveAdapterStatusOpening | WireLiveAdapterStatusReady | WireLiveAdapterStatusDegraded | WireLiveAdapterStatusClosing | WireLiveAdapterStatusClosed | WireLiveAdapterStatusUnknown;
 
+export interface WireLiveConfigRejectionReasonChannelIdentitySwap {
+  from_model: string;
+  from_provider: unknown;
+  kind: "channel_identity_swap";
+  to_model: string;
+  to_provider: unknown;
+}
+
+export interface WireLiveConfigRejectionReasonNonRealtimeResolution {
+  detail: string;
+  kind: "non_realtime_resolution";
+}
+
+export interface WireLiveConfigRejectionReasonImageInputNotImplemented {
+  kind: "image_input_not_implemented";
+}
+
+export interface WireLiveConfigRejectionReasonVideoFrameInputNotImplemented {
+  kind: "video_frame_input_not_implemented";
+}
+
+export interface WireLiveConfigRejectionReasonUnsupportedInputChunkVariant {
+  kind: "unsupported_input_chunk_variant";
+}
+
+export interface WireLiveConfigRejectionReasonRefreshModelSwap {
+  from_model: string;
+  kind: "refresh_model_swap";
+  to_model: string;
+}
+
+export interface WireLiveConfigRejectionReasonRefreshProviderSwap {
+  from_provider: string;
+  kind: "refresh_provider_swap";
+  to_provider: string;
+}
+
+export interface WireLiveConfigRejectionReasonRefreshAudioConfigMismatch {
+  detail: string;
+  kind: "refresh_audio_config_mismatch";
+}
+
+export interface WireLiveConfigRejectionReasonAudioInputFormatMismatch {
+  actual_channels: number;
+  actual_sample_rate_hz: number;
+  expected_channels: number;
+  expected_sample_rate_hz: number;
+  kind: "audio_input_format_mismatch";
+}
+
+export interface WireLiveConfigRejectionReasonOther {
+  detail: string;
+  kind: "other";
+}
+
+export interface WireLiveConfigRejectionReasonUnknown {
+  debug: string;
+  kind: "unknown";
+}
+
+export type WireLiveConfigRejectionReason = WireLiveConfigRejectionReasonChannelIdentitySwap | WireLiveConfigRejectionReasonNonRealtimeResolution | WireLiveConfigRejectionReasonImageInputNotImplemented | WireLiveConfigRejectionReasonVideoFrameInputNotImplemented | WireLiveConfigRejectionReasonUnsupportedInputChunkVariant | WireLiveConfigRejectionReasonRefreshModelSwap | WireLiveConfigRejectionReasonRefreshProviderSwap | WireLiveConfigRejectionReasonRefreshAudioConfigMismatch | WireLiveConfigRejectionReasonAudioInputFormatMismatch | WireLiveConfigRejectionReasonOther | WireLiveConfigRejectionReasonUnknown;
+
 export interface WireLiveAdapterErrorCodeConnectionFailed {
   code: "connection_failed";
 }
@@ -1939,7 +2001,7 @@ export interface WireLiveAdapterErrorCodeConnectionLost {
 
 export interface WireLiveAdapterErrorCodeConfigRejected {
   code: "config_rejected";
-  reason: Record<string, unknown>;
+  reason: WireLiveConfigRejectionReason;
 }
 
 export interface WireLiveAdapterErrorCodeProviderError {
@@ -2437,34 +2499,45 @@ export interface WireAuthErrorOther {
 
 export type WireAuthError = WireAuthErrorMissingSecret | WireAuthErrorUnsupportedCombination | WireAuthErrorMissingRequiredMetadata | WireAuthErrorWorkspaceMismatch | WireAuthErrorExpired | WireAuthErrorStaleCredential | WireAuthErrorRefreshRequired | WireAuthErrorLeaseAbsent | WireAuthErrorUserReauthRequired | WireAuthErrorRefreshFailed | WireAuthErrorInteractiveLoginRequired | WireAuthErrorHostOwnedUnavailable | WireAuthErrorIo | WireAuthErrorOther;
 
+export interface WireTranscriptSourceSpoken {
+  kind: "spoken";
+}
+
+export interface WireTranscriptSourceUnknown {
+  debug: string;
+  kind: "unknown";
+}
+
+export type WireTranscriptSource = WireTranscriptSourceSpoken | WireTranscriptSourceUnknown;
+
 export interface WireAssistantBlockText {
   block_type: "text";
-  data: Record<string, unknown>;
+  data: { meta?: Record<string, unknown>; text: string };
 }
 
 export interface WireAssistantBlockTranscript {
   block_type: "transcript";
-  data: Record<string, unknown>;
+  data: { meta?: Record<string, unknown>; source: WireTranscriptSource; text: string };
 }
 
 export interface WireAssistantBlockReasoning {
   block_type: "reasoning";
-  data: Record<string, unknown>;
+  data: { meta?: Record<string, unknown>; text?: string };
 }
 
 export interface WireAssistantBlockToolUse {
   block_type: "tool_use";
-  data: Record<string, unknown>;
+  data: { args: unknown; id: string; meta?: Record<string, unknown>; name: string };
 }
 
 export interface WireAssistantBlockServerToolContent {
   block_type: "server_tool_content";
-  data: Record<string, unknown>;
+  data: { content: unknown; id?: string; meta?: Record<string, unknown>; name: string };
 }
 
 export interface WireAssistantBlockImage {
   block_type: "image";
-  data: Record<string, unknown>;
+  data: { blob_ref: Record<string, unknown>; height: number; image_id: string; media_type: string; meta: Record<string, unknown>; revised_prompt: Record<string, unknown>; width: number };
 }
 
 export interface WireAssistantBlockUnknown {
