@@ -86,7 +86,7 @@ jobs:
           script: |
             const { owner, repo } = context.repo;
             const ref = process.env.RELEASE_SHA;
-            const checkName = "GHA Cargo";
+            const acceptedCheckNames = new Set(["GHA Cargo", "GHA Cargo / GHA Cargo", "CI gate"]);
             const timeoutMs = 30 * 60 * 1000;
             const pollMs = 30 * 1000;
             const started = Date.now();
@@ -96,12 +96,11 @@ jobs:
                 owner,
                 repo,
                 ref,
-                check_name: checkName,
                 filter: "latest",
                 per_page: 100,
               });
 
-              const checks = data.check_runs.filter((run) => run.name === checkName);
+              const checks = data.check_runs.filter((run) => acceptedCheckNames.has(run.name));
               if (checks.length > 0) {
                 core.info(
                   checks
@@ -109,25 +108,29 @@ jobs:
                     .join("\n")
                 );
               } else {
-                core.info(`No ${checkName} check found yet for ${ref}`);
+                core.info(`No accepted CI check found yet for ${ref}`);
               }
 
               const success = checks.find((run) => run.status === "completed" && run.conclusion === "success");
               if (success) {
-                core.info(`Release commit ${ref} has a successful ${checkName}: ${success.html_url}`);
+                core.info(`Release commit ${ref} has a successful ${success.name}: ${success.html_url}`);
                 return;
               }
 
-              const failed = checks.find((run) => run.status === "completed" && run.conclusion !== "success");
+              const failed = checks.find(
+                (run) =>
+                  run.status === "completed" &&
+                  !["success", "skipped", "neutral"].includes(run.conclusion)
+              );
               if (failed) {
                 core.setFailed(
-                  `Release commit ${ref} does not have green CI: ${checkName} concluded ${failed.conclusion} (${failed.html_url})`
+                  `Release commit ${ref} does not have green CI: ${failed.name} concluded ${failed.conclusion} (${failed.html_url})`
                 );
                 return;
               }
 
               if (Date.now() - started >= timeoutMs) {
-                core.setFailed(`Timed out waiting for ${checkName} to pass on release commit ${ref}`);
+                core.setFailed(`Timed out waiting for an accepted CI check to pass on release commit ${ref}`);
                 return;
               }
 
