@@ -164,6 +164,11 @@ pub enum WireConversionError {
     /// mapping exists. Carries the original debug payload for server logs.
     #[error("unknown wire adapter-error-code variant: {debug}")]
     ErrorCode { debug: String },
+    /// Wire config-rejection reason is the explicit-Unknown sentinel; no
+    /// inverse mapping exists. Carries the original debug payload for
+    /// server logs.
+    #[error("unknown wire config-rejection-reason variant: {debug}")]
+    ConfigRejectionReason { debug: String },
 }
 
 impl TryFrom<WireLiveTransportBootstrap> for LiveTransportBootstrap {
@@ -804,6 +809,16 @@ pub enum WireLiveAdapterErrorCode {
 /// dogma): pins the typed semantic-routing variants on the wire so SDKs
 /// can distinguish a runtime-side identity swap from an adapter-side
 /// input-modality rejection without string parsing.
+///
+/// R6-5 (P3 dogma): closes the last typed-route-as-detail-string gap. The
+/// previous wildcard fallback collapsed future core variants into
+/// `Other { detail: "unknown_live_config_rejection_reason" }`, which SDK
+/// consumers had to pattern-match on the English `detail` to route — the
+/// exact "typed route becomes detail string" antipattern R3-6 + R5-3
+/// closed for transport / observation / continuity / modality / status /
+/// error_code. Future core variants now surface as `Unknown { debug }`
+/// with the `{:?}` projection of the source variant preserved for
+/// server-side observability.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -834,6 +849,27 @@ pub enum WireLiveConfigRejectionReason {
     },
     Other {
         detail: String,
+    },
+    /// R6-5 (P3 dogma): explicit fail-loud variant for unknown core
+    /// variants.
+    ///
+    /// The core [`LiveConfigRejectionReason`] enum is `#[non_exhaustive]`.
+    /// When a future variant lands without an explicit arm in the wire
+    /// `From` impl, the conversion surfaces as `Unknown { debug }` rather
+    /// than silently coercing into `Other { detail:
+    /// "unknown_live_config_rejection_reason" }` — a "typed route becomes
+    /// detail string" antipattern that forces SDK consumers to parse
+    /// English from `detail` to recover the missing route. SDK consumers
+    /// route on the `kind: "unknown"` discriminator and treat it as an
+    /// unrecognized rejection reason — never as `Other`. The `debug`
+    /// payload carries the `{:?}` projection of the source variant so
+    /// server logs name the real shape that needs to be promoted.
+    ///
+    /// **When a new core variant is added, add an explicit arm in the
+    /// forward `From` impl above this variant — `Unknown` is the floor,
+    /// not the destination.**
+    Unknown {
+        debug: String,
     },
 }
 
@@ -879,65 +915,83 @@ impl From<LiveConfigRejectionReason> for WireLiveConfigRejectionReason {
                 Self::RefreshAudioConfigMismatch { detail }
             }
             LiveConfigRejectionReason::Other { detail } => Self::Other { detail },
-            _ => {
+            // Core enum is `#[non_exhaustive]`. R6-5 (P3 dogma): surface
+            // unknown variants explicitly via `Unknown { debug }` rather
+            // than silently coercing to `Other { detail:
+            // "unknown_live_config_rejection_reason" }` (the previous
+            // fail-open default — a "typed route becomes detail string"
+            // antipattern that forced SDK consumers to parse English from
+            // `detail` to recover the missing route). When a new core
+            // variant lands, add an explicit arm above this comment.
+            other => {
                 debug_assert!(
                     false,
                     "WireLiveConfigRejectionReason::from saw an unmapped \
                      LiveConfigRejectionReason variant; add an explicit arm \
                      in meerkat-contracts/src/wire/live.rs."
                 );
-                Self::Other {
-                    detail: "unknown_live_config_rejection_reason".to_string(),
+                Self::Unknown {
+                    debug: format!("{other:?}"),
                 }
             }
         }
     }
 }
 
-impl From<WireLiveConfigRejectionReason> for LiveConfigRejectionReason {
-    fn from(value: WireLiveConfigRejectionReason) -> Self {
+impl TryFrom<WireLiveConfigRejectionReason> for LiveConfigRejectionReason {
+    type Error = WireConversionError;
+
+    fn try_from(value: WireLiveConfigRejectionReason) -> Result<Self, Self::Error> {
+        // No wildcard arm: `WireLiveConfigRejectionReason` is owned by this
+        // crate so even with `#[non_exhaustive]` (which only constrains
+        // matches outside the defining crate) the compiler enforces
+        // exhaustive coverage here. Adding a new wire variant therefore
+        // forces a new arm in this match — no silent fallthrough.
         match value {
             WireLiveConfigRejectionReason::ChannelIdentitySwap {
                 from_model,
                 from_provider,
                 to_model,
                 to_provider,
-            } => Self::ChannelIdentitySwap {
+            } => Ok(Self::ChannelIdentitySwap {
                 from_model,
                 from_provider,
                 to_model,
                 to_provider,
-            },
+            }),
             WireLiveConfigRejectionReason::NonRealtimeResolution { detail } => {
-                Self::NonRealtimeResolution { detail }
+                Ok(Self::NonRealtimeResolution { detail })
             }
             WireLiveConfigRejectionReason::ImageInputNotImplemented => {
-                Self::ImageInputNotImplemented
+                Ok(Self::ImageInputNotImplemented)
             }
             WireLiveConfigRejectionReason::VideoFrameInputNotImplemented => {
-                Self::VideoFrameInputNotImplemented
+                Ok(Self::VideoFrameInputNotImplemented)
             }
             WireLiveConfigRejectionReason::UnsupportedInputChunkVariant => {
-                Self::UnsupportedInputChunkVariant
+                Ok(Self::UnsupportedInputChunkVariant)
             }
             WireLiveConfigRejectionReason::RefreshModelSwap {
                 from_model,
                 to_model,
-            } => Self::RefreshModelSwap {
+            } => Ok(Self::RefreshModelSwap {
                 from_model,
                 to_model,
-            },
+            }),
             WireLiveConfigRejectionReason::RefreshProviderSwap {
                 from_provider,
                 to_provider,
-            } => Self::RefreshProviderSwap {
+            } => Ok(Self::RefreshProviderSwap {
                 from_provider,
                 to_provider,
-            },
+            }),
             WireLiveConfigRejectionReason::RefreshAudioConfigMismatch { detail } => {
-                Self::RefreshAudioConfigMismatch { detail }
+                Ok(Self::RefreshAudioConfigMismatch { detail })
             }
-            WireLiveConfigRejectionReason::Other { detail } => Self::Other { detail },
+            WireLiveConfigRejectionReason::Other { detail } => Ok(Self::Other { detail }),
+            WireLiveConfigRejectionReason::Unknown { debug } => {
+                Err(WireConversionError::ConfigRejectionReason { debug })
+            }
         }
     }
 }
@@ -987,7 +1041,7 @@ impl TryFrom<WireLiveAdapterErrorCode> for LiveAdapterErrorCode {
             WireLiveAdapterErrorCode::ConnectionFailed => Ok(Self::ConnectionFailed),
             WireLiveAdapterErrorCode::ConnectionLost => Ok(Self::ConnectionLost),
             WireLiveAdapterErrorCode::ConfigRejected { reason } => Ok(Self::ConfigRejected {
-                reason: reason.into(),
+                reason: reason.try_into()?,
             }),
             WireLiveAdapterErrorCode::ProviderError => Ok(Self::ProviderError),
             WireLiveAdapterErrorCode::AuthenticationFailed => Ok(Self::AuthenticationFailed),
@@ -2203,5 +2257,93 @@ mod tests {
         let back: WireLiveAdapterErrorCode =
             serde_json::from_value(j).expect("round-trip should succeed");
         assert_eq!(unknown, back);
+    }
+
+    // R6-5 (P3 dogma) — explicit Unknown variant fail-loud regression tests
+    // for the WireLiveConfigRejectionReason mirror.
+
+    #[test]
+    fn unknown_config_rejection_reason_does_not_become_other() {
+        // R6-5 (P3): the wire `Unknown` variant must NOT convert back to
+        // `Other { detail: "..." }` (the previous fail-open default — a
+        // "typed route becomes detail string" antipattern that forced SDK
+        // consumers to parse English from `detail` to recover the missing
+        // route).
+        let unknown = WireLiveConfigRejectionReason::Unknown {
+            debug: "FuturePolicyRejection { … }".into(),
+        };
+        match LiveConfigRejectionReason::try_from(unknown.clone()) {
+            Err(WireConversionError::ConfigRejectionReason { debug }) => {
+                assert!(
+                    debug.contains("FuturePolicyRejection"),
+                    "debug payload preserved"
+                );
+            }
+            other => panic!("unknown wire variant must not coerce to a core variant: {other:?}"),
+        }
+        // Round-trips through serde as the explicit `unknown` discriminator.
+        let j = serde_json::to_value(&unknown).expect("round-trip should succeed");
+        assert_eq!(j["kind"], "unknown");
+        assert_ne!(
+            j["kind"], "other",
+            "Unknown must never serialize as `other`"
+        );
+        assert!(
+            j.get("detail").is_none(),
+            "Unknown wire variant must NOT carry an `Other.detail` field"
+        );
+        assert_eq!(j["debug"], "FuturePolicyRejection { … }");
+        let back: WireLiveConfigRejectionReason =
+            serde_json::from_value(j).expect("round-trip should succeed");
+        assert_eq!(unknown, back);
+    }
+
+    #[test]
+    fn known_config_rejection_reason_variants_never_serialize_as_unknown() {
+        // R6-5 (P3): the explicit-Unknown variant is a floor, not a
+        // destination. Every known core variant must produce its typed
+        // wire counterpart, never `Unknown`.
+        let real_other = LiveConfigRejectionReason::Other {
+            detail: "real explanation".into(),
+        };
+        let wire: WireLiveConfigRejectionReason = real_other.into();
+        match &wire {
+            WireLiveConfigRejectionReason::Other { detail } => {
+                assert_eq!(detail, "real explanation");
+            }
+            other => panic!("real Other must stay Other, got {other:?}"),
+        }
+        let j = serde_json::to_value(&wire).expect("round-trip should succeed");
+        assert_eq!(j["kind"], "other");
+        assert_ne!(j["kind"], "unknown");
+    }
+
+    #[test]
+    fn config_rejection_reason_round_trips_through_core() {
+        // R6-5 (P3): every known wire variant must round-trip through
+        // core via the `TryFrom` inverse.
+        let cases = [
+            WireLiveConfigRejectionReason::ImageInputNotImplemented,
+            WireLiveConfigRejectionReason::VideoFrameInputNotImplemented,
+            WireLiveConfigRejectionReason::UnsupportedInputChunkVariant,
+            WireLiveConfigRejectionReason::NonRealtimeResolution {
+                detail: "not realtime".into(),
+            },
+            WireLiveConfigRejectionReason::RefreshModelSwap {
+                from_model: "a".into(),
+                to_model: "b".into(),
+            },
+            WireLiveConfigRejectionReason::Other {
+                detail: "anything".into(),
+            },
+        ];
+        for v in cases {
+            let core: LiveConfigRejectionReason = v
+                .clone()
+                .try_into()
+                .expect("known wire variant should convert");
+            let back: WireLiveConfigRejectionReason = core.into();
+            assert_eq!(v, back);
+        }
     }
 }
