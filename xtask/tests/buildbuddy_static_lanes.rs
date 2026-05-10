@@ -296,8 +296,14 @@ fn gcp_feature_matrix_lane_fans_out_remote_cargo_actions() {
         "GCP governance submitter should remain a separate visible job"
     );
     assert!(
-        workflow.contains("group: gcp-wasm-feature\n          profile: submitter"),
-        "GCP WASM/feature submitter should remain a separate visible job"
+        workflow.contains("group: gcp-sdk-suites\n          profile: submitter")
+            && workflow.contains("group: gcp-wasm-compile\n          profile: submitter")
+            && workflow.contains("group: gcp-feature-audit\n          profile: submitter"),
+        "GCP WASM/SDK/feature submitters should stay split into separate visible jobs"
+    );
+    assert!(
+        !workflow.contains("group: gcp-wasm-feature\n          profile: submitter"),
+        "GCP WASM/SDK/feature submitters must not collapse back into one serial batch"
     );
 }
 
