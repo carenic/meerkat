@@ -690,3 +690,50 @@ After the tool returns, reply with PY-GEMINI-74-DONE and no extra prose.
             images = assistant_image_blocks(history)
             assert images, "Gemini image generation should append an assistant image block"
             await assert_fetchable_image_blob(client, images[-1])
+
+
+# ---------------------------------------------------------------------------
+# Scenario 75: LiveChannel helper class — import and instantiation smoke
+# ---------------------------------------------------------------------------
+
+
+if include_scenario(75):
+    @pytest.mark.asyncio
+    @requires_live_llm
+    async def test_smoke_scenario_75_live_channel_helper_class():
+        """Verify that ``LiveChannel`` imports from the SDK root and that its
+        lifecycle methods round-trip to the correct ``live/*`` JSON-RPC methods.
+
+        Without ``--live-ws`` the router rejects with ``METHOD_NOT_FOUND``;
+        this test confirms the helper wires session_id correctly and surfaces
+        the typed error.
+        """
+        from meerkat import LiveChannel
+
+        async with live_client(realm_id="env_default") as client:
+            session = await client.create_session(
+                "Reply with PY-LIVE-75-OK and nothing else.",
+                model=smoke_model(),
+                provider="anthropic",
+            )
+            assert session.id
+
+            channel = LiveChannel.session(client, session.id)
+            assert channel.session_id == session.id
+            assert channel.channel_id is None
+
+            # open() should round-trip to live/open and surface the router
+            # rejection since --live-ws is not enabled.
+            with pytest.raises(MeerkatError) as exc_info:
+                await channel.open()
+            assert exc_info.value.code in {"METHOD_NOT_FOUND", "-32601"}
+
+            # status() before open should raise RuntimeError (no channel_id).
+            with pytest.raises(RuntimeError, match="not been opened"):
+                await channel.status()
+
+            # Verify LiveChannel with turning_mode option.
+            channel_ec = LiveChannel.session(
+                client, session.id, turning_mode="explicit_commit"
+            )
+            assert channel_ec.session_id == session.id

@@ -519,13 +519,13 @@ impl From<TranscriptSource> for WireTranscriptSource {
 }
 
 impl TryFrom<WireTranscriptSource> for TranscriptSource {
-    type Error = crate::wire::live::WireConversionError;
+    type Error = crate::wire::error::WireConversionError;
 
     fn try_from(value: WireTranscriptSource) -> Result<Self, Self::Error> {
         match value {
             WireTranscriptSource::Spoken => Ok(Self::Spoken),
             WireTranscriptSource::Unknown { debug } => {
-                Err(crate::wire::live::WireConversionError::TranscriptSource { debug })
+                Err(crate::wire::error::WireConversionError::TranscriptSource { debug })
             }
         }
     }
@@ -648,7 +648,7 @@ fn wire_provider_meta_to_core(value: WireProviderMeta) -> Option<ProviderMeta> {
 /// Pre-1.0 dogma: when a new `AssistantBlock` variant lands, add an
 /// explicit arm both here and in the forward direction.
 impl TryFrom<WireAssistantBlock> for AssistantBlock {
-    type Error = crate::wire::live::WireConversionError;
+    type Error = crate::wire::error::WireConversionError;
 
     fn try_from(value: WireAssistantBlock) -> Result<Self, Self::Error> {
         Ok(match value {
@@ -707,7 +707,7 @@ impl TryFrom<WireAssistantBlock> for AssistantBlock {
                 meta,
             },
             WireAssistantBlock::Unknown => {
-                return Err(crate::wire::live::WireConversionError::AssistantBlock {
+                return Err(crate::wire::error::WireConversionError::AssistantBlock {
                     debug: "WireAssistantBlock::Unknown".to_string(),
                 });
             }
@@ -1642,7 +1642,7 @@ mod tests {
         let err = TranscriptSource::try_from(wire).unwrap_err();
         assert!(matches!(
             err,
-            crate::wire::live::WireConversionError::TranscriptSource { ref debug }
+            crate::wire::error::WireConversionError::TranscriptSource { ref debug }
                 if debug == "FutureSpokenSource"
         ));
     }
@@ -1669,7 +1669,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                crate::wire::live::WireConversionError::AssistantBlock { ref debug }
+                crate::wire::error::WireConversionError::AssistantBlock { ref debug }
                     if debug == "WireAssistantBlock::Unknown"
             ),
             "expected WireConversionError::AssistantBlock, got {err:?}"

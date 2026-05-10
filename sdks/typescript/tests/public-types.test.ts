@@ -923,3 +923,64 @@ function readTranscriptText(block: WireAssistantBlock): string | null {
 
 void transcriptBlock;
 void readTranscriptText;
+
+// =============================================================================
+// LiveChannel: type-level smoke tests proving the helper class is exported
+// from the SDK root, constructs from a MeerkatClient + session id, and
+// exposes the expected method signatures at the type level.
+// =============================================================================
+
+import { LiveChannel } from "../src/index.js";
+import type { LiveChannelOptions } from "../src/index.js";
+
+// LiveChannel.session() is the named constructor — it returns a LiveChannel.
+declare const mockClient: MeerkatClient;
+const liveChannel: LiveChannel = LiveChannel.session(mockClient, "session_123");
+void liveChannel;
+
+// LiveChannelOptions is assignable with turning_mode.
+const liveOpts: LiveChannelOptions = { turningMode: "explicit_commit" };
+void liveOpts;
+
+// LiveChannel with options
+const liveChannelWithOpts: LiveChannel = LiveChannel.session(
+  mockClient,
+  "session_456",
+  { turningMode: "provider_managed" },
+);
+void liveChannelWithOpts;
+
+// channelId is string | undefined before open().
+const maybeChannelId: string | undefined = liveChannel.channelId;
+void maybeChannelId;
+
+// sessionId is always a string.
+const liveSessionId: string = liveChannel.sessionId;
+void liveSessionId;
+
+// open() returns Promise<LiveOpenResult>.
+async function liveChannelOpenShape(ch: LiveChannel) {
+  const result = await ch.open();
+  const channelId: string = result.channel_id;
+  void channelId;
+  return result;
+}
+void liveChannelOpenShape;
+
+// status() returns Promise<LiveStatusResult>.
+async function liveChannelStatusShape(ch: LiveChannel) {
+  const result = await ch.status();
+  const status: import("../src/generated/types.js").WireLiveAdapterStatus = result.status;
+  void status;
+  return result;
+}
+void liveChannelStatusShape;
+
+// refresh() returns Promise<LiveRefreshResult>.
+async function liveChannelRefreshShape(ch: LiveChannel) {
+  const result = await ch.refresh();
+  const queued: "queued" = result.status;
+  void queued;
+  return result;
+}
+void liveChannelRefreshShape;

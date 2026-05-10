@@ -207,8 +207,6 @@ For comprehensive file lists, see the matching reference. This is a minimal poin
 - `meerkat-machine-kernels/src/runtime.rs` — `GeneratedMachineKernel` interpreter
 - `meerkat-runtime/src/meerkat_machine/` — `MeerkatMachine`, session management, dispatch paths, DSL adapter
 - `meerkat-runtime/src/handles/` — runtime impls of DSL handle traits
-- `meerkat-rpc/src/handlers/live.rs` — `live/*` JSON-RPC handlers (open/status/close/refresh/send_input/commit_input/interrupt/truncate)
-- `meerkat-contracts/src/wire/live.rs` — `Live*` wire contracts (params, results, typed transport/capability/continuity mirrors)
 - `meerkat-core/src/handles.rs` — DSL handle trait definitions
 - `meerkat-core/src/runtime_epoch.rs` — `SessionRuntimeBindings`, `RuntimeBuildMode`
 - `meerkat-core/src/agent.rs`, `meerkat-core/src/agent/*.rs` — agent loop
@@ -222,5 +220,6 @@ For comprehensive file lists, see the matching reference. This is a minimal poin
 - `meerkat-contracts/src/wire/supervisor_bridge.rs` — bridge protocol types
 - `docs/architecture/meerkat-runtime-dogma.md` — full dogma
 - `docs/architecture/buildbuddy-bazel-poc.md` — BuildBuddy/Bazel developer and CI backend guide
+- `docs/architecture/identity-first-live-voice-proposal.md` — live adapter + identity-first design notes
 - `tests/integration/src/e2e_lanes.rs` — authoritative e2e lane catalog
 - `scripts/build-backend-env`, `scripts/run-build-backend-lane`, `scripts/buildbuddy-dev` — local build backend switch and BuildBuddy facade

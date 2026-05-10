@@ -22,6 +22,7 @@ Quick start::
 
 # Core client and session
 from .client import MeerkatClient
+from .live import LiveChannel
 from .mob import (
     MemberDeliveryReceipt,
     MemberRespawnReceipt,
@@ -245,6 +246,7 @@ from .events import (
 __all__ = [
     # Client & session
     "MeerkatClient",
+    "LiveChannel",
     "DeferredSession",
     "Session",
     "Mob",

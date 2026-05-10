@@ -146,6 +146,10 @@ summary_path="${lane_log_root}/summary.tsv"
 context_path="${lane_log_root}/context.txt"
 mkdir -p "${lane_log_root}"
 
+# Remove stale lane_done sentinel from a previous run so the batch
+# watchdog does not misread completion status when the log root is reused.
+rm -f "${lane_log_root}/lane_done"
+
 scripts/buildbuddy-write-context --mode "${mode}-${lane}" >"${context_path}"
 printf 'name\tstatus\twall_seconds\tlog\tcommand\n' >"${summary_path}"
 

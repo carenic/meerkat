@@ -5,6 +5,7 @@ mod artifact;
 mod auth;
 mod comms;
 mod connection;
+mod error;
 mod event;
 mod help;
 mod host;
@@ -58,6 +59,7 @@ pub use auth::{
     ActingOnBehalfOf, AuthGrant, GrantAction, GrantScope, PrincipalId, PrincipalKind, PrincipalRef,
     VisibilityClass,
 };
+pub use error::WireConversionError;
 pub use event::{
     EventReplayCursor, EventReplayCursorError, EventReplayEnvelope, EventReplayEventId,
     EventReplayScope, EventsLatestCursorParams, EventsLatestCursorResult, EventsListSinceParams,
@@ -80,8 +82,9 @@ pub use live::{
     LiveChannelParams, LiveCommitInputParams, LiveInputChunkWire, LiveOpenParams, LiveOpenResult,
     LiveRefreshResult, LiveRefreshStatus, LiveSendInputParams, LiveStatusResult,
     LiveTruncateParams, WireLiveAdapterErrorCode, WireLiveAdapterObservation,
-    WireLiveAdapterStatus, WireLiveChannelCapabilities, WireLiveContinuityMode,
-    WireLiveDegradationReason, WireLiveResponseModality, WireLiveTransportBootstrap,
+    WireLiveAdapterStatus, WireLiveChannelCapabilities, WireLiveConfigRejectionReason,
+    WireLiveContinuityMode, WireLiveDegradationReason, WireLiveResponseModality,
+    WireLiveTransportBootstrap, WireProvider,
 };
 pub use mcp_live::{
     McpAddParams, McpLiveOpResponse, McpLiveOpStatus, McpLiveOperation, McpReloadParams,
@@ -158,7 +161,7 @@ pub use session::{
     SessionStreamCloseResult, SessionStreamOpenParams, SessionStreamOpenResult, WireAssistantBlock,
     WireContentBlock, WireContentInput, WireProviderMeta, WireSessionHistory, WireSessionInfo,
     WireSessionMessage, WireSessionSummary, WireStopReason, WireToolCall, WireToolResult,
-    WireToolResultContent,
+    WireToolResultContent, WireTranscriptSource,
 };
 pub use skills::{SkillEntry, SkillInspectResponse, SkillListResponse, SkillSourceProvenance};
 pub use supervisor_bridge::{

@@ -32,6 +32,8 @@ export type {
   MobReadyMemberSnapshot,
   MobReadyWaitOptions,
 } from "./mob.js";
+export { LiveChannel } from "./live.js";
+export type { LiveChannelOptions } from "./live.js";
 export { EventStream } from "./streaming.js";
 export { EventSubscription } from "./subscription.js";
 export type {

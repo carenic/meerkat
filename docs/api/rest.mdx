@@ -10,9 +10,16 @@ Meerkat ships a REST server for running and managing agent sessions over HTTP. T
 
 <Steps>
   <Step title="Start the server">
-    ```bash
+    <CodeGroup>
+    ```bash Installed binary
     rkat-rest --realm team-alpha
     ```
+
+    ```bash Live channel proxy
+    rkat-rpc --realm team-alpha --tcp 127.0.0.1:9001 --live-ws 127.0.0.1:9002
+    rkat-rest --realm team-alpha --live-rpc-tcp 127.0.0.1:9001
+    ```
+    </CodeGroup>
   </Step>
   <Step title="Set API keys">
     Export the key for your chosen provider:
@@ -43,6 +50,7 @@ Meerkat ships a REST server for running and managing agent sessions over HTTP. T
 - `--context-root <path>`
 - `--user-config-root <path>`
 - `--expose-paths`
+- `--live-rpc-tcp <addr>`
 
 If `--realm` is omitted, the server creates a new isolated opaque realm (`realm-...`).
 `--realm-backend` is a creation hint only; after first open, `realm_manifest.json`
@@ -60,6 +68,9 @@ This overview follows the generated OpenAPI artifact at
 | `GET` | `/sessions/{id}` | Fetch session metadata and usage |
 | `GET` | `/sessions/{id}/status` | Fetch current runtime state for a session |
 | `GET` | `/sessions/{id}/history` | Fetch committed session transcript messages |
+| `POST` | `/sessions/{id}/live/open` | Open a live channel on a session |
+| `POST` | `/sessions/{id}/live/close` | Close a live channel |
+| `GET` | `/sessions/{id}/live/status` | Fetch live channel status |
 | `POST` | `/sessions/{id}/system_context` | Append staged runtime system context |
 | `POST` | `/sessions/{id}/messages` | Continue an existing session |
 | `POST` | `/sessions/{id}/external-events` | Queue a runtime-backed external event |
@@ -82,6 +93,9 @@ This overview follows the generated OpenAPI artifact at
 | `POST` | `/sessions/{id}/mcp/reload` | Reload MCP server(s) (mcp feature) |
 | `POST` | `/comms/send` | Push comms message into a session (comms feature) |
 | `GET` | `/comms/peers` | List discoverable peers (comms feature) |
+| `POST` | `/live/open` | Open a live channel (proxied to configured `rkat-rpc` live host) |
+| `POST` | `/live/status` | Read live channel status |
+| `POST` | `/live/close` | Close a live channel |
 | `GET` | `/auth/profiles` | List realm auth profiles, backend profiles, and bindings |
 | `POST` | `/auth/profiles` | Store binding-scoped credentials |
 | `GET` | `/auth/bindings/{binding_id}` | Read a binding-scoped auth profile |
@@ -1175,6 +1189,41 @@ List discoverable peers for a session. Requires the `comms` feature.
   ]
 }
 ```
+
+## Live channels
+
+Live channels provide low-latency audio and text streaming. Create a session
+on a realtime-capable model (e.g. `gpt-realtime-2`), then open a live channel:
+
+```bash
+curl -X POST http://127.0.0.1:8080/sessions \
+  -H 'content-type: application/json' \
+  -d '{"prompt":"Ready for live interaction.","model":"gpt-realtime-2","provider":"openai"}'
+```
+
+Then open the channel:
+
+```bash
+curl -X POST http://127.0.0.1:8080/sessions/{id}/live/open \
+  -H 'content-type: application/json' \
+  -d '{}'
+```
+
+See the [Live Channels guide](/guides/realtime) for the full flow.
+
+### POST /live/open
+
+Open a live channel, proxied to the configured `rkat-rpc --tcp ... --live-ws ...` host.
+
+```bash
+curl -X POST http://127.0.0.1:8080/live/open \
+  -H 'content-type: application/json' \
+  -d '{"session_id":"01936f8a-7b2c-7000-8000-000000000001"}'
+```
+
+`/live/status` and `/live/close` use `{"session_id":"..."}`.
+If `--live-rpc-tcp` is not configured on `rkat-rest`, these
+routes return an unavailable transport error.
 
 ## Error responses
 

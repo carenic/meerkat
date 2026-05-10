@@ -328,8 +328,13 @@ Wildcard `"*"` matches any role.
 
 ---
 
+## Live channels
+
+Each mob member runs in its own session, so live channels are per-member by construction. Point a profile at a realtime-capable model (for example `gpt-realtime-2`) and call `live/open` against the member's session to start a live channel. See the [Live Channels guide](/guides/realtime) for the full flow.
+
 ## See also
 
+- [Live Channels guide](/guides/realtime) — per-member live audio channels
 - [Examples: Mobs](/examples/mobs) — code examples across all surfaces
 - [Examples: Mobpack](/examples/mobpack) — portable deployment
 - [Examples: WASM](/examples/wasm) — browser deployment

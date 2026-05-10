@@ -27,6 +27,84 @@ use meerkat_core::types::Usage;
 use crate::wire::realtime::RealtimeTurningMode;
 use crate::wire::session::WireStopReason;
 
+/// Wire-safe projection of [`meerkat_core::Provider`].
+///
+/// The core `Provider` enum uses `#[serde(rename_all = "snake_case")]` which
+/// transforms `OpenAI` to `"open_a_i"` on the wire -- not the conventional
+/// `"openai"`. `WireProvider` pins the correct wire names with explicit
+/// `#[serde(rename)]` on each variant so SDK consumers see `"openai"`,
+/// `"anthropic"`, `"gemini"`, etc.
+///
+/// Includes an `Unknown { debug: String }` variant for future-proofing per
+/// the wire-mirror dogma used throughout this module.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[non_exhaustive]
+pub enum WireProvider {
+    #[serde(rename = "anthropic")]
+    Anthropic,
+    #[serde(rename = "openai")]
+    OpenAi,
+    #[serde(rename = "gemini")]
+    Gemini,
+    #[serde(rename = "self_hosted")]
+    SelfHosted,
+    #[serde(rename = "other")]
+    Other,
+    /// Fail-loud sentinel for future core variants. When a new
+    /// `Provider` variant is added, add an explicit arm in the `From`
+    /// impl rather than letting it fall through to `Unknown`.
+    ///
+    /// Unlike other wire-mirror `Unknown` variants, this is a unit
+    /// variant because `WireProvider` serializes as a flat string value
+    /// (not an internally-tagged object). The debug payload from the
+    /// source variant is captured in the `WireConversionError::Provider`
+    /// error on the reverse path (and logged server-side in the forward
+    /// `From<Provider>` impl via `debug_assert!`).
+    #[serde(rename = "unknown")]
+    Unknown,
+}
+
+impl From<Provider> for WireProvider {
+    fn from(value: Provider) -> Self {
+        match value {
+            Provider::Anthropic => Self::Anthropic,
+            Provider::OpenAI => Self::OpenAi,
+            Provider::Gemini => Self::Gemini,
+            Provider::SelfHosted => Self::SelfHosted,
+            Provider::Other => Self::Other,
+            // Core `Provider` is not `#[non_exhaustive]` today, but the
+            // wildcard arm future-proofs the wire boundary.
+            #[allow(unreachable_patterns)]
+            other => {
+                debug_assert!(
+                    false,
+                    "WireProvider::from saw an unmapped Provider variant: {other:?}; \
+                     add an explicit arm in meerkat-contracts/src/wire/live.rs."
+                );
+                Self::Unknown
+            }
+        }
+    }
+}
+
+impl TryFrom<WireProvider> for Provider {
+    type Error = WireConversionError;
+
+    fn try_from(value: WireProvider) -> Result<Self, Self::Error> {
+        match value {
+            WireProvider::Anthropic => Ok(Self::Anthropic),
+            WireProvider::OpenAi => Ok(Self::OpenAI),
+            WireProvider::Gemini => Ok(Self::Gemini),
+            WireProvider::SelfHosted => Ok(Self::SelfHosted),
+            WireProvider::Other => Ok(Self::Other),
+            WireProvider::Unknown => Err(WireConversionError::Provider {
+                debug: "WireProvider::Unknown".to_string(),
+            }),
+        }
+    }
+}
+
 /// Request payload for `live/open`.
 ///
 /// R3-1 (P1): `turning_mode` lets callers pick between the provider-managed
@@ -128,63 +206,10 @@ impl From<LiveTransportBootstrap> for WireLiveTransportBootstrap {
     }
 }
 
-/// Conversion error surfaced when a wire variant has no core counterpart.
-///
-/// Fires for the explicit fail-loud `Unknown` wire variants —
-/// `WireLiveTransportBootstrap::Unknown`, `WireLiveAdapterObservation::Unknown`,
-/// `WireLiveContinuityMode::Unknown`, `WireLiveResponseModality::Unknown`,
-/// `WireLiveAdapterStatus::Unknown`, `WireLiveAdapterErrorCode::Unknown`. These
-/// are the wire mirrors' fail-loud sentinels for forward-converted future core
-/// variants. There is no meaningful inverse for `Unknown` so the inverse path
-/// returns this error instead of silently fabricating a placeholder.
-#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
-#[non_exhaustive]
-pub enum WireConversionError {
-    /// Wire transport is the explicit-Unknown sentinel; no inverse mapping
-    /// exists. Carries the original debug payload for server logs.
-    #[error("unknown wire transport variant: {debug}")]
-    Transport { debug: String },
-    /// Wire observation is the explicit-Unknown sentinel; no inverse
-    /// mapping exists. Carries the original debug payload for server logs.
-    #[error("unknown wire observation variant: {debug}")]
-    Observation { debug: String },
-    /// Wire continuity mode is the explicit-Unknown sentinel; no inverse
-    /// mapping exists. Carries the original debug payload for server logs.
-    #[error("unknown wire continuity-mode variant: {debug}")]
-    Continuity { debug: String },
-    /// Wire response modality is the explicit-Unknown sentinel; no inverse
-    /// mapping exists. Carries the original debug payload for server logs.
-    #[error("unknown wire response-modality variant: {debug}")]
-    ResponseModality { debug: String },
-    /// Wire adapter status is the explicit-Unknown sentinel; no inverse
-    /// mapping exists. Carries the original debug payload for server logs.
-    #[error("unknown wire adapter-status variant: {debug}")]
-    Status { debug: String },
-    /// Wire adapter error-code is the explicit-Unknown sentinel; no inverse
-    /// mapping exists. Carries the original debug payload for server logs.
-    #[error("unknown wire adapter-error-code variant: {debug}")]
-    ErrorCode { debug: String },
-    /// Wire config-rejection reason is the explicit-Unknown sentinel; no
-    /// inverse mapping exists. Carries the original debug payload for
-    /// server logs.
-    #[error("unknown wire config-rejection-reason variant: {debug}")]
-    ConfigRejectionReason { debug: String },
-    /// Wire transcript-source is the explicit-Unknown sentinel; no inverse
-    /// mapping exists. Carries the original debug payload for server logs.
-    /// R7-4 (P3 dogma): mirrors the live-wire `Unknown` pattern for
-    /// `WireTranscriptSource` so future core variants are not silently
-    /// misattributed as `Spoken`.
-    #[error("unknown wire transcript-source variant: {debug}")]
-    TranscriptSource { debug: String },
-    /// Wire assistant-block is the explicit-Unknown sentinel; no inverse
-    /// mapping exists. Carries the original debug payload for server logs.
-    /// R7-5 (P3 dogma): the reverse direction previously fabricated an
-    /// empty `AssistantBlock::Text` from `WireAssistantBlock::Unknown`,
-    /// silently producing a zero-length text block on the canonical
-    /// transcript. Now surfaces as a typed error.
-    #[error("unknown wire assistant-block variant: {debug}")]
-    AssistantBlock { debug: String },
-}
+// Re-export from the shared wire error module for backwards compatibility.
+// Callers that previously imported `crate::wire::live::WireConversionError`
+// continue to compile; new code should import from `crate::wire::WireConversionError`.
+pub use crate::wire::error::WireConversionError;
 
 impl TryFrom<WireLiveTransportBootstrap> for LiveTransportBootstrap {
     type Error = WireConversionError;
@@ -849,9 +874,9 @@ pub enum WireLiveAdapterErrorCode {
 pub enum WireLiveConfigRejectionReason {
     ChannelIdentitySwap {
         from_model: String,
-        from_provider: Provider,
+        from_provider: WireProvider,
         to_model: String,
-        to_provider: Provider,
+        to_provider: WireProvider,
     },
     NonRealtimeResolution {
         detail: String,
@@ -921,9 +946,9 @@ impl From<LiveConfigRejectionReason> for WireLiveConfigRejectionReason {
                 to_provider,
             } => Self::ChannelIdentitySwap {
                 from_model,
-                from_provider,
+                from_provider: from_provider.into(),
                 to_model,
-                to_provider,
+                to_provider: to_provider.into(),
             },
             LiveConfigRejectionReason::NonRealtimeResolution { detail } => {
                 Self::NonRealtimeResolution { detail }
@@ -1004,9 +1029,9 @@ impl TryFrom<WireLiveConfigRejectionReason> for LiveConfigRejectionReason {
                 to_provider,
             } => Ok(Self::ChannelIdentitySwap {
                 from_model,
-                from_provider,
+                from_provider: from_provider.try_into()?,
                 to_model,
-                to_provider,
+                to_provider: to_provider.try_into()?,
             }),
             WireLiveConfigRejectionReason::NonRealtimeResolution { detail } => {
                 Ok(Self::NonRealtimeResolution { detail })
@@ -2399,6 +2424,12 @@ mod tests {
                 actual_sample_rate_hz: 16_000,
                 actual_channels: 2,
             },
+            WireLiveConfigRejectionReason::ChannelIdentitySwap {
+                from_model: "claude-opus-4-6".into(),
+                from_provider: WireProvider::Anthropic,
+                to_model: "gpt-5.4".into(),
+                to_provider: WireProvider::OpenAi,
+            },
             WireLiveConfigRejectionReason::Other {
                 detail: "anything".into(),
             },
@@ -2411,5 +2442,94 @@ mod tests {
             let back: WireLiveConfigRejectionReason = core.into();
             assert_eq!(v, back);
         }
+    }
+
+    // --- WireProvider regression tests ---
+
+    #[test]
+    fn wire_provider_openai_serializes_as_openai() {
+        // P2 regression: core `Provider::OpenAI` with `rename_all = "snake_case"`
+        // serializes as `"open_a_i"`. `WireProvider::OpenAi` must serialize as
+        // `"openai"` on the wire.
+        let v = WireProvider::OpenAi;
+        let j = serde_json::to_value(&v).expect("serialization should succeed");
+        assert_eq!(
+            j, "openai",
+            "WireProvider::OpenAi must serialize as \"openai\", not \"open_a_i\""
+        );
+    }
+
+    #[test]
+    fn wire_provider_all_known_variants_round_trip() {
+        let cases = [
+            (WireProvider::Anthropic, "anthropic"),
+            (WireProvider::OpenAi, "openai"),
+            (WireProvider::Gemini, "gemini"),
+            (WireProvider::SelfHosted, "self_hosted"),
+            (WireProvider::Other, "other"),
+        ];
+        for (variant, expected_str) in cases {
+            let j = serde_json::to_value(&variant).expect("serialization should succeed");
+            assert_eq!(j, expected_str, "variant {variant:?} wrong wire name");
+            let back: WireProvider =
+                serde_json::from_value(j).expect("deserialization should succeed");
+            assert_eq!(variant, back);
+        }
+    }
+
+    #[test]
+    fn wire_provider_from_core_round_trips() {
+        let cases = [
+            (Provider::Anthropic, WireProvider::Anthropic),
+            (Provider::OpenAI, WireProvider::OpenAi),
+            (Provider::Gemini, WireProvider::Gemini),
+            (Provider::SelfHosted, WireProvider::SelfHosted),
+            (Provider::Other, WireProvider::Other),
+        ];
+        for (core, expected_wire) in cases {
+            let wire: WireProvider = core.into();
+            assert_eq!(wire, expected_wire);
+            let back: Provider = wire.try_into().expect("known wire variant should convert");
+            assert_eq!(back, core);
+        }
+    }
+
+    #[test]
+    fn wire_provider_unknown_does_not_become_known_variant() {
+        let unknown = WireProvider::Unknown;
+        let j = serde_json::to_value(&unknown).expect("serialization should succeed");
+        assert_eq!(
+            j, "unknown",
+            "WireProvider::Unknown must serialize as \"unknown\""
+        );
+        let back: WireProvider = serde_json::from_value(j).expect("deserialization should succeed");
+        assert_eq!(unknown, back);
+        match Provider::try_from(unknown) {
+            Err(WireConversionError::Provider { .. }) => {
+                // Expected: Unknown has no core counterpart.
+            }
+            other => panic!("unknown wire variant must not coerce to a core variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn channel_identity_swap_serializes_provider_correctly() {
+        // P2 regression: the old shape exposed core `Provider` which
+        // serialized `OpenAI` as `"open_a_i"`. The new `WireProvider`
+        // must serialize as `"openai"`.
+        let v = WireLiveConfigRejectionReason::ChannelIdentitySwap {
+            from_model: "claude-opus-4-6".into(),
+            from_provider: WireProvider::Anthropic,
+            to_model: "gpt-5.4".into(),
+            to_provider: WireProvider::OpenAi,
+        };
+        let j = serde_json::to_value(&v).expect("serialization should succeed");
+        assert_eq!(j["from_provider"], "anthropic");
+        assert_eq!(j["to_provider"], "openai");
+        // Must NOT serialize as "open_a_i"
+        assert_ne!(
+            j["to_provider"], "open_a_i",
+            "WireProvider must use explicit rename, not snake_case"
+        );
     }
 }

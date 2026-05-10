@@ -1,10 +1,10 @@
 ---
 title: "JSON-RPC stdio server"
-description: "Stateful JSON-RPC 2.0 interface for stdio and TCP."
+description: "Stateful JSON-RPC 2.0 interface for stdio, TCP, and optional live audio WebSocket hosting."
 icon: "terminal"
 ---
 
-Meerkat exposes a JSON-RPC 2.0 surface for IDE integration, desktop apps, and automation tools. Stdio is the default, and the binary also supports TCP. Unlike REST and MCP, the RPC server keeps agents alive between turns for fast multi-turn conversations.
+Meerkat exposes a JSON-RPC 2.0 surface for IDE integration, desktop apps, and automation tools. Stdio is the default, and the binary also supports TCP plus an optional live audio WebSocket listener (`--live-ws`). Unlike REST and MCP, the RPC server keeps agents alive between turns for fast multi-turn conversations.
 
 The RPC surface is fully runtime-backed:
 
@@ -26,9 +26,10 @@ The RPC surface is fully runtime-backed:
 
     ```bash
     rkat-rpc --tcp 127.0.0.1:9001
+    rkat-rpc --tcp 127.0.0.1:9001 --live-ws 127.0.0.1:9002
     ```
 
-    TCP listeners are local-only by default. Binding
+    TCP and live WebSocket listeners are local-only by default. Binding
     a non-loopback address such as `0.0.0.0:9001` requires `--allow-remote`;
     that flag only opts in to network exposure and does not add
     authentication or encryption. Use it behind a production-safe transport
@@ -101,8 +102,6 @@ subset.
 | `session/inject_context` | Session | Append runtime-backed system context to the next turn |
 | `turn/start` | Turn | Start a new turn on existing session |
 | `turn/interrupt` | Turn | Cancel in-flight turn |
-| `session/stream_open` | Session | Open a standalone session event stream |
-| `session/stream_close` | Session | Close a standalone session event stream |
 | `live/open` | Live | Open a live audio/text channel for a session |
 | `live/status` | Live | Get the status of a live channel |
 | `live/close` | Live | Close a live channel |
@@ -110,7 +109,9 @@ subset.
 | `live/commit_input` | Live | Commit pending input on a live channel (turn boundary) |
 | `live/interrupt` | Live | Interrupt the assistant turn on a live channel (barge-in) |
 | `live/truncate` | Live | Truncate assistant output at a client-tracked playback cursor |
-| `live/refresh` | Live | Apply mutable session config (instructions/tools/audio) to an open live channel; config-only, does not replay history; identity swaps (model/provider) require close + reopen |
+| `live/refresh` | Live | Apply mutable session config (instructions/tools/audio) to an open live channel |
+| `session/stream_open` | Session | Open a standalone session event stream |
+| `session/stream_close` | Session | Close a standalone session event stream |
 | `mob/create` | Mob | Create a mob from a definition (mob feature) |
 | `mob/list` | Mob | List mobs (mob feature) |
 | `mob/status` | Mob | Get mob status (mob feature) |
@@ -193,6 +194,14 @@ Generated assistant images use the same surface-neutral history and blob APIs as
 </Note>
 
 <Note>
+Live channels provide low-latency audio/text streaming. Create a session
+with a realtime-capable model (e.g. `gpt-realtime-2`), then call
+`live/open` to start the channel. The `--live-ws <addr>` flag on
+`rkat-rpc` enables the WebSocket listener required for audio transport.
+Use `live/status` to observe channel state.
+</Note>
+
+<Note>
 RPC is the canonical typed substrate for the SDKs: use explicit `mob/*` lifecycle, host-ingress, and observation methods from apps. Inside running sessions, mob capability is exposed by composing `meerkat-mob-mcp` (`MobMcpState` + `AgentMobToolSurfaceFactory`) into `SessionBuildOptions.mob_tools`, which provides authorized `mob_*` tools to the agent. `external_tools` remains for callback and MCP-backed tool dispatchers.
 </Note>
 
@@ -255,7 +264,7 @@ Handshake. Returns server capabilities.
       "session/create", "session/list", "session/read",
       "turn/start", "turn/interrupt",
       "runtime/host_info", "config/get",
-      "mob/create"
+      "live/open", "mob/create"
     ]
   }
 }
@@ -901,6 +910,72 @@ List all skills with provenance information, including active and shadowed entri
 </ResponseField>
 
 Returns error `-32603` if skills are not enabled.
+
+## Live channel methods
+
+Live channels provide low-latency audio and text streaming on sessions that use a realtime-capable model. Create a session with a model like `gpt-realtime-2`, then call `live/open` to start the channel explicitly. The `--live-ws <addr>` flag on `rkat-rpc` enables the WebSocket listener required for audio transport. See the [Live Channels guide](/guides/realtime) for the full flow.
+
+### Opening a live channel
+
+Create a session on a realtime-capable model and call `live/open`:
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 19,
+  "method": "session/create",
+  "params": {
+    "prompt": "Let's talk.",
+    "model": "gpt-realtime-2",
+    "provider": "openai"
+  }
+}
+```
+
+```json
+{
+  "jsonrpc": "2.0",
+  "id": 20,
+  "method": "live/open",
+  "params": {
+    "session_id": "01936f8a-7b2c-7000-8000-000000000001"
+  }
+}
+```
+
+`live/open` returns a `LiveOpenResult` with transport bootstrap (e.g. WebSocket URL), `WireLiveChannelCapabilities`, and `WireLiveContinuityMode`.
+
+### live/status
+
+Read the current state of a live channel.
+
+<CodeGroup>
+```json Request
+{
+  "jsonrpc": "2.0",
+  "id": 22,
+  "method": "live/status",
+  "params": {
+    "session_id": "01936f8a-7b2c-7000-8000-000000000001"
+  }
+}
+```
+</CodeGroup>
+
+### Live channel lifecycle methods (`live/*`)
+
+| Method | Purpose |
+|--------|---------|
+| `live/open` | Open a live audio/text channel for a session |
+| `live/status` | Get the status of a live channel |
+| `live/close` | Close a live channel |
+| `live/send_input` | Send an input chunk (audio/text) to a live channel |
+| `live/commit_input` | Commit pending input on a live channel (turn boundary) |
+| `live/interrupt` | Interrupt the assistant turn on a live channel (barge-in) |
+| `live/truncate` | Truncate assistant output at a client-tracked playback cursor |
+| `live/refresh` | Apply mutable session config (instructions/tools/audio) to an open channel; config-only, does not replay history; identity swaps (model/provider) require close + reopen |
+
+These require `rkat-rpc` to be started with `--live-ws <addr>` for WebSocket transport.
 
 ## MCP methods
 
