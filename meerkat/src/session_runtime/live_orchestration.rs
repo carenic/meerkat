@@ -277,3 +277,581 @@ pub fn builtin_tool_visibility_witness() -> meerkat_core::ToolVisibilityWitness 
         last_seen_provenance: Some(provenance),
     }
 }
+
+/// Phase 4 R1: surface-agnostic [`LiveOrchestrator`] that owns the
+/// load-bearing live-channel methods previously stranded on
+/// `meerkat-rpc::SessionRuntime`.
+///
+/// `LiveOrchestrator<'a>` is a borrowing struct: surfaces hand it the
+/// concrete references they own and the orchestrator drives the
+/// recovery / staged-promotion / refresh / hot-swap flows. The RPC
+/// shell wraps this in a thin shim that translates the typed
+/// [`LiveOpenPrecheckError`] / [`SessionError`] onto `RpcError`.
+#[cfg(all(
+    feature = "session-store",
+    feature = "live",
+    not(target_arch = "wasm32")
+))]
+pub use orchestrator::LiveOrchestrator;
+
+#[cfg(all(
+    feature = "session-store",
+    feature = "live",
+    not(target_arch = "wasm32")
+))]
+mod orchestrator {
+    use std::sync::Arc;
+
+    use meerkat_core::service::{
+        CreateSessionRequest, InitialTurnPolicy, SessionError, SessionService,
+    };
+    use meerkat_core::types::{ContentInput, SessionId};
+    use meerkat_core::{DeferredPromptPolicy, SurfaceSessionRecoveryOverrides};
+    use meerkat_live::LiveAdapterHost;
+    use meerkat_llm_core::realtime_session::RealtimeSessionOpenConfig;
+    use meerkat_runtime::{
+        MeerkatMachine, SessionLlmReconfigureHost, SessionLlmReconfigureRequest,
+    };
+    use meerkat_session::PersistentSessionService;
+
+    use super::{
+        build_live_projection_snapshot_for_runtime,
+        live_channel_requires_close_for_identity_change, precheck_identity,
+        realtime_projection_messages, realtime_projection_runtime_system_context,
+    };
+
+    use crate::service_factory::FactoryAgentBuilder;
+    use crate::session_runtime::admission::{
+        StagedCapacityAdmissions, take_staged_capacity_admission,
+    };
+    use crate::session_runtime::errors::LiveOpenPrecheckError;
+    use crate::session_runtime::recovery::{RecoveryContext, RecoveryRuntimeBindingMode};
+    use crate::session_runtime::runtime_state::ArchiveRuntimeCleanup;
+    use crate::session_runtime::staged_promotion::PendingPromotionCleanup;
+    use crate::{StagedLifecycleError, StagedSessionRegistry};
+
+    /// Surface-agnostic live-channel orchestrator.
+    ///
+    /// Borrows the resolved infrastructure from a calling surface
+    /// (RPC, REST, embedded examples) and exposes the W2-A
+    /// load-bearing methods that previously lived on
+    /// `meerkat-rpc::SessionRuntime`.
+    pub struct LiveOrchestrator<'a> {
+        /// Persistent session service.
+        pub service: &'a Arc<PersistentSessionService<FactoryAgentBuilder>>,
+        /// Staged session registry.
+        pub staged_sessions: &'a Arc<StagedSessionRegistry>,
+        /// Service-owned capacity ledger for staged sessions.
+        pub staged_capacity_admissions: &'a StagedCapacityAdmissions,
+        /// Runtime adapter (`MeerkatMachine`).
+        pub runtime_adapter: &'a Arc<MeerkatMachine>,
+        /// Optional live-adapter host (owned `Arc` clone). `None`
+        /// disables refresh / close fan-out
+        /// (`propagate_config_to_live_channels` becomes a no-op).
+        pub host: Option<Arc<LiveAdapterHost>>,
+        /// Shared config runtime (for generation stamping).
+        pub config_runtime: Option<Arc<meerkat_core::ConfigRuntime>>,
+        /// Default LLM client override applied to fresh sessions.
+        pub default_llm_client: Option<Arc<dyn crate::LlmClient>>,
+        /// Optional decorator wrapped around session LLM clients (kept
+        /// here so the orchestrator can build a [`RecoveryContext`]
+        /// without a separate plumbing seam).
+        pub agent_llm_client_decorator: Option<meerkat_core::AgentLlmClientDecorator>,
+        /// Optional external tool dispatcher (RPC's callback dispatcher,
+        /// REST's external bridge, etc.).
+        pub external_tools: Option<Arc<dyn meerkat_core::AgentToolDispatcher>>,
+        /// Surface-supplied archive cleanup for failed recoveries.
+        pub archive_runtime_cleanup: ArchiveRuntimeCleanup,
+        /// Surface-supplied LLM reconfigure host used for the idle
+        /// hot-swap branch of `propagate_config_to_live_channels`.
+        pub llm_reconfigure_host: &'a dyn SessionLlmReconfigureHost,
+        /// Active realm id (cloned from the slot once per call).
+        pub realm_id: Option<&'a meerkat_core::connection::RealmId>,
+        /// Active instance id.
+        pub instance_id: Option<&'a str>,
+        /// Active backend label.
+        pub backend: Option<&'a str>,
+    }
+
+    impl LiveOrchestrator<'_> {
+        fn recovery_context(&self) -> RecoveryContext<'_> {
+            RecoveryContext {
+                service: self.service,
+                runtime_adapter: self.runtime_adapter,
+                realm_id: self.realm_id,
+                instance_id: self.instance_id,
+                backend: self.backend,
+                default_llm_client: self.default_llm_client.clone(),
+                agent_llm_client_decorator: self.agent_llm_client_decorator.clone(),
+                external_tools: self.external_tools.clone(),
+                config_runtime: self.config_runtime.clone(),
+            }
+        }
+
+        async fn cleanup_recovered_runtime_if_new(
+            &self,
+            session_id: &SessionId,
+            runtime_was_registered: bool,
+        ) {
+            if !runtime_was_registered {
+                let _ = self.archive_runtime_cleanup.run(session_id).await;
+            }
+        }
+
+        /// Promote a staged (deferred) session into the live service map
+        /// without running a turn, so realtime-open paths can find it.
+        pub async fn materialize_staged_session_for_realtime_open(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<(), SessionError> {
+            let pending_session = match self.staged_sessions.begin_promotion(session_id).await {
+                Ok(slot) => slot,
+                Err(StagedLifecycleError::AlreadyPromoting(_)) => {
+                    return Err(SessionError::Busy {
+                        id: session_id.clone(),
+                    });
+                }
+                Err(e) => {
+                    return Err(SessionError::Agent(
+                        meerkat_core::error::AgentError::InternalError(format!(
+                            "staged session lifecycle error for {session_id}: {e}"
+                        )),
+                    ));
+                }
+            };
+
+            let Some(slot) = pending_session else {
+                return Ok(());
+            };
+
+            let staged_capacity_admission =
+                take_staged_capacity_admission(self.staged_capacity_admissions, session_id);
+            let mut promotion_cleanup = PendingPromotionCleanup::new(
+                Arc::clone(self.staged_sessions),
+                Arc::clone(self.staged_capacity_admissions),
+                session_id,
+                &slot,
+                staged_capacity_admission,
+            );
+
+            let crate::PromotingSlot {
+                build_config,
+                labels,
+                deferred_prompt,
+                ..
+            } = slot;
+            let mut build_config = *build_config;
+
+            if build_config.llm_client_override.is_none()
+                && let Some(client) = self.default_llm_client.as_ref()
+            {
+                build_config.llm_client_override = Some(Arc::clone(client));
+                promotion_cleanup.update_build_config(&build_config);
+            }
+
+            let runtime_generation = if build_config.config_generation.is_none() {
+                if let Some(runtime) = self.config_runtime.as_ref() {
+                    runtime.get().await.ok().map(|snapshot| snapshot.generation)
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
+
+            let mut build = build_config.to_session_build_options();
+            build.realm_id = build
+                .realm_id
+                .or_else(|| self.realm_id.map(ToString::to_string));
+            build.instance_id = build
+                .instance_id
+                .or_else(|| self.instance_id.map(ToString::to_string));
+            build.backend = build
+                .backend
+                .or_else(|| self.backend.map(ToString::to_string));
+            build.config_generation = build.config_generation.or(runtime_generation);
+
+            let (prompt, deferred_prompt_policy) = match deferred_prompt {
+                Some(prompt) => (prompt, DeferredPromptPolicy::Stage),
+                None => (
+                    ContentInput::Text(String::new()),
+                    DeferredPromptPolicy::Discard,
+                ),
+            };
+
+            let create_req = CreateSessionRequest {
+                model: build_config.model.clone(),
+                prompt,
+                render_metadata: None,
+                system_prompt: build_config.system_prompt.clone(),
+                max_tokens: build_config.max_tokens,
+                event_tx: None,
+                skill_references: None,
+                initial_turn: InitialTurnPolicy::Defer,
+                deferred_prompt_policy,
+                build: Some(build),
+                labels,
+            };
+
+            let admission = match promotion_cleanup.take_staged_capacity_admission() {
+                Some(adm) => adm,
+                None => self.service.reserve_create_session_admission().await?,
+            };
+
+            match self
+                .service
+                .create_session_with_reserved_admission(create_req, admission)
+                .await
+            {
+                Ok(_) => {
+                    promotion_cleanup.mark_materialized();
+                    let _ = promotion_cleanup.finish_now().await;
+                    promotion_cleanup.disarm();
+                    Ok(())
+                }
+                Err(error) => {
+                    promotion_cleanup.restore_now().await;
+                    Err(error)
+                }
+            }
+        }
+
+        /// Recover a persisted-only session into the live service map so
+        /// realtime-open paths can resolve it. Materializes a deferred
+        /// staged session in place; falls back to durable-snapshot
+        /// rebuild for fully archived-but-resumable sessions.
+        pub async fn recover_live_session_for_realtime_open(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<(), SessionError> {
+            if self.service.has_live_session(session_id).await? {
+                return Ok(());
+            }
+
+            if self.staged_sessions.contains(session_id).await {
+                Box::pin(self.materialize_staged_session_for_realtime_open(session_id)).await?;
+                return Ok(());
+            }
+
+            let recovery_ctx = self.recovery_context();
+            let session = recovery_ctx
+                .load_persisted_session(session_id)
+                .await?
+                .ok_or_else(|| SessionError::NotFound {
+                    id: session_id.clone(),
+                })?;
+            let keep_alive = session
+                .session_metadata()
+                .map(|metadata| metadata.keep_alive)
+                .unwrap_or(false);
+            let recovery_overrides = SurfaceSessionRecoveryOverrides {
+                keep_alive: Some(keep_alive),
+                ..Default::default()
+            };
+            let recovered = recovery_ctx
+                .recovered_create_request_with_runtime_binding_mode(
+                    session_id,
+                    session,
+                    recovery_overrides,
+                    RecoveryRuntimeBindingMode::LocalResources,
+                )
+                .await
+                .map_err(recovery_error_to_session_error)?;
+            let runtime_was_registered = recovered.runtime_was_registered;
+            let admission = self.service.reserve_create_session_admission().await?;
+            if let Err(error) = self
+                .service
+                .create_session_with_reserved_admission(recovered.request, admission)
+                .await
+            {
+                self.cleanup_recovered_runtime_if_new(session_id, runtime_was_registered)
+                    .await;
+                return Err(error);
+            }
+
+            Ok(())
+        }
+
+        /// Project the owning live session into the provider-backed
+        /// realtime open seam.
+        pub async fn realtime_session_open_config(
+            &self,
+            session_id: &SessionId,
+            turning_mode: meerkat_contracts::RealtimeTurningMode,
+        ) -> Result<RealtimeSessionOpenConfig, SessionError> {
+            Box::pin(self.recover_live_session_for_realtime_open(session_id)).await?;
+            let session = match self
+                .service
+                .export_realtime_open_session_snapshot(session_id)
+                .await
+            {
+                Ok(session) => session,
+                Err(SessionError::NotFound { .. }) => {
+                    Box::pin(self.recover_live_session_for_realtime_open(session_id)).await?;
+                    self.service
+                        .export_realtime_open_session_snapshot(session_id)
+                        .await?
+                }
+                Err(error) => return Err(error),
+            };
+            let llm_identity = self.service.live_session_llm_identity(session_id).await?;
+            let visible_tools = self.service.live_visible_tool_defs(session_id).await?;
+            Ok(RealtimeSessionOpenConfig::new(
+                turning_mode,
+                llm_identity,
+                visible_tools,
+                realtime_projection_messages(&session),
+            )
+            .with_runtime_system_context(realtime_projection_runtime_system_context(&session)))
+        }
+
+        /// Build a live open config for a session that may be deferred
+        /// (no turns yet).
+        pub async fn live_open_config_for_session(
+            &self,
+            session_id: &SessionId,
+            turning_mode: meerkat_contracts::RealtimeTurningMode,
+        ) -> Result<RealtimeSessionOpenConfig, SessionError> {
+            self.realtime_session_open_config(session_id, turning_mode)
+                .await
+        }
+
+        /// Pre-flight checks for `live/open` before any infra is minted.
+        pub async fn precheck_live_open(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<(), LiveOpenPrecheckError> {
+            let map_lookup_err = |err: SessionError| LiveOpenPrecheckError::SessionLookup {
+                session_id: session_id.clone(),
+                source: err,
+            };
+            if let Some(info) = self.staged_sessions.info(session_id).await {
+                return precheck_identity(&info.effective_llm_identity);
+            }
+            Box::pin(self.recover_live_session_for_realtime_open(session_id))
+                .await
+                .map_err(map_lookup_err)?;
+            let identity = match self.service.live_session_llm_identity(session_id).await {
+                Ok(identity) => identity,
+                Err(SessionError::NotFound { .. }) => {
+                    Box::pin(self.recover_live_session_for_realtime_open(session_id))
+                        .await
+                        .map_err(map_lookup_err)?;
+                    self.service
+                        .live_session_llm_identity(session_id)
+                        .await
+                        .map_err(map_lookup_err)?
+                }
+                Err(other) => return Err(map_lookup_err(other)),
+            };
+            precheck_identity(&identity)
+        }
+
+        /// Fan out `Refresh` (or `Close` if the new resolved model is no
+        /// longer realtime-capable, or if the model/provider was
+        /// swapped) to every active live channel. Best-effort:
+        /// per-channel errors are swallowed via tracing.
+        pub async fn propagate_config_to_live_channels(&self) {
+            let Some(host) = self.host.as_ref() else {
+                return;
+            };
+            let channels = host.active_channels().await;
+            let mut unique_sessions: Vec<SessionId> = Vec::new();
+            for channel_id in &channels {
+                if let Ok(session_id) = host.channel_session(channel_id).await
+                    && !unique_sessions.iter().any(|sid| sid == &session_id)
+                {
+                    unique_sessions.push(session_id);
+                }
+            }
+            if !unique_sessions.is_empty()
+                && let Some(runtime) = self.config_runtime.as_ref()
+                && let Ok(snapshot) = runtime.get().await
+            {
+                let new_global_model = snapshot.config.agent.model.clone();
+                for session_id in &unique_sessions {
+                    let request = SessionLlmReconfigureRequest {
+                        model: Some(new_global_model.clone()),
+                        provider: None,
+                        provider_params: None,
+                        clear_provider_params: false,
+                        auth_binding: None,
+                        clear_auth_binding: false,
+                    };
+                    if let Err(err) = crate::session_runtime::llm_reconfigure::hot_swap_llm_client_on_idle_session(
+                        self.llm_reconfigure_host,
+                        session_id,
+                        &request,
+                    )
+                    .await
+                    {
+                        tracing::debug!(
+                            target: "meerkat::session_runtime::live_orchestration",
+                            ?session_id,
+                            ?err,
+                            "hot-swap on config propagation failed; per-channel \
+                             precheck will fall back to current session identity"
+                        );
+                    }
+                }
+            }
+            for channel_id in channels {
+                let session_id = match host.channel_session(&channel_id).await {
+                    Ok(id) => id,
+                    Err(err) => {
+                        tracing::debug!(
+                            target: "meerkat::session_runtime::live_orchestration",
+                            ?channel_id,
+                            ?err,
+                            "live channel session lookup failed during config propagation"
+                        );
+                        continue;
+                    }
+                };
+                if let Err(precheck_err) = Box::pin(self.precheck_live_open(&session_id)).await {
+                    tracing::info!(
+                        target: "meerkat::session_runtime::live_orchestration",
+                        ?channel_id,
+                        ?session_id,
+                        ?precheck_err,
+                        "closing live channel: new resolution not realtime-capable"
+                    );
+                    let reason = format!("non_realtime_resolution: {precheck_err:?}");
+                    let _ = host
+                        .signal_terminal_error(
+                            &channel_id,
+                            meerkat_core::live_adapter::LiveAdapterErrorCode::ConfigRejected {
+                                reason,
+                            },
+                        )
+                        .await;
+                    continue;
+                }
+                let open_config = match Box::pin(self.live_open_config_for_session(
+                    &session_id,
+                    meerkat_contracts::RealtimeTurningMode::ProviderManaged,
+                ))
+                .await
+                {
+                    Ok(config) => config,
+                    Err(err) => {
+                        tracing::warn!(
+                            target: "meerkat::session_runtime::live_orchestration",
+                            ?channel_id,
+                            ?session_id,
+                            ?err,
+                            "failed to build refreshed open_config for live channel"
+                        );
+                        continue;
+                    }
+                };
+                let bound_identity = match host.channel_llm_identity(&channel_id).await {
+                    Ok(identity) => identity,
+                    Err(err) => {
+                        tracing::debug!(
+                            target: "meerkat::session_runtime::live_orchestration",
+                            ?channel_id,
+                            ?session_id,
+                            ?err,
+                            "channel identity lookup failed; skipping live channel"
+                        );
+                        continue;
+                    }
+                };
+                if let Some(prev) = bound_identity.as_ref()
+                    && live_channel_requires_close_for_identity_change(
+                        Some(prev),
+                        &open_config.llm_identity,
+                    )
+                {
+                    tracing::info!(
+                        target: "meerkat::session_runtime::live_orchestration",
+                        %channel_id,
+                        %session_id,
+                        old_model_id = %prev.model,
+                        new_model_id = %open_config.llm_identity.model,
+                        old_provider_id = ?prev.provider,
+                        new_provider_id = ?open_config.llm_identity.provider,
+                        reason = "model_swap",
+                        "closing live channel: config patch swapped \
+                         model/provider; SDK must reopen against new identity"
+                    );
+                    let reason = format!(
+                        "model_swap: {old} -> {new}",
+                        old = prev.model,
+                        new = open_config.llm_identity.model,
+                    );
+                    if let Err(err) = host
+                        .signal_terminal_error(
+                            &channel_id,
+                            meerkat_core::live_adapter::LiveAdapterErrorCode::ConfigRejected {
+                                reason,
+                            },
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "meerkat::session_runtime::live_orchestration",
+                            ?channel_id,
+                            ?session_id,
+                            ?err,
+                            "failed to signal terminal error on live channel after model swap"
+                        );
+                    }
+                    continue;
+                }
+                let mut snapshot =
+                    build_live_projection_snapshot_for_runtime(&session_id, &open_config);
+                match host.next_snapshot_version(&channel_id).await {
+                    Ok(v) => snapshot.snapshot_version = v,
+                    Err(err) => {
+                        tracing::debug!(
+                            target: "meerkat::session_runtime::live_orchestration",
+                            ?channel_id,
+                            ?session_id,
+                            ?err,
+                            "skipping live channel: snapshot version stamp failed"
+                        );
+                        continue;
+                    }
+                }
+                if let Err(err) = host
+                    .send_command(
+                        &channel_id,
+                        meerkat_core::live_adapter::LiveAdapterCommand::Refresh { snapshot },
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        target: "meerkat::session_runtime::live_orchestration",
+                        ?channel_id,
+                        ?session_id,
+                        ?err,
+                        "failed to dispatch Refresh command to live channel"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Coerce a `RecoveryError` into a `SessionError` for the
+    /// recovery-error-bearing entry points
+    /// (`recover_live_session_for_realtime_open`). Each variant maps to
+    /// the closest typed equivalent the surface-agnostic
+    /// `SessionError` carries; surfaces that need richer translation
+    /// can keep using `RecoveryContext` directly.
+    fn recovery_error_to_session_error(
+        error: crate::session_runtime::errors::RecoveryError,
+    ) -> SessionError {
+        use crate::session_runtime::errors::RecoveryError;
+        match error {
+            RecoveryError::Recovery(error) => SessionError::Agent(
+                meerkat_core::error::AgentError::InternalError(error.to_string()),
+            ),
+            RecoveryError::BindingPreparation { .. } => SessionError::Agent(
+                meerkat_core::error::AgentError::InternalError(error.to_string()),
+            ),
+            RecoveryError::Session(session_error) => session_error,
+        }
+    }
+}

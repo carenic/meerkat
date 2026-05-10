@@ -2712,227 +2712,57 @@ impl SessionRuntime {
         self.approval_service.clone()
     }
 
-    /// Promote a staged (deferred) session into the live service map without
-    /// running a turn, so realtime-open paths (`export_realtime_open_session_snapshot`,
-    /// `live_session_llm_identity`) can find it. Mirrors the staged-promotion
-    /// branch of `start_turn` but creates with `InitialTurnPolicy::Defer` and
-    /// preserves any staged prompt for the first follow-up turn.
+    /// Phase 4 R1: thin RPC shim — delegates to
+    /// `LiveOrchestrator::materialize_staged_session_for_realtime_open`
+    /// in `meerkat::session_runtime::live_orchestration`.
     async fn materialize_staged_session_for_realtime_open(
         &self,
         session_id: &SessionId,
     ) -> Result<(), SessionError> {
-        let pending_session = match self.staged_sessions.begin_promotion(session_id).await {
-            Ok(slot) => slot,
-            Err(meerkat::StagedLifecycleError::AlreadyPromoting(_)) => {
-                return Err(SessionError::Busy {
-                    id: session_id.clone(),
-                });
-            }
-            Err(e) => {
-                return Err(SessionError::Agent(
-                    meerkat_core::error::AgentError::InternalError(format!(
-                        "staged session lifecycle error for {session_id}: {e}"
-                    )),
-                ));
-            }
-        };
-
-        let Some(slot) = pending_session else {
-            return Ok(());
-        };
-
-        let staged_capacity_admission = self.take_staged_capacity_admission(session_id);
-        let mut promotion_cleanup = PendingPromotionCleanup::new(
-            Arc::clone(&self.staged_sessions),
-            Arc::clone(&self.staged_capacity_admissions),
-            session_id,
-            &slot,
-            staged_capacity_admission,
-        );
-
-        let PromotingSlot {
-            build_config,
-            labels,
-            deferred_prompt,
-            ..
-        } = slot;
-        let mut build_config = *build_config;
-
-        if build_config.llm_client_override.is_none()
-            && let Some(client) = self.default_llm_client()
-        {
-            build_config.llm_client_override = Some(client);
-            promotion_cleanup.update_build_config(&build_config);
-        }
-
-        let runtime_generation = if build_config.config_generation.is_none() {
-            if let Some(runtime) = self.config_runtime() {
-                runtime.get().await.ok().map(|snapshot| snapshot.generation)
-            } else {
-                None
-            }
-        } else {
-            None
-        };
-
-        let mut build = build_config.to_session_build_options();
-        build.realm_id = build
-            .realm_id
-            .or_else(|| self.inner.realm_id().map(|r| r.to_string()));
-        build.instance_id = build.instance_id.or_else(|| self.inner.instance_id());
-        build.backend = build.backend.or_else(|| self.inner.backend());
-        build.config_generation = build.config_generation.or(runtime_generation);
-
-        let (prompt, deferred_prompt_policy) = match deferred_prompt {
-            Some(prompt) => (prompt, DeferredPromptPolicy::Stage),
-            None => (
-                ContentInput::Text(String::new()),
-                DeferredPromptPolicy::Discard,
-            ),
-        };
-
-        let create_req = CreateSessionRequest {
-            model: build_config.model.clone(),
-            prompt,
-            render_metadata: None,
-            system_prompt: build_config.system_prompt.clone(),
-            max_tokens: build_config.max_tokens,
-            event_tx: None,
-            skill_references: None,
-            initial_turn: InitialTurnPolicy::Defer,
-            deferred_prompt_policy,
-            build: Some(build),
-            labels,
-        };
-
-        let admission = match promotion_cleanup.take_staged_capacity_admission() {
-            Some(adm) => adm,
-            None => self.service.reserve_create_session_admission().await?,
-        };
-
-        match self
-            .service
-            .create_session_with_reserved_admission(create_req, admission)
+        let snapshot = self.realm_context_snapshot();
+        let cleanup = self.archive_runtime_cleanup();
+        let host = self.llm_reconfigure_host();
+        self.live_orchestrator(&snapshot, cleanup, &host)
+            .materialize_staged_session_for_realtime_open(session_id)
             .await
-        {
-            Ok(_) => {
-                promotion_cleanup.mark_materialized();
-                let _ = promotion_cleanup.finish_now().await;
-                promotion_cleanup.disarm();
-                Ok(())
-            }
-            Err(error) => {
-                promotion_cleanup.restore_now().await;
-                Err(error)
-            }
-        }
     }
 
+    /// Phase 4 R1: thin RPC shim — delegates to
+    /// `LiveOrchestrator::recover_live_session_for_realtime_open` in
+    /// `meerkat::session_runtime::live_orchestration`.
     async fn recover_live_session_for_realtime_open(
         &self,
         session_id: &SessionId,
     ) -> Result<(), SessionError> {
-        if self.service.has_live_session(session_id).await? {
-            return Ok(());
-        }
-
-        // Round-5 fix: deferred sessions live in `staged_sessions` until a
-        // first turn or `live/open` materializes them. The earlier short-
-        // circuit returned `Ok(())` here without admitting the session into
-        // the live service map, so the realtime-open snapshot export below
-        // would still raise `NotFound` and break e2e scenarios 71/72.
-        // `live/open` is not a turn — we materialize the staged slot with
-        // `InitialTurnPolicy::Defer`, preserving any staged prompt for the
-        // first follow-up turn while making the session visible to
-        // `export_realtime_open_session_snapshot` and
-        // `live_session_llm_identity`.
-        if self.staged_sessions.contains(session_id).await {
-            self.materialize_staged_session_for_realtime_open(session_id)
-                .await?;
-            return Ok(());
-        }
-
-        let session = self
-            .load_persisted_session(session_id)
+        let snapshot = self.realm_context_snapshot();
+        let cleanup = self.archive_runtime_cleanup();
+        let host = self.llm_reconfigure_host();
+        self.live_orchestrator(&snapshot, cleanup, &host)
+            .recover_live_session_for_realtime_open(session_id)
             .await
-            .map_err(|err| rpc_error_to_session_error(err, session_id))?
-            .ok_or_else(|| SessionError::NotFound {
-                id: session_id.clone(),
-            })?;
-        let keep_alive = session
-            .session_metadata()
-            .map(|metadata| metadata.keep_alive)
-            .unwrap_or(false);
-        let recovery_overrides = self
-            .recovery_overrides_from_turn(None, keep_alive)
-            .map_err(|err| rpc_error_to_session_error(err, session_id))?;
-        let recovered = self
-            .recovered_create_request_with_runtime_binding_mode(
-                session_id,
-                session,
-                recovery_overrides,
-                RecoveryRuntimeBindingMode::LocalResources,
-            )
-            .await
-            .map_err(|err| rpc_error_to_session_error(err, session_id))?;
-        let runtime_was_registered = recovered.runtime_was_registered;
-        let admission = self.service.reserve_create_session_admission().await?;
-        if let Err(error) = self
-            .service
-            .create_session_with_reserved_admission(recovered.request, admission)
-            .await
-        {
-            self.cleanup_recovered_runtime_if_new(session_id, runtime_was_registered)
-                .await;
-            return Err(error);
-        }
-
-        Ok(())
     }
 
     /// Project the owning live session into the provider-backed realtime open seam.
+    ///
+    /// Phase 4 R1: thin RPC shim — delegates to
+    /// `LiveOrchestrator::realtime_session_open_config`.
     pub async fn realtime_session_open_config(
         &self,
         session_id: &SessionId,
         turning_mode: meerkat_contracts::RealtimeTurningMode,
     ) -> Result<RealtimeSessionOpenConfig, SessionError> {
-        self.recover_live_session_for_realtime_open(session_id)
-            .await?;
-        let session = match self
-            .service
-            .export_realtime_open_session_snapshot(session_id)
+        let snapshot = self.realm_context_snapshot();
+        let cleanup = self.archive_runtime_cleanup();
+        let host = self.llm_reconfigure_host();
+        self.live_orchestrator(&snapshot, cleanup, &host)
+            .realtime_session_open_config(session_id, turning_mode)
             .await
-        {
-            Ok(session) => session,
-            Err(SessionError::NotFound { .. }) => {
-                self.recover_live_session_for_realtime_open(session_id)
-                    .await?;
-                self.service
-                    .export_realtime_open_session_snapshot(session_id)
-                    .await?
-            }
-            Err(error) => return Err(error),
-        };
-        let llm_identity = self.service.live_session_llm_identity(session_id).await?;
-        let visible_tools = self.service.live_visible_tool_defs(session_id).await?;
-        Ok(RealtimeSessionOpenConfig::new(
-            turning_mode,
-            llm_identity,
-            visible_tools,
-            realtime_projection_messages(&session),
-        )
-        .with_runtime_system_context(realtime_projection_runtime_system_context(&session)))
     }
 
     /// Build a live open config for a session that may be deferred (no turns yet).
     ///
-    /// B20: previously this method silently fell back to a degraded config with
-    /// empty history and empty visible tools when the rich session-projection
-    /// path failed. That fallback shape is invariant-violating — a live session
-    /// without its resolved tool set or system context would silently route
-    /// through providers as a clean-room session — so the open is now refused
-    /// rather than served with a degraded config. Callers receive the typed
-    /// projection error from `realtime_session_open_config`.
+    /// Phase 4 R1: thin RPC shim — delegates to
+    /// `LiveOrchestrator::live_open_config_for_session`.
     pub async fn live_open_config_for_session(
         &self,
         session_id: &SessionId,
@@ -2944,61 +2774,54 @@ impl SessionRuntime {
 
     /// Pre-flight checks for `live/open` before any infra is minted.
     ///
-    /// B18: live/open must dispatch to a provider-specific realtime factory.
-    /// Wave 1 only ships the OpenAI factory; sessions resolved to any other
-    /// provider must be rejected with `NoLiveAdapter` rather than silently
-    /// routed through the OpenAI factory.
-    ///
-    /// B19: live/open must reject sessions whose resolved model has no
-    /// `realtime` capability in `meerkat_core::model_profile::capabilities`.
-    /// Without this, a non-realtime model would silently bind to a realtime
-    /// transport and the provider would reject the WebSocket handshake at
-    /// connect time, surfacing as an opaque adapter error.
-    ///
-    /// Wave-3 deferred-session bug: `live_session_llm_identity` only consults
-    /// the live-sessions map. Sessions created with `initial_turn: deferred`
-    /// live in `staged_sessions` until first turn or until
-    /// `recover_live_session_for_realtime_open` materializes them. Without the
-    /// recovery dance below, every deferred-session `live/open` precheck
-    /// returned `SessionLookup` (`INTERNAL_ERROR "session not found"`) before
-    /// the B18/B19 gates ever fired, breaking e2e scenarios 71/72. The
-    /// recover-then-`NotFound`-fallback pattern mirrors
-    /// `realtime_session_open_config` (lines 4030-4046) so deferred and live
-    /// sessions traverse the same materialization path.
+    /// Phase 4 R1: thin RPC shim — delegates to
+    /// `LiveOrchestrator::precheck_live_open`. The B18/B19 gates and
+    /// the deferred-session materialize-then-precheck dance live in
+    /// the surface-agnostic orchestrator.
     pub async fn precheck_live_open(
         &self,
         session_id: &SessionId,
     ) -> Result<(), LiveOpenPrecheckError> {
-        let map_lookup_err = |err: SessionError| LiveOpenPrecheckError::SessionLookup {
-            session_id: session_id.clone(),
-            source: err,
-        };
-        // Wave-3 retry: deferred sessions live in `staged_sessions` until the
-        // first turn promotes them into the live service map. Reading from
-        // staged here lets the precheck gate fire on the resolved model and
-        // provider before any infra is minted, even though
-        // `live_session_llm_identity` would still return `NotFound` for the
-        // session.
-        if let Some(info) = self.staged_sessions.info(session_id).await {
-            return precheck_identity(&info.effective_llm_identity);
-        }
-        self.recover_live_session_for_realtime_open(session_id)
+        let snapshot = self.realm_context_snapshot();
+        let cleanup = self.archive_runtime_cleanup();
+        let host = self.llm_reconfigure_host();
+        self.live_orchestrator(&snapshot, cleanup, &host)
+            .precheck_live_open(session_id)
             .await
-            .map_err(map_lookup_err)?;
-        let identity = match self.service.live_session_llm_identity(session_id).await {
-            Ok(identity) => identity,
-            Err(SessionError::NotFound { .. }) => {
-                self.recover_live_session_for_realtime_open(session_id)
-                    .await
-                    .map_err(map_lookup_err)?;
-                self.service
-                    .live_session_llm_identity(session_id)
-                    .await
-                    .map_err(map_lookup_err)?
-            }
-            Err(other) => return Err(map_lookup_err(other)),
-        };
-        precheck_identity(&identity)
+    }
+
+    /// Phase 4 R1: build a [`LiveOrchestrator`] borrowing this
+    /// runtime's resolved state. Surface-private dependencies
+    /// (callback dispatcher, archive cleanup, hot-swap host) are
+    /// passed in by the caller so the orchestrator stays free of
+    /// RPC-private types.
+    fn live_orchestrator<'a>(
+        &'a self,
+        snapshot: &'a RealmContextSnapshot,
+        archive_runtime_cleanup: meerkat::session_runtime::runtime_state::ArchiveRuntimeCleanup,
+        llm_reconfigure_host: &'a SessionRuntimeLlmReconfigureHost,
+    ) -> meerkat::session_runtime::live_orchestration::LiveOrchestrator<'a> {
+        let agent_llm_client_decorator = self
+            .agent_llm_client_decorator
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        meerkat::session_runtime::live_orchestration::LiveOrchestrator {
+            service: &self.service,
+            staged_sessions: &self.staged_sessions,
+            staged_capacity_admissions: &self.staged_capacity_admissions,
+            runtime_adapter: &self.runtime_adapter,
+            host: self.live_adapter_host(),
+            config_runtime: self.config_runtime(),
+            default_llm_client: self.default_llm_client(),
+            agent_llm_client_decorator,
+            external_tools: self.recovery_external_tools(),
+            archive_runtime_cleanup,
+            llm_reconfigure_host,
+            realm_id: snapshot.realm_id.as_ref(),
+            instance_id: snapshot.instance_id.as_deref(),
+            backend: snapshot.backend.as_deref(),
+        }
     }
 
     fn recovery_overrides_from_turn(
@@ -3915,264 +3738,15 @@ impl SessionRuntime {
             .and_then(|guard| guard.clone())
     }
 
-    /// P1#5: fan out `Refresh` (or `Close` if the new resolved model is no
-    /// longer realtime-capable, or if the model/provider was swapped) to
-    /// every active live channel.
-    ///
-    /// Called after a successful `config/patch` commit so live adapters
-    /// sitting on stale model/provider resolution observe the new canonical
-    /// state. Per channel:
-    ///
-    /// 1. If the new resolved model has no realtime capability, close the
-    ///    channel — leaving a live channel attached to an unsupported
-    ///    resolution would silently route audio to a now-incompatible
-    ///    provider session.
-    /// 2. R11: if the new resolved `model_id` / `provider_id` differs from
-    ///    the identity recorded at `live/open` time
-    ///    (`LiveAdapterHost::channel_llm_identity`), close the channel
-    ///    with a structured `model_swap` log so SDK clients can observe
-    ///    and reopen against the new identity. The OpenAI realtime
-    ///    adapter rejects model drift (the wire `session.update` event
-    ///    cannot rebind the model), so dispatching `Refresh` here would
-    ///    land the channel in a permanent `ConfigRejected` error state.
-    /// 3. Otherwise build a fresh `LiveProjectionSnapshot` via
-    ///    `live_open_config_for_session` and dispatch
-    ///    `LiveAdapterCommand::Refresh { snapshot }`.
-    ///
-    /// Best-effort: per-channel errors are swallowed (logged via tracing) so
-    /// one stale channel cannot block propagation across the fleet. The
-    /// caller does not get per-channel error reporting; this method exists
-    /// to keep state honest, not to expose channel-level diagnostics.
+    /// Phase 4 R1: thin RPC shim — delegates to
+    /// `LiveOrchestrator::propagate_config_to_live_channels`.
     pub async fn propagate_config_to_live_channels(&self) {
-        let Some(host) = self.live_adapter_host() else {
-            return;
-        };
-        let channels = host.active_channels().await;
-        // Resolve the unique set of sessions backing the active channels
-        // and hot-swap each session to the post-patch global agent model
-        // before per-channel precheck. Without this, sessions retain
-        // their creation-time model and `precheck_live_open` always reads
-        // the original identity — closing the gap that makes
-        // `config/patch` a no-op for already-open live sessions and
-        // hides non-realtime resolutions from the realtime-capability
-        // gate (B19) on subsequent `live/open` reopens.
-        let mut unique_sessions: Vec<SessionId> = Vec::new();
-        for channel_id in &channels {
-            if let Ok(session_id) = host.channel_session(channel_id).await
-                && !unique_sessions.iter().any(|sid| sid == &session_id)
-            {
-                unique_sessions.push(session_id);
-            }
-        }
-        if !unique_sessions.is_empty()
-            && let Some(runtime) = self.config_runtime()
-            && let Ok(snapshot) = runtime.get().await
-        {
-            let new_global_model = snapshot.config.agent.model.clone();
-            for session_id in &unique_sessions {
-                let request = SessionLlmReconfigureRequest {
-                    model: Some(new_global_model.clone()),
-                    provider: None,
-                    provider_params: None,
-                    clear_provider_params: false,
-                    auth_binding: None,
-                    clear_auth_binding: false,
-                };
-                if let Err(err) = self
-                    .hot_swap_llm_client_on_idle_session(session_id, &request)
-                    .await
-                {
-                    tracing::debug!(
-                        target: "meerkat_rpc::session_runtime",
-                        ?session_id,
-                        ?err,
-                        "hot-swap on config propagation failed; per-channel \
-                         precheck will fall back to current session identity"
-                    );
-                }
-            }
-        }
-        for channel_id in channels {
-            let session_id = match host.channel_session(&channel_id).await {
-                Ok(id) => id,
-                Err(err) => {
-                    tracing::debug!(
-                        target: "meerkat_rpc::session_runtime",
-                        ?channel_id,
-                        ?err,
-                        "live channel session lookup failed during config propagation"
-                    );
-                    continue;
-                }
-            };
-            // If the new resolved model/provider is not realtime-capable,
-            // close the channel rather than refreshing — a non-realtime
-            // model bound to a live transport would silently route audio
-            // through an incompatible provider session. We route through
-            // `signal_terminal_error` so the WS client receives a typed
-            // close-frame reason (`terminal:config_rejected`) and the
-            // accompanying JSON Error observation carries the precheck
-            // failure cause; otherwise the SDK sees a generic disconnect
-            // indistinguishable from network drop. Same wire-signal
-            // contract as the model-swap branch below.
-            if let Err(precheck_err) = self.precheck_live_open(&session_id).await {
-                tracing::info!(
-                    target: "meerkat_rpc::session_runtime",
-                    ?channel_id,
-                    ?session_id,
-                    ?precheck_err,
-                    "closing live channel: new resolution not realtime-capable"
-                );
-                let reason = format!("non_realtime_resolution: {precheck_err:?}");
-                let _ = host
-                    .signal_terminal_error(
-                        &channel_id,
-                        meerkat_core::live_adapter::LiveAdapterErrorCode::ConfigRejected { reason },
-                    )
-                    .await;
-                continue;
-            }
-            let open_config = match self
-                .live_open_config_for_session(
-                    &session_id,
-                    meerkat_contracts::RealtimeTurningMode::ProviderManaged,
-                )
-                .await
-            {
-                Ok(config) => config,
-                Err(err) => {
-                    tracing::warn!(
-                        target: "meerkat_rpc::session_runtime",
-                        ?channel_id,
-                        ?session_id,
-                        ?err,
-                        "failed to build refreshed open_config for live channel"
-                    );
-                    continue;
-                }
-            };
-            // R11: detect a model/provider swap *before* enqueuing Refresh.
-            //
-            // After R1 the OpenAI realtime adapter rejects model and
-            // provider drift inside its Refresh arm via
-            // `LlmError::InvalidRequest` (R-FOUND2 maps this to
-            // `LiveAdapterErrorCode::ConfigRejected`), because the realtime
-            // wire `session.update` event cannot rebind the underlying
-            // model. Refreshing in place would land the channel in a
-            // permanent error state. Instead, when the new resolved
-            // identity differs from the identity the channel was opened
-            // with, close the channel cleanly and emit a structured event
-            // the SDK can observe + reopen against.
-            //
-            // Contract: this code path does NOT mint a new `live/open`.
-            // Reopen is the caller's responsibility — SDK clients observe
-            // the channel-closed event and decide whether to reopen with
-            // the new identity. The runtime only signals the swap.
-            //
-            // Audio-rate change isn't a model swap but is also rejected by
-            // the OpenAI guard. R11 scope is model + provider only; audio
-            // mismatches still surface as the existing async
-            // `ConfigRejected` error from the adapter Refresh arm. The
-            // typed runtime path for audio drift becomes a follow-up once
-            // `audio_config` is part of the projection snapshot.
-            let bound_identity = match host.channel_llm_identity(&channel_id).await {
-                Ok(identity) => identity,
-                Err(err) => {
-                    tracing::debug!(
-                        target: "meerkat_rpc::session_runtime",
-                        ?channel_id,
-                        ?session_id,
-                        ?err,
-                        "channel identity lookup failed; skipping live channel"
-                    );
-                    continue;
-                }
-            };
-            if let Some(prev) = bound_identity.as_ref()
-                && live_channel_requires_close_for_identity_change(
-                    Some(prev),
-                    &open_config.llm_identity,
-                )
-            {
-                tracing::info!(
-                    target: "meerkat_rpc::session_runtime",
-                    %channel_id,
-                    %session_id,
-                    old_model_id = %prev.model,
-                    new_model_id = %open_config.llm_identity.model,
-                    old_provider_id = ?prev.provider,
-                    new_provider_id = ?open_config.llm_identity.provider,
-                    reason = "model_swap",
-                    "closing live channel: config patch swapped \
-                     model/provider; SDK must reopen against new identity"
-                );
-                // CC1: push a typed `ConfigRejected` synthetic terminal Error
-                // observation through the host's pending-obs slot. This makes
-                // the model-swap close visible to SDK clients as a
-                // `terminal:config_rejected` close-frame reason on the WS,
-                // distinguishable from a generic network drop. The host
-                // closes the underlying adapter as part of this seam, so a
-                // separate `close_channel` call is unnecessary.
-                let reason = format!(
-                    "model_swap: {old} -> {new}",
-                    old = prev.model,
-                    new = open_config.llm_identity.model,
-                );
-                if let Err(err) = host
-                    .signal_terminal_error(
-                        &channel_id,
-                        meerkat_core::live_adapter::LiveAdapterErrorCode::ConfigRejected { reason },
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        target: "meerkat_rpc::session_runtime",
-                        ?channel_id,
-                        ?session_id,
-                        ?err,
-                        "failed to signal terminal error on live channel after model swap"
-                    );
-                }
-                continue;
-            }
-            let mut snapshot =
-                build_live_projection_snapshot_for_runtime(&session_id, &open_config);
-            // R8: stamp via the host's monotonic counter so adapters that
-            // gate on `snapshot_version` for stale-refresh detection see
-            // strictly increasing generations across config propagations.
-            // Pre-fix every refresh shipped `snapshot_version: 0`. A
-            // ChannelNotFound here is benign — another task closed the
-            // channel between `active_channels()` and this point — so we
-            // log and skip rather than aborting the whole sweep.
-            match host.next_snapshot_version(&channel_id).await {
-                Ok(v) => snapshot.snapshot_version = v,
-                Err(err) => {
-                    tracing::debug!(
-                        target: "meerkat_rpc::session_runtime",
-                        ?channel_id,
-                        ?session_id,
-                        ?err,
-                        "skipping live channel: snapshot version stamp failed"
-                    );
-                    continue;
-                }
-            }
-            if let Err(err) = host
-                .send_command(
-                    &channel_id,
-                    meerkat_core::live_adapter::LiveAdapterCommand::Refresh { snapshot },
-                )
-                .await
-            {
-                tracing::warn!(
-                    target: "meerkat_rpc::session_runtime",
-                    ?channel_id,
-                    ?session_id,
-                    ?err,
-                    "failed to dispatch Refresh command to live channel"
-                );
-            }
-        }
+        let snapshot = self.realm_context_snapshot();
+        let cleanup = self.archive_runtime_cleanup();
+        let host = self.llm_reconfigure_host();
+        self.live_orchestrator(&snapshot, cleanup, &host)
+            .propagate_config_to_live_channels()
+            .await;
     }
 
     #[cfg(feature = "mob")]
