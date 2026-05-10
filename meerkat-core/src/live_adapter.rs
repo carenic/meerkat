@@ -107,16 +107,30 @@ pub enum LiveAdapterCommand {
     Open {
         snapshot: LiveProjectionSnapshot,
     },
-    /// P1#5: refresh an *already-open* adapter's projection with a freshly
-    /// built [`LiveProjectionSnapshot`].
+    /// P1#5: refresh an *already-open* adapter's mutable config against a
+    /// freshly built [`LiveProjectionSnapshot`], without replaying history.
     ///
-    /// Triggered when upstream session state changes (model switch via
-    /// `config/patch`, snapshot drift after a session edit, etc.) and the
-    /// runtime wants the live adapter to re-seed its provider session
-    /// against the new canonical state without tearing the channel down.
-    /// Adapters that do not support live re-seeding should treat this as a
-    /// no-op or surface a typed error observation; the OpenAI adapter
-    /// re-runs `seed_history_projection` against the new snapshot.
+    /// Triggered when upstream session state changes (config patch that
+    /// alters instructions / tools / audio, snapshot drift after a session
+    /// edit, etc.) and the runtime wants the live adapter to re-apply the
+    /// mutable configuration fields on the provider session without
+    /// tearing the channel down.
+    ///
+    /// R9 invariant: refresh MUST NOT re-seed the conversation history.
+    /// The `Open` arm is the single authoritative seed point — re-running
+    /// `seed_history_projection` here would duplicate every prior turn
+    /// into the provider's hosted conversation on each refresh. The
+    /// OpenAI adapter therefore handles `Refresh` by validating model
+    /// identity (model swaps require close + reopen — OpenAI Realtime has
+    /// no mutable `model` field) and issuing a single `session.update`
+    /// carrying the new instructions / tools / audio config. The
+    /// snapshot's `runtime_system_context` is folded into `instructions`
+    /// by that update, so newly-authoritative system context still reaches
+    /// the provider — as session config, not as synthetic conversation
+    /// items.
+    ///
+    /// Adapters that do not support live re-config should treat this as a
+    /// no-op or surface a typed error observation.
     Refresh {
         snapshot: LiveProjectionSnapshot,
     },
@@ -277,7 +291,19 @@ pub enum LiveAdapterObservation {
     /// [`Self::TurnCompleted`] (or via the projection sink's text-only
     /// flush). Sinks must drain transcript buffers and any audio playback
     /// state at this signal but leave the display-text buffer alone.
-    TurnInterrupted,
+    ///
+    /// G4 (P1): `response_id` carries the provider's identifier for the
+    /// in-flight response that was interrupted. Without this, projection
+    /// sinks have to *infer* the affected response from staged transcript
+    /// state — and a barge-in that lands before any transcript delta
+    /// (very fast user interjection) leaves the sink with no staged
+    /// response to truncate against. Optional because not every provider
+    /// surfaces an opaque response id, and the truncation path may be
+    /// reachable from synthetic / degraded sources without a known id.
+    TurnInterrupted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        response_id: Option<String>,
+    },
     TurnCompleted {
         /// R6: the provider's response identifier for the turn that just
         /// completed. The OpenAI realtime API delivers `response.done` with a
@@ -1008,9 +1034,24 @@ mod tests {
 
     #[test]
     fn observation_barge_in_is_typed_interrupt_not_side_channel() {
-        let obs = LiveAdapterObservation::TurnInterrupted;
+        let obs = LiveAdapterObservation::TurnInterrupted { response_id: None };
         let json = serde_json::to_string(&obs).unwrap();
         assert!(json.contains("turn_interrupted"));
+        let deser: LiveAdapterObservation = serde_json::from_str(&json).unwrap();
+        assert_eq!(obs, deser);
+    }
+
+    /// G4 (P1): `TurnInterrupted` carries the in-flight response id so the
+    /// projection sink can scope barge-in truncation to the right response
+    /// even when the interrupt lands before any transcript delta has been
+    /// staged.
+    #[test]
+    fn observation_turn_interrupted_round_trips_with_response_id() {
+        let obs = LiveAdapterObservation::TurnInterrupted {
+            response_id: Some("resp_42".into()),
+        };
+        let json = serde_json::to_string(&obs).unwrap();
+        assert!(json.contains("\"response_id\":\"resp_42\""));
         let deser: LiveAdapterObservation = serde_json::from_str(&json).unwrap();
         assert_eq!(obs, deser);
     }
