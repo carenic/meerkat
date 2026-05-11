@@ -4,6 +4,7 @@ use crate::budget::Budget;
 use crate::error::{AgentError, ToolError};
 use crate::event::AgentEvent;
 use crate::hooks::{HookInvocation, HookPoint};
+use crate::lifecycle::run_primitive::{ConversationAppend, ConversationAppendRole, CoreRenderable};
 use crate::ops::{ToolDispatchOutcome, ToolDispatchTimeoutPolicy};
 use crate::retry::RetryPolicy;
 use crate::service::TurnToolOverlay;
@@ -862,7 +863,7 @@ where
 
     /// Run the agent with a user message.
     pub async fn run(&mut self, user_input: ContentInput) -> Result<RunResult, AgentError> {
-        self.run_inner(user_input, None).await
+        self.run_inner(user_input, Vec::new(), None).await
     }
 
     /// Run the agent with events streamed to the provided channel.
@@ -871,7 +872,19 @@ where
         user_input: ContentInput,
         event_tx: mpsc::Sender<AgentEvent>,
     ) -> Result<RunResult, AgentError> {
-        self.run_inner(user_input, Some(event_tx)).await
+        self.run_inner(user_input, Vec::new(), Some(event_tx)).await
+    }
+
+    /// Run the agent with provider-facing prompt content derived from typed
+    /// runtime appends, while persisting those appends according to their roles.
+    pub async fn run_with_events_and_typed_turn_appends(
+        &mut self,
+        user_input: ContentInput,
+        typed_turn_appends: Vec<ConversationAppend>,
+        event_tx: mpsc::Sender<AgentEvent>,
+    ) -> Result<RunResult, AgentError> {
+        self.run_inner(user_input, typed_turn_appends, Some(event_tx))
+            .await
     }
 
     /// Run the agent using the pending continuation boundary already in the session.
@@ -897,6 +910,89 @@ where
         self.run_pending_inner(Some(event_tx)).await
     }
 
+    fn push_transcript_append(&mut self, append: ConversationAppend) -> Result<(), AgentError> {
+        match append.role {
+            ConversationAppendRole::User => {
+                let message = match append.content {
+                    CoreRenderable::Text { text } => crate::types::UserMessage::text(text),
+                    CoreRenderable::Blocks { blocks } => {
+                        crate::types::UserMessage::with_blocks(blocks)
+                    }
+                    CoreRenderable::SystemNotice { kind, body, blocks } => {
+                        crate::types::UserMessage::text(
+                            crate::types::SystemNoticeMessage::with_blocks(kind, body, blocks)
+                                .model_projection_text(),
+                        )
+                    }
+                    CoreRenderable::Json { value } => {
+                        crate::types::UserMessage::text(value.to_string())
+                    }
+                    CoreRenderable::Reference { uri, label } => {
+                        let text = label.map_or(uri.clone(), |label| format!("{label}: {uri}"));
+                        crate::types::UserMessage::text(text)
+                    }
+                };
+                self.session.push(Message::User(message));
+            }
+            ConversationAppendRole::SystemNotice => {
+                let notice = match append.content {
+                    CoreRenderable::SystemNotice { kind, body, blocks } => {
+                        crate::types::SystemNoticeMessage::with_blocks(kind, body, blocks)
+                    }
+                    CoreRenderable::Text { text } => crate::types::SystemNoticeMessage::with_block(
+                        crate::types::SystemNoticeKind::Generic,
+                        Some(text.clone()),
+                        crate::types::SystemNoticeBlock::RuntimeNotice {
+                            category: "runtime_notice".to_string(),
+                            detail: Some(text),
+                            payload: None,
+                        },
+                    ),
+                    CoreRenderable::Blocks { blocks } => {
+                        crate::types::SystemNoticeMessage::with_block(
+                            crate::types::SystemNoticeKind::Generic,
+                            None,
+                            crate::types::SystemNoticeBlock::RuntimeNotice {
+                                category: "runtime_notice".to_string(),
+                                detail: Some(crate::types::text_content(&blocks)),
+                                payload: None,
+                            },
+                        )
+                    }
+                    CoreRenderable::Json { value } => {
+                        crate::types::SystemNoticeMessage::with_block(
+                            crate::types::SystemNoticeKind::Generic,
+                            None,
+                            crate::types::SystemNoticeBlock::RuntimeNotice {
+                                category: "runtime_notice".to_string(),
+                                detail: None,
+                                payload: Some(value),
+                            },
+                        )
+                    }
+                    CoreRenderable::Reference { uri, label } => {
+                        crate::types::SystemNoticeMessage::with_block(
+                            crate::types::SystemNoticeKind::Generic,
+                            label,
+                            crate::types::SystemNoticeBlock::RuntimeNotice {
+                                category: "runtime_notice".to_string(),
+                                detail: Some(uri),
+                                payload: None,
+                            },
+                        )
+                    }
+                };
+                self.session.push(Message::SystemNotice(notice));
+            }
+            ConversationAppendRole::Assistant | ConversationAppendRole::Tool => {
+                return Err(AgentError::ConfigError(
+                    "runtime transcript append role is not supported for turn start".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Core run implementation shared by `run()` and `run_with_events()`.
     ///
     /// Adds user_input as a user message, emits lifecycle events when `event_tx`
@@ -904,6 +1000,7 @@ where
     async fn run_inner(
         &mut self,
         user_input: ContentInput,
+        typed_turn_appends: Vec<ConversationAppend>,
         event_tx: Option<mpsc::Sender<AgentEvent>>,
     ) -> Result<RunResult, AgentError> {
         let event_tx = event_tx.or_else(|| self.default_event_tx.clone());
@@ -937,13 +1034,19 @@ where
         // still include the text projection for compatibility.
         let run_prompt_input = user_input.clone();
 
-        // Add user message — preserve image blocks when present.
-        let user_message = if user_input.has_non_text_content() {
-            crate::types::UserMessage::with_blocks(user_input.into_blocks())
+        if typed_turn_appends.is_empty() {
+            // Add user message — preserve image blocks when present.
+            let user_message = if user_input.has_non_text_content() {
+                crate::types::UserMessage::with_blocks(user_input.into_blocks())
+            } else {
+                crate::types::UserMessage::text(user_input.text_content())
+            };
+            self.session.push(Message::User(user_message));
         } else {
-            crate::types::UserMessage::text(user_input.text_content())
-        };
-        self.session.push(Message::User(user_message));
+            for append in typed_turn_appends {
+                self.push_transcript_append(append)?;
+            }
+        }
 
         self.emit_run_started_event(run_prompt_input.clone(), event_tx.as_ref())
             .await;

@@ -418,7 +418,7 @@ async fn wait_for_member_histories_to_settle(
                 .map(|msg| match msg {
                     meerkat_core::types::Message::System(s) => format!("system:{}", s.content),
                     meerkat_core::types::Message::SystemNotice(notice) => {
-                        format!("notice:{}", notice.rendered_text())
+                        format!("notice:{}", notice.model_projection_text())
                     }
                     meerkat_core::types::Message::User(u) => {
                         format!("user:{}", meerkat_core::types::text_content(&u.content))

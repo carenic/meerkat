@@ -1864,7 +1864,7 @@ mod tests {
                     context_appends: vec![ConversationContextAppend {
                         key: "peer_response_terminal:analyst-rt:req-123".to_string(),
                         content: CoreRenderable::Text {
-                            text: "[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL] Correlated peer response from analyst-rt. Request ID: req-123. Status: completed. Result: {\"request_intent\":\"checksum_token\",\"request_subject\":\"alpha beta gamma\",\"token\":\"birch seventeen\"}.".to_string(),
+                            text: "Peer terminal response from analyst-rt\nRequest ID: req-123\nStatus: completed\nPayload: {\"request_intent\":\"checksum_token\",\"request_subject\":\"alpha beta gamma\",\"token\":\"birch seventeen\"}".to_string(),
                         },
                     }],
                     contributing_input_ids: vec![InputId::new()],
@@ -2112,7 +2112,7 @@ mod tests {
                     context_appends: vec![ConversationContextAppend {
                         key: "peer_response_terminal:analyst-rt:req-456".to_string(),
                         content: CoreRenderable::Text {
-                            text: "[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL] done".to_string(),
+                            text: "Peer terminal response from analyst-rt\nRequest ID: req-456\nStatus: completed\ndone".to_string(),
                         },
                     }],
                     contributing_input_ids: vec![InputId::new()],
@@ -2153,7 +2153,7 @@ mod tests {
             "terminal peer response source must be applied before reaction turn: {system_context}"
         );
         assert!(
-            system_context.contains("[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL] done"),
+            system_context.contains("Peer terminal response from analyst-rt"),
             "terminal peer response context must be applied before reaction turn: {system_context}"
         );
 
@@ -2203,7 +2203,7 @@ mod tests {
                     context_appends: vec![ConversationContextAppend {
                         key: "peer_response_terminal:analyst-rt:req-invalid".to_string(),
                         content: CoreRenderable::Text {
-                            text: "[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL] invalid".to_string(),
+                            text: "Peer terminal response from analyst-rt\nRequest ID: req-invalid\nStatus: completed\ninvalid".to_string(),
                         },
                     }],
                     contributing_input_ids: vec![InputId::new()],

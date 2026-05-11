@@ -23739,7 +23739,7 @@ fn peer_request_notice_request_id(text: &str) -> uuid::Uuid {
     let request_id = text
         .split("Request ID: ")
         .nth(1)
-        .and_then(|tail| tail.split('.').next())
+        .and_then(|tail| tail.split_whitespace().next())
         .expect("peer request notice should include a Request ID");
     uuid::Uuid::parse_str(request_id).expect("request ID should be a UUID")
 }
@@ -23850,8 +23850,8 @@ async fn test_peer_message_reaches_idle_autonomous_member_after_kickoff_completi
     .expect("peer message should reach runtime apply path");
     let delivered_text = delivered.text_content();
     assert!(
-        delivered_text.contains("[COMMS MESSAGE from test-mob/lead/l-1]"),
-        "peer message should carry comms source label: {delivered_text:?}"
+        delivered_text.contains("Peer message from test-mob/lead/l-1"),
+        "peer message should carry typed comms source projection: {delivered_text:?}"
     );
     assert!(
         delivered_text.contains("caption: this block text should survive"),
@@ -24007,8 +24007,8 @@ async fn test_peer_message_reaches_ready_autonomous_member_before_kickoff_settle
     .expect("peer message should reach a startup-ready autonomous member");
     let delivered_text = delivered.text_content();
     assert!(
-        delivered_text.contains("[COMMS MESSAGE from test-mob/lead/l-prekickoff]"),
-        "peer message should carry comms source label: {delivered_text:?}"
+        delivered_text.contains("Peer message from test-mob/lead/l-prekickoff"),
+        "peer message should carry typed comms source projection: {delivered_text:?}"
     );
     assert!(
         delivered_text.contains("caption: startup-ready multimodal comms must still deliver"),
@@ -24135,8 +24135,8 @@ async fn test_peer_messages_reach_all_ready_autonomous_members_before_kickoff_se
 
         let delivered_text = delivered.text_content();
         assert!(
-            delivered_text.contains("[COMMS MESSAGE from test-mob/lead/l-multi]"),
-            "peer message should carry comms source label for {agent_identity}: {delivered_text:?}"
+            delivered_text.contains("Peer message from test-mob/lead/l-multi"),
+            "peer message should carry typed comms source projection for {agent_identity}: {delivered_text:?}"
         );
         assert!(
             delivered_text.contains(&format!("caption: fanout should reach {agent_identity}")),
@@ -24378,11 +24378,11 @@ async fn test_peer_response_reaches_requester_in_runtime_backed_real_comms() {
     tokio::time::timeout(Duration::from_secs(2), async {
         loop {
             let prompts = service.applied_runtime_prompts(&sid_responder).await;
-            if prompts.iter().skip(responder_baseline).any(|prompt| {
-                prompt
-                    .text_content()
-                    .contains("[SYSTEM NOTICE][PEER_REQUEST]")
-            }) {
+            if prompts
+                .iter()
+                .skip(responder_baseline)
+                .any(|prompt| prompt.text_content().contains("Peer request from"))
+            {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(25)).await;
@@ -24419,7 +24419,7 @@ async fn test_peer_response_reaches_requester_in_runtime_backed_real_comms() {
                     let idempotency_key = append.idempotency_key.as_deref().unwrap_or_default();
                     let expected_source =
                         format!("peer_response_terminal:{responder_route_identity}:{request_id}");
-                    text.contains("[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL]")
+                    text.contains("Peer terminal response from")
                         && text.contains("from test-mob/worker/w-responder")
                         && text.contains("lighthouse")
                         && text.contains(&format!("Request ID: {request_id}"))
@@ -24688,7 +24688,7 @@ async fn test_default_peer_response_inherits_request_steer_while_requester_runni
             let prompts = service.applied_runtime_prompts(&sid_responder).await;
             if prompts.iter().skip(responder_baseline).any(|prompt| {
                 let text = prompt.text_content();
-                text.contains("[SYSTEM NOTICE][PEER_REQUEST]")
+                text.contains("Peer request from")
                     && text.contains("Intent: ping")
                     && text.contains(&format!("Request ID: {request_id}"))
             }) {
@@ -24727,9 +24727,7 @@ async fn test_default_peer_response_inherits_request_steer_while_requester_runni
                 .iter()
                 .skip(requester_context_baseline)
                 .any(|append| {
-                    append
-                        .text
-                        .contains("[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL]")
+                    append.text.contains("Peer terminal response from")
                         && append.text.contains(&format!("Request ID: {request_id}"))
                         && append.text.contains("\"message\": \"pong\"")
                 })
@@ -24851,7 +24849,7 @@ async fn test_mcp_send_request_response_terminal_steer_is_visible_to_requester()
                 .skip(responder_baseline)
                 .find(|prompt| {
                     let text = prompt.text_content();
-                    text.contains("[SYSTEM NOTICE][PEER_REQUEST]")
+                    text.contains("Peer request from")
                         && text.contains("Intent: checksum_token")
                         && text.contains("Request ID: ")
                 })
@@ -24897,9 +24895,7 @@ async fn test_mcp_send_request_response_terminal_steer_is_visible_to_requester()
                 .iter()
                 .skip(requester_context_baseline)
                 .find(|append| {
-                    append
-                        .text
-                        .contains("[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL]")
+                    append.text.contains("Peer terminal response from")
                         && append.text.contains("from test-mob/worker/w-mcp-responder")
                         && append.text.contains(&format!("Request ID: {request_id}"))
                         && append.text.contains("Status: completed")

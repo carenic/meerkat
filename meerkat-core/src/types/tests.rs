@@ -110,7 +110,7 @@ fn test_user_message_render_metadata_serialization() {
 }
 
 #[test]
-fn test_legacy_user_notice_deserializes_to_system_notice() {
+fn test_legacy_user_notice_deserializes_as_user_text() {
     let parsed: Message = serde_json::from_value(json!({
         "role": "user",
         "content": "[SYSTEM NOTICE][TOOL_SCOPE] Tool configuration changed.",
@@ -122,11 +122,13 @@ fn test_legacy_user_notice_deserializes_to_system_notice() {
     .unwrap();
 
     match parsed {
-        Message::SystemNotice(notice) => {
-            assert_eq!(notice.kind, SystemNoticeKind::ToolScope);
-            assert_eq!(notice.body, "Tool configuration changed.");
+        Message::User(user) => {
+            assert_eq!(
+                user.text_content(),
+                "[SYSTEM NOTICE][TOOL_SCOPE] Tool configuration changed."
+            );
         }
-        other => panic!("expected system notice, got {other:?}"),
+        other => panic!("expected user message, got {other:?}"),
     }
 }
 

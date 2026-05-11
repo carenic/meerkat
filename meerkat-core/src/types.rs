@@ -998,9 +998,7 @@ impl<'de> Deserialize<'de> for Message {
         Ok(match wire {
             MessageWire::System(message) => Self::System(message),
             MessageWire::SystemNotice(message) => Self::SystemNotice(message),
-            MessageWire::User(message) => SystemNoticeMessage::try_from_legacy_user(&message)
-                .map(Self::SystemNotice)
-                .unwrap_or(Self::User(message)),
+            MessageWire::User(message) => Self::User(message),
             MessageWire::Assistant(message) => Self::Assistant(message),
             MessageWire::BlockAssistant(message) => Self::BlockAssistant(message),
             MessageWire::ToolResults {
@@ -1038,7 +1036,10 @@ impl SystemMessage {
 #[serde(rename_all = "snake_case")]
 pub enum SystemNoticeKind {
     Generic,
+    Comms,
+    ExternalEvent,
     McpPending,
+    Mcp,
     BackgroundJob,
     ToolScope,
     ToolScopeWarning,
@@ -1054,45 +1055,218 @@ impl SystemNoticeKind {
             Self::Generic | Self::McpPending | Self::AuthReauthRequired => {
                 RenderClass::SystemNotice
             }
+            Self::Comms => RenderClass::PeerMessage,
+            Self::ExternalEvent => RenderClass::ExternalEvent,
+            Self::Mcp => RenderClass::SystemNotice,
             Self::BackgroundJob => RenderClass::OpsProgress,
             Self::ToolScope | Self::ToolScopeWarning => RenderClass::ToolScopeNotice,
         }
     }
+}
 
-    pub const fn prefix(self) -> &'static str {
+/// Direction for runtime-authored communication metadata.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SystemNoticeDirection {
+    Incoming,
+    Outgoing,
+    Internal,
+}
+
+/// Peer identity carried in a typed comms transcript block.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SystemNoticePeer {
+    pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub display_name: Option<String>,
+}
+
+/// Typed runtime-authored transcript metadata.
+///
+/// These blocks are the durable contract for comms, tool/MCP state, auth,
+/// background work, and other runtime facts. They are never user-authored text.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum SystemNoticeBlock {
+    Comms {
+        kind: String,
+        direction: SystemNoticeDirection,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        peer: Option<SystemNoticePeer>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        intent: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        status: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<Value>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        content: Vec<ContentBlock>,
+    },
+    ExternalEvent {
+        source: String,
+        event_type: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<Value>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        content: Vec<ContentBlock>,
+    },
+    ToolConfig {
+        payload: crate::event::ToolConfigChangedPayload,
+    },
+    Mcp {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        server_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation: Option<crate::event::ToolConfigChangeOperation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase: Option<crate::event::ExternalToolDeltaPhase>,
+        #[serde(default)]
+        persisted: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pending_sources: Vec<String>,
+    },
+    BackgroundJob {
+        job_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_name: Option<String>,
+        status: crate::event::BackgroundJobTerminalStatus,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    Auth {
+        state: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binding: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
+    RuntimeNotice {
+        category: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<Value>,
+    },
+    Unknown {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        summary: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        payload: Option<Value>,
+    },
+}
+
+impl SystemNoticeBlock {
+    pub fn summary(&self) -> Option<&str> {
         match self {
-            Self::Generic => "[SYSTEM NOTICE]",
-            Self::McpPending => "[SYSTEM NOTICE][MCP_PENDING]",
-            Self::BackgroundJob => "[SYSTEM NOTICE][BG_JOB]",
-            Self::ToolScope => "[SYSTEM NOTICE][TOOL_SCOPE]",
-            Self::ToolScopeWarning => "[SYSTEM NOTICE][TOOL_SCOPE][WARNING]",
-            Self::AuthReauthRequired => "[SYSTEM NOTICE][AUTH_REAUTH_REQUIRED]",
+            Self::Comms { summary, .. } | Self::Unknown { summary, .. } => summary.as_deref(),
+            Self::ExternalEvent { summary, body, .. } => summary.as_deref().or(body.as_deref()),
+            Self::Mcp { detail, .. }
+            | Self::BackgroundJob { detail, .. }
+            | Self::Auth { detail, .. }
+            | Self::RuntimeNotice { detail, .. } => detail.as_deref(),
+            Self::ToolConfig { .. } => None,
         }
     }
 
-    fn parse_legacy(text: &str) -> Option<(Self, &str)> {
-        const PREFIXES: &[(SystemNoticeKind, &str)] = &[
-            (
-                SystemNoticeKind::ToolScopeWarning,
-                "[SYSTEM NOTICE][TOOL_SCOPE][WARNING] ",
-            ),
-            (SystemNoticeKind::ToolScope, "[SYSTEM NOTICE][TOOL_SCOPE] "),
-            (
-                SystemNoticeKind::McpPending,
-                "[SYSTEM NOTICE][MCP_PENDING] ",
-            ),
-            (SystemNoticeKind::BackgroundJob, "[SYSTEM NOTICE][BG_JOB] "),
-            (
-                SystemNoticeKind::AuthReauthRequired,
-                "[SYSTEM NOTICE][AUTH_REAUTH_REQUIRED] ",
-            ),
-            (SystemNoticeKind::Generic, "[SYSTEM NOTICE] "),
-        ];
-
-        PREFIXES
-            .iter()
-            .find_map(|(kind, prefix)| text.strip_prefix(prefix).map(|body| (*kind, body)))
+    pub fn model_projection_text(&self) -> String {
+        match self {
+            Self::Comms {
+                kind,
+                peer,
+                request_id,
+                intent,
+                status,
+                summary,
+                payload,
+                content,
+                ..
+            } => {
+                let peer_label = peer
+                    .as_ref()
+                    .and_then(|peer| peer.display_name.as_deref())
+                    .or_else(|| peer.as_ref().map(|peer| peer.id.as_str()))
+                    .unwrap_or("peer");
+                let mut lines = vec![match kind.as_str() {
+                    "request" => format!("Peer request from {peer_label}"),
+                    "response_progress" => format!("Peer response progress from {peer_label}"),
+                    "response_terminal" => format!("Peer terminal response from {peer_label}"),
+                    _ => format!("Peer message from {peer_label}"),
+                }];
+                if let Some(request_id) = request_id {
+                    lines.push(format!("Request ID: {request_id}"));
+                }
+                if let Some(intent) = intent {
+                    lines.push(format!("Intent: {intent}"));
+                }
+                if let Some(status) = status {
+                    lines.push(format!("Status: {status}"));
+                }
+                if let Some(summary) = summary {
+                    lines.push(summary.clone());
+                }
+                for block in content {
+                    let text = block.text_projection();
+                    if !text.trim().is_empty() {
+                        lines.push(text.into_owned());
+                    }
+                }
+                if let Some(payload) = payload {
+                    lines.push(format!("Payload: {}", format_notice_payload(payload)));
+                }
+                if kind == "request" {
+                    lines.push(
+                        "Respond to this request with the appropriate peer response tool."
+                            .to_string(),
+                    );
+                }
+                lines.join("\n")
+            }
+            Self::ExternalEvent {
+                source,
+                event_type,
+                body,
+                payload,
+                content,
+                ..
+            } => {
+                let mut lines = vec![format!("External event via {source}: {event_type}")];
+                if let Some(body) = body {
+                    lines.push(body.clone());
+                }
+                for block in content {
+                    let text = block.text_projection();
+                    if !text.trim().is_empty() {
+                        lines.push(text.into_owned());
+                    }
+                }
+                if let Some(payload) = payload {
+                    lines.push(format!("Payload: {}", format_notice_payload(payload)));
+                }
+                lines.join("\n")
+            }
+            Self::ToolConfig { payload } => {
+                format!("Tool configuration changed: {}", payload.status_text())
+            }
+            _ => self.summary().unwrap_or_default().to_string(),
+        }
     }
+}
+
+fn format_notice_payload(payload: &Value) -> String {
+    serde_json::to_string_pretty(payload).unwrap_or_else(|_| payload.to_string())
 }
 
 /// System notice message stored in the canonical transcript.
@@ -1101,7 +1275,10 @@ impl SystemNoticeKind {
 #[serde(rename_all = "snake_case")]
 pub struct SystemNoticeMessage {
     pub kind: SystemNoticeKind,
-    pub body: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub blocks: Vec<SystemNoticeBlock>,
     #[cfg_attr(feature = "schema", schemars(with = "String"))]
     #[serde(default = "message_timestamp_now")]
     pub created_at: MessageTimestamp,
@@ -1109,25 +1286,53 @@ pub struct SystemNoticeMessage {
 
 impl SystemNoticeMessage {
     pub fn new(kind: SystemNoticeKind, body: impl Into<String>) -> Self {
+        let body = body.into();
         Self {
             kind,
-            body: body.into(),
+            body: if body.is_empty() { None } else { Some(body) },
+            blocks: Vec::new(),
             created_at: message_timestamp_now(),
         }
     }
 
-    pub fn rendered_text(&self) -> String {
-        format!("{} {}", self.kind.prefix(), self.body)
+    pub fn with_blocks(
+        kind: SystemNoticeKind,
+        body: Option<String>,
+        blocks: Vec<SystemNoticeBlock>,
+    ) -> Self {
+        Self {
+            kind,
+            body,
+            blocks,
+            created_at: message_timestamp_now(),
+        }
     }
 
-    fn try_from_legacy_user(user: &UserMessage) -> Option<Self> {
-        let expected_class = user.render_metadata.as_ref().map(|meta| meta.class)?;
-        let text = user.text_content();
-        let (kind, body) = SystemNoticeKind::parse_legacy(&text)?;
-        if expected_class != kind.render_class() {
-            return None;
+    pub fn with_block(
+        kind: SystemNoticeKind,
+        body: Option<String>,
+        block: SystemNoticeBlock,
+    ) -> Self {
+        Self::with_blocks(kind, body, vec![block])
+    }
+
+    /// Internal model-facing projection for typed runtime facts.
+    ///
+    /// This is used only while assembling provider-visible prompt/context text.
+    /// The projection is not the transcript contract and must not be persisted
+    /// as user-authored content.
+    pub fn model_projection_text(&self) -> String {
+        let mut parts = Vec::new();
+        if let Some(body) = self.body.as_deref().filter(|body| !body.trim().is_empty()) {
+            parts.push(body.to_string());
         }
-        Some(Self::new(kind, body))
+        for block in &self.blocks {
+            let projection = block.model_projection_text();
+            if !projection.trim().is_empty() {
+                parts.push(projection);
+            }
+        }
+        parts.join("\n")
     }
 }
 

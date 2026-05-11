@@ -11,7 +11,7 @@ use crate::connection::AuthBindingRef;
 use crate::provider::Provider;
 use crate::service::TurnToolOverlay;
 use crate::skills::SkillKey;
-use crate::types::{HandlingMode, RenderMetadata};
+use crate::types::{HandlingMode, RenderMetadata, SystemNoticeBlock, SystemNoticeKind};
 
 /// When to apply a conversation mutation relative to the run lifecycle.
 #[non_exhaustive]
@@ -41,6 +41,14 @@ pub enum CoreRenderable {
     /// these from various typed sources (peer messages, external events) and core
     /// needs to render them into conversation messages — not a pass-through boundary.
     Json { value: serde_json::Value },
+    /// Typed runtime-authored system notice content.
+    SystemNotice {
+        kind: SystemNoticeKind,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        body: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        blocks: Vec<SystemNoticeBlock>,
+    },
     /// Reference to an external artifact.
     Reference { uri: String, label: Option<String> },
 }
@@ -1706,41 +1714,35 @@ impl RunPrimitive {
     /// Consolidates the 5 near-identical `extract_prompt` / `extract_runtime_prompt`
     /// functions that were duplicated across RPC, REST, MCP, mob, and CLI surfaces.
     pub fn extract_content_input(&self) -> crate::types::ContentInput {
-        use crate::types::{ContentBlock, ContentInput};
+        use crate::types::ContentInput;
         match self {
             RunPrimitive::StagedInput(staged) => {
-                let mut all_blocks = Vec::new();
-                for append in &staged.appends {
-                    match &append.content {
-                        CoreRenderable::Text { text } => {
-                            all_blocks.push(ContentBlock::Text { text: text.clone() });
-                        }
-                        CoreRenderable::Blocks { blocks } => {
-                            all_blocks.extend(blocks.iter().cloned());
-                        }
-                        _ => {}
-                    }
-                }
-                if all_blocks.is_empty() {
-                    ContentInput::Text(String::new())
-                } else if all_blocks.len() == 1 {
-                    if let ContentBlock::Text { text } = &all_blocks[0] {
-                        ContentInput::Text(text.clone())
-                    } else {
-                        ContentInput::Blocks(all_blocks)
-                    }
-                } else {
-                    ContentInput::Blocks(all_blocks)
-                }
+                content_input_from_conversation_appends(&staged.appends)
             }
             RunPrimitive::ImmediateAppend(append) => match &append.content {
                 CoreRenderable::Text { text } => ContentInput::Text(text.clone()),
                 CoreRenderable::Blocks { blocks } => ContentInput::Blocks(blocks.clone()),
+                CoreRenderable::SystemNotice { kind, body, blocks } => ContentInput::Text(
+                    crate::types::SystemNoticeMessage::with_blocks(
+                        *kind,
+                        body.clone(),
+                        blocks.clone(),
+                    )
+                    .model_projection_text(),
+                ),
                 _ => ContentInput::Text(String::new()),
             },
             RunPrimitive::ImmediateContextAppend(ctx) => match &ctx.content {
                 CoreRenderable::Text { text } => ContentInput::Text(text.clone()),
                 CoreRenderable::Blocks { blocks } => ContentInput::Blocks(blocks.clone()),
+                CoreRenderable::SystemNotice { kind, body, blocks } => ContentInput::Text(
+                    crate::types::SystemNoticeMessage::with_blocks(
+                        *kind,
+                        body.clone(),
+                        blocks.clone(),
+                    )
+                    .model_projection_text(),
+                ),
                 _ => ContentInput::Text(String::new()),
             },
         }
@@ -1815,6 +1817,46 @@ impl RunPrimitive {
                 && !staged.context_appends.is_empty()
                 && staged.boundary == RunApplyBoundary::Immediate
         )
+    }
+}
+
+pub fn content_input_from_conversation_appends(
+    appends: &[ConversationAppend],
+) -> crate::types::ContentInput {
+    use crate::types::{ContentBlock, ContentInput};
+    let mut all_blocks = Vec::new();
+    for append in appends {
+        match &append.content {
+            CoreRenderable::Text { text } => {
+                all_blocks.push(ContentBlock::Text { text: text.clone() });
+            }
+            CoreRenderable::Blocks { blocks } => {
+                all_blocks.extend(blocks.iter().cloned());
+            }
+            CoreRenderable::SystemNotice { kind, body, blocks } => {
+                let notice = crate::types::SystemNoticeMessage::with_blocks(
+                    *kind,
+                    body.clone(),
+                    blocks.clone(),
+                );
+                let text = notice.model_projection_text();
+                if !text.is_empty() {
+                    all_blocks.push(ContentBlock::Text { text });
+                }
+            }
+            _ => {}
+        }
+    }
+    if all_blocks.is_empty() {
+        ContentInput::Text(String::new())
+    } else if all_blocks.len() == 1 {
+        if let ContentBlock::Text { text } = &all_blocks[0] {
+            ContentInput::Text(text.clone())
+        } else {
+            ContentInput::Blocks(all_blocks)
+        }
+    } else {
+        ContentInput::Blocks(all_blocks)
     }
 }
 
@@ -2005,7 +2047,7 @@ mod tests {
             context_appends: vec![ConversationContextAppend {
                 key: "peer_response_terminal:550e8400-e29b-41d4-a716-446655440000:req-123".into(),
                 content: CoreRenderable::Text {
-                    text: "[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL] done".into(),
+                    text: "Peer terminal response: done".into(),
                 },
             }],
             contributing_input_ids: vec![InputId::new()],
@@ -2031,14 +2073,14 @@ mod tests {
                 role: ConversationAppendRole::User,
                 content: CoreRenderable::Blocks {
                     blocks: vec![crate::types::ContentBlock::Text {
-                        text: "[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL] done".into(),
+                        text: "Peer terminal response: done".into(),
                     }],
                 },
             }],
             context_appends: vec![ConversationContextAppend {
                 key: "peer_response_terminal:550e8400-e29b-41d4-a716-446655440000:req-123".into(),
                 content: CoreRenderable::Text {
-                    text: "[SYSTEM NOTICE][PEER_RESPONSE_TERMINAL] done".into(),
+                    text: "Peer terminal response: done".into(),
                 },
             }],
             contributing_input_ids: vec![InputId::new()],
