@@ -941,6 +941,8 @@ jobs:
       - name: Publish Web SDK
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          CARGO_BUILD_JOBS: "1"
+          CARGO_INCREMENTAL: "0"
           RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
         working-directory: sdks/web
         run: |
@@ -976,7 +978,7 @@ jobs:
       github.event.inputs.publish_web_sdk_only == 'true'
     needs: [require_ci_green]
     runs-on: ubuntu-latest
-    timeout-minutes: 60
+    timeout-minutes: 180
     steps:
       - name: Checkout
         uses: actions/checkout@v6
@@ -1010,6 +1012,8 @@ jobs:
       - name: Publish Web SDK
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          CARGO_BUILD_JOBS: "1"
+          CARGO_INCREMENTAL: "0"
           RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
         working-directory: sdks/web
         run: |
