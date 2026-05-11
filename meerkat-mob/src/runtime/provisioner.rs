@@ -986,12 +986,8 @@ fn render_runtime_context_append_text(content: &CoreRenderable) -> String {
             _ => format!("[Reference] {uri}"),
         },
         CoreRenderable::SystemNotice { kind, body, blocks } => {
-            meerkat_core::SystemNoticeMessage::with_blocks(
-                kind.clone(),
-                body.clone(),
-                blocks.clone(),
-            )
-            .model_projection_text()
+            meerkat_core::SystemNoticeMessage::with_blocks(*kind, body.clone(), blocks.clone())
+                .model_projection_text()
         }
         _ => String::new(),
     }
