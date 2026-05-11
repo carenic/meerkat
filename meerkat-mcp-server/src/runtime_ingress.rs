@@ -1211,19 +1211,8 @@ async fn apply_runtime_turn(
 
     let boundary = primitive.apply_boundary();
     let contributing_input_ids = primitive.contributing_input_ids().to_vec();
-    let typed_turn_appends = match primitive {
-        RunPrimitive::StagedInput(staged) => staged.appends.clone(),
-        RunPrimitive::ImmediateAppend(append) => vec![append.clone()],
-        RunPrimitive::ImmediateContextAppend(_) => Vec::new(),
-        _ => Vec::new(),
-    };
-    let prompt = if typed_turn_appends.is_empty() {
-        primitive.extract_content_input()
-    } else {
-        meerkat_core::lifecycle::run_primitive::content_input_from_conversation_appends(
-            &typed_turn_appends,
-        )
-    };
+    let typed_turn_appends = primitive.typed_turn_appends();
+    let prompt = primitive.extract_content_input();
     let pre_turn_context_appends = match primitive {
         RunPrimitive::StagedInput(staged)
             if primitive.is_peer_response_terminal_context_and_run() =>
@@ -1255,7 +1244,7 @@ async fn apply_runtime_turn(
             pre_turn_context_appends.clone(),
             primitive.turn_metadata().cloned(),
         )
-        .with_typed_turn_appends(typed_turn_appends),
+        .with_typed_turn_appends(typed_turn_appends.clone()),
     };
 
     let mut pre_admission = context
@@ -1338,7 +1327,8 @@ async fn apply_runtime_turn(
                                 .and_then(|meta| meta.flow_tool_overlay.clone()),
                             pre_turn_context_appends,
                             primitive.turn_metadata().cloned(),
-                        ),
+                        )
+                        .with_typed_turn_appends(typed_turn_appends),
                     },
                     boundary,
                     contributing_input_ids,
@@ -1471,6 +1461,36 @@ mod tests {
             runtime_pre_admissions: Arc::new(Mutex::new(HashMap::new())),
             runtime_registration_locks: Arc::new(StdMutex::new(HashMap::new())),
         })
+    }
+
+    #[test]
+    fn mcp_context_system_notice_projects_via_typed_notice() {
+        let blocks = vec![meerkat_core::types::SystemNoticeBlock::Comms {
+            kind: "response_terminal".to_string(),
+            direction: meerkat_core::types::SystemNoticeDirection::Incoming,
+            peer: None,
+            request_id: Some("req-1".to_string()),
+            intent: Some("checksum_token".to_string()),
+            status: Some("completed".to_string()),
+            summary: Some("Peer terminal response".to_string()),
+            payload: None,
+            content: Vec::new(),
+        }];
+        let content = CoreRenderable::SystemNotice {
+            kind: meerkat_core::types::SystemNoticeKind::Comms,
+            body: Some("Peer terminal response context".to_string()),
+            blocks: blocks.clone(),
+        };
+
+        assert_eq!(
+            render_context_append_text(&content),
+            meerkat_core::SystemNoticeMessage::with_blocks(
+                meerkat_core::types::SystemNoticeKind::Comms,
+                Some("Peer terminal response context".to_string()),
+                blocks,
+            )
+            .model_projection_text()
+        );
     }
 
     fn create_request(
