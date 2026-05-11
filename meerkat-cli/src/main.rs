@@ -8998,7 +8998,9 @@ async fn show_session(id: &str, scope: &RuntimeScope) -> anyhow::Result<()> {
                 }
                 Message::SystemNotice(notice) => {
                     println!("\n[{}] SYSTEM NOTICE ({:?}):", i + 1, notice.kind);
-                    println!("  {}", notice.body);
+                    if let Some(body) = notice.body.as_deref() {
+                        println!("  {body}");
+                    }
                 }
                 Message::User(u) => {
                     println!("\n[{}] USER:", i + 1);
