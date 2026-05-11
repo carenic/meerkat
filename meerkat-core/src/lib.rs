@@ -299,8 +299,9 @@ pub use types::{
     RunResult, SUPPORTED_VIDEO_MEDIA_TYPES, SecurityMode, SessionId, StopReason, SystemMessage,
     SystemNoticeKind, SystemNoticeMessage, ToolCall, ToolCallIter, ToolCallView, ToolDef,
     ToolIdentity, ToolName, ToolNameSet, ToolProvenance, ToolResult, ToolSourceId, ToolSourceKind,
-    TranscriptSource, Usage, UserMessage, VideoData, has_images, has_non_text_content, has_video,
-    is_supported_video_media_type, validate_inline_video_blocks,
+    TranscriptSource, Usage, UserMessage, VideoData,
+    assistant_blocks_have_visible_or_actionable_output, has_images, has_non_text_content,
+    has_video, is_supported_video_media_type, validate_inline_video_blocks,
 };
 
 // === Provider auth v2 (landed ahead of wiring — see
@@ -332,5 +333,6 @@ pub use connection::{
     BindingId, BindingPolicy, ConnectionTargetError, CredentialSourceSpec, IdentityError,
     ProfileId, ProviderBinding, ProviderBindingConfig, ProviderBindingError, RealmConfigSection,
     RealmConnectionSet, RealmId, ResolvedConnectionTarget,
-    resolve_auth_binding_or_default_for_provider, resolve_realm_binding_target_for_provider,
+    resolve_auth_binding_candidates_for_provider, resolve_auth_binding_or_default_for_provider,
+    resolve_realm_binding_target_for_provider,
 };
