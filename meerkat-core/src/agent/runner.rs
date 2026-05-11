@@ -30,6 +30,68 @@ use tokio::sync::mpsc;
 
 use super::{Agent, AgentBuilder, AgentLlmClient, AgentSessionStore, AgentToolDispatcher};
 
+fn user_message_from_operator_renderable(
+    content: CoreRenderable,
+) -> Result<crate::types::UserMessage, AgentError> {
+    match content {
+        CoreRenderable::Text { text } => Ok(crate::types::UserMessage::text(text)),
+        CoreRenderable::Blocks { blocks } => Ok(crate::types::UserMessage::with_blocks(blocks)),
+        CoreRenderable::SystemNotice { .. }
+        | CoreRenderable::Json { .. }
+        | CoreRenderable::Reference { .. } => Err(AgentError::ConfigError(
+            "role=user transcript append only accepts operator text or content blocks".to_string(),
+        )),
+    }
+}
+
+#[cfg(test)]
+mod typed_transcript_contract_tests {
+    use super::*;
+
+    #[test]
+    fn user_role_accepts_only_operator_text_or_blocks() {
+        assert!(
+            user_message_from_operator_renderable(CoreRenderable::Text {
+                text: "hello".to_string(),
+            })
+            .is_ok()
+        );
+        assert!(
+            user_message_from_operator_renderable(CoreRenderable::Blocks {
+                blocks: vec![crate::types::ContentBlock::Text {
+                    text: "hello".to_string(),
+                }],
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn user_role_rejects_runtime_authored_renderables() {
+        for content in [
+            CoreRenderable::SystemNotice {
+                kind: crate::types::SystemNoticeKind::Comms,
+                body: Some("runtime".to_string()),
+                blocks: Vec::new(),
+            },
+            CoreRenderable::Json {
+                value: serde_json::json!({"runtime": true}),
+            },
+            CoreRenderable::Reference {
+                uri: "artifact://runtime".to_string(),
+                label: Some("runtime".to_string()),
+            },
+        ] {
+            let err = user_message_from_operator_renderable(content)
+                .expect_err("runtime renderable must not become user text");
+            assert!(
+                matches!(err, AgentError::ConfigError(ref message) if message.contains("role=user")),
+                "unexpected error: {err:?}"
+            );
+        }
+    }
+}
+
 fn dispatcher_knows_tool<T>(dispatcher: &T, name: &str) -> bool
 where
     T: AgentToolDispatcher + ?Sized,
@@ -913,25 +975,7 @@ where
     fn push_transcript_append(&mut self, append: ConversationAppend) -> Result<(), AgentError> {
         match append.role {
             ConversationAppendRole::User => {
-                let message = match append.content {
-                    CoreRenderable::Text { text } => crate::types::UserMessage::text(text),
-                    CoreRenderable::Blocks { blocks } => {
-                        crate::types::UserMessage::with_blocks(blocks)
-                    }
-                    CoreRenderable::SystemNotice { kind, body, blocks } => {
-                        crate::types::UserMessage::text(
-                            crate::types::SystemNoticeMessage::with_blocks(kind, body, blocks)
-                                .model_projection_text(),
-                        )
-                    }
-                    CoreRenderable::Json { value } => {
-                        crate::types::UserMessage::text(value.to_string())
-                    }
-                    CoreRenderable::Reference { uri, label } => {
-                        let text = label.map_or(uri.clone(), |label| format!("{label}: {uri}"));
-                        crate::types::UserMessage::text(text)
-                    }
-                };
+                let message = user_message_from_operator_renderable(append.content)?;
                 self.session.push(Message::User(message));
             }
             ConversationAppendRole::SystemNotice => {

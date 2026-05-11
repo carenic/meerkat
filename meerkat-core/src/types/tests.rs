@@ -152,6 +152,64 @@ fn test_reserved_prefix_user_text_stays_user_without_notice_metadata() {
 }
 
 #[test]
+fn test_future_system_notice_block_deserializes_as_unknown_meta() {
+    let parsed: Message = serde_json::from_value(json!({
+        "role": "system_notice",
+        "kind": "generic",
+        "body": "Future runtime fact.",
+        "blocks": [
+            {
+                "type": "future_runtime_fact",
+                "summary": "Future fact",
+                "payload": {
+                    "alpha": 1
+                },
+                "extra": true
+            }
+        ]
+    }))
+    .unwrap();
+
+    match parsed {
+        Message::SystemNotice(notice) => {
+            assert_eq!(notice.kind, SystemNoticeKind::Generic);
+            assert_eq!(notice.body.as_deref(), Some("Future runtime fact."));
+            assert_eq!(notice.blocks.len(), 1);
+            match &notice.blocks[0] {
+                SystemNoticeBlock::Unknown { summary, payload } => {
+                    assert_eq!(summary.as_deref(), Some("Future fact"));
+                    let payload = payload.as_ref().expect("unknown block payload");
+                    assert_eq!(payload["type"], "future_runtime_fact");
+                    assert_eq!(payload["payload"]["alpha"], 1);
+                    assert_eq!(payload["extra"], true);
+                }
+                other => panic!("expected unknown block, got {other:?}"),
+            }
+        }
+        other => panic!("expected system notice, got {other:?}"),
+    }
+}
+
+#[test]
+fn test_system_notice_block_without_type_is_invalid() {
+    let err = serde_json::from_value::<Message>(json!({
+        "role": "system_notice",
+        "kind": "generic",
+        "blocks": [
+            {
+                "summary": "Malformed block"
+            }
+        ]
+    }))
+    .expect_err("missing block type should remain invalid");
+
+    assert!(
+        err.to_string().contains("missing system notice block type"),
+        "unexpected error: {err}"
+    );
+}
+
+#[test]
 fn test_tool_call_serialization() {
     let tool_call = ToolCall::new(
         "tc_abc123".to_string(),

@@ -2,7 +2,7 @@
 //!
 //! These types form the representation boundary for session persistence and wire formats.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::value::RawValue;
 use serde_json::{Map, Value};
 use std::borrow::Cow;
@@ -1088,7 +1088,7 @@ pub struct SystemNoticePeer {
 /// These blocks are the durable contract for comms, tool/MCP state, auth,
 /// background work, and other runtime facts. They are never user-authored text.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum SystemNoticeBlock {
     Comms {
@@ -1168,7 +1168,211 @@ pub enum SystemNoticeBlock {
     },
 }
 
+#[derive(Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum SystemNoticeBlockKnown {
+    Comms {
+        kind: String,
+        direction: SystemNoticeDirection,
+        #[serde(default)]
+        peer: Option<SystemNoticePeer>,
+        #[serde(default)]
+        request_id: Option<String>,
+        #[serde(default)]
+        intent: Option<String>,
+        #[serde(default)]
+        status: Option<String>,
+        #[serde(default)]
+        summary: Option<String>,
+        #[serde(default)]
+        payload: Option<Value>,
+        #[serde(default)]
+        content: Vec<ContentBlock>,
+    },
+    ExternalEvent {
+        source: String,
+        event_type: String,
+        #[serde(default)]
+        summary: Option<String>,
+        #[serde(default)]
+        body: Option<String>,
+        #[serde(default)]
+        payload: Option<Value>,
+        #[serde(default)]
+        content: Vec<ContentBlock>,
+    },
+    ToolConfig {
+        payload: crate::event::ToolConfigChangedPayload,
+    },
+    Mcp {
+        #[serde(default)]
+        server_id: Option<String>,
+        #[serde(default)]
+        operation: Option<crate::event::ToolConfigChangeOperation>,
+        #[serde(default)]
+        phase: Option<crate::event::ExternalToolDeltaPhase>,
+        #[serde(default)]
+        persisted: bool,
+        #[serde(default)]
+        detail: Option<String>,
+        #[serde(default)]
+        pending_sources: Vec<String>,
+    },
+    BackgroundJob {
+        job_id: String,
+        #[serde(default)]
+        display_name: Option<String>,
+        status: crate::event::BackgroundJobTerminalStatus,
+        #[serde(default)]
+        detail: Option<String>,
+    },
+    Auth {
+        state: String,
+        #[serde(default)]
+        binding: Option<String>,
+        #[serde(default)]
+        detail: Option<String>,
+    },
+    RuntimeNotice {
+        category: String,
+        #[serde(default)]
+        detail: Option<String>,
+        #[serde(default)]
+        payload: Option<Value>,
+    },
+    Unknown {
+        #[serde(default)]
+        summary: Option<String>,
+        #[serde(default)]
+        payload: Option<Value>,
+    },
+}
+
+impl From<SystemNoticeBlockKnown> for SystemNoticeBlock {
+    fn from(value: SystemNoticeBlockKnown) -> Self {
+        match value {
+            SystemNoticeBlockKnown::Comms {
+                kind,
+                direction,
+                peer,
+                request_id,
+                intent,
+                status,
+                summary,
+                payload,
+                content,
+            } => Self::Comms {
+                kind,
+                direction,
+                peer,
+                request_id,
+                intent,
+                status,
+                summary,
+                payload,
+                content,
+            },
+            SystemNoticeBlockKnown::ExternalEvent {
+                source,
+                event_type,
+                summary,
+                body,
+                payload,
+                content,
+            } => Self::ExternalEvent {
+                source,
+                event_type,
+                summary,
+                body,
+                payload,
+                content,
+            },
+            SystemNoticeBlockKnown::ToolConfig { payload } => Self::ToolConfig { payload },
+            SystemNoticeBlockKnown::Mcp {
+                server_id,
+                operation,
+                phase,
+                persisted,
+                detail,
+                pending_sources,
+            } => Self::Mcp {
+                server_id,
+                operation,
+                phase,
+                persisted,
+                detail,
+                pending_sources,
+            },
+            SystemNoticeBlockKnown::BackgroundJob {
+                job_id,
+                display_name,
+                status,
+                detail,
+            } => Self::BackgroundJob {
+                job_id,
+                display_name,
+                status,
+                detail,
+            },
+            SystemNoticeBlockKnown::Auth {
+                state,
+                binding,
+                detail,
+            } => Self::Auth {
+                state,
+                binding,
+                detail,
+            },
+            SystemNoticeBlockKnown::RuntimeNotice {
+                category,
+                detail,
+                payload,
+            } => Self::RuntimeNotice {
+                category,
+                detail,
+                payload,
+            },
+            SystemNoticeBlockKnown::Unknown { summary, payload } => {
+                Self::Unknown { summary, payload }
+            }
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for SystemNoticeBlock {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = Value::deserialize(deserializer)?;
+        let block_type = value.get("type").and_then(Value::as_str);
+        match block_type {
+            Some(
+                "comms" | "external_event" | "tool_config" | "mcp" | "background_job" | "auth"
+                | "runtime_notice" | "unknown",
+            ) => serde_json::from_value::<SystemNoticeBlockKnown>(value)
+                .map(Into::into)
+                .map_err(serde::de::Error::custom),
+            Some(_) => Ok(Self::unknown_from_value(value)),
+            None => Err(serde::de::Error::custom("missing system notice block type")),
+        }
+    }
+}
+
 impl SystemNoticeBlock {
+    fn unknown_from_value(value: Value) -> Self {
+        let summary = value
+            .get("summary")
+            .or_else(|| value.get("body"))
+            .or_else(|| value.get("detail"))
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        Self::Unknown {
+            summary,
+            payload: Some(value),
+        }
+    }
+
     pub fn summary(&self) -> Option<&str> {
         match self {
             Self::Comms { summary, .. } | Self::Unknown { summary, .. } => summary.as_deref(),

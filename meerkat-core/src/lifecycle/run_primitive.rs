@@ -1727,6 +1727,18 @@ impl RunPrimitive {
         }
     }
 
+    /// Runtime-authored transcript appends carried by this primitive.
+    ///
+    /// Provider prompt text is derived separately; these appends remain the
+    /// durable authorship source for transcript persistence.
+    pub fn typed_turn_appends(&self) -> Vec<ConversationAppend> {
+        match self {
+            RunPrimitive::StagedInput(staged) => staged.appends.clone(),
+            RunPrimitive::ImmediateAppend(append) => vec![append.clone()],
+            RunPrimitive::ImmediateContextAppend(_) => Vec::new(),
+        }
+    }
+
     /// Return the canonical runtime apply boundary for this primitive.
     pub fn apply_boundary(&self) -> RunApplyBoundary {
         match self {
@@ -1827,13 +1839,7 @@ fn append_content_blocks(
         CoreRenderable::Blocks { blocks } => {
             all_blocks.extend(blocks.iter().cloned());
         }
-        CoreRenderable::SystemNotice { kind, body, blocks } => {
-            let notice =
-                crate::types::SystemNoticeMessage::with_blocks(*kind, body.clone(), blocks.clone());
-            let text = notice.model_projection_text();
-            if !text.is_empty() {
-                all_blocks.push(ContentBlock::Text { text });
-            }
+        CoreRenderable::SystemNotice { blocks, .. } => {
             append_system_notice_media_blocks(blocks, all_blocks);
         }
         _ => {}
@@ -1983,6 +1989,91 @@ mod tests {
         assert_eq!(
             p.extract_content_input(),
             crate::types::ContentInput::Text("single".into())
+        );
+    }
+
+    #[test]
+    fn system_notice_append_does_not_project_into_prompt_text() {
+        let append = ConversationAppend {
+            role: ConversationAppendRole::SystemNotice,
+            content: CoreRenderable::SystemNotice {
+                kind: SystemNoticeKind::Comms,
+                body: Some("Peer request: checksum_token".to_string()),
+                blocks: vec![SystemNoticeBlock::Comms {
+                    kind: "peer_request".to_string(),
+                    direction: crate::types::SystemNoticeDirection::Incoming,
+                    peer: None,
+                    request_id: Some("req-1".to_string()),
+                    intent: Some("checksum_token".to_string()),
+                    status: None,
+                    summary: Some("Peer request: checksum_token".to_string()),
+                    payload: None,
+                    content: vec![crate::types::ContentBlock::Text {
+                        text: "What is the token?".to_string(),
+                    }],
+                }],
+            },
+        };
+        let p = make_staged(vec![append.clone()]);
+
+        assert_eq!(p.typed_turn_appends(), vec![append]);
+        assert_eq!(
+            p.extract_content_input(),
+            crate::types::ContentInput::Text(String::new())
+        );
+    }
+
+    #[test]
+    fn system_notice_append_preserves_media_prompt_blocks_without_text_projection() {
+        let image = crate::types::ContentBlock::Image {
+            media_type: "image/png".to_string(),
+            data: crate::types::ImageData::Inline {
+                data: "aW1hZ2U=".to_string(),
+            },
+        };
+        let p = make_staged(vec![ConversationAppend {
+            role: ConversationAppendRole::SystemNotice,
+            content: CoreRenderable::SystemNotice {
+                kind: SystemNoticeKind::ExternalEvent,
+                body: Some("External event".to_string()),
+                blocks: vec![SystemNoticeBlock::ExternalEvent {
+                    source: "webhook".to_string(),
+                    event_type: "image".to_string(),
+                    summary: Some("Webhook image".to_string()),
+                    body: Some("Do not inject this prose".to_string()),
+                    payload: None,
+                    content: vec![
+                        crate::types::ContentBlock::Text {
+                            text: "Do not inject this text".to_string(),
+                        },
+                        image.clone(),
+                    ],
+                }],
+            },
+        }]);
+
+        let result = p.extract_content_input();
+        assert!(
+            matches!(&result, crate::types::ContentInput::Blocks(blocks) if blocks == &vec![image]),
+            "expected media-only prompt blocks, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn typed_turn_appends_excludes_context_only_appends() {
+        let p = RunPrimitive::ImmediateContextAppend(ConversationContextAppend {
+            key: "ctx".to_string(),
+            content: CoreRenderable::SystemNotice {
+                kind: SystemNoticeKind::Comms,
+                body: Some("context".to_string()),
+                blocks: Vec::new(),
+            },
+        });
+
+        assert!(p.typed_turn_appends().is_empty());
+        assert_eq!(
+            p.extract_content_input(),
+            crate::types::ContentInput::Text(String::new())
         );
     }
 

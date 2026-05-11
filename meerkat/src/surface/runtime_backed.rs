@@ -536,6 +536,14 @@ fn pending_system_context_appends(
                     Some(label) => format!("{label}: {uri}"),
                     None => uri.clone(),
                 },
+                CoreRenderable::SystemNotice { kind, body, blocks } => {
+                    meerkat_core::types::SystemNoticeMessage::with_blocks(
+                        *kind,
+                        body.clone(),
+                        blocks.clone(),
+                    )
+                    .model_projection_text()
+                }
                 _ => String::new(),
             },
             source: Some(append.key.clone()),
@@ -569,7 +577,8 @@ fn start_turn_request_from_primitive(
             None,
             pre_turn_context_appends,
             metadata.cloned(),
-        ),
+        )
+        .with_typed_turn_appends(primitive.typed_turn_appends()),
     })
 }
 
@@ -751,6 +760,43 @@ fn ensure_materialized_session_id_matches(
     })
 }
 
+#[cfg(test)]
+mod typed_transcript_contract_tests {
+    use super::*;
+
+    #[test]
+    fn start_turn_request_carries_typed_turn_appends() {
+        let primitive = RunPrimitive::StagedInput(
+            meerkat_core::lifecycle::run_primitive::StagedRunInput {
+                boundary: meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunStart,
+                appends: vec![meerkat_core::lifecycle::run_primitive::ConversationAppend {
+                    role:
+                        meerkat_core::lifecycle::run_primitive::ConversationAppendRole::SystemNotice,
+                    content: CoreRenderable::SystemNotice {
+                        kind: meerkat_core::types::SystemNoticeKind::Comms,
+                        body: Some("typed notice".to_string()),
+                        blocks: Vec::new(),
+                    },
+                }],
+                context_appends: Vec::new(),
+                contributing_input_ids: vec![meerkat_core::lifecycle::InputId::new()],
+                turn_metadata: None,
+            },
+        );
+
+        let req = start_turn_request_from_primitive(&primitive).expect("request");
+
+        assert_eq!(
+            req.runtime.typed_turn_appends,
+            primitive.typed_turn_appends()
+        );
+        assert_eq!(
+            req.prompt,
+            meerkat_core::types::ContentInput::Text(String::new())
+        );
+    }
+}
+
 #[cfg(all(test, feature = "jsonl-store", not(target_arch = "wasm32")))]
 #[allow(clippy::expect_used, clippy::panic, clippy::unwrap_used)]
 mod tests {
@@ -856,6 +902,10 @@ mod tests {
         );
         assert_eq!(req.runtime.skill_references, None);
         assert_eq!(req.runtime.flow_tool_overlay, None);
+        assert_eq!(
+            req.runtime.typed_turn_appends,
+            primitive.typed_turn_appends()
+        );
         assert_eq!(req.runtime.turn_metadata, Some(metadata));
         assert_eq!(
             req.runtime
