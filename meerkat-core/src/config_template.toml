@@ -51,3 +51,7 @@ web_search = true
 
 [provider_tools.gemini]
 google_search = true
+
+[presentation.html]
+# Used by `rkat run --html` / `--browser` unless overridden per run.
+default_template = "polished"
