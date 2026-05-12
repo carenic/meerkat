@@ -13,6 +13,8 @@ use crate::types::{
     WorkItem, WorkItemFilter, WorkItemId, WorkNamespace,
 };
 
+const BEST_EFFORT_REFRESH_ATTEMPTS: usize = 3;
+
 #[derive(Clone)]
 pub struct WorkGraphService {
     store: Arc<dyn WorkGraphStore>,
@@ -250,8 +252,8 @@ impl WorkGraphService {
             .store
             .update_item_cas(item, expected_previous_revision, event)
             .await?;
-        self.refresh_dependents_after_blocker_change(&closed, now)
-            .await?;
+        self.best_effort_refresh_dependents_after_blocker_change(&closed, now)
+            .await;
         Ok(closed)
     }
 
@@ -289,13 +291,13 @@ impl WorkGraphService {
         );
         let inserted = self.store.insert_edge(edge, event).await?;
         if inserted.kind == WorkEdgeKind::Blocks {
-            self.refresh_item_eligibility(
+            self.best_effort_refresh_item_eligibility(
                 &inserted.realm_id,
                 &inserted.namespace,
                 &inserted.to_id,
                 now,
             )
-            .await?;
+            .await;
         }
         Ok(inserted)
     }
@@ -450,6 +452,42 @@ impl WorkGraphService {
         Ok(())
     }
 
+    async fn best_effort_refresh_dependents_after_blocker_change(
+        &self,
+        blocker: &WorkItem,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        for _ in 0..BEST_EFFORT_REFRESH_ATTEMPTS {
+            match self
+                .refresh_dependents_after_blocker_change(blocker, now)
+                .await
+            {
+                Ok(()) => return,
+                Err(WorkGraphError::StaleRevision { .. }) => continue,
+                Err(_) => return,
+            }
+        }
+    }
+
+    async fn best_effort_refresh_item_eligibility(
+        &self,
+        realm_id: &str,
+        namespace: &WorkNamespace,
+        id: &WorkItemId,
+        now: chrono::DateTime<chrono::Utc>,
+    ) {
+        for _ in 0..BEST_EFFORT_REFRESH_ATTEMPTS {
+            match self
+                .refresh_item_eligibility(realm_id, namespace, id, now)
+                .await
+            {
+                Ok(()) => return,
+                Err(WorkGraphError::StaleRevision { .. }) => continue,
+                Err(_) => return,
+            }
+        }
+    }
+
     async fn refresh_item_eligibility(
         &self,
         realm_id: &str,
@@ -509,14 +547,19 @@ fn unresolved_blocker_count(
 mod tests {
     use std::collections::BTreeSet;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use async_trait::async_trait;
+    use chrono::{DateTime, Utc};
 
     use crate::store::WorkGraphEventFilter;
     use crate::types::{
-        ClaimWorkItemRequest, LinkWorkItemsRequest, WorkEdgeKind, WorkOwner, WorkOwnerKey,
+        ClaimWorkItemRequest, LinkWorkItemsRequest, WorkEdge, WorkEdgeKind, WorkGraphEvent,
+        WorkGraphEventKind, WorkItem, WorkItemFilter, WorkOwner, WorkOwnerKey,
     };
     use crate::{
         CreateWorkItemRequest, MemoryWorkGraphStore, UpdateWorkItemRequest, WorkGraphService,
-        WorkNamespace,
+        WorkGraphStore, WorkGraphStoreKind, WorkItemId, WorkNamespace,
     };
 
     fn create_req(title: &str) -> CreateWorkItemRequest {
@@ -533,6 +576,107 @@ mod tests {
             external_refs: Vec::new(),
             evidence_refs: Vec::new(),
             status: None,
+        }
+    }
+
+    struct RefreshConflictStore {
+        inner: MemoryWorkGraphStore,
+        fail_updated_events: AtomicUsize,
+    }
+
+    impl RefreshConflictStore {
+        fn new() -> Self {
+            Self {
+                inner: MemoryWorkGraphStore::new(),
+                fail_updated_events: AtomicUsize::new(0),
+            }
+        }
+
+        fn fail_next_refresh_update(&self) {
+            self.fail_updated_events.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl WorkGraphStore for RefreshConflictStore {
+        fn kind(&self) -> WorkGraphStoreKind {
+            WorkGraphStoreKind::Custom
+        }
+
+        async fn get_store_time_utc(&self) -> Result<DateTime<Utc>, crate::WorkGraphError> {
+            self.inner.get_store_time_utc().await
+        }
+
+        async fn insert_item(
+            &self,
+            item: WorkItem,
+            event: WorkGraphEvent,
+        ) -> Result<WorkItem, crate::WorkGraphError> {
+            self.inner.insert_item(item, event).await
+        }
+
+        async fn update_item_cas(
+            &self,
+            item: WorkItem,
+            expected_previous_revision: u64,
+            event: WorkGraphEvent,
+        ) -> Result<WorkItem, crate::WorkGraphError> {
+            if event.kind == WorkGraphEventKind::Updated
+                && self
+                    .fail_updated_events
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+            {
+                return Err(crate::WorkGraphError::StaleRevision {
+                    id: item.id,
+                    expected: expected_previous_revision,
+                    actual: expected_previous_revision.saturating_add(1),
+                });
+            }
+            self.inner
+                .update_item_cas(item, expected_previous_revision, event)
+                .await
+        }
+
+        async fn get_item(
+            &self,
+            realm_id: &str,
+            namespace: &WorkNamespace,
+            id: &WorkItemId,
+        ) -> Result<Option<WorkItem>, crate::WorkGraphError> {
+            self.inner.get_item(realm_id, namespace, id).await
+        }
+
+        async fn list_items(
+            &self,
+            filter: WorkItemFilter,
+        ) -> Result<Vec<WorkItem>, crate::WorkGraphError> {
+            self.inner.list_items(filter).await
+        }
+
+        async fn insert_edge(
+            &self,
+            edge: WorkEdge,
+            event: WorkGraphEvent,
+        ) -> Result<WorkEdge, crate::WorkGraphError> {
+            self.inner.insert_edge(edge, event).await
+        }
+
+        async fn list_edges(
+            &self,
+            realm_id: &str,
+            namespace: &WorkNamespace,
+        ) -> Result<Vec<WorkEdge>, crate::WorkGraphError> {
+            self.inner.list_edges(realm_id, namespace).await
+        }
+
+        async fn list_events(
+            &self,
+            filter: WorkGraphEventFilter,
+        ) -> Result<Vec<WorkGraphEvent>, crate::WorkGraphError> {
+            self.inner.list_events(filter).await
         }
     }
 
@@ -575,6 +719,90 @@ mod tests {
             })
             .await
             .expect("close blocker");
+        let ready = service.ready(Default::default()).await.expect("ready");
+        assert!(ready.iter().any(|item| item.id == blocked.id));
+    }
+
+    #[tokio::test]
+    async fn link_reports_success_when_post_insert_refresh_conflicts() {
+        let store = Arc::new(RefreshConflictStore::new());
+        let service =
+            WorkGraphService::with_scope(store.clone(), "realm", WorkNamespace::default());
+        let blocker = service
+            .create(create_req("blocker"))
+            .await
+            .expect("blocker");
+        let blocked = service
+            .create(create_req("blocked"))
+            .await
+            .expect("blocked");
+
+        store.fail_next_refresh_update();
+        let edge = service
+            .link(LinkWorkItemsRequest {
+                realm_id: None,
+                namespace: None,
+                kind: WorkEdgeKind::Blocks,
+                from_id: blocker.id.clone(),
+                to_id: blocked.id.clone(),
+            })
+            .await
+            .expect("link should report inserted edge despite refresh conflict");
+
+        assert_eq!(edge.from_id, blocker.id);
+        assert_eq!(edge.to_id, blocked.id);
+        let edges = store
+            .list_edges("realm", &WorkNamespace::default())
+            .await
+            .expect("edges");
+        assert_eq!(edges.len(), 1);
+        let ready = service.ready(Default::default()).await.expect("ready");
+        assert!(!ready.iter().any(|item| item.id == blocked.id));
+    }
+
+    #[tokio::test]
+    async fn close_reports_success_when_dependent_refresh_conflicts() {
+        let store = Arc::new(RefreshConflictStore::new());
+        let service =
+            WorkGraphService::with_scope(store.clone(), "realm", WorkNamespace::default());
+        let blocker = service
+            .create(create_req("blocker"))
+            .await
+            .expect("blocker");
+        let blocked = service
+            .create(create_req("blocked"))
+            .await
+            .expect("blocked");
+        service
+            .link(LinkWorkItemsRequest {
+                realm_id: None,
+                namespace: None,
+                kind: WorkEdgeKind::Blocks,
+                from_id: blocker.id.clone(),
+                to_id: blocked.id.clone(),
+            })
+            .await
+            .expect("link");
+
+        store.fail_next_refresh_update();
+        let closed = service
+            .close(crate::CloseWorkItemRequest {
+                id: blocker.id.clone(),
+                realm_id: None,
+                namespace: None,
+                expected_revision: blocker.revision,
+                status: crate::WorkStatus::Completed,
+            })
+            .await
+            .expect("close should report committed terminal item despite refresh conflict");
+
+        assert_eq!(closed.id, blocker.id);
+        assert_eq!(closed.status, crate::WorkStatus::Completed);
+        let fetched = service
+            .get(None, None, closed.id)
+            .await
+            .expect("closed item should be stored");
+        assert_eq!(fetched.status, crate::WorkStatus::Completed);
         let ready = service.ready(Default::default()).await.expect("ready");
         assert!(ready.iter().any(|item| item.id == blocked.id));
     }

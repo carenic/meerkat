@@ -8,6 +8,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::WorkGraphError;
+use crate::machines::workgraph_lifecycle as wg_dsl;
 pub use crate::machines::workgraph_lifecycle::WorkGraphLifecycleMachineState as WorkGraphMachineState;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -246,7 +247,7 @@ pub struct WorkEvidenceRef {
     pub summary: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct WorkItem {
     pub id: WorkItemId,
     pub realm_id: String,
@@ -283,6 +284,124 @@ pub struct WorkItem {
 
 fn default_workgraph_machine_state() -> WorkGraphMachineState {
     WorkGraphMachineState::default()
+}
+
+#[derive(Deserialize)]
+struct WorkItemWire {
+    id: WorkItemId,
+    realm_id: String,
+    namespace: WorkNamespace,
+    title: String,
+    #[serde(default)]
+    description: Option<String>,
+    status: WorkStatus,
+    priority: WorkPriority,
+    #[serde(default)]
+    labels: BTreeSet<String>,
+    #[serde(default)]
+    owner: Option<WorkOwner>,
+    #[serde(default)]
+    claim: Option<WorkClaim>,
+    #[serde(default)]
+    machine_state: Option<WorkGraphMachineState>,
+    revision: u64,
+    #[serde(default)]
+    due_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    not_before: Option<DateTime<Utc>>,
+    #[serde(default)]
+    snoozed_until: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+    #[serde(default)]
+    terminal_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    external_refs: Vec<ExternalWorkRef>,
+    #[serde(default)]
+    evidence_refs: Vec<WorkEvidenceRef>,
+}
+
+impl<'de> Deserialize<'de> for WorkItem {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let mut wire = WorkItemWire::deserialize(deserializer)?;
+        let machine_state = wire
+            .machine_state
+            .take()
+            .unwrap_or_else(|| legacy_workgraph_machine_state(&wire));
+        Ok(Self {
+            id: wire.id,
+            realm_id: wire.realm_id,
+            namespace: wire.namespace,
+            title: wire.title,
+            description: wire.description,
+            status: wire.status,
+            priority: wire.priority,
+            labels: wire.labels,
+            owner: wire.owner,
+            claim: wire.claim,
+            machine_state,
+            revision: wire.revision,
+            due_at: wire.due_at,
+            not_before: wire.not_before,
+            snoozed_until: wire.snoozed_until,
+            created_at: wire.created_at,
+            updated_at: wire.updated_at,
+            terminal_at: wire.terminal_at,
+            external_refs: wire.external_refs,
+            evidence_refs: wire.evidence_refs,
+        })
+    }
+}
+
+fn legacy_workgraph_machine_state(wire: &WorkItemWire) -> WorkGraphMachineState {
+    let mut machine_state = WorkGraphMachineState {
+        lifecycle_phase: work_lifecycle_state_from_status(wire.status),
+        revision: wire.revision,
+        due_at_utc_ms: wire.due_at.map(datetime_to_millis),
+        not_before_utc_ms: wire.not_before.map(datetime_to_millis),
+        snoozed_until_utc_ms: wire.snoozed_until.map(datetime_to_millis),
+        terminal_at_utc_ms: wire.terminal_at.map(datetime_to_millis),
+        evidence_count: wire.evidence_refs.len().try_into().unwrap_or(u64::MAX),
+        ..default_workgraph_machine_state()
+    };
+    if let Some(claim) = &wire.claim {
+        machine_state.claim_owner_key = Some(work_owner_key_to_machine(&claim.owner.key));
+        machine_state.claimed_at_utc_ms = Some(datetime_to_millis(claim.claimed_at));
+        machine_state.lease_expires_at_utc_ms = claim.lease_expires_at.map(datetime_to_millis);
+    }
+    machine_state
+}
+
+fn work_lifecycle_state_from_status(status: WorkStatus) -> wg_dsl::WorkLifecycleState {
+    match status {
+        WorkStatus::Open => wg_dsl::WorkLifecycleState::Open,
+        WorkStatus::InProgress => wg_dsl::WorkLifecycleState::InProgress,
+        WorkStatus::Blocked => wg_dsl::WorkLifecycleState::Blocked,
+        WorkStatus::Completed => wg_dsl::WorkLifecycleState::Completed,
+        WorkStatus::Cancelled => wg_dsl::WorkLifecycleState::Cancelled,
+        WorkStatus::Failed => wg_dsl::WorkLifecycleState::Failed,
+    }
+}
+
+fn work_owner_key_to_machine(owner: &WorkOwnerKey) -> wg_dsl::WorkOwnerKey {
+    let kind = match owner.kind {
+        WorkOwnerKind::Principal => wg_dsl::WorkOwnerKind::Principal,
+        WorkOwnerKind::Agent => wg_dsl::WorkOwnerKind::Agent,
+        WorkOwnerKind::Session => wg_dsl::WorkOwnerKind::Session,
+        WorkOwnerKind::Mob => wg_dsl::WorkOwnerKind::Mob,
+        WorkOwnerKind::Label => wg_dsl::WorkOwnerKind::Label,
+    };
+    wg_dsl::WorkOwnerKey {
+        kind,
+        id: owner.id.clone(),
+    }
+}
+
+fn datetime_to_millis(dt: DateTime<Utc>) -> u64 {
+    u64::try_from(dt.timestamp_millis()).unwrap_or(0)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
