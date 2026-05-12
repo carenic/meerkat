@@ -1727,6 +1727,26 @@ impl RunPrimitive {
         }
     }
 
+    /// Project this primitive into provider-visible input.
+    ///
+    /// Unlike [`RunPrimitive::extract_content_input`], this is allowed to
+    /// render typed runtime-authored notices into model text. The rendered text
+    /// is an internal provider projection only; transcript persistence remains
+    /// typed `SystemNotice` content.
+    pub fn model_projection_content_input(&self) -> crate::types::ContentInput {
+        match self {
+            RunPrimitive::StagedInput(staged) => {
+                model_projection_content_input_from_conversation_appends(&staged.appends)
+            }
+            RunPrimitive::ImmediateAppend(append) => {
+                model_projection_content_input_from_core_renderable(&append.content)
+            }
+            RunPrimitive::ImmediateContextAppend(ctx) => {
+                model_projection_content_input_from_core_renderable(&ctx.content)
+            }
+        }
+    }
+
     /// Runtime-authored transcript appends carried by this primitive.
     ///
     /// Provider prompt text is derived separately; these appends remain the
@@ -1821,9 +1841,27 @@ pub fn content_input_from_conversation_appends(
     content_input_from_blocks(all_blocks)
 }
 
+pub fn model_projection_content_input_from_conversation_appends(
+    appends: &[ConversationAppend],
+) -> crate::types::ContentInput {
+    let mut all_blocks = Vec::new();
+    for append in appends {
+        append_model_projection_blocks(&append.content, &mut all_blocks);
+    }
+    content_input_from_blocks(all_blocks)
+}
+
 fn content_input_from_core_renderable(content: &CoreRenderable) -> crate::types::ContentInput {
     let mut all_blocks = Vec::new();
     append_content_blocks(content, &mut all_blocks);
+    content_input_from_blocks(all_blocks)
+}
+
+fn model_projection_content_input_from_core_renderable(
+    content: &CoreRenderable,
+) -> crate::types::ContentInput {
+    let mut all_blocks = Vec::new();
+    append_model_projection_blocks(content, &mut all_blocks);
     content_input_from_blocks(all_blocks)
 }
 
@@ -1841,6 +1879,43 @@ fn append_content_blocks(
         }
         CoreRenderable::SystemNotice { .. } => {}
         _ => {}
+    }
+}
+
+fn append_model_projection_blocks(
+    content: &CoreRenderable,
+    all_blocks: &mut Vec<crate::types::ContentBlock>,
+) {
+    use crate::types::{ContentBlock, SystemNoticeMessage};
+    match content {
+        CoreRenderable::SystemNotice { kind, body, blocks } => {
+            let projection = SystemNoticeMessage::with_blocks(*kind, body.clone(), blocks.clone())
+                .model_projection_text();
+            if !projection.trim().is_empty() {
+                all_blocks.push(ContentBlock::Text { text: projection });
+            }
+            append_system_notice_media_blocks(blocks, all_blocks);
+        }
+        _ => append_content_blocks(content, all_blocks),
+    }
+}
+
+fn append_system_notice_media_blocks(
+    blocks: &[SystemNoticeBlock],
+    all_blocks: &mut Vec<crate::types::ContentBlock>,
+) {
+    for block in blocks {
+        let content = match block {
+            SystemNoticeBlock::Comms { content, .. }
+            | SystemNoticeBlock::ExternalEvent { content, .. } => content,
+            _ => continue,
+        };
+        all_blocks.extend(
+            content
+                .iter()
+                .filter(|block| !matches!(block, crate::types::ContentBlock::Text { .. }))
+                .cloned(),
+        );
     }
 }
 
@@ -2003,6 +2078,10 @@ mod tests {
             p.extract_content_input(),
             crate::types::ContentInput::Text(String::new())
         );
+        let projection = p.model_projection_content_input().text_content();
+        assert!(projection.contains("Peer request"));
+        assert!(projection.contains("checksum_token"));
+        assert!(projection.contains("What is the token?"));
     }
 
     #[test]
@@ -2038,6 +2117,22 @@ mod tests {
             p.extract_content_input(),
             crate::types::ContentInput::Text(String::new())
         );
+        match p.model_projection_content_input() {
+            crate::types::ContentInput::Blocks(blocks) => {
+                assert!(blocks.iter().any(|block| matches!(
+                    block,
+                    crate::types::ContentBlock::Text { text }
+                        if text.contains("Do not inject this prose")
+                            && text.contains("Do not inject this text")
+                )));
+                assert!(
+                    blocks
+                        .iter()
+                        .any(|block| matches!(block, crate::types::ContentBlock::Image { .. }))
+                );
+            }
+            other => panic!("expected typed notice projection with media blocks, got {other:?}"),
+        }
     }
 
     #[test]

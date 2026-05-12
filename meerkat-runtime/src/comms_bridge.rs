@@ -226,6 +226,9 @@ fn map_response_convention(
 }
 
 fn peer_rendered_body(interaction: &InboxInteraction) -> String {
+    if !interaction.rendered_text.trim().is_empty() {
+        return interaction.rendered_text.clone();
+    }
     match &interaction.content {
         InteractionContent::Message { body, .. } => body.clone(),
         InteractionContent::Request { params, .. } => {
@@ -519,7 +522,7 @@ mod tests {
             panic!("Expected peer source");
         };
         assert_eq!(peer_id, "11111111-1111-4111-8111-111111111111");
-        assert_eq!(peer.body, "{\"description\":\"tower with a light\"}");
+        assert_eq!(peer.body, "stale helper prose");
 
         let prompt = crate::input::input_prompt_text(&input);
         assert!(prompt.starts_with(
@@ -601,7 +604,7 @@ mod tests {
                 .expect("classified peer event should project to peer input");
         match input {
             Input::Peer(peer) => {
-                assert_eq!(peer.body, "hello");
+                assert_eq!(peer.body, "stale rendered text");
                 match peer.header.source {
                     InputOrigin::Peer { peer_id, .. } => {
                         assert_eq!(peer_id, test_peer_id().as_str());
@@ -662,7 +665,7 @@ mod tests {
             }
             other => panic!("Expected peer source, got {other:?}"),
         }
-        assert_eq!(peer.body, "{\"pr\":42}");
+        assert_eq!(peer.body, "stale rendered text");
     }
 
     #[test]
@@ -706,7 +709,7 @@ mod tests {
     }
 
     #[test]
-    fn request_body_uses_structured_payload_and_ignores_rendered_text() {
+    fn request_body_preserves_rendered_text_and_structured_payload() {
         let interaction = InboxInteraction {
             from_route: None,
             from: "event:webhook".into(),
@@ -722,7 +725,7 @@ mod tests {
         };
         let input = peer_input_for_test(&interaction, &LogicalRuntimeId::new("test"));
         if let Input::Peer(peer) = input {
-            assert_eq!(peer.body, "{\"peer\":\"agent-1\"}");
+            assert_eq!(peer.body, "stale rendered text");
             assert_eq!(peer.payload, Some(serde_json::json!({"peer":"agent-1"})));
         } else {
             panic!("Expected PeerInput");
@@ -754,7 +757,7 @@ mod tests {
         };
         let input = peer_input_for_test(&interaction, &LogicalRuntimeId::new("test"));
         if let Input::Peer(peer) = input {
-            assert_eq!(peer.body, "see image");
+            assert_eq!(peer.body, "stale rendered text");
             assert_eq!(peer.blocks, Some(blocks));
         } else {
             panic!("Expected PeerInput");
@@ -847,7 +850,7 @@ mod tests {
         };
         let input = peer_input_for_test(&interaction, &LogicalRuntimeId::new("test"));
         if let Input::Peer(peer) = input {
-            assert_eq!(peer.body, "please inspect this image");
+            assert_eq!(peer.body, "stale rendered text");
         } else {
             panic!("Expected PeerInput");
         }

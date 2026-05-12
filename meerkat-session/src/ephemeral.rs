@@ -3389,7 +3389,7 @@ async fn session_task<A: SessionAgent>(
                 let prompt = if typed_turn_appends.is_empty() {
                     prompt
                 } else {
-                    meerkat_core::lifecycle::run_primitive::content_input_from_conversation_appends(
+                    meerkat_core::lifecycle::run_primitive::model_projection_content_input_from_conversation_appends(
                         &typed_turn_appends,
                     )
                 };

@@ -3803,7 +3803,7 @@ impl SessionRuntime {
 
     fn live_text_from_runtime_primitive(primitive: &RunPrimitive) -> Option<String> {
         let mut parts = Vec::new();
-        let prompt = primitive.extract_content_input().text_content();
+        let prompt = primitive.model_projection_content_input().text_content();
         if !prompt.trim().is_empty() {
             parts.push(prompt);
         }
