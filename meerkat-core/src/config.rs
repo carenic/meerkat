@@ -46,6 +46,7 @@ pub struct Config {
     pub skills: crate::skills_config::SkillsConfig,
     pub self_hosted: SelfHostedConfig,
     pub provider_tools: ProviderToolsConfig,
+    pub presentation: PresentationConfig,
     /// Realm-scoped connection sets (backend profiles, auth profiles,
     /// bindings). TOML keys use the singular `[realm.<id>.*]` namespace
     /// even though the Rust field is plural-adjacent — `#[serde(rename)]`
@@ -81,6 +82,7 @@ impl Default for Config {
             skills: crate::skills_config::SkillsConfig::default(),
             self_hosted: SelfHostedConfig::default(),
             provider_tools: ProviderToolsConfig::default(),
+            presentation: PresentationConfig::default(),
             realm: BTreeMap::new(),
         }
     }
@@ -805,6 +807,41 @@ impl Default for AgentConfig {
             extraction_prompt: None,
         }
     }
+}
+
+/// Presentation defaults for surface-owned renderings.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct PresentationConfig {
+    pub html: HtmlPresentationConfig,
+}
+
+/// Defaults for CLI HTML output mode.
+///
+/// This config controls template selection only. It does not enable HTML output
+/// for ordinary runs; surfaces must request the HTML presentation explicitly.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct HtmlPresentationConfig {
+    pub default_template: String,
+    pub templates: BTreeMap<String, HtmlTemplateConfig>,
+}
+
+impl Default for HtmlPresentationConfig {
+    fn default() -> Self {
+        Self {
+            default_template: "polished".to_string(),
+            templates: BTreeMap::new(),
+        }
+    }
+}
+
+/// User-defined HTML output template.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(default)]
+pub struct HtmlTemplateConfig {
+    pub path: Option<PathBuf>,
+    pub body: Option<String>,
 }
 
 /// Model defaults by provider.

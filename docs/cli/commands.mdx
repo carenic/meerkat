@@ -129,11 +129,38 @@ rkat --schema ./triage.schema.json "extract issues from this diff"
 
 `--json` is a convenience alias for `--output json`.
 
+HTML output asks the agent to make the final answer a standalone local HTML artifact:
+
+```bash
+rkat run --html "explain how prompt caching works in this repo"
+rkat run --browser "create a visual implementation plan for this change"
+```
+
+`--html` is a convenience alias for `--output html`. `--browser` is a compact
+shortcut for HTML output plus `--open-in-browser`. HTML output writes the file
+under the active realm's `presentation/html` directory and prints the path.
+
+Template defaults live under `[presentation.html]`:
+
+```toml
+[presentation.html]
+default_template = "polished"
+
+[presentation.html.templates.review]
+path = "html/review.md"
+
+[presentation.html.templates.dense]
+body = "Render this as a dense technical artifact with annotated snippets."
+```
+
+Per run, use `--html-template <NAME>` or `--html-template-file <PATH>`.
+Config template paths are resolved relative to the active config base directory.
+
 ### Streaming defaults
 
 - In a TTY, text output streams by default.
 - In pipes and scripts, streaming is off by default.
-- JSON output stays non-streaming by default so stdout remains valid JSON unless `--stream` is explicitly requested.
+- JSON and HTML output stay non-streaming by default so stdout remains machine-friendly unless `--stream` is explicitly requested.
 
 ### Stdin modes and Unix pipes
 

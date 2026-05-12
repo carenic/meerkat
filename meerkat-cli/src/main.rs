@@ -91,7 +91,7 @@ const CLI_ABOUT: &str = "Run agent tasks and manage local Meerkat surfaces from 
 const ROOT_AFTER_HELP: &str = "Command groups:\n  Runtime:      run, help\n  Realm config: init, config, realm\n  Utility:      session, blob, models, capabilities, doctor\n\nAdditional commands appear when their supporting capabilities are compiled in.\n\nExamples:\n  rkat \"summarize this repository\"\n  rkat help \"How do I add an mcp server?\"\n  cat story.txt | rkat \"summarize the story\"\n  git diff | rkat run \"review these changes\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nUse `<binary> <command> -h` for the basic view and `<binary> <command> --help` for all options.";
 const HELP_AFTER_HELP: &str = "Examples:\n  rkat help \"How do I add an mcp server and schedule to remove it in 30 minutes\"\n  rkat help \"Use gemini with my vertex auth, load ~/codex/skills\" --prompt \"Write a match-3 game in Erlang\"";
 
-const RUN_AFTER_HELP: &str = "Examples:\n  rkat run \"summarize this repository\"\n  cat story.txt | rkat run \"summarize the story\"\n  git diff | rkat run --json \"review these changes\"\n  rkat run --resume \"keep going\"\n  rkat run --resume ~2 \"pick this thread back up\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nDefaults:\n  - `--tools safe`\n  - provider-native web search on for supporting models; use `--no-web-search` to disable\n  - stream on in a TTY, off in pipes/scripts\n  - piped stdin is read as blob context unless `--stdin lines` is set";
+const RUN_AFTER_HELP: &str = "Examples:\n  rkat run \"summarize this repository\"\n  cat story.txt | rkat run \"summarize the story\"\n  git diff | rkat run --json \"review these changes\"\n  rkat run --html \"make a visual explainer\"\n  rkat run --browser \"create an implementation plan\"\n  rkat run --resume \"keep going\"\n  rkat run --resume ~2 \"pick this thread back up\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nDefaults:\n  - `--tools safe`\n  - provider-native web search on for supporting models; use `--no-web-search` to disable\n  - stream on in a TTY, off in pipes/scripts\n  - piped stdin is read as blob context unless `--stdin lines` is set";
 
 const DEFAULT_TRACE_FILTER: &str = "off";
 const VERBOSE_TRACE_FILTER: &str = "info";
@@ -387,6 +387,175 @@ fn print_cli_callback_pending(
     );
     eprintln!("[Pending tool: {} {}]", pending.tool_name, pending.args);
     eprintln!("Provide the tool result, then resume the session using the session ref above.");
+    Ok(())
+}
+
+fn normalize_html_document(raw: &str) -> anyhow::Result<String> {
+    let trimmed = raw.trim();
+    let candidate = strip_markdown_fence(trimmed).unwrap_or(trimmed).trim();
+    let lower = candidate.trim_start().to_ascii_lowercase();
+    if !(lower.starts_with("<!doctype html")
+        || lower.starts_with("<html")
+        || lower.contains("<html"))
+    {
+        anyhow::bail!(
+            "HTML output mode expected a complete HTML document, but the final answer did not contain <html> or <!doctype html>"
+        );
+    }
+    Ok(candidate.to_string())
+}
+
+fn strip_markdown_fence(value: &str) -> Option<&str> {
+    let rest = value.strip_prefix("```")?;
+    let first_newline = rest.find('\n')?;
+    let body = &rest[first_newline + 1..];
+    let end = body.rfind("```")?;
+    Some(&body[..end])
+}
+
+async fn write_html_output_artifact(
+    scope: &RuntimeScope,
+    result: &meerkat_core::types::RunResult,
+) -> anyhow::Result<PathBuf> {
+    let html = normalize_html_document(&result.text)?;
+    let realm_paths =
+        meerkat_store::realm_paths_in(&scope.locator.state_root, scope.locator.realm.as_str());
+    let dir = realm_paths.root.join("presentation").join("html");
+    tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+        anyhow::anyhow!(
+            "Failed to create HTML artifact directory {}: {e}",
+            dir.display()
+        )
+    })?;
+    let filename = format!(
+        "{}-{}-{}.html",
+        Utc::now().format("%Y%m%dT%H%M%SZ"),
+        short_session_id(&result.session_id),
+        uuid::Uuid::new_v4().simple()
+    );
+    let path = dir.join(filename);
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create HTML artifact {}: {e}", path.display()))?;
+    file.write_all(html.as_bytes())
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to write HTML artifact {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+fn file_url_for_path(path: &Path) -> Result<String, String> {
+    let canonical_path = std::fs::canonicalize(path)
+        .map_err(|e| format!("failed to canonicalize {}: {e}", path.display()))?;
+    url::Url::from_file_path(&canonical_path)
+        .map(|url| url.to_string())
+        .map_err(|()| {
+            format!(
+                "failed to convert {} to a file URL",
+                canonical_path.display()
+            )
+        })
+}
+
+fn open_html_artifact_in_browser(path: &Path) -> Result<(), String> {
+    let url = file_url_for_path(path)?;
+    webbrowser::open(&url).map_err(|e| e.to_string())
+}
+
+async fn print_completed_run_result(
+    result: meerkat_core::types::RunResult,
+    output: &CliOutputSelection,
+    stream: bool,
+    scope: &RuntimeScope,
+    include_ref_in_summary: bool,
+) -> anyhow::Result<()> {
+    match output.format {
+        CliOutputFormat::Json => {
+            let session_id = result.session_id.clone();
+            let mut wire: meerkat_contracts::WireRunResult = result.into();
+            wire.session_ref = Some(format_session_ref(&scope.locator.realm, &session_id));
+            println!("{}", serde_json::to_string_pretty(&wire)?);
+        }
+        CliOutputFormat::Html => {
+            let path = write_html_output_artifact(scope, &result).await?;
+            println!("{}", path.display());
+            if output.open_in_browser
+                && let Err(error) = open_html_artifact_in_browser(&path)
+            {
+                eprintln!(
+                    "Warning: failed to open HTML artifact in browser: {error}. Open {} manually.",
+                    path.display()
+                );
+            }
+            if include_ref_in_summary {
+                eprintln!(
+                    "\n[Session: {} | Ref: {} | Turns: {} | Tokens: {} in / {} out | HTML: {}]",
+                    result.session_id,
+                    format_session_ref(&scope.locator.realm, &result.session_id),
+                    result.turns,
+                    result.usage.input_tokens,
+                    result.usage.output_tokens,
+                    path.display()
+                );
+            } else {
+                eprintln!(
+                    "\n[Session: {} | Turns: {} | Tokens: {} in / {} out | HTML: {}]",
+                    short_session_id(&result.session_id),
+                    result.turns,
+                    result.usage.input_tokens,
+                    result.usage.output_tokens,
+                    path.display()
+                );
+            }
+        }
+        CliOutputFormat::Text => {
+            if !stream {
+                println!("{}", result.text);
+            }
+            if include_ref_in_summary {
+                eprintln!(
+                    "\n[Session: {} | Ref: {} | Turns: {} | Tokens: {} in / {} out]",
+                    result.session_id,
+                    format_session_ref(&scope.locator.realm, &result.session_id),
+                    result.turns,
+                    result.usage.input_tokens,
+                    result.usage.output_tokens
+                );
+            } else {
+                eprintln!(
+                    "\n[Session: {} | Turns: {} | Tokens: {} in / {} out]",
+                    short_session_id(&result.session_id),
+                    result.turns,
+                    result.usage.input_tokens,
+                    result.usage.output_tokens
+                );
+            }
+            if let Some(warnings) = &result.schema_warnings
+                && !warnings.is_empty()
+            {
+                eprintln!("\n[Schema warnings]");
+                for warning in warnings {
+                    eprintln!(
+                        "- {:?} {}: {}",
+                        warning.provider, warning.path, warning.message
+                    );
+                }
+            }
+            if let Some(diag) = &result.skill_diagnostics
+                && diag.source_health.state != meerkat_core::skills::SourceHealthState::Healthy
+            {
+                eprintln!(
+                    "\n[Skill source health: {:?} | invalid_ratio: {:.3} | streak: {} | quarantined: {}]",
+                    diag.source_health.state,
+                    diag.source_health.invalid_ratio,
+                    diag.source_health.failure_streak,
+                    diag.quarantined.len()
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -768,6 +937,223 @@ impl From<RealmBackendArg> for RealmBackend {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CliOutputFormat {
+    Text,
+    Json,
+    Html,
+}
+
+impl CliOutputFormat {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Text => "text",
+            Self::Json => "json",
+            Self::Html => "html",
+        }
+    }
+
+    fn streams_by_default(self) -> bool {
+        matches!(self, Self::Text)
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CliOutputSelection {
+    format: CliOutputFormat,
+    open_in_browser: bool,
+    html_template: Option<String>,
+    html_template_file: Option<PathBuf>,
+}
+
+impl CliOutputSelection {
+    fn is_html(&self) -> bool {
+        self.format == CliOutputFormat::Html
+    }
+}
+
+#[derive(Clone, Debug)]
+struct HtmlOutputRequest {
+    instruction: String,
+}
+
+const BUILTIN_HTML_TEMPLATE_POLISHED: &str = r"
+Create a beautiful, readable, information-dense HTML artifact tailored to the user's request.
+
+Design direction:
+- Use a complete standalone HTML5 document with inline CSS and, when useful, small inline JavaScript.
+- Make the page feel like a polished technical artifact: clear hierarchy, generous but not wasteful spacing, excellent typography, and fast scanning.
+- Use tables, callouts, SVG diagrams, timelines, grids, annotated code blocks, tabs, disclosure sections, or lightweight controls when they genuinely improve comprehension.
+- Keep the user's content and preferences primary. If the user asked for a terse answer, make a terse artifact; if they asked for a deep report, make it rich.
+- Prefer restrained professional color with purposeful accents. Avoid generic purple-blue gradient hero pages, decorative blobs, and marketing-page fluff.
+- Make it responsive for desktop and mobile, accessible, and printable enough that someone could share the file.
+
+Content rules:
+- Preserve the truth of the answer. Do not invent facts, metrics, citations, files, or conclusions.
+- Label assumptions and uncertainty plainly.
+- If code, diffs, plans, or schemas are important, render them in readable sections with syntax-like styling and short annotations.
+- Add interaction only when it helps the reader compare, filter, copy, tune, or navigate the information.
+";
+
+fn resolve_cli_output_selection(
+    output: CliOutputFormat,
+    json: bool,
+    html: bool,
+    browser: bool,
+    open_in_browser: bool,
+    html_template: Option<String>,
+    html_template_file: Option<PathBuf>,
+) -> anyhow::Result<CliOutputSelection> {
+    if html_template.is_some() && html_template_file.is_some() {
+        anyhow::bail!("--html-template and --html-template-file are mutually exclusive");
+    }
+
+    let mut format = output;
+    if json {
+        if !matches!(format, CliOutputFormat::Text | CliOutputFormat::Json) {
+            anyhow::bail!(
+                "--json cannot be combined with --output {}",
+                format.as_str()
+            );
+        }
+        format = CliOutputFormat::Json;
+    }
+    if html || browser {
+        if !matches!(format, CliOutputFormat::Text | CliOutputFormat::Html) {
+            anyhow::bail!(
+                "{} cannot be combined with --output {}",
+                if browser { "--browser" } else { "--html" },
+                format.as_str()
+            );
+        }
+        format = CliOutputFormat::Html;
+    }
+
+    if format != CliOutputFormat::Html {
+        if open_in_browser {
+            anyhow::bail!("--open-in-browser requires --html or --output html");
+        }
+        if html_template.is_some() || html_template_file.is_some() {
+            anyhow::bail!("HTML templates require --html or --output html");
+        }
+    }
+
+    Ok(CliOutputSelection {
+        format,
+        open_in_browser: browser || open_in_browser,
+        html_template,
+        html_template_file,
+    })
+}
+
+fn builtin_html_template(name: &str) -> Option<&'static str> {
+    match name {
+        "polished" => Some(BUILTIN_HTML_TEMPLATE_POLISHED),
+        _ => None,
+    }
+}
+
+async fn load_configured_html_template(
+    name: &str,
+    template: &meerkat_core::config::HtmlTemplateConfig,
+    config_base_dir: &Path,
+) -> anyhow::Result<(String, String)> {
+    match (&template.body, &template.path) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!(
+                "presentation.html.templates.{name} must set either body or path, not both"
+            )
+        }
+        (Some(body), None) => Ok((
+            body.clone(),
+            format!("presentation.html.templates.{name}.body"),
+        )),
+        (None, Some(path)) => {
+            let path = if path.is_absolute() {
+                path.clone()
+            } else {
+                config_base_dir.join(path)
+            };
+            let body = tokio::fs::read_to_string(&path).await.map_err(|e| {
+                anyhow::anyhow!(
+                    "Failed to read HTML template `{name}` at {}: {e}",
+                    path.display()
+                )
+            })?;
+            Ok((body, path.display().to_string()))
+        }
+        (None, None) => {
+            anyhow::bail!("presentation.html.templates.{name} must set body or path")
+        }
+    }
+}
+
+async fn resolve_named_html_template(
+    name: &str,
+    config: &Config,
+    config_base_dir: &Path,
+) -> anyhow::Result<(String, String)> {
+    if let Some(template) = config.presentation.html.templates.get(name) {
+        return load_configured_html_template(name, template, config_base_dir).await;
+    }
+    if let Some(body) = builtin_html_template(name) {
+        return Ok((body.to_string(), format!("builtin:{name}")));
+    }
+    anyhow::bail!("unknown HTML template `{name}`")
+}
+
+async fn resolve_html_output_request(
+    output: &CliOutputSelection,
+    config: &Config,
+    config_base_dir: &Path,
+) -> anyhow::Result<Option<HtmlOutputRequest>> {
+    if !output.is_html() {
+        return Ok(None);
+    }
+
+    let (template_body, template_source) = if let Some(path) = &output.html_template_file {
+        let body = tokio::fs::read_to_string(path).await.map_err(|e| {
+            anyhow::anyhow!("Failed to read HTML template file {}: {e}", path.display())
+        })?;
+        (body, path.display().to_string())
+    } else {
+        let template_name = output
+            .html_template
+            .as_deref()
+            .unwrap_or(config.presentation.html.default_template.as_str());
+        resolve_named_html_template(template_name, config, config_base_dir).await?
+    };
+
+    Ok(Some(HtmlOutputRequest {
+        instruction: build_html_output_instruction(&template_body, &template_source),
+    }))
+}
+
+fn build_html_output_instruction(template_body: &str, template_source: &str) -> String {
+    format!(
+        r"[Meerkat CLI HTML Output Mode]
+The caller selected HTML output for this run. Your final assistant response must be only a complete, self-contained HTML document.
+
+Output contract:
+- Start with <!doctype html> or <html>.
+- Include all CSS inline in a <style> tag.
+- Include JavaScript inline only if it improves the artifact.
+- Do not wrap the document in Markdown fences.
+- Do not add explanatory text before or after the HTML.
+- Make the document useful when opened directly from a local file.
+
+Template source: {template_source}
+Template instructions:
+{template_body}
+"
+    )
+}
+
+fn append_html_output_instruction(prompt: &mut String, request: &HtmlOutputRequest) {
+    prompt.push_str("\n\n");
+    prompt.push_str(&request.instruction);
+}
+
 #[derive(Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
@@ -818,18 +1204,39 @@ enum Commands {
         #[arg(long, hide_short_help = true, help_heading = "Advanced options")]
         max_tool_calls: Option<usize>,
 
-        /// Output format (text, json)
+        /// Output format (text, json, html)
         #[arg(
             long,
             short = 'o',
+            value_enum,
             default_value = "text",
             help_heading = "Common options"
         )]
-        output: String,
+        output: CliOutputFormat,
 
         /// Convenience alias for --output json
         #[arg(long, help_heading = "Common options")]
         json: bool,
+
+        /// Convenience alias for --output html
+        #[arg(long, help_heading = "Common options")]
+        html: bool,
+
+        /// Write HTML output and open it in the browser
+        #[arg(long, help_heading = "Common options")]
+        browser: bool,
+
+        /// Open HTML output in the browser after writing the artifact
+        #[arg(long, help_heading = "Common options")]
+        open_in_browser: bool,
+
+        /// HTML output template name
+        #[arg(long, value_name = "NAME", help_heading = "Common options")]
+        html_template: Option<String>,
+
+        /// HTML output template file
+        #[arg(long, value_name = "PATH", help_heading = "Common options")]
+        html_template_file: Option<PathBuf>,
 
         /// Stream LLM response tokens to stdout as they arrive
         #[arg(long, short = 's', help_heading = "Common options")]
@@ -1021,18 +1428,39 @@ enum Commands {
         #[arg(long, hide_short_help = true, help_heading = "Advanced options")]
         max_tokens: Option<u32>,
 
-        /// Output format (text, json)
+        /// Output format (text, json, html)
         #[arg(
             long,
             short = 'o',
+            value_enum,
             default_value = "text",
             help_heading = "Common options"
         )]
-        output: String,
+        output: CliOutputFormat,
 
         /// Convenience alias for --output json
         #[arg(long, help_heading = "Common options")]
         json: bool,
+
+        /// Convenience alias for --output html
+        #[arg(long, help_heading = "Common options")]
+        html: bool,
+
+        /// Write HTML output and open it in the browser
+        #[arg(long, help_heading = "Common options")]
+        browser: bool,
+
+        /// Open HTML output in the browser after writing the artifact
+        #[arg(long, help_heading = "Common options")]
+        open_in_browser: bool,
+
+        /// HTML output template name
+        #[arg(long, value_name = "NAME", help_heading = "Common options")]
+        html_template: Option<String>,
+
+        /// HTML output template file
+        #[arg(long, value_name = "PATH", help_heading = "Common options")]
+        html_template_file: Option<PathBuf>,
 
         /// Stream LLM response tokens to stdout as they arrive
         #[arg(long, short = 's', help_heading = "Common options")]
@@ -1866,6 +2294,11 @@ async fn main() -> anyhow::Result<ExitCode> {
             max_tool_calls,
             output,
             json,
+            html,
+            browser,
+            open_in_browser,
+            html_template,
+            html_template_file,
             stream,
             no_stream,
             no_web_search,
@@ -1919,6 +2352,11 @@ async fn main() -> anyhow::Result<ExitCode> {
                 max_tool_calls,
                 output,
                 json,
+                html,
+                browser,
+                open_in_browser,
+                html_template,
+                html_template_file,
                 stream,
                 no_stream,
                 no_web_search,
@@ -1952,6 +2390,11 @@ async fn main() -> anyhow::Result<ExitCode> {
             max_tokens,
             output,
             json,
+            html,
+            browser,
+            open_in_browser,
+            html_template,
+            html_template_file,
             stream,
             no_stream,
         } => {
@@ -1964,6 +2407,11 @@ async fn main() -> anyhow::Result<ExitCode> {
                 max_tokens,
                 output,
                 json,
+                html,
+                browser,
+                open_in_browser,
+                html_template,
+                html_template_file,
                 stream,
                 no_stream,
                 &cli_scope,
@@ -2042,8 +2490,13 @@ async fn handle_help_command(
     model: Option<String>,
     provider: Option<Provider>,
     max_tokens: Option<u32>,
-    output: String,
+    output: CliOutputFormat,
     json: bool,
+    html: bool,
+    browser: bool,
+    open_in_browser: bool,
+    html_template: Option<String>,
+    html_template_file: Option<PathBuf>,
     stream: bool,
     no_stream: bool,
     scope: &RuntimeScope,
@@ -2073,6 +2526,11 @@ async fn handle_help_command(
         None,
         output,
         json,
+        html,
+        browser,
+        open_in_browser,
+        html_template,
+        html_template_file,
         stream,
         no_stream,
         false,
@@ -2109,8 +2567,13 @@ async fn handle_run_command(
     max_tokens: Option<u32>,
     max_duration: Option<String>,
     max_tool_calls: Option<usize>,
-    output: String,
+    output: CliOutputFormat,
     json: bool,
+    html: bool,
+    browser: bool,
+    open_in_browser: bool,
+    html_template: Option<String>,
+    html_template_file: Option<PathBuf>,
     stream: bool,
     no_stream: bool,
     no_web_search: bool,
@@ -2133,8 +2596,18 @@ async fn handle_run_command(
     auth_binding: Option<AuthBindingRef>,
     scope: &RuntimeScope,
 ) -> anyhow::Result<()> {
-    let output = if json { "json".to_string() } else { output };
-    let json_output = output.eq_ignore_ascii_case("json");
+    let output = resolve_cli_output_selection(
+        output,
+        json,
+        html,
+        browser,
+        open_in_browser,
+        html_template,
+        html_template_file,
+    )?;
+    if output.is_html() && output_schema.is_some() {
+        anyhow::bail!("--html cannot be combined with --schema in HTML Output Mode V1");
+    }
 
     if let Some(session_id) = resume {
         return resume_session(
@@ -2202,7 +2675,7 @@ async fn handle_run_command(
     let provider_params = parse_provider_params(&params);
     let provider_params_json = parse_provider_params_json(provider_params_json);
     let hooks_override = HookRunOverrides::default();
-    let stream = resolve_stream_enabled(stream, no_stream, !json_output)?;
+    let stream = resolve_stream_enabled(stream, no_stream, output.format.streams_by_default())?;
     let stream_policy = if stream {
         Some(stream_renderer::StreamRenderPolicy::PrimaryOnly)
     } else {
@@ -2214,8 +2687,13 @@ async fn handle_run_command(
         .map(|s| parse_output_schema(s))
         .transpose()?;
     let tooling = resolve_tool_preset(tools.unwrap_or(ToolPreset::Safe), yolo);
+    let html_output_request =
+        resolve_html_output_request(&output, &config, &config_base_dir).await?;
     if matches!(stdin, StdinMode::Blob | StdinMode::Auto) {
         prompt = prepend_stdin_blob_context(prompt);
+    }
+    if let Some(request) = &html_output_request {
+        append_html_output_instruction(&mut prompt, request);
     }
 
     match (duration, provider_params, provider_params_json) {
@@ -2243,7 +2721,7 @@ async fn handle_run_command(
                 provider_was_explicit,
                 max_tokens,
                 limits,
-                &output,
+                output,
                 stream,
                 stream_policy.clone(),
                 merged_provider_params,
@@ -6818,7 +7296,7 @@ async fn run_agent(
     provider_was_explicit: bool,
     max_tokens: u32,
     limits: BudgetLimits,
-    output: &str,
+    output: CliOutputSelection,
     stream: bool,
     stream_policy: Option<stream_renderer::StreamRenderPolicy>,
     provider_params: Option<serde_json::Value>,
@@ -7291,64 +7769,11 @@ async fn run_agent(
 
         // Output the result
         match result {
-            CliRuntimeTurnResult::Completed(result) => match output {
-                "json" => {
-                    let json = serde_json::json!({
-                        "text": result.text,
-                        "session_id": result.session_id.to_string(),
-                        "session_ref": format_session_ref(&scope.locator.realm, &result.session_id),
-                        "turns": result.turns,
-                        "tool_calls": result.tool_calls,
-                        "usage": {
-                            "input_tokens": result.usage.input_tokens,
-                            "output_tokens": result.usage.output_tokens,
-                        },
-                        "structured_output": result.structured_output,
-                        "extraction_error": result.extraction_error,
-                        "schema_warnings": result.schema_warnings,
-                        "skill_diagnostics": result.skill_diagnostics,
-                    });
-                    println!("{}", serde_json::to_string_pretty(&json)?);
-                }
-                _ => {
-                    // If we already streamed the output, don't print it again
-                    if !stream {
-                        println!("{}", result.text);
-                    }
-                    eprintln!(
-                        "\n[Session: {} | Turns: {} | Tokens: {} in / {} out]",
-                        short_session_id(&result.session_id),
-                        result.turns,
-                        result.usage.input_tokens,
-                        result.usage.output_tokens
-                    );
-                    if let Some(warnings) = &result.schema_warnings
-                        && !warnings.is_empty()
-                    {
-                        eprintln!("\n[Schema warnings]");
-                        for warning in warnings {
-                            eprintln!(
-                                "- {:?} {}: {}",
-                                warning.provider, warning.path, warning.message
-                            );
-                        }
-                    }
-                    if let Some(diag) = &result.skill_diagnostics
-                        && diag.source_health.state
-                            != meerkat_core::skills::SourceHealthState::Healthy
-                    {
-                        eprintln!(
-                            "\n[Skill source health: {:?} | invalid_ratio: {:.3} | streak: {} | quarantined: {}]",
-                            diag.source_health.state,
-                            diag.source_health.invalid_ratio,
-                            diag.source_health.failure_streak,
-                            diag.quarantined.len()
-                        );
-                    }
-                }
-            },
+            CliRuntimeTurnResult::Completed(result) => {
+                print_completed_run_result(result, &output, stream, scope, false).await?;
+            }
             CliRuntimeTurnResult::CallbackPending(pending) => {
-                print_cli_callback_pending(&pending, Some(output))?;
+                print_cli_callback_pending(&pending, Some(output.format.as_str()))?;
             }
         }
 
@@ -7373,7 +7798,7 @@ async fn resume_session(
     app_context: Option<String>,
     max_duration: Option<String>,
     max_tool_calls: Option<usize>,
-    output: String,
+    output: CliOutputSelection,
     params: Vec<String>,
     provider_params_json: Option<String>,
     no_web_search: bool,
@@ -7448,7 +7873,7 @@ async fn resume_session_with_llm_override(
     app_context: Option<String>,
     max_duration: Option<String>,
     max_tool_calls: Option<usize>,
-    output: String,
+    output: CliOutputSelection,
     params: Vec<String>,
     provider_params_json: Option<String>,
     no_web_search: bool,
@@ -7517,13 +7942,12 @@ async fn resume_session_with_llm_override(
         log_stage("begin");
 
         log_stage("load_config");
-        let (config, _config_base_dir) = load_config(scope).await?;
+        let (config, config_base_dir) = load_config(scope).await?;
         let (config, runtime_preload_skills) = resolve_runtime_skills(config, skills).await?;
         let has_max_duration = max_duration.is_some();
         let has_max_tool_calls = max_tool_calls.is_some();
         let duration = max_duration.map(|s| parse_duration(&s)).transpose()?;
-        let json_output = output.eq_ignore_ascii_case("json");
-        let stream = resolve_stream_enabled(stream, no_stream, !json_output)?;
+        let stream = resolve_stream_enabled(stream, no_stream, output.format.streams_by_default())?;
         let parsed_params = parse_provider_params(&params)?;
         let parsed_params_json = parse_provider_params_json(provider_params_json)?;
         let mut merged_provider_params = merge_provider_params(parsed_params, parsed_params_json)?;
@@ -7536,6 +7960,12 @@ async fn resume_session_with_llm_override(
             .map(serde_json::from_str)
             .transpose()
             .map_err(|e| anyhow::anyhow!("Invalid --app-context JSON: {e}"))?;
+        let html_output_request =
+            resolve_html_output_request(&output, &config, &config_base_dir).await?;
+        let mut prompt = prompt.to_string();
+        if let Some(request) = &html_output_request {
+            append_html_output_instruction(&mut prompt, request);
+        }
         let stdin_events = matches!(stdin, StdinMode::Lines);
 
         // Resolve session identifier (full UUID, short prefix, or relative alias).
@@ -7810,7 +8240,7 @@ async fn resume_session_with_llm_override(
             let create_result = service
                 .create_session(CreateSessionRequest {
                     model,
-                    prompt: prompt.to_string().into(),
+                    prompt: prompt.clone().into(),
                     render_metadata: None,
                     system_prompt,
                     max_tokens,
@@ -7876,7 +8306,7 @@ async fn resume_session_with_llm_override(
                     .collect::<Vec<_>>()
             });
             let input = meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
-                prompt.to_string(),
+                prompt.clone(),
                 Some(
                     meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
                         keep_alive: None,
@@ -7962,41 +8392,11 @@ async fn resume_session_with_llm_override(
         // Output the result
         log_stage("print_result");
         match result {
-            CliRuntimeTurnResult::Completed(result) => match output.as_str() {
-                "json" => {
-                    let json = serde_json::json!({
-                        "text": result.text,
-                        "session_id": result.session_id.to_string(),
-                        "session_ref": format_session_ref(&scope.locator.realm, &result.session_id),
-                        "turns": result.turns,
-                        "tool_calls": result.tool_calls,
-                        "usage": {
-                            "input_tokens": result.usage.input_tokens,
-                            "output_tokens": result.usage.output_tokens,
-                        },
-                        "structured_output": result.structured_output,
-                        "extraction_error": result.extraction_error,
-                        "schema_warnings": result.schema_warnings,
-                        "skill_diagnostics": result.skill_diagnostics,
-                    });
-                    println!("{}", serde_json::to_string_pretty(&json)?);
-                }
-                _ => {
-                    if !stream {
-                        println!("{}", result.text);
-                    }
-                    eprintln!(
-                        "\n[Session: {} | Ref: {} | Turns: {} | Tokens: {} in / {} out]",
-                        result.session_id,
-                        format_session_ref(&scope.locator.realm, &result.session_id),
-                        result.turns,
-                        result.usage.input_tokens,
-                        result.usage.output_tokens
-                    );
-                }
-            },
+            CliRuntimeTurnResult::Completed(result) => {
+                print_completed_run_result(result, &output, stream, scope, true).await?;
+            }
             CliRuntimeTurnResult::CallbackPending(pending) => {
-                print_cli_callback_pending(&pending, Some(&output))?;
+                print_cli_callback_pending(&pending, Some(output.format.as_str()))?;
             }
         }
         log_stage("done");
@@ -13251,8 +13651,13 @@ default_model = "gemma"
             None,
             None,
             None,
-            "text".to_string(),
+            CliOutputFormat::Text,
             false,
+            false,
+            false,
+            false,
+            None,
+            None,
             false,
             true,
             false,
@@ -13371,6 +13776,156 @@ default_model = "gemma"
         assert!(!resolve_stream_enabled(false, false, false).expect("json default"));
         assert!(resolve_stream_enabled(true, false, false).expect("explicit stream"));
         assert!(!resolve_stream_enabled(false, true, true).expect("explicit no-stream"));
+    }
+
+    #[test]
+    fn test_resolve_html_output_selection_aliases_and_conflicts() {
+        let html = resolve_cli_output_selection(
+            CliOutputFormat::Text,
+            false,
+            true,
+            false,
+            false,
+            Some("review".to_string()),
+            None,
+        )
+        .expect("html alias should resolve");
+        assert_eq!(html.format, CliOutputFormat::Html);
+        assert_eq!(html.html_template.as_deref(), Some("review"));
+        assert!(!html.open_in_browser);
+
+        let browser = resolve_cli_output_selection(
+            CliOutputFormat::Text,
+            false,
+            false,
+            true,
+            false,
+            None,
+            None,
+        )
+        .expect("browser alias should resolve");
+        assert_eq!(browser.format, CliOutputFormat::Html);
+        assert!(browser.open_in_browser);
+
+        let conflict = resolve_cli_output_selection(
+            CliOutputFormat::Json,
+            false,
+            true,
+            false,
+            false,
+            None,
+            None,
+        )
+        .expect_err("html and json output must conflict");
+        assert!(conflict.to_string().contains("--html"));
+    }
+
+    #[test]
+    fn test_normalize_html_document_strips_common_markdown_fence() {
+        let normalized =
+            normalize_html_document("```html\n<!doctype html><html><body>ok</body></html>\n```")
+                .expect("fenced html should normalize");
+        assert!(normalized.starts_with("<!doctype html>"));
+        assert!(normalize_html_document("plain text").is_err());
+    }
+
+    #[test]
+    fn test_html_presentation_config_parses_template_aliases() {
+        let config: Config = toml::from_str(
+            r#"
+            [presentation.html]
+            default_template = "dense"
+
+            [presentation.html.templates.dense]
+            body = "Render this as a dense technical artifact."
+            "#,
+        )
+        .expect("presentation config should parse");
+
+        assert_eq!(config.presentation.html.default_template, "dense");
+        assert_eq!(
+            config
+                .presentation
+                .html
+                .templates
+                .get("dense")
+                .and_then(|template| template.body.as_deref()),
+            Some("Render this as a dense technical artifact.")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_write_html_output_artifact_uses_realm_presentation_dir() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let scope = test_scope(temp.path().join("state"), "html-realm");
+        let result = RunResult {
+            text: "<!doctype html><html><body>artifact</body></html>".to_string(),
+            session_id: SessionId::new(),
+            usage: Usage::default(),
+            turns: 1,
+            tool_calls: 0,
+            terminal_cause_kind: None,
+            structured_output: None,
+            extraction_error: None,
+            schema_warnings: None,
+            skill_diagnostics: None,
+        };
+
+        let path = write_html_output_artifact(&scope, &result)
+            .await
+            .expect("artifact should write");
+        assert_eq!(path.extension().and_then(|ext| ext.to_str()), Some("html"));
+        assert!(path.to_string_lossy().contains("presentation/html"));
+        let saved = tokio::fs::read_to_string(path)
+            .await
+            .expect("artifact should be readable");
+        assert!(saved.contains("artifact"));
+    }
+
+    #[tokio::test]
+    async fn test_write_html_output_artifact_uses_unique_paths() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let scope = test_scope(temp.path().join("state"), "html-realm");
+        let result = RunResult {
+            text: "<!doctype html><html><body>artifact</body></html>".to_string(),
+            session_id: SessionId::new(),
+            usage: Usage::default(),
+            turns: 1,
+            tool_calls: 0,
+            terminal_cause_kind: None,
+            structured_output: None,
+            extraction_error: None,
+            schema_warnings: None,
+            skill_diagnostics: None,
+        };
+
+        let first = write_html_output_artifact(&scope, &result)
+            .await
+            .expect("first artifact should write");
+        let second = write_html_output_artifact(&scope, &result)
+            .await
+            .expect("second artifact should write");
+
+        assert_ne!(first, second);
+        assert!(tokio::fs::try_exists(first).await.expect("first exists"));
+        assert!(tokio::fs::try_exists(second).await.expect("second exists"));
+    }
+
+    #[test]
+    fn test_file_url_for_path_uses_platform_file_url() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("artifact with spaces.html");
+        std::fs::write(&path, "<!doctype html><html></html>").expect("write file");
+
+        let file_url = file_url_for_path(&path).expect("file URL should convert");
+        let parsed = url::Url::parse(&file_url).expect("file URL should parse");
+
+        assert_eq!(parsed.scheme(), "file");
+        assert!(file_url.contains("artifact%20with%20spaces.html"));
+        assert_eq!(
+            parsed.to_file_path().expect("file URL should map to path"),
+            std::fs::canonicalize(path).expect("path should canonicalize")
+        );
     }
 
     #[tokio::test]
@@ -13546,6 +14101,38 @@ default_model = "gemma"
                 assert!(matches!(line_format, LineFormat::Json));
                 assert_eq!(allow_tools, vec!["search"]);
                 assert_eq!(block_tools, vec!["shell"]);
+            }
+            _ => unreachable!("expected run command"),
+        }
+    }
+
+    #[test]
+    fn test_run_cli_surface_parses_html_flags() {
+        let cli = Cli::try_parse_from([
+            "rkat",
+            "run",
+            "explain the architecture",
+            "--output",
+            "html",
+            "--open-in-browser",
+            "--html-template-file",
+            "./report-template.md",
+        ])
+        .expect("run html flags should parse");
+
+        match cli.command {
+            Commands::Run {
+                output,
+                open_in_browser,
+                html_template_file,
+                ..
+            } => {
+                assert_eq!(output, CliOutputFormat::Html);
+                assert!(open_in_browser);
+                assert_eq!(
+                    html_template_file.as_deref(),
+                    Some(Path::new("./report-template.md"))
+                );
             }
             _ => unreachable!("expected run command"),
         }
