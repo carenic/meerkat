@@ -825,6 +825,69 @@ impl OpenAiClient {
         }
     }
 
+    fn openai_streamed_image_error_message(
+        event_type: &str,
+        error: Option<&Value>,
+        response: Option<&Value>,
+    ) -> String {
+        let error = error
+            .or_else(|| response.and_then(|value| value.get("error")))
+            .or_else(|| response.and_then(|value| value.get("last_error")));
+        let code = error
+            .and_then(|value| {
+                value
+                    .get("code")
+                    .or_else(|| value.get("type"))
+                    .and_then(Value::as_str)
+            })
+            .unwrap_or("unknown");
+        let message = error
+            .and_then(|value| value.get("message").and_then(Value::as_str))
+            .unwrap_or("unknown streaming error");
+        format!("OpenAI streamed image response {event_type}: {code}: {message}")
+    }
+
+    fn openai_streamed_image_failure_output(
+        request: ProviderImageGenerationRequest,
+        event_type: &str,
+        response: Option<Value>,
+        error: Option<Value>,
+    ) -> ProviderImageGenerationOutput {
+        let terminal = response
+            .as_ref()
+            .and_then(Self::openai_structured_error_terminal)
+            .or_else(|| {
+                error
+                    .as_ref()
+                    .and_then(Self::openai_structured_error_terminal)
+            })
+            .unwrap_or(ImageOperationTerminalClass::Failed);
+        let response_id = response
+            .as_ref()
+            .and_then(|value| value.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let message = Self::openai_streamed_image_error_message(
+            event_type,
+            error.as_ref(),
+            response.as_ref(),
+        );
+
+        ProviderImageGenerationOutput {
+            operation_id: request.operation_id,
+            terminal,
+            images: Vec::new(),
+            provider_text: None,
+            revised_prompt: RevisedPromptDisposition::NotRequested,
+            native_metadata: ProviderImageMetadata::OpenAi(OpenAiImageMetadata {
+                target_model: request.model,
+                response_id,
+                image_generation_call_id: None,
+            }),
+            warnings: vec![ImageGenerationWarning::ProviderExecutionFailed { message }],
+        }
+    }
+
     async fn post_json_to_openai(
         &self,
         endpoint: &str,
@@ -1160,6 +1223,14 @@ impl OpenAiClient {
                 let Some(event) = parsed_event else {
                     continue;
                 };
+                if matches!(event.event_type.as_str(), "error" | "response.error") {
+                    return Ok(Self::openai_streamed_image_failure_output(
+                        request,
+                        &event.event_type,
+                        event.response,
+                        event.error,
+                    ));
+                }
                 if matches!(
                     event.event_type.as_str(),
                     "response.output_item.added" | "response.output_item.done"
@@ -1183,26 +1254,12 @@ impl OpenAiClient {
                     }
                 }
                 if event.event_type == "response.failed" {
-                    let value = event.response.unwrap_or_else(|| serde_json::json!({}));
-                    return Ok(ProviderImageGenerationOutput {
-                        operation_id: request.operation_id,
-                        terminal: Self::openai_structured_error_terminal(&value)
-                            .unwrap_or(ImageOperationTerminalClass::Failed),
-                        images: Vec::new(),
-                        provider_text: None,
-                        revised_prompt: RevisedPromptDisposition::NotRequested,
-                        native_metadata: ProviderImageMetadata::OpenAi(OpenAiImageMetadata {
-                            target_model: request.model,
-                            response_id: value
-                                .get("id")
-                                .and_then(Value::as_str)
-                                .map(str::to_string),
-                            image_generation_call_id: None,
-                        }),
-                        warnings: vec![ImageGenerationWarning::ProviderExecutionFailed {
-                            message: format!("OpenAI streamed image response failed: {value}"),
-                        }],
-                    });
+                    return Ok(Self::openai_streamed_image_failure_output(
+                        request,
+                        &event.event_type,
+                        event.response,
+                        event.error,
+                    ));
                 }
                 if event.event_type == "response.completed" {
                     let mut value = event.response.ok_or_else(|| LlmError::StreamParseError {
@@ -2660,6 +2717,64 @@ mod tests {
         assert_eq!(body["tool_choice"], "required");
 
         handle.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chatgpt_backend_hosted_image_executor_surfaces_stream_error_events()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let cases = [
+            (
+                "error event",
+                r#"data: {"type":"error","error":{"code":"rate_limit_exceeded","message":"too many images"}}"#,
+                None,
+                "rate_limit_exceeded",
+                "too many images",
+            ),
+            (
+                "response.error event",
+                r#"data: {"type":"response.error","response":{"id":"resp_error","error":{"code":"invalid_request_error","message":"bad image request"}}}"#,
+                Some("resp_error"),
+                "invalid_request_error",
+                "bad image request",
+            ),
+        ];
+
+        for (name, event, expected_response_id, expected_code, expected_message) in cases {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let payload = [event, "data: [DONE]", ""].join("\n");
+            let (base_url, handle) = spawn_chatgpt_stub_server(payload, seen).await;
+            let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url)
+                .with_chatgpt_backend_wire();
+
+            let output = client
+                .execute_image_generation(image_executor_request_json(hosted_openai_plan_json()))
+                .await
+                .unwrap_or_else(|err| {
+                    panic!("{name} should return provider failure output: {err}")
+                });
+
+            assert!(matches!(
+                output.terminal,
+                ImageOperationTerminalClass::Failed
+            ));
+            assert!(output.images.is_empty());
+            assert!(matches!(
+                output.native_metadata,
+                ProviderImageMetadata::OpenAi(OpenAiImageMetadata {
+                    response_id,
+                    ..
+                }) if response_id.as_deref() == expected_response_id
+            ));
+            assert!(matches!(
+                output.warnings.as_slice(),
+                [ImageGenerationWarning::ProviderExecutionFailed { message }]
+                    if message.contains(expected_code) && message.contains(expected_message)
+            ));
+
+            handle.abort();
+        }
+
         Ok(())
     }
 
