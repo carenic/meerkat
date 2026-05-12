@@ -127,7 +127,29 @@ right abstraction for the caller.
 require it in the type. If a path cannot supply it, that path cannot expose the
 contract.
 
-### 5. Surfaces Are Thin Over The Shared Runtime
+### 5. Composability Is Feature-Owned
+
+Meerkat is composable. Optional capabilities must live at their owning feature
+boundary.
+
+If a scheduler feature has skills, hooks, tools, manifests, routes, schemas,
+migrations, fixtures, policy, docs, generated artifacts, or public affordances,
+those assets belong to the scheduler crate or package. They do not belong in a
+global `meerkat-core` package, global skills bundle, surface crate, or
+convenience registry because that is easier to discover.
+
+Global registries, catalogs, manifests, bundles, SDK indexes, and product
+surfaces may aggregate optional features only as mechanical projections of
+feature-owned declarations. They must not become the semantic home for the
+feature.
+
+Core crates may define stable extension seams, shared traits, and common
+vocabulary. They must not absorb optional feature semantics, assets, policy,
+docs, tests, or generated files. A feature that cannot be enabled, disabled,
+tested, versioned, or removed with its owning package is not actually
+composable.
+
+### 6. Surfaces Are Thin Over The Shared Runtime
 
 CLI, REST, RPC, MCP, SDKs, WASM, browser hosts, examples, and product binaries
 are skins over shared runtime or explicit standalone substrates.
@@ -156,7 +178,7 @@ limits, not secret substitutes for the product runtime.
 User-facing syntax may be kinder than internal machinery. Its lowering must
 still route through the canonical owner.
 
-### 6. Providers and Policy Stay Behind Their Owning Seams
+### 7. Providers and Policy Stay Behind Their Owning Seams
 
 Meerkat is provider-agnostic at the session, runtime, tool, memory, mob, and
 surface model level.
@@ -187,7 +209,7 @@ Dynamic policy must follow dynamic identity. If model, provider, auth binding,
 session, realm, or owner identity changes, derived policy must be recomputed at
 the owning seam.
 
-### 7. Terminality and Faults Are Explicit
+### 8. Terminality and Faults Are Explicit
 
 The same semantic condition must have one canonical terminal path.
 
@@ -219,7 +241,7 @@ Faults that affect semantics must be modeled or fail closed. This includes:
 If the system cannot explain what happened, who owns the consequence, and what
 the caller may trust, the design is not complete.
 
-### 8. Contracts, Crates, and Generation Are Ratchets
+### 9. Contracts, Crates, and Generation Are Ratchets
 
 Public contracts must be derived from the authority path. Legacy compatibility
 fields and shapes may exist only as temporary compatibility mirrors with an
@@ -252,6 +274,9 @@ Crate boundaries are authority boundaries:
 - provider crates own provider-native mechanics, not shared semantics.
 - surface crates own transport and UX, not meaning.
 - facade crates compose; they do not hide new authorities.
+- optional feature crates own their feature-local skills, tools, hooks,
+  manifests, docs, routes, schemas, migrations, fixtures, generated artifacts,
+  and policy extensions.
 
 Every feature must shrink ambiguity. Adding a type, manifest field, machine,
 helper, SDK parser, compatibility flag, or generated file while leaving the old
@@ -273,6 +298,10 @@ Reject these during review:
 - success responses after hidden failure
 - unbounded queues or dropped observations with semantic consequences
 - generated contracts that do not govern production behavior
+- optional feature assets placed in global core, surface, or skills packages
+  instead of the owning feature crate/package
+- global registries that hand-author optional feature truth instead of
+  discovering feature-owned declarations
 - compatibility mirrors introduced without Highest Dogma Authority approval
 - compatibility mirrors without date or version expiry
 - compatibility paths that can still affect meaning
@@ -288,5 +317,7 @@ For every important behavior, answer:
   handoff protocol carries it?
 - What happens on failure?
 - Which surfaces merely project it?
+- Which crate or package owns the optional feature bundle, and which globals
+  merely discover it?
 
 If any answer is "sort of", the design is wrong.

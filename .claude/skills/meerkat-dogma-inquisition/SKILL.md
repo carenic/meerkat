@@ -83,6 +83,9 @@ Call out repeated antipatterns explicitly:
   local map affects behavior as if authoritative.
 - **Immortal Mirror**: compatibility shape lacks Highest Dogma Authority
   approval, expiry, drift test, or non-authority proof.
+- **Feature Scattering**: optional feature skills, hooks, tools, routes,
+  schemas, fixtures, docs, generated artifacts, or policy live in global/core
+  packages instead of the owning feature crate/package.
 - **Surface Priesthood**: CLI, RPC, REST, MCP, SDK, WASM, browser, or example
   code fabricates handles, statuses, defaults, terminality, or lifecycle.
 - **Provider Leakage**: provider-native mechanics escape provider crates or
@@ -104,10 +107,11 @@ Use the primary rule names in findings:
 2. `Generated Machines Own Canonical Change`
 3. `Shells, Stores, and Projections Are Mechanical`
 4. `Truth Is Typed, Identity Is Canonical`
-5. `Surfaces Are Thin Over The Shared Runtime`
-6. `Providers and Policy Stay Behind Their Owning Seams`
-7. `Terminality and Faults Are Explicit`
-8. `Contracts, Crates, and Generation Are Ratchets`
+5. `Composability Is Feature-Owned`
+6. `Surfaces Are Thin Over The Shared Runtime`
+7. `Providers and Policy Stay Behind Their Owning Seams`
+8. `Terminality and Faults Are Explicit`
+9. `Contracts, Crates, and Generation Are Ratchets`
 
 When symptoms span rules, group by the deepest missing owner or seam. Prefer one
 root diagnosis with multiple evidence rows over scattered surface complaints.

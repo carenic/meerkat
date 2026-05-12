@@ -63,6 +63,7 @@ Common tensions have standard resolutions:
 | Provider has a native concept; runtime wants provider agnosticism | Branch on provider strings in shared runtime | Add a typed provider-extension seam or keep the concept inside the provider crate |
 | Read performance wants denormalization; authority wants one source of truth | Let the index become fallback truth | Define the index as a projection with source, rebuild trigger, staleness rule, and non-authority boundary |
 | Old clients need a field; dogma forbids mirrors | Keep the legacy field forever | Add a temporary compatibility mirror with approval, expiry, drift test, and no behavior influence |
+| Optional feature wants shared discovery | Put feature skills, hooks, routes, and schemas in a global package | Keep assets in the owning feature crate/package; let globals mechanically discover declarations |
 | A task failed after emitting partial evidence; caller expects success | Return success and log the failure | Model or surface the partial failure truth through the canonical terminal path |
 | A shell can observe something the machine cannot | Let the shell update semantic state | Convert the observation into a typed input or declare the machine incomplete |
 
@@ -263,19 +264,22 @@ persistence guarantees; the machine owns meaning.
 Rule 1 and Rule 4: ownership must be typed. A convention, string prefix,
 optional field, path shape, or provider-native name is not an owner.
 
-Rule 1 and Rule 5: surfaces may be friendly, but they must not become clever.
+Rule 1 and Rule 5: optional features own their own assets. A global bundle that
+hosts feature truth is a second owner.
+
+Rule 1 and Rule 6: surfaces may be friendly, but they must not become clever.
 User syntax can differ from internal machinery only if lowering returns to the
 canonical owner.
 
-Rule 1 and Rule 6: provider-specific crates may own provider-native
+Rule 1 and Rule 7: provider-specific crates may own provider-native
 translation. They do not own Meerkat semantics. Shared runtime receives typed
 facts, not provider folklore.
 
-Rule 1 and Rule 7: terminality is where split authority becomes most dangerous.
+Rule 1 and Rule 8: terminality is where split authority becomes most dangerous.
 A timeout, dropped stream, cancelled task, provider error, or failed tool must
 lower into one terminal authority.
 
-Rule 1 and Rule 8: generated artifacts must constrain the real authority path.
+Rule 1 and Rule 9: generated artifacts must constrain the real authority path.
 A generated schema that describes one truth while production follows another is
 documentation theater.
 
@@ -506,11 +510,11 @@ Rule 2 and Rule 4: a generated machine input is only authoritative if it
 carries typed truth. String classifiers and optional owner context smuggle
 handwritten semantics back into the path.
 
-Rule 2 and Rule 7: terminal classifiers must be generated or machine-derived.
+Rule 2 and Rule 8: terminal classifiers must be generated or machine-derived.
 Fault evidence may come from shell code, but fault meaning belongs to the
 machine or protocol.
 
-Rule 2 and Rule 8: if the generated machine does not govern the production
+Rule 2 and Rule 9: if the generated machine does not govern the production
 transition, fix production or fix generation. Do not preserve a hand-authored
 mirror and call it compatibility.
 
@@ -684,13 +688,16 @@ Rule 3 and Rule 2: stores persist and restore machine-owned truth only through
 declared machine, snapshot, journal, or migrator contracts. Storage durability
 is not transition authority.
 
-Rule 3 and Rule 5: surface-local request maps, SDK shadows, browser caches, and
+Rule 3 and Rule 5: global feature registries and indexes are projections of
+feature-owned declarations. They do not own optional capability truth.
+
+Rule 3 and Rule 6: surface-local request maps, SDK shadows, browser caches, and
 CLI state must remain private mechanics.
 
-Rule 3 and Rule 7: stale indexes, dropped waiters, missing receipts, and
+Rule 3 and Rule 8: stale indexes, dropped waiters, missing receipts, and
 recovery guesses must not become terminal outcomes.
 
-Rule 3 and Rule 8: generated or not, an artifact constrains production truth
+Rule 3 and Rule 9: generated or not, an artifact constrains production truth
 only if it is the authority path. Otherwise it is a projection, and projections
 must stay in their lane.
 
@@ -933,16 +940,20 @@ They may not make canonical state changes because they have a nice enum.
 Rule 4 and Rule 3: a projection should be typed, but typing does not let it
 decide behavior.
 
-Rule 4 and Rule 5: friendly names are allowed only as projections over
+Rule 4 and Rule 5: optional feature names, capability ids, skill ids, hook ids,
+and route ids must be typed. Global strings are where composability hides
+collisions.
+
+Rule 4 and Rule 6: friendly names are allowed only as projections over
 canonical handles. UX sugar must resolve through the owner.
 
-Rule 4 and Rule 6: provider-native fields must become typed provider-owned
+Rule 4 and Rule 7: provider-native fields must become typed provider-owned
 facts before shared code sees them.
 
-Rule 4 and Rule 7: error strings are especially tempting folklore. Do not parse
+Rule 4 and Rule 8: error strings are especially tempting folklore. Do not parse
 terminality out of text.
 
-Rule 4 and Rule 8: generated contracts must preserve domain types. Flattening
+Rule 4 and Rule 9: generated contracts must preserve domain types. Flattening
 `SkillKey` into `"source/name"` or policy enums into nullable strings
 reintroduces folklore at the boundary.
 
@@ -954,7 +965,213 @@ reintroduces folklore at the boundary.
 - `None` is not a policy.
 - Provenance that cannot be checked is decoration.
 
-## Chapter 5: Surfaces Are Thin Over The Shared Runtime
+## Chapter 5: Composability Is Feature-Owned
+
+### Thesis
+
+Meerkat is built from composable capabilities, not from a monolith with a bag
+of optional decorations.
+
+An optional feature owns more than its Rust functions. It owns the feature's
+skills, tools, hooks, manifests, routes, schemas, docs fragments, migrations,
+fixtures, policy extensions, generated artifacts, and public affordances. Those
+assets are part of the feature's semantic boundary.
+
+If a capability can be enabled by Cargo feature, runtime module, product
+edition, mobpack, plugin, provider, or host environment, then the capability's
+assets must travel with the owning crate or package. Global packages may
+discover the feature. They may not become the place where the feature secretly
+lives.
+
+This rule exists because Meerkat is meant to be recomposed. A feature that
+leaves skills in core, schemas in a surface, docs in a global package, and
+policy in a side registry is not composable. It is scattered.
+
+### What The Rule Forbids
+
+Rule 5 forbids global-package gravity.
+
+It forbids:
+
+- optional feature skills placed in a global `meerkat-core` or global skills
+  package
+- feature-specific hooks, tools, fixtures, routes, or schemas owned by a
+  surface crate because that surface exposed them first
+- global manifests hand-authoring feature truth instead of discovering
+  feature-owned declarations
+- SDK indexes, MCP catalogs, CLI help, REST route tables, or product manifests
+  becoming the source of truth for optional capability availability
+- optional feature docs that describe behavior not shipped, tested, or versioned
+  with the feature
+- core crates absorbing feature policy because the feature needs a shared
+  vocabulary
+- generated files for an optional feature emitted into a global location with
+  no owner, freshness rule, or feature-gated drift test
+- tests and fixtures for optional behavior living outside the owning feature so
+  the feature can be removed while its expectations remain
+
+Core may define extension seams. Core may define common trait vocabulary,
+domain handles, base event shapes, and discovery protocols. Core must not host
+the feature's semantics merely because many surfaces need to find them.
+
+### Violation Examples
+
+#### Scheduler Skill Hidden In Core
+
+An optional scheduler feature ships its Codex/Claude skill, hook manifest,
+wire route declarations, fixtures, and policy knobs by adding them to a global
+`meerkat-core` skills package because global discovery already scans there.
+
+The scheduler has lost composition ownership. Installing core now smuggles in
+scheduler semantics, disabling scheduler leaves stale assets behind, and future
+features will copy the same global dumping ground.
+
+Correct shape: the scheduler crate/package owns the scheduler skill, hook and
+tool declarations, schemas, docs fragments, fixtures, migrations, and policy
+extension points. The global skills package or platform registry discovers the
+scheduler-owned declaration mechanically when the scheduler feature is present.
+Without the scheduler feature, those assets do not exist.
+
+#### CLI Route Table Owns Mobpack Feature Truth
+
+A CLI command table hand-lists routes and help text for optional mobpack
+features. The mobpack crate has a different manifest, and the REST surface has
+a third copy.
+
+The optional feature now has three owners: CLI, REST, and mobpack.
+
+Correct shape: mobpack owns a typed feature declaration. CLI, REST, MCP, SDKs,
+and docs consume generated or checked projections from that declaration.
+
+#### SDK Package Ships Disabled Feature Types
+
+The TypeScript SDK exposes scheduler-specific methods and generated types even
+when the scheduler capability is not present in the runtime build. Calls fail
+late or silently degrade.
+
+The SDK has made an optional capability look universal.
+
+Correct shape: SDK capability surfaces are generated from feature-owned
+declarations and runtime capability negotiation. Absent feature means absent or
+explicitly unavailable API, not optimistic universal syntax.
+
+#### Provider Feature Assets In Shared Runtime
+
+An optional provider extension contributes prompt templates, native tool
+schemas, auth policy, fixtures, and docs by editing shared runtime files.
+
+The provider extension cannot be removed cleanly, and shared runtime now knows
+provider-native semantics.
+
+Correct shape: provider extension assets live in the provider or feature crate.
+Shared runtime sees only typed extension seams and mechanically discovered
+capability declarations.
+
+### Correct Solution Shapes
+
+Use feature-owned declarations:
+
+```text
+feature crate/package -> feature manifest/declaration -> generated or checked projections -> surfaces/runtime discovery
+```
+
+The feature declaration should name:
+
+- capability id and version
+- owning crate or package
+- exposed skills, tools, hooks, routes, schemas, docs fragments, fixtures, and
+  generated artifacts
+- required extension seams and feature flags
+- availability conditions
+- policy extension points
+- drift tests and generation commands
+
+Global registries should be projections:
+
+```text
+feature-owned declarations -> registry generator -> checked global index
+```
+
+The global index may make discovery fast. It must be rebuildable, checked for
+freshness, and unable to invent feature semantics.
+
+Product bundles may assemble features:
+
+```text
+product profile -> selected feature packages -> generated capability manifest -> surfaces
+```
+
+The product profile chooses what to include. It does not move ownership out of
+the feature package.
+
+When a feature needs shared abstractions, split vocabulary from ownership.
+Core may define `SchedulerCapability`, a discovery trait, or a typed route
+shape. The scheduler crate owns scheduler behavior, skills, schemas, docs,
+fixtures, and policy. Shared vocabulary is the socket, not the appliance.
+
+Tests must follow the same boundary. Feature tests, smoke fixtures, and e2e
+expectations that assert feature semantics live with the feature or are
+generated from feature-owned declarations. Cross-feature integration tests may
+compose feature packages, but they do not become the owner of either feature.
+
+### Review Questions
+
+- Is this capability optional by feature flag, package, runtime module,
+  provider, product profile, plugin, or host environment?
+- Which crate or package owns the capability?
+- Are every skill, hook, tool, route, schema, fixture, migration, doc fragment,
+  generated file, and policy extension owned there?
+- Is any global package hosting feature assets instead of projecting them?
+- Is any surface declaring feature availability from local tables?
+- Can the feature be enabled, disabled, versioned, tested, and removed with its
+  owning package?
+- If a global registry exists, what generator or drift test proves it is a
+  projection?
+- Does the SDK expose feature-specific APIs only when the feature is present or
+  explicitly negotiated?
+- Is shared core defining vocabulary, or has it absorbed feature semantics?
+- Would deleting the feature crate leave stale skills, docs, schemas, tests, or
+  policy behind?
+
+### Tension Notes
+
+Rule 5 and Rule 1: composability is ownership applied to packages. If a
+feature's assets live elsewhere, ownership has split.
+
+Rule 5 and Rule 2: generated machine inputs and feature-owned declarations must
+agree. Do not hand-author a global feature manifest beside generated machine
+truth.
+
+Rule 5 and Rule 3: global registries are projections. They may speed discovery;
+they may not decide feature availability from stale or local state.
+
+Rule 5 and Rule 4: capability ids, feature ids, skill ids, hook ids, and route
+ids must be typed. Stringly global names create collisions and hidden coupling.
+
+Rule 5 and Rule 6: surfaces may expose a composed product shape. They must not
+move feature ownership into CLI, REST, MCP, SDK, or WASM packages.
+
+Rule 5 and Rule 7: provider-specific optional features still belong behind
+provider or feature seams. Shared runtime receives typed declarations, not
+native provider assets.
+
+Rule 5 and Rule 8: feature-specific faults and terminal outcomes must be
+owned by the feature's machine, handoff protocol, or declared contract, not a
+global dispatcher.
+
+Rule 5 and Rule 9: global indexes, generated catalogs, and product manifests
+must be derived from feature-owned declarations and protected by drift tests.
+
+### Maxims
+
+- Optional feature assets live with the optional feature.
+- Global discovery is allowed; global semantic ownership is not.
+- Core owns seams, not every capability that plugs into them.
+- If disabling a feature leaves its skill behind, the feature was never
+  properly optional.
+- A product bundle composes features; it does not confiscate them.
+
+## Chapter 6: Surfaces Are Thin Over The Shared Runtime
 
 ### Thesis
 
@@ -975,7 +1192,7 @@ missing typed seam. Do not implement the behavior locally.
 
 ### What The Rule Forbids
 
-Rule 5 forbids surface-owned semantic authority.
+Rule 6 forbids surface-owned semantic authority.
 
 It forbids:
 
@@ -1100,30 +1317,33 @@ and generated protocol artifacts must agree.
 
 ### Tension Notes
 
-Rule 5 and Rule 1: a surface may own presentation state, transport state, and
+Rule 6 and Rule 1: a surface may own presentation state, transport state, and
 user interaction flow. It may not own runtime facts.
 
-Rule 5 and Rule 2: a surface may parse raw input and classify protocol
+Rule 6 and Rule 2: a surface may parse raw input and classify protocol
 operations. Meaningful classification must lower into typed machine input,
 composition route, or service contract.
 
-Rule 5 and Rule 3: surface caches, SDK objects, UI state, stream buffers, and
+Rule 6 and Rule 3: surface caches, SDK objects, UI state, stream buffers, and
 list views are projections. They may improve responsiveness. They may not
 decide behavior when stale.
 
-Rule 5 and Rule 4: friendly names are projections over canonical handles. If a
+Rule 6 and Rule 4: friendly names are projections over canonical handles. If a
 CLI alias, SDK object id, MCP parameter, browser key, or REST path segment
 becomes authority, type it and resolve it through the owner.
 
-Rule 5 and Rule 6: surfaces may expose provider selection and provider
+Rule 6 and Rule 5: surfaces may expose composed optional capabilities. They
+must not host feature-owned skills, hooks, routes, schemas, docs, or policy.
+
+Rule 6 and Rule 7: surfaces may expose provider selection and provider
 parameters, but provider meaning belongs behind catalog, profile, provider, and
 auth seams.
 
-Rule 5 and Rule 7: HTTP disconnect, WebSocket close, JSON-RPC cancellation, MCP
+Rule 6 and Rule 8: HTTP disconnect, WebSocket close, JSON-RPC cancellation, MCP
 tool failure, SDK abort, and browser unload must lower into explicit runtime or
 standalone fault semantics.
 
-Rule 5 and Rule 8: generated schemas, SDK types, OpenAPI, RPC catalogs, MCP
+Rule 6 and Rule 9: generated schemas, SDK types, OpenAPI, RPC catalogs, MCP
 tools, and docs must describe the production path, not a parallel surface-local
 interpretation.
 
@@ -1135,7 +1355,7 @@ interpretation.
 - Shared behavior belongs in shared helpers.
 - If CLI, REST, RPC, MCP, SDK, and WASM disagree, at least one is lying.
 
-## Chapter 6: Providers and Policy Stay Behind Their Owning Seams
+## Chapter 7: Providers and Policy Stay Behind Their Owning Seams
 
 ### Thesis
 
@@ -1161,7 +1381,7 @@ owning seams.
 
 ### What The Rule Forbids
 
-Rule 6 forbids provider-specific branches in shared code unless the branch is
+Rule 7 forbids provider-specific branches in shared code unless the branch is
 owned by a typed catalog, profile, or provider seam.
 
 Forbidden patterns include:
@@ -1338,29 +1558,32 @@ unsupported, and unavailable. Plain optionality is not policy.
 
 ### Tension Notes
 
-Rule 6 and Rule 1: provider mechanics may belong to provider crates, but shared
+Rule 7 and Rule 1: provider mechanics may belong to provider crates, but shared
 capability and policy facts belong to catalog/profile/auth/factory seams. Do
 not let both own the same fact.
 
-Rule 6 and Rule 2: auth lifecycle is not a provider callback. Provider
+Rule 7 and Rule 2: auth lifecycle is not a provider callback. Provider
 callbacks produce evidence. `AuthMachine` owns auth state change.
 
-Rule 6 and Rule 3: provider-native forms are projections at the boundary. They
+Rule 7 and Rule 3: provider-native forms are projections at the boundary. They
 may be useful for IO, diagnostics, or interop, but must not seed canonical
 session truth during recovery.
 
-Rule 6 and Rule 4: provider strings, model prefixes, and JSON keys are not
+Rule 7 and Rule 4: provider strings, model prefixes, and JSON keys are not
 enough. Use typed provider identity, model identity, `AuthBindingRef`,
 `ModelProfile`, validated extension payloads, and typed policy overrides.
 
-Rule 6 and Rule 5: surfaces may expose friendly provider syntax. They must
+Rule 7 and Rule 5: optional provider features own their feature-local assets
+behind provider or feature seams.
+
+Rule 7 and Rule 6: surfaces may expose friendly provider syntax. They must
 lower it into shared runtime seams.
 
-Rule 6 and Rule 7: provider failures become typed Meerkat faults. Transport
+Rule 7 and Rule 8: provider failures become typed Meerkat faults. Transport
 timeout, rate limit, auth failure, malformed response, dropped stream, and
 provider cancellation are not interchangeable.
 
-Rule 6 and Rule 8: provider crates are authority boundaries. Dependencies from
+Rule 7 and Rule 9: provider crates are authority boundaries. Dependencies from
 shared runtime or surfaces into provider-specific internals are dogma alarms
 unless explicitly part of a typed seam.
 
@@ -1374,7 +1597,7 @@ unless explicitly part of a typed seam.
 - If a provider branch lives outside its seam, prove the owner or delete the
   branch.
 
-## Chapter 7: Terminality and Faults Are Explicit
+## Chapter 8: Terminality and Faults Are Explicit
 
 ### Thesis
 
@@ -1392,7 +1615,7 @@ and "we logged it, therefore we handled it."
 
 ### What The Rule Forbids
 
-Rule 7 forbids parallel terminal paths. A timeout caught in a provider adapter,
+Rule 8 forbids parallel terminal paths. A timeout caught in a provider adapter,
 agent loop, and SDK transport must not produce three different result classes.
 
 It forbids false success. A run that was cancelled, partially streamed,
@@ -1525,27 +1748,30 @@ cancellation model, and failure routes.
 
 ### Tension Notes
 
-Rule 7 and Rule 1: terminality belongs to the same authority that owns
+Rule 8 and Rule 1: terminality belongs to the same authority that owns
 lifecycle truth. If a helper knows the run is over but the machine does not,
 the helper is attempting to become authority.
 
-Rule 7 and Rule 2: fault handling may require new machine inputs or states. Do
+Rule 8 and Rule 2: fault handling may require new machine inputs or states. Do
 not patch around a missing timeout, cancellation, or partial-output transition
 in handwritten code.
 
-Rule 7 and Rule 3: stores and projections may report replay failure, drift, or
+Rule 8 and Rule 3: stores and projections may report replay failure, drift, or
 staleness. They must not invent recovered truth.
 
-Rule 7 and Rule 4: faults need typed identity. Closed, gone, lagged, cancelled,
+Rule 8 and Rule 4: faults need typed identity. Closed, gone, lagged, cancelled,
 expired, rejected, and failed are not interchangeable strings.
 
-Rule 7 and Rule 5: surfaces may choose how to display a fault. They may not
+Rule 8 and Rule 5: optional features must own their own feature-specific fault
+semantics and fixtures.
+
+Rule 8 and Rule 6: surfaces may choose how to display a fault. They may not
 reclassify it.
 
-Rule 7 and Rule 6: provider-native failures must be translated at the provider
+Rule 8 and Rule 7: provider-native failures must be translated at the provider
 seam into typed Meerkat outcomes.
 
-Rule 7 and Rule 8: public contracts must expose real production fault
+Rule 8 and Rule 9: public contracts must expose real production fault
 semantics. A schema that omits cancellation, partial completion, backpressure
 failure, or version rejection is lying.
 
@@ -1557,7 +1783,7 @@ failure, or version rejection is lying.
 - Cancellation is a transition, not an interruption.
 - Tests may be faster than production; they may not be a different world.
 
-## Chapter 8: Contracts, Crates, and Generation Are Ratchets
+## Chapter 9: Contracts, Crates, and Generation Are Ratchets
 
 ### Thesis
 
@@ -1578,7 +1804,7 @@ drift?
 
 ### What The Rule Forbids
 
-Rule 8 forbids hand-authored semantic mirrors.
+Rule 9 forbids hand-authored semantic mirrors.
 
 A semantic mirror is any duplicated representation of a meaningful fact that
 can drift from its owner: a second status enum, a legacy wire field that still
@@ -1586,7 +1812,7 @@ feeds behavior, a handwritten SDK type that decides defaults differently from
 the server, a documentation table used as a catalog, or a generated schema that
 describes a path production does not actually use.
 
-Rule 8 forbids generated artifacts that merely describe intent. Generated
+Rule 9 forbids generated artifacts that merely describe intent. Generated
 artifacts must constrain production. If OpenAPI, RPC catalogs, SDK types,
 machine specs, generated kernels, formal models, or governance ledgers can go
 stale without failing a test, they are stage props.
@@ -1607,7 +1833,7 @@ Compatibility mirrors are forbidden unless all of these are true:
 Compatibility mirrors are not routine engineering tools. They are rare,
 approved debt with a fuse.
 
-Rule 8 also forbids crate-boundary laundering. Moving code into another crate
+Rule 9 also forbids crate-boundary laundering. Moving code into another crate
 does not make it legitimate. If shared runtime branches on provider folklore,
 the provider seam has leaked. If a surface owns request lifecycle truth, the
 surface has become authority. If `meerkat-core` gains filesystem or network
@@ -1766,25 +1992,28 @@ changes.
 
 ### Tension Notes
 
-Rule 8 and Rule 1: contracts, crate boundaries, generated artifacts, and
+Rule 9 and Rule 1: contracts, crate boundaries, generated artifacts, and
 ledgers must preserve singular ownership.
 
-Rule 8 and Rule 2: it is not enough to generate specs from a machine catalog if
+Rule 9 and Rule 2: it is not enough to generate specs from a machine catalog if
 production executes a separate handwritten body.
 
-Rule 8 and Rule 3: permanent read models are projections. Compatibility mirrors
+Rule 9 and Rule 3: permanent read models are projections. Compatibility mirrors
 are external-client debt with approval and expiry.
 
-Rule 8 and Rule 4: a generated bad contract is still bad. Generation ratchets
+Rule 9 and Rule 4: a generated bad contract is still bad. Generation ratchets
 the chosen model; it does not sanctify the wrong abstraction.
 
-Rule 8 and Rule 5: generated surface schemas must describe shared
+Rule 9 and Rule 5: generated indexes and product manifests for optional
+features must derive from feature-owned declarations.
+
+Rule 9 and Rule 6: generated surface schemas must describe shared
 runtime-backed behavior, not parallel surface-local interpretation.
 
-Rule 8 and Rule 6: when provider portability is impossible, use a typed
+Rule 9 and Rule 7: when provider portability is impossible, use a typed
 provider-extension seam. Do not smuggle native fields into shared logic.
 
-Rule 8 and Rule 7: public error codes, terminal statuses, cancellation results,
+Rule 9 and Rule 8: public error codes, terminal statuses, cancellation results,
 retry classes, and recovery outcomes must be generated from or checked against
 the authority that owns fault semantics.
 
