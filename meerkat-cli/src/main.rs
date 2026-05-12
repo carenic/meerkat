@@ -74,7 +74,6 @@ use meerkat_core::error::AgentError;
 use meerkat_core::mcp_config::{McpScope, McpTransportKind};
 use meerkat_core::types::OutputSchema;
 use meerkat_store::{RealmBackend, RealmOrigin};
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -429,34 +428,40 @@ async fn write_html_output_artifact(
         )
     })?;
     let filename = format!(
-        "{}-{}.html",
+        "{}-{}-{}.html",
         Utc::now().format("%Y%m%dT%H%M%SZ"),
-        short_session_id(&result.session_id)
+        short_session_id(&result.session_id),
+        uuid::Uuid::new_v4().simple()
     );
     let path = dir.join(filename);
-    tokio::fs::write(&path, html)
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to create HTML artifact {}: {e}", path.display()))?;
+    file.write_all(html.as_bytes())
         .await
         .map_err(|e| anyhow::anyhow!("Failed to write HTML artifact {}: {e}", path.display()))?;
     Ok(path)
 }
 
-fn file_url_for_path(path: &Path) -> String {
-    let mut url = String::from("file://");
-    for byte in path.to_string_lossy().as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b'-' | b'_' | b'.' | b'~' => {
-                url.push(*byte as char);
-            }
-            other => {
-                let _ = write!(&mut url, "%{other:02X}");
-            }
-        }
-    }
-    url
+fn file_url_for_path(path: &Path) -> Result<String, String> {
+    let canonical_path = std::fs::canonicalize(path)
+        .map_err(|e| format!("failed to canonicalize {}: {e}", path.display()))?;
+    url::Url::from_file_path(&canonical_path)
+        .map(|url| url.to_string())
+        .map_err(|()| {
+            format!(
+                "failed to convert {} to a file URL",
+                canonical_path.display()
+            )
+        })
 }
 
 fn open_html_artifact_in_browser(path: &Path) -> Result<(), String> {
-    webbrowser::open(&file_url_for_path(path)).map_err(|e| e.to_string())
+    let url = file_url_for_path(path)?;
+    webbrowser::open(&url).map_err(|e| e.to_string())
 }
 
 async fn print_completed_run_result(
@@ -13785,6 +13790,52 @@ default_model = "gemma"
             .await
             .expect("artifact should be readable");
         assert!(saved.contains("artifact"));
+    }
+
+    #[tokio::test]
+    async fn test_write_html_output_artifact_uses_unique_paths() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let scope = test_scope(temp.path().join("state"), "html-realm");
+        let result = RunResult {
+            text: "<!doctype html><html><body>artifact</body></html>".to_string(),
+            session_id: SessionId::new(),
+            usage: Usage::default(),
+            turns: 1,
+            tool_calls: 0,
+            terminal_cause_kind: None,
+            structured_output: None,
+            extraction_error: None,
+            schema_warnings: None,
+            skill_diagnostics: None,
+        };
+
+        let first = write_html_output_artifact(&scope, &result)
+            .await
+            .expect("first artifact should write");
+        let second = write_html_output_artifact(&scope, &result)
+            .await
+            .expect("second artifact should write");
+
+        assert_ne!(first, second);
+        assert!(tokio::fs::try_exists(first).await.expect("first exists"));
+        assert!(tokio::fs::try_exists(second).await.expect("second exists"));
+    }
+
+    #[test]
+    fn test_file_url_for_path_uses_platform_file_url() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let path = temp.path().join("artifact with spaces.html");
+        std::fs::write(&path, "<!doctype html><html></html>").expect("write file");
+
+        let file_url = file_url_for_path(&path).expect("file URL should convert");
+        let parsed = url::Url::parse(&file_url).expect("file URL should parse");
+
+        assert_eq!(parsed.scheme(), "file");
+        assert!(file_url.contains("artifact%20with%20spaces.html"));
+        assert_eq!(
+            parsed.to_file_path().expect("file URL should map to path"),
+            std::fs::canonicalize(path).expect("path should canonicalize")
+        );
     }
 
     #[tokio::test]
