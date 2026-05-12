@@ -1,35 +1,29 @@
 ---
 name: Task Workflow
-description: How to use task_create/task_update/task_list for structured work tracking
+description: How to use builtin task tools for private lightweight work tracking
 requires_capabilities: [builtins]
 ---
 
 # Task Workflow
 
-Use the task management tools for structured work tracking.
+Use builtin task tools for lightweight local/session/project work tracking.
+They are useful scratch structure, not the shared durable WorkGraph.
 
-## Creating Tasks
+## Operating Rules
 
-Use `task_create` with a clear subject and description:
-- Subject should be imperative ("Fix login bug", "Add API endpoint")
-- Description should include acceptance criteria
+- Use `task_create` for private planning, checklists, or local project tasks
+  that do not need realm-wide claims, evidence, or cross-agent readiness.
+- Use clear imperative subjects and descriptions with acceptance criteria.
+- Move a task to `in_progress` when you start and `completed` only when it is
+  actually done.
+- Use `task_list` after completing a task to find the next local item.
+- Keep dependencies simple. If blocking relationships must coordinate multiple
+  agents or survive compaction/restarts as shared truth, use WorkGraph instead.
 
-## Status Transitions
+## Boundary With WorkGraph
 
-Tasks flow through: `pending` -> `in_progress` -> `completed`
-- Set `in_progress` when you start working on a task
-- Set `completed` only when fully done
-- Use `deleted` to remove irrelevant tasks
-
-## Blocking Relationships
-
-Use `addBlocks` and `addBlockedBy` to express dependencies:
-- A task with `blockedBy` cannot be started until dependencies complete
-- Check `TaskList` to find unblocked tasks
-
-## Best Practices
-
-- Create tasks before starting work to track progress
-- Update status as you work
-- Use `TaskList` after completing a task to find the next one
-- Prefer working on tasks in ID order (lowest first)
+- Builtin tasks: private scratch, local task lists, simple progress tracking.
+- WorkGraph: realm-scoped durable commitments, readiness, dependency topology,
+  claims, leases, evidence, and terminal truth.
+- Schedule: time-based wakeups and recurrence.
+- Memory: recalled knowledge, not live task state.

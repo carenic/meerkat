@@ -43,7 +43,7 @@ impl RestPathDescriptor {
 }
 
 pub fn rest_path_catalog() -> Vec<RestPathDescriptor> {
-    vec![
+    let mut paths = vec![
         RestPathDescriptor::new(
             "/help",
             vec![RestOperationDescriptor::new(
@@ -374,7 +374,28 @@ pub fn rest_path_catalog() -> Vec<RestPathDescriptor> {
                 "Get a realm's connection set",
             )],
         ),
-    ]
+    ];
+    let workgraph_paths = meerkat_workgraph::workgraph_rest_path_catalog()
+        .iter()
+        .map(|entry| {
+            RestPathDescriptor::new(
+                entry.path,
+                entry
+                    .operations
+                    .iter()
+                    .map(|operation| {
+                        RestOperationDescriptor::new(operation.method, operation.summary)
+                    })
+                    .collect(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let insert_at = paths
+        .iter()
+        .position(|entry| entry.path == "/comms/send")
+        .unwrap_or(paths.len());
+    paths.splice(insert_at..insert_at, workgraph_paths);
+    paths
 }
 
 pub fn rest_documented_paths() -> Vec<&'static str> {

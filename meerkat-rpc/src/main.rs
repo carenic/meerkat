@@ -281,7 +281,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
         .project_root(project_root)
         .builtins(true)
         .shell(true)
-        .schedule(true)
+        .schedule(config.tools.schedule_enabled)
         .memory(true);
     if let Some(context_root) = cli.context_root.clone() {
         factory = factory.context_root(context_root);

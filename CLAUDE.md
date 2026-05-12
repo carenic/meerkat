@@ -143,7 +143,8 @@ meerkat-mcp-server → Expose Meerkat as MCP tools (meerkat_run, meerkat_resume,
 meerkat-rpc       → JSON-RPC stdio server (stateful SessionRuntime, IDE/desktop integration)
 meerkat-rest      → Optional REST API server
 meerkat-comms     → Inter-agent communication (Ed25519-signed messaging, transports, trust model)
-meerkat-contracts → Wire types, capability registry, error codes, supervisor bridge protocol
+meerkat-capabilities → Typed capability vocabulary and feature-owned declaration collection
+meerkat-contracts → Wire types, error codes, generated schemas, supervisor bridge protocol
                      (canonical over all surfaces; BridgeCommand/BridgeReply for mob↔runtime boundary)
 meerkat-skills    → Skill loading, resolution, rendering (filesystem, git, HTTP, embedded sources)
 meerkat-hooks     → Hook infrastructure (in-process, command, HTTP runtimes)

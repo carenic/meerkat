@@ -33,7 +33,8 @@ This is your highest priority. Cross-reference every new function, struct, trait
 - `meerkat-rpc` — JSON-RPC stdio server, SessionRuntime
 - `meerkat-rest` — REST API server
 - `meerkat-comms` — Inter-agent communication
-- `meerkat-contracts` — Wire types, capability registry, error codes
+- `meerkat-capabilities` — Typed capability vocabulary and feature-owned declaration collection
+- `meerkat-contracts` — Wire types, error codes, generated surface schema projections
 - `meerkat-skills` — Skill loading and resolution
 - `meerkat-hooks` — Hook infrastructure
 - `meerkat` (facade) — AgentFactory, re-exports, SDK helpers

@@ -484,7 +484,7 @@ impl AppState {
             .builtins(enable_builtins)
             .shell(enable_shell)
             .workgraph(config.tools.workgraph_enabled)
-            .schedule(true);
+            .schedule(config.tools.schedule_enabled);
         let conventions_context_root = bootstrap.context.context_root.clone();
         let conventions_user_root = bootstrap.context.user_config_root.clone();
         let task_project_root = conventions_context_root
@@ -1769,6 +1769,9 @@ pub struct CreateSessionRequest {
     /// Enable mob tools. Omit to use factory defaults.
     #[serde(default)]
     pub enable_mob: Option<bool>,
+    /// Enable schedule tools. Omit to use factory defaults.
+    #[serde(default)]
+    pub enable_schedule: Option<bool>,
     /// Enable Meerkat-owned fallback web search. Omit to keep hidden.
     #[serde(default)]
     pub enable_web_search: Option<bool>,
@@ -1963,6 +1966,28 @@ pub struct ErrorResponse {
     pub details: Option<Value>,
 }
 
+fn workgraph_observability_router() -> Router<AppState> {
+    meerkat::workgraph_rest_path_catalog()
+        .iter()
+        .fold(Router::new(), |router, descriptor| match descriptor.route {
+            meerkat::WorkGraphRestRoute::Items => {
+                router.route(descriptor.path, get(workgraph_list_items))
+            }
+            meerkat::WorkGraphRestRoute::Item => {
+                router.route(descriptor.path, get(workgraph_get_item))
+            }
+            meerkat::WorkGraphRestRoute::Ready => {
+                router.route(descriptor.path, get(workgraph_ready))
+            }
+            meerkat::WorkGraphRestRoute::Snapshot => {
+                router.route(descriptor.path, get(workgraph_snapshot))
+            }
+            meerkat::WorkGraphRestRoute::Events => {
+                router.route(descriptor.path, get(workgraph_events))
+            }
+        })
+}
+
 /// Build the REST API router
 pub fn router(state: AppState) -> Router {
     let schedule_state = state.clone();
@@ -1989,11 +2014,7 @@ pub fn router(state: AppState) -> Router {
         .route("/sessions/{id}/events", get(session_events))
         .route("/schedule/tools", get(schedule_tools))
         .route("/schedule/call", post(schedule_call))
-        .route("/workgraph/items", get(workgraph_list_items))
-        .route("/workgraph/items/{id}", get(workgraph_get_item))
-        .route("/workgraph/ready", get(workgraph_ready))
-        .route("/workgraph/snapshot", get(workgraph_snapshot))
-        .route("/workgraph/events", get(workgraph_events))
+        .merge(workgraph_observability_router())
         .route("/schedules", get(list_schedules).post(create_schedule))
         .route(
             "/schedules/{id}",
@@ -3695,16 +3716,6 @@ struct WorkGraphEventsQuery {
     limit: Option<usize>,
 }
 
-#[derive(Debug, Serialize)]
-struct WorkGraphItemsResponse {
-    items: Vec<meerkat::WorkItem>,
-}
-
-#[derive(Debug, Serialize)]
-struct WorkGraphEventsResponse {
-    events: Vec<meerkat::WorkGraphEvent>,
-}
-
 impl From<WorkGraphItemsQuery> for meerkat::WorkItemFilter {
     fn from(value: WorkGraphItemsQuery) -> Self {
         Self {
@@ -3867,6 +3878,7 @@ fn help_request_to_create_session(
         enable_shell: Some(false),
         enable_memory: Some(false),
         enable_mob: Some(false),
+        enable_schedule: Some(false),
         enable_web_search: Some(false),
         enable_workgraph: Some(false),
         budget_limits: None,
@@ -4095,7 +4107,7 @@ async fn create_session_inner(
         agent_llm_client_decorator: None,
         override_builtins: ToolCategoryOverride::from_override(req.enable_builtins),
         override_shell: ToolCategoryOverride::from_override(req.enable_shell),
-        override_schedule: ToolCategoryOverride::Inherit,
+        override_schedule: ToolCategoryOverride::from_override(req.enable_schedule),
         override_workgraph: ToolCategoryOverride::from_override(req.enable_workgraph),
         override_memory: ToolCategoryOverride::from_override(req.enable_memory),
         override_mob: ToolCategoryOverride::Inherit,
@@ -4378,12 +4390,12 @@ async fn schedule_call(
 async fn workgraph_list_items(
     State(state): State<AppState>,
     Query(query): Query<WorkGraphItemsQuery>,
-) -> Result<Json<WorkGraphItemsResponse>, ApiError> {
+) -> Result<Json<meerkat::WorkGraphItemsResponse>, ApiError> {
     state
         .workgraph_service
         .list(query.into())
         .await
-        .map(|items| Json(WorkGraphItemsResponse { items }))
+        .map(|items| Json(meerkat::WorkGraphItemsResponse { items }))
         .map_err(workgraph_error_to_api)
 }
 
@@ -4404,12 +4416,12 @@ async fn workgraph_get_item(
 async fn workgraph_ready(
     State(state): State<AppState>,
     Query(query): Query<WorkGraphReadyQuery>,
-) -> Result<Json<WorkGraphItemsResponse>, ApiError> {
+) -> Result<Json<meerkat::WorkGraphItemsResponse>, ApiError> {
     state
         .workgraph_service
         .ready(query.into())
         .await
-        .map(|items| Json(WorkGraphItemsResponse { items }))
+        .map(|items| Json(meerkat::WorkGraphItemsResponse { items }))
         .map_err(workgraph_error_to_api)
 }
 
@@ -4428,12 +4440,12 @@ async fn workgraph_snapshot(
 async fn workgraph_events(
     State(state): State<AppState>,
     Query(query): Query<WorkGraphEventsQuery>,
-) -> Result<Json<WorkGraphEventsResponse>, ApiError> {
+) -> Result<Json<meerkat::WorkGraphEventsResponse>, ApiError> {
     state
         .workgraph_service
         .events(query.into())
         .await
-        .map(|events| Json(WorkGraphEventsResponse { events }))
+        .map(|events| Json(meerkat::WorkGraphEventsResponse { events }))
         .map_err(workgraph_error_to_api)
 }
 
@@ -9091,19 +9103,19 @@ mod tests {
             .expect("seed other WorkGraph item");
         let app = router(state);
 
-        for uri in [
-            "/workgraph/items",
-            &format!("/workgraph/items/{}", item.id),
-            "/workgraph/ready",
-            "/workgraph/snapshot",
-            "/workgraph/events",
-        ] {
+        for descriptor in meerkat::workgraph_rest_path_catalog() {
+            let uri = match descriptor.route {
+                meerkat::WorkGraphRestRoute::Item => {
+                    descriptor.path.replace("{id}", item.id.as_str())
+                }
+                _ => descriptor.path.to_string(),
+            };
             let response = app
                 .clone()
                 .oneshot(
                     axum::http::Request::builder()
                         .method("GET")
-                        .uri(uri)
+                        .uri(uri.as_str())
                         .body(Body::empty())
                         .unwrap(),
                 )
@@ -9112,12 +9124,17 @@ mod tests {
             assert_eq!(response.status(), StatusCode::OK, "GET {uri}");
         }
 
+        let events_path = meerkat::workgraph_rest_path_catalog()
+            .iter()
+            .find(|descriptor| descriptor.route == meerkat::WorkGraphRestRoute::Events)
+            .expect("WorkGraph events route")
+            .path;
         let response = app
             .clone()
             .oneshot(
                 axum::http::Request::builder()
                     .method("GET")
-                    .uri("/workgraph/events?all_namespaces=true")
+                    .uri(format!("{events_path}?all_namespaces=true"))
                     .body(Body::empty())
                     .unwrap(),
             )

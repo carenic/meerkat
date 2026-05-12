@@ -79,9 +79,35 @@ meerkat = { version = "0.6.5", default-features = false, features = ["anthropic"
 # Kitchen sink
 meerkat = { version = "0.6.5", features = [
   "all-providers", "openai-realtime", "session-store", "session-compaction",
-  "memory-store-session", "comms", "mcp", "skills", "schedule", "live"
+  "memory-store-session", "comms", "mcp", "skills", "schedule", "workgraph", "live"
 ] }
 ```
+
+## Runtime Capabilities
+
+`GET /capabilities` and `capabilities/get` report compiled and policy-enabled
+runtime capabilities. Tool-family companion skills use the same capability
+tokens for gating.
+
+| Capability | Config gate | Notes |
+|------------|-------------|-------|
+| `builtins` | `tools.builtins_enabled` | Builtin tasks and utility tools |
+| `shell` | `tools.shell_enabled` | Shell and shell job tools |
+| `schedule` | `tools.schedule_enabled` | Durable schedules and occurrence delivery |
+| `work_graph` | `tools.workgraph_enabled` | WorkGraph tools and companion workflow |
+| `memory_store` | feature/runtime store | Semantic memory retrieval |
+| `skills` | `skills.enabled` and compiled skills support | Skill discovery and loading |
+
+WorkGraph's companion skill uses the same canonical capability token as public
+capability reports: `work_graph`.
+
+Optional capability bundles are declared by the owning feature crate.
+`meerkat-capabilities` supplies the typed vocabulary and collection seam;
+contracts and facades may project those declarations into `CapabilityStatus`,
+but they must not invent feature policy or translate capability aliases. For
+example, `meerkat-schedule` owns the Schedule policy declaration,
+`meerkat-workgraph` owns the WorkGraph policy declaration and registration, and
+`meerkat-skills` owns the Skills policy declaration.
 
 ## Model capabilities
 

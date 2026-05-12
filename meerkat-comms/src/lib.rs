@@ -69,10 +69,10 @@ pub use mcp::tools::{
 
 // Capability registration
 inventory::submit! {
-    meerkat_contracts::CapabilityRegistration {
-        id: meerkat_contracts::CapabilityId::Comms,
+    meerkat_capabilities::CapabilityRegistration {
+        id: meerkat_capabilities::CapabilityId::Comms,
         description: "Inter-agent communication: send, request, response, list peers + keep-alive",
-        scope: meerkat_contracts::CapabilityScope::Universal,
+        scope: meerkat_capabilities::CapabilityScope::Universal,
         requires_feature: Some("comms"),
         prerequisites: &[],
         status_resolver: None,

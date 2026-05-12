@@ -114,6 +114,26 @@ Skills are filtered by their `requires_capabilities` field before being shown or
 - A skill is included only if **all** its required capabilities are available in the current build/config.
 - A skill with an empty `requires_capabilities` list is always available.
 
+## Capability companion skills
+
+Companion skills are the standard agent instruction-manual pattern for
+nontrivial Meerkat-owned tool families.
+
+They are:
+
+- embedded in the crate or tool family that owns the capability
+- gated with `requires_capabilities`
+- discoverable through the normal skills inventory
+- loadable with `load_skill`
+- not automatically preloaded
+
+Tool descriptions should stay short and schema-focused: what the tool does and
+what arguments it accepts. Companion skills explain when, how, and why to use a
+tool family.
+
+Every nontrivial agent-facing built-in tool family should have human docs plus
+a companion skill, or an explicit documented exemption.
+
 ## Skill identity and resolution
 
 Every runtime skill reference resolves to:
@@ -188,9 +208,13 @@ The following skills are embedded in component crates:
 | `hook-authoring` | Hook Authoring | `meerkat-hooks` | `hooks` |
 | `shell-patterns` | Shell Patterns | `meerkat-tools` | `builtins`, `shell` |
 | `task-workflow` | Task Workflow | `meerkat-tools` | `builtins` |
+| `skill-discovery-workflow` | Skill Discovery Workflow | `meerkat-tools` | `skills` |
+| `builtin-utilities-workflow` | Builtin Utilities Workflow | `meerkat-tools` | `builtins` |
 | `mcp-server-setup` | MCP Server Setup | `meerkat-mcp` | (none) |
 | `memory-retrieval` | Memory Retrieval | `meerkat-memory` | `memory_store` |
 | `session-management` | Session Management | `meerkat-session` | `session_store` |
+| `schedule-workflow` | Schedule Workflow | `meerkat-schedule` | `schedule` |
+| `workgraph-workflow` | WorkGraph Workflow | `meerkat-workgraph` | `work_graph` |
 | `multi-agent-comms` | Multi-Agent Comms | `meerkat-comms` | `comms` |
 | `mob-communication` | Mob Communication | `meerkat` | `comms` |
 

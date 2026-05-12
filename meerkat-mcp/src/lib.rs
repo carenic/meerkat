@@ -23,10 +23,10 @@ pub use router::{
 
 // Capability registration
 inventory::submit! {
-    meerkat_contracts::CapabilityRegistration {
-        id: meerkat_contracts::CapabilityId::McpLive,
+    meerkat_capabilities::CapabilityRegistration {
+        id: meerkat_capabilities::CapabilityId::McpLive,
         description: "Live MCP server mutation (add/remove/reload on running sessions)",
-        scope: meerkat_contracts::CapabilityScope::Universal,
+        scope: meerkat_capabilities::CapabilityScope::Universal,
         requires_feature: Some("mcp"),
         prerequisites: &[],
         status_resolver: None,

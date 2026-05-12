@@ -1,0 +1,81 @@
+---
+title: "WorkGraph"
+description: "Realm-scoped durable commitments, dependencies, readiness, claims, and evidence."
+icon: "network"
+---
+
+WorkGraph is Meerkat's durable commitment graph for agents.
+
+It answers:
+
+- what work exists?
+- what is blocked?
+- what is ready?
+- who claimed it?
+- what evidence supports completion?
+- what is terminally done, failed, or cancelled?
+
+WorkGraph is realm-scoped and optional. It is not semantic memory, not schedule,
+and not the lightweight builtin task list.
+
+## Mental Model
+
+```text
+realm
+  -> namespace
+  -> work items
+  -> dependency edges
+  -> readiness
+  -> claims
+  -> evidence
+  -> terminal state
+```
+
+A `WorkItem` is a durable commitment. Edges describe topology such as
+`blocks`, `parent`, `related`, `supersedes`, and `derived_from`. Readiness is
+derived by the WorkGraph subsystem from item state, time gates, claims, and
+topology.
+
+## What WorkGraph Owns
+
+- item lifecycle status
+- dependency legality and graph topology
+- readiness and claimability
+- claim ownership, leases, and revision checks
+- terminal state
+- evidence references
+- event history and current-state projections
+
+Machines and services own these semantics. Tools and read-only host surfaces
+act on or observe that state; they do not reinterpret it.
+
+## Boundaries
+
+| Need | Use |
+|------|-----|
+| Shared durable work, dependencies, readiness, claims, evidence | WorkGraph |
+| One-off private scratch tracking | Builtin `task_*` tools |
+| Time-based wakeups and recurrence | Schedule |
+| Recalled knowledge and compacted context | Memory |
+| Live collaboration messages | Comms |
+
+## Namespaces
+
+Every item belongs to a realm and namespace. The default namespace is
+`default`, but applications can use names such as `session/{id}`, `mob/{id}`,
+or domain-specific namespaces. Namespaces are a scoping tool, not a promise
+that every group is semantically meaningful.
+
+## Surfaces
+
+Agents mutate WorkGraph through WorkGraph tools. Host APIs, REST, and CLI expose
+read-only observability so humans and UIs can inspect items, ready work,
+snapshots, and events.
+
+## See Also
+
+- [WorkGraph guide](/guides/workgraph)
+- [WorkGraph example](/examples/workgraph)
+- [WorkGraph reference](/reference/workgraph-reference)
+- [Scheduling](/concepts/scheduling)
+- [Tools](/concepts/tools)

@@ -21,10 +21,10 @@ inventory::submit! {
 
 // Capability registration
 inventory::submit! {
-    meerkat_contracts::CapabilityRegistration {
-        id: meerkat_contracts::CapabilityId::Hooks,
+    meerkat_capabilities::CapabilityRegistration {
+        id: meerkat_capabilities::CapabilityId::Hooks,
         description: "8 hook points, 3 runtimes (in-process/command/HTTP), observe/allow/deny semantics",
-        scope: meerkat_contracts::CapabilityScope::Universal,
+        scope: meerkat_capabilities::CapabilityScope::Universal,
         requires_feature: None,
         prerequisites: &[],
         status_resolver: None,

@@ -6,6 +6,10 @@ requires_capabilities: [hooks]
 
 # Hook Authoring
 
+Use hooks for runtime observation and policy decisions at typed lifecycle
+points. Hooks can observe, allow, or deny; they should not become hidden owners
+of runtime truth.
+
 ## Hook Points
 
 Meerkat provides 8 hook points in the agent lifecycle:
@@ -20,25 +24,27 @@ Meerkat provides 8 hook points in the agent lifecycle:
 
 ## Execution Modes
 
-- **Foreground**: Blocks execution and can deny. Use for policy enforcement.
-- **Background**: Runs concurrently, fire-and-forget. Use for logging, analytics.
+- Foreground blocks execution and can deny. Use for policy enforcement.
+- Background runs concurrently. Use for logging and analytics.
 
 ## Decision Semantics
 
 Hooks return one of:
-- **Allow**: Proceed normally
-- **Deny**: Block the operation with a reason
-- **Observe only**: Return no decision and no patches
+- Allow: proceed normally.
+- Deny: block the operation with a reason.
+- Observe only: return no decision and no patches.
 
-## Patch Format
+## Boundaries
 
 Semantic hook patches are retired. Hooks can observe typed projections and
 deny through the typed decision shape; provider parameters, assistant text,
 tool arguments/results, and final run text remain owned by the runtime/tool/LLM
 authority that produced them.
 
-## Failure Policy
-
 `failure_policy` is retained for compatibility. Current hook runtime failures
 fail closed through typed engine errors; they are not converted into
 warning-only success or hook-local denials by `fail_open` / `fail_closed`.
+
+Use WorkGraph for durable work state, Schedule for time, and memory for
+knowledge retrieval. Hooks may observe those surfaces, but they do not own
+their semantics.

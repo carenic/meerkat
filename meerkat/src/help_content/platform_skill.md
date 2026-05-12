@@ -278,6 +278,36 @@ ScheduleStore           — persistence (Memory, SQLite)
 
 **Stores are per-realm, not per-instance** — multiple processes may share a schedule store. Use `atomic_plan_mutation()` for safe multi-step changes.
 
+## WorkGraph
+
+WorkGraph is the optional realm-scoped durable commitment graph for agents. It
+owns work item lifecycle, dependencies, readiness, claims, leases, evidence
+references, and terminal state. It is not memory, not schedule, and not the
+lightweight builtin task list.
+
+Agents mutate WorkGraph through `workgraph_*` tools:
+
+| Tool | Description |
+|------|-------------|
+| `workgraph_create` | Create a durable work item |
+| `workgraph_get` / `workgraph_list` | Read items |
+| `workgraph_ready` | Ask WorkGraph for machine-derived ready work |
+| `workgraph_claim` / `workgraph_release` | Claim or release work with revision checks |
+| `workgraph_update` / `workgraph_block` / `workgraph_close` | Update lifecycle state |
+| `workgraph_link` | Add graph edges |
+| `workgraph_add_evidence` | Attach evidence references |
+| `workgraph_snapshot` / `workgraph_events` | Observe graph state and history |
+
+Host RPC, REST, and CLI expose read-only observability:
+
+- RPC: `workgraph/get`, `workgraph/list`, `workgraph/ready`, `workgraph/snapshot`, `workgraph/events`
+- REST: `GET /workgraph/items`, `/workgraph/ready`, `/workgraph/snapshot`, `/workgraph/events`
+- CLI: `rkat workgraph list|show|ready|snapshot|events`
+
+When skills are enabled, `workgraph-workflow` is the companion skill for agent
+operating guidance. It is discoverable and loadable; it is not preloaded by
+default.
+
 ### Rust SDK usage
 
 ```rust
@@ -563,6 +593,12 @@ Canonical skill identity is `SkillKey { source_uuid, skill_name }`. `preload_ski
 - Rust SDK: `SkillRuntime::list_all_with_provenance()`, `SkillRuntime::load_from_source()`
 
 Introspection returns typed keys plus source provenance. Shadowing is by full `SkillKey`, not by `skill_name` alone. Agent-facing skill tools (`browse_skills`, `load_skill`, resource tools, function invocation) also use `source_uuid` + `skill_name`.
+
+Companion skills are embedded operating manuals for Meerkat-owned tool families.
+They are gated by `requires_capabilities`, discoverable through the normal
+skills inventory, and loadable with `load_skill`. They are not automatically
+preloaded. Examples include `workgraph-workflow`, `schedule-workflow`,
+`task-workflow`, `shell-patterns`, and `memory-retrieval`.
 
 ### Hooks
 

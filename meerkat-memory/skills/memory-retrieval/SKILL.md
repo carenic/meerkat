@@ -6,26 +6,22 @@ requires_capabilities: [memory_store]
 
 # Memory Retrieval
 
-## How It Works
+Use memory for knowledge retrieval and long-horizon context recall. Memory is
+not live work state, not a scheduler, and not a commitment graph.
 
-When context compaction discards conversation history, the discarded messages
-are indexed into semantic memory. This allows retrieval of past context that
-was compacted away.
+## Operating Rules
 
-## The MemoryStore Trait
+- Search memory when compacted context, previous sessions, or domain knowledge
+  would materially improve the current answer.
+- Treat matches as recalled evidence with similarity scores, not as current
+  truth. Verify against live stores, files, APIs, or WorkGraph when correctness
+  matters.
+- Use WorkGraph for pending, blocked, claimed, or terminal work.
+- Use Schedule for future wakeups and recurrence.
+- Use builtin tasks for private scratch tracking.
 
-Two key operations:
-- **index**: Store text with metadata (session ID, turn number, timestamp)
-- **search**: Find similar text using semantic similarity
+## Scores
 
-## Understanding Similarity Scores
-
-- Scores range from 0.0 (no match) to 1.0 (exact match)
-- Typical useful matches are above 0.7
-- Results are ranked by similarity
-
-## Session vs Cross-Session Memory
-
-- Memory is indexed per-session by default
-- Cross-session search enables knowledge transfer between runs
-- Session ID in metadata allows filtering
+- Scores range from `0.0` to `1.0`.
+- Higher scores are more similar, not automatically more authoritative.
+- Prefer several corroborating matches over one weak match.

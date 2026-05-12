@@ -12,6 +12,7 @@ use crate::machines::workgraph_lifecycle as wg_dsl;
 pub use crate::machines::workgraph_lifecycle::WorkGraphLifecycleMachineState as WorkGraphMachineState;
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(transparent)]
 pub struct WorkItemId(String);
 
@@ -44,6 +45,7 @@ impl FromStr for WorkItemId {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(transparent)]
 pub struct WorkNamespace(String);
 
@@ -97,6 +99,7 @@ fn validate_token(name: &str, value: String) -> Result<String, WorkGraphError> {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkStatus {
     #[default]
@@ -119,6 +122,7 @@ impl WorkStatus {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkPriority {
     Low,
@@ -128,6 +132,7 @@ pub enum WorkPriority {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkEdgeKind {
     Blocks,
@@ -138,6 +143,7 @@ pub enum WorkEdgeKind {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkOwnerKind {
     Principal,
@@ -160,6 +166,7 @@ impl WorkOwnerKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorkOwnerKey {
     pub kind: WorkOwnerKind,
     pub id: String,
@@ -199,6 +206,7 @@ impl WorkOwnerKey {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorkOwner {
     pub key: WorkOwnerKey,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -215,6 +223,7 @@ impl WorkOwner {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorkClaim {
     pub owner: WorkOwner,
     pub claimed_at: DateTime<Utc>,
@@ -230,6 +239,7 @@ impl WorkClaim {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ExternalWorkRef {
     pub kind: String,
     pub id: String,
@@ -238,6 +248,7 @@ pub struct ExternalWorkRef {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorkEvidenceRef {
     pub kind: String,
     pub id: String,
@@ -356,6 +367,124 @@ impl<'de> Deserialize<'de> for WorkItem {
     }
 }
 
+#[cfg(feature = "schema")]
+impl schemars::JsonSchema for WorkItem {
+    fn schema_name() -> std::borrow::Cow<'static, str> {
+        "WorkItem".into()
+    }
+
+    fn json_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+        schemars::json_schema!({
+            "type": "object",
+            "required": [
+                "id",
+                "realm_id",
+                "namespace",
+                "title",
+                "status",
+                "priority",
+                "machine_state",
+                "revision",
+                "created_at",
+                "updated_at"
+            ],
+            "properties": {
+                "id": { "type": "string" },
+                "realm_id": { "type": "string" },
+                "namespace": { "type": "string" },
+                "title": { "type": "string" },
+                "description": { "type": ["string", "null"] },
+                "status": {
+                    "type": "string",
+                    "enum": ["open", "in_progress", "blocked", "completed", "cancelled", "failed"]
+                },
+                "priority": {
+                    "type": "string",
+                    "enum": ["low", "medium", "high"]
+                },
+                "labels": {
+                    "type": "array",
+                    "uniqueItems": true,
+                    "items": { "type": "string" }
+                },
+                "owner": {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "required": ["key"],
+                            "properties": {
+                                "key": {
+                                    "type": "object",
+                                    "required": ["kind", "id"],
+                                    "properties": {
+                                        "kind": {
+                                            "type": "string",
+                                            "enum": ["principal", "agent", "session", "mob", "label"]
+                                        },
+                                        "id": { "type": "string" }
+                                    }
+                                },
+                                "display_name": { "type": ["string", "null"] }
+                            }
+                        },
+                        { "type": "null" }
+                    ]
+                },
+                "claim": {
+                    "anyOf": [
+                        {
+                            "type": "object",
+                            "required": ["owner", "claimed_at"],
+                            "properties": {
+                                "owner": { "type": "object" },
+                                "claimed_at": { "type": "string", "format": "date-time" },
+                                "lease_expires_at": { "type": ["string", "null"], "format": "date-time" }
+                            }
+                        },
+                        { "type": "null" }
+                    ]
+                },
+                "machine_state": {
+                    "type": "object",
+                    "description": "Catalog-generated WorkGraphLifecycleMachine state projection."
+                },
+                "revision": { "type": "integer", "format": "uint64", "minimum": 0 },
+                "due_at": { "type": ["string", "null"], "format": "date-time" },
+                "not_before": { "type": ["string", "null"], "format": "date-time" },
+                "snoozed_until": { "type": ["string", "null"], "format": "date-time" },
+                "created_at": { "type": "string", "format": "date-time" },
+                "updated_at": { "type": "string", "format": "date-time" },
+                "terminal_at": { "type": ["string", "null"], "format": "date-time" },
+                "external_refs": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["kind", "id"],
+                        "properties": {
+                            "kind": { "type": "string" },
+                            "id": { "type": "string" },
+                            "url": { "type": ["string", "null"] }
+                        }
+                    }
+                },
+                "evidence_refs": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "required": ["kind", "id"],
+                        "properties": {
+                            "kind": { "type": "string" },
+                            "id": { "type": "string" },
+                            "label": { "type": ["string", "null"] },
+                            "summary": { "type": ["string", "null"] }
+                        }
+                    }
+                }
+            }
+        })
+    }
+}
+
 fn legacy_workgraph_machine_state(wire: &WorkItemWire) -> WorkGraphMachineState {
     let mut machine_state = WorkGraphMachineState {
         lifecycle_phase: work_lifecycle_state_from_status(wire.status),
@@ -405,6 +534,7 @@ fn datetime_to_millis(dt: DateTime<Utc>) -> u64 {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorkEdge {
     pub realm_id: String,
     pub namespace: WorkNamespace,
@@ -415,6 +545,7 @@ pub struct WorkEdge {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum WorkGraphEventKind {
     Created,
@@ -428,6 +559,7 @@ pub enum WorkGraphEventKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorkGraphEvent {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub seq: Option<i64>,
@@ -481,6 +613,7 @@ impl WorkGraphEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CreateWorkItemRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realm_id: Option<String>,
@@ -508,6 +641,7 @@ pub struct CreateWorkItemRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct UpdateWorkItemRequest {
     pub id: WorkItemId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -534,6 +668,7 @@ pub struct UpdateWorkItemRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ClaimWorkItemRequest {
     pub id: WorkItemId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -549,6 +684,7 @@ pub struct ClaimWorkItemRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ReleaseWorkItemRequest {
     pub id: WorkItemId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -559,6 +695,7 @@ pub struct ReleaseWorkItemRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CloseWorkItemRequest {
     pub id: WorkItemId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -575,6 +712,7 @@ fn default_terminal_status() -> WorkStatus {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct LinkWorkItemsRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realm_id: Option<String>,
@@ -586,6 +724,7 @@ pub struct LinkWorkItemsRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct AddEvidenceRequest {
     pub id: WorkItemId,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -597,6 +736,7 @@ pub struct AddEvidenceRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorkItemFilter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realm_id: Option<String>,
@@ -615,6 +755,7 @@ pub struct WorkItemFilter {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct ReadyWorkFilter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realm_id: Option<String>,
@@ -627,6 +768,7 @@ pub struct ReadyWorkFilter {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorkGraphSnapshotFilter {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub realm_id: Option<String>,
@@ -645,6 +787,7 @@ pub struct WorkGraphSnapshotFilter {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct WorkGraphSnapshot {
     pub realm_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -656,4 +799,16 @@ pub struct WorkGraphSnapshot {
     pub items: Vec<WorkItem>,
     pub edges: Vec<WorkEdge>,
     pub ready_item_ids: Vec<WorkItemId>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct WorkGraphItemsResponse {
+    pub items: Vec<WorkItem>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct WorkGraphEventsResponse {
+    pub events: Vec<WorkGraphEvent>,
 }

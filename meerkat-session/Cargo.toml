@@ -13,6 +13,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+meerkat-capabilities = { workspace = true }
 meerkat-core = { workspace = true }
 meerkat-contracts = { workspace = true }
 async-trait = { workspace = true }

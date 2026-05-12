@@ -30,6 +30,21 @@ Startup rejects:
 - UUID mutation without lineage.
 - split/merge/rotate lineage without complete per-skill remap coverage.
 
+## Companion Skill Governance
+
+Every nontrivial Meerkat-owned agent-facing tool family should provide:
+
+- concise tool descriptions and schemas
+- human docs for concepts, guides, reference, and examples where appropriate
+- an embedded companion skill gated by `requires_capabilities`
+
+Document an explicit exemption when a built-in tool family is too small or too
+mechanical to justify a companion skill.
+
+Companion skills teach agents how to call existing tools. They must not become
+semantic owners of lifecycle, readiness, policy, or terminal truth. Machines,
+services, stores, and typed dispatch paths remain authoritative.
+
 ## Migration Procedures
 
 ### Rotate (one source to one source)

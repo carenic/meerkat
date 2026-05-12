@@ -1,3 +1,9 @@
+---
+title: "Meerkat Dogma"
+description: "Primary runtime architecture doctrine for semantic authority, seams, projections, and surfaces."
+icon: "landmark"
+---
+
 # Meerkat Dogma
 
 Status: Draft primary architecture doctrine
@@ -277,6 +283,16 @@ Crate boundaries are authority boundaries:
 - optional feature crates own their feature-local skills, tools, hooks,
   manifests, docs, routes, schemas, migrations, fixtures, generated artifacts,
   and policy extensions.
+
+Optional capability bundles use a feature-owned declaration seam:
+
+- shared substrate crates may define typed vocabulary, collection traits,
+  registry mechanics, and generated projection emitters;
+- the owning feature crate declares its capability id usage, policy resolver,
+  companion skills, tools, route/schema fragments, fixtures, and docs;
+- global contracts and facades consume those declarations mechanically and may
+  publish projections, but they must not hand-author optional feature policy or
+  route truth.
 
 Every feature must shrink ambiguity. Adding a type, manifest field, machine,
 helper, SDK parser, compatibility flag, or generated file while leaving the old

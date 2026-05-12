@@ -1420,6 +1420,12 @@ for (const pkg of localPackages.values()) {
   }
 
   if (key === "meerkat-schedule" && libOrMacro) {
+    const scheduleMachineSchemaCompileData = compileData(libOrMacro, dir, false);
+    const scheduleMachineSchemaCompileDataExpr = `${listExpr(scheduleMachineSchemaCompileData.paths, 8)}${
+      scheduleMachineSchemaCompileData.labels.length
+        ? ` + ${listExpr(scheduleMachineSchemaCompileData.labels, 8)}`
+        : ""
+    }`;
     rules.push(`rust_library(
     name = "meerkat_schedule_machine_schema_exports",
     aliases = aliases(package_name = "meerkat-schedule"),
@@ -1427,9 +1433,7 @@ for (const pkg of localPackages.values()) {
     crate_root = "src/lib.rs",
     crate_features = ${listExpr(crateFeaturesFor(key, pkg, ["machine-schema-exports"]))},
     edition = "2024",
-    compile_data = [
-        "Cargo.toml",
-    ],
+    compile_data = ${scheduleMachineSchemaCompileDataExpr},
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//meerkat-machine-codegen:__pkg__"],
     proc_macro_deps = [
@@ -1439,8 +1443,10 @@ for (const pkg of localPackages.values()) {
         proc_macro = True,
     ),
     deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
         "${packageLabel(byName.get("meerkat-core"))}",
         "//meerkat-machine-schema:meerkat_machine_schema",
+        "//meerkat-skills:meerkat_skills",
     ] + all_crate_deps(
         package_name = "meerkat-schedule",
         normal = True,
@@ -1453,9 +1459,7 @@ for (const pkg of localPackages.values()) {
     crate_root = "src/lib.rs",
     crate_features = ${listExpr(crateFeaturesFor(key, pkg, ["machine-schema-exports"]))},
     edition = "2024",
-    compile_data = [
-        "Cargo.toml",
-    ],
+    compile_data = ${scheduleMachineSchemaCompileDataExpr},
     srcs = glob(["src/**/*.rs"]),
     visibility = ["//meerkat-machine-codegen:__pkg__"],
     proc_macro_deps = [
@@ -1465,8 +1469,10 @@ for (const pkg of localPackages.values()) {
         proc_macro = True,
     ),
     deps = [
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_core_agent_factory_build",
         "//meerkat:meerkat_machine_schema_agent_factory_build",
+        "//meerkat:meerkat_skills_agent_factory_build",
     ] + all_crate_deps(
         package_name = "meerkat-schedule",
         normal = True,

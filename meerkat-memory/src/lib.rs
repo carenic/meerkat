@@ -29,10 +29,10 @@ inventory::submit! {
 
 // Capability registration
 inventory::submit! {
-    meerkat_contracts::CapabilityRegistration {
-        id: meerkat_contracts::CapabilityId::MemoryStore,
+    meerkat_capabilities::CapabilityRegistration {
+        id: meerkat_capabilities::CapabilityId::MemoryStore,
         description: "HNSW semantic search + SQLite persistence (indexes compaction discards)",
-        scope: meerkat_contracts::CapabilityScope::Universal,
+        scope: meerkat_capabilities::CapabilityScope::Universal,
         requires_feature: Some("memory-store"),
         prerequisites: &[],
         status_resolver: None,

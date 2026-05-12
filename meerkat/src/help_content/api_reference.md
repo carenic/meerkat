@@ -292,6 +292,13 @@ non-interactive api-key login writes `dev:default_<provider>`.
 - `schedule/occurrences` — occurrences within the planning horizon
 - `schedule/tools`, `schedule/call` — agent-facing schedule tool surface
 
+### WorkGraph
+
+- `workgraph/get`, `workgraph/list`, `workgraph/ready`
+- `workgraph/snapshot`, `workgraph/events`
+- WorkGraph RPC is read-only observability. Agents mutate WorkGraph through
+  `workgraph_*` tools inside sessions.
+
 ### Skills, models, capabilities, runtime, approvals
 
 - `skills/list`, `skills/inspect`
@@ -401,6 +408,13 @@ Schedule tools:
 - `meerkat_schedule_create`, `meerkat_schedule_get`, `meerkat_schedule_list`, `meerkat_schedule_update`
 - `meerkat_schedule_pause`, `meerkat_schedule_resume`, `meerkat_schedule_delete`
 - `meerkat_schedule_occurrences`
+
+WorkGraph tools:
+
+- `workgraph_create`, `workgraph_get`, `workgraph_list`, `workgraph_ready`
+- `workgraph_snapshot`, `workgraph_events`
+- `workgraph_claim`, `workgraph_release`, `workgraph_update`, `workgraph_block`
+- `workgraph_close`, `workgraph_link`, `workgraph_add_evidence`
 
 Comms tools (feature-gated):
 

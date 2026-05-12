@@ -13,7 +13,9 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+meerkat-capabilities = { workspace = true }
 meerkat-core = { workspace = true }
+meerkat-skills = { workspace = true, optional = true }
 meerkat-machine-schema = { workspace = true }
 indexmap = { workspace = true }
 serde = { workspace = true }
@@ -24,6 +26,7 @@ uuid = { workspace = true }
 async-trait = { workspace = true }
 thiserror = { workspace = true }
 futures = { workspace = true }
+inventory = { workspace = true }
 schemars = { workspace = true, optional = true, features = ["chrono04"] }
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
@@ -36,6 +39,7 @@ tokio_with_wasm = { workspace = true }
 default = []
 schema = ["dep:schemars", "meerkat-core/schema"]
 machine-schema-exports = []
+skills = ["dep:meerkat-skills"]
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }

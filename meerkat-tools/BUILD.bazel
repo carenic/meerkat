@@ -42,7 +42,9 @@ rust_library(
     edition = "2024",
     compile_data = [
         "Cargo.toml",
+        "skills/builtin-utilities-workflow/SKILL.md",
         "skills/shell-patterns/SKILL.md",
+        "skills/skill-discovery-workflow/SKILL.md",
         "skills/task-workflow/SKILL.md",
     ],
     srcs = glob(["src/**/*.rs"]),
@@ -56,6 +58,7 @@ rust_library(
         proc_macro = True,
     ),
     deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
         "//meerkat-comms:meerkat_comms",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
@@ -83,7 +86,9 @@ rust_library(
     edition = "2024",
     compile_data = [
         "Cargo.toml",
+        "skills/builtin-utilities-workflow/SKILL.md",
         "skills/shell-patterns/SKILL.md",
+        "skills/skill-discovery-workflow/SKILL.md",
         "skills/task-workflow/SKILL.md",
     ],
     srcs = glob(["src/**/*.rs"]),
@@ -99,6 +104,7 @@ rust_library(
         proc_macro = True,
     ),
     deps = [
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
         "//meerkat:meerkat_core_agent_factory_build",
@@ -132,7 +138,9 @@ rust_test(
     edition = "2024",
     compile_data = [
         "Cargo.toml",
+        "skills/builtin-utilities-workflow/SKILL.md",
         "skills/shell-patterns/SKILL.md",
+        "skills/skill-discovery-workflow/SKILL.md",
         "skills/task-workflow/SKILL.md",
     ],
     srcs = glob(["src/**/*.rs"]),
@@ -158,6 +166,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
         "//meerkat-comms:meerkat_comms",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
@@ -192,7 +201,9 @@ rust_test(
     edition = "2024",
     compile_data = [
         "Cargo.toml",
+        "skills/builtin-utilities-workflow/SKILL.md",
         "skills/shell-patterns/SKILL.md",
+        "skills/skill-discovery-workflow/SKILL.md",
         "skills/task-workflow/SKILL.md",
     ],
     srcs = [
@@ -220,6 +231,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
         "//meerkat-comms:meerkat_comms",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
@@ -255,7 +267,9 @@ rust_test(
     edition = "2024",
     compile_data = [
         "Cargo.toml",
+        "skills/builtin-utilities-workflow/SKILL.md",
         "skills/shell-patterns/SKILL.md",
+        "skills/skill-discovery-workflow/SKILL.md",
         "skills/task-workflow/SKILL.md",
     ],
     srcs = [
@@ -283,6 +297,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
         "//meerkat-comms:meerkat_comms",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
@@ -318,7 +333,9 @@ rust_test(
     edition = "2024",
     compile_data = [
         "Cargo.toml",
+        "skills/builtin-utilities-workflow/SKILL.md",
         "skills/shell-patterns/SKILL.md",
+        "skills/skill-discovery-workflow/SKILL.md",
         "skills/task-workflow/SKILL.md",
     ],
     srcs = [
@@ -344,6 +361,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
         "//meerkat-comms:meerkat_comms",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
@@ -379,7 +397,9 @@ rust_test(
     edition = "2024",
     compile_data = [
         "Cargo.toml",
+        "skills/builtin-utilities-workflow/SKILL.md",
         "skills/shell-patterns/SKILL.md",
+        "skills/skill-discovery-workflow/SKILL.md",
         "skills/task-workflow/SKILL.md",
     ],
     srcs = [
@@ -404,6 +424,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
         "//meerkat-comms:meerkat_comms",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
@@ -439,7 +460,9 @@ rust_test(
     edition = "2024",
     compile_data = [
         "Cargo.toml",
+        "skills/builtin-utilities-workflow/SKILL.md",
         "skills/shell-patterns/SKILL.md",
+        "skills/skill-discovery-workflow/SKILL.md",
         "skills/task-workflow/SKILL.md",
     ],
     srcs = [
@@ -470,6 +493,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
         "//meerkat-comms:meerkat_comms",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
@@ -505,7 +529,9 @@ rust_test(
     edition = "2024",
     compile_data = [
         "Cargo.toml",
+        "skills/builtin-utilities-workflow/SKILL.md",
         "skills/shell-patterns/SKILL.md",
+        "skills/skill-discovery-workflow/SKILL.md",
         "skills/task-workflow/SKILL.md",
     ],
     srcs = [
@@ -532,6 +558,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
         "//meerkat-comms:meerkat_comms",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",

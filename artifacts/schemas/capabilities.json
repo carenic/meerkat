@@ -32,6 +32,7 @@
           "shell",
           "comms",
           "memory_store",
+          "schedule",
           "work_graph",
           "session_store",
           "session_compaction",
@@ -50,7 +51,7 @@
           },
           {
             "additionalProperties": false,
-            "description": "Compiled in but disabled by policy.\n\n`description` summarizes why — this is intentionally a human-readable\nstring, not a config path, because the reality is multi-layered:\nalways-compiled features like `Builtins` and `Shell` are controlled by\n`AgentFactory` flags, per-build `AgentBuildConfig` overrides, and\n`BuiltinToolConfig` policy layers (soft + enforced). A single\n\"config_path\" can't represent that resolution chain.",
+            "description": "Compiled in but disabled by policy.",
             "properties": {
               "DisabledByPolicy": {
                 "properties": {
@@ -172,6 +173,7 @@
       "shell",
       "comms",
       "memory_store",
+      "schedule",
       "work_graph",
       "session_store",
       "session_compaction",
@@ -183,8 +185,8 @@
   },
   "CapabilityScope": {
     "$defs": {
-      "Protocol": {
-        "description": "Protocol surfaces supported by Meerkat.",
+      "CapabilityProtocol": {
+        "description": "Protocol surfaces used only for capability declaration metadata.",
         "enum": [
           "rpc",
           "rest",
@@ -210,7 +212,7 @@
             "properties": {
               "protocols": {
                 "items": {
-                  "$ref": "#/$defs/Protocol"
+                  "$ref": "#/$defs/CapabilityProtocol"
                 },
                 "type": "array"
               }
@@ -240,7 +242,7 @@
       },
       {
         "additionalProperties": false,
-        "description": "Compiled in but disabled by policy.\n\n`description` summarizes why — this is intentionally a human-readable\nstring, not a config path, because the reality is multi-layered:\nalways-compiled features like `Builtins` and `Shell` are controlled by\n`AgentFactory` flags, per-build `AgentBuildConfig` overrides, and\n`BuiltinToolConfig` policy layers (soft + enforced). A single\n\"config_path\" can't represent that resolution chain.",
+        "description": "Compiled in but disabled by policy.",
         "properties": {
           "DisabledByPolicy": {
             "properties": {

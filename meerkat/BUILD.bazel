@@ -34,6 +34,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -79,6 +80,53 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
+        "//meerkat-cli:__pkg__",
+        "//meerkat-client:__pkg__",
+        "//meerkat-comms:__pkg__",
+        "//meerkat-contracts:__pkg__",
+        "//meerkat-core:__pkg__",
+        "//meerkat-gemini:__pkg__",
+        "//meerkat-hooks:__pkg__",
+        "//meerkat-live:__pkg__",
+        "//meerkat-llm-core:__pkg__",
+        "//meerkat-machine-codegen:__pkg__",
+        "//meerkat-machine-derive:__pkg__",
+        "//meerkat-machine-dsl-core:__pkg__",
+        "//meerkat-machine-dsl:__pkg__",
+        "//meerkat-machine-kernels:__pkg__",
+        "//meerkat-machine-schema:__pkg__",
+        "//meerkat-mcp-server:__pkg__",
+        "//meerkat-mcp:__pkg__",
+        "//meerkat-memory:__pkg__",
+        "//meerkat-mob-mcp:__pkg__",
+        "//meerkat-mob-pack:__pkg__",
+        "//meerkat-mob:__pkg__",
+        "//meerkat-models:__pkg__",
+        "//meerkat-openai:__pkg__",
+        "//meerkat-providers:__pkg__",
+        "//meerkat-rest:__pkg__",
+        "//meerkat-rpc:__pkg__",
+        "//meerkat-runtime:__pkg__",
+        "//meerkat-schedule:__pkg__",
+        "//meerkat-session:__pkg__",
+        "//meerkat-skills:__pkg__",
+        "//meerkat-store:__pkg__",
+        "//meerkat-tools:__pkg__",
+        "//meerkat-web-runtime:__pkg__",
+        "//meerkat-workgraph:__pkg__",
+        "//meerkat:__pkg__",
+        "//tests/integration:__pkg__",
+    ],
+)
+
+alias(
+    name = "meerkat_capabilities_agent_factory_build",
+    actual = "//meerkat-capabilities:meerkat_capabilities_agent_factory_build",
+    visibility = [
+        "//meerkat-anthropic:__pkg__",
+        "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -124,6 +172,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -169,6 +218,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -214,6 +264,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -259,6 +310,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -304,6 +356,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -349,6 +402,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -394,6 +448,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -439,6 +494,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -484,6 +540,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -529,6 +586,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -574,6 +632,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -619,6 +678,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -664,6 +724,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -709,6 +770,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -754,6 +816,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -799,6 +862,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -844,6 +908,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -889,6 +954,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -934,6 +1000,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -979,6 +1046,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -1024,6 +1092,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -1069,6 +1138,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -1114,6 +1184,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -1159,6 +1230,7 @@ alias(
     visibility = [
         "//meerkat-anthropic:__pkg__",
         "//meerkat-auth-core:__pkg__",
+        "//meerkat-capabilities:__pkg__",
         "//meerkat-cli:__pkg__",
         "//meerkat-client:__pkg__",
         "//meerkat-comms:__pkg__",
@@ -1244,6 +1316,7 @@ rust_library(
     ),
     deps = [
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
@@ -1333,6 +1406,7 @@ rust_test(
     ),
     deps = [
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
@@ -1457,6 +1531,7 @@ rust_test(
     deps = [
         "//meerkat:meerkat",
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
@@ -1547,6 +1622,7 @@ rust_test(
     deps = [
         "//meerkat:meerkat",
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
@@ -1637,6 +1713,7 @@ rust_test(
     deps = [
         "//meerkat:meerkat",
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
@@ -1731,6 +1808,7 @@ rust_test(
     deps = [
         "//meerkat:meerkat",
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
@@ -1821,6 +1899,7 @@ rust_test(
     deps = [
         "//meerkat:meerkat",
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
@@ -1913,6 +1992,7 @@ rust_test(
     deps = [
         "//meerkat:meerkat",
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
@@ -2006,6 +2086,7 @@ rust_test(
     deps = [
         "//meerkat:meerkat",
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
@@ -2097,6 +2178,7 @@ rust_test(
     deps = [
         "//meerkat:meerkat",
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
@@ -2188,6 +2270,7 @@ rust_test(
     deps = [
         "//meerkat:meerkat",
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
@@ -2283,6 +2366,7 @@ rust_test(
     deps = [
         "//meerkat:meerkat",
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
@@ -2373,6 +2457,7 @@ rust_test(
     deps = [
         "//meerkat:meerkat",
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
@@ -2465,6 +2550,7 @@ rust_test(
     deps = [
         "//meerkat:meerkat",
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
@@ -2559,6 +2645,7 @@ rust_test(
     deps = [
         "//meerkat:meerkat",
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
@@ -2649,6 +2736,7 @@ rust_test(
     deps = [
         "//meerkat:meerkat",
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
@@ -2740,6 +2828,7 @@ rust_test(
     deps = [
         "//meerkat:meerkat",
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
@@ -2830,6 +2919,7 @@ rust_test(
     deps = [
         "//meerkat:meerkat",
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
@@ -2920,6 +3010,7 @@ rust_test(
     deps = [
         "//meerkat:meerkat",
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
@@ -3011,6 +3102,7 @@ rust_test(
     deps = [
         "//meerkat:meerkat",
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
@@ -3101,6 +3193,7 @@ rust_test(
     deps = [
         "//meerkat:meerkat",
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
@@ -3191,6 +3284,7 @@ rust_test(
     deps = [
         "//meerkat:meerkat",
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
@@ -3281,6 +3375,7 @@ rust_test(
     deps = [
         "//meerkat:meerkat",
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
@@ -3371,6 +3466,7 @@ rust_test(
     deps = [
         "//meerkat:meerkat",
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
@@ -3465,6 +3561,7 @@ rust_test(
     deps = [
         "//meerkat:meerkat",
         "//meerkat:meerkat_anthropic_agent_factory_build",
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_client_agent_factory_build",
         "//meerkat:meerkat_comms_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",

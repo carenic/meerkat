@@ -9,7 +9,8 @@ meerkat-auth-core         (token stores, OAuth helpers, cloud authorizers — no
 
 meerkat-core              (pure types, traits, agent loop, session-store contract, model_profile catalog,
                            DSL handle traits)
-  ├── meerkat-contracts       (wire types, capability registry, error codes, schema codegen source)
+  ├── meerkat-capabilities    (typed capability vocabulary, feature-owned declaration collection)
+  ├── meerkat-contracts       (wire types, error codes, generated surface schema projections)
   ├── meerkat-anthropic       (Anthropic streaming client, implements AgentLlmClient through llm-core)
   ├── meerkat-openai          (OpenAI client, including realtime transport — implements AgentLlmClient)
   ├── meerkat-gemini          (Gemini client, including inline video — implements AgentLlmClient)

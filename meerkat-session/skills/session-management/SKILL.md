@@ -6,29 +6,23 @@ requires_capabilities: [session_store]
 
 # Session Management
 
-## Session Persistence
+Use session management guidance when resuming, inspecting, or reasoning about a
+conversation's persisted runtime state.
 
-Sessions are persisted via the realm-backed durable store. The `.rkat/sessions/`
-directory contains derived projection files — NOT canonical state. Deleting
-them and replaying from the event store produces identical content.
+## Operating Rules
 
-## Resume Patterns
+- Resume with the `session_id` from a previous run. The runtime rebuilds the
+  session from durable state when persistence is enabled.
+- Treat projection files as derived. Canonical session state belongs to the
+  runtime/store machinery, not to ad hoc file edits.
+- Compaction may replace old transcript detail with summaries. Use skills,
+  memory, files, and WorkGraph to recover relevant context when needed.
+- Session persistence preserves conversation continuity. It does not replace
+  WorkGraph for shared durable work or Schedule for future wakeups.
 
-To resume a session:
-1. Use the `session_id` from a previous run
-2. The session's full history is replayed from the event store
-3. New turns continue from where the previous run left off
+## Compaction
 
-## Compaction Threshold Tuning
-
-Compaction triggers when token usage exceeds the configured threshold:
-- Lower threshold = more frequent compaction, smaller context
-- Higher threshold = less compaction, richer context but higher cost
-- Default threshold balances cost and context quality
-
-## Event Store Replay
-
-The event store records every mutation. Full replay produces:
-- Reconstructed session state
-- Materialized `.rkat/sessions/` projection files
-- Verified consistency via the SessionProjector
+- Lower thresholds compact more often and reduce live context.
+- Higher thresholds preserve more live context but cost more tokens.
+- If compaction causes ambiguity, inspect durable artifacts or ask for the
+  missing detail instead of inventing it.
