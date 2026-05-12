@@ -7430,7 +7430,7 @@ async fn run_agent(
             .builtins(enable_builtins)
             .shell(enable_shell)
             .workgraph(config.tools.workgraph_enabled)
-            .schedule(true);
+            .schedule(config.tools.schedule_enabled);
         if let Some(context_root) = scope.context_root.clone() {
             factory = factory.context_root(context_root);
         }
@@ -8067,7 +8067,7 @@ async fn resume_session_with_llm_override(
             .builtins(tooling.builtins.resolve(config.tools.builtins_enabled))
             .shell(tooling.shell.resolve(config.tools.shell_enabled))
             .workgraph(config.tools.workgraph_enabled)
-            .schedule(true);
+            .schedule(config.tools.schedule_enabled);
         if let Some(context_root) = scope.context_root.clone() {
             factory = factory.context_root(context_root);
         }
@@ -8467,7 +8467,7 @@ async fn get_or_create_cli_persistent_surface_from_bundle(
         .builtins(config.tools.builtins_enabled)
         .shell(config.tools.shell_enabled)
         .workgraph(config.tools.workgraph_enabled)
-        .schedule(true);
+        .schedule(config.tools.schedule_enabled);
     if let Some(context_root) = scope.context_root.clone() {
         factory = factory.context_root(context_root);
     }

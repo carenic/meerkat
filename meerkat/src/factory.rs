@@ -2023,57 +2023,93 @@ impl AgentFactory {
         config: &Config,
         build_config: Option<&AgentBuildConfig>,
     ) -> Vec<meerkat_core::skills::CapabilityId> {
-        let mut capabilities: BTreeSet<meerkat_contracts::CapabilityId> =
-            meerkat_contracts::available_capabilities(config)
+        let registered: BTreeSet<meerkat_capabilities::CapabilityId> =
+            meerkat_capabilities::build_capabilities()
+                .into_iter()
+                .map(|registration| registration.id)
+                .collect();
+        let mut capabilities: BTreeSet<meerkat_capabilities::CapabilityId> =
+            meerkat_capabilities::available_capabilities(config)
                 .into_iter()
                 .collect();
+
+        let set_tool_capability =
+            |capabilities: &mut BTreeSet<meerkat_capabilities::CapabilityId>,
+             capability: meerkat_capabilities::CapabilityId,
+             enabled: bool| {
+                if enabled && registered.contains(&capability) {
+                    capabilities.insert(capability);
+                } else {
+                    capabilities.remove(&capability);
+                }
+            };
 
         let builtins_enabled = build_config
             .map(|build| build.override_builtins.resolve(self.enable_builtins))
             .unwrap_or(self.enable_builtins);
-        if !builtins_enabled {
-            capabilities.remove(&meerkat_contracts::CapabilityId::Builtins);
-        }
+        set_tool_capability(
+            &mut capabilities,
+            meerkat_capabilities::CapabilityId::Builtins,
+            builtins_enabled,
+        );
 
         let shell_enabled = build_config
             .map(|build| build.override_shell.resolve(self.enable_shell))
             .unwrap_or(self.enable_shell);
-        if !shell_enabled {
-            capabilities.remove(&meerkat_contracts::CapabilityId::Shell);
-        }
+        set_tool_capability(
+            &mut capabilities,
+            meerkat_capabilities::CapabilityId::Shell,
+            shell_enabled,
+        );
 
         let memory_enabled = build_config
             .map(|build| build.override_memory.resolve(self.enable_memory))
             .unwrap_or(self.enable_memory);
-        if !memory_enabled {
-            capabilities.remove(&meerkat_contracts::CapabilityId::MemoryStore);
-        }
+        set_tool_capability(
+            &mut capabilities,
+            meerkat_capabilities::CapabilityId::MemoryStore,
+            memory_enabled,
+        );
+
+        let schedule_enabled = build_config
+            .map(|build| build.override_schedule.resolve(self.enable_schedule))
+            .unwrap_or(self.enable_schedule);
+        set_tool_capability(
+            &mut capabilities,
+            meerkat_capabilities::CapabilityId::Schedule,
+            schedule_enabled,
+        );
 
         let workgraph_enabled = build_config
             .map(|build| build.override_workgraph.resolve(self.enable_workgraph))
             .unwrap_or(self.enable_workgraph);
-        if !workgraph_enabled {
-            capabilities.remove(&meerkat_contracts::CapabilityId::WorkGraph);
-        }
+        set_tool_capability(
+            &mut capabilities,
+            meerkat_capabilities::CapabilityId::WorkGraph,
+            workgraph_enabled,
+        );
 
         #[cfg(feature = "comms")]
         {
             let build_requests_comms =
                 build_config.is_some_and(|build| build.comms_name.is_some() || build.keep_alive);
             let has_comms_runtime = self.comms_runtime.is_some();
-            if !(self.enable_comms || build_requests_comms || has_comms_runtime) {
-                capabilities.remove(&meerkat_contracts::CapabilityId::Comms);
-            }
+            set_tool_capability(
+                &mut capabilities,
+                meerkat_capabilities::CapabilityId::Comms,
+                self.enable_comms || build_requests_comms || has_comms_runtime,
+            );
         }
 
-        // Project the contract-facing `CapabilityId` enum to the typed
-        // core `CapabilityId` slug that `DefaultSkillEngine` expects.
+        // Project the capability-registry `CapabilityId` enum to the typed
+        // core skill capability slug that `DefaultSkillEngine` expects.
         // The stringify path is stable by construction — the enum
         // `Display` impl emits the canonical snake_case slug which
         // `core::skills::CapabilityId::parse` accepts.
         capabilities
             .into_iter()
-            .filter_map(|cap| meerkat_core::skills::CapabilityId::parse(&cap.to_string()).ok())
+            .map(|cap| cap.to_string())
+            .filter_map(|cap| meerkat_core::skills::CapabilityId::parse(&cap).ok())
             .collect()
     }
 
@@ -7738,7 +7774,7 @@ mod tests {
         assert_eq!(snapshot.expires_at, Some(expires_at.timestamp() as u64));
     }
 
-    #[cfg(feature = "skills")]
+    #[cfg(all(feature = "skills", feature = "comms"))]
     #[tokio::test]
     async fn default_skill_runtime_resolves_embedded_mob_communication_skill() {
         let temp = tempfile::tempdir().unwrap();
@@ -7761,6 +7797,17 @@ mod tests {
         assert_eq!(resolved[0].key, skill_key);
         assert_eq!(resolved[0].name, "mob-communication");
         assert!(resolved[0].rendered_body.contains("Mob Communication"));
+    }
+
+    #[cfg(not(feature = "skills"))]
+    #[test]
+    fn skills_capability_is_absent_when_facade_skills_feature_is_disabled() {
+        let caps = meerkat_capabilities::available_capabilities(&Config::default());
+
+        assert!(
+            !caps.contains(&meerkat_capabilities::CapabilityId::Skills),
+            "skills capability must reflect composed runtime support, not merely the linked skill substrate"
+        );
     }
 
     #[cfg(feature = "skills")]
@@ -7843,6 +7890,24 @@ mod tests {
         assert!(
             caps.iter().any(|cap| cap.as_str() == "comms"),
             "per-session comms identity should expose comms capability to skills"
+        );
+    }
+
+    #[cfg(feature = "skills")]
+    #[test]
+    fn build_override_can_expose_schedule_skill_capability() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = AgentFactory::new(temp.path().join("sessions"));
+        let mut config = Config::default();
+        config.tools.schedule_enabled = false;
+        let mut build = AgentBuildConfig::new("gpt-5.4");
+        build.override_schedule = ToolCategoryOverride::Enable;
+
+        let caps = factory.effective_skill_capabilities(&config, Some(&build));
+
+        assert!(
+            caps.iter().any(|cap| cap.as_str() == "schedule"),
+            "per-build schedule enable should expose schedule capability to skills"
         );
     }
 

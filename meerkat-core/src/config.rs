@@ -389,6 +389,9 @@ impl Config {
         if other.mob_enabled != defaults.mob_enabled {
             self.tools.mob_enabled = other.mob_enabled;
         }
+        if other.schedule_enabled != defaults.schedule_enabled {
+            self.tools.schedule_enabled = other.schedule_enabled;
+        }
         if other.workgraph_enabled != defaults.workgraph_enabled {
             self.tools.workgraph_enabled = other.workgraph_enabled;
         }
@@ -421,6 +424,9 @@ impl Config {
         }
         if tools.contains_key("mob_enabled") {
             self.tools.mob_enabled = layer.mob_enabled;
+        }
+        if tools.contains_key("schedule_enabled") {
+            self.tools.schedule_enabled = layer.schedule_enabled;
         }
         if tools.contains_key("workgraph_enabled") {
             self.tools.workgraph_enabled = layer.workgraph_enabled;
@@ -1511,6 +1517,8 @@ pub struct ToolsConfig {
     pub comms_enabled: bool,
     /// Mob (multi-agent orchestration) tools enabled
     pub mob_enabled: bool,
+    /// Scheduler tools enabled
+    pub schedule_enabled: bool,
     /// WorkGraph tools enabled
     pub workgraph_enabled: bool,
 }
@@ -1526,6 +1534,7 @@ impl Default for ToolsConfig {
             shell_enabled: false,
             comms_enabled: false,
             mob_enabled: false,
+            schedule_enabled: true,
             workgraph_enabled: false,
         }
     }

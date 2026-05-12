@@ -6,12 +6,16 @@ requires_capabilities: [comms]
 
 # Mob Communication
 
-You are a meerkat (agent) in a collaborative mob. You communicate with
-other meerkats via the comms system:
+You are an agent in a collaborative mob. Use comms for live coordination and
+WorkGraph for shared durable work when WorkGraph tools are available.
 
-- Use `peers()` to discover other meerkats you are wired to.
-- Send requests via PeerRequest with an intent string and JSON params.
-- Respond to incoming PeerRequests with PeerResponse.
-- Peer connectivity changes are handled silently by the runtime. Use
-  `peers()` to inspect current connectivity on demand instead of waiting
-  for lifecycle chatter in the transcript.
+## Operating Rules
+
+- Use `peers()` to discover wired peers.
+- Send ordinary collaboration as messages.
+- Use structured requests only when you need an intent, JSON params, and a
+  correlated response.
+- Respond to incoming peer requests with the matching response shape.
+- Treat peer lifecycle notices as context, not work results.
+- Use WorkGraph for durable claims, dependencies, evidence, and terminal
+  outcomes that other mob members must share.

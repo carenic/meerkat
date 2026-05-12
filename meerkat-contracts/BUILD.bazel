@@ -51,8 +51,10 @@ rust_library(
         proc_macro = True,
     ),
     deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
         "//meerkat-core:meerkat_core",
         "//meerkat-schedule:meerkat_schedule",
+        "//meerkat-workgraph:meerkat_workgraph",
     ] + all_crate_deps(
         package_name = "meerkat-contracts",
         normal = True,
@@ -84,8 +86,10 @@ rust_library(
         proc_macro = True,
     ),
     deps = [
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_core_agent_factory_build",
         "//meerkat:meerkat_schedule_agent_factory_build",
+        "//meerkat:meerkat_workgraph_agent_factory_build",
     ] + all_crate_deps(
         package_name = "meerkat-contracts",
         normal = True,
@@ -133,8 +137,10 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
         "//meerkat-core:meerkat_core",
         "//meerkat-schedule:meerkat_schedule",
+        "//meerkat-workgraph:meerkat_workgraph",
     ] + all_crate_deps(
         package_name = "meerkat-contracts",
         normal = True,
@@ -166,9 +172,11 @@ rust_binary(
         proc_macro = True,
     ),
     deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
         "//meerkat-schedule:meerkat_schedule",
+        "//meerkat-workgraph:meerkat_workgraph",
     ] + all_crate_deps(
         package_name = "meerkat-contracts",
         normal = True,
@@ -218,9 +226,11 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
         "//meerkat-schedule:meerkat_schedule",
+        "//meerkat-workgraph:meerkat_workgraph",
     ] + all_crate_deps(
         package_name = "meerkat-contracts",
         normal = True,
@@ -269,9 +279,11 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
         "//meerkat-schedule:meerkat_schedule",
+        "//meerkat-workgraph:meerkat_workgraph",
     ] + all_crate_deps(
         package_name = "meerkat-contracts",
         normal = True,
@@ -319,9 +331,11 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
         "//meerkat-schedule:meerkat_schedule",
+        "//meerkat-workgraph:meerkat_workgraph",
     ] + all_crate_deps(
         package_name = "meerkat-contracts",
         normal = True,
@@ -369,9 +383,11 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
         "//meerkat-schedule:meerkat_schedule",
+        "//meerkat-workgraph:meerkat_workgraph",
     ] + all_crate_deps(
         package_name = "meerkat-contracts",
         normal = True,
@@ -419,9 +435,11 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
         "//meerkat-schedule:meerkat_schedule",
+        "//meerkat-workgraph:meerkat_workgraph",
     ] + all_crate_deps(
         package_name = "meerkat-contracts",
         normal = True,
@@ -470,9 +488,11 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
         "//meerkat-schedule:meerkat_schedule",
+        "//meerkat-workgraph:meerkat_workgraph",
     ] + all_crate_deps(
         package_name = "meerkat-contracts",
         normal = True,
@@ -521,9 +541,11 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
         "//meerkat-schedule:meerkat_schedule",
+        "//meerkat-workgraph:meerkat_workgraph",
     ] + all_crate_deps(
         package_name = "meerkat-contracts",
         normal = True,
@@ -572,9 +594,11 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
         "//meerkat-schedule:meerkat_schedule",
+        "//meerkat-workgraph:meerkat_workgraph",
     ] + all_crate_deps(
         package_name = "meerkat-contracts",
         normal = True,
@@ -623,9 +647,11 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
         "//meerkat-schedule:meerkat_schedule",
+        "//meerkat-workgraph:meerkat_workgraph",
     ] + all_crate_deps(
         package_name = "meerkat-contracts",
         normal = True,
@@ -674,9 +700,11 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
         "//meerkat-schedule:meerkat_schedule",
+        "//meerkat-workgraph:meerkat_workgraph",
     ] + all_crate_deps(
         package_name = "meerkat-contracts",
         normal = True,

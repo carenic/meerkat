@@ -51,6 +51,7 @@ rkat [--realm <id>] [--isolated] [--instance <id>] \
 | `rkat blob ...` | Inspect and retrieve stored blob content |
 | `rkat mcp ...` | Manage local/project MCP server config |
 | `rkat mob ...` | Pack, inspect, validate, deploy, and build mob artifacts |
+| `rkat workgraph ...` | Inspect WorkGraph items, ready work, snapshots, and events |
 | `rkat skill ...` | Manage configured skill sources and inspect available skills |
 | `rkat models` | List built-in models plus configured self-hosted aliases |
 | `rkat capabilities` | Show runtime capabilities |
@@ -345,6 +346,21 @@ rkat skill get <NAME_OR_ID_OR_PATH> [--json]
 rkat skill list [--json]
 rkat skill inspect <skill-name> --source-uuid <uuid> [--json]
 ```
+
+## workgraph
+
+`rkat workgraph` is read-only operator lookup for the active realm.
+
+```bash
+rkat workgraph list [--namespace <NS>] [--all-namespaces] [--status <STATUS>] [--label <LABEL>] [--include-terminal] [--limit <N>] [--json]
+rkat workgraph show <ID> [--namespace <NS>] [--json]
+rkat workgraph ready [--namespace <NS>] [--label <LABEL>] [--limit <N>] [--json]
+rkat workgraph snapshot [--namespace <NS>] [--all-namespaces] [--status <STATUS>] [--label <LABEL>] [--include-terminal] [--limit <N>] [--json]
+rkat workgraph events [--namespace <NS>] [--all-namespaces] [--after-seq <N>] [--limit <N>] [--json]
+```
+
+Agents mutate WorkGraph through `workgraph_*` tools. CLI does not expose write
+verbs in v1.
 
 ## models
 

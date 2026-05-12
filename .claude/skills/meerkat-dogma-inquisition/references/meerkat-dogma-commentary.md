@@ -1,3 +1,9 @@
+---
+title: "Meerkat Dogma Commentary"
+description: "Companion commentary with examples, repair shapes, and review questions for Meerkat dogma."
+icon: "book-open"
+---
+
 # Meerkat Dogma Commentary
 
 Status: Draft companion commentary

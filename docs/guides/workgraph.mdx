@@ -1,0 +1,142 @@
+---
+title: "WorkGraph"
+description: "Use WorkGraph tools to create, link, claim, evidence, close, and observe durable work."
+icon: "network"
+---
+
+# WorkGraph
+
+Use this guide when an agent should coordinate durable work across sessions,
+compaction, restarts, schedules, or multiple agents.
+
+<Note>
+Agents write WorkGraph through tools. RPC, REST, and CLI are read-only
+observability surfaces in v1.
+</Note>
+
+## Create Work
+
+Use `workgraph_create` for a durable commitment.
+
+```json
+{
+  "title": "Prepare dentist transport reminder",
+  "description": "Create a reminder for L to explain to A that car P is in the workshop.",
+  "namespace": "homecare",
+  "priority": "high",
+  "labels": ["family-logistics", "autism-support"],
+  "due_at": "2026-05-19T08:00:00Z",
+  "external_refs": [
+    {
+      "kind": "calendar_event",
+      "id": "dentist-a-2026-05-20"
+    }
+  ]
+}
+```
+
+## Link Dependencies
+
+Use `workgraph_link` to describe relationships.
+
+```json
+{
+  "kind": "blocks",
+  "from_id": "work_check_car_status",
+  "to_id": "work_prepare_dentist_reminder",
+  "namespace": "homecare"
+}
+```
+
+For `blocks`, the target is not ready until the blocker is terminally resolved.
+Use `related`, `parent`, `supersedes`, or `derived_from` when readiness should
+not be blocked.
+
+## Find Ready Work
+
+Use `workgraph_ready` instead of inferring readiness.
+
+```json
+{
+  "namespace": "homecare",
+  "labels": ["family-logistics"],
+  "limit": 10
+}
+```
+
+Ready work is non-terminal, not blocked, due or eligible, and claimable.
+
+## Claim Before Shared Work
+
+Use `workgraph_claim` before doing durable work. Include the current
+`expected_revision`.
+
+```json
+{
+  "id": "work_prepare_dentist_reminder",
+  "namespace": "homecare",
+  "expected_revision": 3,
+  "owner": {
+    "key": { "kind": "agent", "id": "homecore/logistics-agent" },
+    "display_name": "Homecore logistics agent"
+  },
+  "lease_seconds": 1800
+}
+```
+
+If a write returns a stale revision error, reload with `workgraph_get` or
+`workgraph_snapshot`, then decide whether the action still makes sense.
+
+## Update And Add Evidence
+
+Use `workgraph_update` for title, description, priority, labels, due gates, and
+external references. Use `workgraph_add_evidence` for proof of progress or
+completion.
+
+```json
+{
+  "id": "work_prepare_dentist_reminder",
+  "namespace": "homecare",
+  "expected_revision": 4,
+  "evidence": {
+    "kind": "notification",
+    "id": "sms-draft-l-2026-05-19",
+    "label": "Reminder prepared",
+    "summary": "Reminder explains that car P is unavailable and names the replacement car."
+  }
+}
+```
+
+Evidence refs point to external or Meerkat-owned artifacts. WorkGraph stores the
+reference, not the artifact bytes.
+
+## Close Or Release
+
+Use `workgraph_close` only when terminal truth exists.
+
+```json
+{
+  "id": "work_prepare_dentist_reminder",
+  "namespace": "homecare",
+  "expected_revision": 5,
+  "status": "completed"
+}
+```
+
+Use `workgraph_release` if you stop before terminal completion and another
+agent should be able to claim the item.
+
+## Observe From Host Surfaces
+
+Operators and UIs can inspect WorkGraph without mutating it:
+
+- CLI: `rkat workgraph list`, `show`, `ready`, `snapshot`, `events`
+- REST: `GET /workgraph/items`, `/workgraph/ready`, `/workgraph/snapshot`,
+  `/workgraph/events`
+- RPC: `workgraph/get`, `workgraph/list`, `workgraph/ready`,
+  `workgraph/snapshot`, `workgraph/events`
+
+## Agent Instruction Manual
+
+When skills are enabled and WorkGraph capability is available, agents can load
+the `workgraph-workflow` companion skill for operating guidance.

@@ -53,6 +53,55 @@ pub use types::{
     TriggerSpec, UpdateScheduleRequest,
 };
 
+pub const SCHEDULE_CAPABILITY_DISABLED_DESCRIPTION: &str = "config.tools.schedule_enabled is false";
+
+pub fn schedule_capability_enabled(config: &meerkat_core::Config) -> bool {
+    config.tools.schedule_enabled
+}
+
+pub const SCHEDULE_CAPABILITY_POLICY: meerkat_capabilities::FeatureCapabilityPolicy =
+    meerkat_capabilities::FeatureCapabilityPolicy::new(
+        schedule_capability_enabled,
+        SCHEDULE_CAPABILITY_DISABLED_DESCRIPTION,
+    );
+
+pub const fn schedule_capability_policy() -> meerkat_capabilities::FeatureCapabilityPolicy {
+    SCHEDULE_CAPABILITY_POLICY
+}
+
+inventory::submit! {
+    meerkat_capabilities::CapabilityRegistration {
+        id: meerkat_capabilities::CapabilityId::Schedule,
+        description: "Realm-scoped durable schedules and occurrence delivery",
+        scope: meerkat_capabilities::CapabilityScope::Universal,
+        requires_feature: None,
+        prerequisites: &[],
+        status_resolver: Some(|config| {
+            let policy = crate::schedule_capability_policy();
+            if policy.is_enabled(config) {
+                meerkat_capabilities::CapabilityStatus::Available
+            } else {
+                meerkat_capabilities::CapabilityStatus::DisabledByPolicy {
+                    description: policy.disabled_description().into(),
+                }
+            }
+        }),
+    }
+}
+
+#[cfg(feature = "skills")]
+inventory::submit! {
+    meerkat_skills::SkillRegistration {
+        id: "schedule-workflow",
+        name: "Schedule Workflow",
+        description: "How to author and inspect durable schedules from agent tools",
+        scope: meerkat_core::skills::SkillScope::Builtin,
+        requires_capabilities: &["schedule"],
+        body: include_str!("../skills/schedule-workflow/SKILL.md"),
+        extensions: &[],
+    }
+}
+
 #[doc(hidden)]
 #[cfg(feature = "machine-schema-exports")]
 pub mod machine_schema_exports {

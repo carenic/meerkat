@@ -1,0 +1,150 @@
+---
+title: "WorkGraph Reference"
+description: "WorkGraph item fields, statuses, edges, evidence, tools, and read-only host surfaces."
+icon: "list-tree"
+---
+
+# WorkGraph Reference
+
+WorkGraph is an optional realm-scoped subsystem. Agents mutate it through tools.
+Host RPC, REST, and CLI expose read-only observability/operator lookup.
+
+## WorkItem
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `id` | `WorkItemId` | Unique work item id |
+| `realm_id` | `string` | Realm that owns the item |
+| `namespace` | `WorkNamespace` | Namespace within the realm, default `default` |
+| `title` | `string` | Short title |
+| `description` | `string?` | Optional detail |
+| `status` | `WorkStatus` | Lifecycle status |
+| `priority` | `low | medium | high` | Priority |
+| `labels` | `string[]` | Filtering and grouping labels |
+| `owner` | `WorkOwner?` | Intended owner or assignee |
+| `claim` | `WorkClaim?` | Active claim owner and optional lease |
+| `machine_state` | object | Generated WorkGraph lifecycle machine state |
+| `revision` | `u64` | CAS revision for write tools |
+| `due_at` | RFC3339 timestamp? | Due time |
+| `not_before` | RFC3339 timestamp? | Earliest eligibility time |
+| `snoozed_until` | RFC3339 timestamp? | Snooze gate |
+| `created_at` | RFC3339 timestamp | Creation time |
+| `updated_at` | RFC3339 timestamp | Last update time |
+| `terminal_at` | RFC3339 timestamp? | Terminal time |
+| `external_refs` | `ExternalWorkRef[]` | Typed pointers to external objects |
+| `evidence_refs` | `WorkEvidenceRef[]` | Typed evidence pointers |
+
+## Statuses
+
+| Status | Meaning |
+|--------|---------|
+| `open` | Created and not currently claimed |
+| `in_progress` | Claimed or actively being worked |
+| `blocked` | Not ready because a block exists or machine state is blocked |
+| `completed` | Terminal success |
+| `cancelled` | Terminal cancellation |
+| `failed` | Terminal failure |
+
+Terminal items cannot be claimed.
+
+## Edge Kinds
+
+| Kind | Meaning |
+|------|---------|
+| `blocks` | Source must resolve before target can be ready |
+| `parent` | Hierarchical grouping |
+| `related` | Non-blocking association |
+| `supersedes` | Source replaces target |
+| `derived_from` | Source was derived from target |
+
+WorkGraph rejects invalid endpoints, self edges, duplicate edges, and cycles for
+`blocks` and `parent`.
+
+## Owners And Claims
+
+`WorkOwnerKey.kind` is one of:
+
+- `principal`
+- `agent`
+- `session`
+- `mob`
+- `label`
+
+Claims are revision-based. Mutating tools require the current `expected_revision`.
+Optional leases allow abandoned work to become recoverable through machine-
+approved transitions.
+
+## Evidence Refs
+
+`WorkEvidenceRef` contains:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `kind` | `string` | Evidence type, such as `artifact`, `pr`, `log`, `summary`, or `notification` |
+| `id` | `string` | External or Meerkat-owned artifact id |
+| `label` | `string?` | Human label |
+| `summary` | `string?` | Short explanation |
+
+Evidence refs are pointers. WorkGraph does not own the artifact content.
+
+## Agent Tools
+
+| Tool | Purpose |
+|------|---------|
+| `workgraph_create` | Create a work item |
+| `workgraph_get` | Read one item |
+| `workgraph_list` | List items |
+| `workgraph_ready` | List machine-derived ready items |
+| `workgraph_snapshot` | Read items, edges, ready ids, scope, timestamp, and event high-water mark |
+| `workgraph_events` | Read event history |
+| `workgraph_claim` | Claim an item with CAS revision |
+| `workgraph_release` | Release an active claim |
+| `workgraph_update` | Update mutable item fields |
+| `workgraph_block` | Put an item into blocked state |
+| `workgraph_close` | Close as `completed`, `cancelled`, or `failed` |
+| `workgraph_link` | Add a graph edge |
+| `workgraph_add_evidence` | Add an evidence reference |
+
+## Read-Only RPC
+
+| Method | Purpose |
+|--------|---------|
+| `workgraph/get` | Read one item |
+| `workgraph/list` | List items |
+| `workgraph/ready` | List ready items |
+| `workgraph/snapshot` | Read graph snapshot |
+| `workgraph/events` | Read event history |
+
+Mutating WorkGraph RPC methods are intentionally absent in v1.
+
+## Read-Only REST
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET` | `/workgraph/items` | List items |
+| `GET` | `/workgraph/items/{id}` | Read one item |
+| `GET` | `/workgraph/ready` | List ready items |
+| `GET` | `/workgraph/snapshot` | Read graph snapshot |
+| `GET` | `/workgraph/events` | Read event history |
+
+Common query parameters: `realm_id`, `namespace`, `all_namespaces`,
+`statuses`, `labels`, `include_terminal`, `limit`, and `after_seq` for events.
+
+## Read-Only CLI
+
+```bash
+rkat workgraph list [--namespace <NS>] [--all-namespaces] [--status <STATUS>] [--label <LABEL>] [--include-terminal] [--limit <N>] [--json]
+rkat workgraph show <ID> [--namespace <NS>] [--json]
+rkat workgraph ready [--namespace <NS>] [--label <LABEL>] [--limit <N>] [--json]
+rkat workgraph snapshot [--namespace <NS>] [--all-namespaces] [--status <STATUS>] [--label <LABEL>] [--include-terminal] [--limit <N>] [--json]
+rkat workgraph events [--namespace <NS>] [--all-namespaces] [--after-seq <N>] [--limit <N>] [--json]
+```
+
+CLI commands use the same realm flags as other `rkat` commands.
+
+## Companion Skill
+
+`workgraph-workflow` is an embedded builtin companion skill gated by the
+`work_graph` capability. It teaches agents how to use the WorkGraph tool family.
+It is discoverable through the normal skills inventory and is not automatically
+preloaded.

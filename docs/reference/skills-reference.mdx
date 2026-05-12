@@ -47,6 +47,24 @@ Shadowing is keyed by the full `SkillKey`, not by `skill_name` alone. Two source
 | HTTP | `type = "http"`, `url`, auth fields | Requires the HTTP skills feature. |
 | Stdio | `type = "stdio"`, `command`, `args` | External skill source process. |
 
+## Companion Skill Convention
+
+Meerkat-owned nontrivial agent-facing tool families use embedded companion
+skills as their operating manuals. A companion skill is a normal skill:
+
+- source: embedded builtin source
+- identity: normal `SkillKey { source_uuid, skill_name }`
+- gating: `requires_capabilities`
+- activation: `preload_skills`, `skill_refs`, or `load_skill`
+
+There is no auto-preload path for companion skills. Availability in the
+inventory means "this instruction manual can be loaded", not "this manual has
+already been injected".
+
+Tool descriptions should describe the tool contract. Companion skills describe
+workflow behavior such as when to claim WorkGraph items, how to author
+schedules, or when to use builtin tasks versus durable work.
+
 ## Activation paths
 
 - **Preload at session creation**: `preload_skills: SkillKey[]`; content is resolved into the system prompt before the first turn.

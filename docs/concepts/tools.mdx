@@ -79,10 +79,16 @@ Meerkat ships with tool categories you enable per-agent. Nothing is on by defaul
 | Shell | `shell`, `shell_jobs`, `shell_job_status`, `shell_job_cancel` | `enable_shell` |
 | Memory | `memory_search` | `enable_memory` |
 | Scheduler | `meerkat_schedule_*` | `enable_schedule` |
+| WorkGraph | `workgraph_*` | `enable_workgraph` |
 | Comms | `send_message`, `send_request`, `send_response`, `peers` | `enable_comms` |
 | Mob orchestration | `mob_*`, `meerkat_*` | `enable_mob` |
 
 Shell tools support allow/deny list security policies. Runtime tool visibility can also be shaped with mob overlays and turn-boundary tool-scope updates. See the [built-in tools reference](/reference/builtin-tools) for parameter details.
+
+For nontrivial Meerkat-owned tool families, companion skills provide the agent
+instruction manual. Tool descriptions stay short and schema-oriented; skills
+such as `workgraph-workflow`, `schedule-workflow`, `task-workflow`, and
+`shell-patterns` explain the operating posture for the tool family.
 
 ## Tool scoping
 

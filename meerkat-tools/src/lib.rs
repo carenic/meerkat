@@ -66,17 +66,17 @@ pub use schema::{empty_object_schema, schema_for};
 
 // Capability registrations
 inventory::submit! {
-    meerkat_contracts::CapabilityRegistration {
-        id: meerkat_contracts::CapabilityId::Builtins,
+    meerkat_capabilities::CapabilityRegistration {
+        id: meerkat_capabilities::CapabilityId::Builtins,
         description: "Built-in tools: task_list, task_create, task_get, task_update, datetime, apply_patch, view_image, generate_image, blob_save_file, blob_load_file, blob_inspect",
-        scope: meerkat_contracts::CapabilityScope::Universal,
+        scope: meerkat_capabilities::CapabilityScope::Universal,
         requires_feature: None,
         prerequisites: &[],
         status_resolver: Some(|config| {
             if config.tools.builtins_enabled {
-                meerkat_contracts::CapabilityStatus::Available
+                meerkat_capabilities::CapabilityStatus::Available
             } else {
-                meerkat_contracts::CapabilityStatus::DisabledByPolicy {
+                meerkat_capabilities::CapabilityStatus::DisabledByPolicy {
                     description: std::borrow::Cow::Borrowed("tools.builtins_enabled = false"),
                 }
             }
@@ -86,17 +86,17 @@ inventory::submit! {
 
 #[cfg(not(target_arch = "wasm32"))]
 inventory::submit! {
-    meerkat_contracts::CapabilityRegistration {
-        id: meerkat_contracts::CapabilityId::Shell,
+    meerkat_capabilities::CapabilityRegistration {
+        id: meerkat_capabilities::CapabilityId::Shell,
         description: "Shell tool with job management: shell, shell_jobs, shell_job_status, shell_job_cancel",
-        scope: meerkat_contracts::CapabilityScope::Universal,
+        scope: meerkat_capabilities::CapabilityScope::Universal,
         requires_feature: None,
         prerequisites: &[],
         status_resolver: Some(|config| {
             if config.tools.shell_enabled {
-                meerkat_contracts::CapabilityStatus::Available
+                meerkat_capabilities::CapabilityStatus::Available
             } else {
-                meerkat_contracts::CapabilityStatus::DisabledByPolicy {
+                meerkat_capabilities::CapabilityStatus::DisabledByPolicy {
                     description: std::borrow::Cow::Borrowed("tools.shell_enabled = false"),
                 }
             }
@@ -113,6 +113,30 @@ inventory::submit! {
         scope: meerkat_core::skills::SkillScope::Builtin,
         requires_capabilities: &["builtins"],
         body: include_str!("../skills/task-workflow/SKILL.md"),
+        extensions: &[],
+    }
+}
+
+inventory::submit! {
+    meerkat_skills::SkillRegistration {
+        id: "skill-discovery-workflow",
+        name: "Skill Discovery Workflow",
+        description: "How to browse, load, and use Meerkat skills during a session",
+        scope: meerkat_core::skills::SkillScope::Builtin,
+        requires_capabilities: &["skills"],
+        body: include_str!("../skills/skill-discovery-workflow/SKILL.md"),
+        extensions: &[],
+    }
+}
+
+inventory::submit! {
+    meerkat_skills::SkillRegistration {
+        id: "builtin-utilities-workflow",
+        name: "Builtin Utilities Workflow",
+        description: "How to use Meerkat built-in utility tools safely and productively",
+        scope: meerkat_core::skills::SkillScope::Builtin,
+        requires_capabilities: &["builtins"],
+        body: include_str!("../skills/builtin-utilities-workflow/SKILL.md"),
         extensions: &[],
     }
 }

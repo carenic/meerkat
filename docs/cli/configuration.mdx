@@ -49,6 +49,16 @@ Compatibility files still exist:
 
 These are useful for templates (`rkat init`) and compatibility workflows, but realm config is the runtime source of truth for CLI/RPC/REST/MCP surfaces.
 
+Common tool gates:
+
+```toml
+[tools]
+builtins_enabled = false
+shell_enabled = false
+schedule_enabled = true
+workgraph_enabled = false
+```
+
 ## Self-hosted model config
 
 Self-hosted models are defined directly in realm config:

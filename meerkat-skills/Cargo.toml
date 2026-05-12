@@ -14,13 +14,14 @@ categories.workspace = true
 
 [features]
 default = []
+capability = []
 # HTTP transport is native-only today; wasm resolver paths return a typed
 # unavailable transport error when an HTTP repository is configured.
 skills-http = ["dep:reqwest", "dep:urlencoding"]
 
 [dependencies]
+meerkat-capabilities = { workspace = true }
 meerkat-core = { workspace = true }
-meerkat-contracts = { workspace = true }
 inventory = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

@@ -1,6 +1,6 @@
 [package]
 name = "meerkat-contracts"
-description = "Wire format contracts and capability registry for Meerkat"
+description = "Wire format contracts and generated surface schemas for Meerkat"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -14,15 +14,22 @@ categories.workspace = true
 
 [features]
 default = []
-schema = ["dep:schemars", "meerkat-core/schema", "meerkat-schedule/schema"]
+schema = [
+    "dep:schemars",
+    "meerkat-capabilities/schema",
+    "meerkat-core/schema",
+    "meerkat-schedule/schema",
+    "meerkat-workgraph/schema",
+]
 
 [dependencies]
+meerkat-capabilities = { workspace = true }
 meerkat-core = { workspace = true }
 meerkat-schedule = { workspace = true }
+meerkat-workgraph = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 strum = { workspace = true }
-inventory = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
 base64 = { workspace = true }

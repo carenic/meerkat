@@ -82,10 +82,10 @@ inventory::submit! {
 // Capability registrations (inventory not available on wasm32)
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
 inventory::submit! {
-    meerkat_contracts::CapabilityRegistration {
-        id: meerkat_contracts::CapabilityId::SessionStore,
+    meerkat_capabilities::CapabilityRegistration {
+        id: meerkat_capabilities::CapabilityId::SessionStore,
         description: "PersistentSessionService, SessionProjector",
-        scope: meerkat_contracts::CapabilityScope::Universal,
+        scope: meerkat_capabilities::CapabilityScope::Universal,
         requires_feature: Some("session-store"),
         prerequisites: &[],
         status_resolver: None,
@@ -94,10 +94,10 @@ inventory::submit! {
 
 #[cfg(all(feature = "session-compaction", not(target_arch = "wasm32")))]
 inventory::submit! {
-    meerkat_contracts::CapabilityRegistration {
-        id: meerkat_contracts::CapabilityId::SessionCompaction,
+    meerkat_capabilities::CapabilityRegistration {
+        id: meerkat_capabilities::CapabilityId::SessionCompaction,
         description: "DefaultCompactor: auto-compact at token threshold, LLM summary, history rebuild",
-        scope: meerkat_contracts::CapabilityScope::Universal,
+        scope: meerkat_capabilities::CapabilityScope::Universal,
         requires_feature: Some("session-compaction"),
         prerequisites: &[],
         status_resolver: None,

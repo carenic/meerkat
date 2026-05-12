@@ -198,6 +198,10 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
         "ExecutionPlacementIdentity": schema_for!(meerkat_core::ExecutionPlacementIdentity),
         "ScheduleListResult": schema_for!(crate::wire::ScheduleListResult),
         "ScheduleOccurrencesResult": schema_for!(crate::wire::ScheduleOccurrencesResult),
+        "WorkItem": schema_for!(meerkat_workgraph::WorkItem),
+        "WorkGraphSnapshot": schema_for!(meerkat_workgraph::WorkGraphSnapshot),
+        "WorkGraphItemsResponse": schema_for!(meerkat_workgraph::WorkGraphItemsResponse),
+        "WorkGraphEventsResponse": schema_for!(meerkat_workgraph::WorkGraphEventsResponse),
         // Phase 4c — auth-binding wire types.
         "WireAuthBindingRef": schema_for!(crate::wire::WireAuthBindingRef),
         "WireBackendProfile": schema_for!(crate::wire::WireBackendProfile),
@@ -1030,6 +1034,12 @@ pub fn emit_all_schemas(output_dir: &std::path::Path) -> Result<(), Box<dyn std:
     }
 
     fn rest_operation_contract(path: &str, method: &str) -> RestOperationContract {
+        if let Some(response_schema) =
+            meerkat_workgraph::workgraph_rest_response_schema(path, method)
+        {
+            return RestOperationContract::json(response_schema);
+        }
+
         match (path, method) {
             ("/help", "post") => {
                 RestOperationContract::with_json_request("HelpRequest", "HelpResponse")
@@ -1894,6 +1904,23 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("#/components/schemas/SessionDetailsResponse")
         );
+
+        for descriptor in meerkat_workgraph::workgraph_rest_path_catalog() {
+            for catalog_operation in descriptor.operations {
+                let operation = &rest_openapi["paths"][descriptor.path][catalog_operation.method];
+                let expected =
+                    format!("#/components/schemas/{}", catalog_operation.response_schema);
+                assert_eq!(
+                    operation
+                        .pointer("/responses/200/content/application~1json/schema/$ref")
+                        .and_then(serde_json::Value::as_str),
+                    Some(expected.as_str()),
+                    "{} {} must be present in generated REST OpenAPI",
+                    catalog_operation.method,
+                    descriptor.path
+                );
+            }
+        }
 
         for retired in [
             "/sessions/{id}/submit",

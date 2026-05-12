@@ -81,6 +81,11 @@ This overview follows the generated OpenAPI artifact at
 | `POST` | `/schedules/{id}/pause` | Pause a schedule |
 | `POST` | `/schedules/{id}/resume` | Resume a schedule |
 | `GET` | `/schedules/{id}/occurrences` | List schedule occurrences |
+| `GET` | `/workgraph/items` | List WorkGraph items |
+| `GET` | `/workgraph/items/{id}` | Fetch one WorkGraph item |
+| `GET` | `/workgraph/ready` | List ready WorkGraph items |
+| `GET` | `/workgraph/snapshot` | Read a WorkGraph observability snapshot |
+| `GET` | `/workgraph/events` | Read WorkGraph event history |
 | `POST` | `/sessions/{id}/mcp/add` | Stage live MCP server addition (mcp feature) |
 | `POST` | `/sessions/{id}/mcp/remove` | Stage live MCP server removal (mcp feature) |
 | `POST` | `/sessions/{id}/mcp/reload` | Reload MCP server(s) (mcp feature) |
@@ -131,6 +136,12 @@ sessions, mob capability is still exposed by composing `meerkat-mob-mcp`
 reserved for callback and MCP-backed dispatchers.
 </Note>
 
+<Note>
+WorkGraph REST endpoints are read-only observability/operator lookup. Agents
+create, claim, update, link, evidence, and close WorkGraph items through
+WorkGraph tools inside sessions.
+</Note>
+
 ## Request cancellation
 
 REST request cancellation is opt-in and request-ID based.
@@ -170,6 +181,8 @@ Cancellation only affects uncommitted work:
   [tools]
   builtins_enabled = false
   shell_enabled = false
+  schedule_enabled = true
+  workgraph_enabled = false
   ```
 
   API keys are provided via environment variables:
@@ -226,7 +239,9 @@ Create and run a new session.
   "hooks_override": null,
   "enable_builtins": null,
   "enable_shell": null,
-  "enable_memory": null
+  "enable_memory": null,
+  "enable_schedule": null,
+  "enable_workgraph": null
 }
 ```
 
@@ -333,6 +348,14 @@ History is returned oldest-to-newest and reflects the last committed session sna
 
 <ParamField body="enable_memory" type="bool | null" default="null (factory default)">
   Enable semantic memory. Omit to use factory defaults.
+</ParamField>
+
+<ParamField body="enable_schedule" type="bool | null" default="null (factory default)">
+  Override schedule tools for this session. Omit to use factory defaults.
+</ParamField>
+
+<ParamField body="enable_workgraph" type="bool | null" default="null (factory default)">
+  Override WorkGraph tools for this session. Omit to use factory defaults.
 </ParamField>
 
 #### Response fields
@@ -807,7 +830,7 @@ Returns runtime capabilities with status resolved against config.
 }
 ```
 
-The full response includes all capabilities: `sessions`, `streaming`, `structured_output`, `hooks`, `builtins`, `shell`, `comms`, `memory_store`, `session_store`, `session_compaction`, `skills`, `mcp_live`. See the [RPC capabilities endpoint](/api/rpc#capabilitiesget) for the complete example.
+The full response includes all capabilities: `sessions`, `streaming`, `structured_output`, `hooks`, `builtins`, `shell`, `comms`, `memory_store`, `schedule`, `work_graph`, `session_store`, `session_compaction`, `skills`, `mcp_live`. See the [RPC capabilities endpoint](/api/rpc#capabilitiesget) for the complete example.
 
 ### GET /config
 

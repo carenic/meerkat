@@ -13,6 +13,7 @@ keywords.workspace = true
 categories.workspace = true
 
 [dependencies]
+meerkat-capabilities = { workspace = true }
 meerkat-core = { workspace = true, features = [
     "jsonschema",
     "__meerkat-facade-agent-factory-build",
@@ -107,7 +108,14 @@ comms = ["dep:meerkat-comms", "dep:parking_lot", "meerkat-tools/comms"]
 mcp = ["dep:meerkat-mcp", "meerkat-tools/mcp"]
 schedule = []
 workgraph = []
-skills = ["dep:meerkat-skills", "meerkat-skills/skills-http", "meerkat-tools/skills"]
+skills = [
+    "dep:meerkat-skills",
+    "meerkat-skills/capability",
+    "meerkat-skills/skills-http",
+    "meerkat-tools/skills",
+    "meerkat-schedule/skills",
+    "meerkat-workgraph/skills",
+]
 # Live-channel orchestration (LiveAdapterHost wiring + realtime open/refresh
 # helpers shared by RPC, Rust SDK, REST, etc.). Pulls in `meerkat-live`.
 live = ["dep:meerkat-live"]

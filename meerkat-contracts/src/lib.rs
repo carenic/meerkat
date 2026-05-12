@@ -1,6 +1,6 @@
 #![recursion_limit = "1024"]
 
-//! Meerkat contracts — canonical wire types, capability model, and error contracts.
+//! Meerkat contracts — canonical wire types, surface schemas, and error contracts.
 //!
 //! This crate is the single source of truth for all wire-facing types.
 //! Surface crates (RPC, REST, MCP, CLI) consume these types directly.

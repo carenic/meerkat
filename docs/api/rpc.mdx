@@ -211,6 +211,12 @@ Use `live/status` to observe channel state.
 RPC is the canonical typed substrate for the SDKs: use explicit `mob/*` lifecycle, host-ingress, and observation methods from apps. Inside running sessions, mob capability is exposed by composing `meerkat-mob-mcp` (`MobMcpState` + `AgentMobToolSurfaceFactory`) into `SessionBuildOptions.mob_tools`, which provides authorized `mob_*` tools to the agent. `external_tools` remains for callback and MCP-backed tool dispatchers.
 </Note>
 
+<Note>
+WorkGraph RPC methods are read-only observability. Programmatic hosts should
+inspect WorkGraph through `workgraph/get`, `list`, `ready`, `snapshot`, and
+`events`; agents mutate WorkGraph through the `workgraph_*` tools.
+</Note>
+
 ## Protocol
 
 Standard JSON-RPC 2.0 with `"jsonrpc": "2.0"` on every message. Three message types:
@@ -333,6 +339,8 @@ Create a new session and run the first turn. Set `initial_turn` to `"deferred"` 
     "enable_builtins": false,
     "enable_shell": false,
     "enable_memory": false,
+    "enable_schedule": null,
+    "enable_workgraph": null,
     "keep_alive": null,
     "comms_name": null,
     "provider_params": null,
@@ -417,6 +425,14 @@ Only `prompt` is required. All other fields are optional and fall back to config
 
 <ParamField body="enable_memory" type="bool" default="false">
   Enable semantic memory (`memory_search` tool + compaction indexing).
+</ParamField>
+
+<ParamField body="enable_schedule" type="bool | null" default="null">
+  Override schedule tools for this session. `null` uses the surface default.
+</ParamField>
+
+<ParamField body="enable_workgraph" type="bool | null" default="null">
+  Override WorkGraph tools for this session. `null` uses the surface default.
 </ParamField>
 
 <ParamField body="keep_alive" type="bool | null" default="null">

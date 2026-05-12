@@ -6,28 +6,23 @@ requires_capabilities: [comms]
 
 # Multi-Agent Communication
 
-## Keep-Alive Mode
+Use comms for live collaboration between agents. Comms moves messages and
+correlated requests; it is not durable shared work state.
 
-Enable keep-alive to keep the session alive for peer messaging:
-- Requires `--keep-alive` flag or `keep_alive: true` in session build options
-- Must specify a `comms_name` for peer identification
+## Operating Rules
 
-## Message Patterns
+- Use keep-alive mode with a `comms_name` when a session should receive peer
+  messages after the first turn.
+- Use one-way messages for ordinary coordination and request/response only
+  when you need a correlated answer.
+- Use peer discovery before addressing peers by name.
+- Keep durable commitments, claims, dependencies, and terminal outcomes in
+  WorkGraph when WorkGraph is available.
+- Summarize important peer decisions back into durable artifacts or WorkGraph
+  evidence when they matter beyond the live conversation.
 
-### Fire-and-forget
-Use `comms_send` for one-way messages that don't need a response.
+## Transport Notes
 
-### Request/Response
-Use `comms_request` to send and wait for a response.
-Use `comms_response` to reply to incoming requests.
-
-## Peer Discovery
-
-- Use `comms_peers` to see connected peers
-- Peers must be in the trust configuration to communicate
-
-## Transport Selection
-
-- **UDS** (Unix Domain Socket): Same machine, lowest latency
-- **TCP**: Cross-machine communication
-- **inproc**: In-process, for peers in the same runtime
+- UDS is for same-machine low-latency peers.
+- TCP is for cross-machine peers.
+- In-process transport is for peers in the same runtime.

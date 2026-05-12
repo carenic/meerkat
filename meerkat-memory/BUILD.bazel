@@ -50,6 +50,7 @@ rust_library(
         proc_macro = True,
     ),
     deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
         "//meerkat-skills:meerkat_skills",
@@ -83,6 +84,7 @@ rust_library(
         proc_macro = True,
     ),
     deps = [
+        "//meerkat:meerkat_capabilities_agent_factory_build",
         "//meerkat:meerkat_contracts_agent_factory_build",
         "//meerkat:meerkat_core_agent_factory_build",
         "//meerkat:meerkat_skills_agent_factory_build",
@@ -132,6 +134,7 @@ rust_test(
         proc_macro_dev = True,
     ),
     deps = [
+        "//meerkat-capabilities:meerkat_capabilities",
         "//meerkat-contracts:meerkat_contracts",
         "//meerkat-core:meerkat_core",
         "//meerkat-skills:meerkat_skills",
