@@ -31,7 +31,7 @@ Before reviewing, establish the review target and baseline:
 - For local changes, inspect the working tree and the relevant files.
 - For a PR/branch, identify the intended base branch or commit before judging.
 - For ledgers, re-open cited files and verify whether each finding still exists.
-- For Meerkat-specific work, read `docs-internal/archive/public-docs-removed-2026-05-11/architecture/meerkat-dogma.md` when it
+- For Meerkat-specific work, read `docs/architecture/meerkat-dogma.md` when it
   exists; otherwise read the bundled dogma reference.
 - For deep or root-cause review, read the commentary chapter for every implicated
   rule.

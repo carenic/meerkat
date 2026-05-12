@@ -4,7 +4,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-CANONICAL_DIR="$ROOT/docs-internal/archive/public-docs-removed-2026-05-11/architecture"
+CANONICAL_DIR="$ROOT/docs/architecture"
 SKILL_REF_DIR="$ROOT/.claude/skills/meerkat-dogma-inquisition/references"
 
 docs=(
@@ -35,7 +35,7 @@ done
 if [[ "$changed" -ne 0 ]]; then
   cat >&2 <<'MSG'
 
-Meerkat dogma skill docs were refreshed from docs-internal/archive/public-docs-removed-2026-05-11/architecture.
+Meerkat dogma skill docs were refreshed from docs/architecture.
 Stage the updated .claude/skills/meerkat-dogma-inquisition/references files and retry.
 MSG
   exit 1

@@ -1,7 +1,7 @@
 # Meerkat Dogma Commentary
 
 Status: Draft companion commentary
-Primary doctrine: `docs-internal/archive/public-docs-removed-2026-05-11/architecture/meerkat-dogma.md`
+Primary doctrine: `docs/architecture/meerkat-dogma.md`
 
 ## Purpose
 

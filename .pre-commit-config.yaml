@@ -36,7 +36,7 @@ repos:
         name: sync Meerkat dogma skill docs
         entry: scripts/sync-meerkat-dogma-skill-docs.sh
         language: script
-        files: '^(docs-internal/archive/public-docs-removed-2026-05-11/architecture/meerkat-dogma(-commentary)?\.md|\.claude/skills/meerkat-dogma-inquisition/references/meerkat-dogma(-commentary)?\.md|scripts/sync-meerkat-dogma-skill-docs\.sh)$'
+        files: '^(docs/architecture/meerkat-dogma(-commentary)?\.md|\.claude/skills/meerkat-dogma-inquisition/references/meerkat-dogma(-commentary)?\.md|scripts/sync-meerkat-dogma-skill-docs\.sh)$'
         pass_filenames: false
 
   # Manual: changed-crate deterministic validation when you want a local preflight.
