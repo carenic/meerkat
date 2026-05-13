@@ -92,7 +92,7 @@ use crate::compose_tools_with_comms;
 #[cfg(not(target_arch = "wasm32"))]
 use crate::{create_default_hook_engine, resolve_layered_hooks_config};
 
-#[cfg(feature = "openai")]
+#[cfg(all(feature = "openai", feature = "openai-realtime"))]
 fn is_azure_openai_connection(connection: &meerkat_providers::ResolvedConnection) -> bool {
     matches!(
         connection.backend,

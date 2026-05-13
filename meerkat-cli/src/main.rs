@@ -5531,24 +5531,7 @@ async fn handle_doctor(scope: &RuntimeScope) -> anyhow::Result<()> {
             ],
         ),
     ];
-    let openai_env_present = ["RKAT_OPENAI_API_KEY", "OPENAI_API_KEY"]
-        .iter()
-        .any(|env_key| env_var_present(env_key));
-    let azure_openai_env_present = ["RKAT_AZURE_OPENAI_API_KEY", "AZURE_OPENAI_API_KEY"]
-        .iter()
-        .any(|env_key| env_var_present(env_key))
-        && ["RKAT_AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_ENDPOINT"]
-            .iter()
-            .any(|env_key| env_var_present(env_key));
-    if openai_env_present {
-        println!("ok\tprovider\topenai via OPENAI_API_KEY");
-    } else if azure_openai_env_present {
-        println!("ok\tprovider\topenai via AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT");
-    } else {
-        println!(
-            "warn\tprovider\topenai missing RKAT_OPENAI_API_KEY/OPENAI_API_KEY or AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT"
-        );
-    }
+    println!("{}", doctor_openai_env_default_message(env_var_present));
     for (provider, env_keys) in provider_keys {
         if let Some(env_key) = env_keys.iter().find(|env_key| env_var_present(env_key)) {
             println!("ok\tprovider\t{provider} via {env_key}");
@@ -5687,6 +5670,32 @@ fn env_var_present(env_key: &str) -> bool {
         .ok()
         .filter(|value| !value.is_empty())
         .is_some()
+}
+
+fn doctor_openai_env_default_message<F>(mut env_present: F) -> &'static str
+where
+    F: FnMut(&str) -> bool,
+{
+    let public_openai_env_present = ["RKAT_OPENAI_API_KEY", "OPENAI_API_KEY"]
+        .iter()
+        .any(|env_key| env_present(env_key));
+    let azure_key_present = ["RKAT_AZURE_OPENAI_API_KEY", "AZURE_OPENAI_API_KEY"]
+        .iter()
+        .any(|env_key| env_present(env_key));
+    let azure_endpoint_present = ["RKAT_AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_ENDPOINT"]
+        .iter()
+        .any(|env_key| env_present(env_key));
+    let azure_explicit =
+        env_present("RKAT_AZURE_OPENAI_API_KEY") || env_present("RKAT_AZURE_OPENAI_ENDPOINT");
+
+    if azure_key_present && azure_endpoint_present && (azure_explicit || !public_openai_env_present)
+    {
+        "ok\tprovider\topenai via AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT"
+    } else if public_openai_env_present {
+        "ok\tprovider\topenai via OPENAI_API_KEY"
+    } else {
+        "warn\tprovider\topenai missing RKAT_OPENAI_API_KEY/OPENAI_API_KEY or AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT"
+    }
 }
 
 async fn handle_realm_command(command: RealmCommands, scope: &RuntimeScope) -> anyhow::Result<()> {
@@ -12873,6 +12882,35 @@ mod tests {
             auth_header
         });
         (base_url, handle)
+    }
+
+    fn doctor_openai_message_for_env(keys: &[&str]) -> &'static str {
+        doctor_openai_env_default_message(|key| keys.contains(&key))
+    }
+
+    #[test]
+    fn doctor_openai_env_default_reports_rkat_azure_override_before_public_openai() {
+        let message = doctor_openai_message_for_env(&[
+            "OPENAI_API_KEY",
+            "RKAT_AZURE_OPENAI_API_KEY",
+            "RKAT_AZURE_OPENAI_ENDPOINT",
+        ]);
+
+        assert_eq!(
+            message,
+            "ok\tprovider\topenai via AZURE_OPENAI_API_KEY + AZURE_OPENAI_ENDPOINT"
+        );
+    }
+
+    #[test]
+    fn doctor_openai_env_default_keeps_public_openai_before_plain_azure_env() {
+        let message = doctor_openai_message_for_env(&[
+            "OPENAI_API_KEY",
+            "AZURE_OPENAI_API_KEY",
+            "AZURE_OPENAI_ENDPOINT",
+        ]);
+
+        assert_eq!(message, "ok\tprovider\topenai via OPENAI_API_KEY");
     }
 
     #[tokio::test]
