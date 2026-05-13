@@ -8012,7 +8012,7 @@
   },
   "info": {
     "title": "Meerkat REST API",
-    "version": "0.6.7"
+    "version": "0.6.8"
   },
   "openapi": "3.1.0",
   "paths": {
