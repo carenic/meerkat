@@ -97,7 +97,9 @@ fn azure_openai_base_url(configured: Option<&str>) -> Result<String, ProviderCli
         ));
     };
     let trimmed = raw.trim_end_matches('/');
-    if trimmed.ends_with("/openai") {
+    if let Some(base) = trimmed.strip_suffix("/openai/v1") {
+        Ok(format!("{base}/openai"))
+    } else if trimmed.ends_with("/openai") {
         Ok(trimmed.to_string())
     } else {
         Ok(format!("{trimmed}/openai"))
@@ -472,6 +474,13 @@ impl ProviderRuntime for OpenAiProviderRuntime {
                  — registry dispatch invariant violated"
             ),
         };
+        if matches!(backend_kind, OpenAiBackendKind::AzureOpenAi)
+            && azure_openai_wire_config(&connection)
+                .image_generation_deployment
+                .is_none()
+        {
+            return Ok(None);
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if let Some(authorizer) = connection.resolved_authorizer() {
             let base_url = match backend_kind {
@@ -624,6 +633,23 @@ mod tests {
                 metadata,
                 None,
                 "openai:test",
+            )),
+        }
+    }
+
+    fn resolved_azure_connection(options: serde_json::Value) -> ResolvedConnection {
+        let mut backend = backend("azure_openai");
+        backend.base_url = Some("https://example.openai.azure.com".to_string());
+        backend.options = options;
+        ResolvedConnection {
+            provider: Provider::OpenAI,
+            backend: NormalizedBackendKind::OpenAi(OpenAiBackendKind::AzureOpenAi),
+            backend_profile: Arc::new(backend),
+            auth_lease: Arc::new(StaticLease::inline_secret(
+                "azure-api-key".into(),
+                AuthMetadata::default(),
+                None,
+                "openai:azure",
             )),
         }
     }
@@ -783,6 +809,10 @@ mod tests {
             azure_openai_base_url(Some("https://example.openai.azure.com/openai")).unwrap(),
             "https://example.openai.azure.com/openai"
         );
+        assert_eq!(
+            azure_openai_base_url(Some("https://example.openai.azure.com/openai/v1/")).unwrap(),
+            "https://example.openai.azure.com/openai"
+        );
     }
 
     #[test]
@@ -824,6 +854,32 @@ mod tests {
         )
         .expect("allowed combination");
         assert_eq!(vb.policy(), &policy);
+    }
+
+    #[test]
+    fn azure_openai_without_image_deployment_does_not_claim_image_executor() {
+        let executor = OpenAiProviderRuntime
+            .build_image_generation_executor(resolved_azure_connection(serde_json::Value::Null))
+            .expect("Azure text connection should build cleanly");
+
+        assert!(
+            executor.is_none(),
+            "Azure OpenAI should not shadow another OpenAI image binding unless image deployment is configured"
+        );
+    }
+
+    #[test]
+    fn azure_openai_with_image_deployment_claims_image_executor() {
+        let executor = OpenAiProviderRuntime
+            .build_image_generation_executor(resolved_azure_connection(serde_json::json!({
+                "image_generation_deployment": "gpt-image-2"
+            })))
+            .expect("Azure image-capable connection should build cleanly");
+
+        assert!(
+            executor.is_some(),
+            "Azure OpenAI image executor should remain available when image deployment is configured"
+        );
     }
 
     #[test]
