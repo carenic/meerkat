@@ -7,8 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-This unreleased line collects the changes currently on `main` after the
-formal 0.6.6 release. It is a feature-bearing development line: WorkGraph,
+## [0.6.7] - 2026-05-13
+
+Meerkat 0.6.7 is a feature-bearing release: WorkGraph,
 Azure OpenAI, project-local CLI defaults, HTML artifacts, typed transcript
 notices, capability companion skills, provider image/search improvements, and
 several runtime/provider fixes.
