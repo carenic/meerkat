@@ -2038,19 +2038,18 @@ mod tests {
     #[test]
     fn test_config_default() {
         let config = Config::default();
-        assert_eq!(config.agent.model, "claude-opus-4-7");
+        assert_eq!(config.agent.model, "gpt-5.5");
         assert_eq!(config.agent.max_tokens_per_turn, 16384);
         assert_eq!(config.retry.max_retries, 3);
         assert_eq!(config.max_sessions(), DEFAULT_MAX_SESSIONS);
     }
 
     #[test]
-    fn config_template_agent_model_tracks_anthropic_catalog_default() {
+    fn config_template_agent_model_tracks_openai_catalog_default() {
         let config = Config::template().expect("template parses");
         assert_eq!(
             config.agent.model.as_str(),
-            crate::model_profile::catalog::default_model("anthropic")
-                .expect("anthropic catalog default")
+            crate::model_profile::catalog::default_model("openai").expect("openai catalog default")
         );
     }
 
@@ -2072,7 +2071,7 @@ max_sessions = 7
     fn test_config_layering() {
         // 1. Test defaults
         let config = Config::default();
-        assert_eq!(config.agent.model, "claude-opus-4-7");
+        assert_eq!(config.agent.model, "gpt-5.5");
         assert_eq!(config.budget.max_tokens, None);
 
         // 2. Test env override (secrets only)

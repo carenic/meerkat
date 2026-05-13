@@ -2658,7 +2658,7 @@ async fn handle_run_command(
         auth_binding_selection
             .as_ref()
             .and_then(|selection| selection.default_model.clone())
-            .unwrap_or_else(|| config.agent.model.clone())
+            .unwrap_or_else(|| resolve_cli_default_agent_model(&config))
     });
     let max_tokens = max_tokens.unwrap_or(config.agent.max_tokens_per_turn);
     let resolved_provider = resolve_cli_provider_with_auth_binding(
@@ -3216,6 +3216,16 @@ async fn load_config(scope: &RuntimeScope) -> anyhow::Result<(Config, PathBuf)> 
         .validate()
         .map_err(|e| anyhow::anyhow!("Invalid runtime config: {e}"))?;
     Ok((config, base_dir))
+}
+
+const LEGACY_AGENT_MODEL_DEFAULTS: &[&str] = &["claude-opus-4-7"];
+
+fn resolve_cli_default_agent_model(config: &Config) -> String {
+    if LEGACY_AGENT_MODEL_DEFAULTS.contains(&config.agent.model.as_str()) {
+        return config.models.openai.clone();
+    }
+
+    config.agent.model.clone()
 }
 
 async fn handle_config_get(
@@ -7319,7 +7329,7 @@ async fn run_agent(
     labels: Vec<(String, String)>,
     instructions: Vec<String>,
     app_context: Option<String>,
-    _config_base_dir: PathBuf,
+    config_base_dir: PathBuf,
     hooks_override: HookRunOverrides,
     auth_binding: Option<AuthBindingRef>,
     scope: &RuntimeScope,
@@ -7359,7 +7369,7 @@ async fn run_agent(
             labels,
             instructions,
             app_context,
-            _config_base_dir,
+            config_base_dir,
             hooks_override,
             auth_binding,
             scope,
@@ -7441,6 +7451,16 @@ async fn run_agent(
         #[cfg(feature = "comms")]
         let factory = factory.comms(!comms_overrides.disabled);
 
+        let context_root = scope
+            .context_root
+            .as_deref()
+            .map_or_else(|| "(none)".to_string(), |path| path.display().to_string());
+        tracing::info!(
+            "Using realm: {}, context root: {}, config root: {}",
+            scope.locator.realm.as_str(),
+            context_root,
+            config_base_dir.display()
+        );
         tracing::info!("Using provider: {:?}, model: {}", provider, model);
 
         // Apply --comms-listen-tcp override to the config
@@ -17193,6 +17213,26 @@ capabilities = ["definitely_missing_capability"]
         let from_json = parse_hook_run_overrides(None, Some(fixture))
             .expect("fixture hook override must parse from inline json");
         assert_eq!(from_json, from_file);
+    }
+
+    #[test]
+    fn test_resolve_cli_default_agent_model_heals_legacy_builtin_default() {
+        let mut config = Config::default();
+        config.agent.model = "claude-opus-4-7".to_string();
+        config.models.openai = "gpt-5.5-custom".to_string();
+
+        assert_eq!(resolve_cli_default_agent_model(&config), "gpt-5.5-custom");
+    }
+
+    #[test]
+    fn test_resolve_cli_default_agent_model_preserves_custom_model() {
+        let mut config = Config::default();
+        config.agent.model = "claude-sonnet-4-6".to_string();
+
+        assert_eq!(
+            resolve_cli_default_agent_model(&config),
+            "claude-sonnet-4-6"
+        );
     }
 
     #[test]
