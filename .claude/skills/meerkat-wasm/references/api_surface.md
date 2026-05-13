@@ -1,6 +1,6 @@
 # WASM Runtime API Surface
 
-## wasm_bindgen Exports (current as of 0.6.5)
+## wasm_bindgen Exports (current as of 0.6.6)
 
 The `meerkat-web-runtime` crate exposes the browser bootstrap, session, mob,
 auth, and subscription functions below via `#[wasm_bindgen]`. Names listed below
@@ -245,7 +245,7 @@ Helper spawn/fork request JSON (`mob_spawn_helper`, `mob_fork_helper`) may carry
     },
     "operator": {
       "model": "claude-sonnet-4-6",
-      "tools": { "comms": true, "mob_tasks": true },
+      "tools": { "comms": true, "builtins": true, "mob": true },
       "peer_description": "Executes tasks"
     }
   },

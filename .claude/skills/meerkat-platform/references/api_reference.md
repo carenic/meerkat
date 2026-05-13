@@ -67,6 +67,7 @@ rkat skill add <PATH> [--name <NAME>]
 rkat skill remove|get <NAME_OR_SOURCE_UUID_OR_PATH> [--json for get]
 rkat skill list [--json]
 rkat skill inspect <SKILL_NAME> --source-uuid <SOURCE_UUID> [--json]
+rkat workgraph list|show|ready|snapshot|events ...
 rkat models
 rkat help <QUESTION> [--prompt <PROMPT>] [--plan-execution] [--json] [--stream|--no-stream]
 rkat auth realms|profiles|profile|profile-delete|bindings|test|status|login|logout|refresh ...
@@ -94,13 +95,13 @@ source; it writes `./.rkat/config.toml` from `~/.rkat/config.toml`.
 Important `rkat run` options:
 
 ```bash
---resume[=<SESSION>]                  # UUID, short prefix, realm:<uuid>, last, ~, ~N
+--resume[=<SESSION>]                  # UUID, prefix/tail handle, realm:<uuid>, last, ~, ~N
 -t, --tools <safe|workspace|full|none> # default safe; --yolo aliases full
 --allow-tool <TOOL>                    # repeatable first-turn allow overlay
 --block-tool <TOOL>                    # repeatable first-turn block overlay
 --wait-for-mcp
 --auth-binding <REALM:BINDING[:PROFILE]>
---output <text|json> / --json
+--output <text|json|html> / --json / --html / --browser
 --stream / --no-stream
 --stdin <auto|blob|lines|off>
 --line-format <text|json>
@@ -110,6 +111,26 @@ Hard CLI negatives: no `rkat sessions`, no `rkat resume`, no `rkat rpc`, no
 `rkat live`, no `rkat image`, no `--tools all`, no `rkat blob get -o`, no
 `rkat session show --json`, no `rkat models --json`, no
 `rkat capabilities --json`.
+
+### WorkGraph host observability
+
+WorkGraph is a realm-scoped durable commitment graph. Agents mutate it through
+the `workgraph_*` tool family when `enable_workgraph` / `tools.workgraph_enabled`
+is active. Host surfaces are read-only:
+
+```bash
+rkat workgraph list [--namespace <NS>] [--all-namespaces] [--status <STATUS>] [--label <LABEL>] [--include-terminal] [--limit <N>] [--json]
+rkat workgraph show <ID> [--namespace <NS>] [--json]
+rkat workgraph ready [--namespace <NS>] [--label <LABEL>] [--limit <N>] [--json]
+rkat workgraph snapshot [--namespace <NS>] [--all-namespaces] [--status <STATUS>] [--label <LABEL>] [--include-terminal] [--limit <N>] [--json]
+rkat workgraph events [--namespace <NS>] [--all-namespaces] [--after-seq <N>] [--limit <N>] [--json]
+```
+
+RPC exposes `workgraph/get`, `workgraph/list`, `workgraph/ready`,
+`workgraph/snapshot`, and `workgraph/events`. REST exposes
+`GET /workgraph/items`, `/workgraph/items/{id}`, `/workgraph/ready`,
+`/workgraph/snapshot`, and `/workgraph/events`. Python and TypeScript SDKs wrap
+the same read-only surface.
 
 ### MCP CLI config surface
 
@@ -685,9 +706,15 @@ let build = SessionBuildOptions {
 Skill introspection (standalone, no session required):
 
 ```rust
+use meerkat_core::skills::{SkillKey, SkillName, SourceUuid};
+
 if let Some(runtime) = factory.build_skill_runtime(&config).await {
     let entries = runtime.list_all_with_provenance(&SkillFilter::default()).await?;
-    let doc = runtime.load_from_source(&"task-workflow".into(), Some("company")).await?;
+    let key = SkillKey::new(
+        SourceUuid::builtin(),
+        SkillName::parse("task-workflow")?,
+    );
+    let doc = runtime.load_from_source(&key, Some("company")).await?;
 }
 ```
 

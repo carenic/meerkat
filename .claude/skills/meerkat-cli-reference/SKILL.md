@@ -51,6 +51,7 @@ rkat blob get <BLOB-ID> [--output <FILE>] [--json]
 rkat realm current|list|show|create|delete|prune ...
 rkat mcp add|remove|list|get ...
 rkat mob spawn-helper|fork-helper|member-status|force-cancel|respawn|wait-kickoff|run-flow|flow-status|pack|inspect|validate|deploy|web ...
+rkat workgraph list|show|ready|snapshot|events ...
 rkat skill add|remove|get|list|inspect ...
 rkat config get|set|patch ...
 rkat capabilities
@@ -73,10 +74,15 @@ Common options:
 --resume [<SESSION>]            # omit value to resume last
 -m, --model <MODEL>
 -d, --max-duration <DURATION>
--o, --output <text|json>
+-o, --output <text|json|html>
 --json                          # alias for --output json
 -s, --stream
 --no-stream
+--html                          # alias for --output html
+--browser                       # output html and open it in the browser
+--open-in-browser               # open HTML output after writing the artifact
+--html-template <NAME>
+--html-template-file <PATH>
 --skill <PATH_OR_ID>            # repeatable
 -t, --tools <safe|workspace|full|none>
 --yolo                          # alias for --tools full
@@ -105,14 +111,17 @@ Advanced options:
 --auth-binding <REALM:BINDING[:PROFILE]>
 ```
 
-Resume targets: full UUID, short UUID prefix, `realm:<uuid>`, `last`, `~`,
-`~0`, or `~N`.
+Resume targets: full UUID, UUID prefix/tail handle, `realm:<uuid>`, `last`,
+`~`, `~0`, or `~N`.
 
 Defaults:
 
 - `--tools safe`
+- default model is OpenAI `gpt-5.5` unless realm config/auth binding selects another model
+- CLI realm state is project-local by default: `<context-root>/.rkat/realms/<ws-...>/`
 - stream on in a TTY, off in pipes/scripts
 - piped stdin is blob context unless `--stdin lines`
+- short session handles are UUID tails; resume accepts full UUID, prefix/tail, `realm:<uuid>`, `last`, `~`, or `~N`
 
 ## Help
 
@@ -284,3 +293,17 @@ Runtime env fallback order:
 - Anthropic: `RKAT_ANTHROPIC_API_KEY`, `ANTHROPIC_API_KEY`
 - OpenAI: `RKAT_OPENAI_API_KEY`, `OPENAI_API_KEY`
 - Gemini: `RKAT_GEMINI_API_KEY`, `GEMINI_API_KEY`, `RKAT_GOOGLE_API_KEY`, `GOOGLE_API_KEY`
+- Azure OpenAI: `RKAT_AZURE_OPENAI_API_KEY` + `RKAT_AZURE_OPENAI_ENDPOINT`, then `AZURE_OPENAI_API_KEY` + `AZURE_OPENAI_ENDPOINT`
+
+## WorkGraph
+
+`rkat workgraph` is read-only operator lookup for the active realm. Agents
+mutate WorkGraph through `workgraph_*` tools.
+
+```bash
+rkat workgraph list [--namespace <NS>] [--all-namespaces] [--status <STATUS>] [--label <LABEL>] [--include-terminal] [--limit <N>] [--json]
+rkat workgraph show <ID> [--namespace <NS>] [--json]
+rkat workgraph ready [--namespace <NS>] [--label <LABEL>] [--limit <N>] [--json]
+rkat workgraph snapshot [--namespace <NS>] [--all-namespaces] [--status <STATUS>] [--label <LABEL>] [--include-terminal] [--limit <N>] [--json]
+rkat workgraph events [--namespace <NS>] [--all-namespaces] [--after-seq <N>] [--limit <N>] [--json]
+```

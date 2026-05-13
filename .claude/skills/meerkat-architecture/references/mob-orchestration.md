@@ -104,7 +104,10 @@ Definition has `WiringRules` with `role_wiring: [{a, b}]`. At spawn time, `MobAc
 - `FlowFrameEngine` — scheduler-backed frame execution and revisit/healing
 - `SpawnPolicyService` — runtime policy swap (RwLock)
 - `MobOpsAdapter` — bridges to `OpsLifecycleRegistry`
-- `MobTaskBoardService` — task board validation and persistence
+
+Mob no longer owns a separate task-board service. Durable cross-agent
+commitments live in WorkGraph; mob-owned services stay focused on orchestration,
+member lifecycle, flow execution, wiring, and runtime bridges.
 
 Remaining `*_authority.rs` files under `meerkat-mob/src/runtime/` (roster, loop_iteration, member_lifecycle, wiring, runtime_bridge) are shell mechanics — data projections, pure planners, sealed mutators — not state machines. They never contain `fn apply(input) -> Result<Transition, Error>` match tables; that logic lives in MobMachine DSL.
 

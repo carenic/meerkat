@@ -7,6 +7,114 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+This unreleased line collects the changes currently on `main` after the
+formal 0.6.6 release. It is a feature-bearing development line: WorkGraph,
+Azure OpenAI, project-local CLI defaults, HTML artifacts, typed transcript
+notices, capability companion skills, provider image/search improvements, and
+several runtime/provider fixes.
+
+### Added
+
+- **WorkGraph subsystem** (#684, #688, #689, #694, #696, #699, #702) — added
+  `meerkat-workgraph`, a realm-scoped durable commitment graph with work
+  items, namespaces, labels, priorities, due/not-before/snooze gates, owners,
+  claim leases, external references, evidence references, topology edges,
+  revision/CAS checks, event history, ready-item derivation, snapshots, and the
+  catalog-owned `WorkGraphLifecycleMachine`.
+- **WorkGraph agent tools and host observability** (#684, #699, #702) — agents
+  can mutate WorkGraph through `workgraph_create`, `workgraph_claim`,
+  `workgraph_release`, `workgraph_update`, `workgraph_block`,
+  `workgraph_close`, `workgraph_link`, and `workgraph_add_evidence`, while
+  CLI/RPC/REST/SDK callers get read-only lookup through `list`, `show/get`,
+  `ready`, `snapshot`, and `events` surfaces.
+- **WorkGraph SDK support** (#684, #702) — Python and TypeScript clients now
+  forward `enable_workgraph` / `enableWorkGraph` on session creation and expose
+  typed read-only WorkGraph APIs for items, ready work, snapshots, and events.
+- **Azure OpenAI backend support** (#700) — OpenAI provider bindings can now
+  target Azure OpenAI through `backend_kind = "azure_openai"` and
+  `auth_method = "azure_api_key"`, including Azure endpoint normalization,
+  `api-key` auth, deployment-name model selection, image-generation deployment
+  options, Azure image headers, and RKAT-prefixed env overrides.
+- **HTML output mode** (#693) — `rkat run` now supports `--output html`,
+  `--html`, `--browser`, `--open-in-browser`, `--html-template`, and
+  `--html-template-file`, writing standalone HTML artifacts under the active
+  realm's presentation output.
+- **Project-local CLI realms** — CLI `run`, `run --resume`, and `session`
+  commands now default to a workspace-derived `ws-...` realm under
+  `<context-root>/.rkat/realms`, with `--context-root`, `--state-root`,
+  `--realm`, and `--isolated` preserving explicit control.
+- **Provider-native search/image delegation** (#682, #691) — Anthropic,
+  Gemini, and OpenAI gained provider-native search fallback executors; OpenAI
+  hosted image generation now supports `provider_params.reasoning_effort` and
+  `provider_params.web_search` on the hosted `gpt-image-2` path.
+- **Typed capability registry** — added `meerkat-capabilities` as the typed
+  capability vocabulary and feature-owned registration point for sessions,
+  streaming, structured output, hooks, builtins, shell, comms, memory,
+  schedule, WorkGraph, session store, compaction, skills, MCP live, and live.
+- **Companion workflow skills** (#694) — added/expanded embedded companion
+  skills for WorkGraph, scheduling, skill discovery, and built-in utility
+  workflows so tool descriptions can stay schema-oriented while operational
+  guidance lives in skills.
+- **Dogma and WorkGraph documentation** (#689, #694) — added public Meerkat
+  dogma docs, the `meerkat-dogma-inquisition` skill, WorkGraph concept/guide/
+  reference/example docs, realm docs, Azure OpenAI docs, HTML-output docs, and
+  capability/skill reference updates.
+
+### Changed
+
+- **Default CLI model is OpenAI** — the CLI now defaults to OpenAI `gpt-5.5`,
+  with provider-aware default-model resolution that follows auth binding
+  provider/defaults, repairs legacy built-in defaults, and preserves explicit
+  user model choices.
+- **Runtime metadata is typed transcript data** (#686) — comms, external
+  events, MCP changes, tool config, auth, background jobs, and runtime notices
+  are persisted as typed `system_notice` blocks instead of being reclassified
+  from `[SYSTEM NOTICE]` user-text prefixes. Provider-facing notice text is now
+  a projection assembled for the model, not the stored operator prompt.
+- **Mob task-board surface retired** — the old mob task-board model and
+  `mob_tasks` profile knob were removed in favor of agent-facing mob tools and
+  WorkGraph for durable cross-agent commitments.
+- **BuildBuddy and release preflight hardened** — release preflight now runs
+  `scripts/release-doctor`; BuildBuddy runs keep pending jobs queued; release
+  backend selection, wasm-pack checks, npm/crates readiness, and Web SDK
+  recovery timeouts were tightened.
+- **OpenAI request behavior tightened** — image and Responses API calls now
+  use `store: false` where appropriate, hosted image generation streams through
+  the ChatGPT backend path, and OpenAI/Azure request construction is more
+  explicit about backend-specific headers and URLs.
+- **Skills identity tightened** — skill references now use structured
+  `SkillKey { source_uuid, skill_name }` identity, legacy string refs are
+  rejected on the wire, and large skill collections use a collection summary
+  mode rather than injecting all content eagerly.
+
+### Fixed
+
+- **CLI session handle ambiguity** — short session handles now use the UUID
+  tail, while resume accepts either prefix or tail and ambiguous matches report
+  fuller realm/session refs, avoiding UUIDv7 timestamp-prefix collisions such
+  as repeated `019e...` handles.
+- **WorkGraph runtime gaps** (#688, #689, #702) — WorkGraph machine authority
+  is durable, legacy refresh paths are hardened, invalid graph topology is
+  rejected, and WorkGraph/delegate runtime wiring stays available across turns.
+- **OpenAI image and stream failures** (#691, #692, #695) — OAuth-backed image
+  generation, streamed image error events, HTTP failure bodies, compaction
+  stream failures, `response.failed` handling, and image smoke timeout behavior
+  now surface as structured provider/runtime failures instead of timeouts or
+  parse surprises.
+- **Anthropic/Claude OAuth edge cases** — fixed Anthropic OAuth scope refresh
+  failures, Claude AI OAuth request envelopes, beta header composition, and
+  rate-limit routing via the `x-app` header.
+- **Deferred session and mob runtime behavior** (#697, #701, #702) — fixed
+  deferred session context promotion, forwarded CLI mob runtime apply, and kept
+  mob wiring responsive while turns are in flight.
+- **Azure OpenAI regressions** (#700) — fixed CI regressions, env precedence,
+  endpoint normalization, image-deployment edge cases, and auth-contract
+  vocabulary coverage for Azure OpenAI.
+- **Typed notice regressions** (#686) — fixed CLI typed notice display, clippy
+  issues, typed turn-gate behavior, smoke summaries, and provider projections.
+- **HTML artifact output edge cases** (#693) — fixed browser/open handling and
+  artifact output behavior for HTML mode.
+
 ## [0.6.6] - 2026-05-11
 
 Meerkat 0.6.6 is a patch release for live transport smoke coverage, session

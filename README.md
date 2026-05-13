@@ -54,10 +54,10 @@ Those tools excel at interactive development with rich terminal UIs. Meerkat is 
 
 ```bash
 cargo install rkat
-export RKAT_ANTHROPIC_API_KEY=sk-ant-...
+export RKAT_OPENAI_API_KEY=sk-...
 ```
 
-`RKAT_ANTHROPIC_API_KEY`, `RKAT_OPENAI_API_KEY`, and `RKAT_GEMINI_API_KEY` take precedence over the provider-native names (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`). You can also install from the Homebrew tap, use release binaries, or let the Python and TypeScript SDKs auto-resolve `rkat-rpc`:
+`RKAT_OPENAI_API_KEY`, `RKAT_ANTHROPIC_API_KEY`, and `RKAT_GEMINI_API_KEY` take precedence over the provider-native names (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GOOGLE_API_KEY`). Azure OpenAI uses `RKAT_AZURE_OPENAI_API_KEY` plus `RKAT_AZURE_OPENAI_ENDPOINT` (or the unprefixed Azure names). You can also install from the Homebrew tap, use release binaries, or let the Python and TypeScript SDKs auto-resolve `rkat-rpc`:
 
 ```bash
 brew install lukacf/meerkat/rkat
@@ -73,6 +73,13 @@ Release artifacts include `rkat`, `rkat-rpc`, `rkat-rest`, and `rkat-mcp`.
 ```bash
 rkat run "What is the capital of France?"
 rkat run --model gpt-5.5 "Explain async/await"
+```
+
+**Render rich answers in your browser** when a visual artifact is easier to read:
+
+```bash
+rkat run --browser "Create a one-page HTML brief comparing REST, RPC, and MCP surfaces"
+rkat help --browser "How do I configure Azure OpenAI?"
 ```
 
 **Share state across processes** with an explicit realm:
@@ -212,13 +219,15 @@ make release-preflight
 
 ## Capabilities
 
-**Providers and streaming.** Anthropic, OpenAI, Gemini, and self-hosted models share one streaming interface. The model catalog carries defaults, capability gates, parameter schemas, provider-native web-search behavior, image defaults, and provider/model mismatch checks.
+**Providers and streaming.** Anthropic, OpenAI, Azure OpenAI, Gemini, and self-hosted models share one streaming interface. The model catalog carries defaults, capability gates, parameter schemas, provider-native web-search behavior, image defaults, and provider/model mismatch checks.
 
 **Sessions, realms, and auth.** Sessions are realm-scoped and resumable across surfaces. Env vars are the fast path; realm bindings add backend profiles, auth profiles, `auth_binding`, OAuth/device flows, TokenStore persistence, cloud IAM, external resolvers, auth freshness, and per-member overrides.
 
 **Tools and integration.** Custom dispatchers, builtins, shell, scheduler tools, comms, skills, memory, MCP servers, and structured output compose into one tool surface. Applications can discover deferred tools with `tool_catalog_search` and `tool_catalog_load`, live-add or reload MCP servers, and scope tool visibility by profile, session, or turn.
 
 **Scheduling.** Durable schedules run sessions or mobs from once, interval, or calendar triggers. Occurrences survive process restarts and carry overlap, misfire, and missing-target policy. Host apps use REST/RPC schedule APIs; agents use the `meerkat_schedule_*` tools.
+
+**WorkGraph.** WorkGraph is a realm-scoped durable commitment graph for agent work. Agents create, claim, link, evidence, and close work items through `workgraph_*` tools, while CLI, REST, RPC, Python, and TypeScript surfaces provide read-only observability for items, ready work, snapshots, and events.
 
 **Multi-agent mobs.** Mobs are reusable teams built from definitions, profiles, profile stores, budgets, scoped tools, credentials, flows, and signed peer-to-peer wiring. Prefabs are no longer the model; define the team you need and launch members through the current `mob_*` tools and host APIs.
 
@@ -232,7 +241,7 @@ make release-preflight
 
 **Packaging and targets.** Mobpack ships the current CLI surface: `rkat mob pack`, `rkat mob inspect`, `rkat mob validate`, `rkat mob deploy`, and `rkat mob web build`.
 
-**Modularity.** Rust library consumers choose feature flags such as `anthropic`, `openai`, `gemini`, `session-store`, `mcp`, `comms`, `skills`, and `schedule`. Shipped CLI/RPC/REST/MCP binaries are product builds with the expected batteries included.
+**Modularity.** Rust library consumers choose feature flags such as `anthropic`, `openai`, `gemini`, `session-store`, `mcp`, `comms`, `skills`, `schedule`, and `workgraph`. Shipped CLI/RPC/REST/MCP binaries are product builds with the expected batteries included.
 
 ## Surfaces
 
@@ -427,6 +436,8 @@ See full guide: [Mobpack and Web Deployment](https://docs.rkat.ai/guides/mobpack
 export RKAT_ANTHROPIC_API_KEY=sk-ant-...
 export RKAT_OPENAI_API_KEY=sk-...
 export RKAT_GEMINI_API_KEY=...
+export RKAT_AZURE_OPENAI_API_KEY=...
+export RKAT_AZURE_OPENAI_ENDPOINT=https://example.openai.azure.com/
 ```
 
 ```toml

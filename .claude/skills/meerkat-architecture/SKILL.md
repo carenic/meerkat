@@ -173,6 +173,7 @@ per-binding (ops registry membership, adapter ownership for a running channel).
 | `meerkat-hooks` | Hook runtimes (in-process, command, HTTP) | Implements `HookEngine` |
 | `meerkat-skills` | Skill loading (filesystem, git, HTTP, embedded) | Implements `SkillEngine` |
 | `meerkat-memory` | Semantic memory stores and retrieval | Implements `MemoryStore` |
+| `meerkat-workgraph` | Realm-scoped durable WorkGraph store, service, lifecycle policy, tool surface, and read-only host surface helpers | `WorkGraphStore` |
 | `meerkat-mob` | Multi-agent orchestration, member provisioning, flow runtime, **identity-first binding model, supervisor bridge** | `MobSessionService`, `MobProvisioner`, `MobMemberRuntimeBridge` |
 | `meerkat-mob-pack` | Mobpack archive format, signing, trust policies, validation | — |
 | `meerkat-mob-mcp` | MCP/operator mob surface plus agent-facing delegation tool surface | `MobMcpState`, `AgentMobToolSurfaceFactory` |
@@ -216,6 +217,7 @@ For comprehensive file lists, see the matching reference. This is a minimal poin
 - `meerkat-core/src/agent.rs`, `meerkat-core/src/agent/*.rs` — agent loop
 - `meerkat/src/factory.rs` — `AgentFactory::build_agent()` (pipeline)
 - `meerkat-session/src/{ephemeral,persistent}.rs` — session services
+- `meerkat-workgraph/src/{types,store,service,tools}.rs` — WorkGraph domain model, durable stores, service policy, and agent tools
 - `meerkat-mob/src/runtime/actor.rs` — `MobActor`
 - `meerkat-mob/src/backend.rs`, `meerkat-mob/src/ids.rs` — identity-first binding model
 - `meerkat-mob/src/runtime/supervisor_bridge.rs` — supervisor bridge transport

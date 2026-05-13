@@ -116,6 +116,27 @@ Notes:
 - `-H KEY:VALUE` is for HTTP/SSE headers; `-e KEY=VALUE` is for stdio process environment.
 - `rkat mcp` is a config surface. Live mutation of a running session uses JSON-RPC `mcp/add|remove|reload`, REST `POST /sessions/{id}/mcp/*`, MCP-server tools, or SDK helpers.
 
+## WorkGraph
+
+WorkGraph is the realm-scoped durable commitment graph for shared agent work.
+It owns work item lifecycle, dependency readiness, claims/leases, evidence
+references, and event snapshots. It is optional and enabled through
+`enable_workgraph` / `tools.workgraph_enabled`.
+
+- Agents mutate WorkGraph through `workgraph_*` tools.
+- CLI/REST/RPC/SDK surfaces are read-only observability in v1.
+- CLI: `rkat workgraph list|show|ready|snapshot|events`.
+- RPC: `workgraph/get`, `workgraph/list`, `workgraph/ready`,
+  `workgraph/snapshot`, `workgraph/events`.
+- REST: `GET /workgraph/items`, `/workgraph/items/{id}`,
+  `/workgraph/ready`, `/workgraph/snapshot`, `/workgraph/events`.
+- Python/TypeScript SDKs expose typed read-only wrappers and session options
+  `enable_workgraph` / `enableWorkGraph`.
+
+Use WorkGraph for durable pending work, dependencies, claims, and evidence. Use
+Schedule for time and recurrence; use memory for retrieved knowledge; use comms
+for live messages.
+
 ## Mob behavior (current contract)
 
 - CLI `run`/`run --resume` compose `mob_*` tools through `meerkat-mob-mcp` dispatcher integration when mob tools are enabled, for example with `--tools full` or config `tools.mob_enabled=true`.
@@ -449,13 +470,13 @@ The `meerkat` facade crate defaults to providers only (Anthropic, OpenAI, Gemini
 
 ```toml
 # Default: three providers, no storage/comms/tools
-meerkat = "0.6.5"
+meerkat = "0.6.6"
 
 # Single provider, minimal
-meerkat = { version = "0.6.5", default-features = false, features = ["anthropic"] }
+meerkat = { version = "0.6.6", default-features = false, features = ["anthropic"] }
 
 # Add persistence + memory + comms + live channels
-meerkat = { version = "0.6.5", features = [
+meerkat = { version = "0.6.6", features = [
     "jsonl-store", "session-store", "session-compaction",
     "memory-store-session", "comms", "mcp", "skills",
     "openai-realtime", "live"

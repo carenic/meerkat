@@ -21,6 +21,7 @@ meerkat-core              (pure types, traits, agent loop, session-store contrac
   ├── meerkat-session         (session service: Ephemeral, Persistent)
   ├── meerkat-runtime         (runtime control plane, policy engine, completion-feed wake,
                                 DSL handle impls)
+  ├── meerkat-workgraph       (realm-scoped durable WorkGraph service, stores, tools, read surface)
   ├── meerkat-live            (LiveAdapterHost, live projection sink, WebSocket transport)
   ├── meerkat-comms           (inter-agent: inproc, TCP, UDS, Ed25519)
   ├── meerkat-hooks           (hook engine: in-process, command, HTTP)
@@ -51,7 +52,7 @@ Surface binaries:
   └── meerkat-mcp-server    → rkat-mcp                    (MCP server)
 ```
 
-There are no separate public reduced-surface binaries in 0.6.5. Reduced-surface distributions are source builds of the same surface crates with a narrower Cargo feature set.
+There are no separate public reduced-surface binaries in 0.6.6. Reduced-surface distributions are source builds of the same surface crates with a narrower Cargo feature set.
 
 ## Key Traits
 
@@ -71,6 +72,7 @@ There are no separate public reduced-surface binaries in 0.6.5. Reduced-surface 
 | `MemoryStore` | Semantic memory | `HnswMemoryStore`, `SimpleMemoryStore` (meerkat-memory) |
 | `OpsLifecycleRegistry` | Async operation tracking (wait_all, collect_completed, bounded retention, timestamps, concurrency, detached wake) | `RuntimeOpsLifecycleRegistry` (meerkat-runtime) |
 | `MobToolsFactory` | Late-binding session-scoped mob tool construction | `AgentMobToolSurfaceFactory` (meerkat-mob-mcp) |
+| `WorkGraphStore` | Durable realm-scoped work item, edge, claim, event, and snapshot storage | `MemoryWorkGraphStore`, `SqliteWorkGraphStore` (meerkat-workgraph) |
 
 ### Runtime traits (defined in meerkat-runtime)
 
