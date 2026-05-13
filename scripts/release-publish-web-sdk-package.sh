@@ -13,6 +13,8 @@ if [[ -z "${tarball}" || ! -f "${tarball}" ]]; then
   exit 2
 fi
 
+tarball="$(cd "$(dirname "${tarball}")" && pwd -P)/$(basename "${tarball}")"
+
 cd "${root}"
 
 dry_run="${MEERKAT_REGISTRY_DRY_RUN:-${REGISTRY_DRY_RUN:-false}}"

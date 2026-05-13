@@ -3,7 +3,7 @@ set -euo pipefail
 
 usage() {
   cat <<'EOF'
-usage: release-workflow-dispatch [--mode full|assets|packages|web-sdk] [--version vX.Y.Z] [--backend auto|github-hosted|buildbuddy] [--ref REF] [--dry-run]
+usage: release-workflow-dispatch [--mode full|assets|packages|web-sdk|web-sdk-publish] [--version vX.Y.Z] [--backend auto|github-hosted|buildbuddy] [--ref REF] [--web-sdk-artifact-run-id RUN_ID] [--dry-run]
 
 Dispatches the release workflow through the same public/default vs owner-only
 BuildBuddy backend split used by CI.
@@ -18,6 +18,7 @@ Environment equivalents:
   RELEASE_BACKEND            auto, github-hosted, or buildbuddy. Defaults to auto.
   RELEASE_REF                Workflow ref. Defaults to the tag for full and main for recovery modes.
   REGISTRY_DRY_RUN           true/false for package publish dry-runs.
+  WEB_SDK_ARTIFACT_RUN_ID    Existing workflow run id containing rkat-web-package.
   RELEASE_WORKFLOW_DRY_RUN   true/false to print the gh command without dispatching.
   MEERKAT_BUILDBUDDY         When RELEASE_BACKEND=auto, true selects buildbuddy
                               and false/0 selects github-hosted. If unset, auto
@@ -30,6 +31,7 @@ mode="${MODE:-full}"
 version="${VERSION:-${RELEASE_TAG:-}}"
 backend="${RELEASE_BACKEND:-auto}"
 workflow_ref="${RELEASE_REF:-}"
+web_sdk_artifact_run_id="${WEB_SDK_ARTIFACT_RUN_ID:-}"
 case "${RELEASE_WORKFLOW_DRY_RUN:-false}" in
   1|true|TRUE|yes|YES|on|ON) dry_run=1 ;;
   *) dry_run=0 ;;
@@ -57,6 +59,10 @@ while [[ $# -gt 0 ]]; do
       dry_run=1
       shift
       ;;
+    --web-sdk-artifact-run-id)
+      web_sdk_artifact_run_id="${2:?--web-sdk-artifact-run-id requires a value}"
+      shift 2
+      ;;
     -h|--help)
       usage
       exit 0
@@ -70,7 +76,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 case "${mode}" in
-  full|assets|packages|web-sdk) ;;
+  full|assets|packages|web-sdk|web-sdk-publish) ;;
   *)
     echo "unknown release mode: ${mode}" >&2
     usage >&2
@@ -144,7 +150,7 @@ esac
 if [[ -z "${workflow_ref}" ]]; then
   case "${mode}" in
     full) workflow_ref="${version}" ;;
-    assets|packages|web-sdk) workflow_ref="main" ;;
+    assets|packages|web-sdk|web-sdk-publish) workflow_ref="main" ;;
   esac
 fi
 
@@ -180,6 +186,18 @@ case "${mode}" in
       -f "registry_dry_run=${REGISTRY_DRY_RUN:-false}"
     )
     ;;
+  web-sdk-publish)
+    if [[ -z "${web_sdk_artifact_run_id}" ]]; then
+      echo "--web-sdk-artifact-run-id is required for --mode web-sdk-publish" >&2
+      exit 2
+    fi
+    args+=(
+      -f "publish_release_packages=true"
+      -f "publish_web_sdk_only=true"
+      -f "web_sdk_artifact_run_id=${web_sdk_artifact_run_id}"
+      -f "registry_dry_run=${REGISTRY_DRY_RUN:-false}"
+    )
+    ;;
 esac
 
 printf 'release workflow backend: %s\n' "${backend}"
@@ -194,6 +212,9 @@ fi
 case "${mode}" in
   full|packages|web-sdk)
     printf 'release workflow registry publishing: prebuilt Web SDK artifact + GitHub-hosted credentialed publish (use web-sdk/packages recovery for retries)\n'
+    ;;
+  web-sdk-publish)
+    printf 'release workflow registry publishing: existing Web SDK artifact %s + GitHub-hosted credentialed publish\n' "${web_sdk_artifact_run_id}"
     ;;
 esac
 
