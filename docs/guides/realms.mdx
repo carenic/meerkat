@@ -1,0 +1,180 @@
+---
+title: "Realm guide"
+description: "How rkat chooses a realm, where realm state lives, and how to share or isolate state deliberately."
+icon: "earth-americas"
+---
+
+Realms are Meerkat's state boundary. A realm owns sessions, runtime config,
+auth bindings, schedules, blobs, mob state, and the pinned persistence backend.
+
+There are two separate choices:
+
+1. **Realm identity**: which logical realm id is active.
+2. **Realm state root**: where realm directories are stored on disk.
+
+The CLI's default is workspace-friendly identity with project-local storage:
+
+```bash
+rkat "summarize this repo"
+```
+
+That derives a stable `ws-...` realm id from the workspace/context root, then
+stores the realm under `<context-root>/.rkat/realms/`.
+
+## See The Active Realm
+
+Use verbose mode when behavior is surprising:
+
+```bash
+rkat "hello" --verbose
+```
+
+The startup log includes:
+
+```text
+Using realm: ws-..., context root: /path/to/workspace, realm root: /path/to/workspace/.rkat/realms/ws-...
+```
+
+- `realm` is the logical sharing key.
+- `context root` is the path used to derive a workspace realm when `--realm` is omitted.
+- `realm root` is the physical realm directory that contains `config.toml`,
+  `realm_manifest.json`, sessions, blobs, and other realm state.
+
+## Default CLI Behavior
+
+When `--realm` is omitted, CLI run/session commands use a stable workspace
+realm:
+
+```bash
+rkat run "fix the failing test"
+rkat session list
+```
+
+By default, the context root is the current directory. The CLI derives the
+workspace realm id from that path and creates `.rkat/realms/<realm>/` there on
+first use.
+
+This means a subdirectory is a different default realm from its parent. Pass
+`--context-root <parent>` or `--realm <id>` when you want a subdirectory command
+to share the parent project's state.
+
+## Where State Lives
+
+By default, CLI realm state is project-local:
+
+```text
+<context-root>/.rkat/realms/
+```
+
+Each realm gets a subdirectory:
+
+```text
+<state-root>/<realm-id>/
+  config.toml
+  realm_manifest.json
+  sessions.sqlite3
+  sessions_jsonl/
+```
+
+Project-local `.rkat/` also contains project-scoped files such as
+`.rkat/mcp.toml`, `.rkat/skills/`, and compatibility configuration workflows.
+
+## Choose An Explicit Shared Realm
+
+Use `--realm` when multiple surfaces or folders should intentionally share
+state:
+
+```bash
+rkat --realm team-alpha run "draft release notes"
+rkat --realm team-alpha session list
+rkat-rpc --realm team-alpha
+rkat-rest --realm team-alpha
+rkat-mcp --realm team-alpha
+```
+
+The same explicit realm id means the same sessions, config, auth bindings,
+schedules, blobs, and mob state.
+
+## Isolate A Run
+
+Use `--isolated` when a command should not reuse workspace state:
+
+```bash
+rkat --isolated run "try this without touching my project realm"
+```
+
+This creates a fresh opaque `realm-...` id.
+
+## Change The Workspace Root
+
+Use `--context-root` when you want workspace-derived identity, but from a
+specific path:
+
+```bash
+rkat --context-root "$PWD" run "use this folder as the workspace identity"
+```
+
+This changes both the derived `ws-...` realm id and, unless `--state-root` is
+also supplied, the default project-local state root.
+
+## Override The State Root
+
+Use `--state-root` when you want realm files somewhere other than
+`<context-root>/.rkat/realms`:
+
+```bash
+rkat --state-root "$HOME/.local/share/meerkat/realms" run "store this realm globally"
+```
+
+`--state-root` changes the parent directory that contains realm directories. It
+does not change the realm id. Combine it with `--context-root` or `--realm` when
+you need both custom storage and predictable identity:
+
+```bash
+rkat \
+  --context-root "$PWD" \
+  --state-root "$HOME/.local/share/meerkat/realms" \
+  run "use project identity and global storage"
+```
+
+## Backend Pinning
+
+The first open of a realm writes `realm_manifest.json` and pins the backend.
+
+```bash
+rkat --realm audit --realm-backend sqlite run "start audit"
+```
+
+After the manifest exists, `--realm-backend` is ignored for that realm. The
+stored manifest wins so every surface opens the same backend.
+
+## Common Surprises
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| A subdirectory does not see parent sessions | CLI defaults `context_root` to the current directory | Pass `--context-root <parent>` or an explicit shared `--realm` |
+| A command creates a new `.rkat/realms` directory | No state root was supplied, so CLI used `<context-root>/.rkat/realms` | Pass `--state-root <path>` |
+| CLI and RPC do not share state | RPC defaults to an isolated opaque realm | Pass the same `--realm` to both |
+| `--realm-backend` does not switch an existing realm | Backend is pinned in `realm_manifest.json` | Create a new realm or migrate state intentionally |
+
+## Recommended Defaults
+
+For normal local development, use the CLI defaults and inspect with
+`--verbose` when needed.
+
+For team or daemon workflows, use explicit names:
+
+```bash
+rkat --realm prod run "check deploy readiness"
+rkat-rpc --realm prod
+```
+
+For a fully explicit project-local setup, set both axes:
+
+```bash
+rkat \
+  --context-root "$PWD" \
+  --state-root "$PWD/.rkat/realms" \
+  --realm project \
+  run "work only in this project-local realm"
+```

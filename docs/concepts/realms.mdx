@@ -6,6 +6,9 @@ icon: "earth-americas"
 
 Meerkat is realm-first. A `realm_id` is the only identity key for sharing or isolating state across surfaces.
 
+For task-oriented CLI behavior, filesystem layout, and troubleshooting, see the
+[realm guide](/guides/realms).
+
 ## Core rules
 
 1. Same `realm_id` means shared sessions, config, and runtime metadata.
@@ -26,6 +29,11 @@ Realm IDs must be 1-64 characters, start with an ASCII alphanumeric character, a
 | Python/TypeScript SDK | Whatever the spawned `rkat-rpc` process picks (new opaque realm unless `realm_id` is passed) |
 
 This means CLI is workspace-friendly by default, while non-CLI surfaces are isolated by default.
+
+The CLI workspace default uses the current directory as `context_root`, derives
+identity from that path, and stores realm runtime state under
+`<context-root>/.rkat/realms/` unless `--context-root` or `--state-root` is
+provided.
 
 ## Explicit sharing
 

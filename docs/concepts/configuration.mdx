@@ -14,7 +14,15 @@ Every realm has its own config file and runtime state:
 - `config_state.json` (generation counter for CAS)
 - `realm_manifest.json` (pinned backend + metadata)
 
-The canonical location is under the platform data directory:
+The canonical location is under the active realm state root. For CLI commands,
+the default is project-local:
+
+```text
+<context-root>/.rkat/realms/<realm>/
+```
+
+For daemon/API surfaces that do not receive a `--state-root`, the default state
+root is the platform data directory:
 
 - macOS: `~/Library/Application Support/meerkat/realms/<realm>/`
 - Linux: `~/.local/share/meerkat/realms/<realm>/`
@@ -77,7 +85,8 @@ rkat --realm team-alpha config get --format json --with-generation
 rkat --realm team-alpha config patch --json '{"agent":{"model":"gpt-5.5"}}' --expected-generation 4
 ```
 
-Without `--realm`, CLI uses the workspace-derived default realm (`ws-...`).
+Without `--realm`, CLI derives a stable workspace realm (`ws-...`) from the
+current directory, or from `--context-root` when supplied.
 
 ## What about `~/.rkat/config.toml` and `.rkat/config.toml`?
 

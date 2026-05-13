@@ -241,7 +241,7 @@ fn test_config_patch_semantics() {
 #[test]
 fn test_inv_001_default_model_from_config() {
     let config = Config::default();
-    assert_eq!(config.agent.model, config.models.anthropic);
+    assert_eq!(config.agent.model, config.models.openai);
 }
 
 #[test]

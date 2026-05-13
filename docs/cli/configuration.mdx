@@ -9,8 +9,11 @@ icon: "sliders"
 All CLI commands accept realm scope flags:
 
 - `--realm <id>`
+- `--isolated`
 - `--instance <id>`
 - `--realm-backend <sqlite|jsonl>` (creation hint only)
+- `--state-root <path>`
+- `--context-root <path>`
 
 These flags decide which realm config/session state is used.
 
@@ -23,6 +26,13 @@ These flags decide which realm config/session state is used.
 | `rkat-rpc` | New opaque realm (`realm-...`) |
 
 If you want CLI + RPC to share the same state, pass the same explicit `--realm` to both.
+
+For CLI commands, the default context root is the current directory. The default
+state root is `<context-root>/.rkat/realms`.
+
+Use `--verbose` on `rkat run` to print the active realm, context root, and
+physical realm root. See the [realm guide](/guides/realms) for the full
+identity-vs-storage model.
 
 ## Environment variables
 
@@ -38,7 +48,8 @@ See [providers](/concepts/providers) for full key precedence (`RKAT_*` variants 
 
 ## Config files
 
-Canonical runtime config for CLI commands is realm-scoped (`<realm>/config.toml` under platform data dir).
+Canonical runtime config for CLI commands is realm-scoped
+(`<context-root>/.rkat/realms/<realm>/config.toml` by default).
 
 Compatibility files still exist:
 
@@ -102,11 +113,14 @@ Use `bearer_token_env` instead of `bearer_token` whenever possible.
 
 ## Session storage layout
 
-Realm storage lives under platform data dir:
+CLI realm storage lives under the active state root. By default, that is
+project-local:
 
-- macOS: `~/Library/Application Support/meerkat/realms/<realm>/`
-- Linux: `~/.local/share/meerkat/realms/<realm>/`
-- Windows: `%APPDATA%\meerkat\realms\<realm>\`
+```text
+<context-root>/.rkat/realms/<realm>/
+```
+
+Pass `--state-root <path>` to use a different parent directory.
 
 Important files:
 

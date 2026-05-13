@@ -88,10 +88,10 @@ const EXIT_BUDGET_EXHAUSTED: u8 = 2;
 
 const CLI_ABOUT: &str = "Run agent tasks and manage local Meerkat surfaces from the terminal";
 
-const ROOT_AFTER_HELP: &str = "Command groups:\n  Runtime:      run, help\n  Realm config: init, config, realm\n  Utility:      session, blob, models, capabilities, doctor\n\nAdditional commands appear when their supporting capabilities are compiled in.\n\nExamples:\n  rkat \"summarize this repository\"\n  rkat help \"How do I add an mcp server?\"\n  cat story.txt | rkat \"summarize the story\"\n  git diff | rkat run \"review these changes\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nUse `<binary> <command> -h` for the basic view and `<binary> <command> --help` for all options.";
+const ROOT_AFTER_HELP: &str = "Command groups:\n  Runtime:      run, help\n  Realm config: init, config, realm\n  Utility:      session, blob, models, capabilities, doctor\n\nAdditional commands appear when their supporting capabilities are compiled in.\n\nRealm defaults:\n  - context root: current directory, unless --context-root is supplied\n  - state root: <context-root>/.rkat/realms, unless --state-root is supplied\n  - realm id: workspace-derived ws-... unless --realm or --isolated is supplied\n\nExamples:\n  rkat \"summarize this repository\"\n  rkat help \"How do I add an mcp server?\"\n  cat story.txt | rkat \"summarize the story\"\n  git diff | rkat run \"review these changes\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nUse `<binary> <command> -h` for the basic view and `<binary> <command> --help` for all options.";
 const HELP_AFTER_HELP: &str = "Examples:\n  rkat help \"How do I add an mcp server and schedule to remove it in 30 minutes\"\n  rkat help \"Use gemini with my vertex auth, load ~/codex/skills\" --prompt \"Write a match-3 game in Erlang\"";
 
-const RUN_AFTER_HELP: &str = "Examples:\n  rkat run \"summarize this repository\"\n  cat story.txt | rkat run \"summarize the story\"\n  git diff | rkat run --json \"review these changes\"\n  rkat run --html \"make a visual explainer\"\n  rkat run --browser \"create an implementation plan\"\n  rkat run --resume \"keep going\"\n  rkat run --resume ~2 \"pick this thread back up\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nDefaults:\n  - `--tools safe`\n  - provider-native web search on for supporting models; use `--no-web-search` to disable\n  - stream on in a TTY, off in pipes/scripts\n  - piped stdin is read as blob context unless `--stdin lines` is set";
+const RUN_AFTER_HELP: &str = "Examples:\n  rkat run \"summarize this repository\"\n  cat story.txt | rkat run \"summarize the story\"\n  git diff | rkat run --json \"review these changes\"\n  rkat run --html \"make a visual explainer\"\n  rkat run --browser \"create an implementation plan\"\n  rkat run --resume \"keep going\"\n  rkat run --resume ~2 \"pick this thread back up\"\n  tail -f app.log | rkat run --stdin lines \"watch for incidents\"\n  rkat run -t workspace \"fix the failing test\"\n\nDefaults:\n  - realm state under <context-root>/.rkat/realms; use --verbose to print the active realm root\n  - `--tools safe`\n  - provider-native web search on for supporting models; use `--no-web-search` to disable\n  - stream on in a TTY, off in pipes/scripts\n  - piped stdin is read as blob context unless `--stdin lines` is set";
 
 const DEFAULT_TRACE_FILTER: &str = "off";
 const VERBOSE_TRACE_FILTER: &str = "info";
@@ -882,7 +882,7 @@ struct Cli {
         help_heading = "Realm options"
     )]
     realm_backend: Option<RealmBackendArg>,
-    /// Override state root (directory that contains realms).
+    /// Override realm state root. Defaults to <context-root>/.rkat/realms.
     #[arg(
         long,
         global = true,
@@ -890,7 +890,7 @@ struct Cli {
         help_heading = "Realm options"
     )]
     state_root: Option<PathBuf>,
-    /// Convention context root for skills/hooks/AGENTS/MCP config.
+    /// Context root for realm identity and project files. Defaults to CWD.
     #[arg(
         long,
         global = true,
@@ -2654,12 +2654,8 @@ async fn handle_run_command(
         .as_ref()
         .map(|binding| resolve_cli_auth_binding_selection(&config, binding))
         .transpose()?;
-    let model = model.unwrap_or_else(|| {
-        auth_binding_selection
-            .as_ref()
-            .and_then(|selection| selection.default_model.clone())
-            .unwrap_or_else(|| config.agent.model.clone())
-    });
+    let model =
+        resolve_cli_effective_model(&config, model, provider, auth_binding_selection.as_ref());
     let max_tokens = max_tokens.unwrap_or(config.agent.max_tokens_per_turn);
     let resolved_provider = resolve_cli_provider_with_auth_binding(
         &config,
@@ -3136,12 +3132,12 @@ fn resolve_runtime_scope_with_realm(
     cli: &Cli,
     realm_override: Option<String>,
 ) -> anyhow::Result<RuntimeScope> {
-    let default_selection = {
-        let root = cli.context_root.clone().unwrap_or_else(|| {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            find_project_root(&cwd).unwrap_or(cwd)
-        });
-        RealmSelection::WorkspaceDerived { root }
+    let context_root = cli
+        .context_root
+        .clone()
+        .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")));
+    let default_selection = RealmSelection::WorkspaceDerived {
+        root: context_root.clone(),
     };
     let selection =
         RealmConfig::selection_from_inputs(realm_override, cli.isolated, default_selection)?;
@@ -3150,6 +3146,10 @@ fn resolve_runtime_scope_with_realm(
         RealmSelection::Isolated => RealmOrigin::Generated,
         RealmSelection::WorkspaceDerived { .. } => RealmOrigin::Workspace,
     };
+    let state_root = cli
+        .state_root
+        .clone()
+        .unwrap_or_else(|| default_cli_state_root(&context_root));
     let realm_cfg = RealmConfig {
         selection,
         instance_id: cli.instance.clone(),
@@ -3157,16 +3157,9 @@ fn resolve_runtime_scope_with_realm(
             .realm_backend
             .map(Into::into)
             .map(|b: RealmBackend| b.as_str().to_string()),
-        state_root: cli.state_root.clone(),
+        state_root: Some(state_root),
     };
     let locator = realm_cfg.resolve_locator()?;
-    let context_root = Some(match cli.context_root.clone() {
-        Some(root) => root,
-        None => {
-            let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-            find_project_root(&cwd).unwrap_or(cwd)
-        }
-    });
     let user_config_root = cli.user_config_root.clone().or_else(dirs::home_dir);
     #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
     let (auth_lease, oauth_flow_authority) = new_cli_auth_handles();
@@ -3179,12 +3172,16 @@ fn resolve_runtime_scope_with_realm(
         // Existing realms are always opened using their pinned manifest backend.
         backend_hint: cli.realm_backend.map(Into::into),
         origin_hint,
-        context_root,
+        context_root: Some(context_root),
         user_config_root,
         auth_lease,
         #[cfg(all(feature = "anthropic", feature = "openai", feature = "gemini"))]
         oauth_flow_authority,
     })
+}
+
+fn default_cli_state_root(context_root: &Path) -> PathBuf {
+    context_root.join(".rkat").join("realms")
 }
 
 async fn resolve_config_store(
@@ -3216,6 +3213,74 @@ async fn load_config(scope: &RuntimeScope) -> anyhow::Result<(Config, PathBuf)> 
         .validate()
         .map_err(|e| anyhow::anyhow!("Invalid runtime config: {e}"))?;
     Ok((config, base_dir))
+}
+
+const LEGACY_AGENT_MODEL_DEFAULTS: &[&str] = &["claude-opus-4-7"];
+
+fn model_provider(config: &Config, model: &str) -> Option<Provider> {
+    config
+        .model_registry()
+        .ok()
+        .and_then(|registry| registry.entry(model).map(|entry| entry.provider))
+        .and_then(Provider::from_core)
+}
+
+fn provider_default_model(config: &Config, provider: Provider) -> Option<String> {
+    let model = match provider {
+        Provider::Anthropic => &config.models.anthropic,
+        Provider::Openai => &config.models.openai,
+        Provider::Gemini => &config.models.gemini,
+        Provider::SelfHosted => return None,
+    };
+    (!model.is_empty()).then(|| model.clone())
+}
+
+fn best_available_default_model(config: &Config) -> String {
+    [Provider::Openai, Provider::Anthropic, Provider::Gemini]
+        .into_iter()
+        .find_map(|provider| provider_default_model(config, provider))
+        .unwrap_or_else(|| config.agent.model.clone())
+}
+
+fn resolve_cli_default_agent_model(config: &Config) -> String {
+    if LEGACY_AGENT_MODEL_DEFAULTS.contains(&config.agent.model.as_str()) {
+        return best_available_default_model(config);
+    }
+
+    config.agent.model.clone()
+}
+
+fn resolve_provider_constrained_default_model(config: &Config, provider: Provider) -> String {
+    match model_provider(config, &config.agent.model) {
+        Some(model_provider) if model_provider == provider => config.agent.model.clone(),
+        Some(_) => {
+            provider_default_model(config, provider).unwrap_or_else(|| config.agent.model.clone())
+        }
+        None => config.agent.model.clone(),
+    }
+}
+
+fn resolve_cli_effective_model(
+    config: &Config,
+    explicit_model: Option<String>,
+    explicit_provider: Option<Provider>,
+    auth_binding: Option<&CliAuthBindingSelection>,
+) -> String {
+    if let Some(model) = explicit_model {
+        return model;
+    }
+
+    if let Some(model) = auth_binding.and_then(|selection| selection.default_model.clone()) {
+        return model;
+    }
+
+    if let Some(provider) =
+        explicit_provider.or_else(|| auth_binding.map(|selection| selection.provider))
+    {
+        return resolve_provider_constrained_default_model(config, provider);
+    }
+
+    resolve_cli_default_agent_model(config)
 }
 
 async fn handle_config_get(
@@ -7319,7 +7384,7 @@ async fn run_agent(
     labels: Vec<(String, String)>,
     instructions: Vec<String>,
     app_context: Option<String>,
-    _config_base_dir: PathBuf,
+    config_base_dir: PathBuf,
     hooks_override: HookRunOverrides,
     auth_binding: Option<AuthBindingRef>,
     scope: &RuntimeScope,
@@ -7359,7 +7424,7 @@ async fn run_agent(
             labels,
             instructions,
             app_context,
-            _config_base_dir,
+            config_base_dir,
             hooks_override,
             auth_binding,
             scope,
@@ -7441,6 +7506,16 @@ async fn run_agent(
         #[cfg(feature = "comms")]
         let factory = factory.comms(!comms_overrides.disabled);
 
+        let context_root = scope
+            .context_root
+            .as_deref()
+            .map_or_else(|| "(none)".to_string(), |path| path.display().to_string());
+        tracing::info!(
+            "Using realm: {}, context root: {}, realm root: {}",
+            scope.locator.realm.as_str(),
+            context_root,
+            config_base_dir.display()
+        );
         tracing::info!("Using provider: {:?}, model: {}", provider, model);
 
         // Apply --comms-listen-tcp override to the config
@@ -17193,6 +17268,159 @@ capabilities = ["definitely_missing_capability"]
         let from_json = parse_hook_run_overrides(None, Some(fixture))
             .expect("fixture hook override must parse from inline json");
         assert_eq!(from_json, from_file);
+    }
+
+    #[test]
+    fn test_default_cli_state_root_is_project_local_rkat_realms() {
+        let root = PathBuf::from("/tmp/example-project");
+
+        assert_eq!(
+            default_cli_state_root(&root),
+            PathBuf::from("/tmp/example-project/.rkat/realms")
+        );
+    }
+
+    #[test]
+    fn test_resolve_runtime_scope_uses_context_local_state_root_by_default() {
+        let cli = Cli::try_parse_from([
+            "rkat",
+            "--context-root",
+            "/tmp/example-project",
+            "run",
+            "hello",
+        ])
+        .expect("cli should parse");
+        let scope =
+            resolve_runtime_scope_with_realm(&cli, cli.realm.clone()).expect("scope resolves");
+
+        assert_eq!(
+            scope.locator.state_root,
+            PathBuf::from("/tmp/example-project/.rkat/realms")
+        );
+    }
+
+    #[test]
+    fn test_resolve_runtime_scope_respects_explicit_state_root() {
+        let cli = Cli::try_parse_from([
+            "rkat",
+            "--context-root",
+            "/tmp/example-project",
+            "--state-root",
+            "/tmp/custom-realms",
+            "run",
+            "hello",
+        ])
+        .expect("cli should parse");
+        let scope =
+            resolve_runtime_scope_with_realm(&cli, cli.realm.clone()).expect("scope resolves");
+
+        assert_eq!(
+            scope.locator.state_root,
+            PathBuf::from("/tmp/custom-realms")
+        );
+    }
+
+    #[test]
+    fn test_resolve_cli_default_agent_model_heals_legacy_builtin_default() {
+        let mut config = Config::default();
+        config.agent.model = "claude-opus-4-7".to_string();
+        config.models.openai = "gpt-5.5-custom".to_string();
+
+        assert_eq!(resolve_cli_default_agent_model(&config), "gpt-5.5-custom");
+    }
+
+    #[test]
+    fn test_resolve_cli_default_agent_model_falls_back_by_best_available_priority() {
+        let mut config = Config::default();
+        config.agent.model = "claude-opus-4-7".to_string();
+        config.models.openai.clear();
+
+        assert_eq!(
+            resolve_cli_default_agent_model(&config),
+            config.models.anthropic
+        );
+
+        config.models.anthropic.clear();
+        assert_eq!(
+            resolve_cli_default_agent_model(&config),
+            config.models.gemini
+        );
+    }
+
+    #[test]
+    fn test_resolve_cli_default_agent_model_preserves_custom_model() {
+        let mut config = Config::default();
+        config.agent.model = "claude-sonnet-4-6".to_string();
+
+        assert_eq!(
+            resolve_cli_default_agent_model(&config),
+            "claude-sonnet-4-6"
+        );
+    }
+
+    #[test]
+    fn test_resolve_cli_effective_model_keeps_legacy_default_when_provider_matches() {
+        let mut config = Config::default();
+        config.agent.model = "claude-opus-4-7".to_string();
+
+        assert_eq!(
+            resolve_cli_effective_model(&config, None, Some(Provider::Anthropic), None),
+            "claude-opus-4-7"
+        );
+    }
+
+    #[test]
+    fn test_resolve_cli_effective_model_uses_constrained_provider_default_on_mismatch() {
+        let config = Config::default();
+
+        assert_eq!(
+            resolve_cli_effective_model(&config, None, Some(Provider::Anthropic), None),
+            config.models.anthropic
+        );
+    }
+
+    #[test]
+    fn test_resolve_cli_effective_model_uses_auth_binding_provider_without_binding_default() {
+        let mut config = Config::default();
+        config.agent.model = "claude-opus-4-7".to_string();
+        let selection = CliAuthBindingSelection {
+            provider: Provider::Anthropic,
+            default_model: None,
+        };
+
+        assert_eq!(
+            resolve_cli_effective_model(&config, None, None, Some(&selection)),
+            "claude-opus-4-7"
+        );
+    }
+
+    #[test]
+    fn test_resolve_cli_effective_model_uses_binding_default_before_provider_default() {
+        let config = Config::default();
+        let selection = CliAuthBindingSelection {
+            provider: Provider::Anthropic,
+            default_model: Some("claude-sonnet-4-6".to_string()),
+        };
+
+        assert_eq!(
+            resolve_cli_effective_model(&config, None, None, Some(&selection)),
+            "claude-sonnet-4-6"
+        );
+    }
+
+    #[test]
+    fn test_resolve_cli_effective_model_uses_gemini_default_for_gemini_binding_mismatch() {
+        let mut config = Config::default();
+        config.agent.model = "claude-opus-4-7".to_string();
+        let selection = CliAuthBindingSelection {
+            provider: Provider::Gemini,
+            default_model: None,
+        };
+
+        assert_eq!(
+            resolve_cli_effective_model(&config, None, None, Some(&selection)),
+            config.models.gemini
+        );
     }
 
     #[test]
