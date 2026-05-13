@@ -29,8 +29,16 @@ Default persistent backend:
 
 Default realm behavior:
 
-- CLI (`run`, `run --resume`, `session`): workspace-derived stable realm.
+- CLI (`run`, `run --resume`, `session`): workspace-derived stable realm from the context root, defaulting to the current directory.
 - RPC/REST/MCP/SDK: new opaque realm unless explicitly provided.
+
+CLI filesystem defaults:
+
+- `context_root` controls workspace identity and project files (`.rkat/mcp.toml`, `.rkat/skills`, AGENTS/CLAUDE discovery, etc.).
+- `state_root` is the parent directory containing realm directories.
+- Without overrides, CLI uses `context_root = CWD` and `state_root = <context_root>/.rkat/realms`, creating it on first use.
+- `--context-root` changes the derived `ws-...` realm id and, unless `--state-root` is supplied, the project-local realm state root.
+- `--state-root` changes storage location only; it does not change the realm id.
 
 Use explicit realm to share:
 

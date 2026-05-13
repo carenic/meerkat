@@ -57,6 +57,7 @@
           {
             "group": "Guides: Runtime Behavior",
             "pages": [
+              "guides/realms",
               "guides/structured-output",
               "guides/memory",
               "guides/hooks",

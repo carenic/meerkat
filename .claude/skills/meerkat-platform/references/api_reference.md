@@ -43,8 +43,8 @@ Global flags (available on all commands):
 --isolated                # start in isolated mode (new generated realm)
 --instance <id>           # optional instance ID inside a realm
 --realm-backend <sqlite|jsonl>
---state-root <path>       # override state root directory
---context-root <path>     # convention context root for skills/hooks/AGENTS/MCP config
+--state-root <path>       # override realm state root; default <context-root>/.rkat/realms
+--context-root <path>     # realm identity + project files root; default CWD
 --user-config-root <path> # optional user-global convention root
 ```
 
