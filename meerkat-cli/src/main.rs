@@ -6981,6 +6981,28 @@ impl meerkat_mob::MobSessionService for RunMobSessionService {
         .await
     }
 
+    async fn apply_runtime_turn(
+        &self,
+        session_id: &SessionId,
+        run_id: meerkat_core::RunId,
+        req: meerkat_core::service::StartTurnRequest,
+        boundary: meerkat_core::lifecycle::run_primitive::RunApplyBoundary,
+        contributing_input_ids: Vec<meerkat_core::InputId>,
+    ) -> Result<
+        meerkat_core::lifecycle::core_executor::CoreApplyOutput,
+        meerkat_core::service::SessionError,
+    > {
+        <EphemeralSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::apply_runtime_turn(
+            &self.inner,
+            session_id,
+            run_id,
+            req,
+            boundary,
+            contributing_input_ids,
+        )
+        .await
+    }
+
     async fn session_belongs_to_mob(
         &self,
         _session_id: &SessionId,
@@ -9342,6 +9364,28 @@ impl meerkat_mob::MobSessionService for MobCliSessionService {
         <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::archive_with_mob_lifecycle_authority(
             &self.inner,
             session_id,
+        )
+        .await
+    }
+
+    async fn apply_runtime_turn(
+        &self,
+        session_id: &SessionId,
+        run_id: meerkat_core::RunId,
+        req: meerkat_core::service::StartTurnRequest,
+        boundary: meerkat_core::lifecycle::run_primitive::RunApplyBoundary,
+        contributing_input_ids: Vec<meerkat_core::InputId>,
+    ) -> Result<
+        meerkat_core::lifecycle::core_executor::CoreApplyOutput,
+        meerkat_core::service::SessionError,
+    > {
+        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::apply_runtime_turn(
+            &self.inner,
+            session_id,
+            run_id,
+            req,
+            boundary,
+            contributing_input_ids,
         )
         .await
     }
@@ -16554,6 +16598,173 @@ capabilities = ["definitely_missing_capability"]
         assert!(system_prompt.contains("mob_list"));
         assert!(system_prompt.contains("mob_create"));
         assert!(system_prompt.contains("delegate"));
+    }
+
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn test_run_mob_session_service_forwards_runtime_apply() {
+        let temp = tempfile::tempdir().expect("tempdir must be created");
+        let factory = AgentFactory::new(temp.path().join("sessions"))
+            .builtins(false)
+            .shell(false);
+        let service = Arc::new(build_cli_service(factory, Config::default(), None));
+        let wrapper = RunMobSessionService::new(Arc::clone(&service));
+        let llm_override: Arc<dyn LlmClient> = Arc::new(CapturingLlmClient::new(
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(None)),
+        ));
+
+        let created = wrapper
+            .create_session(CreateSessionRequest {
+                model: "gpt-5.4".to_string(),
+                prompt: "seed".to_string().into(),
+                render_metadata: None,
+                system_prompt: None,
+                max_tokens: Some(32),
+                event_tx: None,
+                skill_references: None,
+                initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+                deferred_prompt_policy: DeferredPromptPolicy::Discard,
+                build: Some(SessionBuildOptions {
+                    llm_client_override: Some(meerkat::encode_llm_client_override_for_service(
+                        llm_override,
+                    )),
+                    ..SessionBuildOptions::default()
+                }),
+                labels: None,
+            })
+            .await
+            .expect("deferred run mob session should be created");
+
+        let output = <RunMobSessionService as meerkat_mob::MobSessionService>::apply_runtime_turn(
+            &wrapper,
+            &created.session_id,
+            meerkat_core::RunId::new(),
+            StartTurnRequest {
+                prompt: "delegate kickoff".to_string().into(),
+                system_prompt: None,
+                event_tx: None,
+                runtime: {
+                    let turn_metadata = meerkat_runtime::runtime_stamped_prompt_turn_metadata(None);
+                    let handling_mode = turn_metadata
+                        .handling_mode
+                        .unwrap_or(meerkat_core::types::HandlingMode::Queue);
+                    meerkat_core::service::StartTurnRuntimeSemantics::new(
+                        None,
+                        handling_mode,
+                        None,
+                        None,
+                        Vec::new(),
+                        Some(turn_metadata),
+                    )
+                },
+            },
+            meerkat_core::lifecycle::run_primitive::RunApplyBoundary::Immediate,
+            vec![],
+        )
+        .await
+        .expect("run mob wrapper should forward runtime-backed apply");
+
+        match output.terminal {
+            Some(meerkat_core::lifecycle::core_executor::CoreApplyTerminal::RunResult(
+                run_result,
+            )) => assert_eq!(run_result.text, "ok"),
+            other => panic!("expected terminal run result, got {other:?}"),
+        }
+    }
+
+    #[cfg(all(feature = "mob", feature = "session-store"))]
+    #[tokio::test]
+    async fn test_mob_cli_session_service_forwards_runtime_apply() {
+        let temp = tempfile::tempdir().expect("tempdir must be created");
+        let session_store = sqlite_session_store(&temp);
+        let persistence = PersistenceBundle::new(
+            Arc::clone(&session_store),
+            Some(Arc::new(meerkat_runtime::InMemoryRuntimeStore::new())),
+            Arc::new(meerkat_store::MemoryBlobStore::default()),
+        );
+        let factory = AgentFactory::new(temp.path().join("sessions"))
+            .session_store(session_store)
+            .builtins(false)
+            .shell(false);
+        let (service, runtime_adapter) = build_cli_runtime_backed_service_with_defaults(
+            factory,
+            Config::default(),
+            persistence,
+            None,
+        );
+        let service = Arc::new(service);
+        let wrapper = MobCliSessionService::new(Arc::clone(&service));
+        let llm_override: Arc<dyn LlmClient> = Arc::new(CapturingLlmClient::new(
+            Arc::new(Mutex::new(Vec::new())),
+            Arc::new(Mutex::new(None)),
+        ));
+
+        let session = Session::new();
+        let session_id = session.id().clone();
+        let bindings = runtime_adapter
+            .prepare_bindings(session_id.clone())
+            .await
+            .expect("runtime bindings should be prepared");
+        let created = service
+            .create_session(CreateSessionRequest {
+                model: "gpt-5.4".to_string(),
+                prompt: "seed".to_string().into(),
+                render_metadata: None,
+                system_prompt: None,
+                max_tokens: Some(32),
+                event_tx: None,
+                skill_references: None,
+                initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+                deferred_prompt_policy: DeferredPromptPolicy::Discard,
+                build: Some(SessionBuildOptions {
+                    resume_session: Some(session),
+                    runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
+                    llm_client_override: Some(meerkat::encode_llm_client_override_for_service(
+                        llm_override,
+                    )),
+                    ..SessionBuildOptions::default()
+                }),
+                labels: None,
+            })
+            .await
+            .expect("deferred persistent mob session should be created");
+
+        let output = <MobCliSessionService as meerkat_mob::MobSessionService>::apply_runtime_turn(
+            &wrapper,
+            &created.session_id,
+            meerkat_core::RunId::new(),
+            StartTurnRequest {
+                prompt: "delegate kickoff".to_string().into(),
+                system_prompt: None,
+                event_tx: None,
+                runtime: {
+                    let turn_metadata = meerkat_runtime::runtime_stamped_prompt_turn_metadata(None);
+                    let handling_mode = turn_metadata
+                        .handling_mode
+                        .unwrap_or(meerkat_core::types::HandlingMode::Queue);
+                    meerkat_core::service::StartTurnRuntimeSemantics::new(
+                        None,
+                        handling_mode,
+                        None,
+                        None,
+                        Vec::new(),
+                        Some(turn_metadata),
+                    )
+                },
+            },
+            meerkat_core::lifecycle::run_primitive::RunApplyBoundary::Immediate,
+            vec![],
+        )
+        .await
+        .expect("persistent mob wrapper should forward runtime-backed apply");
+
+        match output.terminal {
+            Some(meerkat_core::lifecycle::core_executor::CoreApplyTerminal::RunResult(
+                run_result,
+            )) => assert_eq!(run_result.text, "ok"),
+            other => panic!("expected terminal run result, got {other:?}"),
+        }
     }
 
     #[cfg(all(feature = "mob", feature = "session-store"))]
