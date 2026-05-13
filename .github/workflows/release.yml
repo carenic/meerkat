@@ -669,7 +669,6 @@ jobs:
       - name: Build and pack Web SDK
         env:
           VERSION: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.release_tag || github.ref_name }}
-          CARGO_BUILD_JOBS: "1"
           CARGO_INCREMENTAL: "0"
           RUSTFLAGS: '--cfg getrandom_backend="wasm_js"'
         run: scripts/release-build-web-sdk-package.sh "${GITHUB_WORKSPACE}/web-sdk-package"
