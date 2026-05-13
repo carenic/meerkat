@@ -49,9 +49,10 @@ fi
 tarball="${out_dir}/${packfile}"
 mv "${packfile}" "${tarball}"
 
-tar -tzf "${tarball}" | grep -Fxq "package/wasm/meerkat_web_runtime_bg.wasm"
-tar -tzf "${tarball}" | grep -Fxq "package/dist/index.js"
-tar -tzf "${tarball}" | grep -Fxq "package/proxy/cli.mjs"
+tar_listing="$(tar -tzf "${tarball}")"
+grep -Fxq "package/wasm/meerkat_web_runtime_bg.wasm" <<<"${tar_listing}"
+grep -Fxq "package/dist/index.js" <<<"${tar_listing}"
+grep -Fxq "package/proxy/cli.mjs" <<<"${tar_listing}"
 
 smoke_dir="$(mktemp -d)"
 trap 'rm -rf "${smoke_dir}"' EXIT
