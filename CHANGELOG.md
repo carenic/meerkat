@@ -17,6 +17,10 @@ Meerkat 0.6.10 is a hotfix release for mob delegate authority inheritance.
   inherit explicit profile-spawn authority within a mob without being granted
   full mob-management scope, preserving the typed authority boundary while
   allowing nested mob delegation workflows to continue.
+- **Reasoning-only LLM completions** (#709) — assistant turns that only emit
+  reasoning content or provider continuity metadata now satisfy core commit
+  validation, and streamed reasoning deltas are finalized on successful
+  completion so GPT-5.5-style silent reasoning responses are preserved.
 
 ## [0.6.9] - 2026-05-14
 
