@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.10] - 2026-05-14
+
+Meerkat 0.6.10 is a hotfix release for mob delegate authority inheritance.
+
+### Fixed
+
+- **Mob delegate authority inheritance** (#708) — child delegates can now
+  inherit explicit profile-spawn authority within a mob without being granted
+  full mob-management scope, preserving the typed authority boundary while
+  allowing nested mob delegation workflows to continue.
+
 ## [0.6.9] - 2026-05-14
 
 Meerkat 0.6.9 is a hotfix release for turn cancellation and multimodal mob
