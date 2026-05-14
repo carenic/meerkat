@@ -7,6 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.9] - 2026-05-14
+
+Meerkat 0.6.9 is a hotfix release for turn cancellation and multimodal mob
+comms delivery, plus release-lane recovery improvements from the 0.6.8 rollout.
+
+### Changed
+
+- **Web SDK release recovery** — release workflows can now publish `@rkat/web`
+  from an already-built `rkat-web-package` artifact, allowing npm publish
+  retries without rebuilding the WebAssembly runtime.
+- **Web SDK release build parallelism** — the Web SDK release package build no
+  longer serializes Cargo work, reducing cold release-package build time on the
+  GCP runner lane.
+
+### Fixed
+
+- **Steer-boundary cancellation** (#706) — fixed turn-state cancellation around
+  steer boundaries so interrupted or redirected turns do not leave stale
+  cancellation state in the runtime.
+- **Multimodal comms notices** (#707) — fixed multimodal comms notice delivery
+  across Anthropic, Gemini, OpenAI, and OpenAI-compatible providers so generated
+  image notices and related mob comms survive provider-specific content
+  projection.
+- **Web SDK package/archive checks** — fixed release packaging checks that could
+  fail a valid `@rkat/web` tarball under `pipefail`, and made npm publish use an
+  absolute tarball path so local recovery artifacts are not interpreted as git
+  package specs.
+
 ## [0.6.8] - 2026-05-13
 
 Meerkat 0.6.8 is a hotfix release for long-context model compaction defaults
