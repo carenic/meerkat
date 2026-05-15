@@ -1,7 +1,7 @@
 // Generated wire types for Meerkat SDK
-// Contract version: 0.6.10
+// Contract version: 0.6.11
 
-export const CONTRACT_VERSION = "0.6.10";
+export const CONTRACT_VERSION = "0.6.11";
 
 export interface WireUsage {
   input_tokens: number;
