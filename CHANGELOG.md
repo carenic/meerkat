@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.11] - 2026-05-15
+
+Meerkat 0.6.11 is a hotfix release for turn-driven mob spawn prompt delivery.
+
+### Fixed
+
+- **Turn-driven spawn initial messages** (#710) — explicit initial messages for
+  turn-driven mob spawns and respawns are now submitted through `SubmitWork`
+  after the member is live, preserving caller intent instead of silently
+  dropping the prompt during deferred session initialization.
+
 ## [0.6.10] - 2026-05-14
 
 Meerkat 0.6.10 is a hotfix release for mob delegate authority inheritance.
