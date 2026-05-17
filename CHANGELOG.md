@@ -7,6 +7,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.14] - 2026-05-17
+
+Meerkat 0.6.14 adds batched local mob-member wiring, with public RPC, REST, MCP,
+Python, and TypeScript SDK surfaces.
+
+### Added
+
+- **Batch mob topology materialization** (#715) — mobs can now wire dense local
+  member graphs through `MobHandle::wire_members_batch(...)`, preserving
+  MobMachine ownership of peer wiring truth while coalescing roster projection
+  and event replay into a compact `MembersWiredBatch` event.
+- **Batch wiring public surfaces** (#716) — `mob/wire_members_batch`,
+  `POST /mob/{id}/wire-members-batch`, `meerkat_mob_wire_members_batch`,
+  `MeerkatClient.mob_wire_members_batch(...)`, `Mob.wire_members_batch(...)`,
+  `client.mobWireMembersBatch(...)`, and `mob.wireMembersBatch(...)` now expose
+  the local-member batch wiring path across JSON-RPC, REST, MCP, Python, and
+  TypeScript.
+
+### Changed
+
+- **Burst mob delivery backpressure** (#715) — runtime-originated in-process
+  peer sends, lifecycle notifications, peer-retire fanout, mob command capacity,
+  and deferred turn-event buffering now handle bursty dense mob workloads without
+  converting full queues into semantic message loss.
+
 ## [0.6.13] - 2026-05-16
 
 Meerkat 0.6.13 is a hotfix release for committed lifecycle and runtime effect
