@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.15] - 2026-05-18
+
+Meerkat 0.6.15 is a smoke-test hotfix release for mob lifecycle, image comms,
+and release asset reliability.
+
+### Changed
+
+- **Release asset routing** (#717) — BuildBuddy release assets now cover
+  validation plus Linux and macOS binaries, while the Windows release binary is
+  always built on GitHub-hosted runners to avoid the known Windows remote
+  execution input-tree failures.
+
+### Fixed
+
+- **E2E smoke mob lifecycle and image comms** (#718) — fixes the mob lifecycle
+  and generated-image communication regressions found by e2e smoke testing,
+  including runtime/session handling and MCP/tool-surface behavior needed for
+  the smoke suite to pass again.
+
 ## [0.6.14] - 2026-05-17
 
 Meerkat 0.6.14 adds batched local mob-member wiring, with public RPC, REST, MCP,
