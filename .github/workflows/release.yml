@@ -484,6 +484,21 @@ jobs:
         with:
           profile: native
 
+      - name: Use BuildBuddy Windows hosted executors
+        if: ${{ matrix.target == 'x86_64-pc-windows-msvc' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i '/--remote_default_exec_properties=use-self-hosted-executors=true/d' .bazelrc
+          python3 - <<'PY'
+          from pathlib import Path
+
+          path = Path("platforms/BUILD.bazel")
+          text = path.read_text(encoding="utf-8")
+          text = text.replace('        "use-self-hosted-executors": "true",\n', "")
+          path.write_text(text, encoding="utf-8")
+          PY
+
       - name: Build release binaries via BuildBuddy
         shell: bash
         env:

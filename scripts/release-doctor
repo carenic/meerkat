@@ -131,6 +131,14 @@ else
   bad "Release workflow should build Linux/macOS/Windows assets on BuildBuddy for owner releases"
 fi
 
+if grep -Fq 'Use BuildBuddy Windows hosted executors' .github/workflows/release.yml &&
+  grep -Fq '/--remote_default_exec_properties=use-self-hosted-executors=true/d' .github/workflows/release.yml &&
+  grep -Fq '"use-self-hosted-executors": "true"' .github/workflows/release.yml; then
+  pass "Release workflow strips self-hosted Windows executor routing for recovery builds"
+else
+  bad "Release workflow should strip self-hosted Windows executor routing before BuildBuddy Windows recovery builds"
+fi
+
 web_build_timeout="$(
   awk '
     /^  build_web_sdk_package:/ { in_job = 1; next }
