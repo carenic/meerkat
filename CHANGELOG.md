@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.16] - 2026-05-18
+
+Meerkat 0.6.16 is a hotfix release for mob peer wake behavior and
+BuildBuddy-backed Windows release assets.
+
+### Changed
+
+- **Mob peer send and tool bridge parity** (#727) — aligns mob peer send
+  behavior with the tool bridge path so peer-to-peer wake and delivery semantics
+  stay consistent across mob surfaces.
+- **Windows BuildBuddy release endpoint** (#726) — Windows release binary builds
+  now route directly to the hosted King BuildBuddy endpoint instead of a mutable
+  secret-backed endpoint, preventing stale private endpoint routing from
+  breaking release asset publication.
+
+### Fixed
+
+- **Peer wake interrupt semantics** (#727) — fixes peer wake interruption so
+  mob members are woken correctly when new peer traffic arrives.
+
 ## [0.6.15] - 2026-05-18
 
 Meerkat 0.6.15 is a smoke-test hotfix release for mob lifecycle, image comms,
