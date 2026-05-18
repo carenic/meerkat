@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.6.17] - 2026-05-18
+
+Meerkat 0.6.17 improves mob spawn boundary configuration, task-workflow
+guidance, and steer cancellation behavior.
+
+### Added
+
+- **Mob spawn boundary customization** (#728) — mob spawn flows can customize
+  member spawn boundaries through the mob runtime path, with tests covering the
+  builder, runtime handle, actor, and tool surfaces.
+- **Mob task workflow guidance preload** (#729) — mob build profiles now preload
+  task workflow guidance so spawned members receive the expected workflow context
+  at construction time.
+
+### Fixed
+
+- **Steer admission boundary cancellation** (#730) — fixes cancellation behavior
+  at the steer admission boundary and updates the machine contract/spec coverage
+  around the cancellation path.
+
 ## [0.6.16] - 2026-05-18
 
 Meerkat 0.6.16 is a hotfix release for mob peer wake behavior and
