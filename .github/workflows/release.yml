@@ -492,7 +492,26 @@ jobs:
           BUILDBUDDY_EXECUTOR_POOL: ${{ vars.MEERKAT_BUILDBUDDY_EXECUTOR_POOL || 'meerkat-ci' }}
         run: |
           set -euo pipefail
-          printf 'build:buildbuddy-windows-rbe --remote_default_exec_properties=Pool=%s\n' "${BUILDBUDDY_EXECUTOR_POOL}" >> .bazelrc
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          path = Path("scripts/buildbuddy-bazel-poc")
+          text = path.read_text(encoding="utf-8")
+          start = text.index("  release-build-windows-x86)")
+          end = text.index("    ;;\n", start)
+          block = text[start:end]
+          needle = "      --compilation_mode=opt\n      --remote_download_outputs=toplevel\n"
+          replacement = (
+              "      --compilation_mode=opt\n"
+              "      --remote_download_outputs=toplevel\n"
+              f"      --remote_default_exec_properties=Pool={os.environ['BUILDBUDDY_EXECUTOR_POOL']}\n"
+          )
+          if replacement not in block:
+              block = block.replace(needle, replacement, 1)
+              text = text[:start] + block + text[end:]
+          path.write_text(text, encoding="utf-8")
+          PY
 
       - name: Build release binaries via BuildBuddy
         shell: bash
