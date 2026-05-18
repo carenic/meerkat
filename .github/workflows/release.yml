@@ -498,9 +498,12 @@ jobs:
           end = text.index("    ;;\n", start)
           block = text[start:end]
           needle = "      --compilation_mode=opt\n"
-          replacement = "      --compilation_mode=opt\n      --verbose_failures\n"
+          replacement = "      --compilation_mode=opt\n      --remote_bytestream_uri_prefix=king.europe.buildbuddy.io\n      --verbose_failures\n"
           if replacement not in block:
-              block = block.replace(needle, replacement, 1)
+              if "--remote_bytestream_uri_prefix=king.europe.buildbuddy.io" not in block:
+                  block = block.replace(needle, replacement, 1)
+              elif "      --verbose_failures\n" not in block:
+                  block = block.replace(needle, needle + "      --verbose_failures\n", 1)
               text = text[:start] + block + text[end:]
           path.write_text(text, encoding="utf-8")
           PY
