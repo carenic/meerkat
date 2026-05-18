@@ -1,7 +1,7 @@
 // Generated wire types for Meerkat SDK
-// Contract version: 0.6.15
+// Contract version: 0.6.16
 
-export const CONTRACT_VERSION = "0.6.15";
+export const CONTRACT_VERSION = "0.6.16";
 
 export interface WireUsage {
   input_tokens: number;
@@ -273,6 +273,7 @@ export interface WireMobToolConfig {
   mob?: boolean;
   schedule?: boolean;
   shell?: boolean;
+  workgraph?: boolean;
 }
 
 export interface WireMobProfile {
@@ -742,6 +743,7 @@ export interface MobToolConfigInput {
   mob?: boolean;
   schedule?: boolean;
   shell?: boolean;
+  workgraph?: boolean;
 }
 
 export interface MobTopologyRuleInput {

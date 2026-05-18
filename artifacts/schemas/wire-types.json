@@ -10469,7 +10469,8 @@
               "memory": false,
               "mob": false,
               "schedule": false,
-              "shell": false
+              "shell": false,
+              "workgraph": false
             }
           }
         },
@@ -10624,6 +10625,10 @@
             "type": "boolean"
           },
           "shell": {
+            "default": false,
+            "type": "boolean"
+          },
+          "workgraph": {
             "default": false,
             "type": "boolean"
           }
@@ -25781,6 +25786,10 @@
           "shell": {
             "default": false,
             "type": "boolean"
+          },
+          "workgraph": {
+            "default": false,
+            "type": "boolean"
           }
         },
         "type": "object"
@@ -25841,7 +25850,8 @@
           "memory": false,
           "mob": false,
           "schedule": false,
-          "shell": false
+          "shell": false,
+          "workgraph": false
         }
       }
     },
@@ -25897,6 +25907,10 @@
         "type": "boolean"
       },
       "shell": {
+        "default": false,
+        "type": "boolean"
+      },
+      "workgraph": {
         "default": false,
         "type": "boolean"
       }

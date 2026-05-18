@@ -2,14 +2,14 @@ from __future__ import annotations
 
 """Generated wire types for Meerkat SDK.
 
-Contract version: 0.6.15
+Contract version: 0.6.16
 """
 
 from dataclasses import dataclass, field
 from typing import Any, Literal, NotRequired, Optional, Required, TypedDict
 
 
-CONTRACT_VERSION = "0.6.15"
+CONTRACT_VERSION = "0.6.16"
 
 
 @dataclass
@@ -380,6 +380,7 @@ class WireMobToolConfig:
     mob: Optional[bool] = None
     schedule: Optional[bool] = None
     shell: Optional[bool] = None
+    workgraph: Optional[bool] = None
 
 
 @dataclass
@@ -1011,6 +1012,7 @@ class MobToolConfigInput:
     mob: Optional[bool] = None
     schedule: Optional[bool] = None
     shell: Optional[bool] = None
+    workgraph: Optional[bool] = None
 
 
 @dataclass
