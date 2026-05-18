@@ -446,7 +446,6 @@ case "${command}" in
     winsdk_root="C:/Program Files (x86)/Windows Kits/10"
     extra_args+=(
       --compilation_mode=opt
-      "--remote_instance_name=${BUILDBUDDY_WINDOWS_REMOTE_INSTANCE:-meerkat-release-windows}"
       --remote_bytestream_uri_prefix=king.europe.buildbuddy.io
       --remote_download_outputs=toplevel
       "--action_env=PATH=${msvc_root}/VC/Tools/MSVC/${msvc_ver}/bin/HostX64/x64;${winsdk_root}/bin/${winsdk_ver}/x64;C:/Windows/System32"
