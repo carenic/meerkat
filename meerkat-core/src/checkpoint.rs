@@ -1013,6 +1013,20 @@ pub(crate) fn record_checkpoint_stamp_verification(
 pub fn session_checkpoint_digest(
     session: &Session,
 ) -> Result<SessionCheckpointDigest, SessionCheckpointError> {
+    let digest = session_checkpoint_digest_uncached(session)?;
+    // Computing this digest IS a complete canonical verification of this exact
+    // document, so record it under the same memo a successful stamp compare
+    // records. A stamp minted here and installed back-to-back on the same
+    // unmutated document then costs ONE canonical pass instead of two; a
+    // document that changed in between re-keys the memo (message count,
+    // metadata entry count, or `updated_at`) and pays the full recompute.
+    record_checkpoint_stamp_verification(session, &digest);
+    Ok(digest)
+}
+
+fn session_checkpoint_digest_uncached(
+    session: &Session,
+) -> Result<SessionCheckpointDigest, SessionCheckpointError> {
     record_content_digest_computation();
     let history_digest = session_transcript_history_checkpoint_digest(session)?;
     let mut document = session.checkpoint_digest_document()?;
@@ -1052,11 +1066,21 @@ pub fn session_transcript_history_checkpoint_digest(
         .cloned()
         .map(serde_json::from_value::<SessionCheckpointDigest>)
         .transpose()?;
-    let computed = session
-        .metadata()
-        .get(SESSION_TRANSCRIPT_HISTORY_STATE_KEY)
-        .map(session_checkpoint_history_digest)
-        .transpose()?;
+    let computed = match session.metadata().get(SESSION_TRANSCRIPT_HISTORY_STATE_KEY) {
+        // Deriving this canonicalizes and hashes every retained revision body.
+        // The session memoizes it for the exact graph value it currently
+        // carries, so the several derivations a single save boundary performs
+        // collapse to one; any write to the history key clears the memo.
+        Some(history) => match session.cached_transcript_history_witness() {
+            Some(cached) => Some(SessionCheckpointDigest(cached.to_string())),
+            None => {
+                let computed = session_checkpoint_history_digest(history)?;
+                session.record_transcript_history_witness(computed.as_str());
+                Some(computed)
+            }
+        },
+        None => None,
+    };
     match (carried, computed) {
         (Some(carried), Some(computed)) if carried != computed => {
             Err(SessionCheckpointError::TranscriptHistoryWitnessMismatch { carried, computed })
@@ -2076,7 +2100,7 @@ mod tests {
     fn checkpoint_digest_erases_transcript_construction_timestamps() {
         let session = session_with_text("same semantic message");
         let mut reconstructed = session.clone();
-        let messages = std::sync::Arc::make_mut(&mut reconstructed.messages);
+        let messages = reconstructed.messages.mutate_in_place();
         let Some(Message::User(user)) = messages.first_mut() else {
             panic!("expected user message");
         };
@@ -2111,7 +2135,7 @@ mod tests {
         );
 
         let mut divergent = snapshot.clone();
-        std::sync::Arc::make_mut(&mut divergent.messages).clear();
+        divergent.messages.mutate_in_place().clear();
         divergent.push(Message::User(UserMessage::text(
             "a different turn one".to_string(),
         )));
@@ -2149,7 +2173,7 @@ mod tests {
         );
 
         let mut divergent = snapshot.clone();
-        std::sync::Arc::make_mut(&mut divergent.messages).clear();
+        divergent.messages.mutate_in_place().clear();
         divergent.push(Message::User(UserMessage::text(
             "a different turn one".to_string(),
         )));

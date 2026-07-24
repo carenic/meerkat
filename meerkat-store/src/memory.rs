@@ -3,9 +3,10 @@
 use crate::{SessionFilter, SessionStore, SessionStoreError};
 use async_trait::async_trait;
 use meerkat_core::session_store::{
-    IncrementalSessionStore, SessionHead, SessionHeadCas, head_canonical_plain_save_guard,
-    reconstruct_rewrite_record, session_head_cas_token, strand_layout_for_history,
-    validate_commit_rewrite_transition, validate_save_head_transition,
+    IncrementalSessionStore, SaveGuardWitness, SessionHead, SessionHeadCas,
+    head_canonical_plain_save_guard_with_witness, reconstruct_rewrite_record,
+    session_head_cas_token, strand_layout_for_history, validate_commit_rewrite_transition,
+    validate_save_head_transition,
 };
 use meerkat_core::transcript_messages_digest;
 use meerkat_core::types::Message;
@@ -367,7 +368,12 @@ impl SessionStore for MemoryStore {
         if let Some((head, _token)) = state.heads.get(session.id()).cloned() {
             let adopted = state.adopted_commits(session.id(), head.rewrite_count);
             let previous = state.materialize_slim(&head)?;
-            head_canonical_plain_save_guard(session, &previous, &adopted)?;
+            head_canonical_plain_save_guard_with_witness(
+                session,
+                &previous,
+                &adopted,
+                SaveGuardWitness::none().with_previous_revision(&head.head_revision),
+            )?;
             return state.write_head_canonical_session(session, &head);
         }
         // F1 closure (wave-c C-H1): same shrink-guard as persistent
@@ -387,8 +393,9 @@ impl SessionStore for MemoryStore {
         let mut state = self.state.write().await;
         state.stats.whole_blob_saves += 1;
         if let Some(stored) = state.heads.get(session.id()).cloned() {
-            let incoming_revision =
-                transcript_messages_digest(session.messages()).map_err(SessionStoreError::from)?;
+            let incoming_revision = session
+                .transcript_content_digest()
+                .map_err(SessionStoreError::from)?;
             if incoming_revision != commit.revision {
                 return Err(SessionStoreError::InvalidTranscriptRewrite {
                     id: session.id().clone(),

@@ -429,6 +429,7 @@ test_suite(
         "//meerkat-core:runtime_turn_metadata_typed_round_trip_test",
         "//meerkat-core:source_identity_resolve_enforces_lifecycle_test",
         "//meerkat-core:tool_notice_projection_test",
+        "//meerkat-core:transcript_digest_budget_test",
         "//meerkat-gemini:meerkat_gemini_unit_test",
         "//meerkat-gemini:oauth_resolve_test",
         "//meerkat-hooks:meerkat_hooks_unit_test",

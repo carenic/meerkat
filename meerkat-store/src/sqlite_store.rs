@@ -5,9 +5,10 @@ use crate::json_column::JsonColumnBytes;
 use crate::{SessionFilter, SessionStore, SessionStoreError, StoreError};
 use async_trait::async_trait;
 use meerkat_core::session_store::{
-    IncrementalSessionStore, SessionHead, SessionHeadCas, StrandLayout, TranscriptStrandId,
-    head_canonical_plain_save_guard, reconstruct_rewrite_record, session_head_cas_token,
-    strand_layout_for_history, validate_commit_rewrite_transition, validate_save_head_transition,
+    IncrementalSessionStore, SaveGuardWitness, SessionHead, SessionHeadCas, StrandLayout,
+    TranscriptStrandId, head_canonical_plain_save_guard_with_witness, reconstruct_rewrite_record,
+    session_head_cas_token, strand_layout_for_history, validate_commit_rewrite_transition,
+    validate_save_head_transition,
 };
 use meerkat_core::time_compat::SystemTime;
 use meerkat_core::transcript_messages_digest;
@@ -819,7 +820,12 @@ impl SessionStore for SqliteSessionStore {
                     .map(|row| row.commit)
                     .collect::<Vec<_>>();
                 let previous = materialize_slim_in_txn(tx, session.id(), &head)?;
-                head_canonical_plain_save_guard(&session, &previous, &adopted)?;
+                head_canonical_plain_save_guard_with_witness(
+                    &session,
+                    &previous,
+                    &adopted,
+                    SaveGuardWitness::none().with_previous_revision(&head.head_revision),
+                )?;
                 write_head_canonical_session_in_txn(tx, &session, &head)?;
                 return Ok(());
             }
@@ -846,7 +852,8 @@ impl SessionStore for SqliteSessionStore {
                 // adopt-head sequence in one transaction, preserving the
                 // legacy error surface (TranscriptRevisionConflict on a
                 // stale parent).
-                let incoming_revision = transcript_messages_digest(session.messages())
+                let incoming_revision = session
+                    .transcript_content_digest()
                     .map_err(SessionStoreError::from)?;
                 if incoming_revision != commit.revision {
                     return Err(SessionStoreError::InvalidTranscriptRewrite {

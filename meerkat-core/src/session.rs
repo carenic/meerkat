@@ -34,6 +34,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::Arc;
 
+mod digest_accumulator;
+
+use digest_accumulator::TranscriptMessages;
+
 /// Current session format version.
 ///
 /// The persisted `version` byte is mandatory and fail-closed: a stored row
@@ -472,7 +476,20 @@ impl TranscriptHistoryState {
     /// are removed.
     fn compact_mechanical_revision_bodies(&mut self) -> Result<(), TranscriptEditError> {
         validate_transcript_history_state(self)?;
+        self.prune_mechanical_revision_bodies();
+        Ok(())
+    }
 
+    /// The pruning half of [`Self::compact_mechanical_revision_bodies`],
+    /// without the full graph validation.
+    ///
+    /// Callable ONLY when the graph's validity is already established: pruning
+    /// drops bodies, so running it over an unvalidated graph could launder a
+    /// corrupt body out of sight. The append fast path in
+    /// `transcript_history_state_after_message_mutation` is the one caller,
+    /// and it proves the two facts that pruning needs (previously validated
+    /// graph, new head extends the previous head) before calling.
+    fn prune_mechanical_revision_bodies(&mut self) {
         let mut retained = BTreeSet::from([self.head.clone()]);
         for commit in &self.commits {
             retained.insert(commit.parent_revision.clone());
@@ -507,8 +524,20 @@ impl TranscriptHistoryState {
         // bodies, and points an unaudited live head directly at the already
         // validated latest commit. Re-hashing every retained transcript here
         // would repeat the dominant snapshot cost without adding evidence.
-        Ok(())
     }
+}
+
+/// Shape of a message mutation, as known by the seam that performed it.
+///
+/// The transcript-head refresh is the only consumer: an append can reuse the
+/// already-validated graph, while any other shape re-enters full validation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptMutationShape {
+    /// Messages were appended to the end of the live transcript; every
+    /// retained prefix is unchanged.
+    Appended,
+    /// The transcript was replaced or rewritten in place.
+    Rewritten,
 }
 
 /// Re-derive pre-0.7.14 (bookkeeping-inclusive) transcript revision strings to
@@ -865,28 +894,32 @@ fn canonicalize_digest_image_blocks(blocks: &mut [crate::types::ContentBlock]) {
 fn canonicalize_message_images_for_digest(messages: &[Message]) -> Vec<Message> {
     let mut canonical = messages.to_vec();
     for message in &mut canonical {
-        match message {
-            Message::User(user) => canonicalize_digest_image_blocks(&mut user.content),
-            Message::ToolResults { results, .. } => {
-                for result in results.iter_mut() {
-                    canonicalize_digest_image_blocks(&mut result.content);
-                }
-            }
-            Message::SystemNotice(notice) => {
-                for block in &mut notice.blocks {
-                    match block {
-                        crate::types::SystemNoticeBlock::Comms { content, .. }
-                        | crate::types::SystemNoticeBlock::ExternalEvent { content, .. } => {
-                            canonicalize_digest_image_blocks(content);
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            _ => {}
-        }
+        canonicalize_message_images_for_digest_in_place(message);
     }
     canonical
+}
+
+fn canonicalize_message_images_for_digest_in_place(message: &mut Message) {
+    match message {
+        Message::User(user) => canonicalize_digest_image_blocks(&mut user.content),
+        Message::ToolResults { results, .. } => {
+            for result in results.iter_mut() {
+                canonicalize_digest_image_blocks(&mut result.content);
+            }
+        }
+        Message::SystemNotice(notice) => {
+            for block in &mut notice.blocks {
+                match block {
+                    crate::types::SystemNoticeBlock::Comms { content, .. }
+                    | crate::types::SystemNoticeBlock::ExternalEvent { content, .. } => {
+                        canonicalize_digest_image_blocks(content);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
 }
 
 /// Canonical checkpoint representation of the retained transcript graph.
@@ -964,31 +997,65 @@ fn digest_timestamp_sentinel() -> crate::types::MessageTimestamp {
 fn canonicalize_messages_for_digest(messages: &[Message]) -> Vec<Message> {
     let mut canonical = canonicalize_message_images_for_digest(messages);
     for message in &mut canonical {
-        match message {
-            Message::System(system) => {
-                system.created_at = digest_timestamp_sentinel();
-            }
-            Message::SystemNotice(notice) => {
-                notice.created_at = digest_timestamp_sentinel();
-            }
-            Message::User(user) => {
-                user.identity = crate::types::TranscriptMessageIdentity::default();
-                user.created_at = digest_timestamp_sentinel();
-            }
-            Message::BlockAssistant(assistant) => {
-                assistant.identity = crate::types::TranscriptMessageIdentity::default();
-                assistant.created_at = digest_timestamp_sentinel();
-            }
-            Message::ToolResults { created_at, .. } => {
-                *created_at = digest_timestamp_sentinel();
-            }
+        erase_message_construction_bookkeeping(message);
+    }
+    canonical
+}
+
+fn erase_message_construction_bookkeeping(message: &mut Message) {
+    match message {
+        Message::System(system) => {
+            system.created_at = digest_timestamp_sentinel();
+        }
+        Message::SystemNotice(notice) => {
+            notice.created_at = digest_timestamp_sentinel();
+        }
+        Message::User(user) => {
+            user.identity = crate::types::TranscriptMessageIdentity::default();
+            user.created_at = digest_timestamp_sentinel();
+        }
+        Message::BlockAssistant(assistant) => {
+            assistant.identity = crate::types::TranscriptMessageIdentity::default();
+            assistant.created_at = digest_timestamp_sentinel();
+        }
+        Message::ToolResults { created_at, .. } => {
+            *created_at = digest_timestamp_sentinel();
         }
     }
+}
+
+/// Per-message projection of [`canonicalize_messages_for_digest`].
+///
+/// Transcript canonicalization is element-wise, so the identity byte stream a
+/// transcript digest hashes is `"[" + json(c(m0)) + "," + json(c(m1)) + ... +
+/// "]"`. [`digest_accumulator`] folds exactly these per-message bytes, which
+/// is why an incremental midstate reproduces the format-2 digest value
+/// unchanged. `canonicalize_messages_for_digest_is_element_wise` pins the
+/// equivalence.
+pub(crate) fn canonicalize_message_for_digest(message: &Message) -> Message {
+    let mut canonical = message.clone();
+    canonicalize_message_images_for_digest_in_place(&mut canonical);
+    erase_message_construction_bookkeeping(&mut canonical);
     canonical
 }
 
 pub fn transcript_messages_digest(messages: &[Message]) -> Result<String, serde_json::Error> {
     sha256_json_digest(&canonicalize_messages_for_digest(messages))
+}
+
+/// Full transcript digest that does NOT bump the content-digest budget
+/// counter.
+///
+/// Reserved for the debug-build witness cross-check: that recompute is
+/// verification scaffolding, not production work, so counting it would make
+/// the digest-budget regression tests measure the cross-check instead of the
+/// path being budgeted.
+pub(crate) fn transcript_messages_digest_uncounted(
+    messages: &[Message],
+) -> Result<String, serde_json::Error> {
+    let canonical = canonicalize_messages_for_digest(messages);
+    let bytes = serde_json::to_vec(&canonical)?;
+    Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
 }
 
 /// Digest format used by pre-0.7.14 transcript revision strings.
@@ -1326,14 +1393,31 @@ pub struct Session {
     version: u32,
     /// Unique identifier
     id: SessionId,
-    /// All messages in order (Arc for CoW on fork)
-    pub(crate) messages: Arc<Vec<Message>>,
+    /// All messages in order (Arc for CoW on fork) plus the incremental
+    /// transcript-digest accumulator that owns them.
+    ///
+    /// The buffer is deliberately wrapped: [`TranscriptMessages`] exposes no
+    /// `DerefMut`, so every message mutation must name one of its typed
+    /// mutators, and each mutator states whether the retained digest midstate
+    /// survives. That makes the accumulator's invalidation set exhaustive by
+    /// construction instead of by convention.
+    pub(crate) messages: TranscriptMessages,
     /// When the session was created
     created_at: SystemTime,
     /// When the session was last updated
     updated_at: SystemTime,
     /// Arbitrary metadata
     metadata: serde_json::Map<String, serde_json::Value>,
+    /// Memoized canonical witness of the transcript-history graph currently
+    /// under [`SESSION_TRANSCRIPT_HISTORY_STATE_KEY`].
+    ///
+    /// Deriving it canonicalizes and hashes every retained revision body, and
+    /// it is derived up to four times per save boundary (head projection,
+    /// stamp mint, stamp install, intra-turn projection) from the same
+    /// unchanged graph. This is pure derived state: the three methods that
+    /// write the history key clear it, so it can never outlive the value it
+    /// describes.
+    transcript_history_witness: std::sync::OnceLock<String>,
     /// Whether transcript-history metadata has already crossed a validating,
     /// compacting authority boundary in this in-memory session.
     ///
@@ -1445,10 +1529,11 @@ impl<'de> Deserialize<'de> for Session {
         Ok(Session {
             version,
             id: serde_repr.id,
-            messages: Arc::new(serde_repr.messages),
+            messages: TranscriptMessages::from_vec(serde_repr.messages),
             created_at: serde_repr.created_at,
             updated_at: serde_repr.updated_at,
             metadata,
+            transcript_history_witness: std::sync::OnceLock::new(),
             transcript_history_metadata_validation: TranscriptHistoryMetadataValidation::Validated,
             usage: serde_repr.usage,
         })
@@ -1566,7 +1651,7 @@ impl Session {
         Ok(Self {
             version,
             id,
-            messages: Arc::new(messages),
+            messages: TranscriptMessages::from_vec(messages),
             created_at,
             updated_at,
             transcript_history_metadata_validation: if metadata
@@ -1577,6 +1662,7 @@ impl Session {
                 TranscriptHistoryMetadataValidation::Validated
             },
             metadata,
+            transcript_history_witness: std::sync::OnceLock::new(),
             usage,
         })
     }
@@ -4739,10 +4825,11 @@ impl Session {
         Self {
             version: session_version(),
             id: SessionId::new(),
-            messages: Arc::new(Vec::new()),
+            messages: TranscriptMessages::default(),
             created_at: now,
             updated_at: now,
             metadata: serde_json::Map::new(),
+            transcript_history_witness: std::sync::OnceLock::new(),
             transcript_history_metadata_validation: TranscriptHistoryMetadataValidation::Validated,
             usage: Usage::default(),
         }
@@ -4768,6 +4855,49 @@ impl Session {
     /// Get all messages.
     pub fn messages(&self) -> &[Message] {
         &self.messages
+    }
+
+    /// Format-2 content digest of the live transcript.
+    ///
+    /// Byte-identical to `transcript_messages_digest(session.messages())` —
+    /// same canonicalization, same bytes, same string — but served from the
+    /// session's retained SHA-256 midstate when one covers the current buffer,
+    /// so an ordinary append costs O(delta) instead of O(document). Prefer
+    /// this over the free function anywhere a `Session` is in hand; the free
+    /// function stays for slices that no session owns (revision bodies,
+    /// candidate vectors).
+    pub fn transcript_content_digest(&self) -> Result<String, serde_json::Error> {
+        self.messages.digest()
+    }
+
+    /// Format-2 content digest of the first `count` live messages.
+    ///
+    /// Served from the boundary ring when a previous full digest was taken at
+    /// exactly that count — which is the save-guard prefix question — and by
+    /// full recompute otherwise.
+    pub fn transcript_prefix_digest(&self, count: usize) -> Result<String, serde_json::Error> {
+        if count > self.messages.len() {
+            // Fail closed rather than silently digesting a shorter prefix: a
+            // caller asking past the end has lost track of which row it is
+            // comparing against, and answering with a different prefix's
+            // digest would launder that into a continuity verdict.
+            return Err(<serde_json::Error as serde::ser::Error>::custom(format!(
+                "transcript prefix digest requested for {count} messages but the transcript has {}",
+                self.messages.len()
+            )));
+        }
+        if let Some(witness) = self.messages.prefix_digest_witness(count) {
+            return Ok(witness);
+        }
+        transcript_messages_digest(&self.messages[..count])
+    }
+
+    /// Number of non-append transcript mutations this in-memory session has
+    /// applied. Diagnostics and regression tests only.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn transcript_mutation_epoch(&self) -> u64 {
+        self.messages.mutation_epoch()
     }
 
     /// Replace the message buffer for core-owned internal transcript rewrites.
@@ -4891,9 +5021,9 @@ impl Session {
             .cloned()
             .collect::<Vec<_>>();
         refreshed.extend(replacements);
-        if transcript_messages_digest(self.messages()).ok()
-            == transcript_messages_digest(&refreshed).ok()
-        {
+        let refreshed_digest = transcript_messages_digest(&refreshed)
+            .map_err(|error| TranscriptEditError::HistoryStateMalformed(error.to_string()))?;
+        if self.messages.digest().ok().as_deref() == Some(refreshed_digest.as_str()) {
             return Ok(());
         }
 
@@ -4901,12 +5031,19 @@ impl Session {
             self.reconciled_realtime_transcript_metadata_after_rewrite(&refreshed)?;
         let updated_at = SystemTime::now();
         let history_state = self
-            .transcript_history_state_after_message_mutation(&refreshed, updated_at)?
+            .transcript_history_state_after_message_mutation(
+                &refreshed,
+                refreshed_digest,
+                updated_at,
+                TranscriptMutationShape::Rewritten,
+            )?
             .map(serde_json::to_value)
             .transpose()
             .map_err(|error| TranscriptEditError::HistoryStateMalformed(error.to_string()))?;
 
-        self.messages = Arc::new(refreshed);
+        // SEAM 1 (non-append): synthetic notices are stripped from anywhere in
+        // the vector, so the retained midstate and prefix ring are discarded.
+        self.messages.replace(refreshed);
         self.updated_at = updated_at;
         if let Some(value) = realtime_state {
             self.set_metadata_unchecked(SESSION_REALTIME_TRANSCRIPT_STATE_KEY, value);
@@ -4931,9 +5068,10 @@ impl Session {
     ///
     /// Updates the timestamp. For adding multiple messages, prefer `push_batch`.
     pub fn push(&mut self, message: Message) {
-        Arc::make_mut(&mut self.messages).push(message);
+        // SEAM 2 (append): the accumulator folds only the appended bytes.
+        self.messages.push(message);
         self.updated_at = SystemTime::now();
-        self.refresh_transcript_head_after_message_mutation();
+        self.refresh_transcript_head_after_message_mutation(TranscriptMutationShape::Appended);
     }
 
     /// Add multiple messages in one operation (single timestamp update)
@@ -4943,10 +5081,10 @@ impl Session {
         if messages.is_empty() {
             return;
         }
-        let inner = Arc::make_mut(&mut self.messages);
-        inner.extend(messages);
+        // SEAM 3 (append): the accumulator folds only the appended batch.
+        self.messages.extend_batch(messages);
         self.updated_at = SystemTime::now();
-        self.refresh_transcript_head_after_message_mutation();
+        self.refresh_transcript_head_after_message_mutation(TranscriptMutationShape::Appended);
     }
 
     /// Rewrite inline media payloads in-place as `BlobRef` pointers.
@@ -4964,20 +5102,39 @@ impl Session {
         blob_store: &dyn crate::BlobStore,
         start: usize,
     ) -> Result<(), crate::blob::BlobStoreError> {
+        // SEAM 4 (in-place media scan): the scan reports the lowest mutated
+        // index. `None` means the buffer is byte-identical, so the retained
+        // midstate stays valid AND no transcript-head refresh is owed — which
+        // is what deletes the two full transcript digests this paid on EVERY
+        // boundary save of a history-bearing session, images or not.
         let previous_digest = if self
             .metadata
             .contains_key(SESSION_TRANSCRIPT_HISTORY_STATE_KEY)
         {
-            transcript_messages_digest(self.messages()).ok()
+            self.messages.digest().ok()
         } else {
             None
         };
-        let messages = Arc::make_mut(&mut self.messages);
-        crate::image_content::externalize_messages_from(blob_store, messages, start).await?;
-        if let Some(previous_digest) = previous_digest
-            && transcript_messages_digest(self.messages()).ok().as_ref() != Some(&previous_digest)
+        let buffer = self.messages.begin_in_place_scan();
+        let lowest_mutated = match crate::image_content::externalize_messages_from_reporting_lowest(
+            blob_store, buffer, start,
+        )
+        .await
         {
-            self.refresh_transcript_head_after_message_mutation();
+            Ok(lowest_mutated) => lowest_mutated,
+            Err(error) => {
+                // The scan may have externalized part of the buffer before
+                // failing; fail safe by discarding the parked midstate.
+                self.messages.finish_in_place_scan(Some(start));
+                return Err(error);
+            }
+        };
+        self.messages.finish_in_place_scan(lowest_mutated);
+        if lowest_mutated.is_some()
+            && let Some(previous_digest) = previous_digest
+            && self.messages.digest().ok().as_ref() != Some(&previous_digest)
+        {
+            self.refresh_transcript_head_after_message_mutation(TranscriptMutationShape::Rewritten);
         }
         Ok(())
     }
@@ -5010,22 +5167,32 @@ impl Session {
             .metadata
             .contains_key(SESSION_TRANSCRIPT_HISTORY_STATE_KEY)
         {
-            transcript_messages_digest(self.messages()).ok()
+            self.messages.digest().ok()
         } else {
             None
         };
-        let messages = Arc::make_mut(&mut self.messages);
-        let decoded_total =
-            crate::image_content::hydrate_user_images_for_realtime_projection_with_usage(
+        // SEAM 5 (in-place media scan): same contract as `externalize_media`.
+        let buffer = self.messages.begin_in_place_scan();
+        let (decoded_total, lowest_mutated) =
+            match crate::image_content::hydrate_user_images_for_realtime_projection_reporting_lowest(
                 blob_store,
-                messages,
+                buffer,
                 max_decoded_bytes,
             )
-            .await?;
-        if let Some(previous_digest) = previous_digest
-            && transcript_messages_digest(self.messages()).ok().as_ref() != Some(&previous_digest)
+            .await
+            {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    self.messages.finish_in_place_scan(Some(0));
+                    return Err(error);
+                }
+            };
+        self.messages.finish_in_place_scan(lowest_mutated);
+        if lowest_mutated.is_some()
+            && let Some(previous_digest) = previous_digest
+            && self.messages.digest().ok().as_ref() != Some(&previous_digest)
         {
-            self.refresh_transcript_head_after_message_mutation();
+            self.refresh_transcript_head_after_message_mutation(TranscriptMutationShape::Rewritten);
         }
         Ok(decoded_total)
     }
@@ -5292,7 +5459,9 @@ impl Session {
         let mutation_kind = prompt.mutation_kind();
         let (prompt, _replacing_existing) = prompt.into_parts();
         let message = SystemMessage::with_mutation_kind(prompt, mutation_kind);
-        let inner = Arc::make_mut(&mut self.messages);
+        // SEAM 6 (non-append): index 0 is replaced or the vector is shifted, so
+        // neither the midstate nor any retained prefix survives.
+        let inner = self.messages.mutate_in_place();
         // Check if first message is system
         if let Some(Message::System(_)) = inner.first() {
             inner[0] = Message::System(message);
@@ -5300,7 +5469,7 @@ impl Session {
             inner.insert(0, Message::System(message));
         }
         self.updated_at = SystemTime::now();
-        self.refresh_transcript_head_after_message_mutation();
+        self.refresh_transcript_head_after_message_mutation(TranscriptMutationShape::Rewritten);
     }
 
     /// Set a system prompt through generated durable-config authority.
@@ -5718,6 +5887,20 @@ impl Session {
         &self.metadata
     }
 
+    /// Memoized canonical witness of the current transcript-history graph.
+    ///
+    /// `None` means "not derived yet in this session instance", never
+    /// "absent": the caller derives and records it. Cleared by every write to
+    /// [`SESSION_TRANSCRIPT_HISTORY_STATE_KEY`].
+    pub(crate) fn cached_transcript_history_witness(&self) -> Option<&str> {
+        self.transcript_history_witness.get().map(String::as_str)
+    }
+
+    /// Record the canonical witness derived from the CURRENT history value.
+    pub(crate) fn record_transcript_history_witness(&self, witness: &str) {
+        let _ = self.transcript_history_witness.set(witness.to_string());
+    }
+
     fn set_metadata_unchecked(&mut self, key: &str, value: serde_json::Value) {
         // Reapplying an identical durable projection is not a session-content
         // mutation. In particular, cold materialization restores the sealed
@@ -5732,6 +5915,7 @@ impl Session {
         if key == SESSION_TRANSCRIPT_HISTORY_STATE_KEY {
             self.metadata
                 .remove(SESSION_TRANSCRIPT_HISTORY_CHECKPOINT_DIGEST_KEY);
+            self.transcript_history_witness = std::sync::OnceLock::new();
             self.transcript_history_metadata_validation =
                 TranscriptHistoryMetadataValidation::RequiresValidation;
         }
@@ -5745,6 +5929,7 @@ impl Session {
             .insert(SESSION_TRANSCRIPT_HISTORY_STATE_KEY.to_string(), value);
         self.metadata
             .remove(SESSION_TRANSCRIPT_HISTORY_CHECKPOINT_DIGEST_KEY);
+        self.transcript_history_witness = std::sync::OnceLock::new();
         self.transcript_history_metadata_validation =
             TranscriptHistoryMetadataValidation::Validated;
         self.updated_at = SystemTime::now();
@@ -5769,6 +5954,7 @@ impl Session {
                 .metadata
                 .remove(SESSION_TRANSCRIPT_HISTORY_CHECKPOINT_DIGEST_KEY)
                 .is_some();
+            self.transcript_history_witness = std::sync::OnceLock::new();
             self.transcript_history_metadata_validation =
                 TranscriptHistoryMetadataValidation::Validated;
         }
@@ -6545,13 +6731,25 @@ impl Session {
         stamp: crate::checkpoint::SessionCheckpointStamp,
     ) -> Result<(), crate::checkpoint::SessionCheckpointError> {
         stamp.validate_for_session(&self.id)?;
-        let actual = crate::checkpoint::session_checkpoint_digest(self)?;
-        if stamp.digest() != &actual {
-            return Err(crate::checkpoint::SessionCheckpointError::DigestMismatch {
-                expected: stamp.digest().clone(),
-                actual,
-            });
-        }
+        // Fast path: this exact document shape was already proved to carry this
+        // exact digest in this process — which is the case for the dominant
+        // caller, a mint immediately followed by an install of the stamp it
+        // just minted from the same unmutated document. The slow path is
+        // unchanged: a foreign or stale stamp re-derives the canonical digest
+        // and fails closed on mismatch.
+        let actual =
+            if crate::checkpoint::checkpoint_stamp_verification_is_cached(self, stamp.digest()) {
+                stamp.digest().clone()
+            } else {
+                let actual = crate::checkpoint::session_checkpoint_digest(self)?;
+                if stamp.digest() != &actual {
+                    return Err(crate::checkpoint::SessionCheckpointError::DigestMismatch {
+                        expected: stamp.digest().clone(),
+                        actual,
+                    });
+                }
+                actual
+            };
         let value = serde_json::to_value(&stamp)?;
         self.metadata
             .remove(SESSION_RUNTIME_CHECKPOINT_PROVENANCE_KEY);
@@ -6673,7 +6871,8 @@ impl Session {
                 updated_at = commit.committed_at;
             }
         }
-        self.messages = Arc::new(head_body.messages);
+        // SEAM 7 (non-append): the projection adopts a graph head body.
+        self.messages.replace(head_body.messages);
         self.updated_at = updated_at;
         Ok(())
     }
@@ -6832,7 +7031,8 @@ impl Session {
             self.set_metadata_unchecked(SESSION_REALTIME_TRANSCRIPT_STATE_KEY, value);
         }
 
-        self.messages = Arc::new(rewritten);
+        // SEAM 8 (non-append): an audited rewrite replaces a mid-vector span.
+        self.messages.replace(rewritten);
         self.updated_at = SystemTime::now();
         Ok(commit)
     }
@@ -6840,7 +7040,9 @@ impl Session {
     fn transcript_history_state_after_message_mutation(
         &self,
         messages: &[Message],
+        head: String,
         created_at: SystemTime,
+        shape: TranscriptMutationShape,
     ) -> Result<Option<TranscriptHistoryState>, TranscriptEditError> {
         if !self
             .metadata
@@ -6856,9 +7058,44 @@ impl Session {
                     "transcript history metadata key decoded without state".to_string(),
                 )
             })?;
+
+        // Fast path: an APPEND onto a graph that a validating authority
+        // installed. The two full graph validations this used to pay per
+        // appended batch re-proved nothing that changed — every retained body
+        // is untouched, every commit's inputs are untouched, and the one new
+        // fact ("the new head body extends the previous head") is proved in
+        // O(1) from a retained prefix midstate instead of by re-hashing the
+        // whole graph. Anything that does not prove cleanly falls through to
+        // the full validating path below; correctness never depends on the
+        // fast path being taken.
+        if shape == TranscriptMutationShape::Appended
+            && self.transcript_history_metadata_validation
+                == TranscriptHistoryMetadataValidation::Validated
+            && let Some(previous_head_body) = state
+                .revisions
+                .iter()
+                .find(|body| body.revision == state.head)
+            && previous_head_body.messages.len() <= messages.len()
+            && self
+                .messages
+                .prefix_digest_witness(previous_head_body.messages.len())
+                .as_deref()
+                == Some(state.head.as_str())
+        {
+            if !state.revisions.iter().any(|body| body.revision == head) {
+                state.revisions.push(TranscriptRevisionBody {
+                    revision: head.clone(),
+                    parent_revision: state.commits.last().map(|commit| commit.revision.clone()),
+                    messages: messages.to_vec(),
+                    created_at,
+                });
+            }
+            state.head = head;
+            state.prune_mechanical_revision_bodies();
+            return Ok(Some(state));
+        }
+
         state.compact_mechanical_revision_bodies()?;
-        let head = transcript_messages_digest(messages)
-            .map_err(|error| TranscriptEditError::HistoryStateMalformed(error.to_string()))?;
         if !state.revisions.iter().any(|body| body.revision == head) {
             state.revisions.push(TranscriptRevisionBody {
                 revision: head.clone(),
@@ -6872,10 +7109,30 @@ impl Session {
         Ok(Some(state))
     }
 
-    fn refresh_transcript_head_after_message_mutation(&mut self) {
-        match self
-            .transcript_history_state_after_message_mutation(self.messages(), SystemTime::now())
+    fn refresh_transcript_head_after_message_mutation(&mut self, shape: TranscriptMutationShape) {
+        if !self
+            .metadata
+            .contains_key(SESSION_TRANSCRIPT_HISTORY_STATE_KEY)
         {
+            return;
+        }
+        let head = match self.messages.digest() {
+            Ok(head) => head,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %self.id,
+                    error = %error,
+                    "failed to digest transcript after message mutation"
+                );
+                return;
+            }
+        };
+        match self.transcript_history_state_after_message_mutation(
+            self.messages(),
+            head,
+            SystemTime::now(),
+            shape,
+        ) {
             Ok(Some(state)) => match serde_json::to_value(state) {
                 Ok(value) => {
                     self.set_validated_transcript_history_metadata(value);
@@ -6947,10 +7204,11 @@ impl Session {
         Self {
             version: session_version(),
             id: SessionId::new(),
-            messages: Arc::new(truncated),
+            messages: TranscriptMessages::from_vec(truncated),
             created_at: now,
             updated_at: now,
             metadata: self.fork_metadata_projection(),
+            transcript_history_witness: std::sync::OnceLock::new(),
             transcript_history_metadata_validation: TranscriptHistoryMetadataValidation::Validated,
             usage: self.usage.clone(),
         }
@@ -7067,10 +7325,11 @@ impl Session {
         Self {
             version: session_version(),
             id: SessionId::new(),
-            messages: Arc::clone(&self.messages),
+            messages: self.messages.clone(),
             created_at: now,
             updated_at: now,
             metadata: self.fork_metadata_projection(),
+            transcript_history_witness: std::sync::OnceLock::new(),
             transcript_history_metadata_validation: TranscriptHistoryMetadataValidation::Validated,
             usage: self.usage.clone(),
         }
@@ -7621,6 +7880,83 @@ impl PersistedSessionMetadataView {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+
+    /// The append fast path in `transcript_history_state_after_message_mutation`
+    /// must be a pure cost optimization: the graph it installs has to be the
+    /// same graph the full validating path installs.
+    ///
+    /// Control session takes the slow path (its history-validation flag is
+    /// flipped back to `RequiresValidation` before every append, which is the
+    /// state an unchecked metadata write leaves behind); the subject takes the
+    /// fast path. Both must agree on head, commits, and the retained
+    /// (revision, messages) set — only body construction timestamps differ,
+    /// and those are storage bookkeeping the canonical digest erases.
+    #[test]
+    fn append_fast_path_installs_the_same_graph_as_the_validating_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        fn seeded() -> Result<Session, Box<dyn std::error::Error>> {
+            let mut session = Session::new();
+            session.push(Message::User(UserMessage::text("A".to_string())));
+            session.push(Message::User(UserMessage::text("B".to_string())));
+            session.commit_transcript_rewrite(
+                TranscriptRewriteSelection::MessageRange { start: 1, end: 2 },
+                vec![Message::User(UserMessage::text("B2".to_string()))],
+                TranscriptRewriteReason::new("unit-test"),
+                Some("unit-test".to_string()),
+                None,
+            )?;
+            Ok(session)
+        }
+
+        let mut subject = seeded()?;
+        let mut control = subject.clone();
+
+        for index in 0..4 {
+            let message = Message::User(UserMessage::text(format!("append {index}")));
+            subject.push(message.clone());
+
+            // Force the control down the full validating path.
+            let value = control
+                .metadata()
+                .get(SESSION_TRANSCRIPT_HISTORY_STATE_KEY)
+                .cloned()
+                .ok_or_else(|| std::io::Error::other("control history missing"))?;
+            control.transcript_history_metadata_validation =
+                TranscriptHistoryMetadataValidation::RequiresValidation;
+            control.set_validated_transcript_history_metadata(value);
+            control.transcript_history_metadata_validation =
+                TranscriptHistoryMetadataValidation::RequiresValidation;
+            control.push(message);
+
+            let subject_state = subject
+                .transcript_history_state()?
+                .ok_or_else(|| std::io::Error::other("subject history missing"))?;
+            let control_state = control
+                .transcript_history_state()?
+                .ok_or_else(|| std::io::Error::other("control history missing"))?;
+            assert_eq!(subject_state.head, control_state.head, "head at {index}");
+            assert_eq!(
+                subject_state.commits, control_state.commits,
+                "commits at {index}"
+            );
+            let project = |state: &TranscriptHistoryState| {
+                let mut bodies = state
+                    .revisions
+                    .iter()
+                    .map(|body| (body.revision.clone(), body.messages.clone()))
+                    .collect::<Vec<_>>();
+                bodies.sort_by(|left, right| left.0.cmp(&right.0));
+                bodies
+            };
+            assert_eq!(
+                project(&subject_state),
+                project(&control_state),
+                "retained bodies at {index}"
+            );
+            subject.validate_transcript_history_state()?;
+        }
+        Ok(())
+    }
     use super::*;
     use crate::realtime_transcript::RealtimeTranscriptRole;
     use crate::types::{
@@ -8885,7 +9221,7 @@ mod tests {
             parent = revision;
         }
         state.head = parent;
-        session.messages = Arc::new(messages);
+        session.messages.replace(messages);
         session.set_metadata_unchecked_for_test(
             SESSION_TRANSCRIPT_HISTORY_STATE_KEY,
             serde_json::to_value(state).expect("uncompacted history"),
@@ -9138,7 +9474,7 @@ mod tests {
                 .replace_synthetic_notices(SystemNoticeKind::McpPending, Vec::new())
                 .is_err()
         );
-        assert_eq!(session.messages, before_messages);
+        assert_eq!(session.messages(), before_messages.as_slice());
         assert_eq!(session.metadata, before_metadata);
         assert_eq!(session.updated_at, before_updated_at);
     }
@@ -11626,7 +11962,7 @@ mod tests {
         let forked = session.fork();
 
         // Both should point to the same underlying data (Arc refcount > 1)
-        assert!(Arc::ptr_eq(&session.messages, &forked.messages));
+        assert!(Arc::ptr_eq(session.messages.arc(), forked.messages.arc()));
         assert_eq!(forked.messages().len(), 100);
     }
 
@@ -11716,13 +12052,13 @@ mod tests {
 
         // Fork shares the Arc
         let forked = session.fork();
-        assert!(Arc::ptr_eq(&session.messages, &forked.messages));
+        assert!(Arc::ptr_eq(session.messages.arc(), forked.messages.arc()));
 
         // Push on original triggers CoW - original gets new Arc
         session.push(Message::User(UserMessage::text("Second".to_string())));
 
         // Now they should have different Arcs
-        assert!(!Arc::ptr_eq(&session.messages, &forked.messages));
+        assert!(!Arc::ptr_eq(session.messages.arc(), forked.messages.arc()));
         assert_eq!(session.messages().len(), 2);
         assert_eq!(forked.messages().len(), 1);
     }
