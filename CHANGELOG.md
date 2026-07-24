@@ -13,6 +13,15 @@ via cargo-semver-checks against the published baselines).
 
 ## [Unreleased]
 
+### Added
+
+- **`claude-opus-5`**: Claude Opus 5 joins the curated Anthropic catalog
+  (Claude 5 family sibling of Fable 5; 1M context, 128k max output,
+  adaptive-only thinking, full low..max effort ladder, compaction +
+  structured outputs + web search, sampling parameters removed) and
+  replaces `claude-opus-4-8` as the Anthropic provider default. The
+  cross-provider global default is unchanged (`gpt-5.6-sol`).
+
 ### Added (storage unification arc)
 
 - **`meerkat-sqlite`**: new leaf crate owning the shared SQLite mechanics —

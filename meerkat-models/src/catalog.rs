@@ -32,7 +32,7 @@ const PROVIDER_NAMES: &[&str] = &["anthropic", "gemini", "openai"];
 
 /// Explicit default model ID per provider. This product policy is independent
 /// of [`ModelTier`].
-const DEFAULT_ANTHROPIC: &str = "claude-opus-4-8";
+const DEFAULT_ANTHROPIC: &str = "claude-opus-5";
 // Deliberate product policy: GPT-5.6 Sol is the OpenAI/global default even
 // while OpenAI limits access to preview-enabled API organizations and Codex
 // workspaces. Operators without preview access must explicitly pin GPT-5.5.
