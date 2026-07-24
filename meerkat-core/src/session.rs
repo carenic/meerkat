@@ -513,7 +513,19 @@ fn transcript_graph_decode_memo() -> &'static Mutex<BoundedTranscriptGraphDecode
 /// Whether this exact graph-shape fact was already proved on this process's
 /// decode path. A poisoned lock degrades to "not cached": the caller
 /// re-verifies.
+///
+/// Setting `MEERKAT_DISABLE_GRAPH_DECODE_MEMO` (any value) forces every
+/// lookup to miss, reproducing the pre-memo decode cost. It is a diagnostic
+/// kill-switch with exactly two uses: red-first verification of the e2e
+/// gates that assert this memo absorbs repeat decodes (see the marker-less
+/// resume-cost assertion in `meerkat-mob/tests/smoke_mob_idle_burn.rs`),
+/// and ruling the memo in or out when stale memoized trust is suspected.
+/// It must never be set in production — it restores the
+/// O(document)-per-decode verification cost this memo exists to remove.
 fn transcript_graph_fact_is_memoized(key: &str) -> bool {
+    if std::env::var_os("MEERKAT_DISABLE_GRAPH_DECODE_MEMO").is_some() {
+        return false;
+    }
     transcript_graph_decode_memo()
         .lock()
         .map(|memo| memo.contains(key))

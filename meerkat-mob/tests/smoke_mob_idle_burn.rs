@@ -16,6 +16,13 @@
 //! clock or %CPU sampling. This test must stay ALONE in its test binary so no
 //! sibling test's CPU pollutes the measurement.
 //!
+//! The marker-less arm additionally asserts RESUME COST as a ratio against a
+//! marked-baseline cold restart: idle CPU alone cannot see the decode-memo
+//! regression (a mob with no repeat-load driver quiesces either way), but a
+//! resume that re-pays decode-time graph verification per load runs ~3x
+//! slower. Red-first verification: run with
+//! `MEERKAT_DISABLE_GRAPH_DECODE_MEMO=1` and the ratio assertion must fail.
+//!
 //! No live provider is involved: members run against a scripted LLM client,
 //! so the lane needs no API keys and the measured window is deterministic.
 //!
@@ -55,6 +62,22 @@ const MAX_IDLE_CPU: Duration = Duration::from_secs(3);
 const LARGE_TURN_INPUT_BYTES: usize = 3_000_000;
 const LARGE_SESSION_TURNS: usize = 4;
 const MIN_PERSISTED_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Marker-less resume cost is asserted as a RATIO against a marked-baseline
+/// cold restart of the same fleet, so the bound is machine-speed-invariant.
+/// The baseline documents carry no transcript history state on disk; the
+/// resume-time system-prompt-refresh rewrite creates history mid-resume, so
+/// the baseline is only PARTIALLY exposed to decode-memo loss (late-window
+/// validation repeats), while the marker-less arm pays the heal probe plus
+/// full graph validation from its first decode. Measured on the reference
+/// box: memo on 41.3s / 26.9s (ratio 1.54 — the structural gap: a roughly
+/// double-size document plus one memoized verification pass per document);
+/// memo off (`MEERKAT_DISABLE_GRAPH_DECODE_MEMO=1`) 123.5s / 54.2s (ratio
+/// 2.28). K = 1.75 sits between with ~25% margin each way. The absolute
+/// floor keeps sub-second baseline resumes on fast machines from turning
+/// timing noise into a failure.
+const MARKERLESS_RESUME_RATIO: f64 = 1.75;
+const MARKERLESS_RESUME_FLOOR: Duration = Duration::from_secs(5);
 
 const MEMBER_IDS: [&str; 3] = ["lead-1", "w-1", "w-2"];
 const LARGE_MEMBER_ID: &str = "w-1";
@@ -507,6 +530,49 @@ async fn e2e_smoke_mob_idle_burn_gate() {
     }
     drop(handle);
 
+    // ---- Marked-baseline cold restart (ratio denominator) ----
+    // The persisted documents carry no transcript history state yet (the
+    // resume itself will create it via the system-prompt-refresh rewrite),
+    // so this is the least memo-exposed resume the runtime can perform on
+    // this fleet. Dividing the marker-less resume below by this number
+    // cancels machine speed and leaves the decode-time verification cost
+    // the memo exists to absorb.
+    let marked_resume_start = Instant::now();
+    let storage = MobStorage::persistent(&mob_db_path).expect("reopen mob storage for baseline");
+    let handle = MobBuilder::for_resume(storage)
+        .with_session_service(service.clone())
+        .with_default_llm_client(Arc::new(capture.clone()))
+        .notify_orchestrator_on_resume(false)
+        .resume()
+        .await
+        .expect("resume mob for the marked baseline");
+    let deadline = Instant::now() + Duration::from_secs(240);
+    while active_member_count(&handle).await < MEMBER_IDS.len() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {} active members after the marked baseline \
+             restart; roster: {:?}",
+            MEMBER_IDS.len(),
+            handle.list_members().await
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+    let marked_resume = marked_resume_start.elapsed();
+    eprintln!("[idle-burn gate] marked baseline resume-to-ready: {marked_resume:?}");
+
+    wait_for_quiesce("mob never quiesced after the marked baseline restart").await;
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown after the marked baseline restart");
+    for (_, session_id) in &member_session_ids {
+        service
+            .discard_live_session(session_id)
+            .await
+            .expect("discard live session after the marked baseline restart");
+    }
+    drop(handle);
+
     for (member_id, session_id) in &member_session_ids {
         let path = sessions_root.join(format!("{session_id}.jsonl"));
         let bytes = fs::read(&path).expect("read persisted session document");
@@ -558,9 +624,27 @@ async fn e2e_smoke_mob_idle_burn_gate() {
         );
         sleep(Duration::from_millis(100)).await;
     }
+    let markerless_resume = resume_start.elapsed();
     eprintln!(
-        "[idle-burn gate] marker-less resume-to-ready: {:?}",
-        resume_start.elapsed()
+        "[idle-burn gate] marker-less resume-to-ready: {markerless_resume:?} \
+         (marked baseline: {marked_resume:?})"
+    );
+
+    // Resume-cost contract: without the process-lifetime decode memo the
+    // marker-less resume re-runs the heal probe plus full graph validation
+    // on EVERY decode of every document, and this ratio blows past the
+    // budget (measured ~3x the memo-on resume; red-first verifiable with
+    // MEERKAT_DISABLE_GRAPH_DECODE_MEMO=1).
+    let allowed_markerless_resume =
+        marked_resume.mul_f64(MARKERLESS_RESUME_RATIO) + MARKERLESS_RESUME_FLOOR;
+    assert!(
+        markerless_resume <= allowed_markerless_resume,
+        "marker-less resume-to-ready took {markerless_resume:?}, exceeding \
+         {allowed_markerless_resume:?} (marked baseline {marked_resume:?} x \
+         {MARKERLESS_RESUME_RATIO} + {MARKERLESS_RESUME_FLOOR:?}): marker-less \
+         (pre-0.8.6-written) documents are re-paying decode-time \
+         transcript-graph verification on every load; the process-lifetime \
+         decode memo is not absorbing repeat loads of unchanged marker-less bytes"
     );
 
     // A fixed-cadence loop that re-pays O(document) digest work per tick on
