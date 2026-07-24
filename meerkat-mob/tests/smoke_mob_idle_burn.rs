@@ -117,6 +117,98 @@ fn process_cpu_time() -> Duration {
         .as_duration()
 }
 
+/// Probe the process CPU rate until a 2s probe reads idle-level. Trailing
+/// durable commits are legitimate work; a mob that NEVER quiesces fails here
+/// — which is exactly the defect class this gate exists to catch.
+async fn wait_for_quiesce(what: &str) {
+    let quiesce_deadline = Instant::now() + Duration::from_secs(240);
+    loop {
+        let probe_start = process_cpu_time();
+        sleep(Duration::from_secs(2)).await;
+        let probe_burn = process_cpu_time().saturating_sub(probe_start);
+        if probe_burn < Duration::from_millis(200) {
+            break;
+        }
+        assert!(
+            Instant::now() < quiesce_deadline,
+            "{what}: still burning {probe_burn:?} per 2s probe (an idle-CPU hot loop)"
+        );
+    }
+}
+
+/// Rewrite one persisted session document into the pre-marker fleet shape
+/// (the HomeCore cutover state: written by 0.8.4-class code, `digest_format`
+/// absent, current-format digests):
+///   1. commit a REAL audited transcript rewrite so the document retains
+///      transcript-history revision bodies like a production
+///      compacted/rewritten session — the decode-time heal probe and graph
+///      validation only exist for documents that carry this state;
+///   2. re-stamp the checkpoint over the rewritten document (out-of-band
+///      successor, same pattern as the cold-restart harness);
+///   3. strip the `digest_format` marker from the serialized bytes exactly
+///      as a pre-marker writer would have persisted them. The checkpoint
+///      digest is marker-invariant, so the stamp keeps verifying before and
+///      after the strip.
+fn markerless_history_document(bytes: &[u8], member_id: &str) -> Vec<u8> {
+    use meerkat_core::session::SESSION_TRANSCRIPT_HISTORY_STATE_KEY;
+    use meerkat_core::{
+        SessionCheckpointProvenance, SessionCheckpointStamp, SessionCheckpointState,
+        TranscriptRewriteReason, TranscriptRewriteSelection,
+    };
+
+    let mut session: meerkat_core::Session =
+        serde_json::from_slice(bytes).expect("decode persisted session document");
+    let predecessor = match session
+        .try_checkpoint_state()
+        .expect("gate fixture checkpoint must verify")
+    {
+        SessionCheckpointState::Verified(stamp) => stamp,
+        SessionCheckpointState::LegacyUnverified { .. } => {
+            panic!("gate fixture documents are written stamped by this build")
+        }
+    };
+    let message_count = session.messages().len();
+    assert!(
+        message_count >= 2,
+        "seeded member {member_id} must have a transcript to rewrite"
+    );
+    session
+        .commit_transcript_rewrite(
+            TranscriptRewriteSelection::MessageRange {
+                start: message_count - 1,
+                end: message_count,
+            },
+            vec![meerkat_core::Message::User(
+                meerkat_core::types::UserMessage::text(format!(
+                    "marker-less fixture rewrite for {member_id}"
+                )),
+            )],
+            TranscriptRewriteReason::new("idle-burn marker-less fixture"),
+            None,
+            None,
+        )
+        .expect("commit fixture transcript rewrite");
+    let stamp = SessionCheckpointStamp::successor(
+        &session,
+        &predecessor,
+        SessionCheckpointProvenance::TranscriptRewrite,
+    )
+    .expect("mint successor checkpoint over the rewritten document");
+    session
+        .install_checkpoint_stamp(stamp)
+        .expect("install successor checkpoint");
+
+    let mut document = serde_json::to_value(&session).expect("serialize rewritten session");
+    let state = document["metadata"][SESSION_TRANSCRIPT_HISTORY_STATE_KEY]
+        .as_object_mut()
+        .expect("rewritten session must retain transcript history state");
+    assert!(
+        state.remove("digest_format").is_some(),
+        "this build must have stamped the digest-format marker"
+    );
+    serde_json::to_vec(&document).expect("serialize marker-less session document")
+}
+
 fn idle_profile(peer_description: &str) -> Profile {
     Profile {
         model: "gpt-5.5".to_string(),
@@ -240,7 +332,7 @@ async fn e2e_smoke_mob_idle_burn_gate() {
         builder,
         32,
         store_dyn,
-        runtime_store,
+        runtime_store.clone(),
         blob_store,
     ));
 
@@ -344,23 +436,8 @@ async fn e2e_smoke_mob_idle_burn_gate() {
     );
 
     // Quiesce before opening the measured window: trailing durable commits of
-    // the large turns are legitimate work. Probe the process CPU rate until a
-    // 2s probe reads idle-level; a mob that NEVER quiesces fails here — which
-    // is exactly the defect class this gate exists to catch.
-    let quiesce_deadline = Instant::now() + Duration::from_secs(240);
-    loop {
-        let probe_start = process_cpu_time();
-        sleep(Duration::from_secs(2)).await;
-        let probe_burn = process_cpu_time().saturating_sub(probe_start);
-        if probe_burn < Duration::from_millis(200) {
-            break;
-        }
-        assert!(
-            Instant::now() < quiesce_deadline,
-            "mob never quiesced after seeding: still burning {probe_burn:?} \
-             per 2s probe (an idle-CPU hot loop)"
-        );
-    }
+    // the large turns are legitimate work.
+    wait_for_quiesce("mob never quiesced after seeding").await;
 
     // The measured contract: a converged, idle mob must consume ~zero CPU
     // regardless of member count or session-document size.
@@ -395,6 +472,134 @@ async fn e2e_smoke_mob_idle_burn_gate() {
         assert!(
             Instant::now() < deadline,
             "timed out waiting for the post-idle turn to reach the LLM"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    // ---- Marker-less cutover leg (the HomeCore production shape) ----
+    // A real fleet upgrades onto state migrated by PRE-marker builds: the
+    // persisted documents carry transcript history but no `digest_format`
+    // marker, so every decode re-runs the legacy heal probe (a full
+    // head-transcript hash) plus the per-body graph validation. The idle
+    // contract must hold on that state too: rewrite every persisted copy
+    // into the pre-marker shape via direct store access, cold-restart the
+    // mob on it, and re-measure the idle window.
+    let mut member_session_ids = Vec::new();
+    for member_id in MEMBER_IDS {
+        let session_id = handle
+            .resolve_bridge_session_id(&AgentIdentity::from(member_id))
+            .await
+            .expect("member session id");
+        member_session_ids.push((member_id, session_id));
+    }
+
+    // Settle the liveness turn's trailing persistence before going down.
+    wait_for_quiesce("mob never quiesced after the post-idle liveness turn").await;
+    handle
+        .shutdown()
+        .await
+        .expect("shutdown before marker-less restart");
+    for (_, session_id) in &member_session_ids {
+        service
+            .discard_live_session(session_id)
+            .await
+            .expect("discard live session before same-process restart");
+    }
+    drop(handle);
+
+    for (member_id, session_id) in &member_session_ids {
+        let path = sessions_root.join(format!("{session_id}.jsonl"));
+        let bytes = fs::read(&path).expect("read persisted session document");
+        let markerless = markerless_history_document(&bytes, member_id);
+        fs::write(&path, &markerless).expect("write marker-less session document");
+
+        // The runtime snapshot is a second full copy decoded on every
+        // authoritative load; rewrite it through the store's guarded CAS so
+        // both copies carry the identical marker-less document.
+        let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(session_id);
+        if let Some(current) = runtime_store
+            .load_session_snapshot(&runtime_id)
+            .await
+            .expect("load runtime session snapshot")
+        {
+            let replaced = runtime_store
+                .replace_session_snapshot_if_current(&runtime_id, &current, markerless.clone())
+                .await
+                .expect("replace runtime session snapshot");
+            assert!(
+                replaced,
+                "runtime snapshot CAS must apply while the mob is down"
+            );
+        }
+    }
+    eprintln!(
+        "[idle-burn gate] rewrote {} persisted documents into the marker-less pre-0.8.6 shape",
+        member_session_ids.len()
+    );
+
+    // Cold restart on the marker-less state — the production cutover shape.
+    let resume_start = Instant::now();
+    let storage = MobStorage::persistent(&mob_db_path).expect("reopen mob storage");
+    let handle = MobBuilder::for_resume(storage)
+        .with_session_service(service.clone())
+        .with_default_llm_client(Arc::new(capture.clone()))
+        .notify_orchestrator_on_resume(false)
+        .resume()
+        .await
+        .expect("resume mob on marker-less state");
+    let deadline = Instant::now() + Duration::from_secs(240);
+    while active_member_count(&handle).await < MEMBER_IDS.len() {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {} active members after the marker-less \
+             restart; roster: {:?}",
+            MEMBER_IDS.len(),
+            handle.list_members().await
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+    eprintln!(
+        "[idle-burn gate] marker-less resume-to-ready: {:?}",
+        resume_start.elapsed()
+    );
+
+    // A fixed-cadence loop that re-pays O(document) digest work per tick on
+    // the marker-less documents never quiesces and fails here.
+    wait_for_quiesce("mob never quiesced after the marker-less restart").await;
+
+    let cpu_before = process_cpu_time();
+    sleep(IDLE_WINDOW).await;
+    let idle_cpu = process_cpu_time().saturating_sub(cpu_before);
+    eprintln!("[idle-burn gate] marker-less idle CPU over {IDLE_WINDOW:?}: {idle_cpu:?}");
+    assert!(
+        idle_cpu <= MAX_IDLE_CPU,
+        "idle mob burned {idle_cpu:?} CPU over {IDLE_WINDOW:?} (limit {MAX_IDLE_CPU:?}) \
+         on marker-less (pre-0.8.6-written) session documents; repeat decodes \
+         of unchanged marker-less bytes must be absorbed, not re-verified per tick"
+    );
+
+    // Cheap idle must not mean dead, on this state either.
+    assert_eq!(
+        handle.list_members().await.len(),
+        MEMBER_IDS.len(),
+        "post-marker-less-idle roster lost members"
+    );
+    let turns_before = capture.count();
+    handle
+        .member(&AgentIdentity::from("lead-1"))
+        .await
+        .expect("post-marker-less-idle member handle")
+        .send(
+            "post-marker-less-idle liveness probe".to_string(),
+            HandlingMode::Queue,
+        )
+        .await
+        .expect("post-marker-less-idle turn");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while capture.count() <= turns_before {
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for the post-marker-less-idle turn to reach the LLM"
         );
         sleep(Duration::from_millis(100)).await;
     }
