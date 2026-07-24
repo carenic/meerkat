@@ -140,6 +140,7 @@ pub const REALM_DATABASE_FILES: &[(&str, &[&str])] = &[
     ),
     ("runtime.sqlite3", &["runtime-store"]),
     ("workgraph.sqlite3", &["workgraph"]),
+    ("jobs.sqlite3", &["jobs"]),
     ("memory/memory.sqlite3", &["memory"]),
     ("tasks.db", &["tools-tasks"]),
     ("sessions_jsonl/session_index.sqlite3", &["jsonl-index"]),
@@ -155,7 +156,12 @@ pub const KNOWN_LEDGER_DOMAINS: &[&str] = &[
     "session-store",
     "schedule-store",
     "runtime-store",
+    // Lazily provisioned by the first durable-delivery write; absent on
+    // realms that never used durable delivery, so it is deliberately NOT in
+    // any `REALM_DATABASE_FILES` expected-domain list.
+    "runtime-delivery",
     "workgraph",
+    "jobs",
     "memory",
     "mob",
     "tools-tasks",
@@ -1839,6 +1845,18 @@ mod tests {
             )
             .unwrap();
         }
+        {
+            let conn = Connection::open(realm_dir.join("jobs.sqlite3")).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE meerkat_schema (domain TEXT PRIMARY KEY, version INTEGER NOT NULL)",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO meerkat_schema (domain, version) VALUES ('jobs', 1)",
+                [],
+            )
+            .unwrap();
+        }
         let mobs_dir = realm_dir.join("mobs");
         std::fs::create_dir_all(&mobs_dir).unwrap();
         {
@@ -1879,6 +1897,12 @@ mod tests {
                 .domains
                 .contains(&("workgraph".to_string(), Some(9999)))
         );
+        let jobs_db = entry
+            .databases
+            .iter()
+            .find(|d| d.path.ends_with("jobs.sqlite3"))
+            .expect("jobs db inventory");
+        assert!(jobs_db.domains.contains(&("jobs".to_string(), Some(1))));
         let mob_db = entry
             .databases
             .iter()

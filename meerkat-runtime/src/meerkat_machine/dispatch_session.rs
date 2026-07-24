@@ -1624,11 +1624,14 @@ impl MeerkatMachine {
             });
         };
         let runtime_id = Self::logical_runtime_id(session_id);
-        let witnesses = store.load_input_states(&runtime_id).await.map_err(|err| {
-            RuntimeDriverError::Internal(format!(
-                "terminal-status witness read failed for {runtime_id}: {err}"
-            ))
-        })?;
+        let witnesses = store
+            .load_input_states_strict(&runtime_id)
+            .await
+            .map_err(|err| {
+                RuntimeDriverError::Internal(format!(
+                    "terminal-status witness read failed for {runtime_id}: {err}"
+                ))
+            })?;
         if witnesses.is_empty() {
             let lifecycle = store
                 .load_machine_lifecycle_record(&runtime_id)

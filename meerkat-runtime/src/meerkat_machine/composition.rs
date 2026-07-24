@@ -1373,7 +1373,7 @@ mod tests {
         assert!(outcome.is_accepted());
         let completion = completion.expect("queued durable work installs a completion waiter");
         let durable_before =
-            crate::store::RuntimeStore::load_input_states(store.as_ref(), &runtime_id)
+            crate::store::RuntimeStore::load_input_states_strict(store.as_ref(), &runtime_id)
                 .await
                 .expect("load queued durable work before missing-live preparation");
         assert_eq!(durable_before.len(), 1);
@@ -1434,7 +1434,7 @@ mod tests {
             "typed exit/readmit must leave completion waiters verbatim"
         );
         let durable_after_revival =
-            crate::store::RuntimeStore::load_input_states(store.as_ref(), &runtime_id)
+            crate::store::RuntimeStore::load_input_states_strict(store.as_ref(), &runtime_id)
                 .await
                 .expect("load queued durable work after missing-live preparation");
         assert_eq!(durable_after_revival.len(), 1);

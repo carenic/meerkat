@@ -7433,7 +7433,7 @@ async fn live_and_durable_run_terminal_reports_agree_after_recovery() {
     );
 
     let durable_witnesses = restarted_store
-        .load_input_states(&runtime_id_for_session(&session_id))
+        .load_input_states_strict(&runtime_id_for_session(&session_id))
         .await
         .expect("store-handle-direct witness read should succeed");
     let durable = crate::terminal_status::evaluate_run(&run_id, &durable_witnesses);
@@ -9704,8 +9704,7 @@ async fn persistent_destroy_durable_commit_observes_canonical_destroy_truth() {
         async fn load_input_states(
             &self,
             runtime_id: &LogicalRuntimeId,
-        ) -> Result<Vec<crate::input_state::StoredInputState>, crate::store::RuntimeStoreError>
-        {
+        ) -> Result<Vec<crate::store::InputStateRow>, crate::store::RuntimeStoreError> {
             self.inner.load_input_states(runtime_id).await
         }
 
@@ -25222,7 +25221,7 @@ impl RuntimeStore for RuntimeCommitAtomicityStore {
     async fn load_input_states(
         &self,
         runtime_id: &LogicalRuntimeId,
-    ) -> Result<Vec<crate::input_state::StoredInputState>, crate::store::RuntimeStoreError> {
+    ) -> Result<Vec<crate::store::InputStateRow>, crate::store::RuntimeStoreError> {
         self.inner.load_input_states(runtime_id).await
     }
 
