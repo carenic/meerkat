@@ -93,6 +93,149 @@ via cargo-semver-checks against the published baselines).
   `open_realm_session_store`) and `meerkat_skills::resolve_repositories` —
   use the explicit-root variants.
 
+### Added (durable jobs arc)
+
+- **`meerkat-jobs`**: new publishable crate owning realm-scoped detached job
+  execution. The generated `DetachedJob` machine is the single lifecycle
+  authority: attempt leases with fencing tokens, heartbeats, restart
+  checkpoints, typed terminals, and machine-authorized retry (scheduled
+  retry due times are honored across recovery). Ships `DetachedJobStore`
+  (SQLite-backed on a new per-realm `jobs.sqlite3` under the `jobs` ledger
+  domain, plus in-memory), predicate watches, and a durable notification
+  outbox.
+- **Runtime delivery inbox** (`meerkat-runtime`): job terminals and
+  notifications reach the origin session through a generated ordered-cursor
+  delivery machine — idempotent submission, sequence-ordered application,
+  exactly-once acks — drained by a per-realm driver. Its tables live under
+  the lazily-provisioned `runtime-delivery` ledger domain (see Fixed: only
+  actually using durable delivery stamps a realm's file).
+- **Durable callback protocol**: external callbacks now carry
+  `tool_use_id` end to end, and a suspended assistant batch with multiple
+  external calls is typed instead of impossible —
+  `AgentError::CallbackBatchPending` surfaces the complete pending set
+  (`PendingCallbackToolCall`) so a host supplies one exact result set; no
+  callback is silently selected or dropped.
+  `AgentEvent::InteractionCallbackPending` gained the full
+  `pending_tool_calls` set (empty on lines written by older producers).
+- **17 new JSON-RPC methods** (generated catalog + `docs/api/rpc.mdx`):
+  `jobs/get`, `jobs/list`, `jobs/cancel`, `jobs/progress`, `jobs/result`,
+  `jobs/artifacts`, `jobs/retry`, `jobs/health`, `jobs/subscribe`,
+  `jobs/unsubscribe`, `monitors/start`, and the host-worker lease surface
+  `mobkit/jobs/heartbeat`, `mobkit/jobs/progress`, `mobkit/jobs/checkpoint`,
+  `mobkit/jobs/complete`, `mobkit/jobs/fail`, `mobkit/jobs/cancel_ack`.
+  Wire types in `meerkat_contracts::wire::jobs` feed the regenerated
+  schemas and SDK types.
+- **Streaming-tool supervision** (`meerkat_core::streaming_tool`): a tool
+  declared `Streaming` runs under a canonical supervisor that hands it a
+  typed progress sink and cancellation token
+  (`ToolStreamingDispatchContext`); validated `ToolProgressFrame`s reset an
+  inactivity watchdog, and a stalled stream fails typed as
+  `ToolError::InactivityTimeout` (error code `inactivity_timeout`, wire
+  class `timeout`) under the execution policy's inactivity and absolute
+  deadlines instead of hanging the turn. Mob member upcalls carry the new
+  class across the bridge. Fast and detached dispatch contexts expose no
+  streaming surface; a streaming-declared tool fails closed without one
+  rather than fabricating progress authority.
+- **Shell builtin rewritten onto durable jobs**: `shell(background: true)`
+  runs as a realm-scoped detached job — durable progress and terminal
+  delivery back into the origin session, blob-spooled output, a monitor
+  protocol for live supervision (`monitors/start`), and restart recovery
+  that reconciles still-running jobs instead of forgetting them.
+- **Jobs × WorkGraph × Schedule composition** (`meerkat::job_composition`):
+  the ownership seams stay separate — `DetachedJobMachine` owns execution,
+  WorkGraph owns evidence and closure, Schedule owns occurrence delivery,
+  and MeerkatMachine owns explicit per-session wait bindings — and the
+  facade composes them: `ScheduledJobTemplate` /
+  `ScheduledDurableJobRunnable` let schedule occurrences launch durable
+  jobs as host runnables, `JobWorkGraphLink` +
+  `JobTerminalEvidenceProjector` file typed job-terminal evidence onto work
+  items, and `JobAwaitCoordinator` registers deterministic wait bindings
+  (`OperationId::for_detached_job_wait`) that a reconstructed runtime
+  re-derives after volatile operation state is discarded. A shared-realm
+  e2e lane exercises the full loop.
+
+### Changed (durable jobs arc — operator-visible)
+
+- **The external-callback deadline quadrupled: 30s → 120s.** Every
+  `tools/register` client (IDE hosts, embedding gateways) now holds a turn
+  open for up to two minutes on an unresponsive callback host where it
+  previously failed at thirty seconds; hosts and transports add bounded
+  handoff margins of 125s/130s on top
+  (`meerkat-rpc/src/callback_dispatcher.rs`). Callers that relied on the
+  30s failure as a liveness probe must bring their own timeout.
+- **`shell(background: true)` now requires a durable realm.** Detached
+  execution is gated on a persistent job store AND a persistent blob store
+  AND a realm id with a delivery projector; where those are absent —
+  memory-backend realms, ephemeral services, WASM, most examples — the
+  former in-process background shell is gone and the call fails closed with
+  a typed tool error ("detached shell execution requires a durable realm
+  job/blob runtime"). This is a deliberate capability removal from a
+  default-on builtin: an in-process fallback would silently drop the
+  durability the tool now advertises.
+- Sqlite-backend realms gain a `jobs.sqlite3` database (with a `jobs`
+  schema-ledger domain), created at realm open. Pre-0.8.8 binaries never
+  open this file, so it is rollback-inert.
+- **Error-taxonomy debt, recorded honestly:** the typed deferred
+  tool-results ingress refusals (`DeferredToolResultsIngressError`) and the
+  pending-callback-batch validation errors are currently flattened to
+  `AgentError::ConfigError` strings at the session boundary
+  (`classify_callback_result_ingress`, `try_stage_tool_results` call
+  sites), so SDK callers see one `config_error` code and cannot distinguish
+  "safe to retry" from "client bug". Typed surfacing is a follow-up.
+
+### Fixed (durable jobs arc)
+
+- **Three upgrade/rollback breaks closed before they could ship.** All
+  three were invisible to CI because no legacy on-disk fixtures existed;
+  each now has a v0.8.7-shaped regression fixture that fails on the
+  pre-fix code.
+  - **A 0.8.8 realm open no longer locks 0.8.7 out.** The durable-delivery
+    tables were originally migration 2 of the `runtime-store` ledger
+    domain, applied unconditionally at every realm open — so the first
+    0.8.8 open stamped `runtime-store=2` into `sessions.sqlite3` and a
+    v0.8.7 binary then refused EVERY realm open
+    (`SchemaFromTheFuture`, no downgrade verb). `runtime-store` is pinned
+    at version 1; the delivery tables moved to their own `runtime-delivery`
+    domain, provisioned lazily by the first durable-delivery WRITE (reads
+    of an unprovisioned domain report empty and stamp nothing). Older
+    binaries never read foreign ledger domains, so a delivery-stamped file
+    still opens on v0.8.7 for everything except the delivery feature it
+    predates.
+  - **Pre-0.8.8 persisted rows keep decoding.** The durable-callback
+    `tool_use_id` was added as a required field inside two persisted
+    contracts without a version change: stored input-state rows
+    (`interaction_terminal_outbox` candidates, whose SHA-256
+    `candidate_digest` must also keep verifying byte-identically) and the
+    session event log (`run_failed` callback reasons under
+    `EVENT_SCHEMA_VERSION` 2). Both now decode legacy shapes via
+    optional/defaulted fields that re-serialize byte-identically, so
+    upgraded fleets read their own history. Known residue, on record:
+    unpublished mid-flight callback rows WRITTEN BY 0.8.8 do not survive a
+    downgrade to v0.8.7 (settled and published data does); the follow-up
+    that removes the persisted id entirely is chartered for the next
+    release.
+  - **One damaged input-state row no longer poisons a runtime.**
+    `RuntimeStore::load_input_states` previously turned a single
+    undecodable row into a whole-call `ReadFailed`, making every durable
+    input of that runtime unreadable (recovery then backs off forever —
+    the session is bricked). Rows now surface individually with a typed
+    per-row corruption witness; recovery proceeds loudly with the
+    decodable rows and leaves the damaged row on disk for forensics, and
+    strict callers get the failing row's identity in the error.
+- **Durable delivery livelock on lifecycle-terminal waits.** A retired or
+  unregistered wait is persisted as `Terminated`, but terminal matching
+  recognized only `Completed`/`Cancelled`/`Failed` — the resulting
+  `Corrupt` error aborted the drain before the row was acked and the ~1s
+  driver retried an unackable delivery forever: head-of-line blocking at
+  three levels (session inbox, cross-session drain, per-job projection).
+  Terminal acceptance is now an exhaustive match with no wildcard arm (a
+  new outcome variant is a compile error, not a silent corrupt bucket);
+  the drain is fail-safe by RETENTION, never discard — per-row/per-job
+  outcomes let rows ahead of a poisoned one still apply and ack, other
+  jobs keep projecting, and the RPC drain aggregates failures instead of
+  aborting the realm; the delivery driver backs off 1s → 60s on a
+  non-progressing pass and resets on progress.
+
 ### Breaking
 
 - **Removed public helpers (storage unification arc):**
@@ -250,6 +393,32 @@ via cargo-semver-checks against the published baselines).
   `Arc<dyn SessionRuntimeLlmReconfigureService>` instead of the concrete
   session service so embedded runtimes can install the same canonical
   reconfiguration boundary.
+- **Callback identity is typed through the public enums (durable jobs
+  arc):** `AgentError::CallbackPending` gained the required `tool_use_id`
+  field, and `meerkat_runtime::completion::CompletionOutcome` and
+  `meerkat_core::lifecycle::core_executor::CoreApplyTerminal` (neither is
+  `#[non_exhaustive]`) gained `CallbackBatchPending` variants — external
+  exhaustive matchers and field-exhaustive destructuring of the
+  callback-pending shapes must be updated. The wire siblings
+  (`AgentErrorReason::CallbackPending.tool_use_id`,
+  `AgentEvent::InteractionCallbackPending.pending_tool_calls`) default when
+  absent, so previously persisted events keep decoding; only source-level
+  matching breaks.
+- **`RuntimeStore::load_input_states` returns per-row outcomes (durable
+  jobs arc):** the signature moved from `Vec<StoredInputState>` to
+  `Vec<InputStateRow>` (`Decoded` | `Corrupt { input_id, detail }`) so one
+  damaged row cannot poison the load; implementations must wrap rows, and
+  callers wanting the old all-or-error semantics use the provided
+  `load_input_states_strict`.
+- **New variants on exhaustively-matchable enums (durable jobs arc):**
+  `ToolError` gained `InactivityTimeout { name, inactivity_ms }` (error
+  code `inactivity_timeout`; maps to the `timeout` wire class),
+  `OperationKind` gained `DetachedJobWait` (`OperationKind::ALL` is now
+  four entries), and `OperationSource` gained `DetachedJob { realm_id,
+  job_id }`. None of these enums is `#[non_exhaustive]`, deliberately —
+  external exhaustive matches must add the arms. (Per this project's
+  versioning policy these are declared clean breaks; a compile error on
+  the next variant is the intended behavior, not an oversight.)
 
 ### Added
 
