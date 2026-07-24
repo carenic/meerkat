@@ -11,7 +11,7 @@ use meerkat_core::types::{ContentBlock, ImageData, SessionId};
 use meerkat_runtime::input_state::{
     InputStatePersistenceRecord, InputStateSeed, InputTerminalOutcome, StoredInputState,
 };
-use meerkat_runtime::store::{RuntimeStoreError, load_runtime_state};
+use meerkat_runtime::store::{InputStateRow, RuntimeStoreError, load_runtime_state};
 use meerkat_runtime::{
     EphemeralRuntimeDriver, InMemoryRuntimeStore, Input, InputDurability, InputHeader, InputOrigin,
     InputState, InputVisibility, LogicalRuntimeId, MeerkatMachine, PersistentRuntimeDriver,
@@ -236,7 +236,7 @@ impl RuntimeStore for FailPersistInputStore {
     async fn load_input_states(
         &self,
         runtime_id: &LogicalRuntimeId,
-    ) -> Result<Vec<StoredInputState>, RuntimeStoreError> {
+    ) -> Result<Vec<InputStateRow>, RuntimeStoreError> {
         if self.fail_load_input_states_for.as_ref() == Some(runtime_id) {
             return Err(RuntimeStoreError::ReadFailed(
                 "synthetic legacy input-state load failure".into(),
@@ -512,7 +512,7 @@ async fn dedup_not_persisted() {
     assert!(outcome.is_deduplicated());
 
     // Only one state in store
-    let states = store.load_input_states(&rid).await.unwrap();
+    let states = store.load_input_states_strict(&rid).await.unwrap();
     assert_eq!(states.len(), 1);
 }
 

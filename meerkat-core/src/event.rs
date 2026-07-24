@@ -318,6 +318,9 @@ pub enum AgentErrorReason {
         message: String,
     },
     CallbackPending {
+        /// Empty on pre-durable-callback (v0.8.7) event-log lines, which
+        /// predate the field; live producers always populate it.
+        #[serde(default, skip_serializing_if = "String::is_empty")]
         tool_use_id: String,
         tool_name: String,
         args: Value,

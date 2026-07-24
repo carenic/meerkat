@@ -18,7 +18,7 @@ use tokio_with_wasm::alias::sync::Mutex;
 
 use super::{
     AuthOAuthFlowSnapshotUpdate, FencedInputStateBatchCasOutcome, FencedMachineLifecycleCasOutcome,
-    InputStateBatchCasOutcome, MachineLifecycleCasOutcome, MachineLifecycleCommit,
+    InputStateBatchCasOutcome, InputStateRow, MachineLifecycleCasOutcome, MachineLifecycleCommit,
     MachineLifecycleExpectedVersion, MachineLifecycleObservation, MachineLifecycleStoreRecord,
     RuntimeDeliveryAuthorityCasOutcome, RuntimeDeliveryAuthorityRecord, RuntimeDeliveryStoreRecord,
     RuntimeStore, RuntimeStoreError, RuntimeStoreWriteFence, RuntimeStoreWriteFenceOutcome,
@@ -796,12 +796,17 @@ impl RuntimeStore for InMemoryRuntimeStore {
     async fn load_input_states(
         &self,
         runtime_id: &LogicalRuntimeId,
-    ) -> Result<Vec<StoredInputState>, RuntimeStoreError> {
+    ) -> Result<Vec<InputStateRow>, RuntimeStoreError> {
         let inner = self.inner.lock().await;
         let states = inner
             .input_states
             .get(&runtime_id.0)
-            .map(|m| m.values().cloned().collect())
+            .map(|m| {
+                m.values()
+                    .cloned()
+                    .map(|state| InputStateRow::Decoded(Box::new(state)))
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(states)
     }
@@ -1851,7 +1856,7 @@ mod tests {
             .unwrap();
 
         // Load input states
-        let states = store.load_input_states(&rid).await.unwrap();
+        let states = store.load_input_states_strict(&rid).await.unwrap();
         assert_eq!(states.len(), 1);
         assert_eq!(states[0].state.input_id, input_id);
 
@@ -1904,7 +1909,7 @@ mod tests {
                 .unwrap(),
             None
         );
-        let inputs = store.load_input_states(&rid).await.unwrap();
+        let inputs = store.load_input_states_strict(&rid).await.unwrap();
         assert_eq!(inputs.len(), 1);
         assert_eq!(inputs[0].state.input_id, seeded_input.state.input_id);
     }
@@ -2010,7 +2015,13 @@ mod tests {
                 .unwrap(),
             None
         );
-        assert!(store.load_input_states(&rid).await.unwrap().is_empty());
+        assert!(
+            store
+                .load_input_states_strict(&rid)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(
             store
                 .load_boundary_receipt(&rid, &receipt.run_id, receipt.sequence)
@@ -2072,7 +2083,13 @@ mod tests {
                 .unwrap(),
             None
         );
-        assert!(store.load_input_states(&rid).await.unwrap().is_empty());
+        assert!(
+            store
+                .load_input_states_strict(&rid)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(
             store
                 .load_boundary_receipt(&rid, &receipt.run_id, receipt.sequence)
@@ -2112,7 +2129,13 @@ mod tests {
             store.load_session_snapshot(&rid).await.unwrap(),
             Some(corrupt)
         );
-        assert!(store.load_input_states(&rid).await.unwrap().is_empty());
+        assert!(
+            store
+                .load_input_states_strict(&rid)
+                .await
+                .unwrap()
+                .is_empty()
+        );
         assert!(
             store
                 .load_boundary_receipt(&rid, &receipt.run_id, receipt.sequence)
@@ -2226,7 +2249,7 @@ mod tests {
                 .unwrap(),
             InputStateBatchCasOutcome::Stale
         );
-        let rows = store.load_input_states(&rid).await.unwrap();
+        let rows = store.load_input_states_strict(&rid).await.unwrap();
         assert_eq!(rows.len(), 3);
         assert!(rows.iter().all(|row| row.state.recovery_count == 1));
     }
@@ -2293,7 +2316,7 @@ mod tests {
         let store = InMemoryRuntimeStore::new();
         let rid = LogicalRuntimeId::new("test");
 
-        let states = store.load_input_states(&rid).await.unwrap();
+        let states = store.load_input_states_strict(&rid).await.unwrap();
         assert!(states.is_empty());
 
         let state = store.load_input_state(&rid, &InputId::new()).await.unwrap();
@@ -2339,7 +2362,7 @@ mod tests {
             .await
             .unwrap();
 
-        let states = store.load_input_states(&rid).await.unwrap();
+        let states = store.load_input_states_strict(&rid).await.unwrap();
         assert_eq!(states.len(), 1);
         assert_eq!(
             states[0].seed.phase,
@@ -2478,8 +2501,8 @@ mod tests {
             .await
             .unwrap();
 
-        let s1 = store.load_input_states(&rid1).await.unwrap();
-        let s2 = store.load_input_states(&rid2).await.unwrap();
+        let s1 = store.load_input_states_strict(&rid1).await.unwrap();
+        let s2 = store.load_input_states_strict(&rid2).await.unwrap();
         assert_eq!(s1.len(), 1);
         assert_eq!(s2.len(), 2);
     }
@@ -2669,7 +2692,13 @@ mod tests {
                 .unwrap(),
             None
         );
-        assert!(store.load_input_states(&rid).await.unwrap().is_empty());
+        assert!(
+            store
+                .load_input_states_strict(&rid)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]

@@ -11406,10 +11406,8 @@ mod tests {
         async fn load_input_states(
             &self,
             runtime_id: &meerkat_runtime::identifiers::LogicalRuntimeId,
-        ) -> Result<
-            Vec<meerkat_runtime::input_state::StoredInputState>,
-            meerkat_runtime::RuntimeStoreError,
-        > {
+        ) -> Result<Vec<meerkat_runtime::InputStateRow>, meerkat_runtime::RuntimeStoreError>
+        {
             self.inner.load_input_states(runtime_id).await
         }
 

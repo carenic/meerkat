@@ -113,7 +113,13 @@ pub(crate) enum InteractionTerminalCandidate {
     },
     CompletedWithoutResult,
     CallbackPending {
-        tool_use_id: String,
+        /// `None` on rows persisted by pre-durable-callback (v0.8.7) binaries,
+        /// which wrote this variant without the field. The option is part of
+        /// the persisted contract: a legacy row must re-serialize
+        /// byte-identically so its stored `candidate_digest` keeps verifying.
+        /// Live producers always write `Some`.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tool_use_id: Option<String>,
         tool_name: String,
         args: serde_json::Value,
     },
@@ -146,7 +152,11 @@ impl InteractionTerminalCandidate {
                 tool_name,
                 args,
             } => Some(CoreApplyTerminal::CallbackPending {
-                tool_use_id: tool_use_id.clone(),
+                // A v0.8.7 row never recorded the id; empty means "identity
+                // unknown, pre-0.8.8 row". Durable-callback consumers that
+                // need the id never see such rows because the protocol did
+                // not exist when they were written.
+                tool_use_id: tool_use_id.clone().unwrap_or_default(),
                 tool_name: tool_name.clone(),
                 args: args.clone(),
             }),
@@ -627,12 +637,28 @@ pub(crate) fn interaction_terminal_candidate_matches_event(
         ) => {
             tool_name == event_tool
                 && args == event_args
-                && pending_tool_calls.as_slice()
-                    == [meerkat_core::error::PendingCallbackToolCall {
-                        tool_use_id: tool_use_id.clone(),
-                        tool_name: tool_name.clone(),
-                        args: args.clone(),
-                    }]
+                && match tool_use_id {
+                    Some(tool_use_id) => {
+                        pending_tool_calls.as_slice()
+                            == [meerkat_core::error::PendingCallbackToolCall {
+                                tool_use_id: tool_use_id.clone(),
+                                tool_name: tool_name.clone(),
+                                args: args.clone(),
+                            }]
+                    }
+                    // A v0.8.7 candidate pairs with a v0.8.7 finalized event
+                    // (no pending set) or with an event this binary finalized
+                    // from the same legacy candidate (unknown-identity id).
+                    None => {
+                        pending_tool_calls.is_empty()
+                            || pending_tool_calls.as_slice()
+                                == [meerkat_core::error::PendingCallbackToolCall {
+                                    tool_use_id: String::new(),
+                                    tool_name: tool_name.clone(),
+                                    args: args.clone(),
+                                }]
+                    }
+                }
         }
         (
             InteractionTerminalCandidate::CallbackBatchPending { pending_tool_calls },
@@ -1229,6 +1255,139 @@ mod tests {
             migrated["stored_input_state_version"],
             meerkat_core::generated::session_persistence_version_authority::STORED_INPUT_STATE_VERSION,
         );
+    }
+
+    /// v0.8.7 regression witness (release-bricking class): a stored-input-state
+    /// v4 row whose interaction terminal outbox carries the
+    /// pre-durable-callback `callback_pending` candidate shape (no
+    /// `tool_use_id`) must decode AND keep verifying against its stored
+    /// candidate digest — v0.8.7 computed that digest over exactly these
+    /// bytes, so the decoded candidate must re-serialize byte-identically.
+    #[test]
+    fn stored_input_state_v087_callback_pending_row_still_decodes() {
+        let candidate_json =
+            r#"{"candidate_type":"callback_pending","tool_name":"external","args":{"value":1}}"#;
+        let completion_ids_json = r#"["00000000-0000-0000-0000-0000000000aa"]"#;
+        let candidate_digest = format!("{:x}", Sha256::digest(candidate_json.as_bytes()));
+        let completion_ids_digest = format!("{:x}", Sha256::digest(completion_ids_json.as_bytes()));
+        let row = format!(
+            r#"{{
+                "stored_input_state_version": 4,
+                "input_id": "00000000-0000-0000-0000-0000000000aa",
+                "current_state": "applied",
+                "created_at": "2026-01-01T00:00:00Z",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "interaction_terminal_outbox": {{
+                    "interaction_id": "00000000-0000-0000-0000-0000000000aa",
+                    "input_id": "00000000-0000-0000-0000-0000000000aa",
+                    "batch_ordinal": 0,
+                    "batch_key": {{"scope":"run","run_id":"00000000-0000-0000-0000-0000000000bb"}},
+                    "owner_session_id": "00000000-0000-0000-0000-0000000000cc",
+                    "owner_agent_runtime_id": "runtime-a",
+                    "owner_fence_token": 7,
+                    "owner_runtime_generation": 3,
+                    "owner_runtime_epoch_id": "epoch-3",
+                    "candidate_owner_input_id": "00000000-0000-0000-0000-0000000000aa",
+                    "candidate": {candidate_json},
+                    "candidate_digest": "{candidate_digest}",
+                    "completion_input_ids": {completion_ids_json},
+                    "completion_input_ids_digest": "{completion_ids_digest}",
+                    "phase": {{"phase":"candidate"}}
+                }}
+            }}"#
+        );
+
+        let restored: StoredInputState =
+            serde_json::from_str(&row).expect("v0.8.7 callback-pending row must decode");
+        let outbox = restored
+            .state
+            .interaction_terminal_outbox
+            .as_ref()
+            .expect("outbox survives decode");
+        let candidate = outbox.candidate.as_ref().expect("owner keeps candidate");
+        assert!(matches!(
+            candidate,
+            InteractionTerminalCandidate::CallbackPending {
+                tool_use_id: None,
+                ..
+            }
+        ));
+        assert_eq!(
+            interaction_terminal_payload_digest(candidate).unwrap(),
+            outbox.candidate_digest,
+            "legacy candidate must re-serialize byte-identically under its stored digest"
+        );
+        // Recovery projects the unknown identity as empty, never a fabricated id.
+        assert!(matches!(
+            candidate.core_apply_terminal(),
+            Some(meerkat_core::lifecycle::core_executor::CoreApplyTerminal::CallbackPending {
+                tool_use_id,
+                ..
+            }) if tool_use_id.is_empty()
+        ));
+    }
+
+    /// The legacy (identity-less) callback candidate pairs with both event
+    /// shapes it can durably meet: a v0.8.7-finalized event (no pending set)
+    /// and an event this binary finalizes from the same legacy candidate.
+    /// A candidate WITH identity still demands the exact pending set.
+    #[test]
+    fn legacy_callback_candidate_matches_legacy_and_reprojected_events() {
+        let interaction_id = InteractionId(uuid::Uuid::new_v4());
+        let args = serde_json::json!({"value": 1});
+        let legacy_candidate = InteractionTerminalCandidate::CallbackPending {
+            tool_use_id: None,
+            tool_name: "external".to_string(),
+            args: args.clone(),
+        };
+        let event = |pending_tool_calls| AgentEvent::InteractionCallbackPending {
+            interaction_id,
+            tool_name: "external".to_string(),
+            args: args.clone(),
+            pending_tool_calls,
+        };
+
+        let legacy_event = event(Vec::new());
+        let reprojected_event = event(vec![meerkat_core::error::PendingCallbackToolCall {
+            tool_use_id: String::new(),
+            tool_name: "external".to_string(),
+            args: args.clone(),
+        }]);
+        assert!(interaction_terminal_candidate_matches_event(
+            &legacy_candidate,
+            interaction_id,
+            &legacy_event,
+            false,
+        ));
+        assert!(interaction_terminal_candidate_matches_event(
+            &legacy_candidate,
+            interaction_id,
+            &reprojected_event,
+            false,
+        ));
+
+        let modern_candidate = InteractionTerminalCandidate::CallbackPending {
+            tool_use_id: Some("call-9".to_string()),
+            tool_name: "external".to_string(),
+            args: args.clone(),
+        };
+        assert!(!interaction_terminal_candidate_matches_event(
+            &modern_candidate,
+            interaction_id,
+            &legacy_event,
+            false,
+        ));
+        let exact_event = event(vec![meerkat_core::error::PendingCallbackToolCall {
+            tool_use_id: "call-9".to_string(),
+            tool_name: "external".to_string(),
+            args: args.clone(),
+        }]);
+        assert!(interaction_terminal_candidate_matches_event(
+            &modern_candidate,
+            interaction_id,
+            &exact_event,
+            false,
+        ));
     }
 
     #[test]

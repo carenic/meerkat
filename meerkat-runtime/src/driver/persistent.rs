@@ -77,13 +77,12 @@ impl PersistentRuntimeDriver {
         recovered_unregister_progress: Option<&crate::store::MachineUnregisterProgressSnapshot>,
         write_fence: Arc<dyn RuntimeStoreWriteFence>,
     ) -> Result<RecoveryReport, RuntimeDriverError> {
-        let observed = self
-            .store
-            .load_input_states(&self.runtime_id)
-            .await
-            .map_err(|error| RuntimeDriverError::RecoveryBackoff {
-                reason: format!("failed to observe durable inputs for recovery: {error}"),
-            })?;
+        let observed =
+            crate::store::load_input_states_for_recovery(self.store.as_ref(), &self.runtime_id)
+                .await
+                .map_err(|error| RuntimeDriverError::RecoveryBackoff {
+                    reason: format!("failed to observe durable inputs for recovery: {error}"),
+                })?;
         let report = crate::meerkat_machine::machine_recover_persistent_inputs_from_observed(
             self.store.as_ref(),
             &self.runtime_id,
@@ -255,8 +254,7 @@ impl PersistentRuntimeDriver {
     pub(crate) async fn durable_input_states_for_terminal_recovery(
         &self,
     ) -> Result<Vec<StoredInputState>, RuntimeDriverError> {
-        self.store
-            .load_input_states(&self.runtime_id)
+        crate::store::load_input_states_for_recovery(self.store.as_ref(), &self.runtime_id)
             .await
             .map_err(|error| {
                 RuntimeDriverError::Internal(format!(
@@ -1621,7 +1619,7 @@ mod tests {
         // admission in the live driver.  Capture the CAS witness from the
         // durable store, as recovery adoption does, instead of assuming the
         // two independently timestamped admission shells are byte-identical.
-        let expected = store.load_input_states(&rid).await.unwrap();
+        let expected = store.load_input_states_strict(&rid).await.unwrap();
         for input_id in &input_ids {
             driver
                 .inner_mut()
@@ -1640,7 +1638,7 @@ mod tests {
         );
         assert!(
             store
-                .load_input_states(&rid)
+                .load_input_states_strict(&rid)
                 .await
                 .unwrap()
                 .iter()
@@ -1664,7 +1662,7 @@ mod tests {
         );
         assert!(
             store
-                .load_input_states(&rid)
+                .load_input_states_strict(&rid)
                 .await
                 .unwrap()
                 .iter()
@@ -1731,7 +1729,7 @@ mod tests {
         }
 
         // First owner acquires the durable batch witness.
-        let initial = store.load_input_states(&rid).await.unwrap();
+        let initial = store.load_input_states_strict(&rid).await.unwrap();
         for input_id in &input_ids {
             owner
                 .inner_mut()
@@ -1747,13 +1745,13 @@ mod tests {
                 .unwrap(),
             InputStateBatchCasOutcome::Swapped
         );
-        let owner_witness = store.load_input_states(&rid).await.unwrap();
+        let owner_witness = store.load_input_states_strict(&rid).await.unwrap();
 
         // A second store handle takes over before Candidate -> Finalized.
         let mut takeover =
             PersistentRuntimeDriver::new(rid.clone(), store_trait.clone(), blob_store.clone());
         RuntimeDriver::recover(&mut takeover).await.unwrap();
-        let takeover_expected = store.load_input_states(&rid).await.unwrap();
+        let takeover_expected = store.load_input_states_strict(&rid).await.unwrap();
         for input_id in &input_ids {
             takeover
                 .inner_mut()
@@ -1790,7 +1788,7 @@ mod tests {
         );
         assert!(
             store
-                .load_input_states(&rid)
+                .load_input_states_strict(&rid)
                 .await
                 .unwrap()
                 .iter()
@@ -1800,7 +1798,7 @@ mod tests {
         // The takeover owner finalizes, then a third handle takes ownership
         // before Finalized -> Published. The old finalizer's receipt write is
         // fenced by its exact pre-publication witness.
-        let takeover_witness = store.load_input_states(&rid).await.unwrap();
+        let takeover_witness = store.load_input_states_strict(&rid).await.unwrap();
         for input_id in &input_ids {
             takeover
                 .inner_mut()
@@ -1816,10 +1814,10 @@ mod tests {
                 .unwrap(),
             InputStateBatchCasOutcome::Swapped
         );
-        let finalized_witness = store.load_input_states(&rid).await.unwrap();
+        let finalized_witness = store.load_input_states_strict(&rid).await.unwrap();
         let mut publisher = PersistentRuntimeDriver::new(rid.clone(), store_trait, blob_store);
         RuntimeDriver::recover(&mut publisher).await.unwrap();
-        let publisher_expected = store.load_input_states(&rid).await.unwrap();
+        let publisher_expected = store.load_input_states_strict(&rid).await.unwrap();
         for input_id in &input_ids {
             publisher
                 .inner_mut()
@@ -1859,7 +1857,7 @@ mod tests {
         );
         assert!(
             store
-                .load_input_states(&rid)
+                .load_input_states_strict(&rid)
                 .await
                 .unwrap()
                 .iter()

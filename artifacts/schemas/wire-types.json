@@ -320,12 +320,12 @@
                 "type": "string"
               },
               "tool_use_id": {
+                "description": "Empty on pre-durable-callback (v0.8.7) event-log lines, which\npredate the field; live producers always populate it.",
                 "type": "string"
               }
             },
             "required": [
               "reason_type",
-              "tool_use_id",
               "tool_name",
               "args"
             ],
@@ -17559,12 +17559,12 @@
                 "type": "string"
               },
               "tool_use_id": {
+                "description": "Empty on pre-durable-callback (v0.8.7) event-log lines, which\npredate the field; live producers always populate it.",
                 "type": "string"
               }
             },
             "required": [
               "reason_type",
-              "tool_use_id",
               "tool_name",
               "args"
             ],
@@ -25779,12 +25779,12 @@
                 "type": "string"
               },
               "tool_use_id": {
+                "description": "Empty on pre-durable-callback (v0.8.7) event-log lines, which\npredate the field; live producers always populate it.",
                 "type": "string"
               }
             },
             "required": [
               "reason_type",
-              "tool_use_id",
               "tool_name",
               "args"
             ],
@@ -35359,12 +35359,12 @@
                 "type": "string"
               },
               "tool_use_id": {
+                "description": "Empty on pre-durable-callback (v0.8.7) event-log lines, which\npredate the field; live producers always populate it.",
                 "type": "string"
               }
             },
             "required": [
               "reason_type",
-              "tool_use_id",
               "tool_name",
               "args"
             ],
@@ -51214,12 +51214,12 @@
                 "type": "string"
               },
               "tool_use_id": {
+                "description": "Empty on pre-durable-callback (v0.8.7) event-log lines, which\npredate the field; live producers always populate it.",
                 "type": "string"
               }
             },
             "required": [
               "reason_type",
-              "tool_use_id",
               "tool_name",
               "args"
             ],
@@ -59998,12 +59998,12 @@
                 "type": "string"
               },
               "tool_use_id": {
+                "description": "Empty on pre-durable-callback (v0.8.7) event-log lines, which\npredate the field; live producers always populate it.",
                 "type": "string"
               }
             },
             "required": [
               "reason_type",
-              "tool_use_id",
               "tool_name",
               "args"
             ],
@@ -103831,12 +103831,12 @@
                 "type": "string"
               },
               "tool_use_id": {
+                "description": "Empty on pre-durable-callback (v0.8.7) event-log lines, which\npredate the field; live producers always populate it.",
                 "type": "string"
               }
             },
             "required": [
               "reason_type",
-              "tool_use_id",
               "tool_name",
               "args"
             ],

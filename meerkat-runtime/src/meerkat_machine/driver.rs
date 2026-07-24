@@ -2786,7 +2786,7 @@ fn authorized_directed_terminal_outboxes(
             tool_name,
             args,
         }) => InteractionTerminalCandidate::CallbackPending {
-            tool_use_id: tool_use_id.clone(),
+            tool_use_id: Some(tool_use_id.clone()),
             tool_name: tool_name.clone(),
             args: args.clone(),
         },
@@ -4232,7 +4232,7 @@ async fn load_input_states_for_runtime(
     store: &dyn crate::store::RuntimeStore,
     runtime_id: &LogicalRuntimeId,
 ) -> Result<Vec<StoredInputState>, crate::store::RuntimeStoreError> {
-    store.load_input_states(runtime_id).await
+    crate::store::load_input_states_for_recovery(store, runtime_id).await
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -7363,7 +7363,7 @@ mod recovery_tests {
         );
         let durable_after_cancel = serialized_input_states(
             store
-                .load_input_states(&runtime_id)
+                .load_input_states_strict(&runtime_id)
                 .await
                 .expect("load durable image after cancellation"),
         );
@@ -7425,7 +7425,7 @@ mod recovery_tests {
         );
         let durable_after_cancel = serialized_input_states(
             store
-                .load_input_states(&runtime_id)
+                .load_input_states_strict(&runtime_id)
                 .await
                 .expect("load committed durable image"),
         );
@@ -7455,7 +7455,7 @@ mod recovery_tests {
         );
         let durable_after_retry = serialized_input_states(
             store
-                .load_input_states(&runtime_id)
+                .load_input_states_strict(&runtime_id)
                 .await
                 .expect("load durable image after idempotent retry"),
         );
@@ -7534,7 +7534,7 @@ mod recovery_tests {
             InteractionTerminalOutboxPhase::Candidate
         ));
         let durable = store
-            .load_input_states(&runtime_id)
+            .load_input_states_strict(&runtime_id)
             .await
             .expect("load durable finalized outbox");
         assert!(matches!(
@@ -7698,7 +7698,7 @@ mod recovery_tests {
             InteractionTerminalOutboxPhase::Finalized { .. }
         ));
         let durable_after_cancel = store
-            .load_input_states(&runtime_id)
+            .load_input_states_strict(&runtime_id)
             .await
             .expect("load durable published outbox");
         assert!(matches!(
@@ -7787,7 +7787,7 @@ mod recovery_tests {
         let shell_before = serialized_input_states(shell_before);
         let durable_before = serialized_input_states(
             store
-                .load_input_states(&runtime_id)
+                .load_input_states_strict(&runtime_id)
                 .await
                 .expect("load durable terminal batches"),
         );
@@ -7813,7 +7813,7 @@ mod recovery_tests {
         );
         let durable_after = serialized_input_states(
             store
-                .load_input_states(&runtime_id)
+                .load_input_states_strict(&runtime_id)
                 .await
                 .expect("load durable terminal batches after rejection"),
         );
@@ -7882,7 +7882,7 @@ mod recovery_tests {
         let shell_before = serialized_input_states(shell_before);
         let durable_before = serialized_input_states(
             store
-                .load_input_states(&runtime_id)
+                .load_input_states_strict(&runtime_id)
                 .await
                 .expect("load durable terminal batch"),
         );
@@ -7908,7 +7908,7 @@ mod recovery_tests {
         assert_eq!(
             serialized_input_states(
                 store
-                    .load_input_states(&runtime_id)
+                    .load_input_states_strict(&runtime_id)
                     .await
                     .expect("load durable terminal batch after rejection"),
             ),

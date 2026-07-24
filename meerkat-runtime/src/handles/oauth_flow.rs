@@ -1935,7 +1935,7 @@ mod tests {
         async fn load_input_states(
             &self,
             _runtime_id: &LogicalRuntimeId,
-        ) -> Result<Vec<StoredInputState>, RuntimeStoreError> {
+        ) -> Result<Vec<crate::store::InputStateRow>, RuntimeStoreError> {
             Err(RuntimeStoreError::Unsupported(
                 "load_input_states".to_string(),
             ))
