@@ -1391,6 +1391,10 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
         path: PathBuf,
         #[cfg(test)]
         unregister_finalization_fault: AtomicU8,
+        /// Candidate bytes shipped into the snapshot byte-equality probe.
+        /// Observability seam for the length-gate regression tests only.
+        #[cfg(test)]
+        snapshot_byte_probe_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl SqliteRuntimeStore {
@@ -1402,6 +1406,10 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
                 path,
                 #[cfg(test)]
                 unregister_finalization_fault: AtomicU8::new(0),
+                #[cfg(test)]
+                snapshot_byte_probe_bytes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                    0,
+                )),
             })
         }
 
@@ -1441,6 +1449,14 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
         fn inject_unregister_finalization_fault(&self, fault: u8) {
             self.unregister_finalization_fault
                 .store(fault, Ordering::SeqCst);
+        }
+
+        /// Total candidate bytes this store has shipped into the snapshot
+        /// byte-equality probe. Length-gate regression tests only.
+        #[cfg(test)]
+        fn snapshot_byte_probe_bytes(&self) -> u64 {
+            self.snapshot_byte_probe_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
         }
     }
 
@@ -1724,6 +1740,8 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
         ) -> Result<(), RuntimeStoreError> {
             let path = self.path.clone();
             let runtime_id = runtime_id.clone();
+            #[cfg(test)]
+            let snapshot_byte_probe_bytes = std::sync::Arc::clone(&self.snapshot_byte_probe_bytes);
             tokio::task::spawn_blocking(move || {
                 let incoming =
                     serde_json::from_slice(&session_delta.session_snapshot)
@@ -1731,18 +1749,41 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
                 let mut conn = open_runtime_connection(&path)?;
                 let tx = begin_runtime_transaction(&mut conn)?;
                 ensure_compaction_intents_already_outboxed(&tx, &runtime_id, &incoming)?;
-                let snapshot_is_unchanged = tx
+                // Byte equality requires equal lengths, and `length()` on a
+                // BLOB reads the record header, not the payload. Ordinary
+                // turns grow the document, so the unchanged-snapshot probe
+                // usually costs one integer compare instead of shipping the
+                // whole candidate blob into SQLite to hear "no".
+                let candidate_len = i64::try_from(session_delta.session_snapshot.len()).ok();
+                let stored_len = tx
                     .query_row(
-                        "SELECT 1 FROM runtime_session_snapshots WHERE runtime_id = ?1 AND session_snapshot = ?2",
-                        params![
-                            runtime_id_text(&runtime_id),
-                            session_delta.session_snapshot.as_slice()
-                        ],
-                        |row| row.get::<_, i64>(0),
+                        "SELECT length(session_snapshot) FROM runtime_session_snapshots WHERE runtime_id = ?1",
+                        params![runtime_id_text(&runtime_id)],
+                        |row| row.get::<_, Option<i64>>(0),
                     )
                     .optional()
                     .map_err(|err| RuntimeStoreError::ReadFailed(err.to_string()))?
-                    .is_some();
+                    .flatten();
+                let snapshot_is_unchanged = candidate_len.is_some()
+                    && stored_len == candidate_len
+                    && {
+                        #[cfg(test)]
+                        snapshot_byte_probe_bytes.fetch_add(
+                            session_delta.session_snapshot.len() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        tx.query_row(
+                            "SELECT 1 FROM runtime_session_snapshots WHERE runtime_id = ?1 AND session_snapshot = ?2",
+                            params![
+                                runtime_id_text(&runtime_id),
+                                session_delta.session_snapshot.as_slice()
+                            ],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()
+                        .map_err(|err| RuntimeStoreError::ReadFailed(err.to_string()))?
+                        .is_some()
+                    };
                 if snapshot_is_unchanged {
                     // Incoming bytes already crossed typed Session validation
                     // and compaction-intent authority. Exact identity means
@@ -4299,6 +4340,112 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
             assert_eq!(
                 store.load_session_snapshot(&runtime_id).await.unwrap(),
                 Some(snapshot)
+            );
+        }
+
+        /// Replace one occurrence of `needle` so the fixture differs in
+        /// content but not in serialized length (same-session document,
+        /// deterministic byte-for-byte otherwise).
+        fn splice_bytes(bytes: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+            assert_eq!(needle.len(), replacement.len());
+            let position = bytes
+                .windows(needle.len())
+                .position(|window| window == needle)
+                .expect("fixture needle present");
+            let mut out = bytes.to_vec();
+            out[position..position + needle.len()].copy_from_slice(replacement);
+            out
+        }
+
+        #[tokio::test]
+        async fn commit_session_snapshot_growth_ships_zero_probe_bytes() {
+            let (_dir, store) = temp_store();
+            let runtime_id = runtime_id();
+            let mut session = Session::new();
+            session.push(Message::User(UserMessage::text("first turn".to_string())));
+            store
+                .commit_session_snapshot(
+                    &runtime_id,
+                    SessionDelta {
+                        session_snapshot: serde_json::to_vec(&session).unwrap(),
+                    },
+                )
+                .await
+                .unwrap();
+            let baseline = store.snapshot_byte_probe_bytes();
+
+            session.push(Message::User(UserMessage::text(
+                "second turn grows the document".to_string(),
+            )));
+            let grown = serde_json::to_vec(&session).unwrap();
+            store
+                .commit_session_snapshot(
+                    &runtime_id,
+                    SessionDelta {
+                        session_snapshot: grown.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                store.snapshot_byte_probe_bytes(),
+                baseline,
+                "a length-changing save must answer the unchanged-snapshot \
+                 question from the stored length alone, not ship the whole \
+                 candidate blob into SQLite for a byte compare that answers no"
+            );
+            assert_eq!(
+                store.load_session_snapshot(&runtime_id).await.unwrap(),
+                Some(grown)
+            );
+        }
+
+        #[tokio::test]
+        async fn commit_session_snapshot_equal_length_different_bytes_still_byte_compares() {
+            let (_dir, store) = temp_store();
+            let runtime_id = runtime_id();
+            let mut session = Session::new();
+            session.push(Message::User(UserMessage::text("probe".to_string())));
+            session.set_metadata(
+                "probe_slot",
+                serde_json::Value::String("probe-fixture-aaaa".to_string()),
+            );
+            let first = serde_json::to_vec(&session).unwrap();
+            let second = splice_bytes(&first, b"probe-fixture-aaaa", b"probe-fixture-bbbb");
+            assert_eq!(first.len(), second.len());
+            assert_ne!(first, second);
+
+            store
+                .commit_session_snapshot(
+                    &runtime_id,
+                    SessionDelta {
+                        session_snapshot: first,
+                    },
+                )
+                .await
+                .unwrap();
+            let before = store.snapshot_byte_probe_bytes();
+            store
+                .commit_session_snapshot(
+                    &runtime_id,
+                    SessionDelta {
+                        session_snapshot: second.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                store.snapshot_byte_probe_bytes() - before,
+                second.len() as u64,
+                "length-equal candidates must still run the byte probe"
+            );
+            assert_eq!(
+                store.load_session_snapshot(&runtime_id).await.unwrap(),
+                Some(second),
+                "length-equal but different content must be written, not \
+                 treated as unchanged"
             );
         }
 

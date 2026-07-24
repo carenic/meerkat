@@ -365,6 +365,7 @@ impl MeerkatMachine {
                     &run_id,
                     std::slice::from_ref(input_id),
                     session_snapshot,
+                    session_id,
                 )
                 .await
         };

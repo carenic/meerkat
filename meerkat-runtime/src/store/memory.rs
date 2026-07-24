@@ -98,6 +98,10 @@ pub struct InMemoryRuntimeStore {
     machine_lifecycle_cas_conflicts_remaining: Arc<AtomicUsize>,
     #[cfg(test)]
     machine_lifecycle_observe_errors_remaining: Arc<AtomicUsize>,
+    /// Candidate bytes shipped into the snapshot byte-equality compare.
+    /// Observability seam for the length-gate regression tests only.
+    #[cfg(test)]
+    snapshot_byte_probe_bytes: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl InMemoryRuntimeStore {
@@ -113,7 +117,17 @@ impl InMemoryRuntimeStore {
             machine_lifecycle_cas_conflicts_remaining: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             machine_lifecycle_observe_errors_remaining: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            snapshot_byte_probe_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         }
+    }
+
+    /// Total candidate bytes this store has shipped into the snapshot
+    /// byte-equality compare. Length-gate regression tests only.
+    #[cfg(test)]
+    pub(crate) fn snapshot_byte_probe_bytes(&self) -> u64 {
+        self.snapshot_byte_probe_bytes
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -391,8 +405,17 @@ impl RuntimeStore for InMemoryRuntimeStore {
                 .map_err(|err| RuntimeStoreError::WriteFailed(err.to_string()))?;
         let mut inner = self.inner.lock().await;
         ensure_compaction_intents_already_outboxed(&inner, runtime_id, &incoming)?;
+        // Length gate mirroring the SQLite store: only length-equal
+        // candidates pay the byte compare; ordinary turns grow the document.
         if inner.sessions.get(&runtime_id.0).is_some_and(|snapshot| {
-            snapshot.as_slice() == session_delta.session_snapshot.as_slice()
+            snapshot.len() == session_delta.session_snapshot.len() && {
+                #[cfg(test)]
+                self.snapshot_byte_probe_bytes.fetch_add(
+                    session_delta.session_snapshot.len() as u64,
+                    std::sync::atomic::Ordering::Relaxed,
+                );
+                snapshot.as_slice() == session_delta.session_snapshot.as_slice()
+            }
         }) {
             // The incoming document still crossed typed Session validation
             // and compaction-intent authority above. Exact byte identity now
@@ -3296,6 +3319,112 @@ mod tests {
                 .await
                 .unwrap(),
             Some(raw)
+        );
+    }
+
+    /// Replace one occurrence of `needle` so the fixture differs in content
+    /// but not in serialized length.
+    fn splice_bytes(bytes: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+        assert_eq!(needle.len(), replacement.len());
+        let position = bytes
+            .windows(needle.len())
+            .position(|window| window == needle)
+            .expect("fixture needle present");
+        let mut out = bytes.to_vec();
+        out[position..position + needle.len()].copy_from_slice(replacement);
+        out
+    }
+
+    #[tokio::test]
+    async fn commit_session_snapshot_growth_ships_zero_probe_bytes() {
+        let store = InMemoryRuntimeStore::new();
+        let rid = LogicalRuntimeId::new("runtime-length-gate-growth");
+        let mut session = meerkat_core::Session::new();
+        session.push(meerkat_core::Message::User(
+            meerkat_core::types::UserMessage::text("first turn".to_string()),
+        ));
+        store
+            .commit_session_snapshot(
+                &rid,
+                SessionDelta {
+                    session_snapshot: serde_json::to_vec(&session).unwrap(),
+                },
+            )
+            .await
+            .unwrap();
+        let baseline = store.snapshot_byte_probe_bytes();
+
+        session.push(meerkat_core::Message::User(
+            meerkat_core::types::UserMessage::text("second turn grows the document".to_string()),
+        ));
+        let grown = serde_json::to_vec(&session).unwrap();
+        store
+            .commit_session_snapshot(
+                &rid,
+                SessionDelta {
+                    session_snapshot: grown.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.snapshot_byte_probe_bytes(),
+            baseline,
+            "a length-changing save must skip the unchanged-snapshot byte compare"
+        );
+        assert_eq!(
+            store.load_session_snapshot(&rid).await.unwrap(),
+            Some(grown)
+        );
+    }
+
+    #[tokio::test]
+    async fn commit_session_snapshot_equal_length_different_bytes_still_byte_compares() {
+        let store = InMemoryRuntimeStore::new();
+        let rid = LogicalRuntimeId::new("runtime-length-gate-equal");
+        let mut session = meerkat_core::Session::new();
+        session.push(meerkat_core::Message::User(
+            meerkat_core::types::UserMessage::text("probe".to_string()),
+        ));
+        session.set_metadata(
+            "probe_slot",
+            serde_json::Value::String("probe-fixture-aaaa".to_string()),
+        );
+        let first = serde_json::to_vec(&session).unwrap();
+        let second = splice_bytes(&first, b"probe-fixture-aaaa", b"probe-fixture-bbbb");
+        assert_eq!(first.len(), second.len());
+        assert_ne!(first, second);
+
+        store
+            .commit_session_snapshot(
+                &rid,
+                SessionDelta {
+                    session_snapshot: first,
+                },
+            )
+            .await
+            .unwrap();
+        let before = store.snapshot_byte_probe_bytes();
+        store
+            .commit_session_snapshot(
+                &rid,
+                SessionDelta {
+                    session_snapshot: second.clone(),
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.snapshot_byte_probe_bytes() - before,
+            second.len() as u64,
+            "length-equal candidates must still run the byte compare"
+        );
+        assert_eq!(
+            store.load_session_snapshot(&rid).await.unwrap(),
+            Some(second),
+            "length-equal but different content must be written, not treated as unchanged"
         );
     }
 }
