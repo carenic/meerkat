@@ -1706,6 +1706,27 @@ fn sha256_json_digest<T: Serialize + ?Sized>(value: &T) -> Result<String, serde_
 /// A conversation session with full history
 ///
 /// Uses Arc<Vec<Message>> internally for efficient forking (copy-on-write).
+/// Process-local derived caches for the transcript-history graph.
+///
+/// Grouped behind ONE pointer deliberately. `Session` is embedded throughout
+/// the agent's nested async state machine, whose futures compose sizes
+/// additively, so every inline byte here is paid again at each spawn depth —
+/// and the CLI's full-tools spawn runs against a literal 2 MB production stack
+/// budget, pinned by
+/// `tools_full_with_explicit_auth_binding_can_spawn_within_production_stack_budget`.
+/// Holding these three inline grew `Session` from 136 to 528 bytes and
+/// overflowed that stack. None is persisted or part of a session's identity;
+/// all are rebuildable from the metadata graph.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct SessionHistoryCaches {
+    /// Memoized canonical witness of the transcript-history graph.
+    witness: std::sync::OnceLock<String>,
+    /// Content-addressed canonical chunks for incremental witness assembly.
+    assembly: HistoryWitnessAssemblyCache,
+    /// Shared parsed form of the current history graph.
+    shared_state: SharedTranscriptHistoryState,
+}
+
 #[derive(Debug, Clone)]
 pub struct Session {
     /// Persisted envelope format version, validated fail-closed on read by
@@ -1737,15 +1758,13 @@ pub struct Session {
     /// unchanged graph. This is pure derived state: the three methods that
     /// write the history key clear it, so it can never outlive the value it
     /// describes.
-    transcript_history_witness: std::sync::OnceLock<String>,
+    history_caches: Box<SessionHistoryCaches>,
     /// Cached canonical byte segments of the transcript-history graph
     /// (commits segment, per-retained-body chunks) for incremental witness
     /// assembly. Content-addressed; survives head-only append updates that
     /// clear the witness memo above.
-    history_witness_assembly: HistoryWitnessAssemblyCache,
     /// Shared parsed form of the current history graph; see
     /// [`SharedTranscriptHistoryState`].
-    transcript_history_state_shared: SharedTranscriptHistoryState,
     /// Whether transcript-history metadata has already crossed a validating,
     /// compacting authority boundary in this in-memory session.
     ///
@@ -1871,9 +1890,7 @@ impl<'de> Deserialize<'de> for Session {
             created_at: serde_repr.created_at,
             updated_at: serde_repr.updated_at,
             metadata,
-            transcript_history_witness: std::sync::OnceLock::new(),
-            history_witness_assembly: HistoryWitnessAssemblyCache::default(),
-            transcript_history_state_shared: SharedTranscriptHistoryState::default(),
+            history_caches: Box::default(),
             transcript_history_metadata_validation: TranscriptHistoryMetadataValidation::Validated,
             usage: serde_repr.usage,
         })
@@ -2002,9 +2019,7 @@ impl Session {
                 TranscriptHistoryMetadataValidation::Validated
             },
             metadata,
-            transcript_history_witness: std::sync::OnceLock::new(),
-            history_witness_assembly: HistoryWitnessAssemblyCache::default(),
-            transcript_history_state_shared: SharedTranscriptHistoryState::default(),
+            history_caches: Box::default(),
             usage,
         })
     }
@@ -5174,9 +5189,7 @@ impl Session {
             created_at: now,
             updated_at: now,
             metadata: serde_json::Map::new(),
-            transcript_history_witness: std::sync::OnceLock::new(),
-            history_witness_assembly: HistoryWitnessAssemblyCache::default(),
-            transcript_history_state_shared: SharedTranscriptHistoryState::default(),
+            history_caches: Box::default(),
             transcript_history_metadata_validation: TranscriptHistoryMetadataValidation::Validated,
             usage: Usage::default(),
         }
@@ -6240,12 +6253,12 @@ impl Session {
     /// "absent": the caller derives and records it. Cleared by every write to
     /// [`SESSION_TRANSCRIPT_HISTORY_STATE_KEY`].
     pub(crate) fn cached_transcript_history_witness(&self) -> Option<&str> {
-        self.transcript_history_witness.get().map(String::as_str)
+        self.history_caches.witness.get().map(String::as_str)
     }
 
     /// Record the canonical witness derived from the CURRENT history value.
     pub(crate) fn record_transcript_history_witness(&self, witness: &str) {
-        let _ = self.transcript_history_witness.set(witness.to_string());
+        let _ = self.history_caches.witness.set(witness.to_string());
     }
 
     /// Assemble the transcript-history checkpoint witness incrementally:
@@ -6285,7 +6298,7 @@ impl Session {
             Some(commit) => commit.get("revision")?.as_str()?.to_string(),
             None => String::new(),
         };
-        let mut cache = self.history_witness_assembly.locked();
+        let mut cache = self.history_caches.assembly.locked();
         let commits_bytes = match &cache.commits {
             Some((count, last, bytes))
                 if *count == commits_array.len() && *last == commits_last =>
@@ -6421,8 +6434,8 @@ impl Session {
         if key == SESSION_TRANSCRIPT_HISTORY_STATE_KEY {
             self.metadata
                 .remove(SESSION_TRANSCRIPT_HISTORY_CHECKPOINT_DIGEST_KEY);
-            self.transcript_history_witness = std::sync::OnceLock::new();
-            self.transcript_history_state_shared.clear();
+            self.history_caches.witness = std::sync::OnceLock::new();
+            self.history_caches.shared_state.clear();
             self.transcript_history_metadata_validation =
                 TranscriptHistoryMetadataValidation::RequiresValidation;
         }
@@ -6436,8 +6449,8 @@ impl Session {
             .insert(SESSION_TRANSCRIPT_HISTORY_STATE_KEY.to_string(), value);
         self.metadata
             .remove(SESSION_TRANSCRIPT_HISTORY_CHECKPOINT_DIGEST_KEY);
-        self.transcript_history_witness = std::sync::OnceLock::new();
-        self.transcript_history_state_shared.clear();
+        self.history_caches.witness = std::sync::OnceLock::new();
+        self.history_caches.shared_state.clear();
         self.transcript_history_metadata_validation =
             TranscriptHistoryMetadataValidation::Validated;
         self.updated_at = SystemTime::now();
@@ -6452,7 +6465,7 @@ impl Session {
         state: std::sync::Arc<TranscriptHistoryState>,
     ) {
         self.set_validated_transcript_history_metadata(value);
-        self.transcript_history_state_shared.set(state);
+        self.history_caches.shared_state.set(state);
     }
 
     #[cfg(test)]
@@ -6474,8 +6487,8 @@ impl Session {
                 .metadata
                 .remove(SESSION_TRANSCRIPT_HISTORY_CHECKPOINT_DIGEST_KEY)
                 .is_some();
-            self.transcript_history_witness = std::sync::OnceLock::new();
-            self.transcript_history_state_shared.clear();
+            self.history_caches.witness = std::sync::OnceLock::new();
+            self.history_caches.shared_state.clear();
             self.transcript_history_metadata_validation =
                 TranscriptHistoryMetadataValidation::Validated;
         }
@@ -6984,14 +6997,15 @@ impl Session {
     pub(crate) fn transcript_history_state_shared(
         &self,
     ) -> Result<Option<std::sync::Arc<TranscriptHistoryState>>, serde_json::Error> {
-        if let Some(state) = self.transcript_history_state_shared.get() {
+        if let Some(state) = self.history_caches.shared_state.get() {
             return Ok(Some(state));
         }
         let Some(state) = self.transcript_history_state()? else {
             return Ok(None);
         };
         let state = std::sync::Arc::new(state);
-        self.transcript_history_state_shared
+        self.history_caches
+            .shared_state
             .set(std::sync::Arc::clone(&state));
         Ok(Some(state))
     }
@@ -7751,9 +7765,7 @@ impl Session {
             created_at: now,
             updated_at: now,
             metadata: self.fork_metadata_projection(),
-            transcript_history_witness: std::sync::OnceLock::new(),
-            history_witness_assembly: HistoryWitnessAssemblyCache::default(),
-            transcript_history_state_shared: SharedTranscriptHistoryState::default(),
+            history_caches: Box::default(),
             transcript_history_metadata_validation: TranscriptHistoryMetadataValidation::Validated,
             usage: self.usage.clone(),
         }
@@ -7874,9 +7886,7 @@ impl Session {
             created_at: now,
             updated_at: now,
             metadata: self.fork_metadata_projection(),
-            transcript_history_witness: std::sync::OnceLock::new(),
-            history_witness_assembly: HistoryWitnessAssemblyCache::default(),
-            transcript_history_state_shared: SharedTranscriptHistoryState::default(),
+            history_caches: Box::default(),
             transcript_history_metadata_validation: TranscriptHistoryMetadataValidation::Validated,
             usage: self.usage.clone(),
         }

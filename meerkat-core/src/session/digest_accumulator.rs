@@ -119,7 +119,17 @@ struct AccumulatorState {
 /// Retained SHA-256 midstate over the transcript identity byte stream.
 #[derive(Debug, Default)]
 pub(crate) struct TranscriptDigestAccumulator {
-    state: Mutex<AccumulatorState>,
+    /// Boxed deliberately: `Session` is embedded in the agent's async state
+    /// machine, whose futures compose sizes additively through nesting, so
+    /// every inline byte here is paid again at each spawn depth. Holding the
+    /// state behind a pointer keeps `Session` small enough for the production
+    /// spawn stack budget (pinned by rkat's
+    /// `tools_full_with_explicit_auth_binding_can_spawn_within_production_stack_budget`,
+    /// which this struct overflowed at 208 inline bytes — `stream_a`'s
+    /// `Option<Midstate>` is 128 of them). One small allocation per session,
+    /// against a struct that already heap-allocates its transcript, metadata
+    /// map and Arc.
+    state: Mutex<Box<AccumulatorState>>,
 }
 
 impl Clone for TranscriptDigestAccumulator {
@@ -168,7 +178,7 @@ pub(crate) fn take_verification_sample() -> bool {
 }
 
 impl TranscriptDigestAccumulator {
-    fn locked(&self) -> std::sync::MutexGuard<'_, AccumulatorState> {
+    fn locked(&self) -> std::sync::MutexGuard<'_, Box<AccumulatorState>> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
@@ -431,14 +441,16 @@ fn record_boundary(state: &mut AccumulatorState, stream: &Midstate) {
 #[derive(Debug, Default)]
 pub(crate) struct TranscriptMessages {
     messages: Arc<Vec<Message>>,
-    accumulator: TranscriptDigestAccumulator,
+    /// Boxed for the same reason the state inside it is: `Session` rides the
+    /// agent's nested async futures against a 2 MB production stack budget.
+    accumulator: Box<TranscriptDigestAccumulator>,
 }
 
 impl Clone for TranscriptMessages {
     fn clone(&self) -> Self {
         Self {
             messages: Arc::clone(&self.messages),
-            accumulator: self.accumulator.clone(),
+            accumulator: Box::new((*self.accumulator).clone()),
         }
     }
 }
@@ -464,7 +476,7 @@ impl TranscriptMessages {
     pub(crate) fn from_vec(messages: Vec<Message>) -> Self {
         Self {
             messages: Arc::new(messages),
-            accumulator: TranscriptDigestAccumulator::default(),
+            accumulator: Box::default(),
         }
     }
 
