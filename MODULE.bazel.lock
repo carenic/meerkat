@@ -510,7 +510,7 @@
           "REPO_MAPPING:rules_rust+,rules_cc rules_cc+",
           "REPO_MAPPING:rules_rust+,rules_rust rules_rust+",
           "FILE:@@//Cargo.lock 146444b61021649e691561b1d695f5f64a7dfc0607fb4665f53b6c22ae60518b",
-          "FILE:@@//Cargo.toml f3f0c00bb6f7b8688a030ab21e3284979fea44f6b55c10270afc963f28400f10",
+          "FILE:@@//Cargo.toml 69b28be8da8b4848dce6656212b0f11959f4ef92f65634e9af64dcfd27379860",
           "FILE:@@//meerkat-machine-derive/Cargo.toml f91da732cdc018477e0db4a1e89ea66cbbf1659bc4eae29782f9b6ba2ac487a6",
           "FILE:@@//meerkat-agent-build-authority/Cargo.toml 60ea4aff0eab73a475d3e58856bde5eb49f855fa2068df3f9cdda23768f68261",
           "FILE:@@//meerkat-sqlite/Cargo.toml adbb3ba9a303a8797b9303f9a50f87a732a75e12d3960baef1d4e4b96f8f123d",

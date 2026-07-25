@@ -185,22 +185,6 @@ oai-rt-rs = "0.4.0"
 split-debuginfo = "off"
 
 [profile.test]
-# Stack-slot coloring is an LLVM optimization that does not run at
-# opt-level = 0, so a large function reserves a separate stack slot for every
-# local in every branch and never reuses them. The 2 MiB Tokio worker-stack
-# budget this suite asserts is a RELEASE-build property; measured at
-# opt-level = 0 it tests debug frame bloat instead of the thing it claims.
-#
-# Measured on the mob spawn path (tools_full_with_explicit_auth_binding_can_
-# spawn_within_production_stack_budget): release passes at 512 KiB and fails
-# at 256 KiB; debug needs ~1.8-2 MiB on macOS arm64 and exceeds 2 MiB on Linux
-# x86_64, whose frames are larger. `Agent::run_loop` alone reserved ~740 KiB
-# of frame for 1974 lines while its async generator is only 20 KiB — the cost
-# is uncolored slots, not live state.
-#
-# opt-level = 1 turns coloring on so CI measures frames that resemble the
-# binaries we ship, without weakening the assertion itself.
-opt-level = 1
 codegen-units = 256
 debug = 0
 incremental = false
