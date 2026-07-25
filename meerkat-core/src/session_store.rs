@@ -237,13 +237,13 @@ pub fn append_only_save_guard_with_witness(
             reason: format!("incoming transcript history state is malformed: {err}"),
         })?;
     let incoming_revision = resolve_transcript_revision(incoming, witness.incoming_revision)?;
-    let incoming_state = incoming.transcript_history_state().map_err(|err| {
+    let incoming_state = incoming.transcript_history_state_shared().map_err(|err| {
         SessionStoreError::InvalidTranscriptRewrite {
             id: incoming.id().clone(),
             reason: format!("incoming transcript history state is malformed: {err}"),
         }
     })?;
-    if let Some(state) = incoming_state.as_ref()
+    if let Some(state) = incoming_state.as_deref()
         && state.head != incoming_revision
     {
         return Err(SessionStoreError::InvalidTranscriptRewrite {
@@ -267,13 +267,13 @@ pub fn append_only_save_guard_with_witness(
             incoming,
             None,
             None,
-            incoming_state.as_ref(),
+            incoming_state.as_deref(),
             &incoming_revision,
             None,
         )?;
         return Ok(());
     };
-    let previous_state = previous.transcript_history_state().map_err(|err| {
+    let previous_state = previous.transcript_history_state_shared().map_err(|err| {
         SessionStoreError::InvalidTranscriptRewrite {
             id: incoming.id().clone(),
             reason: format!("previous transcript history state is malformed: {err}"),
@@ -292,8 +292,8 @@ pub fn append_only_save_guard_with_witness(
         validate_plain_save_transcript_history_preservation(
             incoming,
             Some(previous),
-            previous_state.as_ref(),
-            incoming_state.as_ref(),
+            previous_state.as_deref(),
+            incoming_state.as_deref(),
             &incoming_revision,
             Some(&previous_revision),
         )?;
@@ -310,8 +310,8 @@ pub fn append_only_save_guard_with_witness(
             validate_plain_save_transcript_history_preservation(
                 incoming,
                 Some(previous),
-                previous_state.as_ref(),
-                incoming_state.as_ref(),
+                previous_state.as_deref(),
+                incoming_state.as_deref(),
                 &incoming_revision,
                 Some(&previous_revision),
             )?;
@@ -322,8 +322,8 @@ pub fn append_only_save_guard_with_witness(
         validate_plain_save_transcript_history_preservation(
             incoming,
             Some(previous),
-            previous_state.as_ref(),
-            incoming_state.as_ref(),
+            previous_state.as_deref(),
+            incoming_state.as_deref(),
             &incoming_revision,
             Some(&previous_revision),
         )?;
@@ -333,8 +333,8 @@ pub fn append_only_save_guard_with_witness(
         validate_plain_save_transcript_history_preservation(
             incoming,
             Some(previous),
-            previous_state.as_ref(),
-            incoming_state.as_ref(),
+            previous_state.as_deref(),
+            incoming_state.as_deref(),
             &incoming_revision,
             Some(&previous_revision),
         )?;
@@ -1820,9 +1820,19 @@ impl SessionHead {
                     "failed to derive transcript-history checkpoint witness: {error}"
                 ))
             })?;
-        let mut metadata = session.metadata().clone();
-        metadata.remove(SESSION_TRANSCRIPT_HISTORY_STATE_KEY);
-        metadata.remove(SESSION_TRANSCRIPT_HISTORY_CHECKPOINT_DIGEST_KEY);
+        // Build the slim metadata WITHOUT cloning the transcript-history
+        // graph value: on a compacted session that value carries every
+        // retained revision body plus the live head body, so `clone()` then
+        // `remove()` was one full O(graph) tree copy per boundary save.
+        let mut metadata = session
+            .metadata()
+            .iter()
+            .filter(|(key, _)| {
+                key.as_str() != SESSION_TRANSCRIPT_HISTORY_STATE_KEY
+                    && key.as_str() != SESSION_TRANSCRIPT_HISTORY_CHECKPOINT_DIGEST_KEY
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<serde_json::Map<String, serde_json::Value>>();
         if let Some(history_digest) = history_digest {
             metadata.insert(
                 SESSION_TRANSCRIPT_HISTORY_CHECKPOINT_DIGEST_KEY.to_string(),

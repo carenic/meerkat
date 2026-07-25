@@ -76,10 +76,26 @@ impl Midstate {
             self.hasher.update(b",");
         }
         let canonical = super::canonicalize_message_for_digest(message);
-        self.hasher.update(serde_json::to_vec(&canonical)?);
+        let bytes = serde_json::to_vec(&canonical)?;
+        crate::checkpoint::record_content_digest_bytes(bytes.len() as u64);
+        self.hasher.update(bytes);
         self.covered += 1;
         Ok(())
     }
+}
+
+/// Retained canonical-SORTED bytes of the current message vector: the
+/// `write_canonical_json` form (lexicographic object keys) of
+/// `canonicalize_messages_for_digest(messages)`, interior only (no closing
+/// `]`). This is the byte stream the transcript-history checkpoint WITNESS
+/// hashes for the live head body — a different byte stream from the
+/// `to_vec` identity stream the midstates cover, which is why it is retained
+/// separately. Seeded lazily on the first witness assembly; extended per
+/// append; invalidated with the midstates.
+#[derive(Debug, Clone)]
+struct SortedStream {
+    bytes: Vec<u8>,
+    covered: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -90,6 +106,8 @@ struct AccumulatorState {
     stream_a: Option<Midstate>,
     /// Retained prefix midstates at previously witnessed boundaries.
     boundaries: VecDeque<Midstate>,
+    /// Canonical-sorted byte stream for witness assembly, when enabled.
+    sorted_stream: Option<SortedStream>,
     /// Monotonic count of non-append transcript mutations. Observability for
     /// tests and diagnostics; correctness does not depend on it.
     epoch: u64,
@@ -124,8 +142,29 @@ thread_local! {
     static CROSS_CHECK_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
-fn cross_check_enabled() -> bool {
-    cfg!(any(test, debug_assertions)) && CROSS_CHECK_ENABLED.with(std::cell::Cell::get)
+/// Release-mode sampled verification budget: the first N witness-served
+/// digests per process are recomputed and compared even in release builds.
+/// Debug/test builds verify every serve (the thread-local above); release
+/// builds otherwise had ZERO runtime verification — the entire safety
+/// argument rested on the type-level no-`DerefMut` enforcement, while a
+/// wrong `head_revision` would be persisted into two durable stores and
+/// make sessions unloadable. Sampling converts that argument into evidence
+/// at bounded cost; a mismatch panics before anything wrong is persisted.
+static RELEASE_VERIFICATION_BUDGET: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(32);
+
+pub(crate) fn take_verification_sample() -> bool {
+    if cfg!(any(test, debug_assertions)) {
+        CROSS_CHECK_ENABLED.with(std::cell::Cell::get)
+    } else {
+        RELEASE_VERIFICATION_BUDGET
+            .fetch_update(
+                std::sync::atomic::Ordering::Relaxed,
+                std::sync::atomic::Ordering::Relaxed,
+                |budget| budget.checked_sub(1),
+            )
+            .is_ok()
+    }
 }
 
 impl TranscriptDigestAccumulator {
@@ -143,6 +182,7 @@ impl TranscriptDigestAccumulator {
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         state.stream_a = None;
         state.boundaries.clear();
+        state.sorted_stream = None;
         state.parked = None;
         state.epoch = state.epoch.saturating_add(1);
     }
@@ -154,18 +194,35 @@ impl TranscriptDigestAccumulator {
     /// boundaries survive an append by construction.
     fn extend(&mut self, appended: &[Message]) {
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
-        let Some(stream) = state.stream_a.as_mut() else {
-            return;
-        };
-        for message in appended {
-            if stream.absorb(message).is_err() {
-                // A message that cannot serialize also cannot be digested by
-                // the full path; drop the midstate and let the recompute
-                // surface the typed error at the call site.
-                state.stream_a = None;
-                state.boundaries.clear();
-                state.epoch = state.epoch.saturating_add(1);
-                return;
+        if let Some(stream) = state.stream_a.as_mut() {
+            for message in appended {
+                if stream.absorb(message).is_err() {
+                    // A message that cannot serialize also cannot be digested
+                    // by the full path; drop every retained state and let the
+                    // recompute surface the typed error at the call site.
+                    state.stream_a = None;
+                    state.boundaries.clear();
+                    state.sorted_stream = None;
+                    state.epoch = state.epoch.saturating_add(1);
+                    return;
+                }
+            }
+        }
+        if let Some(sorted) = state.sorted_stream.as_mut() {
+            for message in appended {
+                match sorted_canonical_message_bytes(message) {
+                    Ok(bytes) => {
+                        if sorted.covered > 0 {
+                            sorted.bytes.push(b',');
+                        }
+                        sorted.bytes.extend_from_slice(&bytes);
+                        sorted.covered += 1;
+                    }
+                    Err(_) => {
+                        state.sorted_stream = None;
+                        break;
+                    }
+                }
             }
         }
     }
@@ -173,12 +230,14 @@ impl TranscriptDigestAccumulator {
     /// Park the accumulator across an in-place scan of unknown outcome.
     fn begin_in_place_scan(&mut self) {
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
-        if state.stream_a.is_none() && state.boundaries.is_empty() {
+        if state.stream_a.is_none() && state.boundaries.is_empty() && state.sorted_stream.is_none()
+        {
             return;
         }
         let parked = AccumulatorState {
             stream_a: state.stream_a.take(),
             boundaries: std::mem::take(&mut state.boundaries),
+            sorted_stream: state.sorted_stream.take(),
             epoch: state.epoch,
             parked: None,
         };
@@ -207,6 +266,7 @@ impl TranscriptDigestAccumulator {
         }
         state.stream_a = parked.stream_a;
         state.boundaries = parked.boundaries;
+        state.sorted_stream = parked.sorted_stream;
     }
 
     /// Digest of `messages` — witness-served when the retained midstate covers
@@ -248,7 +308,7 @@ impl TranscriptDigestAccumulator {
         }
         let digest = stream.finalize();
         drop(state);
-        if cross_check_enabled()
+        if take_verification_sample()
             && let Ok(recomputed) = super::transcript_messages_digest_uncounted(messages)
         {
             assert_eq!(
@@ -279,7 +339,7 @@ impl TranscriptDigestAccumulator {
             })?;
         let digest = boundary.finalize();
         drop(state);
-        if cross_check_enabled()
+        if take_verification_sample()
             && let Ok(recomputed) = super::transcript_messages_digest_uncounted(&messages[..count])
         {
             assert_eq!(
@@ -290,6 +350,63 @@ impl TranscriptDigestAccumulator {
         }
         Some(digest)
     }
+
+    /// Feed the canonical-sorted byte form of `messages` (a complete
+    /// canonical JSON array) into `hasher`.
+    ///
+    /// Seeds the retained sorted stream on first use (one O(transcript)
+    /// canonicalization), then serves and extends in O(delta) per append.
+    /// Returns `false` when the stream cannot prove it covers exactly this
+    /// vector (parked scan, count mismatch it cannot reseed, serialization
+    /// failure); the caller falls back to the full canonicalization path.
+    fn hash_sorted_canonical_into(&self, messages: &[Message], hasher: &mut Sha256) -> bool {
+        let mut state = self.locked();
+        if state.parked.is_some() {
+            return false;
+        }
+        let serve = match state.sorted_stream.as_ref() {
+            Some(sorted) if sorted.covered == messages.len() => true,
+            _ => {
+                let mut sorted = SortedStream {
+                    bytes: Vec::new(),
+                    covered: 0,
+                };
+                for message in messages {
+                    let Ok(bytes) = sorted_canonical_message_bytes(message) else {
+                        return false;
+                    };
+                    if sorted.covered > 0 {
+                        sorted.bytes.push(b',');
+                    }
+                    sorted.bytes.extend_from_slice(&bytes);
+                    sorted.covered += 1;
+                }
+                state.sorted_stream = Some(sorted);
+                true
+            }
+        };
+        if !serve {
+            return false;
+        }
+        let Some(sorted) = state.sorted_stream.as_ref() else {
+            return false;
+        };
+        hasher.update(b"[");
+        hasher.update(&sorted.bytes);
+        hasher.update(b"]");
+        crate::checkpoint::record_content_digest_bytes(sorted.bytes.len() as u64 + 2);
+        true
+    }
+}
+
+/// Canonical-sorted bytes of one message: `write_canonical_json` over the
+/// digest-canonicalized message value. This is the per-element form of the
+/// history-witness byte stream (canonical array writing is element-wise).
+fn sorted_canonical_message_bytes(message: &Message) -> Result<Vec<u8>, serde_json::Error> {
+    let canonical = serde_json::to_value(super::canonicalize_message_for_digest(message))?;
+    let mut bytes = Vec::new();
+    crate::checkpoint::write_canonical_json(&canonical, &mut bytes)?;
+    Ok(bytes)
 }
 
 fn record_boundary(state: &mut AccumulatorState, stream: &Midstate) {
@@ -426,6 +543,13 @@ impl TranscriptMessages {
     /// Non-append mutation count of this buffer.
     pub(crate) fn mutation_epoch(&self) -> u64 {
         self.accumulator.epoch()
+    }
+
+    /// Feed the canonical-sorted form of the current buffer into `hasher`;
+    /// see [`TranscriptDigestAccumulator::hash_sorted_canonical_into`].
+    pub(crate) fn hash_sorted_canonical_into(&self, hasher: &mut Sha256) -> bool {
+        self.accumulator
+            .hash_sorted_canonical_into(&self.messages, hasher)
     }
 }
 

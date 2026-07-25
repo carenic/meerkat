@@ -953,6 +953,100 @@ pub(crate) fn canonicalize_checkpoint_history_value(
     }))
 }
 
+/// Cached canonical byte segments for incremental history-witness assembly.
+///
+/// Entries are content-addressed: body chunks are keyed by the revision
+/// string (which IS the digest of the body's canonical messages, so a key
+/// determines its bytes), and the commits segment is keyed by
+/// `(count, last revision)` — an append-only audit log evolving inside one
+/// session instance cannot repeat that pair with different earlier entries.
+/// The debug/test cross-check plus release sampling in
+/// [`Session::assemble_transcript_history_witness`] backstop both keying
+/// arguments with recompute-and-compare.
+#[derive(Debug, Default)]
+pub(crate) struct HistoryWitnessAssemblyCache {
+    inner: std::sync::Mutex<HistoryWitnessAssemblyCacheInner>,
+}
+
+#[derive(Debug, Default, Clone)]
+struct HistoryWitnessAssemblyCacheInner {
+    /// Canonical bytes of the commits array, keyed by (count, last revision).
+    commits: Option<(usize, String, std::sync::Arc<[u8]>)>,
+    /// Canonical `{"messages":…,"revision":…}` chunk per retained body.
+    bodies: std::collections::HashMap<String, std::sync::Arc<[u8]>>,
+}
+
+impl Clone for HistoryWitnessAssemblyCache {
+    fn clone(&self) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(self.locked().clone()),
+        }
+    }
+}
+
+impl HistoryWitnessAssemblyCache {
+    fn locked(&self) -> std::sync::MutexGuard<'_, HistoryWitnessAssemblyCacheInner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// Shared parsed form of the current transcript-history graph.
+///
+/// Guards and the per-append head refresh need the TYPED graph; parsing the
+/// metadata value is O(graph), and a turn boundary parsed it twice (incoming
+/// and previous) plus once more per append. The typed installer caches the
+/// exact state it just serialized; readers share it by `Arc`. Cleared by
+/// every write to the history key, exactly like the witness memo.
+#[derive(Debug, Default)]
+pub(crate) struct SharedTranscriptHistoryState {
+    inner: std::sync::Mutex<Option<std::sync::Arc<TranscriptHistoryState>>>,
+}
+
+impl Clone for SharedTranscriptHistoryState {
+    fn clone(&self) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(self.locked().clone()),
+        }
+    }
+}
+
+impl SharedTranscriptHistoryState {
+    fn locked(&self) -> std::sync::MutexGuard<'_, Option<std::sync::Arc<TranscriptHistoryState>>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn clear(&self) {
+        *self.locked() = None;
+    }
+
+    fn set(&self, state: std::sync::Arc<TranscriptHistoryState>) {
+        *self.locked() = Some(state);
+    }
+
+    fn get(&self) -> Option<std::sync::Arc<TranscriptHistoryState>> {
+        self.locked().clone()
+    }
+}
+
+/// Canonical witness chunk of one retained revision body: the
+/// `write_canonical_json` form of `{"messages": canonicalized, "revision": r}`
+/// — exactly the per-element bytes `canonicalize_checkpoint_history_value`
+/// produces for this body.
+fn canonical_history_body_chunk(body_value: &serde_json::Value) -> Option<Vec<u8>> {
+    let body: TranscriptRevisionBody = serde_json::from_value(body_value.clone()).ok()?;
+    let canonical = serde_json::json!({
+        "revision": body.revision,
+        "messages": canonicalize_messages_for_digest(&body.messages),
+    });
+    let mut bytes = Vec::new();
+    crate::checkpoint::write_canonical_json(&canonical, &mut bytes).ok()?;
+    Some(bytes)
+}
+
 fn canonicalize_checkpoint_deferred_turn_value(
     value: &serde_json::Value,
 ) -> Result<serde_json::Value, serde_json::Error> {
@@ -1370,9 +1464,12 @@ fn revision_body_extends_head(
     Ok(candidate_tail_prefix_digest == head_tail_digest)
 }
 
+use digest_accumulator::take_verification_sample as digest_accumulator_take_verification_sample;
+
 fn sha256_json_digest<T: Serialize + ?Sized>(value: &T) -> Result<String, serde_json::Error> {
     crate::checkpoint::record_content_digest_computation();
     let bytes = serde_json::to_vec(value)?;
+    crate::checkpoint::record_content_digest_bytes(bytes.len() as u64);
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(digest.len() * 2);
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -1418,6 +1515,14 @@ pub struct Session {
     /// write the history key clear it, so it can never outlive the value it
     /// describes.
     transcript_history_witness: std::sync::OnceLock<String>,
+    /// Cached canonical byte segments of the transcript-history graph
+    /// (commits segment, per-retained-body chunks) for incremental witness
+    /// assembly. Content-addressed; survives head-only append updates that
+    /// clear the witness memo above.
+    history_witness_assembly: HistoryWitnessAssemblyCache,
+    /// Shared parsed form of the current history graph; see
+    /// [`SharedTranscriptHistoryState`].
+    transcript_history_state_shared: SharedTranscriptHistoryState,
     /// Whether transcript-history metadata has already crossed a validating,
     /// compacting authority boundary in this in-memory session.
     ///
@@ -1534,6 +1639,8 @@ impl<'de> Deserialize<'de> for Session {
             updated_at: serde_repr.updated_at,
             metadata,
             transcript_history_witness: std::sync::OnceLock::new(),
+            history_witness_assembly: HistoryWitnessAssemblyCache::default(),
+            transcript_history_state_shared: SharedTranscriptHistoryState::default(),
             transcript_history_metadata_validation: TranscriptHistoryMetadataValidation::Validated,
             usage: serde_repr.usage,
         })
@@ -1663,6 +1770,8 @@ impl Session {
             },
             metadata,
             transcript_history_witness: std::sync::OnceLock::new(),
+            history_witness_assembly: HistoryWitnessAssemblyCache::default(),
+            transcript_history_state_shared: SharedTranscriptHistoryState::default(),
             usage,
         })
     }
@@ -4830,6 +4939,8 @@ impl Session {
             updated_at: now,
             metadata: serde_json::Map::new(),
             transcript_history_witness: std::sync::OnceLock::new(),
+            history_witness_assembly: HistoryWitnessAssemblyCache::default(),
+            transcript_history_state_shared: SharedTranscriptHistoryState::default(),
             transcript_history_metadata_validation: TranscriptHistoryMetadataValidation::Validated,
             usage: Usage::default(),
         }
@@ -5901,6 +6012,165 @@ impl Session {
         let _ = self.transcript_history_witness.set(witness.to_string());
     }
 
+    /// Assemble the transcript-history checkpoint witness incrementally:
+    /// byte-identical to `canonical_value_digest(canonicalize_checkpoint_
+    /// history_value(history))`, served as ONE raw SHA-256 pass over cached
+    /// canonical segments instead of a clone + parse + canonicalize + write
+    /// pass over the whole graph.
+    ///
+    /// `None` on any structural surprise — the caller falls back to the full
+    /// canonicalization path, which is also where malformed graphs get their
+    /// typed errors. Only graphs installed by an in-process typed path
+    /// (`Validated`) are assembled, so the legacy heal/reconstruction steps
+    /// the full parse performs are known no-ops for every assembled graph.
+    ///
+    /// The irreducible residual is the hash itself: the canonical form
+    /// interleaves the per-append-changing `head` BEFORE the retained bodies
+    /// (`commits` < `head` < `revisions`), and SHA-256 is sequential, so any
+    /// head change forces re-hashing every byte after it. Removing that pass
+    /// requires a digest-format change and is out of phase-1 scope.
+    pub(crate) fn assemble_transcript_history_witness(
+        &self,
+        history: &serde_json::Value,
+    ) -> Option<crate::checkpoint::SessionCheckpointDigest> {
+        use sha2::Digest as _;
+        if self.transcript_history_metadata_validation
+            != TranscriptHistoryMetadataValidation::Validated
+        {
+            return None;
+        }
+        let object = history.as_object()?;
+        let head = object.get("head")?.as_str()?;
+        let commits_value = object.get("commits")?;
+        let commits_array = commits_value.as_array()?;
+        let revisions = object.get("revisions")?.as_array()?;
+
+        let commits_last = match commits_array.last() {
+            Some(commit) => commit.get("revision")?.as_str()?.to_string(),
+            None => String::new(),
+        };
+        let mut cache = self.history_witness_assembly.locked();
+        let commits_bytes = match &cache.commits {
+            Some((count, last, bytes))
+                if *count == commits_array.len() && *last == commits_last =>
+            {
+                std::sync::Arc::clone(bytes)
+            }
+            _ => {
+                let typed: Vec<TranscriptRewriteCommit> =
+                    serde_json::from_value(commits_value.clone()).ok()?;
+                let value = serde_json::to_value(&typed).ok()?;
+                let mut bytes = Vec::new();
+                crate::checkpoint::write_canonical_json(&value, &mut bytes).ok()?;
+                let bytes: std::sync::Arc<[u8]> = bytes.into();
+                cache.commits = Some((
+                    commits_array.len(),
+                    commits_last,
+                    std::sync::Arc::clone(&bytes),
+                ));
+                bytes
+            }
+        };
+
+        // (revision, chunk) pairs; `None` bytes = the live head body, which
+        // streams from the accumulator's retained sorted transcript bytes.
+        let mut chunks: Vec<(&str, Option<std::sync::Arc<[u8]>>)> =
+            Vec::with_capacity(revisions.len());
+        for body_value in revisions {
+            let revision = body_value.get("revision")?.as_str()?;
+            if revision == head {
+                let body_messages = body_value.get("messages")?.as_array()?;
+                if body_messages.len() != self.messages.len() {
+                    return None;
+                }
+                chunks.push((revision, None));
+                continue;
+            }
+            let bytes = match cache.bodies.get(revision) {
+                Some(bytes) => std::sync::Arc::clone(bytes),
+                None => {
+                    let bytes = canonical_history_body_chunk(body_value)?;
+                    let bytes: std::sync::Arc<[u8]> = bytes.into();
+                    cache
+                        .bodies
+                        .insert(revision.to_string(), std::sync::Arc::clone(&bytes));
+                    bytes
+                }
+            };
+            chunks.push((revision, Some(bytes)));
+        }
+        // Bound the cache to bodies the current graph retains.
+        if cache.bodies.len() > revisions.len() {
+            let live = revisions
+                .iter()
+                .filter_map(|body| body.get("revision").and_then(serde_json::Value::as_str))
+                .collect::<std::collections::HashSet<_>>();
+            cache
+                .bodies
+                .retain(|revision, _| live.contains(revision.as_str()));
+        }
+        drop(cache);
+
+        // Stable sort by revision string: exactly the ordering
+        // `canonicalize_checkpoint_history_value` applies to the array.
+        chunks.sort_by(|left, right| left.0.cmp(right.0));
+
+        let mut hasher = Sha256::new();
+        let mut hashed_bytes = 0u64;
+        let mut absorb = |hasher: &mut Sha256, bytes: &[u8]| {
+            hashed_bytes += bytes.len() as u64;
+            hasher.update(bytes);
+        };
+        absorb(&mut hasher, b"{\"commits\":");
+        absorb(&mut hasher, &commits_bytes);
+        absorb(&mut hasher, b",\"head\":");
+        absorb(&mut hasher, serde_json::to_string(head).ok()?.as_bytes());
+        absorb(&mut hasher, b",\"revisions\":[");
+        for (index, (revision, bytes)) in chunks.iter().enumerate() {
+            if index > 0 {
+                absorb(&mut hasher, b",");
+            }
+            match bytes {
+                Some(bytes) => absorb(&mut hasher, bytes),
+                None => {
+                    absorb(&mut hasher, b"{\"messages\":");
+                    if !self.messages.hash_sorted_canonical_into(&mut hasher) {
+                        return None;
+                    }
+                    absorb(&mut hasher, b",\"revision\":");
+                    absorb(
+                        &mut hasher,
+                        serde_json::to_string(revision).ok()?.as_bytes(),
+                    );
+                    absorb(&mut hasher, b"}");
+                }
+            }
+        }
+        absorb(&mut hasher, b"]}");
+        // One whole-graph hash pass: counted as one budget pass with the
+        // bytes it actually hashed (the sorted-stream bytes count inside
+        // `hash_sorted_canonical_into`).
+        crate::checkpoint::record_content_digest_computation();
+        crate::checkpoint::record_content_digest_bytes(hashed_bytes);
+        let digest = crate::checkpoint::SessionCheckpointDigest::from_assembled(format!(
+            "sha256:{:x}",
+            hasher.finalize()
+        ));
+
+        if digest_accumulator_take_verification_sample() {
+            let recomputed =
+                crate::checkpoint::session_checkpoint_history_digest_uncounted(history).ok()?;
+            assert_eq!(
+                digest, recomputed,
+                "incremental history-witness assembly diverged from the canonical \
+                 derivation: a cached segment or the sorted transcript stream is \
+                 stale, or a keying assumption (content-addressed bodies, \
+                 append-only commits) was violated"
+            );
+        }
+        Some(digest)
+    }
+
     fn set_metadata_unchecked(&mut self, key: &str, value: serde_json::Value) {
         // Reapplying an identical durable projection is not a session-content
         // mutation. In particular, cold materialization restores the sealed
@@ -5916,6 +6186,7 @@ impl Session {
             self.metadata
                 .remove(SESSION_TRANSCRIPT_HISTORY_CHECKPOINT_DIGEST_KEY);
             self.transcript_history_witness = std::sync::OnceLock::new();
+            self.transcript_history_state_shared.clear();
             self.transcript_history_metadata_validation =
                 TranscriptHistoryMetadataValidation::RequiresValidation;
         }
@@ -5930,9 +6201,22 @@ impl Session {
         self.metadata
             .remove(SESSION_TRANSCRIPT_HISTORY_CHECKPOINT_DIGEST_KEY);
         self.transcript_history_witness = std::sync::OnceLock::new();
+        self.transcript_history_state_shared.clear();
         self.transcript_history_metadata_validation =
             TranscriptHistoryMetadataValidation::Validated;
         self.updated_at = SystemTime::now();
+    }
+
+    /// [`Self::set_validated_transcript_history_metadata`] when the caller
+    /// also holds the typed state it just serialized: caches the parsed form
+    /// so guards and the next append refresh skip the O(graph) reparse.
+    fn set_validated_transcript_history_metadata_with_state(
+        &mut self,
+        value: serde_json::Value,
+        state: std::sync::Arc<TranscriptHistoryState>,
+    ) {
+        self.set_validated_transcript_history_metadata(value);
+        self.transcript_history_state_shared.set(state);
     }
 
     #[cfg(test)]
@@ -5955,6 +6239,7 @@ impl Session {
                 .remove(SESSION_TRANSCRIPT_HISTORY_CHECKPOINT_DIGEST_KEY)
                 .is_some();
             self.transcript_history_witness = std::sync::OnceLock::new();
+            self.transcript_history_state_shared.clear();
             self.transcript_history_metadata_validation =
                 TranscriptHistoryMetadataValidation::Validated;
         }
@@ -6455,6 +6740,24 @@ impl Session {
             .get(SESSION_TRANSCRIPT_HISTORY_STATE_KEY)
             .map(|value| serde_json::from_value(value.clone()))
             .transpose()
+    }
+
+    /// [`Self::transcript_history_state`] served from the per-instance
+    /// shared cache: one parse per graph value, shared by `Arc` thereafter.
+    /// Every write to the history key clears the cache.
+    pub(crate) fn transcript_history_state_shared(
+        &self,
+    ) -> Result<Option<std::sync::Arc<TranscriptHistoryState>>, serde_json::Error> {
+        if let Some(state) = self.transcript_history_state_shared.get() {
+            return Ok(Some(state));
+        }
+        let Some(state) = self.transcript_history_state()? else {
+            return Ok(None);
+        };
+        let state = std::sync::Arc::new(state);
+        self.transcript_history_state_shared
+            .set(std::sync::Arc::clone(&state));
+        Ok(Some(state))
     }
 
     /// Return the already-validated transcript graph head without cloning and
@@ -7051,8 +7354,9 @@ impl Session {
             return Ok(None);
         }
         let mut state = self
-            .transcript_history_state()
+            .transcript_history_state_shared()
             .map_err(|error| TranscriptEditError::HistoryStateMalformed(error.to_string()))?
+            .map(|state| (*state).clone())
             .ok_or_else(|| {
                 TranscriptEditError::HistoryStateMalformed(
                     "transcript history metadata key decoded without state".to_string(),
@@ -7133,9 +7437,12 @@ impl Session {
             SystemTime::now(),
             shape,
         ) {
-            Ok(Some(state)) => match serde_json::to_value(state) {
+            Ok(Some(state)) => match serde_json::to_value(&state) {
                 Ok(value) => {
-                    self.set_validated_transcript_history_metadata(value);
+                    self.set_validated_transcript_history_metadata_with_state(
+                        value,
+                        std::sync::Arc::new(state),
+                    );
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -7209,6 +7516,8 @@ impl Session {
             updated_at: now,
             metadata: self.fork_metadata_projection(),
             transcript_history_witness: std::sync::OnceLock::new(),
+            history_witness_assembly: HistoryWitnessAssemblyCache::default(),
+            transcript_history_state_shared: SharedTranscriptHistoryState::default(),
             transcript_history_metadata_validation: TranscriptHistoryMetadataValidation::Validated,
             usage: self.usage.clone(),
         }
@@ -7330,6 +7639,8 @@ impl Session {
             updated_at: now,
             metadata: self.fork_metadata_projection(),
             transcript_history_witness: std::sync::OnceLock::new(),
+            history_witness_assembly: HistoryWitnessAssemblyCache::default(),
+            transcript_history_state_shared: SharedTranscriptHistoryState::default(),
             transcript_history_metadata_validation: TranscriptHistoryMetadataValidation::Validated,
             usage: self.usage.clone(),
         }
