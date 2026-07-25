@@ -16,6 +16,75 @@ use serde_json::{Value, json};
 
 const AUTHORITY_REJECTION: &str = "generated session persistence version authority rejected";
 
+/// v0.8.7 event-log regression witness: every pre-0.8.8 session that used
+/// external callbacks (IDE hosts, production gateways) carries durable
+/// `run_failed` lines whose `callback_pending` reason predates `tool_use_id`,
+/// and `interaction_callback_pending` lines that predate
+/// `pending_tool_calls`. The projector and session event reads replay these
+/// exact lines; they must keep decoding under `EVENT_SCHEMA_VERSION` 2.
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+#[test]
+fn v087_callback_event_log_lines_still_decode() {
+    let run_failed_line = json!({
+        "seq": 41,
+        "schema_version": meerkat_session::event_store::EVENT_SCHEMA_VERSION,
+        "timestamp": { "secs_since_epoch": 1, "nanos_since_epoch": 0 },
+        "source": { "type": "session", "session_id": "00000000-0000-0000-0000-000000000001" },
+        "stream_seq": 41,
+        "event": {
+            "type": "run_failed",
+            "session_id": "00000000-0000-0000-0000-000000000001",
+            "error_report": {
+                "class": "callback_pending",
+                "reason": {
+                    "reason_type": "callback_pending",
+                    "tool_name": "external",
+                    "args": { "value": 1 }
+                },
+                "message": "external callback pending: external"
+            }
+        }
+    });
+    let stored: meerkat_session::event_store::StoredEvent = serde_json::from_value(run_failed_line)
+        .expect("v0.8.7 run_failed callback_pending line must decode");
+    let meerkat_core::event::AgentEvent::RunFailed { error_report, .. } = &stored.event else {
+        panic!("line decodes as RunFailed");
+    };
+    let Some(meerkat_core::event::AgentErrorReason::CallbackPending { tool_use_id, .. }) =
+        error_report.reason.as_ref()
+    else {
+        panic!("reason decodes as CallbackPending");
+    };
+    assert!(
+        tool_use_id.is_empty(),
+        "the pre-0.8.8 line has no callback identity; it must decode as empty, not fail"
+    );
+
+    let interaction_callback_line = json!({
+        "seq": 42,
+        "schema_version": meerkat_session::event_store::EVENT_SCHEMA_VERSION,
+        "timestamp": { "secs_since_epoch": 2, "nanos_since_epoch": 0 },
+        "source": { "type": "session", "session_id": "00000000-0000-0000-0000-000000000001" },
+        "stream_seq": 42,
+        "event": {
+            "type": "interaction_callback_pending",
+            "interaction_id": "00000000-0000-0000-0000-000000000002",
+            "tool_name": "external",
+            "args": { "value": 1 }
+        }
+    });
+    let stored: meerkat_session::event_store::StoredEvent =
+        serde_json::from_value(interaction_callback_line)
+            .expect("v0.8.7 interaction_callback_pending line must decode");
+    let meerkat_core::event::AgentEvent::InteractionCallbackPending {
+        pending_tool_calls, ..
+    } = &stored.event
+    else {
+        panic!("line decodes as InteractionCallbackPending");
+    };
+    assert!(pending_tool_calls.is_empty());
+}
+
 fn session_envelope(version: Option<Value>) -> Value {
     let mut envelope = json!({
         "id": "00000000-0000-0000-0000-000000000001",

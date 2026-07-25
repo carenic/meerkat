@@ -2434,6 +2434,48 @@ impl UnregisterFinalizationCommit {
     }
 }
 
+/// One durable input row observed by [`RuntimeStore::load_input_states`].
+#[derive(Debug, Clone)]
+pub enum InputStateRow {
+    /// The row decoded under this binary's persisted contract.
+    Decoded(Box<StoredInputState>),
+    /// The row's persisted bytes no longer decode. The row stays on disk
+    /// untouched (forensics), and is reported typed so one damaged row does
+    /// not make the runtime's other durable inputs unreadable.
+    Corrupt {
+        /// Row key as stored (the row's JSON no longer parses, so the typed
+        /// `InputId` cannot be recovered from it).
+        input_id: String,
+        /// Decode failure detail.
+        detail: String,
+    },
+}
+
+/// Recovery projection of [`RuntimeStore::load_input_states`]: corrupt rows
+/// are reported loudly and skipped so one damaged row cannot make the whole
+/// runtime unrecoverable (the v0.8.7 failure mode). The damaged rows stay on
+/// disk untouched for forensics.
+pub async fn load_input_states_for_recovery(
+    store: &dyn RuntimeStore,
+    runtime_id: &LogicalRuntimeId,
+) -> Result<Vec<StoredInputState>, RuntimeStoreError> {
+    let mut states = Vec::new();
+    for row in store.load_input_states(runtime_id).await? {
+        match row {
+            InputStateRow::Decoded(state) => states.push(*state),
+            InputStateRow::Corrupt { input_id, detail } => {
+                tracing::error!(
+                    runtime_id = %runtime_id.0,
+                    input_id = %input_id,
+                    detail = %detail,
+                    "durable input row no longer decodes; recovering the runtime's remaining inputs without it"
+                );
+            }
+        }
+    }
+    Ok(states)
+}
+
 /// Atomic persistence interface for runtime state.
 ///
 /// Implementations:
@@ -2666,11 +2708,40 @@ pub trait RuntimeStore: Send + Sync {
         ))
     }
 
-    /// Load all input states for a runtime.
+    /// Load all input states for a runtime, one row outcome per stored row.
+    ///
+    /// A row whose persisted bytes no longer decode under this binary's
+    /// contract is surfaced as [`InputStateRow::Corrupt`] instead of failing
+    /// the whole load: one damaged row must not make every other durable
+    /// input unreadable. The store never drops or rewrites the damaged row;
+    /// the caller owns the per-row skip/fail policy
+    /// ([`RuntimeStore::load_input_states_strict`] is the fail-on-any
+    /// projection).
     async fn load_input_states(
         &self,
         runtime_id: &LogicalRuntimeId,
-    ) -> Result<Vec<StoredInputState>, RuntimeStoreError>;
+    ) -> Result<Vec<InputStateRow>, RuntimeStoreError>;
+
+    /// Strict projection of [`RuntimeStore::load_input_states`]: every row
+    /// must decode; the first corrupt row fails the whole load with its row
+    /// identity in the typed error.
+    async fn load_input_states_strict(
+        &self,
+        runtime_id: &LogicalRuntimeId,
+    ) -> Result<Vec<StoredInputState>, RuntimeStoreError> {
+        let mut states = Vec::new();
+        for row in self.load_input_states(runtime_id).await? {
+            match row {
+                InputStateRow::Decoded(state) => states.push(*state),
+                InputStateRow::Corrupt { input_id, detail } => {
+                    return Err(RuntimeStoreError::ReadFailed(format!(
+                        "input state row `{input_id}` failed to decode: {detail}"
+                    )));
+                }
+            }
+        }
+        Ok(states)
+    }
 
     /// Load a specific boundary receipt.
     async fn load_boundary_receipt(

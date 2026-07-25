@@ -3264,7 +3264,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         let runtime_id = Self::runtime_id_for_session(id);
         let stored_states = self
             .runtime_store
-            .load_input_states(&runtime_id)
+            .load_input_states_strict(&runtime_id)
             .await
             .map_err(|err| {
                 SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
@@ -13648,7 +13648,8 @@ mod tests {
         async fn load_input_states(
             &self,
             runtime_id: &LogicalRuntimeId,
-        ) -> Result<Vec<StoredInputState>, meerkat_runtime::store::RuntimeStoreError> {
+        ) -> Result<Vec<meerkat_runtime::InputStateRow>, meerkat_runtime::store::RuntimeStoreError>
+        {
             if self
                 .input_state_load_errors
                 .lock()

@@ -22,15 +22,15 @@ mod inner {
     };
     use crate::store::{
         AuthOAuthFlowSnapshotUpdate, FencedInputStateBatchCasOutcome,
-        FencedMachineLifecycleCasOutcome, InputStateBatchCasOutcome, MachineLifecycleCasOutcome,
-        MachineLifecycleCommit, MachineLifecycleExpectedVersion, MachineLifecycleObservation,
-        MachineLifecycleSnapshot, MachineLifecycleStoreRecord, RuntimeDeliveryAuthorityCasOutcome,
-        RuntimeDeliveryAuthorityRecord, RuntimeDeliveryStoreRecord, RuntimeStore,
-        RuntimeStoreError, RuntimeStoreWriteFence, RuntimeStoreWriteFenceOutcome, SessionDelta,
-        classify_machine_lifecycle_record, complete_compaction_projection_checkpoint,
-        decoded_prepared_machine_lifecycle_replacement, execute_runtime_store_write_fence,
-        prepare_input_state_batch_cas, prepare_machine_lifecycle_replacement,
-        validate_machine_lifecycle_replacement,
+        FencedMachineLifecycleCasOutcome, InputStateBatchCasOutcome, InputStateRow,
+        MachineLifecycleCasOutcome, MachineLifecycleCommit, MachineLifecycleExpectedVersion,
+        MachineLifecycleObservation, MachineLifecycleSnapshot, MachineLifecycleStoreRecord,
+        RuntimeDeliveryAuthorityCasOutcome, RuntimeDeliveryAuthorityRecord,
+        RuntimeDeliveryStoreRecord, RuntimeStore, RuntimeStoreError, RuntimeStoreWriteFence,
+        RuntimeStoreWriteFenceOutcome, SessionDelta, classify_machine_lifecycle_record,
+        complete_compaction_projection_checkpoint, decoded_prepared_machine_lifecycle_replacement,
+        execute_runtime_store_write_fence, prepare_input_state_batch_cas,
+        prepare_machine_lifecycle_replacement, validate_machine_lifecycle_replacement,
     };
 
     const CREATE_RUNTIME_SCHEMA_SQL: &str = r"
@@ -113,7 +113,7 @@ CREATE TABLE IF NOT EXISTS runtime_delivery_inbox (
 CREATE INDEX IF NOT EXISTS idx_runtime_delivery_inbox_sequence
     ON runtime_delivery_inbox (runtime_id, sequence)";
 
-    fn migration_0002_runtime_delivery_inbox(
+    fn migration_0001_runtime_delivery_inbox(
         tx: &rusqlite::Transaction<'_>,
     ) -> Result<(), rusqlite::Error> {
         tx.execute_batch(CREATE_RUNTIME_DELIVERY_SCHEMA_SQL)
@@ -121,21 +121,39 @@ CREATE INDEX IF NOT EXISTS idx_runtime_delivery_inbox_sequence
 
     /// The runtime store's schema domain in the per-file migration ledger.
     /// (Co-tenants the sessions file in the sqlite realm backend.)
+    ///
+    /// Pinned at version 1: raising this domain's supported version makes
+    /// every pre-existing binary refuse to open the realm's sessions file the
+    /// moment a newer binary opens it once (`SchemaFromTheFuture` on every
+    /// realm open, with no downgrade verb). New capabilities get their own
+    /// lazily-provisioned domain instead — see [`RUNTIME_DELIVERY_DOMAIN`].
     pub const RUNTIME_STORE_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::SchemaDomain {
         name: "runtime-store",
-        migrations: &[
-            meerkat_sqlite::Migration {
-                version: 1,
-                name: "base-schema",
-                apply: migration_0001_runtime_schema,
-            },
-            meerkat_sqlite::Migration {
-                version: 2,
-                name: "runtime-delivery-inbox",
-                apply: migration_0002_runtime_delivery_inbox,
-            },
-        ],
+        migrations: &[meerkat_sqlite::Migration {
+            version: 1,
+            name: "base-schema",
+            apply: migration_0001_runtime_schema,
+        }],
     };
+
+    /// Durable-delivery schema domain (delivery authority + inbox tables).
+    ///
+    /// Deliberately NOT applied by [`open_runtime_connection`]: it is
+    /// provisioned lazily by the first delivery *write*
+    /// ([`open_runtime_delivery_write_connection`]), so merely opening a
+    /// realm with this binary leaves the file fully openable by binaries
+    /// that predate durable delivery. Those binaries never read foreign
+    /// ledger domains, so a `runtime-delivery` row is invisible to them;
+    /// only files where durable delivery was actually used carry it.
+    pub const RUNTIME_DELIVERY_DOMAIN: meerkat_sqlite::SchemaDomain =
+        meerkat_sqlite::SchemaDomain {
+            name: "runtime-delivery",
+            migrations: &[meerkat_sqlite::Migration {
+                version: 1,
+                name: "delivery-inbox",
+                apply: migration_0001_runtime_delivery_inbox,
+            }],
+        };
 
     fn map_shared_sqlite_error(err: meerkat_sqlite::SqliteStoreError) -> RuntimeStoreError {
         match err {
@@ -193,6 +211,60 @@ CREATE INDEX IF NOT EXISTS idx_runtime_delivery_inbox_sequence
         )
         .map_err(map_shared_sqlite_error)?;
         meerkat_sqlite::apply_domain_migrations(&mut conn, &RUNTIME_STORE_DOMAIN)
+            .map_err(map_shared_sqlite_error)?;
+        Ok(RuntimeConn {
+            conn,
+            _guard: guard,
+        })
+    }
+
+    /// Delivery-verb connection: preflights only the delivery domain (the
+    /// operation reads nothing else) and never provisions it — a read on a
+    /// file where durable delivery was never used must not stamp the file.
+    /// Returns `Ok(None)` when the domain is absent, which reads as "no
+    /// delivery state".
+    fn open_runtime_delivery_read_connection(
+        path: &Path,
+    ) -> Result<Option<RuntimeConn>, RuntimeStoreError> {
+        let guard =
+            meerkat_sqlite::OperationGuard::for_database(path).map_err(map_shared_sqlite_error)?;
+        let conn = meerkat_sqlite::open_with(
+            path,
+            meerkat_sqlite::ConnectionProfile::PRIMARY,
+            meerkat_sqlite::OpenOptions {
+                schema_preflight: &[&RUNTIME_DELIVERY_DOMAIN],
+                ..meerkat_sqlite::OpenOptions::default()
+            },
+        )
+        .map_err(map_shared_sqlite_error)?;
+        let provisioned = meerkat_sqlite::domain_version(&conn, RUNTIME_DELIVERY_DOMAIN.name)
+            .map_err(map_shared_sqlite_error)?
+            .is_some();
+        Ok(provisioned.then_some(RuntimeConn {
+            conn,
+            _guard: guard,
+        }))
+    }
+
+    /// Delivery-write connection: provisions the delivery domain on first
+    /// use. This is the ONLY place the `runtime-delivery` ledger row is
+    /// stamped — actually using durable delivery marks the file, opening a
+    /// realm does not.
+    fn open_runtime_delivery_write_connection(
+        path: &Path,
+    ) -> Result<RuntimeConn, RuntimeStoreError> {
+        let guard =
+            meerkat_sqlite::OperationGuard::for_database(path).map_err(map_shared_sqlite_error)?;
+        let mut conn = meerkat_sqlite::open_with(
+            path,
+            meerkat_sqlite::ConnectionProfile::PRIMARY,
+            meerkat_sqlite::OpenOptions {
+                schema_preflight: &[&RUNTIME_DELIVERY_DOMAIN],
+                ..meerkat_sqlite::OpenOptions::default()
+            },
+        )
+        .map_err(map_shared_sqlite_error)?;
+        meerkat_sqlite::apply_domain_migrations(&mut conn, &RUNTIME_DELIVERY_DOMAIN)
             .map_err(map_shared_sqlite_error)?;
         Ok(RuntimeConn {
             conn,
@@ -1319,6 +1391,10 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
         path: PathBuf,
         #[cfg(test)]
         unregister_finalization_fault: AtomicU8,
+        /// Candidate bytes shipped into the snapshot byte-equality probe.
+        /// Observability seam for the length-gate regression tests only.
+        #[cfg(test)]
+        snapshot_byte_probe_bytes: std::sync::Arc<std::sync::atomic::AtomicU64>,
     }
 
     impl SqliteRuntimeStore {
@@ -1330,6 +1406,10 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
                 path,
                 #[cfg(test)]
                 unregister_finalization_fault: AtomicU8::new(0),
+                #[cfg(test)]
+                snapshot_byte_probe_bytes: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(
+                    0,
+                )),
             })
         }
 
@@ -1370,6 +1450,14 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
             self.unregister_finalization_fault
                 .store(fault, Ordering::SeqCst);
         }
+
+        /// Total candidate bytes this store has shipped into the snapshot
+        /// byte-equality probe. Length-gate regression tests only.
+        #[cfg(test)]
+        fn snapshot_byte_probe_bytes(&self) -> u64 {
+            self.snapshot_byte_probe_bytes
+                .load(std::sync::atomic::Ordering::Relaxed)
+        }
     }
 
     #[async_trait::async_trait]
@@ -1382,7 +1470,9 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
             &self,
             runtime_id: &LogicalRuntimeId,
         ) -> Result<Option<RuntimeDeliveryAuthorityRecord>, RuntimeStoreError> {
-            let conn = open_runtime_connection(&self.path)?;
+            let Some(conn) = open_runtime_delivery_read_connection(&self.path)? else {
+                return Ok(None);
+            };
             conn.query_row(
                 r"
                 SELECT revision, state_json
@@ -1408,7 +1498,9 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
             runtime_id: &LogicalRuntimeId,
             delivery_id: &str,
         ) -> Result<Option<RuntimeDeliveryStoreRecord>, RuntimeStoreError> {
-            let conn = open_runtime_connection(&self.path)?;
+            let Some(conn) = open_runtime_delivery_read_connection(&self.path)? else {
+                return Ok(None);
+            };
             conn.query_row(
                 r"
                 SELECT sequence, submission_json
@@ -1437,7 +1529,7 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
             replacement: RuntimeDeliveryAuthorityRecord,
             inserted_delivery: Option<RuntimeDeliveryStoreRecord>,
         ) -> Result<RuntimeDeliveryAuthorityCasOutcome, RuntimeStoreError> {
-            let mut conn = open_runtime_connection(&self.path)?;
+            let mut conn = open_runtime_delivery_write_connection(&self.path)?;
             let tx = begin_runtime_transaction(&mut conn)?;
             let current = tx
                 .query_row(
@@ -1525,7 +1617,9 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
             if limit == 0 {
                 return Ok(Vec::new());
             }
-            let conn = open_runtime_connection(&self.path)?;
+            let Some(conn) = open_runtime_delivery_read_connection(&self.path)? else {
+                return Ok(Vec::new());
+            };
             let mut statement = conn
                 .prepare(
                     r"
@@ -1646,6 +1740,8 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
         ) -> Result<(), RuntimeStoreError> {
             let path = self.path.clone();
             let runtime_id = runtime_id.clone();
+            #[cfg(test)]
+            let snapshot_byte_probe_bytes = std::sync::Arc::clone(&self.snapshot_byte_probe_bytes);
             tokio::task::spawn_blocking(move || {
                 let incoming =
                     serde_json::from_slice(&session_delta.session_snapshot)
@@ -1653,18 +1749,41 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
                 let mut conn = open_runtime_connection(&path)?;
                 let tx = begin_runtime_transaction(&mut conn)?;
                 ensure_compaction_intents_already_outboxed(&tx, &runtime_id, &incoming)?;
-                let snapshot_is_unchanged = tx
+                // Byte equality requires equal lengths, and `length()` on a
+                // BLOB reads the record header, not the payload. Ordinary
+                // turns grow the document, so the unchanged-snapshot probe
+                // usually costs one integer compare instead of shipping the
+                // whole candidate blob into SQLite to hear "no".
+                let candidate_len = i64::try_from(session_delta.session_snapshot.len()).ok();
+                let stored_len = tx
                     .query_row(
-                        "SELECT 1 FROM runtime_session_snapshots WHERE runtime_id = ?1 AND session_snapshot = ?2",
-                        params![
-                            runtime_id_text(&runtime_id),
-                            session_delta.session_snapshot.as_slice()
-                        ],
-                        |row| row.get::<_, i64>(0),
+                        "SELECT length(session_snapshot) FROM runtime_session_snapshots WHERE runtime_id = ?1",
+                        params![runtime_id_text(&runtime_id)],
+                        |row| row.get::<_, Option<i64>>(0),
                     )
                     .optional()
                     .map_err(|err| RuntimeStoreError::ReadFailed(err.to_string()))?
-                    .is_some();
+                    .flatten();
+                let snapshot_is_unchanged = candidate_len.is_some()
+                    && stored_len == candidate_len
+                    && {
+                        #[cfg(test)]
+                        snapshot_byte_probe_bytes.fetch_add(
+                            session_delta.session_snapshot.len() as u64,
+                            std::sync::atomic::Ordering::Relaxed,
+                        );
+                        tx.query_row(
+                            "SELECT 1 FROM runtime_session_snapshots WHERE runtime_id = ?1 AND session_snapshot = ?2",
+                            params![
+                                runtime_id_text(&runtime_id),
+                                session_delta.session_snapshot.as_slice()
+                            ],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .optional()
+                        .map_err(|err| RuntimeStoreError::ReadFailed(err.to_string()))?
+                        .is_some()
+                    };
                 if snapshot_is_unchanged {
                     // Incoming bytes already crossed typed Session validation
                     // and compaction-intent authority. Exact identity means
@@ -2071,7 +2190,7 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
         async fn load_input_states(
             &self,
             runtime_id: &LogicalRuntimeId,
-        ) -> Result<Vec<StoredInputState>, RuntimeStoreError> {
+        ) -> Result<Vec<InputStateRow>, RuntimeStoreError> {
             let path = self.path.clone();
             let runtime_id = runtime_id.clone();
             tokio::task::spawn_blocking(move || {
@@ -2079,7 +2198,7 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
                 let mut stmt = conn
                     .prepare(
                         r"
-                        SELECT state_json
+                        SELECT input_id, state_json
                         FROM runtime_input_states
                         WHERE runtime_id = ?1
                         ORDER BY input_id ASC
@@ -2088,14 +2207,24 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
                     .map_err(|err| RuntimeStoreError::ReadFailed(err.to_string()))?;
                 let rows = stmt
                     .query_map(params![runtime_id_text(&runtime_id)], |row| {
-                        row.get::<_, JsonColumnBytes>(0)
-                            .map(JsonColumnBytes::into_bytes)
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, JsonColumnBytes>(1)?.into_bytes(),
+                        ))
                     })
                     .map_err(|err| RuntimeStoreError::ReadFailed(err.to_string()))?;
                 rows.map(|row| {
-                    let bytes =
+                    let (input_id, bytes) =
                         row.map_err(|err| RuntimeStoreError::ReadFailed(err.to_string()))?;
-                    deserialize_persisted_input_state(&bytes)
+                    // Decode failure is a per-row fact: report it typed under
+                    // the row's key instead of poisoning the whole load.
+                    Ok(match deserialize_persisted_input_state(&bytes) {
+                        Ok(state) => InputStateRow::Decoded(Box::new(state)),
+                        Err(err) => InputStateRow::Corrupt {
+                            input_id,
+                            detail: err.to_string(),
+                        },
+                    })
                 })
                 .collect()
             })
@@ -3957,7 +4086,14 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
                     .unwrap()
                     .is_some()
             );
-            assert_eq!(store.load_input_states(&runtime_id).await.unwrap().len(), 1);
+            assert_eq!(
+                store
+                    .load_input_states_strict(&runtime_id)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
         }
 
         #[tokio::test]
@@ -4023,7 +4159,7 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
             };
             let rows = SqliteRuntimeStore::new(path)
                 .unwrap()
-                .load_input_states(&runtime_id)
+                .load_input_states_strict(&runtime_id)
                 .await
                 .unwrap();
             assert_eq!(rows.len(), expected.len());
@@ -4068,7 +4204,7 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
                 .await
                 .expect_err("trigger must abort the replacement transaction");
             assert!(matches!(error, RuntimeStoreError::WriteFailed(_)));
-            let rows = store.load_input_states(&runtime_id).await.unwrap();
+            let rows = store.load_input_states_strict(&runtime_id).await.unwrap();
             assert_eq!(rows.len(), expected.len());
             assert!(
                 rows.iter().all(|row| row.state.recovery_count == 0),
@@ -4113,7 +4249,7 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
                 InputStateBatchCasOutcome::Swapped,
                 "retry after a lost CAS acknowledgement must observe the exact replacement as success"
             );
-            let rows = store.load_input_states(&runtime_id).await.unwrap();
+            let rows = store.load_input_states_strict(&runtime_id).await.unwrap();
             assert_eq!(rows.len(), crate::store::MAX_INPUT_STATE_BATCH_CAS);
             assert!(rows.iter().all(|row| row.state.recovery_count == 7));
         }
@@ -4144,7 +4280,7 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
             assert_eq!(receipt_row_count(&store), 0);
             assert!(
                 store
-                    .load_input_states(&runtime_id)
+                    .load_input_states_strict(&runtime_id)
                     .await
                     .unwrap()
                     .is_empty()
@@ -4204,6 +4340,112 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
             assert_eq!(
                 store.load_session_snapshot(&runtime_id).await.unwrap(),
                 Some(snapshot)
+            );
+        }
+
+        /// Replace one occurrence of `needle` so the fixture differs in
+        /// content but not in serialized length (same-session document,
+        /// deterministic byte-for-byte otherwise).
+        fn splice_bytes(bytes: &[u8], needle: &[u8], replacement: &[u8]) -> Vec<u8> {
+            assert_eq!(needle.len(), replacement.len());
+            let position = bytes
+                .windows(needle.len())
+                .position(|window| window == needle)
+                .expect("fixture needle present");
+            let mut out = bytes.to_vec();
+            out[position..position + needle.len()].copy_from_slice(replacement);
+            out
+        }
+
+        #[tokio::test]
+        async fn commit_session_snapshot_growth_ships_zero_probe_bytes() {
+            let (_dir, store) = temp_store();
+            let runtime_id = runtime_id();
+            let mut session = Session::new();
+            session.push(Message::User(UserMessage::text("first turn".to_string())));
+            store
+                .commit_session_snapshot(
+                    &runtime_id,
+                    SessionDelta {
+                        session_snapshot: serde_json::to_vec(&session).unwrap(),
+                    },
+                )
+                .await
+                .unwrap();
+            let baseline = store.snapshot_byte_probe_bytes();
+
+            session.push(Message::User(UserMessage::text(
+                "second turn grows the document".to_string(),
+            )));
+            let grown = serde_json::to_vec(&session).unwrap();
+            store
+                .commit_session_snapshot(
+                    &runtime_id,
+                    SessionDelta {
+                        session_snapshot: grown.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                store.snapshot_byte_probe_bytes(),
+                baseline,
+                "a length-changing save must answer the unchanged-snapshot \
+                 question from the stored length alone, not ship the whole \
+                 candidate blob into SQLite for a byte compare that answers no"
+            );
+            assert_eq!(
+                store.load_session_snapshot(&runtime_id).await.unwrap(),
+                Some(grown)
+            );
+        }
+
+        #[tokio::test]
+        async fn commit_session_snapshot_equal_length_different_bytes_still_byte_compares() {
+            let (_dir, store) = temp_store();
+            let runtime_id = runtime_id();
+            let mut session = Session::new();
+            session.push(Message::User(UserMessage::text("probe".to_string())));
+            session.set_metadata(
+                "probe_slot",
+                serde_json::Value::String("probe-fixture-aaaa".to_string()),
+            );
+            let first = serde_json::to_vec(&session).unwrap();
+            let second = splice_bytes(&first, b"probe-fixture-aaaa", b"probe-fixture-bbbb");
+            assert_eq!(first.len(), second.len());
+            assert_ne!(first, second);
+
+            store
+                .commit_session_snapshot(
+                    &runtime_id,
+                    SessionDelta {
+                        session_snapshot: first,
+                    },
+                )
+                .await
+                .unwrap();
+            let before = store.snapshot_byte_probe_bytes();
+            store
+                .commit_session_snapshot(
+                    &runtime_id,
+                    SessionDelta {
+                        session_snapshot: second.clone(),
+                    },
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(
+                store.snapshot_byte_probe_bytes() - before,
+                second.len() as u64,
+                "length-equal candidates must still run the byte probe"
+            );
+            assert_eq!(
+                store.load_session_snapshot(&runtime_id).await.unwrap(),
+                Some(second),
+                "length-equal but different content must be written, not \
+                 treated as unchanged"
             );
         }
 
@@ -4346,7 +4588,7 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
             );
             assert!(
                 store
-                    .load_input_states(&runtime_id)
+                    .load_input_states_strict(&runtime_id)
                     .await
                     .unwrap()
                     .is_empty()
@@ -4649,7 +4891,7 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
                     .unwrap()
                     .is_none()
             );
-            let states = store.load_input_states(&runtime_id).await.unwrap();
+            let states = store.load_input_states_strict(&runtime_id).await.unwrap();
             assert_eq!(states.len(), 1);
         }
 
@@ -4711,7 +4953,11 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
                 "failed terminal transaction must roll back machine lifecycle"
             );
             assert_eq!(
-                store.load_input_states(&runtime_id).await.unwrap().len(),
+                store
+                    .load_input_states_strict(&runtime_id)
+                    .await
+                    .unwrap()
+                    .len(),
                 1,
                 "failed terminal transaction must retain only the seeded input row"
             );
@@ -4846,7 +5092,7 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
             );
             assert!(
                 store
-                    .load_input_states(&runtime_id)
+                    .load_input_states_strict(&runtime_id)
                     .await
                     .unwrap()
                     .is_empty()
@@ -4934,7 +5180,14 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
                 .expect("machine lifecycle snapshot");
             assert_eq!(lifecycle.runtime_state(), runtime_state);
             assert_eq!(lifecycle.binding(), &binding);
-            assert_eq!(store.load_input_states(&runtime_id).await.unwrap().len(), 1);
+            assert_eq!(
+                store
+                    .load_input_states_strict(&runtime_id)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
         }
 
         #[tokio::test(flavor = "multi_thread")]
@@ -5235,7 +5488,14 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
                 lifecycle.binding(),
                 &crate::store::MachineLifecycleBindingFacts::default()
             );
-            assert_eq!(store.load_input_states(&runtime_id).await.unwrap().len(), 1);
+            assert_eq!(
+                store
+                    .load_input_states_strict(&runtime_id)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
             assert!(
                 store
                     .load_ops_lifecycle(&runtime_id)
@@ -5295,7 +5555,7 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
             );
             assert!(
                 store
-                    .load_input_states(&runtime_id)
+                    .load_input_states_strict(&runtime_id)
                     .await
                     .unwrap()
                     .is_empty()
@@ -5394,7 +5654,14 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
                 .unwrap()
                 .expect("the in-progress atomic poll must finish before cancellation returns");
             assert_eq!(lifecycle.runtime_state(), RuntimeState::Idle);
-            assert_eq!(store.load_input_states(&runtime_id).await.unwrap().len(), 1);
+            assert_eq!(
+                store
+                    .load_input_states_strict(&runtime_id)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
             assert!(
                 store
                     .load_ops_lifecycle(&runtime_id)
@@ -5675,7 +5942,7 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
             );
 
             let err = store
-                .load_input_states(&runtime_id)
+                .load_input_states_strict(&runtime_id)
                 .await
                 .expect_err("v0 input-state row must fail the bulk read path closed");
             assert!(
@@ -6266,7 +6533,11 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
                 Some(RuntimeState::Idle)
             );
             assert_eq!(
-                reopened.load_input_states(&runtime_id).await.unwrap().len(),
+                reopened
+                    .load_input_states_strict(&runtime_id)
+                    .await
+                    .unwrap()
+                    .len(),
                 1
             );
             assert!(
@@ -6523,6 +6794,157 @@ BEGIN SELECT RAISE(ABORT, 'legacy migration audit rows are append-only'); END;
             assert_eq!(
                 raw_fixture_row(&path, "runtime_states", "runtime_state_json", &runtime_id.0),
                 raw
+            );
+        }
+
+        // ── upgrade/rollback ledger contract for the delivery domain ──────
+        //
+        // v0.8.7 supports exactly `runtime-store@1` and refuses any higher
+        // version at every realm open (`SchemaFromTheFuture`, no downgrade
+        // verb), while never reading foreign ledger domains. These tests pin
+        // the resulting contract: opening a realm with this binary leaves
+        // the file byte-compatible for v0.8.7; only durable-delivery WRITES
+        // stamp the new lazily-provisioned `runtime-delivery` domain.
+
+        #[test]
+        fn opening_the_runtime_store_stamps_only_runtime_store_v1() {
+            let (_dir, store) = temp_store();
+            let conn = Connection::open(store.path()).unwrap();
+            assert_eq!(
+                meerkat_sqlite::domain_version(&conn, "runtime-store").unwrap(),
+                Some(1),
+                "runtime-store must stay at the version every deployed binary supports"
+            );
+            assert_eq!(
+                meerkat_sqlite::domain_version(&conn, "runtime-delivery").unwrap(),
+                None,
+                "opening a realm must not stamp the delivery domain"
+            );
+        }
+
+        #[tokio::test]
+        async fn delivery_reads_do_not_provision_the_delivery_domain() {
+            let (_dir, store) = temp_store();
+            let rid = runtime_id();
+            assert!(
+                store
+                    .load_runtime_delivery_authority(&rid)
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                store
+                    .load_runtime_delivery_record(&rid, "job:job_1:terminal:1")
+                    .await
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(
+                store
+                    .list_runtime_delivery_records(&rid, 0, 16)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+            let conn = Connection::open(store.path()).unwrap();
+            assert_eq!(
+                meerkat_sqlite::domain_version(&conn, "runtime-delivery").unwrap(),
+                None,
+                "delivery reads must not stamp the delivery domain"
+            );
+        }
+
+        #[tokio::test]
+        async fn first_delivery_write_provisions_the_delivery_domain_lazily() {
+            let (_dir, store) = temp_store();
+            let rid = runtime_id();
+            let outcome = store
+                .compare_and_swap_runtime_delivery_authority(
+                    &rid,
+                    None,
+                    RuntimeDeliveryAuthorityRecord::from_parts(1, b"state".to_vec()),
+                    Some(RuntimeDeliveryStoreRecord::from_parts(
+                        "job:job_1:terminal:1",
+                        1,
+                        b"payload".to_vec(),
+                    )),
+                )
+                .await
+                .unwrap();
+            assert!(matches!(
+                outcome,
+                RuntimeDeliveryAuthorityCasOutcome::Applied(_)
+            ));
+            let conn = Connection::open(store.path()).unwrap();
+            assert_eq!(
+                meerkat_sqlite::domain_version(&conn, "runtime-delivery").unwrap(),
+                Some(1),
+                "the first delivery write provisions the delivery domain"
+            );
+            assert_eq!(
+                meerkat_sqlite::domain_version(&conn, "runtime-store").unwrap(),
+                Some(1),
+                "delivery use must not move the runtime-store domain"
+            );
+            drop(conn);
+            assert!(
+                store
+                    .load_runtime_delivery_authority(&rid)
+                    .await
+                    .unwrap()
+                    .is_some()
+            );
+            assert_eq!(
+                store
+                    .list_runtime_delivery_records(&rid, 0, 16)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+        }
+
+        // ── per-row corruption containment for durable inputs ─────────────
+
+        #[tokio::test]
+        async fn one_corrupt_input_row_does_not_poison_the_load() {
+            let (_dir, store) = temp_store();
+            let rid = runtime_id();
+            let good = input_state();
+            store.persist_input_state(&rid, &good).await.unwrap();
+            let conn = Connection::open(store.path()).unwrap();
+            conn.execute(
+                "INSERT INTO runtime_input_states (runtime_id, input_id, state_json)
+                 VALUES (?1, 'zz-corrupt-row', ?2)",
+                params![rid.0.clone(), b"{\"not\":\"an input state\"}".as_slice()],
+            )
+            .unwrap();
+            drop(conn);
+
+            let rows = store.load_input_states(&rid).await.unwrap();
+            assert_eq!(rows.len(), 2);
+            assert!(matches!(&rows[0], InputStateRow::Decoded(state)
+                if state.state.input_id == good.as_stored().state.input_id));
+            let InputStateRow::Corrupt { input_id, detail } = &rows[1] else {
+                panic!("damaged row must surface as a typed per-row corruption witness");
+            };
+            assert_eq!(input_id, "zz-corrupt-row");
+            assert!(!detail.is_empty());
+
+            let strict = store.load_input_states_strict(&rid).await;
+            let Err(RuntimeStoreError::ReadFailed(message)) = strict else {
+                panic!("strict projection must fail on the corrupt row");
+            };
+            assert!(message.contains("zz-corrupt-row"));
+
+            let recovered = crate::store::load_input_states_for_recovery(&store, &rid)
+                .await
+                .unwrap();
+            assert_eq!(
+                recovered.len(),
+                1,
+                "recovery proceeds with the decodable rows"
             );
         }
     }

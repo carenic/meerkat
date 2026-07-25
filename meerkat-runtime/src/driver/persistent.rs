@@ -77,13 +77,12 @@ impl PersistentRuntimeDriver {
         recovered_unregister_progress: Option<&crate::store::MachineUnregisterProgressSnapshot>,
         write_fence: Arc<dyn RuntimeStoreWriteFence>,
     ) -> Result<RecoveryReport, RuntimeDriverError> {
-        let observed = self
-            .store
-            .load_input_states(&self.runtime_id)
-            .await
-            .map_err(|error| RuntimeDriverError::RecoveryBackoff {
-                reason: format!("failed to observe durable inputs for recovery: {error}"),
-            })?;
+        let observed =
+            crate::store::load_input_states_for_recovery(self.store.as_ref(), &self.runtime_id)
+                .await
+                .map_err(|error| RuntimeDriverError::RecoveryBackoff {
+                    reason: format!("failed to observe durable inputs for recovery: {error}"),
+                })?;
         let report = crate::meerkat_machine::machine_recover_persistent_inputs_from_observed(
             self.store.as_ref(),
             &self.runtime_id,
@@ -255,8 +254,7 @@ impl PersistentRuntimeDriver {
     pub(crate) async fn durable_input_states_for_terminal_recovery(
         &self,
     ) -> Result<Vec<StoredInputState>, RuntimeDriverError> {
-        self.store
-            .load_input_states(&self.runtime_id)
+        crate::store::load_input_states_for_recovery(self.store.as_ref(), &self.runtime_id)
             .await
             .map_err(|error| {
                 RuntimeDriverError::Internal(format!(
@@ -1197,6 +1195,7 @@ impl PersistentRuntimeDriver {
         input_ids: &[InputId],
         stage_authority: crate::meerkat_machine::driver::AuthorizedStageForRun,
         session_snapshot: Option<Vec<u8>>,
+        owner_session_id: &meerkat_core::types::SessionId,
     ) -> Result<(), RuntimeDriverError> {
         let checkpoint = self.inner.rollback_snapshot();
         let receipt = match self.inner.machine_realize_live_boundary_context_injected(
@@ -1222,18 +1221,10 @@ impl PersistentRuntimeDriver {
             .atomic_apply(
                 &self.runtime_id,
                 session_snapshot
-                    .as_ref()
-                    .map(|session_snapshot| crate::store::SessionDelta {
-                        session_snapshot: session_snapshot.clone(),
-                    }),
+                    .map(|session_snapshot| crate::store::SessionDelta { session_snapshot }),
                 receipt.clone(),
                 input_updates,
-                session_snapshot
-                    .as_deref()
-                    .and_then(|snapshot| {
-                        serde_json::from_slice::<meerkat_core::Session>(snapshot).ok()
-                    })
-                    .map(|session| session.id().clone()),
+                Some(owner_session_id.clone()),
             )
             .await
         {
@@ -1248,16 +1239,15 @@ impl PersistentRuntimeDriver {
     pub(crate) async fn machine_commit_completed_boundary_snapshot(
         &mut self,
         receipt: &RunBoundaryReceipt,
-        session_snapshot: Option<&Vec<u8>>,
+        session_snapshot: Option<Vec<u8>>,
         owner_session_id: &meerkat_core::types::SessionId,
     ) -> Result<(), RuntimeDriverError> {
         let input_updates = self.inner.authorized_stored_input_states_snapshot()?;
         self.store
             .atomic_apply(
                 &self.runtime_id,
-                session_snapshot.map(|session_snapshot| crate::store::SessionDelta {
-                    session_snapshot: session_snapshot.clone(),
-                }),
+                session_snapshot
+                    .map(|session_snapshot| crate::store::SessionDelta { session_snapshot }),
                 receipt.clone(),
                 input_updates,
                 Some(owner_session_id.clone()),
@@ -1621,7 +1611,7 @@ mod tests {
         // admission in the live driver.  Capture the CAS witness from the
         // durable store, as recovery adoption does, instead of assuming the
         // two independently timestamped admission shells are byte-identical.
-        let expected = store.load_input_states(&rid).await.unwrap();
+        let expected = store.load_input_states_strict(&rid).await.unwrap();
         for input_id in &input_ids {
             driver
                 .inner_mut()
@@ -1640,7 +1630,7 @@ mod tests {
         );
         assert!(
             store
-                .load_input_states(&rid)
+                .load_input_states_strict(&rid)
                 .await
                 .unwrap()
                 .iter()
@@ -1664,7 +1654,7 @@ mod tests {
         );
         assert!(
             store
-                .load_input_states(&rid)
+                .load_input_states_strict(&rid)
                 .await
                 .unwrap()
                 .iter()
@@ -1731,7 +1721,7 @@ mod tests {
         }
 
         // First owner acquires the durable batch witness.
-        let initial = store.load_input_states(&rid).await.unwrap();
+        let initial = store.load_input_states_strict(&rid).await.unwrap();
         for input_id in &input_ids {
             owner
                 .inner_mut()
@@ -1747,13 +1737,13 @@ mod tests {
                 .unwrap(),
             InputStateBatchCasOutcome::Swapped
         );
-        let owner_witness = store.load_input_states(&rid).await.unwrap();
+        let owner_witness = store.load_input_states_strict(&rid).await.unwrap();
 
         // A second store handle takes over before Candidate -> Finalized.
         let mut takeover =
             PersistentRuntimeDriver::new(rid.clone(), store_trait.clone(), blob_store.clone());
         RuntimeDriver::recover(&mut takeover).await.unwrap();
-        let takeover_expected = store.load_input_states(&rid).await.unwrap();
+        let takeover_expected = store.load_input_states_strict(&rid).await.unwrap();
         for input_id in &input_ids {
             takeover
                 .inner_mut()
@@ -1790,7 +1780,7 @@ mod tests {
         );
         assert!(
             store
-                .load_input_states(&rid)
+                .load_input_states_strict(&rid)
                 .await
                 .unwrap()
                 .iter()
@@ -1800,7 +1790,7 @@ mod tests {
         // The takeover owner finalizes, then a third handle takes ownership
         // before Finalized -> Published. The old finalizer's receipt write is
         // fenced by its exact pre-publication witness.
-        let takeover_witness = store.load_input_states(&rid).await.unwrap();
+        let takeover_witness = store.load_input_states_strict(&rid).await.unwrap();
         for input_id in &input_ids {
             takeover
                 .inner_mut()
@@ -1816,10 +1806,10 @@ mod tests {
                 .unwrap(),
             InputStateBatchCasOutcome::Swapped
         );
-        let finalized_witness = store.load_input_states(&rid).await.unwrap();
+        let finalized_witness = store.load_input_states_strict(&rid).await.unwrap();
         let mut publisher = PersistentRuntimeDriver::new(rid.clone(), store_trait, blob_store);
         RuntimeDriver::recover(&mut publisher).await.unwrap();
-        let publisher_expected = store.load_input_states(&rid).await.unwrap();
+        let publisher_expected = store.load_input_states_strict(&rid).await.unwrap();
         for input_id in &input_ids {
             publisher
                 .inner_mut()
@@ -1859,7 +1849,7 @@ mod tests {
         );
         assert!(
             store
-                .load_input_states(&rid)
+                .load_input_states_strict(&rid)
                 .await
                 .unwrap()
                 .iter()

@@ -156,6 +156,10 @@ pub const KNOWN_LEDGER_DOMAINS: &[&str] = &[
     "session-store",
     "schedule-store",
     "runtime-store",
+    // Lazily provisioned by the first durable-delivery write; absent on
+    // realms that never used durable delivery, so it is deliberately NOT in
+    // any `REALM_DATABASE_FILES` expected-domain list.
+    "runtime-delivery",
     "workgraph",
     "jobs",
     "memory",

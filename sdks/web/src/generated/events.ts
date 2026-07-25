@@ -57,7 +57,7 @@ export type AgentErrorReason = {
   args: unknown;
   reason_type: "callback_pending";
   tool_name: string;
-  tool_use_id: string;
+  tool_use_id?: string;
 } | {
   cause_kind: TurnTerminalCauseKind;
   outcome: TurnTerminalOutcome;

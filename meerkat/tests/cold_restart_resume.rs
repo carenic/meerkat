@@ -537,7 +537,7 @@ mod tests {
         let runtime_store = service.runtime_store();
         let runtime_id = meerkat_runtime::identifiers::LogicalRuntimeId::for_session(&session_id);
         let recovered_inputs = runtime_store
-            .load_input_states(&runtime_id)
+            .load_input_states_strict(&runtime_id)
             .await
             .expect("input states must load from the reopened runtime companion");
         assert!(

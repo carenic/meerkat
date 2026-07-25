@@ -843,9 +843,9 @@ pub use service_ext::SessionServiceRuntimeExt;
 #[cfg(feature = "sqlite-store")]
 pub use store::SqliteRuntimeStore;
 pub use store::{
-    InMemoryRuntimeStore, RuntimeDeliveryAuthorityCasOutcome, RuntimeDeliveryAuthorityRecord,
-    RuntimeDeliveryStoreRecord, RuntimeStore, RuntimeStoreError, RuntimeStoreWriteFence,
-    RuntimeStoreWriteFenceOutcome, SessionDelta,
+    InMemoryRuntimeStore, InputStateRow, RuntimeDeliveryAuthorityCasOutcome,
+    RuntimeDeliveryAuthorityRecord, RuntimeDeliveryStoreRecord, RuntimeStore, RuntimeStoreError,
+    RuntimeStoreWriteFence, RuntimeStoreWriteFenceOutcome, SessionDelta,
 };
 pub use traits::{
     DestroyReport, RecoveryReport, RecycleReport, ResetReport, RetireReport, RuntimeControlPlane,

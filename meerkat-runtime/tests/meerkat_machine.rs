@@ -342,7 +342,7 @@ impl RuntimeStore for HarnessRuntimeStore {
     async fn load_input_states(
         &self,
         runtime_id: &meerkat_runtime::identifiers::LogicalRuntimeId,
-    ) -> Result<Vec<StoredInputState>, RuntimeStoreError> {
+    ) -> Result<Vec<meerkat_runtime::InputStateRow>, RuntimeStoreError> {
         if !self.load_input_states_delay.is_zero() {
             tokio::time::sleep(self.load_input_states_delay).await;
         }
@@ -870,7 +870,7 @@ async fn failed_service_turn_atomically_commits_snapshot_receipt_and_lifecycle()
     );
     assert!(
         store
-            .load_input_states(&runtime_id)
+            .load_input_states_strict(&runtime_id)
             .await
             .unwrap()
             .is_empty()
