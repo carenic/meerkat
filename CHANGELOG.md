@@ -253,6 +253,23 @@ via cargo-semver-checks against the published baselines).
 
 ### Added
 
+- **`IncrementalSessionStore` range-read capability probes** (substrate for
+  head-trusted O(page) history reads; the service read path is unchanged in
+  this release): two additive verbs with conservative defaults.
+  `load_canonical_head` returns the persisted head row only when head+rows
+  are the session's canonical durable representation — `None` for absent AND
+  blob-only sessions, never synthesizing from the legacy blob (default:
+  `None`, so non-overriding stores and non-forwarding wrappers stay on the
+  whole-load path). `load_rewrite_commits` returns the adopted rewrite
+  commits, oldest first, without materializing retained revision bodies, and
+  always equals `load_rewrites`' commits (default derives from
+  `load_rewrites`). `SqliteSessionStore` and `MemoryStore` override both
+  (head-row-only probe; commit-row-only query bounded by the adopted count);
+  `JsonlStore` is deliberately untouched (whole-blob, no incremental
+  capability). The conformance suite gains conditional pins: `None`-for-all
+  stores remain conformant, an advertised canonical head must be the
+  persisted row with page-exact strand serving, and delegating wrappers must
+  forward both verbs (`capability_discovery` chapter).
 - Mob identity convergence now exposes actor-serialized declaration-manifest
   apply/read APIs backed by durable direct desired material and wiring,
   bounded incarnation-fenced leases, immutable operation receipts, total

@@ -1458,6 +1458,51 @@ impl IncrementalSessionStore for SqliteSessionStore {
         })
         .await
     }
+
+    async fn load_canonical_head(
+        &self,
+        id: &SessionId,
+    ) -> Result<Option<SessionHead>, SessionStoreError> {
+        let id = id.clone();
+        // Head row ONLY: unlike `load_head`, a blob-only session gets `None`
+        // rather than an O(document) synthesized head (no blob read at all).
+        self.in_read_txn(move |tx| Ok(head_row_in_txn(tx, &id)?.map(|(head, _token)| head)))
+            .await
+    }
+
+    async fn load_rewrite_commits(
+        &self,
+        id: &SessionId,
+    ) -> Result<Vec<TranscriptRewriteCommit>, SessionStoreError> {
+        let id = id.clone();
+        self.in_read_txn(move |tx| {
+            if let Some((head, _token)) = head_row_in_txn(tx, &id)? {
+                // The commit half of the rewrite rows only (bounded by the
+                // adopted count); no strand-body reads.
+                return Ok(rewrite_rows_in_txn(tx, &id, head.rewrite_count)?
+                    .into_iter()
+                    .map(|row| row.commit)
+                    .collect());
+            }
+            // Blob-only session: derive the commits from the frozen blob's
+            // layout so the answer always equals `load_rewrites`' commits.
+            // (Blob-only sessions are never served by the fast read path —
+            // `load_canonical_head` is `None` — so this arm is contract
+            // parity, not a hot path.)
+            let Some(session) =
+                load_session_snapshot_in_txn(tx, &id).map_err(into_session_store_error)?
+            else {
+                return Ok(Vec::new());
+            };
+            let (layout, _head) = layout_for_blob_session(&session)?;
+            Ok(layout
+                .rewrites
+                .into_iter()
+                .map(|rewrite| rewrite.commit)
+                .collect())
+        })
+        .await
+    }
 }
 
 #[cfg(test)]
@@ -1842,6 +1887,134 @@ mod tests {
         )
         .optional()
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn canonical_head_is_row_only_and_never_synthesizes_for_blob_only() {
+        let (_dir, store) = temp_store();
+
+        // Blob-only session: plain save writes the legacy blob row; no head
+        // row exists.
+        let mut blob_session = Session::new();
+        blob_session.push(user("blob one"));
+        store.save(&blob_session).await.unwrap();
+        assert!(blob_row_bytes(store.path(), blob_session.id()).is_some());
+
+        let inc = incremental(&store);
+        // `load_head` still synthesizes (compat contract, unchanged)...
+        assert!(inc.load_head(blob_session.id()).await.unwrap().is_some());
+        // ...but the canonical probe must answer None without synthesizing.
+        assert!(
+            inc.load_canonical_head(blob_session.id())
+                .await
+                .unwrap()
+                .is_none(),
+            "a blob-only session has no canonical head row"
+        );
+        {
+            let conn = open_connection(store.path()).unwrap();
+            let heads: i64 = conn
+                .query_row("SELECT COUNT(*) FROM session_heads", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(heads, 0, "the canonical probe must not write");
+        }
+
+        // Absent session: None, not an error.
+        assert!(
+            inc.load_canonical_head(&SessionId::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Head-canonical session: the canonical probe serves exactly the
+        // persisted head row (== load_head for a head-canonical session).
+        let mut head_session = Session::new();
+        head_session.push(user("head one"));
+        head_session.push(user("head two"));
+        let saved_head = seed_incremental(&inc, &head_session).await;
+        let canonical = inc
+            .load_canonical_head(head_session.id())
+            .await
+            .unwrap()
+            .expect("head-canonical session must advertise its head row");
+        assert_eq!(canonical, saved_head);
+        assert_eq!(
+            Some(canonical),
+            inc.load_head(head_session.id()).await.unwrap(),
+            "for a head-canonical session the canonical probe equals load_head"
+        );
+    }
+
+    #[tokio::test]
+    async fn rewrite_commits_serve_adopted_commit_rows_without_bodies() {
+        let (_dir, store) = temp_store();
+        let inc = incremental(&store);
+        let mut session = Session::new();
+        session.push(user("one"));
+        session.push(user("two"));
+        let head = seed_incremental(&inc, &session).await;
+        assert!(
+            inc.load_rewrite_commits(session.id())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+
+        let commit = session
+            .commit_transcript_rewrite(
+                TranscriptRewriteSelection::MessageRange { start: 0, end: 2 },
+                vec![user("[compacted] summary")],
+                TranscriptRewriteReason::new("compaction"),
+                Some("test".to_string()),
+                None,
+            )
+            .unwrap();
+        let parent_body = session
+            .transcript_revision_body(&commit.parent_revision)
+            .unwrap()
+            .unwrap();
+        let revision_body = session
+            .transcript_revision_body(&commit.revision)
+            .unwrap()
+            .unwrap();
+        let record = TranscriptRewriteRecord::new(commit.clone(), parent_body, revision_body)
+            .expect("valid rewrite record");
+        let token = session_head_cas_token(&head).unwrap();
+        let next = inc
+            .commit_rewrite(
+                session.id(),
+                &record,
+                SessionHeadCas::IfToken(token.clone()),
+            )
+            .await
+            .unwrap();
+
+        // Recorded but not adopted: the commit view stays empty, exactly
+        // like load_rewrites.
+        assert!(
+            inc.load_rewrite_commits(session.id())
+                .await
+                .unwrap()
+                .is_empty(),
+            "recorded-but-unadopted commits must not be served"
+        );
+
+        inc.save_head(&next, SessionHeadCas::IfToken(token))
+            .await
+            .unwrap();
+        let commits = inc.load_rewrite_commits(session.id()).await.unwrap();
+        assert_eq!(commits, vec![commit]);
+        assert_eq!(
+            commits,
+            inc.load_rewrites(session.id())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|record| record.commit)
+                .collect::<Vec<_>>(),
+            "the commit view must equal load_rewrites' commits"
+        );
     }
 
     #[tokio::test]

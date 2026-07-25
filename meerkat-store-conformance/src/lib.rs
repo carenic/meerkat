@@ -81,7 +81,9 @@ pub use factory::{
     FnSessionStoreFactory, SessionStoreFactory,
 };
 pub use failure::ConformanceFailure;
-pub use wrappers::{ForwardingSessionStore, SwallowingSessionStore};
+pub use wrappers::{
+    DefaultRangeVerbIncrementalStore, ForwardingSessionStore, SwallowingSessionStore,
+};
 
 #[cfg(all(test, not(target_arch = "wasm32")))]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
