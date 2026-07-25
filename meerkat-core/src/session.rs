@@ -31,8 +31,8 @@ use crate::types::{
 };
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashMap};
-use std::sync::Arc;
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
 
 mod digest_accumulator;
 
@@ -390,6 +390,174 @@ fn digest_format_is_unknown(format: &u32) -> bool {
 /// The digest-format generation minted by [`transcript_messages_digest`].
 pub(crate) const TRANSCRIPT_DIGEST_FORMAT_CURRENT: u32 = 2;
 
+/// Decode-memo fact: the retained head body's content digest equals the
+/// stored head revision string (the legacy heal probe found nothing to heal).
+const TRANSCRIPT_GRAPH_FACT_HEAL_PROBE_CURRENT: u8 = 1;
+/// Decode-memo fact: [`validate_transcript_history_state`] fully succeeded
+/// for a graph of this exact shape.
+const TRANSCRIPT_GRAPH_FACT_VALIDATED: u8 = 2;
+
+/// Cheap structural identity of a transcript revision graph for the
+/// process-lifetime decode memo.
+///
+/// The key pins everything the decode-time digest work reads EXCEPT retained
+/// message content: the head revision string, every retained body's
+/// content-addressed revision string, parent pointer, and message count, and
+/// the full serialized commit log (span digests, selection bounds, counts).
+/// Message bodies are trusted through their content-addressed revision
+/// strings once one full verification proved them in this process — the same
+/// read-trusts/write-verifies model as the checkpoint-stamp memo. The `fact`
+/// tag namespaces independently proven facts so one can never satisfy a
+/// consult for the other. Hashing here is O(graph structure), never
+/// O(message content), and deliberately does not count as a content-digest
+/// computation.
+fn transcript_graph_shape_key(
+    fact: u8,
+    head: &str,
+    commits: &[TranscriptRewriteCommit],
+    revisions: &[TranscriptRevisionBody],
+) -> Option<String> {
+    let mut hasher = Sha256::new();
+    hasher.update([fact]);
+    hasher.update((head.len() as u64).to_le_bytes());
+    hasher.update(head.as_bytes());
+    hasher.update((revisions.len() as u64).to_le_bytes());
+    for body in revisions {
+        hasher.update((body.revision.len() as u64).to_le_bytes());
+        hasher.update(body.revision.as_bytes());
+        match body.parent_revision.as_deref() {
+            Some(parent) => {
+                hasher.update([1]);
+                hasher.update((parent.len() as u64).to_le_bytes());
+                hasher.update(parent.as_bytes());
+            }
+            None => hasher.update([0]),
+        }
+        hasher.update((body.messages.len() as u64).to_le_bytes());
+    }
+    hasher.update((commits.len() as u64).to_le_bytes());
+    for commit in commits {
+        let bytes = serde_json::to_vec(commit).ok()?;
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(&bytes);
+    }
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(2 + digest.len() * 2);
+    out.push(char::from(b'0' + fact));
+    out.push(':');
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    for byte in digest {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    Some(out)
+}
+
+/// Process-lifetime bounded memo of decode-time transcript-graph digest
+/// facts (heal-probe outcome, full graph validation).
+///
+/// Marker-less documents (written by pre-marker code) and every decoded
+/// document's graph validation otherwise pay a full canonical-JSON + SHA-256
+/// pass over retained transcript bodies on EVERY decode — O(document) work
+/// per repeat load of unchanged bytes. The memo only ever ADDS the fact "a
+/// graph of this exact shape was proved on this process's decode path":
+/// admission requires one complete verification, so the first decode after
+/// boot always hashes, and changed content re-keys the memo (revision
+/// strings, counts, parents, or commit bytes change) and re-verifies.
+/// Bounded FIFO eviction only forces a redundant re-verification, never a
+/// stale trust decision for a key that was never proved. Write and typed
+/// mutation seams never consult this memo.
+struct BoundedTranscriptGraphDecodeMemo {
+    capacity: usize,
+    entries: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl BoundedTranscriptGraphDecodeMemo {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: HashSet::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn contains(&self, key: &str) -> bool {
+        self.entries.contains(key)
+    }
+
+    fn record(&mut self, key: String) {
+        if self.entries.contains(&key) {
+            return;
+        }
+        while self.entries.len() >= self.capacity {
+            let Some(evicted) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&evicted);
+        }
+        self.order.push_back(key.clone());
+        self.entries.insert(key);
+    }
+}
+
+const TRANSCRIPT_GRAPH_DECODE_MEMO_CAPACITY: usize = 4096;
+
+static TRANSCRIPT_GRAPH_DECODE_MEMO: OnceLock<Mutex<BoundedTranscriptGraphDecodeMemo>> =
+    OnceLock::new();
+
+fn transcript_graph_decode_memo() -> &'static Mutex<BoundedTranscriptGraphDecodeMemo> {
+    TRANSCRIPT_GRAPH_DECODE_MEMO.get_or_init(|| {
+        Mutex::new(BoundedTranscriptGraphDecodeMemo::new(
+            TRANSCRIPT_GRAPH_DECODE_MEMO_CAPACITY,
+        ))
+    })
+}
+
+/// Whether this exact graph-shape fact was already proved on this process's
+/// decode path. A poisoned lock degrades to "not cached": the caller
+/// re-verifies.
+///
+/// Setting `MEERKAT_DISABLE_GRAPH_DECODE_MEMO` (any value) forces every
+/// lookup to miss, reproducing the pre-memo decode cost. It is a diagnostic
+/// kill-switch with exactly two uses: red-first verification of the e2e
+/// gates that assert this memo absorbs repeat decodes (see the marker-less
+/// resume-cost assertion in `meerkat-mob/tests/smoke_mob_idle_burn.rs`),
+/// and ruling the memo in or out when stale memoized trust is suspected.
+/// It must never be set in production — it restores the
+/// O(document)-per-decode verification cost this memo exists to remove.
+fn transcript_graph_fact_is_memoized(key: &str) -> bool {
+    if std::env::var_os("MEERKAT_DISABLE_GRAPH_DECODE_MEMO").is_some() {
+        return false;
+    }
+    transcript_graph_decode_memo()
+        .lock()
+        .map(|memo| memo.contains(key))
+        .unwrap_or(false)
+}
+
+/// Record one completed decode-path proof of this exact graph-shape fact.
+fn record_transcript_graph_fact(key: String) {
+    if let Ok(mut memo) = transcript_graph_decode_memo().lock() {
+        memo.record(key);
+    }
+}
+
+/// Validation trust mode for
+/// [`TranscriptHistoryState::compact_mechanical_revision_bodies_for`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TranscriptGraphValidationMode {
+    /// Always run the full per-body digest validation. Every write, typed
+    /// mutation, and serialization seam uses this mode: a cached hit is
+    /// memoized trust, not a fresh proof of current bytes.
+    FullVerify,
+    /// Decode path for durable documents: a graph shape whose full
+    /// validation already succeeded on this process's decode path may skip
+    /// the per-body digest re-verification. First sight still verifies
+    /// fully and admits the shape into the bounded decode memo.
+    DecodeMemoized,
+}
+
 impl<'de> Deserialize<'de> for TranscriptHistoryState {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
@@ -433,8 +601,9 @@ impl<'de> Deserialize<'de> for TranscriptHistoryState {
         // Fast path: a graph stamped with the current digest format skips the
         // heal probe outright — the probe hashes the full head transcript,
         // which is decode-hot (every session load). Unstamped graphs (legacy
-        // or pre-marker writers) pay the probe once; their next save
-        // persists the marker.
+        // or pre-marker writers) pay the probe once per process per shape
+        // (the bounded decode memo absorbs repeat decodes of unchanged
+        // marker-less bytes); their next save persists the marker.
         let head_is_current = state.digest_format >= TRANSCRIPT_DIGEST_FORMAT_CURRENT
             || match state
                 .revisions
@@ -442,9 +611,29 @@ impl<'de> Deserialize<'de> for TranscriptHistoryState {
                 .find(|body| body.revision == state.head)
             {
                 Some(head_body) => {
-                    transcript_messages_digest(&head_body.messages)
-                        .map_err(serde::de::Error::custom)?
-                        == state.head
+                    let probe_key = transcript_graph_shape_key(
+                        TRANSCRIPT_GRAPH_FACT_HEAL_PROBE_CURRENT,
+                        &state.head,
+                        &state.commits,
+                        &state.revisions,
+                    );
+                    if probe_key
+                        .as_deref()
+                        .is_some_and(transcript_graph_fact_is_memoized)
+                    {
+                        true
+                    } else {
+                        let current = transcript_messages_digest(&head_body.messages)
+                            .map_err(serde::de::Error::custom)?
+                            == state.head;
+                        // Only the idempotent outcome is memoizable: a
+                        // stale-format head must keep healing on every
+                        // decode until a save persists the healed strings.
+                        if current && let Some(key) = probe_key {
+                            record_transcript_graph_fact(key);
+                        }
+                        current
+                    }
                 }
                 None => true,
             };
@@ -475,7 +664,41 @@ impl TranscriptHistoryState {
     /// full-body lineage validator intact after the intermediate append heads
     /// are removed.
     fn compact_mechanical_revision_bodies(&mut self) -> Result<(), TranscriptEditError> {
-        validate_transcript_history_state(self)?;
+        self.compact_mechanical_revision_bodies_for(TranscriptGraphValidationMode::FullVerify)
+    }
+
+    /// [`Self::compact_mechanical_revision_bodies`] with an explicit
+    /// validation trust mode. Only the durable-document decode seam passes
+    /// [`TranscriptGraphValidationMode::DecodeMemoized`]; typed mutation and
+    /// serialization seams keep the unconditional full validation.
+    ///
+    /// MERGE NOTE (class2 integration): this composes the decode memo (which
+    /// absorbs repeat decodes of unchanged marker-less documents) with the
+    /// extracted pruning half below (which the append fast path calls with
+    /// its own O(1) validity proof, skipping validation entirely). Both
+    /// mechanisms are load-bearing; neither replaces the other.
+    fn compact_mechanical_revision_bodies_for(
+        &mut self,
+        mode: TranscriptGraphValidationMode,
+    ) -> Result<(), TranscriptEditError> {
+        let validated_key = match mode {
+            TranscriptGraphValidationMode::FullVerify => None,
+            TranscriptGraphValidationMode::DecodeMemoized => transcript_graph_shape_key(
+                TRANSCRIPT_GRAPH_FACT_VALIDATED,
+                &self.head,
+                &self.commits,
+                &self.revisions,
+            ),
+        };
+        let already_proved = validated_key
+            .as_deref()
+            .is_some_and(transcript_graph_fact_is_memoized);
+        if !already_proved {
+            validate_transcript_history_state(self)?;
+            if let Some(key) = validated_key {
+                record_transcript_graph_fact(key);
+            }
+        }
         self.prune_mechanical_revision_bodies();
         Ok(())
     }
@@ -1580,8 +1803,11 @@ impl Serialize for Session {
             == TranscriptHistoryMetadataValidation::RequiresValidation
         {
             let mut metadata = self.metadata.clone();
-            compact_transcript_history_metadata_for_snapshot(&mut metadata)
-                .map_err(<S::Error as serde::ser::Error>::custom)?;
+            compact_transcript_history_metadata_for_snapshot(
+                &mut metadata,
+                TranscriptGraphValidationMode::FullVerify,
+            )
+            .map_err(<S::Error as serde::ser::Error>::custom)?;
             Some(metadata)
         } else {
             None
@@ -1602,6 +1828,7 @@ impl Serialize for Session {
 
 fn compact_transcript_history_metadata_for_snapshot(
     metadata: &mut serde_json::Map<String, serde_json::Value>,
+    mode: TranscriptGraphValidationMode,
 ) -> Result<(), String> {
     let Some(value) = metadata.remove(SESSION_TRANSCRIPT_HISTORY_STATE_KEY) else {
         return Ok(());
@@ -1609,7 +1836,7 @@ fn compact_transcript_history_metadata_for_snapshot(
     let mut state: TranscriptHistoryState =
         serde_json::from_value(value).map_err(|error| error.to_string())?;
     state
-        .compact_mechanical_revision_bodies()
+        .compact_mechanical_revision_bodies_for(mode)
         .map_err(|error| error.to_string())?;
     metadata.insert(
         SESSION_TRANSCRIPT_HISTORY_STATE_KEY.to_string(),
@@ -1629,8 +1856,14 @@ impl<'de> Deserialize<'de> for Session {
         )
         .map_err(<D::Error as serde::de::Error>::custom)?;
         let mut metadata = serde_repr.metadata;
-        compact_transcript_history_metadata_for_snapshot(&mut metadata)
-            .map_err(<D::Error as serde::de::Error>::custom)?;
+        // Durable-document decode seam: repeat decodes of an unchanged graph
+        // shape skip the per-body digest re-verification via the bounded
+        // process-lifetime decode memo (first sight still verifies fully).
+        compact_transcript_history_metadata_for_snapshot(
+            &mut metadata,
+            TranscriptGraphValidationMode::DecodeMemoized,
+        )
+        .map_err(<D::Error as serde::de::Error>::custom)?;
         Ok(Session {
             version,
             id: serde_repr.id,
@@ -1786,8 +2019,11 @@ impl Session {
         if self.transcript_history_metadata_validation
             == TranscriptHistoryMetadataValidation::RequiresValidation
         {
-            compact_transcript_history_metadata_for_snapshot(&mut metadata)
-                .map_err(<serde_json::Error as serde::ser::Error>::custom)?;
+            compact_transcript_history_metadata_for_snapshot(
+                &mut metadata,
+                TranscriptGraphValidationMode::FullVerify,
+            )
+            .map_err(<serde_json::Error as serde::ser::Error>::custom)?;
         }
         if let Some(history) = metadata.get_mut(SESSION_TRANSCRIPT_HISTORY_STATE_KEY) {
             *history = canonicalize_checkpoint_history_value(history)?;
@@ -9083,6 +9319,115 @@ mod tests {
             history.commits[0].selection.semantic(),
             TranscriptRewriteSemantic::Edit,
             "free-form reason must not upgrade an ordinary edit"
+        );
+    }
+
+    /// HomeCore cutover regression: documents written by pre-marker code
+    /// (`digest_format` absent, current-format digests) previously re-paid
+    /// the decode-time heal probe plus the full per-body graph validation —
+    /// a canonical-JSON + SHA-256 pass over the whole retained transcript —
+    /// on EVERY decode. Repeat decodes of unchanged bytes must be absorbed
+    /// by the bounded process-lifetime decode memo after the first
+    /// full-verify decode.
+    #[test]
+    fn marker_less_document_decode_memoizes_probe_and_graph_validation() {
+        use crate::checkpoint::session_content_digest_computations;
+
+        // Fixture content is unique to this test so no sibling test's decode
+        // can pre-warm the process-lifetime memo for this graph shape.
+        let mut session = Session::new();
+        session.push(Message::User(UserMessage::text(
+            "marker-less-memo old context one",
+        )));
+        session.push(Message::User(UserMessage::text(
+            "marker-less-memo old context two",
+        )));
+        session
+            .commit_transcript_rewrite(
+                TranscriptRewriteSelection::MessageRange { start: 0, end: 2 },
+                vec![Message::User(UserMessage::text(
+                    "marker-less-memo replacement",
+                ))],
+                TranscriptRewriteReason::new("edit"),
+                None,
+                None,
+            )
+            .unwrap();
+        let mut document = serde_json::to_value(&session).unwrap();
+        // Forge the pre-marker writer's shape (the HomeCore 0.8.4-migrated
+        // fleet): identical current-format digests, marker absent.
+        document["metadata"][SESSION_TRANSCRIPT_HISTORY_STATE_KEY]
+            .as_object_mut()
+            .unwrap()
+            .remove("digest_format")
+            .expect("fixture blob was written with the marker");
+
+        let before_first = session_content_digest_computations();
+        let first: Session = serde_json::from_value(document.clone()).unwrap();
+        let after_first = session_content_digest_computations();
+        assert!(
+            after_first > before_first,
+            "first decode of a marker-less document must fully verify \
+             (heal probe + per-body graph validation)"
+        );
+        // Decode stamps the in-memory state, so any re-save persists the
+        // marker (the mobkit stamping verb relies on exactly this).
+        let restamped = serde_json::to_value(&first).unwrap();
+        assert_eq!(
+            restamped["metadata"][SESSION_TRANSCRIPT_HISTORY_STATE_KEY]["digest_format"],
+            serde_json::json!(TRANSCRIPT_DIGEST_FORMAT_CURRENT),
+            "decoding a marker-less document must stamp the current digest format"
+        );
+
+        for _ in 0..3 {
+            let repeat: Session = serde_json::from_value(document.clone()).unwrap();
+            assert_eq!(repeat.messages().len(), first.messages().len());
+        }
+        assert_eq!(
+            session_content_digest_computations(),
+            after_first,
+            "repeat decodes of unchanged marker-less bytes must not recompute \
+             content digests (O(1) per repeat load within a process)"
+        );
+
+        // The marker-stamped spelling of the SAME graph shares the proof:
+        // the probe is format-gated and the graph validation is memoized on
+        // shape, which deliberately excludes the compatibility marker.
+        let stamped_repeat: Session = serde_json::from_value(restamped).unwrap();
+        assert_eq!(stamped_repeat.messages().len(), first.messages().len());
+        assert_eq!(
+            session_content_digest_computations(),
+            after_first,
+            "repeat decode of the marker-stamped spelling must not recompute digests"
+        );
+
+        // Changed content re-keys the memo and re-verifies: appending a
+        // message to the retained head body (message count changes the
+        // shape key) must be caught by full validation, never laundered
+        // through memoized trust.
+        let mut tampered = document.clone();
+        let head = tampered["metadata"][SESSION_TRANSCRIPT_HISTORY_STATE_KEY]["head"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let bodies = tampered["metadata"][SESSION_TRANSCRIPT_HISTORY_STATE_KEY]["revisions"]
+            .as_array_mut()
+            .unwrap();
+        let head_body = bodies
+            .iter_mut()
+            .find(|body| body["revision"].as_str() == Some(head.as_str()))
+            .unwrap();
+        let smuggled = head_body["messages"][0].clone();
+        head_body["messages"].as_array_mut().unwrap().push(smuggled);
+        let digests_before_tampered = session_content_digest_computations();
+        let error = serde_json::from_value::<Session>(tampered).unwrap_err();
+        assert!(
+            error.to_string().contains("digest"),
+            "tampered head body must fail digest validation, got: {error}"
+        );
+        assert!(
+            session_content_digest_computations() > digests_before_tampered,
+            "a changed graph shape must re-verify, not hit the memo"
         );
     }
 

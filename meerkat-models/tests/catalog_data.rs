@@ -191,11 +191,27 @@ fn claude_fable_5_in_catalog_without_changing_default_ladder() {
         allowed_models(Provider::Anthropic).any(|id| id == "claude-fable-5"),
         "claude-fable-5 must be in the Anthropic allowlist"
     );
-    // The Anthropic default remains Opus 4.8 even though Fable 5 is the more
-    // capable (and more expensive) model. The cross-provider global default
-    // is independently owned by the OpenAI recommendation.
-    assert_eq!(default_model(Provider::Anthropic), Some("claude-opus-4-8"));
+    // The Anthropic default is Opus 5, not Fable 5 — Fable 5 stays a
+    // premium opt-in. The cross-provider global default is independently
+    // owned by the OpenAI recommendation.
+    assert_eq!(default_model(Provider::Anthropic), Some("claude-opus-5"));
     assert_eq!(global_default_model(), "gpt-5.6-sol");
+}
+
+#[test]
+fn claude_opus_5_is_cataloged_and_owns_the_anthropic_default() {
+    let entry =
+        entry_for(Provider::Anthropic, "claude-opus-5").expect("claude-opus-5 must be in catalog");
+    assert_eq!(entry.provider, "anthropic");
+    assert_eq!(entry.display_name, "Claude Opus 5");
+    assert_eq!(entry.context_window, Some(1_000_000));
+    assert_eq!(entry.max_output_tokens, Some(128_000));
+    assert!(
+        allowed_models(Provider::Anthropic).any(|id| id == "claude-opus-5"),
+        "claude-opus-5 must be in the Anthropic allowlist"
+    );
+    assert_eq!(infer_provider("claude-opus-5"), Some(Provider::Anthropic));
+    assert_eq!(default_model(Provider::Anthropic), Some("claude-opus-5"));
 }
 
 #[test]
@@ -460,6 +476,35 @@ fn claude_fable_5_is_cataloged_with_official_limits() {
     assert!(
         !caps.supports_thinking_budget_legacy,
         "budget_tokens is fully removed on Fable 5"
+    );
+    assert!(caps.vision);
+    assert!(caps.supports_compaction);
+    assert!(caps.supports_structured_output);
+    assert!(caps.supports_web_search);
+    assert!(caps.effort_levels.contains(&EffortLevel::Xhigh));
+    assert!(caps.effort_levels.contains(&EffortLevel::Max));
+}
+
+#[test]
+fn claude_opus_5_capability_row_mirrors_the_claude_5_generation() {
+    let caps = capabilities_for(Provider::Anthropic, "claude-opus-5")
+        .expect("claude-opus-5 must be in the Anthropic catalog");
+    assert_eq!(caps.provider, Provider::Anthropic);
+    assert_eq!(caps.model_family, "claude-opus-5");
+    assert_eq!(caps.context_window, 1_000_000);
+    assert_eq!(caps.max_output_tokens, 128_000);
+    assert!(
+        caps.max_output_tokens_beta.is_none(),
+        "Opus 5 is not listed for the output-300k batch beta"
+    );
+    assert_eq!(caps.thinking, ThinkingSupport::AnthropicAdaptiveOnly);
+    assert!(
+        !caps.supports_temperature && !caps.supports_top_p && !caps.supports_top_k,
+        "Opus 5 rejects all sampling parameters"
+    );
+    assert!(
+        !caps.supports_thinking_budget_legacy,
+        "budget_tokens is fully removed on Opus 5"
     );
     assert!(caps.vision);
     assert!(caps.supports_compaction);
