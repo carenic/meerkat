@@ -264,6 +264,38 @@ resolve the `session_heads` row for the session, then read
 and may change without notice.
 </Warning>
 
+### Range-read capability probes (`load_canonical_head` / `load_rewrite_commits`)
+
+`IncrementalSessionStore` carries two additive read verbs that expose the
+head-canonical representation to future O(page) history reads:
+
+- **`load_canonical_head`** returns the persisted head row ONLY when
+  head+rows are the session's canonical durable representation. Unlike
+  `load_head` (which may synthesize a deterministic head from a legacy blob —
+  an O(document) parse), it answers `None` for absent AND blob-only sessions
+  and never reads the blob. `Some` promises the row is the persisted head
+  itself and that `load_messages` over `head.strand` page-serves exactly the
+  rows the head covers.
+- **`load_rewrite_commits`** returns the ADOPTED rewrite commits
+  (`idx < head.rewrite_count`), oldest first, without materializing retained
+  revision bodies. It must always equal `load_rewrites`' commits, in order —
+  including the empty set while a recorded rewrite is not yet adopted.
+
+Both verbs have conservative defaults (`None`; derive from `load_rewrites`),
+so every existing store — including delegating wrappers that do not forward
+them — degrades to the whole-load path, never to a refusal. The conformance
+suite pins the contract conditionally: a store answering `None` for every
+canonical-head probe is fully conformant; a store answering `Some` must serve
+the persisted row and page-exact strand reads, and delegating wrappers must
+forward both verbs (`capability_discovery` chapter).
+
+**The service read path is unchanged in this release**: `read_history`,
+`read_transcript_revision`, and `list_transcript_revisions` still perform the
+full authoritative load (with its arbitration, stamp verification, and
+rewrite-log replay/audit backfill) on every read. These verbs are the store
+substrate for the head-trusted range-read fast paths scheduled for the next
+release; nothing consumes them on the read path yet.
+
 ### Durable runtime lifecycle vocabulary (`runtime_states`)
 
 The runtime companion persists one lifecycle row per runtime. The full

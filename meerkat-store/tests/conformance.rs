@@ -27,8 +27,8 @@ use async_trait::async_trait;
 use meerkat_core::{ArtifactStore, BlobStore, SessionStore};
 use meerkat_store::{MemoryArtifactStore, MemoryBlobStore};
 use meerkat_store_conformance::{
-    ArtifactStoreFactory, BlobStoreFactory, ConformanceFailure, ForwardingSessionStore,
-    SessionStoreFactory, SwallowingSessionStore, chapters,
+    ArtifactStoreFactory, BlobStoreFactory, ConformanceFailure, DefaultRangeVerbIncrementalStore,
+    ForwardingSessionStore, SessionStoreFactory, SwallowingSessionStore, chapters,
 };
 
 fn factory_failure(error: impl std::fmt::Display) -> ConformanceFailure {
@@ -283,6 +283,47 @@ mod memory_store {
             .expect_err("the swallow test must fail loudly for a swallowing wrapper");
         assert_eq!(failure.chapter(), "capability_discovery");
         assert_eq!(failure.step(), "as_incremental_forwarded");
+    }
+
+    /// A defaults-only-range-verb store is a fully conformant STORE: the
+    /// conservative `load_canonical_head`/`load_rewrite_commits` defaults
+    /// keep every reader on the whole-load path, and the incremental chapter
+    /// accepts that shape (the `Some`-pins are conditional).
+    #[tokio::test]
+    async fn incremental_profile_accepts_a_defaults_only_range_verb_store() {
+        struct DefaultsOnlyFactory {
+            store: Arc<dyn SessionStore>,
+        }
+
+        #[async_trait]
+        impl SessionStoreFactory for DefaultsOnlyFactory {
+            async fn open(&self) -> Result<Arc<dyn SessionStore>, ConformanceFailure> {
+                Ok(Arc::clone(&self.store))
+            }
+        }
+
+        let inner: Arc<dyn SessionStore> = Arc::new(meerkat_store::MemoryStore::new());
+        let store = DefaultRangeVerbIncrementalStore::wrap(inner)
+            .expect("memory store must expose the incremental capability");
+        chapters::incremental(&DefaultsOnlyFactory { store })
+            .await
+            .expect("a store keeping the range-read verbs on their defaults must stay conformant");
+    }
+
+    /// ...but as a DELEGATING WRAPPER the same shape silently discards the
+    /// inner store's range-read capability, and the capability-discovery
+    /// forwarding pin makes that loud.
+    #[tokio::test]
+    async fn range_verb_swallowing_incremental_wrapper_is_detected_loudly() {
+        let inner: Arc<dyn SessionStore> = Arc::new(meerkat_store::MemoryStore::new());
+        let failure = chapters::assert_forwards_incremental(inner, |inner| {
+            DefaultRangeVerbIncrementalStore::wrap(inner)
+                .expect("memory store must expose the incremental capability")
+        })
+        .await
+        .expect_err("a wrapper leaving the range-read verbs on defaults must fail the pin");
+        assert_eq!(failure.chapter(), "capability_discovery");
+        assert_eq!(failure.step(), "range_read_verbs_forwarded");
     }
 }
 

@@ -16,8 +16,10 @@ const CHAPTER: &str = "incremental";
 
 /// Incremental profile: O(delta) `append_messages` semantics, CAS-guarded
 /// `save_head` (`Create` / `IfToken`), `commit_rewrite` CAS against the head
-/// token, `TranscriptRevisionConflict` on token/parent mismatch, and
-/// `load_messages` / `load_rewrites` round-trips.
+/// token, `TranscriptRevisionConflict` on token/parent mismatch,
+/// `load_messages` / `load_rewrites` round-trips, and the conditional
+/// range-read capability contract (`load_canonical_head` /
+/// `load_rewrite_commits`).
 ///
 /// Invoke this chapter only for stores whose `as_incremental` returns
 /// `Some`; invoking it for a store without the capability fails loudly.
@@ -35,6 +37,205 @@ pub async fn incremental(factory: &dyn SessionStoreFactory) -> Result<(), Confor
     append_contract(&steps, inc.as_ref()).await?;
     save_head_cas(&steps, inc.as_ref()).await?;
     rewrite_commit_and_adoption(&steps, factory, &store, inc.as_ref()).await?;
+    range_read_capability(&steps, &store, inc.as_ref()).await?;
+    Ok(())
+}
+
+/// Ensure the commit view equals `load_rewrites`' commits, in order.
+async fn ensure_commit_view_matches(
+    steps: &Steps,
+    step: &'static str,
+    inc: &dyn IncrementalSessionStore,
+    id: &meerkat_core::SessionId,
+    what: &str,
+) -> Result<(), ConformanceFailure> {
+    let commits = steps.wrap(step, inc.load_rewrite_commits(id).await)?;
+    let derived = steps
+        .wrap(step, inc.load_rewrites(id).await)?
+        .into_iter()
+        .map(|record| record.commit)
+        .collect::<Vec<_>>();
+    steps.ensure(
+        step,
+        commits == derived,
+        format!("load_rewrite_commits must equal load_rewrites' commits, in order ({what})"),
+    )
+}
+
+/// Conditional range-read capability pins.
+///
+/// `load_canonical_head` has a conservative default (`None`), so a store that
+/// never advertises a canonical head remains fully conformant — the `Some`
+/// pins below apply only when the store opts in. `load_rewrite_commits` must
+/// ALWAYS equal `load_rewrites`' commits (the default derives them), so that
+/// pin is unconditional.
+async fn range_read_capability(
+    steps: &Steps,
+    store: &Arc<dyn meerkat_core::SessionStore>,
+    inc: &dyn IncrementalSessionStore,
+) -> Result<(), ConformanceFailure> {
+    const STEP: &str = "range_read_capability";
+    let (session, head, token) = seed(steps, STEP, inc, &["range one", "range two"]).await?;
+
+    // Absent session: None, not an error, for both verbs.
+    let absent = fixtures::session_with_texts(&["never persisted"]);
+    steps.ensure(
+        STEP,
+        steps
+            .wrap(STEP, inc.load_canonical_head(absent.id()).await)?
+            .is_none(),
+        "load_canonical_head over an absent session must be None",
+    )?;
+    steps.ensure(
+        STEP,
+        steps
+            .wrap(STEP, inc.load_rewrite_commits(absent.id()).await)?
+            .is_empty(),
+        "load_rewrite_commits over an absent session must be empty",
+    )?;
+
+    // Unconditional: the commit view equals load_rewrites' commits (empty
+    // here — no rewrite yet).
+    ensure_commit_view_matches(steps, STEP, inc, session.id(), "fresh head-canonical").await?;
+
+    // Conditional: a store MAY answer None (the conservative default is
+    // legal and keeps every reader on the whole-load path). If it answers
+    // Some for this head-canonical session, the row must be the persisted
+    // head itself and its strand must page-serve exactly.
+    if let Some(canonical) = steps.wrap(STEP, inc.load_canonical_head(session.id()).await)? {
+        steps.ensure(
+            STEP,
+            canonical == head,
+            "an advertised canonical head must equal the saved head row",
+        )?;
+        let loaded_head = steps
+            .wrap(STEP, inc.load_head(session.id()).await)?
+            .ok_or_else(|| steps.fail(STEP, "head-canonical session must load_head"))?;
+        steps.ensure(
+            STEP,
+            canonical == loaded_head,
+            "for a head-canonical session the canonical head must equal load_head's row",
+        )?;
+
+        // Page-serving: ranges over the canonical head's strand serve
+        // exactly the slim transcript's rows.
+        let slim = steps
+            .wrap(STEP, store.load(session.id()).await)?
+            .ok_or_else(|| steps.fail(STEP, "head-canonical session must load"))?;
+        let count = canonical.message_count;
+        let all = steps.wrap(
+            STEP,
+            inc.load_messages(session.id(), &canonical.strand, 0..count)
+                .await,
+        )?;
+        steps.ensure(
+            STEP,
+            all.as_slice() == slim.messages(),
+            "the canonical head's strand must serve exactly the head-covered messages",
+        )?;
+        for start in 0..count {
+            for end in start..=count {
+                let page = steps.wrap(
+                    STEP,
+                    inc.load_messages(session.id(), &canonical.strand, start..end)
+                        .await,
+                )?;
+                let expected = &slim.messages()[usize::try_from(start)
+                    .map_err(|_| steps.fail(STEP, "message_count exceeds the address space"))?
+                    ..usize::try_from(end).map_err(|_| {
+                        steps.fail(STEP, "message_count exceeds the address space")
+                    })?];
+                steps.ensure(
+                    STEP,
+                    page.as_slice() == expected,
+                    format!(
+                        "canonical-strand range {start}..{end} must page-serve exactly the \
+                         corresponding slim rows"
+                    ),
+                )?;
+            }
+        }
+    }
+
+    // Rewrite lifecycle: the commit view tracks adoption exactly.
+    let mut rewritten = session.clone();
+    let commit = steps.wrap(
+        STEP,
+        rewritten.commit_transcript_rewrite(
+            TranscriptRewriteSelection::MessageRange { start: 0, end: 2 },
+            vec![Message::User(UserMessage::text(
+                "[conformance] range-read summary".to_string(),
+            ))],
+            TranscriptRewriteReason::new("conformance"),
+            Some("meerkat-store-conformance".to_string()),
+            None,
+        ),
+    )?;
+    let parent_body = steps
+        .wrap(
+            STEP,
+            rewritten.transcript_revision_body(&commit.parent_revision),
+        )?
+        .ok_or_else(|| steps.fail(STEP, "rewrite must retain the parent revision body"))?;
+    let revision_body = steps
+        .wrap(STEP, rewritten.transcript_revision_body(&commit.revision))?
+        .ok_or_else(|| steps.fail(STEP, "rewrite must retain the new revision body"))?;
+    let record = steps.wrap(
+        STEP,
+        TranscriptRewriteRecord::new(commit.clone(), parent_body, revision_body),
+    )?;
+    let next = steps.wrap(
+        STEP,
+        inc.commit_rewrite(
+            session.id(),
+            &record,
+            SessionHeadCas::IfToken(token.clone()),
+        )
+        .await,
+    )?;
+
+    // Recorded but NOT adopted: served by neither view.
+    steps.ensure(
+        STEP,
+        steps
+            .wrap(STEP, inc.load_rewrite_commits(session.id()).await)?
+            .is_empty(),
+        "recorded-but-unadopted commits must not be served by load_rewrite_commits",
+    )?;
+    ensure_commit_view_matches(steps, STEP, inc, session.id(), "recorded-but-unadopted").await?;
+
+    // Adopted: exactly the commit, and still equal to load_rewrites' view.
+    steps.wrap(
+        STEP,
+        inc.save_head(&next, SessionHeadCas::IfToken(token)).await,
+    )?;
+    let commits = steps.wrap(STEP, inc.load_rewrite_commits(session.id()).await)?;
+    steps.ensure(
+        STEP,
+        commits.len() == 1 && commits[0] == commit,
+        "the adopted commit must be served by load_rewrite_commits",
+    )?;
+    ensure_commit_view_matches(steps, STEP, inc, session.id(), "adopted").await?;
+
+    // If the store advertises canonical heads, the post-adoption head must
+    // be the adopted row and its strand must serve the rewritten transcript.
+    if let Some(canonical) = steps.wrap(STEP, inc.load_canonical_head(session.id()).await)? {
+        steps.ensure(
+            STEP,
+            canonical.rewrite_count == 1 && canonical.head_revision == commit.revision,
+            "the post-adoption canonical head must carry the adopted commit revision",
+        )?;
+        let page = steps.wrap(
+            STEP,
+            inc.load_messages(session.id(), &canonical.strand, 0..canonical.message_count)
+                .await,
+        )?;
+        steps.ensure(
+            STEP,
+            page.as_slice() == rewritten.messages(),
+            "the post-adoption canonical strand must serve exactly the rewritten transcript",
+        )?;
+    }
     Ok(())
 }
 

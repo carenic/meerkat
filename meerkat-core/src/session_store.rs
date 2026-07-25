@@ -2010,6 +2010,53 @@ pub trait IncrementalSessionStore: SessionStore {
         &self,
         id: &SessionId,
     ) -> Result<Vec<TranscriptRewriteRecord>, SessionStoreError>;
+
+    /// Head row ONLY when head+rows are the session's canonical durable
+    /// representation.
+    ///
+    /// Unlike [`load_head`], which may synthesize a deterministic head for a
+    /// legacy blob-only session (an O(document) blob parse), this must return
+    /// `None` for absent AND blob-only sessions and must never read the blob.
+    /// It is the capability probe for head-trusted range reads: `Some`
+    /// promises the returned row is the persisted head row itself and that
+    /// [`load_messages`] over `head.strand` serves exactly the rows the head
+    /// covers, without materializing the whole document.
+    ///
+    /// The conservative default returns `None`: a store that does not
+    /// override this simply never advertises the canonical head, keeping
+    /// every reader on the whole-load path (fallback, never refusal).
+    ///
+    /// [`load_head`]: IncrementalSessionStore::load_head
+    /// [`load_messages`]: IncrementalSessionStore::load_messages
+    async fn load_canonical_head(
+        &self,
+        id: &SessionId,
+    ) -> Result<Option<SessionHead>, SessionStoreError> {
+        let _ = id;
+        Ok(None)
+    }
+
+    /// Adopted rewrite COMMITS only (`idx < head.rewrite_count`), oldest
+    /// first, without materializing retained revision bodies.
+    ///
+    /// Must serve exactly the commits of [`load_rewrites`], in the same
+    /// order — including the empty set while a recorded rewrite is not yet
+    /// adopted. The default derives from `load_rewrites` (always correct,
+    /// but O(sum of retained bodies)); overriding stores read the small
+    /// commit rows directly.
+    ///
+    /// [`load_rewrites`]: IncrementalSessionStore::load_rewrites
+    async fn load_rewrite_commits(
+        &self,
+        id: &SessionId,
+    ) -> Result<Vec<TranscriptRewriteCommit>, SessionStoreError> {
+        Ok(self
+            .load_rewrites(id)
+            .await?
+            .into_iter()
+            .map(|record| record.commit)
+            .collect())
+    }
 }
 
 /// Plain-save guard for head-canonical rows where retained history lives
@@ -2470,6 +2517,196 @@ mod tests {
         AssistantBlock, BlockAssistantMessage, StopReason, SystemMessage, SystemNoticeBlock,
         SystemNoticeKind, SystemNoticeMessage, UserMessage,
     };
+
+    /// Minimal incremental store keeping every default-provided method on its
+    /// trait default: pins that the range-read capability verbs are
+    /// conservative (`load_canonical_head` never advertises a head;
+    /// `load_rewrite_commits` derives exactly from `load_rewrites`).
+    struct DefaultVerbIncrementalStore {
+        rewrites: Vec<TranscriptRewriteRecord>,
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl SessionStore for DefaultVerbIncrementalStore {
+        async fn save(&self, _session: &Session) -> Result<(), SessionStoreError> {
+            Err(SessionStoreError::Internal(
+                "not exercised by the default-verb pin".to_string(),
+            ))
+        }
+
+        async fn save_transcript_rewrite(
+            &self,
+            _session: &Session,
+            _commit: &TranscriptRewriteCommit,
+        ) -> Result<(), SessionStoreError> {
+            Err(SessionStoreError::Internal(
+                "not exercised by the default-verb pin".to_string(),
+            ))
+        }
+
+        async fn save_authoritative_projection(
+            &self,
+            _session: &Session,
+        ) -> Result<(), SessionStoreError> {
+            Err(SessionStoreError::Internal(
+                "not exercised by the default-verb pin".to_string(),
+            ))
+        }
+
+        async fn save_authoritative_projection_if_current_revision(
+            &self,
+            _session: &Session,
+            _expected_current_revision: Option<String>,
+        ) -> Result<(), SessionStoreError> {
+            Err(SessionStoreError::Internal(
+                "not exercised by the default-verb pin".to_string(),
+            ))
+        }
+
+        async fn load(&self, _id: &SessionId) -> Result<Option<Session>, SessionStoreError> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _filter: SessionFilter,
+        ) -> Result<Vec<SessionMeta>, SessionStoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn load_meta(
+            &self,
+            _id: &SessionId,
+        ) -> Result<Option<SessionMeta>, SessionStoreError> {
+            Ok(None)
+        }
+
+        async fn delete(&self, _id: &SessionId) -> Result<(), SessionStoreError> {
+            Err(SessionStoreError::Internal(
+                "not exercised by the default-verb pin".to_string(),
+            ))
+        }
+
+        async fn delete_if_current_revision(
+            &self,
+            _id: &SessionId,
+            _expected_current_revision: &str,
+        ) -> Result<bool, SessionStoreError> {
+            Err(SessionStoreError::Internal(
+                "not exercised by the default-verb pin".to_string(),
+            ))
+        }
+
+        async fn exists(&self, _id: &SessionId) -> Result<bool, SessionStoreError> {
+            Ok(false)
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl IncrementalSessionStore for DefaultVerbIncrementalStore {
+        async fn append_messages(
+            &self,
+            _id: &SessionId,
+            _strand: &TranscriptStrandId,
+            _base_seq: u64,
+            _messages: &[Message],
+        ) -> Result<(), SessionStoreError> {
+            Err(SessionStoreError::Internal(
+                "not exercised by the default-verb pin".to_string(),
+            ))
+        }
+
+        async fn commit_rewrite(
+            &self,
+            _id: &SessionId,
+            _record: &TranscriptRewriteRecord,
+            _expected: SessionHeadCas,
+        ) -> Result<SessionHead, SessionStoreError> {
+            Err(SessionStoreError::Internal(
+                "not exercised by the default-verb pin".to_string(),
+            ))
+        }
+
+        async fn save_head(
+            &self,
+            _head: &SessionHead,
+            _expected: SessionHeadCas,
+        ) -> Result<(), SessionStoreError> {
+            Err(SessionStoreError::Internal(
+                "not exercised by the default-verb pin".to_string(),
+            ))
+        }
+
+        async fn load_head(
+            &self,
+            _id: &SessionId,
+        ) -> Result<Option<SessionHead>, SessionStoreError> {
+            Ok(None)
+        }
+
+        async fn load_messages(
+            &self,
+            _id: &SessionId,
+            _strand: &TranscriptStrandId,
+            _range: std::ops::Range<u64>,
+        ) -> Result<Vec<Message>, SessionStoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn load_rewrites(
+            &self,
+            _id: &SessionId,
+        ) -> Result<Vec<TranscriptRewriteRecord>, SessionStoreError> {
+            Ok(self.rewrites.clone())
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn range_read_defaults_are_conservative() -> Result<(), Box<dyn std::error::Error>> {
+        // A store on the trait defaults never advertises a canonical head —
+        // every reader stays on the whole-load path.
+        let empty = DefaultVerbIncrementalStore {
+            rewrites: Vec::new(),
+        };
+        let id = SessionId::new();
+        assert!(empty.load_canonical_head(&id).await?.is_none());
+        assert!(empty.load_rewrite_commits(&id).await?.is_empty());
+
+        // The default commit view derives exactly from load_rewrites: same
+        // commits, same order.
+        let mut session = Session::new();
+        session.push(Message::User(UserMessage::text("seed".to_string())));
+        session.commit_transcript_rewrite(
+            crate::TranscriptRewriteSelection::MessageRange { start: 0, end: 1 },
+            vec![Message::User(UserMessage::text("rewritten".to_string()))],
+            crate::TranscriptRewriteReason::new("unit-test-edit"),
+            Some("unit-test".to_string()),
+            None,
+        )?;
+        let state = session
+            .transcript_history_state()?
+            .expect("rewrite mints history state");
+        let commit = state.commits[0].clone();
+        let parent_body = session
+            .transcript_revision_body(&commit.parent_revision)?
+            .expect("parent body retained");
+        let revision_body = session
+            .transcript_revision_body(&commit.revision)?
+            .expect("revision body retained");
+        let record = TranscriptRewriteRecord::new(commit.clone(), parent_body, revision_body)?;
+        let store = DefaultVerbIncrementalStore {
+            rewrites: vec![record],
+        };
+        assert_eq!(store.load_rewrite_commits(&id).await?, vec![commit]);
+        assert!(
+            store.load_canonical_head(&id).await?.is_none(),
+            "the conservative default must never advertise a canonical head"
+        );
+        Ok(())
+    }
 
     #[test]
     fn exact_snapshot_head_coherence_guard_rejects_live_transcript_forgery()
