@@ -893,6 +893,29 @@ pub(crate) fn record_content_digest_computation() {
     CONTENT_DIGEST_COMPUTATIONS.with(|count| count.set(count.get().saturating_add(1)));
 }
 
+thread_local! {
+    /// Per-thread count of BYTES canonicalized-and-hashed for session content
+    /// digests. The pass counter alone cannot see size-dependence: one
+    /// whole-graph canonical pass counts 1 at every transcript size, which is
+    /// exactly how a 211x release-timing regression once hid behind an
+    /// "equal counts" assertion. Structural regression tests assert byte
+    /// deltas are equal across transcript sizes.
+    static CONTENT_DIGEST_BYTES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// Per-thread count of bytes fed into session content-digest passes.
+/// Observability seam for structural size-independence regression tests
+/// only; not a public API.
+#[doc(hidden)]
+#[must_use]
+pub fn session_content_digest_bytes() -> u64 {
+    CONTENT_DIGEST_BYTES.with(Cell::get)
+}
+
+pub(crate) fn record_content_digest_bytes(bytes: u64) {
+    CONTENT_DIGEST_BYTES.with(|count| count.set(count.get().saturating_add(bytes)));
+}
+
 /// Identity under which one full stamp verification is memoized.
 ///
 /// The digest string alone cannot see an in-process content mutation that
@@ -1013,7 +1036,24 @@ pub(crate) fn record_checkpoint_stamp_verification(
 pub fn session_checkpoint_digest(
     session: &Session,
 ) -> Result<SessionCheckpointDigest, SessionCheckpointError> {
-    record_content_digest_computation();
+    let digest = session_checkpoint_digest_uncached(session)?;
+    // Computing this digest IS a complete canonical verification of this exact
+    // document, so record it under the same memo a successful stamp compare
+    // records. A stamp minted here and installed back-to-back on the same
+    // unmutated document then costs ONE canonical pass instead of two; a
+    // document that changed in between re-keys the memo (message count,
+    // metadata entry count, or `updated_at`) and pays the full recompute.
+    record_checkpoint_stamp_verification(session, &digest);
+    Ok(digest)
+}
+
+fn session_checkpoint_digest_uncached(
+    session: &Session,
+) -> Result<SessionCheckpointDigest, SessionCheckpointError> {
+    // No count here: every canonical pass this performs — the history-graph
+    // witness (when computed) and the document pass — is counted at the pass
+    // site, `canonical_value_digest`. Counting the caller too used to hide a
+    // whole-graph pass inside one recorded "computation".
     let history_digest = session_transcript_history_checkpoint_digest(session)?;
     let mut document = session.checkpoint_digest_document()?;
     if let Some(metadata) = document
@@ -1052,11 +1092,29 @@ pub fn session_transcript_history_checkpoint_digest(
         .cloned()
         .map(serde_json::from_value::<SessionCheckpointDigest>)
         .transpose()?;
-    let computed = session
-        .metadata()
-        .get(SESSION_TRANSCRIPT_HISTORY_STATE_KEY)
-        .map(session_checkpoint_history_digest)
-        .transpose()?;
+    let computed = match session.metadata().get(SESSION_TRANSCRIPT_HISTORY_STATE_KEY) {
+        // Deriving this canonicalizes and hashes every retained revision body.
+        // The session memoizes it for the exact graph value it currently
+        // carries, so the several derivations a single save boundary performs
+        // collapse to one; any write to the history key clears the memo.
+        Some(history) => match session.cached_transcript_history_witness() {
+            Some(cached) => Some(SessionCheckpointDigest(cached.to_string())),
+            None => {
+                // Incremental assembly first: cached canonical segments plus
+                // the retained sorted transcript stream reduce the derivation
+                // to one raw hash pass. Any structural surprise falls back to
+                // the full canonicalization below, which also remains the
+                // error-reporting path for malformed graphs.
+                let computed = match session.assemble_transcript_history_witness(history) {
+                    Some(assembled) => assembled,
+                    None => session_checkpoint_history_digest(history)?,
+                };
+                session.record_transcript_history_witness(computed.as_str());
+                Some(computed)
+            }
+        },
+        None => None,
+    };
     match (carried, computed) {
         (Some(carried), Some(computed)) if carried != computed => {
             Err(SessionCheckpointError::TranscriptHistoryWitnessMismatch { carried, computed })
@@ -1070,6 +1128,8 @@ pub fn session_transcript_history_checkpoint_digest(
 /// Exact byte digest of a legacy source BLOB used only as migration custody.
 #[must_use]
 pub fn legacy_session_source_blob_digest(source_blob: &[u8]) -> SessionCheckpointDigest {
+    record_content_digest_computation();
+    record_content_digest_bytes(source_blob.len() as u64);
     SessionCheckpointDigest(format!("sha256:{:x}", Sha256::digest(source_blob)))
 }
 
@@ -1078,6 +1138,30 @@ fn session_checkpoint_history_digest(
 ) -> Result<SessionCheckpointDigest, SessionCheckpointError> {
     let history = crate::session::canonicalize_checkpoint_history_value(history)?;
     canonical_value_digest(&history)
+}
+
+/// Full history-witness recompute that does NOT bump the digest budget
+/// counters. Reserved for the incremental-assembly cross-check: that
+/// recompute is verification scaffolding, not production work.
+pub(crate) fn session_checkpoint_history_digest_uncounted(
+    history: &serde_json::Value,
+) -> Result<SessionCheckpointDigest, SessionCheckpointError> {
+    let history = crate::session::canonicalize_checkpoint_history_value(history)?;
+    let mut canonical = Vec::new();
+    write_canonical_json(&history, &mut canonical)?;
+    Ok(SessionCheckpointDigest(format!(
+        "sha256:{:x}",
+        Sha256::digest(canonical)
+    )))
+}
+
+impl SessionCheckpointDigest {
+    /// Adopt a digest string minted by the incremental history-witness
+    /// assembly, which produces the exact `sha256:<64 hex>` spelling of
+    /// [`canonical_value_digest`] byte-for-byte.
+    pub(crate) fn from_assembled(digest: String) -> Self {
+        Self(digest)
+    }
 }
 
 /// Compute the storage-invariant witness for a reconstructed transcript
@@ -1094,6 +1178,12 @@ fn canonical_value_digest(
 ) -> Result<SessionCheckpointDigest, SessionCheckpointError> {
     let mut canonical = Vec::new();
     write_canonical_json(value, &mut canonical)?;
+    // Every call is one full canonical-JSON + SHA-256 pass over a whole
+    // document or graph value: this is THE pass the digest budget exists to
+    // observe. It went uncounted once and the budget reported zero while a
+    // whole-graph pass per boundary grew release timing 211x.
+    record_content_digest_computation();
+    record_content_digest_bytes(canonical.len() as u64);
     Ok(SessionCheckpointDigest(format!(
         "sha256:{:x}",
         Sha256::digest(canonical)
@@ -1106,7 +1196,7 @@ fn checkpoint_history_digest_marker(digest: &SessionCheckpointDigest) -> serde_j
     })
 }
 
-fn write_canonical_json(
+pub(crate) fn write_canonical_json(
     value: &serde_json::Value,
     output: &mut Vec<u8>,
 ) -> Result<(), serde_json::Error> {
@@ -2076,7 +2166,7 @@ mod tests {
     fn checkpoint_digest_erases_transcript_construction_timestamps() {
         let session = session_with_text("same semantic message");
         let mut reconstructed = session.clone();
-        let messages = std::sync::Arc::make_mut(&mut reconstructed.messages);
+        let messages = reconstructed.messages.mutate_in_place();
         let Some(Message::User(user)) = messages.first_mut() else {
             panic!("expected user message");
         };
@@ -2111,7 +2201,7 @@ mod tests {
         );
 
         let mut divergent = snapshot.clone();
-        std::sync::Arc::make_mut(&mut divergent.messages).clear();
+        divergent.messages.mutate_in_place().clear();
         divergent.push(Message::User(UserMessage::text(
             "a different turn one".to_string(),
         )));
@@ -2149,7 +2239,7 @@ mod tests {
         );
 
         let mut divergent = snapshot.clone();
-        std::sync::Arc::make_mut(&mut divergent.messages).clear();
+        divergent.messages.mutate_in_place().clear();
         divergent.push(Message::User(UserMessage::text(
             "a different turn one".to_string(),
         )));

@@ -8250,6 +8250,17 @@ impl MobActor {
         }
     }
 
+    /// HARD INVARIANT: every applied machine input must publish through this
+    /// function — both the direct apply seam
+    /// ([`Self::apply_dsl_input_collect_transition`]) and every
+    /// prepared-commit seam (`commit_prepared_dsl_input[_after]`,
+    /// `commit_prepared_dsl_transition[_after]`) call it unconditionally
+    /// after committing to the DSL authority. The event-driven reconcilers
+    /// (placed kickoff, placed completion, remote turn) treat watch wakes as
+    /// a superset of machine-derived work arrival and idle on a slow safety
+    /// tick between wakes; a mutation path that bypasses this publish
+    /// degrades their convergence latency to that safety interval. Any new
+    /// commit path must call this function after mutating `dsl_authority`.
     fn publish_machine_state_projection(&self) {
         self.dsl_topology_epoch.store(
             self.dsl_authority.state().topology_epoch,
@@ -8297,6 +8308,8 @@ impl MobActor {
             // the sole write seam for the dogma-#13 projection watch.
             let _ = self.phase_watch_tx.send(self.state());
         }
+        // Hard invariant (see publish_machine_state_projection): the direct
+        // apply seam publishes after EVERY applied input.
         self.publish_machine_state_projection();
         Ok(transition)
     }
@@ -8387,6 +8400,9 @@ impl MobActor {
         if phase_changed {
             let _ = self.phase_watch_tx.send(self.state());
         }
+        // Hard invariant (see publish_machine_state_projection): every
+        // prepared-commit seam — this one and its _after/_transition
+        // siblings below — publishes after every committed input.
         self.publish_machine_state_projection();
         Ok(())
     }

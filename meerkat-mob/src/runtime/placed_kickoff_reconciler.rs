@@ -204,6 +204,66 @@ fn resolved_host_cancel_can_close(
             == Some(&mob_dsl::PlacedKickoffOutcomeKind::Cancelled)
 }
 
+/// Which lane a Pending kickoff obligation is in, per the phase predicates
+/// evaluated over one published machine state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PendingKickoffLane {
+    /// Public cancellation committed: only the exact host-cancel replay may run.
+    HostCancel,
+    /// Origin (first-turn delivery) is still authorized.
+    Origin,
+    /// Neither lane is currently authorized (lifecycle fence or kickoff not
+    /// starting); custody is retained but this scan must not act on the row.
+    OriginFenced,
+}
+
+/// Small owned scan input projected under one machine-state watch borrow.
+///
+/// §12.3 compatibility contract: this projection returns owned work rows plus
+/// lane tags, never `&state`, never a full-state clone, and never a
+/// state-exposing closure, so it stays compatible with the durable-jobs
+/// execution-activity projection family expected to join it on `MobHandle`.
+pub(super) struct PlacedKickoffScanProjection {
+    pub(super) pending: Vec<(mob_dsl::PlacedKickoffObligation, PendingKickoffLane)>,
+    /// Resolved custody rows, each tagged with whether the structural
+    /// cancellation carrier authorizes controller-side closure.
+    pub(super) resolved: Vec<(mob_dsl::PlacedKickoffObligation, bool)>,
+}
+
+/// Pure projection over the actor-published machine state. Lane tags are
+/// computed with the same phase predicates the scan historically re-ran on a
+/// full-state clone, in the same precedence order (host-cancel supersedes
+/// origin; a fenced origin retains custody without acting).
+pub(super) fn project_placed_kickoff_scan(
+    state: &mob_dsl::MobMachineState,
+) -> PlacedKickoffScanProjection {
+    let pending = state
+        .pending_placed_kickoff_outcomes
+        .iter()
+        .map(|obligation| {
+            let lane = if kickoff_phase_requires_host_cancel(state, obligation) {
+                PendingKickoffLane::HostCancel
+            } else if kickoff_phase_allows_origin(state, obligation) {
+                PendingKickoffLane::Origin
+            } else {
+                PendingKickoffLane::OriginFenced
+            };
+            (obligation.clone(), lane)
+        })
+        .collect();
+    let resolved = state
+        .resolved_placed_kickoff_outcomes
+        .iter()
+        .map(|obligation| {
+            (
+                obligation.clone(),
+                resolved_host_cancel_can_close(state, obligation),
+            )
+        })
+        .collect();
+    PlacedKickoffScanProjection { pending, resolved }
+}
+
 /// One actor-lifetime adopter for durable placed kickoff custody.
 pub(crate) struct PlacedKickoffReconciler {
     mob_id: MobId,
@@ -231,19 +291,35 @@ impl PlacedKickoffReconciler {
 
     async fn run(self) {
         let actor_closed = self.handle.command_tx.clone();
-        let mut event_rx = self.handle.events.subscribe().ok();
+        // Wake source: the machine-state watch ONLY. Both work sets this scan
+        // adopts (pending/resolved kickoff outcomes) and every lane flip it
+        // consults (kickoff cancelled/starting, lifecycle fence) are pure
+        // MobMachineState, mutable only through DSL inputs, and the actor
+        // publishes the watch on EVERY applied input. The historical mob
+        // event subscription was a proxy wake the watch strictly dominates
+        // for machine-derived work (it fires even for transitions with no
+        // public event).
+        let mut machine_changes = Some(self.handle.machine_state_changes());
         let mut retry = BTreeMap::<mob_dsl::PlacedKickoffObligation, RetryState>::new();
         let mut dispositions =
             BTreeMap::<mob_dsl::PlacedKickoffObligation, DeliveryDisposition>::new();
         let mut row_cursor = BTreeMap::<mob_dsl::HostId, mob_dsl::PlacedKickoffObligation>::new();
         let mut host_cursor = 0usize;
         let mut next_scan_after = RECONCILE_SCAN_INTERVAL;
+        // Unconditional first scan: the watch does not fire for the value
+        // present at subscribe time, and custody recovered during resume
+        // exists at spawn with no subsequent publish.
+        let mut deadline =
+            super::ReconcileScanDeadline::first_scan(Instant::now(), RECONCILE_SCAN_INTERVAL);
 
         loop {
             tokio::select! {
                 () = actor_closed.closed() => break,
-                () = tokio::time::sleep(next_scan_after) => {},
-                () = wait_for_event(&mut event_rx) => {},
+                () = super::wait_for_machine_state_change(&mut machine_changes) => {
+                    deadline.pull_earlier(Instant::now(), RECONCILE_SCAN_INTERVAL);
+                    continue;
+                }
+                () = tokio::time::sleep(deadline.sleep_duration(Instant::now())) => {},
             }
             match self
                 .scan_once(
@@ -256,7 +332,10 @@ impl PlacedKickoffReconciler {
             {
                 Ok(summary) => {
                     next_scan_after = if summary.live == 0 {
-                        (next_scan_after * 2).min(RECONCILE_MAX_RETRY_DELAY)
+                        // Quiescent: the machine-state watch owns the wake
+                        // for any new custody row; the safety tick only
+                        // bounds drift from watch-invisible signals.
+                        super::RECONCILE_SAFETY_INTERVAL
                     } else {
                         summary
                             .next_retry_after
@@ -273,6 +352,7 @@ impl PlacedKickoffReconciler {
                     next_scan_after = (next_scan_after * 2).min(RECONCILE_MAX_RETRY_DELAY);
                 }
             }
+            deadline.rearm(Instant::now(), next_scan_after);
         }
     }
 
@@ -307,25 +387,46 @@ impl PlacedKickoffReconciler {
             fence_token: obligation.fence_token.0,
         };
         let identity = AgentIdentity::from(obligation.agent_identity.0.as_str());
-        let current_state = self.handle.machine_state_watch_rx.borrow().clone();
-        if !kickoff_phase_requires_host_cancel(&current_state, obligation) {
-            return Ok(None);
+        // Watch-borrow discipline: the guard stays inside this sync block and
+        // never crosses an await. Same predicates, same order as the
+        // historical full-state clone.
+        enum CancelGate {
+            NotRequired,
+            RouteStale,
+            MissingCancelCapability,
+            Proceed,
         }
-        if !exact_cancel_route_is_current(&current_state, obligation) {
-            return Err(MobError::Internal(format!(
-                "placed kickoff cancellation '{}' retains machine custody without its exact current route",
-                obligation.input_id.0
-            )));
-        }
-        if current_state
-            .host_tracked_input_cancel
-            .get(&obligation.host_id)
-            != Some(&true)
-        {
-            return Err(MobError::Internal(format!(
-                "placed autonomous kickoff '{}' entered durable custody without tracked_input_cancel host capability",
-                obligation.agent_identity.0
-            )));
+        let gate = {
+            let current_state = self.handle.machine_state_watch_rx.borrow();
+            if !kickoff_phase_requires_host_cancel(&current_state, obligation) {
+                CancelGate::NotRequired
+            } else if !exact_cancel_route_is_current(&current_state, obligation) {
+                CancelGate::RouteStale
+            } else if current_state
+                .host_tracked_input_cancel
+                .get(&obligation.host_id)
+                != Some(&true)
+            {
+                CancelGate::MissingCancelCapability
+            } else {
+                CancelGate::Proceed
+            }
+        };
+        match gate {
+            CancelGate::NotRequired => return Ok(None),
+            CancelGate::RouteStale => {
+                return Err(MobError::Internal(format!(
+                    "placed kickoff cancellation '{}' retains machine custody without its exact current route",
+                    obligation.input_id.0
+                )));
+            }
+            CancelGate::MissingCancelCapability => {
+                return Err(MobError::Internal(format!(
+                    "placed autonomous kickoff '{}' entered durable custody without tracked_input_cancel host capability",
+                    obligation.agent_identity.0
+                )));
+            }
+            CancelGate::Proceed => {}
         }
         let entry = self.handle.roster.read().await.get(&identity).cloned();
         let Some(entry) = entry else {
@@ -374,15 +475,38 @@ impl PlacedKickoffReconciler {
         &self,
         obligation: &mob_dsl::PlacedKickoffObligation,
     ) -> Result<PendingAttempt, MobError> {
-        let current_state = self.handle.machine_state_watch_rx.borrow().clone();
-        if !current_state
-            .pending_placed_kickoff_outcomes
-            .contains(obligation)
-        {
+        // Watch-borrow discipline: each re-check point below evaluates its
+        // gate under a sync borrow of the published state (guard never
+        // crosses an await). Same predicates, same order as the historical
+        // full-state clones.
+        enum PendingPhaseGate {
+            Gone,
+            HostCancel,
+            OriginFenced,
+            Origin { route_current: bool },
+        }
+        let gate = {
+            let current_state = self.handle.machine_state_watch_rx.borrow();
+            if !current_state
+                .pending_placed_kickoff_outcomes
+                .contains(obligation)
+            {
+                PendingPhaseGate::Gone
+            } else if kickoff_phase_requires_host_cancel(&current_state, obligation) {
+                PendingPhaseGate::HostCancel
+            } else if !kickoff_phase_allows_origin(&current_state, obligation) {
+                PendingPhaseGate::OriginFenced
+            } else {
+                PendingPhaseGate::Origin {
+                    route_current: exact_route_is_current(&current_state, obligation),
+                }
+            }
+        };
+        if matches!(gate, PendingPhaseGate::Gone) {
             return Ok(PendingAttempt::NoChange);
         }
 
-        if kickoff_phase_requires_host_cancel(&current_state, obligation) {
+        if matches!(gate, PendingPhaseGate::HostCancel) {
             let Some(response) = self.cancel_pending_obligation(obligation).await? else {
                 return Ok(PendingAttempt::NoChange);
             };
@@ -414,14 +538,17 @@ impl PlacedKickoffReconciler {
             return Ok(PendingAttempt::NoChange);
         }
 
-        if !kickoff_phase_allows_origin(&current_state, obligation) {
-            return Ok(PendingAttempt::NoChange);
-        }
-        if !exact_route_is_current(&current_state, obligation) {
-            return Err(MobError::Internal(format!(
-                "placed kickoff origin '{}' retains machine custody without its exact current route",
-                obligation.input_id.0
-            )));
+        match gate {
+            PendingPhaseGate::OriginFenced => return Ok(PendingAttempt::NoChange),
+            PendingPhaseGate::Origin {
+                route_current: false,
+            } => {
+                return Err(MobError::Internal(format!(
+                    "placed kickoff origin '{}' retains machine custody without its exact current route",
+                    obligation.input_id.0
+                )));
+            }
+            _ => {}
         }
 
         let carrier = self
@@ -478,15 +605,20 @@ impl PlacedKickoffReconciler {
             fence_token: obligation.fence_token.0,
         };
         let identity = AgentIdentity::from(obligation.agent_identity.0.as_str());
-        let current_state = self.handle.machine_state_watch_rx.borrow().clone();
-        if !current_state
-            .pending_placed_kickoff_outcomes
-            .contains(obligation)
-            || !kickoff_phase_allows_origin(&current_state, obligation)
-        {
+        let (origin_still_open, route_current) = {
+            let current_state = self.handle.machine_state_watch_rx.borrow();
+            (
+                current_state
+                    .pending_placed_kickoff_outcomes
+                    .contains(obligation)
+                    && kickoff_phase_allows_origin(&current_state, obligation),
+                exact_route_is_current(&current_state, obligation),
+            )
+        };
+        if !origin_still_open {
             return Ok(PendingAttempt::NoChange);
         }
-        if !exact_route_is_current(&current_state, obligation) {
+        if !route_current {
             return Err(MobError::Internal(format!(
                 "placed kickoff origin '{}' retained custody but lost its exact route before roster resolution",
                 obligation.input_id.0
@@ -537,15 +669,20 @@ impl PlacedKickoffReconciler {
         // or returns terminal truth, while cancel-first makes this delayed
         // delivery a no-effect replay. No controller-wide lock spans network
         // I/O, so a blackholed host cannot close another host's lane.
-        let current_state = self.handle.machine_state_watch_rx.borrow().clone();
-        if !current_state
-            .pending_placed_kickoff_outcomes
-            .contains(obligation)
-            || !kickoff_phase_allows_origin(&current_state, obligation)
-        {
+        let (origin_still_open, route_current) = {
+            let current_state = self.handle.machine_state_watch_rx.borrow();
+            (
+                current_state
+                    .pending_placed_kickoff_outcomes
+                    .contains(obligation)
+                    && kickoff_phase_allows_origin(&current_state, obligation),
+                exact_route_is_current(&current_state, obligation),
+            )
+        };
+        if !origin_still_open {
             return Ok(PendingAttempt::NoChange);
         }
-        if !exact_route_is_current(&current_state, obligation) {
+        if !route_current {
             return Err(MobError::Internal(format!(
                 "placed kickoff origin '{}' retained custody but lost its exact route before delivery",
                 obligation.input_id.0
@@ -593,30 +730,28 @@ impl PlacedKickoffReconciler {
         row_cursor: &mut BTreeMap<mob_dsl::HostId, mob_dsl::PlacedKickoffObligation>,
         host_cursor: &mut usize,
     ) -> Result<ScanSummary, MobError> {
-        let state = self.handle.machine_state_watch_rx.borrow().clone();
-        let pending = state
-            .pending_placed_kickoff_outcomes
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let resolved = state
-            .resolved_placed_kickoff_outcomes
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
+        // One borrow-scoped projection instead of cloning the whole
+        // (potentially restore-scale) machine state per scan. Lane tags carry
+        // the phase-predicate answers computed under that single borrow.
+        let PlacedKickoffScanProjection { pending, resolved } = self
+            .handle
+            .project_placed_kickoff_scan_from_current_machine_state();
         let live = pending
             .iter()
-            .chain(&resolved)
-            .cloned()
+            .map(|(obligation, _)| obligation.clone())
+            .chain(resolved.iter().map(|(obligation, _)| obligation.clone()))
             .collect::<BTreeSet<_>>();
-        let pending_set = pending.iter().cloned().collect::<BTreeSet<_>>();
+        let pending_set = pending
+            .iter()
+            .map(|(obligation, _)| obligation.clone())
+            .collect::<BTreeSet<_>>();
         retry.retain(|obligation, _| pending_set.contains(obligation));
         dispositions.retain(|obligation, _| pending_set.contains(obligation));
 
         // Resolved custody still needs the member pump: it carries the ACK on
         // the next poll and only a confirmed host response may close custody.
-        for obligation in &resolved {
-            if resolved_host_cancel_can_close(&state, obligation) {
+        for (obligation, cancel_can_close) in &resolved {
+            if *cancel_can_close {
                 // `Cancelled` outcome kind is minted only from the exact,
                 // replay-stable CancelTrackedMemberInput host receipt. Unlike
                 // a turn terminal row, its durable host tombstone has no poll
@@ -656,7 +791,7 @@ impl PlacedKickoffReconciler {
         }
 
         let mut by_host = BTreeMap::<mob_dsl::HostId, Vec<mob_dsl::PlacedKickoffObligation>>::new();
-        for obligation in pending {
+        for (obligation, lane) in pending {
             let identity = AgentIdentity::from(obligation.agent_identity.0.as_str());
             if let Err(error) = self.handle.ensure_pump_for_obligation(&identity).await {
                 tracing::debug!(
@@ -667,7 +802,7 @@ impl PlacedKickoffReconciler {
                 );
             }
 
-            if kickoff_phase_requires_host_cancel(&state, &obligation) {
+            if lane == PendingKickoffLane::HostCancel {
                 retry.entry(obligation.clone()).or_default();
                 // Public cancellation permanently switches this obligation to
                 // the host-cancel lane. It must never fall through to the
@@ -698,7 +833,7 @@ impl PlacedKickoffReconciler {
             // retaining Pending custody: a delivery may already have been
             // admitted and its host sidecar must still be drained, but an
             // unsent kickoff must never begin after cancellation.
-            if !kickoff_phase_allows_origin(&state, &obligation) {
+            if lane == PendingKickoffLane::OriginFenced {
                 retry.remove(&obligation);
                 continue;
             }
@@ -807,16 +942,6 @@ impl PlacedKickoffReconciler {
     }
 }
 
-async fn wait_for_event(event_rx: &mut Option<crate::store::MobEventReceiver>) {
-    match event_rx {
-        Some(receiver) => match receiver.recv().await {
-            Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => *event_rx = None,
-        },
-        None => std::future::pending::<()>().await,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -824,6 +949,62 @@ mod tests {
     #[test]
     fn cleanup_host_window_is_bounded() {
         assert_eq!(MAX_CONCURRENT_HOSTS, 8);
+    }
+
+    #[test]
+    fn scan_projection_lane_tags_match_the_phase_predicates() {
+        let identity = mob_dsl::AgentIdentity("placed-worker".to_string());
+        let obligation = mob_dsl::PlacedKickoffObligation {
+            agent_identity: identity.clone(),
+            ..Default::default()
+        };
+        let mut state = mob_dsl::MobMachineState::default();
+        state.member_kickoff_starting.insert(identity.clone());
+        state
+            .pending_placed_kickoff_outcomes
+            .insert(obligation.clone());
+        let projection = project_placed_kickoff_scan(&state);
+        assert_eq!(
+            projection.pending,
+            vec![(obligation.clone(), PendingKickoffLane::Origin)]
+        );
+        assert!(projection.resolved.is_empty());
+
+        // The lifecycle intent fences origin without erasing custody.
+        state.placed_completion_lifecycle_quiescing = true;
+        state.placed_completion_lifecycle_intent =
+            Some(mob_dsl::PlacedCompletionLifecycleIntentKind::Stop);
+        let projection = project_placed_kickoff_scan(&state);
+        assert_eq!(
+            projection.pending,
+            vec![(obligation.clone(), PendingKickoffLane::OriginFenced)]
+        );
+        state.placed_completion_lifecycle_quiescing = false;
+        state.placed_completion_lifecycle_intent = None;
+
+        // Public cancellation supersedes origin: the host-cancel lane wins
+        // even while the fence predicates would also close origin.
+        state.member_kickoff_starting.remove(&identity);
+        state.member_kickoff_cancelled.insert(identity.clone());
+        let projection = project_placed_kickoff_scan(&state);
+        assert_eq!(
+            projection.pending,
+            vec![(obligation.clone(), PendingKickoffLane::HostCancel)]
+        );
+
+        // Resolved custody carries the structural-closure answer.
+        state.pending_placed_kickoff_outcomes.remove(&obligation);
+        state
+            .resolved_placed_kickoff_outcomes
+            .insert(obligation.clone());
+        let projection = project_placed_kickoff_scan(&state);
+        assert!(projection.pending.is_empty());
+        assert_eq!(projection.resolved, vec![(obligation.clone(), false)]);
+        state
+            .member_placed_kickoff_outcome_kinds
+            .insert(identity, mob_dsl::PlacedKickoffOutcomeKind::Cancelled);
+        let projection = project_placed_kickoff_scan(&state);
+        assert_eq!(projection.resolved, vec![(obligation, true)]);
     }
 
     #[test]

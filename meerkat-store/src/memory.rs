@@ -3,9 +3,10 @@
 use crate::{SessionFilter, SessionStore, SessionStoreError};
 use async_trait::async_trait;
 use meerkat_core::session_store::{
-    IncrementalSessionStore, SessionHead, SessionHeadCas, head_canonical_plain_save_guard,
-    reconstruct_rewrite_record, session_head_cas_token, strand_layout_for_history,
-    validate_commit_rewrite_transition, validate_save_head_transition,
+    IncrementalSessionStore, SaveGuardWitness, SessionHead, SessionHeadCas,
+    head_canonical_plain_save_guard_with_witness, reconstruct_rewrite_record,
+    session_head_cas_token, strand_layout_for_history, validate_commit_rewrite_transition,
+    validate_save_head_transition,
 };
 use meerkat_core::transcript_messages_digest;
 use meerkat_core::types::Message;
@@ -367,7 +368,12 @@ impl SessionStore for MemoryStore {
         if let Some((head, _token)) = state.heads.get(session.id()).cloned() {
             let adopted = state.adopted_commits(session.id(), head.rewrite_count);
             let previous = state.materialize_slim(&head)?;
-            head_canonical_plain_save_guard(session, &previous, &adopted)?;
+            head_canonical_plain_save_guard_with_witness(
+                session,
+                &previous,
+                &adopted,
+                SaveGuardWitness::none().with_previous_revision(&head.head_revision),
+            )?;
             return state.write_head_canonical_session(session, &head);
         }
         // F1 closure (wave-c C-H1): same shrink-guard as persistent
@@ -387,8 +393,9 @@ impl SessionStore for MemoryStore {
         let mut state = self.state.write().await;
         state.stats.whole_blob_saves += 1;
         if let Some(stored) = state.heads.get(session.id()).cloned() {
-            let incoming_revision =
-                transcript_messages_digest(session.messages()).map_err(SessionStoreError::from)?;
+            let incoming_revision = session
+                .transcript_content_digest()
+                .map_err(SessionStoreError::from)?;
             if incoming_revision != commit.revision {
                 return Err(SessionStoreError::InvalidTranscriptRewrite {
                     id: session.id().clone(),
@@ -721,6 +728,46 @@ impl IncrementalSessionStore for MemoryStore {
             })
             .collect()
     }
+
+    async fn load_canonical_head(
+        &self,
+        id: &SessionId,
+    ) -> Result<Option<SessionHead>, SessionStoreError> {
+        // Head row ONLY: unlike `load_head`, a blob-only session gets `None`
+        // rather than a synthesized head (no blob layout at all).
+        let state = self.state.read().await;
+        Ok(state.heads.get(id).map(|(head, _token)| head.clone()))
+    }
+
+    async fn load_rewrite_commits(
+        &self,
+        id: &SessionId,
+    ) -> Result<Vec<TranscriptRewriteCommit>, SessionStoreError> {
+        let state = self.state.read().await;
+        if let Some((head, _token)) = state.heads.get(id) {
+            // Adopted commit rows only; no strand-body reads.
+            let adopted = usize::try_from(head.rewrite_count)
+                .map_err(|_| SessionStoreError::Corrupted(id.clone()))?;
+            let rows = state.rewrites.get(id).map(Vec::as_slice).unwrap_or(&[]);
+            return Ok(rows
+                .iter()
+                .take(adopted)
+                .map(|row| row.commit.clone())
+                .collect());
+        }
+        // Blob-only session: derive the commits from the blob's layout so the
+        // answer always equals `load_rewrites`' commits (never served by the
+        // fast read path — `load_canonical_head` is `None`).
+        let Some(session) = state.sessions.get(id) else {
+            return Ok(Vec::new());
+        };
+        let (layout, _head) = layout_for_blob_session(session)?;
+        Ok(layout
+            .rewrites
+            .into_iter()
+            .map(|rewrite| rewrite.commit)
+            .collect())
+    }
 }
 
 #[cfg(test)]
@@ -728,6 +775,126 @@ impl IncrementalSessionStore for MemoryStore {
 mod tests {
     use super::*;
     use meerkat_core::{Message, TranscriptRewriteReason, TranscriptRewriteSelection, UserMessage};
+
+    #[tokio::test]
+    async fn canonical_head_is_row_only_and_rewrite_commits_match_load_rewrites() {
+        let store = Arc::new(MemoryStore::new());
+
+        // Blob-only session: plain save keeps the legacy blob entry; no head.
+        let mut blob_session = Session::new();
+        blob_session.push(Message::User(UserMessage::text("blob one".to_string())));
+        store.save(&blob_session).await.unwrap();
+        let inc = Arc::clone(&store)
+            .as_incremental()
+            .expect("memory store must expose the incremental capability");
+        // `load_head` still synthesizes (compat contract, unchanged)...
+        assert!(inc.load_head(blob_session.id()).await.unwrap().is_some());
+        // ...but the canonical probe answers None without synthesizing.
+        assert!(
+            inc.load_canonical_head(blob_session.id())
+                .await
+                .unwrap()
+                .is_none(),
+            "a blob-only session has no canonical head row"
+        );
+        // Absent session: None, not an error.
+        assert!(
+            inc.load_canonical_head(&SessionId::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        // Head-canonical session through the incremental write path.
+        let mut session = Session::new();
+        session.push(Message::User(UserMessage::text("one".to_string())));
+        session.push(Message::User(UserMessage::text("two".to_string())));
+        let root = TranscriptStrandId::root();
+        inc.append_messages(session.id(), &root, 0, session.messages())
+            .await
+            .unwrap();
+        let head = SessionHead::from_session(&session, root, 0).unwrap();
+        inc.save_head(&head, SessionHeadCas::Create).await.unwrap();
+        let canonical = inc
+            .load_canonical_head(session.id())
+            .await
+            .unwrap()
+            .expect("head-canonical session must advertise its head row");
+        assert_eq!(canonical, head);
+        assert_eq!(Some(canonical), inc.load_head(session.id()).await.unwrap());
+
+        // Rewrite commit view: empty while recorded-but-unadopted, then
+        // exactly load_rewrites' commits after adoption.
+        assert!(
+            inc.load_rewrite_commits(session.id())
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let commit = session
+            .commit_transcript_rewrite(
+                TranscriptRewriteSelection::MessageRange { start: 0, end: 2 },
+                vec![Message::User(UserMessage::text(
+                    "[compacted] summary".to_string(),
+                ))],
+                TranscriptRewriteReason::new("compaction"),
+                Some("test".to_string()),
+                None,
+            )
+            .unwrap();
+        let parent_body = session
+            .transcript_revision_body(&commit.parent_revision)
+            .unwrap()
+            .unwrap();
+        let revision_body = session
+            .transcript_revision_body(&commit.revision)
+            .unwrap()
+            .unwrap();
+        let record =
+            TranscriptRewriteRecord::new(commit.clone(), parent_body, revision_body).unwrap();
+        let token = meerkat_core::session_store::session_head_cas_token(&head).unwrap();
+        let next = inc
+            .commit_rewrite(
+                session.id(),
+                &record,
+                SessionHeadCas::IfToken(token.clone()),
+            )
+            .await
+            .unwrap();
+        assert!(
+            inc.load_rewrite_commits(session.id())
+                .await
+                .unwrap()
+                .is_empty(),
+            "recorded-but-unadopted commits must not be served"
+        );
+        inc.save_head(&next, SessionHeadCas::IfToken(token))
+            .await
+            .unwrap();
+        let commits = inc.load_rewrite_commits(session.id()).await.unwrap();
+        assert_eq!(commits, vec![commit]);
+        assert_eq!(
+            commits,
+            inc.load_rewrites(session.id())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|record| record.commit)
+                .collect::<Vec<_>>()
+        );
+
+        // Blob-only parity: the commit view equals load_rewrites' commits for
+        // a blob-only session too (both derived from the frozen blob layout).
+        assert_eq!(
+            inc.load_rewrite_commits(blob_session.id()).await.unwrap(),
+            inc.load_rewrites(blob_session.id())
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|record| record.commit)
+                .collect::<Vec<_>>()
+        );
+    }
 
     #[tokio::test]
     async fn test_memory_store_roundtrip() -> Result<(), Box<dyn std::error::Error>> {

@@ -32,7 +32,7 @@ const BETA_INTERLEAVED_THINKING: BetaHeader = BetaHeader {
 };
 
 /// Headers advertised for models with adaptive thinking + compaction
-/// (Fable 5, Opus 4.8, Opus 4.7, Sonnet 4.6).
+/// (Opus 5, Fable 5, Opus 4.8, Opus 4.7, Sonnet 4.6).
 const ADAPTIVE_COMPACTION_BETAS: &[BetaHeader] = &[
     BETA_COMPACTION,
     BETA_STRUCTURED_OUTPUT,
@@ -52,9 +52,9 @@ const BETA_OUTPUT_300K: BetaValue<u32> = BetaValue {
 
 // ── Effort tiers ──────────────────────────────────────────────────────────
 
-/// Effort tiers accepted by Fable 5, Opus 4.8, and Opus 4.7; `xhigh` sits
-/// between `high` and `max`.
-const FABLE_5_OPUS_48_47_EFFORT: &[EffortLevel] = &[
+/// Effort tiers accepted by the Claude 5 family (Opus 5, Fable 5) and
+/// Opus 4.8/4.7; `xhigh` sits between `high` and `max`.
+const CLAUDE_5_OPUS_48_47_EFFORT: &[EffortLevel] = &[
     EffortLevel::Low,
     EffortLevel::Medium,
     EffortLevel::High,
@@ -145,7 +145,55 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_k: false,
         thinking: ThinkingSupport::AnthropicAdaptiveOnly,
         supports_reasoning: false,
-        effort_levels: FABLE_5_OPUS_48_47_EFFORT,
+        effort_levels: CLAUDE_5_OPUS_48_47_EFFORT,
+        openai_responses_params: None,
+        supports_web_search: true,
+        supports_inference_geo: true,
+        supports_compaction: true,
+        supports_structured_output: true,
+        supports_legacy_penalties: false,
+        supports_thinking_budget_legacy: false,
+        beta_headers: ADAPTIVE_COMPACTION_BETAS,
+        call_timeout_secs: Some(300),
+    },
+    // Claude Opus 5
+    //
+    // Claude 5 family sibling of Fable 5 (API ID claude-opus-5, announced
+    // alongside Fable 5/Mythos 5:
+    // https://www.anthropic.com/news/claude-fable-5-mythos-5). The row
+    // mirrors claude-fable-5 — same generation, same request surface: 1M
+    // context, 128k max output, vision, adaptive-only thinking, the full
+    // low..max effort ladder, compaction + structured outputs + web search,
+    // sampling parameters removed, budget_tokens removed. Like Fable 5 it is
+    // not listed in the output-300k-2026-03-24 batch-beta note, hence no
+    // extended-output beta. Meerkat-owned operational default: Opus-tier
+    // 300s call timeout.
+    ModelCapabilities {
+        id: "claude-opus-5",
+        provider: Provider::Anthropic,
+        display_name: "Claude Opus 5",
+        tier: ModelTier::Recommended,
+        model_family: "claude-opus-5",
+        context_window: 1_000_000,
+        max_output_tokens: 128_000,
+        context_window_beta: None,
+        max_output_tokens_beta: None,
+        vision: true,
+        image_tool_results: true,
+        inline_video: false,
+        realtime: false,
+        realtime_supports_provider_managed_turns: false,
+        realtime_supports_explicit_commit: false,
+        realtime_interrupt_supported: false,
+        realtime_transcript_supported: false,
+        transcription_companion_model: None,
+        image_generation: false,
+        supports_temperature: false,
+        supports_top_p: false,
+        supports_top_k: false,
+        thinking: ThinkingSupport::AnthropicAdaptiveOnly,
+        supports_reasoning: false,
+        effort_levels: CLAUDE_5_OPUS_48_47_EFFORT,
         openai_responses_params: None,
         supports_web_search: true,
         supports_inference_geo: true,
@@ -200,7 +248,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_k: false,
         thinking: ThinkingSupport::AnthropicAdaptiveOnly,
         supports_reasoning: false,
-        effort_levels: FABLE_5_OPUS_48_47_EFFORT,
+        effort_levels: CLAUDE_5_OPUS_48_47_EFFORT,
         openai_responses_params: None,
         supports_web_search: true,
         supports_inference_geo: true,
@@ -254,7 +302,7 @@ pub const CAPABILITIES: &[ModelCapabilities] = &[
         supports_top_k: false,
         thinking: ThinkingSupport::AnthropicAdaptiveOnly,
         supports_reasoning: false,
-        effort_levels: FABLE_5_OPUS_48_47_EFFORT,
+        effort_levels: CLAUDE_5_OPUS_48_47_EFFORT,
         openai_responses_params: None,
         supports_web_search: true,
         supports_inference_geo: true,

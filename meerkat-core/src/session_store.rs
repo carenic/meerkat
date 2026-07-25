@@ -157,9 +157,78 @@ fn record_slim_materialization_verified(id: &SessionId, revision: &str, count: u
     memo.push_back((id.to_string(), revision.to_string(), count));
 }
 
+/// Transcript digests a caller has already proved, handed to a save guard so
+/// it does not recompute them.
+///
+/// Trust model: a witness carries exactly the same authority as
+/// [`SessionHead::head_revision`] — caller-attested, audited at the next
+/// `commit_rewrite`, and verified fail-closed on every
+/// [`SessionHead::into_session`]. Supply one only for a digest you hold
+/// durable evidence for (a persisted `head_revision` for the row you loaded,
+/// or a digest this process just computed over that exact message vector).
+/// Every field is optional and absent fields are computed exactly as before,
+/// so `SaveGuardWitness::none()` reproduces the unwitnessed guard verdict.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SaveGuardWitness<'a> {
+    previous_revision: Option<&'a str>,
+    incoming_revision: Option<&'a str>,
+}
+
+impl<'a> SaveGuardWitness<'a> {
+    /// No caller-proved digests: the guard computes everything itself.
+    #[must_use]
+    pub fn none() -> Self {
+        Self::default()
+    }
+
+    /// Record the proved transcript digest of the previously persisted row.
+    #[must_use]
+    pub fn with_previous_revision(mut self, revision: &'a str) -> Self {
+        self.previous_revision = Some(revision);
+        self
+    }
+
+    /// Record the proved transcript digest of the incoming document.
+    #[must_use]
+    pub fn with_incoming_revision(mut self, revision: &'a str) -> Self {
+        self.incoming_revision = Some(revision);
+        self
+    }
+}
+
+/// Resolve a transcript digest witness-first, then from the session's own
+/// incremental accumulator, then by full recompute.
+///
+/// All three produce the identical format-2 string; only the cost differs.
+fn resolve_transcript_revision(
+    session: &Session,
+    witness: Option<&str>,
+) -> Result<String, SessionStoreError> {
+    if let Some(revision) = witness {
+        return Ok(revision.to_string());
+    }
+    session
+        .transcript_content_digest()
+        .map_err(SessionStoreError::from)
+}
+
 pub fn append_only_save_guard(
     incoming: &Session,
     previous: Option<&Session>,
+) -> Result<(), SessionStoreError> {
+    append_only_save_guard_with_witness(incoming, previous, SaveGuardWitness::none())
+}
+
+/// [`append_only_save_guard`] with caller-proved transcript digests.
+///
+/// Same accept/reject boundary, same errors, same messages — the witness only
+/// removes recomputation. Store mirrors that already hold the persisted
+/// `head_revision` for `previous` use this to keep a plain save off the
+/// O(document) path entirely.
+pub fn append_only_save_guard_with_witness(
+    incoming: &Session,
+    previous: Option<&Session>,
+    witness: SaveGuardWitness<'_>,
 ) -> Result<(), SessionStoreError> {
     incoming
         .validate_transcript_history_state()
@@ -167,15 +236,14 @@ pub fn append_only_save_guard(
             id: incoming.id().clone(),
             reason: format!("incoming transcript history state is malformed: {err}"),
         })?;
-    let incoming_revision =
-        transcript_messages_digest(incoming.messages()).map_err(SessionStoreError::from)?;
-    let incoming_state = incoming.transcript_history_state().map_err(|err| {
+    let incoming_revision = resolve_transcript_revision(incoming, witness.incoming_revision)?;
+    let incoming_state = incoming.transcript_history_state_shared().map_err(|err| {
         SessionStoreError::InvalidTranscriptRewrite {
             id: incoming.id().clone(),
             reason: format!("incoming transcript history state is malformed: {err}"),
         }
     })?;
-    if let Some(state) = incoming_state.as_ref()
+    if let Some(state) = incoming_state.as_deref()
         && state.head != incoming_revision
     {
         return Err(SessionStoreError::InvalidTranscriptRewrite {
@@ -199,11 +267,13 @@ pub fn append_only_save_guard(
             incoming,
             None,
             None,
-            incoming_state.as_ref(),
+            incoming_state.as_deref(),
+            &incoming_revision,
+            None,
         )?;
         return Ok(());
     };
-    let previous_state = previous.transcript_history_state().map_err(|err| {
+    let previous_state = previous.transcript_history_state_shared().map_err(|err| {
         SessionStoreError::InvalidTranscriptRewrite {
             id: incoming.id().clone(),
             reason: format!("previous transcript history state is malformed: {err}"),
@@ -217,14 +287,15 @@ pub fn append_only_save_guard(
             reason: "incoming save would erase retained transcript history state".to_string(),
         });
     }
-    let previous_revision =
-        transcript_messages_digest(previous.messages()).map_err(SessionStoreError::from)?;
+    let previous_revision = resolve_transcript_revision(previous, witness.previous_revision)?;
     if previous_revision == incoming_revision {
         validate_plain_save_transcript_history_preservation(
             incoming,
             Some(previous),
-            previous_state.as_ref(),
-            incoming_state.as_ref(),
+            previous_state.as_deref(),
+            incoming_state.as_deref(),
+            &incoming_revision,
+            Some(&previous_revision),
         )?;
         return Ok(());
     }
@@ -232,14 +303,17 @@ pub fn append_only_save_guard(
     let prev_len = previous.messages().len();
     let new_len = incoming.messages().len();
     if new_len >= prev_len {
-        let incoming_prefix_revision = transcript_messages_digest(&incoming.messages()[..prev_len])
+        let incoming_prefix_revision = incoming
+            .transcript_prefix_digest(prev_len)
             .map_err(SessionStoreError::from)?;
         if incoming_prefix_revision == previous_revision {
             validate_plain_save_transcript_history_preservation(
                 incoming,
                 Some(previous),
-                previous_state.as_ref(),
-                incoming_state.as_ref(),
+                previous_state.as_deref(),
+                incoming_state.as_deref(),
+                &incoming_revision,
+                Some(&previous_revision),
             )?;
             return Ok(());
         }
@@ -248,8 +322,10 @@ pub fn append_only_save_guard(
         validate_plain_save_transcript_history_preservation(
             incoming,
             Some(previous),
-            previous_state.as_ref(),
-            incoming_state.as_ref(),
+            previous_state.as_deref(),
+            incoming_state.as_deref(),
+            &incoming_revision,
+            Some(&previous_revision),
         )?;
         return Ok(());
     }
@@ -257,8 +333,10 @@ pub fn append_only_save_guard(
         validate_plain_save_transcript_history_preservation(
             incoming,
             Some(previous),
-            previous_state.as_ref(),
-            incoming_state.as_ref(),
+            previous_state.as_deref(),
+            incoming_state.as_deref(),
+            &incoming_revision,
+            Some(&previous_revision),
         )?;
         return Ok(());
     }
@@ -278,11 +356,17 @@ pub fn append_only_save_guard(
     })
 }
 
+/// `incoming_revision` / `previous_revision` are the digests the calling guard
+/// already resolved for these exact documents. They are pass-through
+/// parameters, not new evidence: this validator used to recompute both, which
+/// doubled every plain save's transcript hashing for no additional proof.
 fn validate_plain_save_transcript_history_preservation(
     incoming: &Session,
     previous: Option<&Session>,
     previous_state: Option<&TranscriptHistoryState>,
     incoming_state: Option<&TranscriptHistoryState>,
+    incoming_revision: &str,
+    previous_revision: Option<&str>,
 ) -> Result<(), SessionStoreError> {
     let Some(previous) = previous else {
         if incoming_state.is_some() {
@@ -326,10 +410,12 @@ fn validate_plain_save_transcript_history_preservation(
             id: incoming.id().clone(),
             reason: format!("incoming transcript history state is malformed: {err}"),
         })?;
-    let incoming_revision =
-        transcript_messages_digest(incoming.messages()).map_err(SessionStoreError::from)?;
-    let previous_revision =
-        transcript_messages_digest(previous.messages()).map_err(SessionStoreError::from)?;
+    let previous_revision = match previous_revision {
+        Some(previous_revision) => previous_revision.to_string(),
+        None => previous
+            .transcript_content_digest()
+            .map_err(SessionStoreError::from)?,
+    };
     if previous_state.head != previous_revision {
         return Err(SessionStoreError::InvalidTranscriptRewrite {
             id: incoming.id().clone(),
@@ -393,10 +479,7 @@ fn validate_audited_revision_bodies_preserved(
             })?;
         if previous_body.parent_revision != incoming_body.parent_revision
             || previous_body.created_at != incoming_body.created_at
-            || transcript_messages_digest(&previous_body.messages)
-                .map_err(SessionStoreError::from)?
-                != transcript_messages_digest(&incoming_body.messages)
-                    .map_err(SessionStoreError::from)?
+            || !audited_bodies_are_equivalent(&previous_body.messages, &incoming_body.messages)?
         {
             return Err(SessionStoreError::InvalidTranscriptRewrite {
                 id: incoming.id().clone(),
@@ -407,6 +490,37 @@ fn validate_audited_revision_bodies_preserved(
         }
     }
     Ok(())
+}
+
+/// Whether two audited revision bodies carry the same transcript.
+///
+/// Structural equality is the fast path: `Message: PartialEq` short-circuits
+/// on the first difference and costs no hashing, and byte/structural equality
+/// implies digest equality, so an equal verdict is strictly stronger than the
+/// digest compare it replaces.
+///
+/// The digest compare is kept as the FALLBACK, and it is not optional.
+/// Canonicalization deliberately erases what `PartialEq` compares: transcript
+/// message identity and `created_at` are reset to sentinels, and inline vs
+/// blob image forms collapse to one blob identity
+/// (`canonicalize_messages_for_digest`). Digest-equal but structurally
+/// different audited bodies therefore exist in the wild — the first save after
+/// blob-store enablement, a body re-derived through a heal path, a resume that
+/// re-projects the same conversation under a new runtime authority. Rejecting
+/// those would freeze the session's writes fail-closed, which is exactly the
+/// class of bug this guard exists to prevent, not to cause.
+fn audited_bodies_are_equivalent(
+    previous_body: &[Message],
+    incoming_body: &[Message],
+) -> Result<bool, SessionStoreError> {
+    if previous_body == incoming_body {
+        return Ok(true);
+    }
+    let previous_digest =
+        transcript_messages_digest(previous_body).map_err(SessionStoreError::from)?;
+    let incoming_digest =
+        transcript_messages_digest(incoming_body).map_err(SessionStoreError::from)?;
+    Ok(previous_digest == incoming_digest)
 }
 
 fn validate_rewrite_save_retains_previous_commits(
@@ -1697,17 +1811,28 @@ impl SessionHead {
         strand: TranscriptStrandId,
         rewrite_count: u64,
     ) -> Result<Self, SessionStoreError> {
-        let head_revision =
-            transcript_messages_digest(session.messages()).map_err(SessionStoreError::from)?;
+        let head_revision = session
+            .transcript_content_digest()
+            .map_err(SessionStoreError::from)?;
         let history_digest =
             crate::session_transcript_history_checkpoint_digest(session).map_err(|error| {
                 SessionStoreError::Serialization(format!(
                     "failed to derive transcript-history checkpoint witness: {error}"
                 ))
             })?;
-        let mut metadata = session.metadata().clone();
-        metadata.remove(SESSION_TRANSCRIPT_HISTORY_STATE_KEY);
-        metadata.remove(SESSION_TRANSCRIPT_HISTORY_CHECKPOINT_DIGEST_KEY);
+        // Build the slim metadata WITHOUT cloning the transcript-history
+        // graph value: on a compacted session that value carries every
+        // retained revision body plus the live head body, so `clone()` then
+        // `remove()` was one full O(graph) tree copy per boundary save.
+        let mut metadata = session
+            .metadata()
+            .iter()
+            .filter(|(key, _)| {
+                key.as_str() != SESSION_TRANSCRIPT_HISTORY_STATE_KEY
+                    && key.as_str() != SESSION_TRANSCRIPT_HISTORY_CHECKPOINT_DIGEST_KEY
+            })
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<serde_json::Map<String, serde_json::Value>>();
         if let Some(history_digest) = history_digest {
             metadata.insert(
                 SESSION_TRANSCRIPT_HISTORY_CHECKPOINT_DIGEST_KEY.to_string(),
@@ -1744,30 +1869,47 @@ impl SessionHead {
         // pair; re-hashing on every slim materialization made every store
         // read O(transcript) (the idle-burn / slow-boot class). A mutated
         // transcript changes the revision -> new key -> full re-verify.
-        if !slim_materialization_verified(&self.id, &self.head_revision, self.message_count) {
-            let digest = transcript_messages_digest(&messages).map_err(SessionStoreError::from)?;
-            if digest != self.head_revision {
-                return Err(SessionStoreError::Corrupted(self.id));
-            }
-            record_slim_materialization_verified(&self.id, &self.head_revision, self.message_count);
-        }
+        let verify =
+            !slim_materialization_verified(&self.id, &self.head_revision, self.message_count);
         let SessionHead {
             id,
             version,
+            head_revision,
+            message_count,
             created_at,
             updated_at,
             usage,
             metadata,
             ..
         } = self;
-        Session::from_head_parts(
-            version, id, messages, created_at, updated_at, metadata, usage,
+        let session = Session::from_head_parts(
+            version,
+            id.clone(),
+            messages,
+            created_at,
+            updated_at,
+            metadata,
+            usage,
         )
         .map_err(|err| {
             SessionStoreError::Serialization(format!(
                 "failed to restore session from head row: {err}"
             ))
-        })
+        })?;
+        // The verification pass is the session's own first digest, so it seeds
+        // the incremental accumulator instead of being computed and thrown
+        // away: the mandatory first-sight hash now also pays for every later
+        // save guard on this in-memory session.
+        if verify {
+            let digest = session
+                .transcript_content_digest()
+                .map_err(SessionStoreError::from)?;
+            if digest != head_revision {
+                return Err(SessionStoreError::Corrupted(id));
+            }
+            record_slim_materialization_verified(&id, &head_revision, message_count);
+        }
+        Ok(session)
     }
 }
 
@@ -1878,6 +2020,53 @@ pub trait IncrementalSessionStore: SessionStore {
         &self,
         id: &SessionId,
     ) -> Result<Vec<TranscriptRewriteRecord>, SessionStoreError>;
+
+    /// Head row ONLY when head+rows are the session's canonical durable
+    /// representation.
+    ///
+    /// Unlike [`load_head`], which may synthesize a deterministic head for a
+    /// legacy blob-only session (an O(document) blob parse), this must return
+    /// `None` for absent AND blob-only sessions and must never read the blob.
+    /// It is the capability probe for head-trusted range reads: `Some`
+    /// promises the returned row is the persisted head row itself and that
+    /// [`load_messages`] over `head.strand` serves exactly the rows the head
+    /// covers, without materializing the whole document.
+    ///
+    /// The conservative default returns `None`: a store that does not
+    /// override this simply never advertises the canonical head, keeping
+    /// every reader on the whole-load path (fallback, never refusal).
+    ///
+    /// [`load_head`]: IncrementalSessionStore::load_head
+    /// [`load_messages`]: IncrementalSessionStore::load_messages
+    async fn load_canonical_head(
+        &self,
+        id: &SessionId,
+    ) -> Result<Option<SessionHead>, SessionStoreError> {
+        let _ = id;
+        Ok(None)
+    }
+
+    /// Adopted rewrite COMMITS only (`idx < head.rewrite_count`), oldest
+    /// first, without materializing retained revision bodies.
+    ///
+    /// Must serve exactly the commits of [`load_rewrites`], in the same
+    /// order — including the empty set while a recorded rewrite is not yet
+    /// adopted. The default derives from `load_rewrites` (always correct,
+    /// but O(sum of retained bodies)); overriding stores read the small
+    /// commit rows directly.
+    ///
+    /// [`load_rewrites`]: IncrementalSessionStore::load_rewrites
+    async fn load_rewrite_commits(
+        &self,
+        id: &SessionId,
+    ) -> Result<Vec<TranscriptRewriteCommit>, SessionStoreError> {
+        Ok(self
+            .load_rewrites(id)
+            .await?
+            .into_iter()
+            .map(|record| record.commit)
+            .collect())
+    }
 }
 
 /// Plain-save guard for head-canonical rows where retained history lives
@@ -1898,14 +2087,32 @@ pub fn head_canonical_plain_save_guard(
     previous_slim: &Session,
     stored_commits: &[TranscriptRewriteCommit],
 ) -> Result<(), SessionStoreError> {
+    head_canonical_plain_save_guard_with_witness(
+        incoming,
+        previous_slim,
+        stored_commits,
+        SaveGuardWitness::none(),
+    )
+}
+
+/// [`head_canonical_plain_save_guard`] with caller-proved transcript digests.
+///
+/// The head-canonical caller normally holds the stored row's `head_revision`
+/// already, which is exactly the `previous_slim` digest this guard would
+/// otherwise recompute over every strand row it just materialized.
+pub fn head_canonical_plain_save_guard_with_witness(
+    incoming: &Session,
+    previous_slim: &Session,
+    stored_commits: &[TranscriptRewriteCommit],
+    witness: SaveGuardWitness<'_>,
+) -> Result<(), SessionStoreError> {
     incoming
         .validate_transcript_history_state()
         .map_err(|err| SessionStoreError::InvalidTranscriptRewrite {
             id: incoming.id().clone(),
             reason: format!("incoming transcript history state is malformed: {err}"),
         })?;
-    let incoming_revision =
-        transcript_messages_digest(incoming.messages()).map_err(SessionStoreError::from)?;
+    let incoming_revision = resolve_transcript_revision(incoming, witness.incoming_revision)?;
     let incoming_state = incoming.transcript_history_state().map_err(|err| {
         SessionStoreError::InvalidTranscriptRewrite {
             id: incoming.id().clone(),
@@ -1941,15 +2148,15 @@ pub fn head_canonical_plain_save_guard(
         }
     }
 
-    let previous_revision =
-        transcript_messages_digest(previous_slim.messages()).map_err(SessionStoreError::from)?;
+    let previous_revision = resolve_transcript_revision(previous_slim, witness.previous_revision)?;
     if previous_revision == incoming_revision {
         return Ok(());
     }
     let prev_len = previous_slim.messages().len();
     let new_len = incoming.messages().len();
     if new_len >= prev_len {
-        let incoming_prefix_revision = transcript_messages_digest(&incoming.messages()[..prev_len])
+        let incoming_prefix_revision = incoming
+            .transcript_prefix_digest(prev_len)
             .map_err(SessionStoreError::from)?;
         if incoming_prefix_revision == previous_revision {
             return Ok(());
@@ -2320,6 +2527,196 @@ mod tests {
         AssistantBlock, BlockAssistantMessage, StopReason, SystemMessage, SystemNoticeBlock,
         SystemNoticeKind, SystemNoticeMessage, UserMessage,
     };
+
+    /// Minimal incremental store keeping every default-provided method on its
+    /// trait default: pins that the range-read capability verbs are
+    /// conservative (`load_canonical_head` never advertises a head;
+    /// `load_rewrite_commits` derives exactly from `load_rewrites`).
+    struct DefaultVerbIncrementalStore {
+        rewrites: Vec<TranscriptRewriteRecord>,
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl SessionStore for DefaultVerbIncrementalStore {
+        async fn save(&self, _session: &Session) -> Result<(), SessionStoreError> {
+            Err(SessionStoreError::Internal(
+                "not exercised by the default-verb pin".to_string(),
+            ))
+        }
+
+        async fn save_transcript_rewrite(
+            &self,
+            _session: &Session,
+            _commit: &TranscriptRewriteCommit,
+        ) -> Result<(), SessionStoreError> {
+            Err(SessionStoreError::Internal(
+                "not exercised by the default-verb pin".to_string(),
+            ))
+        }
+
+        async fn save_authoritative_projection(
+            &self,
+            _session: &Session,
+        ) -> Result<(), SessionStoreError> {
+            Err(SessionStoreError::Internal(
+                "not exercised by the default-verb pin".to_string(),
+            ))
+        }
+
+        async fn save_authoritative_projection_if_current_revision(
+            &self,
+            _session: &Session,
+            _expected_current_revision: Option<String>,
+        ) -> Result<(), SessionStoreError> {
+            Err(SessionStoreError::Internal(
+                "not exercised by the default-verb pin".to_string(),
+            ))
+        }
+
+        async fn load(&self, _id: &SessionId) -> Result<Option<Session>, SessionStoreError> {
+            Ok(None)
+        }
+
+        async fn list(
+            &self,
+            _filter: SessionFilter,
+        ) -> Result<Vec<SessionMeta>, SessionStoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn load_meta(
+            &self,
+            _id: &SessionId,
+        ) -> Result<Option<SessionMeta>, SessionStoreError> {
+            Ok(None)
+        }
+
+        async fn delete(&self, _id: &SessionId) -> Result<(), SessionStoreError> {
+            Err(SessionStoreError::Internal(
+                "not exercised by the default-verb pin".to_string(),
+            ))
+        }
+
+        async fn delete_if_current_revision(
+            &self,
+            _id: &SessionId,
+            _expected_current_revision: &str,
+        ) -> Result<bool, SessionStoreError> {
+            Err(SessionStoreError::Internal(
+                "not exercised by the default-verb pin".to_string(),
+            ))
+        }
+
+        async fn exists(&self, _id: &SessionId) -> Result<bool, SessionStoreError> {
+            Ok(false)
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl IncrementalSessionStore for DefaultVerbIncrementalStore {
+        async fn append_messages(
+            &self,
+            _id: &SessionId,
+            _strand: &TranscriptStrandId,
+            _base_seq: u64,
+            _messages: &[Message],
+        ) -> Result<(), SessionStoreError> {
+            Err(SessionStoreError::Internal(
+                "not exercised by the default-verb pin".to_string(),
+            ))
+        }
+
+        async fn commit_rewrite(
+            &self,
+            _id: &SessionId,
+            _record: &TranscriptRewriteRecord,
+            _expected: SessionHeadCas,
+        ) -> Result<SessionHead, SessionStoreError> {
+            Err(SessionStoreError::Internal(
+                "not exercised by the default-verb pin".to_string(),
+            ))
+        }
+
+        async fn save_head(
+            &self,
+            _head: &SessionHead,
+            _expected: SessionHeadCas,
+        ) -> Result<(), SessionStoreError> {
+            Err(SessionStoreError::Internal(
+                "not exercised by the default-verb pin".to_string(),
+            ))
+        }
+
+        async fn load_head(
+            &self,
+            _id: &SessionId,
+        ) -> Result<Option<SessionHead>, SessionStoreError> {
+            Ok(None)
+        }
+
+        async fn load_messages(
+            &self,
+            _id: &SessionId,
+            _strand: &TranscriptStrandId,
+            _range: std::ops::Range<u64>,
+        ) -> Result<Vec<Message>, SessionStoreError> {
+            Ok(Vec::new())
+        }
+
+        async fn load_rewrites(
+            &self,
+            _id: &SessionId,
+        ) -> Result<Vec<TranscriptRewriteRecord>, SessionStoreError> {
+            Ok(self.rewrites.clone())
+        }
+    }
+
+    #[tokio::test]
+    #[allow(clippy::expect_used)]
+    async fn range_read_defaults_are_conservative() -> Result<(), Box<dyn std::error::Error>> {
+        // A store on the trait defaults never advertises a canonical head —
+        // every reader stays on the whole-load path.
+        let empty = DefaultVerbIncrementalStore {
+            rewrites: Vec::new(),
+        };
+        let id = SessionId::new();
+        assert!(empty.load_canonical_head(&id).await?.is_none());
+        assert!(empty.load_rewrite_commits(&id).await?.is_empty());
+
+        // The default commit view derives exactly from load_rewrites: same
+        // commits, same order.
+        let mut session = Session::new();
+        session.push(Message::User(UserMessage::text("seed".to_string())));
+        session.commit_transcript_rewrite(
+            crate::TranscriptRewriteSelection::MessageRange { start: 0, end: 1 },
+            vec![Message::User(UserMessage::text("rewritten".to_string()))],
+            crate::TranscriptRewriteReason::new("unit-test-edit"),
+            Some("unit-test".to_string()),
+            None,
+        )?;
+        let state = session
+            .transcript_history_state()?
+            .expect("rewrite mints history state");
+        let commit = state.commits[0].clone();
+        let parent_body = session
+            .transcript_revision_body(&commit.parent_revision)?
+            .expect("parent body retained");
+        let revision_body = session
+            .transcript_revision_body(&commit.revision)?
+            .expect("revision body retained");
+        let record = TranscriptRewriteRecord::new(commit.clone(), parent_body, revision_body)?;
+        let store = DefaultVerbIncrementalStore {
+            rewrites: vec![record],
+        };
+        assert_eq!(store.load_rewrite_commits(&id).await?, vec![commit]);
+        assert!(
+            store.load_canonical_head(&id).await?.is_none(),
+            "the conservative default must never advertise a canonical head"
+        );
+        Ok(())
+    }
 
     #[test]
     fn exact_snapshot_head_coherence_guard_rejects_live_transcript_forgery()
@@ -3609,7 +4006,7 @@ mod tests {
         )));
 
         let mut incoming = previous.clone();
-        incoming.messages = std::sync::Arc::new(
+        incoming.messages.replace(
             previous
                 .messages()
                 .iter()
@@ -3669,6 +4066,86 @@ mod tests {
             Err(SessionStoreError::InvalidTranscriptRewrite { reason, .. })
                 if reason.contains("changes audited transcript body")
         ));
+        Ok(())
+    }
+
+    /// Required pin for the audited-body fast path: canonical digests
+    /// deliberately erase transcript message identity and `created_at`, so two
+    /// audited bodies can be digest-equal (same transcript) while
+    /// `Message: PartialEq` says they differ. The structural compare is only a
+    /// FAST PATH; the digest compare must still admit the save. A bare
+    /// `PartialEq` here would reject every boundary save of an affected
+    /// session fail-closed and freeze its writes.
+    #[test]
+    fn append_only_guard_admits_digest_equal_audited_body_with_rebuilt_bookkeeping()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut previous = Session::new();
+        previous.push(Message::User(UserMessage::text("A".to_string())));
+        previous.commit_transcript_rewrite(
+            TranscriptRewriteSelection::MessageRange { start: 0, end: 1 },
+            vec![Message::User(UserMessage::text("B".to_string()))],
+            crate::TranscriptRewriteReason::new("first"),
+            Some("unit-test".to_string()),
+            None,
+        )?;
+
+        let mut incoming = previous.clone();
+        let mut state = incoming
+            .transcript_history_state()?
+            .ok_or_else(|| std::io::Error::other("incoming history missing"))?;
+        // Re-project every audited body the way a re-derivation path does:
+        // fresh construction bookkeeping, identical conversation content. The
+        // revision strings are unchanged because the digest erases exactly
+        // these fields.
+        let mut rebuilt_any = false;
+        for body in &mut state.revisions {
+            for message in &mut body.messages {
+                if let Message::User(user) = message {
+                    user.identity = user.identity.with_run_id(crate::lifecycle::RunId::new());
+                    user.created_at = chrono::Utc::now();
+                    rebuilt_any = true;
+                }
+            }
+        }
+        assert!(rebuilt_any, "fixture must rebuild at least one body");
+        incoming.set_metadata_unchecked_for_test(
+            crate::session::SESSION_TRANSCRIPT_HISTORY_STATE_KEY,
+            serde_json::to_value(state)?,
+        );
+        incoming.push(Message::User(UserMessage::text(
+            "ordinary append".to_string(),
+        )));
+
+        // Sanity: the bodies really are structurally different but
+        // digest-identical, i.e. the fixture exercises the fallback.
+        let previous_state = previous
+            .transcript_history_state()?
+            .ok_or_else(|| std::io::Error::other("previous history missing"))?;
+        let incoming_state = incoming
+            .transcript_history_state()?
+            .ok_or_else(|| std::io::Error::other("incoming history missing"))?;
+        let audited = previous_state.commits[0].parent_revision.clone();
+        let previous_body = previous_state
+            .revisions
+            .iter()
+            .find(|body| body.revision == audited)
+            .ok_or_else(|| std::io::Error::other("previous audited body missing"))?;
+        let incoming_body = incoming_state
+            .revisions
+            .iter()
+            .find(|body| body.revision == audited)
+            .ok_or_else(|| std::io::Error::other("incoming audited body missing"))?;
+        assert_ne!(previous_body.messages, incoming_body.messages);
+        assert_eq!(
+            transcript_messages_digest(&previous_body.messages)?,
+            transcript_messages_digest(&incoming_body.messages)?
+        );
+        assert!(audited_bodies_are_equivalent(
+            &previous_body.messages,
+            &incoming_body.messages
+        )?);
+
+        append_only_save_guard(&incoming, Some(&previous))?;
         Ok(())
     }
 
@@ -4342,7 +4819,7 @@ mod tests {
             }
         }
         rebookkept.push(Message::User(UserMessage::text("turn two".to_string())));
-        incoming.messages = std::sync::Arc::new(rebookkept);
+        incoming.messages.replace(rebookkept);
 
         assert!(
             append_only_save_guard(&incoming, Some(&previous)).is_ok(),
@@ -4371,7 +4848,7 @@ mod tests {
             }];
         }
         diverged.push(Message::User(UserMessage::text("turn two".to_string())));
-        incoming.messages = std::sync::Arc::new(diverged);
+        incoming.messages.replace(diverged);
 
         assert!(matches!(
             append_only_save_guard(&incoming, Some(&previous)),

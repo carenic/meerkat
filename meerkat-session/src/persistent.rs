@@ -65,8 +65,9 @@ use meerkat_core::session_document::{
     SessionDocumentKey, SessionDocumentMachineAuthority, TranscriptEditKind,
 };
 use meerkat_core::session_store::{
-    IncrementalSessionStore, SessionHead, SessionHeadCas, TranscriptStrandId,
-    head_canonical_plain_save_guard, session_head_cas_token,
+    IncrementalSessionStore, SaveGuardWitness, SessionHead, SessionHeadCas, TranscriptStrandId,
+    head_canonical_plain_save_guard, head_canonical_plain_save_guard_with_witness,
+    session_head_cas_token,
 };
 use meerkat_core::types::{RunResult, SessionId, ToolResult};
 use meerkat_core::{DeferredFirstTurnPhase, SessionDeferredTurnState, SessionLifecycleTerminal};
@@ -1576,9 +1577,12 @@ async fn verify_incremental_projection_continuity(
             .await?;
         let previous_slim = head.clone().into_session(previous_rows)?;
         let stored_commits = &commits[..adopted.min(commits.len())];
-        if let Err(guard_error) =
-            head_canonical_plain_save_guard(session, &previous_slim, stored_commits)
-            && !runtime_projection_rollback_authorized(session, &previous_slim)?
+        if let Err(guard_error) = head_canonical_plain_save_guard_with_witness(
+            session,
+            &previous_slim,
+            stored_commits,
+            SaveGuardWitness::none().with_previous_revision(&head.head_revision),
+        ) && !runtime_projection_rollback_authorized(session, &previous_slim)?
         {
             return Err(guard_error);
         }
@@ -1824,11 +1828,14 @@ async fn save_session_projection_incremental(
         ))
     })?;
     let plain_append = live.len() >= head_count
-        && meerkat_core::transcript_messages_digest(&live[..head_count]).map_err(|err| {
-            incremental_internal_error(format!(
-                "failed to digest incoming transcript prefix for session {id}: {err}"
-            ))
-        })? == head.head_revision;
+        && session
+            .transcript_prefix_digest(head_count)
+            .map_err(|err| {
+                incremental_internal_error(format!(
+                    "failed to digest incoming transcript prefix for session {id}: {err}"
+                ))
+            })?
+            == head.head_revision;
     let final_strand = if plain_append {
         if live.len() > head_count {
             store
@@ -1847,14 +1854,17 @@ async fn save_session_projection_incremental(
             .into_session(previous_rows)
             .map_err(incremental_store_error)?;
         let stored_commits = &commits[..adopted.min(commits.len())];
-        if let Err(guard_error) =
-            head_canonical_plain_save_guard(session, &previous_slim, stored_commits)
-            && !runtime_projection_rollback_authorized(session, &previous_slim)
-                .map_err(incremental_store_error)?
+        if let Err(guard_error) = head_canonical_plain_save_guard_with_witness(
+            session,
+            &previous_slim,
+            stored_commits,
+            SaveGuardWitness::none().with_previous_revision(&head.head_revision),
+        ) && !runtime_projection_rollback_authorized(session, &previous_slim)
+            .map_err(incremental_store_error)?
         {
             return Err(incremental_store_error(guard_error));
         }
-        let live_digest = meerkat_core::transcript_messages_digest(live).map_err(|err| {
+        let live_digest = session.transcript_content_digest().map_err(|err| {
             incremental_internal_error(format!(
                 "failed to digest incoming transcript for session {id}: {err}"
             ))
@@ -1897,21 +1907,19 @@ async fn save_session_projection_allowing_internal_rewrite(
         .await
         .map_err(|err| SessionError::Store(Box::new(err)));
     };
-    let previous_revision =
-        meerkat_core::transcript_messages_digest(previous.messages()).map_err(|err| {
-            SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
-                "failed to digest previous transcript for projection save: {err}"
-            )))
-        })?;
+    let previous_revision = previous.transcript_content_digest().map_err(|err| {
+        SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
+            "failed to digest previous transcript for projection save: {err}"
+        )))
+    })?;
     let previous_projection_token =
         meerkat_core::session_store::session_projection_cas_token(&previous)
             .map_err(|err| SessionError::Store(Box::new(err)))?;
-    let incoming_revision =
-        meerkat_core::transcript_messages_digest(session.messages()).map_err(|err| {
-            SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
-                "failed to digest incoming transcript for projection save: {err}"
-            )))
-        })?;
+    let incoming_revision = session.transcript_content_digest().map_err(|err| {
+        SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
+            "failed to digest incoming transcript for projection save: {err}"
+        )))
+    })?;
     let Some(state) = session.transcript_history_state().map_err(|err| {
         SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
             "failed to read transcript history for projection save: {err}"
@@ -2186,7 +2194,8 @@ async fn save_session_projection_with_storage_normalization_bridge(
             let Some(previous) = store.load(session.id()).await? else {
                 return Err(error);
             };
-            let previous_revision = meerkat_core::transcript_messages_digest(previous.messages())
+            let previous_revision = previous
+                .transcript_content_digest()
                 .map_err(SessionStoreError::from)?;
             let previous_projection_token =
                 meerkat_core::session_store::session_projection_cas_token(&previous)?;
@@ -2199,9 +2208,9 @@ async fn save_session_projection_with_storage_normalization_bridge(
                         "failed to externalize previous persisted projection for save bridge: {err}"
                     ))
                 })?;
-            let normalized_revision =
-                meerkat_core::transcript_messages_digest(normalized_previous.messages())
-                    .map_err(SessionStoreError::from)?;
+            let normalized_revision = normalized_previous
+                .transcript_content_digest()
+                .map_err(SessionStoreError::from)?;
             if normalized_revision == previous_revision {
                 if save_verified_transcript_history_projection(
                     store,
@@ -2273,7 +2282,8 @@ async fn save_verified_transcript_history_projection(
             reason: format!("incoming transcript history state is malformed: {err}"),
         }
     })?;
-    let incoming_revision = meerkat_core::transcript_messages_digest(session.messages())
+    let incoming_revision = session
+        .transcript_content_digest()
         .map_err(SessionStoreError::from)?;
     if state.head != incoming_revision
         || !state
@@ -2385,7 +2395,8 @@ async fn verify_authoritative_projection_persisted_continuity(
     let Some(previous) = store.load(session.id()).await? else {
         return Ok(None);
     };
-    let previous_revision = meerkat_core::transcript_messages_digest(previous.messages())
+    let previous_revision = previous
+        .transcript_content_digest()
         .map_err(SessionStoreError::from)?;
     let previous_projection_token =
         meerkat_core::session_store::session_projection_cas_token(&previous)?;
@@ -2401,9 +2412,9 @@ async fn verify_authoritative_projection_persisted_continuity(
                         "failed to externalize previous persisted projection for authoritative save guard: {err}"
                     ))
                 })?;
-            let normalized_revision =
-                meerkat_core::transcript_messages_digest(normalized_previous.messages())
-                    .map_err(SessionStoreError::from)?;
+            let normalized_revision = normalized_previous
+                .transcript_content_digest()
+                .map_err(SessionStoreError::from)?;
             if normalized_revision != previous_revision
                 && meerkat_core::session_store::run_boundary_snapshot_save_guard(
                     session,
@@ -2569,7 +2580,7 @@ impl meerkat_core::checkpoint::SessionCheckpointer for StoreCheckpointer {
         if *guard {
             return;
         }
-        let current_revision = match meerkat_core::transcript_messages_digest(session.messages()) {
+        let current_revision = match session.transcript_content_digest() {
             Ok(revision) => revision,
             Err(error) => {
                 tracing::warn!("Host-mode checkpoint transcript digest failed: {error}");
@@ -32049,6 +32060,77 @@ mod tests {
         assert_eq!(
             snapshot_stamp, adopted.stamp,
             "the snapshot converges onto the existing authority; no INITIAL stamp is minted"
+        );
+    }
+
+    /// Turn-boundary digest budget at the incremental projection seam.
+    ///
+    /// This is the production defect's own shape: an ordinary append-only turn
+    /// committed through `save_session_projection_incremental`. The counted
+    /// quantity is full O(document) content-digest passes
+    /// (`session_content_digest_computations`, a thread-local counter, so this
+    /// test keeps every measurement on its own thread).
+    ///
+    /// The assertion is EQUALITY across two very different transcript sizes,
+    /// not "fewer than before": a fixed number of whole-document passes still
+    /// makes a one-word turn scale with the accumulated document, which is
+    /// exactly the 14 MB -> 60 s / 94 MB -> 180 s production report.
+    #[tokio::test]
+    async fn incremental_boundary_save_digest_budget_is_independent_of_transcript_size() {
+        async fn measure(turns: usize) -> u64 {
+            let store = Arc::new(MemoryStore::new());
+            let incremental: Arc<dyn IncrementalSessionStore> = store.clone();
+            let blob_store = memory_blob_store();
+
+            let mut session = Session::with_id(SessionId::new());
+            session.set_system_prompt("system".to_string());
+            for index in 0..turns {
+                session.push(Message::User(UserMessage::text(format!("ask {index}"))));
+                session.push(Message::User(UserMessage::text(format!("reply {index}"))));
+            }
+
+            // Two warm-up boundaries: the first materializes the head row, the
+            // second puts the session in steady state (head row present, live
+            // accumulator seeded) — the shape every turn after the first has.
+            for warmup in 0..2 {
+                save_session_projection_incremental(
+                    incremental.as_ref(),
+                    blob_store.as_ref(),
+                    None,
+                    None,
+                    &session,
+                    &[],
+                )
+                .await
+                .expect("warm-up boundary save");
+                session.push(Message::User(UserMessage::text(format!(
+                    "warm-up {warmup}"
+                ))));
+            }
+
+            let before = meerkat_core::session_content_digest_computations();
+            save_session_projection_incremental(
+                incremental.as_ref(),
+                blob_store.as_ref(),
+                None,
+                None,
+                &session,
+                &[],
+            )
+            .await
+            .expect("boundary save");
+            meerkat_core::session_content_digest_computations() - before
+        }
+
+        let small = measure(8).await;
+        let large = measure(1_500).await;
+        println!(
+            "incremental boundary save full-document digest passes: 8 turns => {small}, 1500 turns => {large}"
+        );
+        assert_eq!(
+            small, large,
+            "an ordinary append-only turn boundary must cost the same number of \
+             whole-document digest passes at 8 turns ({small}) and 1500 turns ({large})"
         );
     }
 }

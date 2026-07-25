@@ -459,6 +459,150 @@ fn finalized_sequences(events: &[MobEvent]) -> BTreeSet<u64> {
         .collect()
 }
 
+/// Whether the machine holds NO remote-turn custody in any phase. One half of
+/// the scan's dual-witness quiescence check; see
+/// `MobHandle::project_remote_turn_custody_is_quiet_from_current_machine_state`.
+pub(super) fn remote_turn_custody_is_quiet(state: &mob_dsl::MobMachineState) -> bool {
+    state.pending_remote_turn_outcomes.is_empty()
+        && state.committed_remote_turn_outcomes.is_empty()
+        && state.resolved_remote_turn_outcomes.is_empty()
+}
+
+/// Page size for the cache's cursor-tailing poll; matches the SQLite event
+/// bus watcher's catch-up batch.
+const EPOCH_EVENT_POLL_LIMIT: usize = 1024;
+
+/// Current-epoch public-event slice for one mob: mob-filtered, truncated at
+/// the LAST `MobReset` (the reset event itself is excluded from the epoch).
+///
+/// Shared by the boot seed and the cache-equivalence tests so the incremental
+/// fold below provably reproduces the historical `replay_all` slice.
+pub(crate) fn current_epoch_events_for_mob(events: &[MobEvent], mob_id: &MobId) -> Vec<MobEvent> {
+    let mob_events = events
+        .iter()
+        .filter(|event| event.mob_id == *mob_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let epoch_start = mob_events
+        .iter()
+        .rposition(|event| matches!(event.kind, MobEventKind::MobReset))
+        .map_or(0, |position| position + 1);
+    mob_events[epoch_start..].to_vec()
+}
+
+/// Boot-time seed for [`EpochEventCache`], computed from the full-ledger
+/// replay the builder already performs for the actor idempotency index. The
+/// resume path's Record-projection repair appends land before that replay, so
+/// the seed is repair-inclusive; anything appended between the boot replay
+/// and the first scan is picked up by the first `refresh` poll.
+pub(crate) struct RemoteTurnEventSeed {
+    pub(crate) last_cursor: u64,
+    pub(crate) epoch_events: Vec<MobEvent>,
+}
+
+impl RemoteTurnEventSeed {
+    pub(crate) fn from_boot_replay(all_events: &[MobEvent], mob_id: &MobId) -> Self {
+        Self {
+            // The cursor is store-global (all mobs share it), so the frontier
+            // is the maximum across the whole replay, not this mob's slice.
+            last_cursor: all_events
+                .iter()
+                .map(|event| event.cursor)
+                .max()
+                .unwrap_or(0),
+            epoch_events: current_epoch_events_for_mob(all_events, mob_id),
+        }
+    }
+}
+
+/// Outcome of one [`EpochEventCache::refresh`] pass.
+struct EpochRefreshOutcome {
+    /// A new event for THIS mob entered (or reset) the epoch slice.
+    advanced_for_this_mob: bool,
+    /// The poll returned any rows at all (any mob). `false` under a wake is
+    /// the cursor-regression probe trigger.
+    any_rows: bool,
+}
+
+/// Process-local, actor-lifetime tail of this mob's current-epoch public
+/// events, replacing the per-scan whole-ledger `replay_all` (whose SQL has no
+/// mob_id predicate and decodes every mob's history on every idle scan).
+///
+/// Invariants:
+/// - `poll` is the source of truth; broadcast wakes are wake-only, so a
+///   lagged or absent subscription cannot corrupt the cache.
+/// - The cursor is store-global and allocated inside the append transaction,
+///   so visibility order equals cursor order and the paged fold reproduces
+///   the `replay_all` + mob-filter + last-`MobReset` slice exactly.
+/// - `MobReset` truncates the epoch prefix and is itself excluded, matching
+///   the historical `rposition + 1` slice.
+/// - Cursor regression (only possible via the destroy path's store `clear()`,
+///   which also closes the command channel) is handled by `reset` + rebuild.
+/// - `prune` retention is the conservative direction: `MobReset` is a prune
+///   anchor, so the epoch boundary cannot be pruned out from under the cache;
+///   mob-event pruning currently has no production caller. Revisit this note
+///   before enabling production pruning.
+struct EpochEventCache {
+    mob_id: MobId,
+    last_cursor: u64,
+    epoch_events: Vec<MobEvent>,
+}
+
+impl EpochEventCache {
+    fn from_seed(mob_id: MobId, seed: RemoteTurnEventSeed) -> Self {
+        Self {
+            mob_id,
+            last_cursor: seed.last_cursor,
+            epoch_events: seed.epoch_events,
+        }
+    }
+
+    fn reset(&mut self) {
+        self.last_cursor = 0;
+        self.epoch_events.clear();
+    }
+
+    async fn refresh(
+        &mut self,
+        events: &Arc<dyn MobEventStore>,
+    ) -> Result<EpochRefreshOutcome, MobError> {
+        self.refresh_paged(events, EPOCH_EVENT_POLL_LIMIT).await
+    }
+
+    async fn refresh_paged(
+        &mut self,
+        events: &Arc<dyn MobEventStore>,
+        page_limit: usize,
+    ) -> Result<EpochRefreshOutcome, MobError> {
+        let mut outcome = EpochRefreshOutcome {
+            advanced_for_this_mob: false,
+            any_rows: false,
+        };
+        loop {
+            let batch = events.poll(self.last_cursor, page_limit).await?;
+            let complete = batch.len() < page_limit;
+            for event in batch {
+                outcome.any_rows = true;
+                self.last_cursor = event.cursor;
+                if event.mob_id != self.mob_id {
+                    // Other mobs' traffic advances the store-global cursor
+                    // but never marks work for this reconciler.
+                    continue;
+                }
+                outcome.advanced_for_this_mob = true;
+                if matches!(event.kind, MobEventKind::MobReset) {
+                    self.epoch_events.clear();
+                } else {
+                    self.epoch_events.push(event);
+                }
+            }
+            if complete {
+                return Ok(outcome);
+            }
+        }
+    }
+}
+
 /// Load and validate private replay rows for the current epoch.
 ///
 /// An intent can be current without a public Record carrier only when its
@@ -850,12 +994,30 @@ enum ReconcileWake {
     ActorClosed,
     Adopted(Option<AdoptedCompletion>),
     Event,
+    MachineChanged,
     Scan,
 }
 
 struct ScanSummary {
     live_intents: usize,
     next_retry_after: Option<Duration>,
+    /// Dual-witness quiescence: durable rows AND machine custody both empty
+    /// (plus no retry backlog and every recovered run converged).
+    quiescent: bool,
+}
+
+/// Dual-witness quiescence for one completed scan. The row-side witness
+/// (`live_intents`, from THIS scan's fresh durable read) covers
+/// Absent-custody rows awaiting machine recovery; the machine-side witness
+/// covers the torn window where custody was minted but the private-row read
+/// raced. Rows-empty alone is NOT quiescence.
+fn scan_quiescence_witness(
+    live_intents: usize,
+    retry_is_empty: bool,
+    all_recovered_converged: bool,
+    machine_custody_quiet: bool,
+) -> bool {
+    live_intents == 0 && retry_is_empty && all_recovered_converged && machine_custody_quiet
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -887,7 +1049,9 @@ impl RemoteTurnIntentReconciler {
         provisioner: Arc<dyn MobProvisioner>,
         tickets: Arc<RemoteFlowTicketRegistry>,
         recovered_runs: BTreeSet<RunId>,
+        event_seed: RemoteTurnEventSeed,
     ) {
+        let events_cache = EpochEventCache::from_seed(mob_id.clone(), event_seed);
         let reconciler = Self {
             mob_id,
             handle,
@@ -895,10 +1059,10 @@ impl RemoteTurnIntentReconciler {
             tickets,
             recovered_runs,
         };
-        reconciler.run().await;
+        reconciler.run(events_cache).await;
     }
 
-    async fn run(self) {
+    async fn run(self, mut events_cache: EpochEventCache) {
         let mut completion_waiters = FuturesUnordered::<AdoptedCompletionFuture>::new();
         let mut adopted = BTreeSet::<RemoteTurnKey>::new();
         // A positive bridge ACK means the remote host owns the exact input.
@@ -911,10 +1075,23 @@ impl RemoteTurnIntentReconciler {
         let mut host_cursor = 0usize;
         let mut converged_runs = BTreeSet::<RunId>::new();
         let actor_closed = self.handle.command_tx.clone();
+        // Wake sources are BOTH lanes: the mob event subscription (durable
+        // appends drive the epoch material, including cross-process appends
+        // surfaced by the SQLite event bus watcher) AND the machine-state
+        // watch (custody can move with NO public event — the wrote-then-error
+        // case leaves machine Pending custody after a failed public append).
         let mut event_rx = self.handle.events.subscribe().ok();
+        let mut machine_changes = Some(self.handle.machine_state_changes());
         let mut next_scan_after = RECONCILE_SCAN_INTERVAL;
-        let mut next_scan_at = Instant::now() + next_scan_after;
+        // Unconditional first scan with the wake flag seeded true: the watch
+        // does not fire for the value present at subscribe time, and custody
+        // recovered during resume exists at spawn with no subsequent publish,
+        // so crash-recovery replay must not wait for a wake or safety tick.
+        let mut deadline =
+            super::ReconcileScanDeadline::first_scan(Instant::now(), RECONCILE_SCAN_INTERVAL);
         let mut idle_delay = RECONCILE_SCAN_INTERVAL;
+        let mut wake_since_last_scan = true;
+        let mut previous_scan_quiescent = false;
 
         loop {
             let wake = tokio::select! {
@@ -923,8 +1100,11 @@ impl RemoteTurnIntentReconciler {
                     ReconcileWake::Adopted(completion)
                 }
                 () = Self::wait_for_event(&mut event_rx) => ReconcileWake::Event,
+                () = super::wait_for_machine_state_change(&mut machine_changes) => {
+                    ReconcileWake::MachineChanged
+                }
                 () = tokio::time::sleep(
-                    next_scan_at.saturating_duration_since(Instant::now()),
+                    deadline.sleep_duration(Instant::now()),
                 ) => ReconcileWake::Scan,
             };
             match wake {
@@ -940,7 +1120,8 @@ impl RemoteTurnIntentReconciler {
                     {
                         tracing::warn!(error = %error, "remote-turn adopted terminal reconciliation remains pending");
                     }
-                    next_scan_at = next_scan_at.min(Instant::now() + RECONCILE_SCAN_INTERVAL);
+                    wake_since_last_scan = true;
+                    deadline.pull_earlier(Instant::now(), RECONCILE_SCAN_INTERVAL);
                 }
                 ReconcileWake::Event => {
                     // Structural append wakeup. A small debounce lets the
@@ -948,12 +1129,24 @@ impl RemoteTurnIntentReconciler {
                     // the wake was StepDispatched. Use an absolute deadline
                     // and only move it earlier: a busy event stream must not
                     // postpone reconciliation forever.
-                    next_scan_at = next_scan_at.min(Instant::now() + RECONCILE_SCAN_INTERVAL);
+                    wake_since_last_scan = true;
+                    deadline.pull_earlier(Instant::now(), RECONCILE_SCAN_INTERVAL);
+                }
+                ReconcileWake::MachineChanged => {
+                    // Custody moved (possibly with no public append); same
+                    // min-earlier debounce as the event lane.
+                    wake_since_last_scan = true;
+                    deadline.pull_earlier(Instant::now(), RECONCILE_SCAN_INTERVAL);
                 }
                 ReconcileWake::Scan => {
+                    let woken = wake_since_last_scan;
+                    wake_since_last_scan = false;
                     let mut new_adoptions = Vec::new();
                     let scan_result = self
                         .scan_once(
+                            &mut events_cache,
+                            woken,
+                            previous_scan_quiescent,
                             &mut new_adoptions,
                             &mut adopted,
                             &mut accepted,
@@ -968,7 +1161,19 @@ impl RemoteTurnIntentReconciler {
                     }
                     match scan_result {
                         Ok(summary) => {
-                            if summary.live_intents == 0 {
+                            previous_scan_quiescent =
+                                summary.quiescent && completion_waiters.is_empty();
+                            if previous_scan_quiescent {
+                                // Converged: both wake lanes own new-work
+                                // detection; the safety tick only bounds
+                                // drift from signals they cannot observe.
+                                idle_delay = RECONCILE_SCAN_INTERVAL;
+                                next_scan_after = super::RECONCILE_SAFETY_INTERVAL;
+                            } else if summary.live_intents == 0 {
+                                // Rows are empty but the dual witness is not
+                                // satisfied (e.g. Absent-custody rows or an
+                                // unconverged recovered run): keep today's
+                                // bounded idle ladder.
                                 idle_delay = (idle_delay * 2).min(RECONCILE_MAX_RETRY_DELAY);
                                 next_scan_after = idle_delay;
                             } else {
@@ -981,10 +1186,11 @@ impl RemoteTurnIntentReconciler {
                         }
                         Err(error) => {
                             tracing::warn!(error = %error, "remote-turn intent reconciliation scan failed; retrying");
+                            previous_scan_quiescent = false;
                             next_scan_after = (next_scan_after * 2).min(RECONCILE_MAX_RETRY_DELAY);
                         }
                     }
-                    next_scan_at = Instant::now() + next_scan_after;
+                    deadline.rearm(Instant::now(), next_scan_after);
                 }
             }
         }
@@ -1002,24 +1208,14 @@ impl RemoteTurnIntentReconciler {
         }
     }
 
-    async fn current_epoch_events(&self) -> Result<Vec<MobEvent>, MobError> {
-        let all = self.handle.events.replay_all().await?;
-        let mob_events = all
-            .into_iter()
-            .filter(|event| event.mob_id == self.mob_id)
-            .collect::<Vec<_>>();
-        let epoch_start = mob_events
-            .iter()
-            .rposition(|event| matches!(event.kind, MobEventKind::MobReset))
-            .map_or(0, |position| position + 1);
-        Ok(mob_events[epoch_start..].to_vec())
-    }
-
     // One scan advances a single cohesive recovery frontier; the mutable
     // collections are independent custody indexes, not a second state owner.
     #[allow(clippy::too_many_arguments)]
     async fn scan_once(
         &self,
+        events_cache: &mut EpochEventCache,
+        wake_since_last_scan: bool,
+        previous_scan_quiescent: bool,
         new_adoptions: &mut Vec<AdoptedWait>,
         adopted: &mut BTreeSet<RemoteTurnKey>,
         accepted: &mut BTreeSet<RemoteTurnKey>,
@@ -1028,12 +1224,44 @@ impl RemoteTurnIntentReconciler {
         host_cursor: &mut usize,
         converged_runs: &mut BTreeSet<RunId>,
     ) -> Result<ScanSummary, MobError> {
-        let epoch_events = self.current_epoch_events().await?;
+        // The cache refresh precedes every run-store row read, so the events
+        // snapshot is always older-or-equal to the rows — the exact staleness
+        // direction the torn-snapshot guard in prepare (and the
+        // live_scan_stale_event_snapshot_preserves_fresh_private_rows pin)
+        // proves non-destructive for repair=false scans.
+        let refreshed = events_cache.refresh(&self.handle.events).await?;
+        if wake_since_last_scan && !refreshed.any_rows {
+            // A wake with zero rows past the frontier is the cursor
+            // regression probe: the destroy path's store clear() resets the
+            // cursor allocator. That path also closes the command channel, so
+            // this rebuild is defensive for the race window only and must not
+            // be load-bearing for any other flow.
+            let latest = self.handle.events.latest_cursor().await?;
+            if latest < events_cache.last_cursor {
+                events_cache.reset();
+                events_cache.refresh(&self.handle.events).await?;
+            }
+        }
+        if previous_scan_quiescent && !wake_since_last_scan && !refreshed.advanced_for_this_mob {
+            // Idle safety tick over a proven-quiescent mob: the whole scan is
+            // the one indexed poll above returning zero rows. Soundness:
+            // every private-row mint in a live process is accompanied by an
+            // actor machine input (custody mint -> watch publish) and every
+            // dispatch by current-epoch FlowStarted/StepDispatched appends;
+            // pre-actor rows are covered by the unconditional first scan
+            // (wake flag seeded true).
+            return Ok(ScanSummary {
+                live_intents: 0,
+                next_retry_after: None,
+                quiescent: true,
+            });
+        }
+        let epoch_events = events_cache.epoch_events.as_slice();
         let material = prepare_remote_turn_recovery_material(
             self.handle.run_store.clone(),
             self.handle.events.clone(),
             &self.mob_id,
-            &epoch_events,
+            epoch_events,
             false,
         )
         .await?;
@@ -1288,9 +1516,22 @@ impl RemoteTurnIntentReconciler {
             .values()
             .map(|state| state.next_attempt.saturating_duration_since(now))
             .min();
+        let all_recovered_converged = self
+            .recovered_runs
+            .iter()
+            .all(|run_id| converged_runs.contains(run_id));
+        let machine_custody_quiet = self
+            .handle
+            .project_remote_turn_custody_is_quiet_from_current_machine_state();
         Ok(ScanSummary {
             live_intents,
             next_retry_after,
+            quiescent: scan_quiescence_witness(
+                live_intents,
+                retry.is_empty(),
+                all_recovered_converged,
+                machine_custody_quiet,
+            ),
         })
     }
 
@@ -2082,6 +2323,209 @@ mod tests {
             })
             .await
             .expect("append StepDispatched");
+    }
+
+    async fn append_flow_marker(
+        event_store: &Arc<dyn MobEventStore>,
+        mob_id: &MobId,
+        marker: &str,
+    ) -> MobEvent {
+        event_store
+            .append(NewMobEvent {
+                mob_id: mob_id.clone(),
+                timestamp: None,
+                kind: MobEventKind::FlowStarted {
+                    run_id: RunId::new(),
+                    flow_id: FlowId::from(marker),
+                    params: serde_json::json!({}),
+                },
+            })
+            .await
+            .expect("append flow marker event")
+    }
+
+    async fn append_mob_reset(event_store: &Arc<dyn MobEventStore>, mob_id: &MobId) -> MobEvent {
+        event_store
+            .append(NewMobEvent {
+                mob_id: mob_id.clone(),
+                timestamp: None,
+                kind: MobEventKind::MobReset,
+            })
+            .await
+            .expect("append MobReset")
+    }
+
+    fn epoch_flow_markers(events: &[MobEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match &event.kind {
+                MobEventKind::FlowStarted { flow_id, .. } => Some(flow_id.to_string()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn epoch_event_cache_seeded_refresh_matches_full_replay_slice() {
+        let this_mob = MobId::from("cache-equivalence-a");
+        let other_mob = MobId::from("cache-equivalence-b");
+        let event_store: Arc<dyn MobEventStore> = Arc::new(InMemoryMobEventStore::new());
+
+        // Boot prefix: interleaved two-mob traffic including a mid-stream
+        // reset for this mob.
+        append_flow_marker(&event_store, &this_mob, "boot-1").await;
+        append_flow_marker(&event_store, &other_mob, "other-1").await;
+        append_flow_marker(&event_store, &this_mob, "boot-2").await;
+        append_mob_reset(&event_store, &this_mob).await;
+        append_flow_marker(&event_store, &this_mob, "epoch-1").await;
+
+        let boot_replay = event_store.replay_all().await.expect("boot replay");
+        let seed = RemoteTurnEventSeed::from_boot_replay(&boot_replay, &this_mob);
+        assert_eq!(epoch_flow_markers(&seed.epoch_events), vec!["epoch-1"]);
+        let mut cache = EpochEventCache::from_seed(this_mob.clone(), seed);
+
+        // Post-boot traffic: more interleaving plus a second reset.
+        append_flow_marker(&event_store, &other_mob, "other-2").await;
+        append_flow_marker(&event_store, &this_mob, "epoch-2").await;
+        append_mob_reset(&event_store, &this_mob).await;
+        append_flow_marker(&event_store, &this_mob, "epoch-3").await;
+        append_flow_marker(&event_store, &other_mob, "other-3").await;
+
+        let refreshed = cache.refresh(&event_store).await.expect("refresh");
+        assert!(refreshed.advanced_for_this_mob);
+        assert!(refreshed.any_rows);
+
+        let full_replay = event_store.replay_all().await.expect("full replay");
+        let expected = current_epoch_events_for_mob(&full_replay, &this_mob);
+        assert_eq!(epoch_flow_markers(&expected), vec!["epoch-3"]);
+        assert_eq!(
+            epoch_flow_markers(&cache.epoch_events),
+            epoch_flow_markers(&expected),
+            "the incremental fold must reproduce the replay_all slice"
+        );
+        assert_eq!(
+            cache.last_cursor,
+            full_replay.last().expect("events").cursor,
+            "the cursor frontier is store-global across both mobs"
+        );
+
+        // A refresh with no new rows is a no-op.
+        let idle = cache.refresh(&event_store).await.expect("idle refresh");
+        assert!(!idle.any_rows);
+        assert!(!idle.advanced_for_this_mob);
+        assert_eq!(epoch_flow_markers(&cache.epoch_events), vec!["epoch-3"]);
+    }
+
+    #[tokio::test]
+    async fn epoch_event_cache_pages_through_the_poll_limit() {
+        let mob_id = MobId::from("cache-pagination");
+        let event_store: Arc<dyn MobEventStore> = Arc::new(InMemoryMobEventStore::new());
+        for index in 0..5 {
+            append_flow_marker(&event_store, &mob_id, &format!("page-{index}")).await;
+        }
+        let mut cache = EpochEventCache::from_seed(
+            mob_id.clone(),
+            RemoteTurnEventSeed {
+                last_cursor: 0,
+                epoch_events: Vec::new(),
+            },
+        );
+        let refreshed = cache
+            .refresh_paged(&event_store, 2)
+            .await
+            .expect("paged refresh");
+        assert!(refreshed.advanced_for_this_mob);
+        assert_eq!(
+            epoch_flow_markers(&cache.epoch_events),
+            vec!["page-0", "page-1", "page-2", "page-3", "page-4"],
+            "a full page must trigger the next poll rather than truncate"
+        );
+    }
+
+    #[tokio::test]
+    async fn epoch_event_cache_other_mob_traffic_advances_cursor_without_marking_work() {
+        let this_mob = MobId::from("cache-other-mob-a");
+        let other_mob = MobId::from("cache-other-mob-b");
+        let event_store: Arc<dyn MobEventStore> = Arc::new(InMemoryMobEventStore::new());
+        let mut cache = EpochEventCache::from_seed(
+            this_mob.clone(),
+            RemoteTurnEventSeed {
+                last_cursor: 0,
+                epoch_events: Vec::new(),
+            },
+        );
+        let other = append_flow_marker(&event_store, &other_mob, "other-only").await;
+        let refreshed = cache.refresh(&event_store).await.expect("refresh");
+        assert!(refreshed.any_rows);
+        assert!(
+            !refreshed.advanced_for_this_mob,
+            "other mobs' traffic must never mark work for this reconciler"
+        );
+        assert!(cache.epoch_events.is_empty());
+        assert_eq!(
+            cache.last_cursor, other.cursor,
+            "the cursor still advances so the next poll skips decoded rows"
+        );
+    }
+
+    #[tokio::test]
+    async fn epoch_event_cache_cursor_regression_resets_and_rebuilds() {
+        let mob_id = MobId::from("cache-cursor-regression");
+        let event_store: Arc<dyn MobEventStore> = Arc::new(InMemoryMobEventStore::new());
+        append_flow_marker(&event_store, &mob_id, "pre-clear-1").await;
+        append_flow_marker(&event_store, &mob_id, "pre-clear-2").await;
+        let mut cache = EpochEventCache::from_seed(
+            mob_id.clone(),
+            RemoteTurnEventSeed::from_boot_replay(
+                &event_store.replay_all().await.expect("replay"),
+                &mob_id,
+            ),
+        );
+
+        // Destroy-path clear() resets the cursor allocator; a later append
+        // lands BELOW the cache frontier and an unpatched poll sees nothing.
+        event_store.clear().await.expect("clear");
+        append_flow_marker(&event_store, &mob_id, "post-clear").await;
+        let stalled = cache.refresh(&event_store).await.expect("stalled refresh");
+        assert!(!stalled.any_rows, "regression hides rows from a plain poll");
+        let latest = event_store.latest_cursor().await.expect("latest cursor");
+        assert!(
+            latest < cache.last_cursor,
+            "latest_cursor exposes the regression"
+        );
+
+        // The scan's probe path: reset and rebuild by paged poll.
+        cache.reset();
+        let rebuilt = cache.refresh(&event_store).await.expect("rebuild");
+        assert!(rebuilt.advanced_for_this_mob);
+        assert_eq!(epoch_flow_markers(&cache.epoch_events), vec!["post-clear"]);
+        assert_eq!(cache.last_cursor, latest);
+    }
+
+    #[test]
+    fn machine_pending_custody_without_rows_is_not_quiescent() {
+        // Dual witness: zero durable rows alone must NOT satisfy quiescence
+        // while the machine still holds custody in any phase (covers the
+        // torn window where custody was minted but the private-row read
+        // raced, and the Absent-custody direction below).
+        let mut state = mob_dsl::MobMachineState::default();
+        assert!(remote_turn_custody_is_quiet(&state));
+        state
+            .pending_remote_turn_outcomes
+            .insert(mob_dsl::RemoteTurnObligation::default());
+        assert!(!remote_turn_custody_is_quiet(&state));
+        assert!(
+            !scan_quiescence_witness(0, true, true, remote_turn_custody_is_quiet(&state)),
+            "machine Pending custody with zero rows must keep the busy ladder"
+        );
+
+        // Row-side witness: a durable Absent-custody row (live_intents > 0)
+        // is not quiescent even when the machine sets are empty.
+        assert!(!scan_quiescence_witness(1, true, true, true));
+        // Unconverged recovered runs and retry backlog also block the slow tick.
+        assert!(!scan_quiescence_witness(0, false, true, true));
+        assert!(!scan_quiescence_witness(0, true, false, true));
+        assert!(scan_quiescence_witness(0, true, true, true));
     }
 
     #[tokio::test]

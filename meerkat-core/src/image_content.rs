@@ -247,6 +247,21 @@ pub async fn externalize_content_blocks(
     blob_store: &dyn BlobStore,
     blocks: &mut [ContentBlock],
 ) -> Result<(), BlobStoreError> {
+    externalize_content_blocks_reporting_mutation(blob_store, blocks)
+        .await
+        .map(|_| ())
+}
+
+/// [`externalize_content_blocks`] that reports whether it changed anything.
+///
+/// The change fact is what lets a caller keep a retained transcript-digest
+/// midstate across the scan instead of re-hashing the whole transcript twice
+/// to discover that a text-only session had no images to externalize.
+async fn externalize_content_blocks_reporting_mutation(
+    blob_store: &dyn BlobStore,
+    blocks: &mut [ContentBlock],
+) -> Result<bool, BlobStoreError> {
+    let mut mutated = false;
     for block in blocks.iter_mut() {
         if let ContentBlock::Image {
             media_type,
@@ -260,9 +275,10 @@ pub async fn externalize_content_blocks(
                     blob_id: blob_ref.blob_id,
                 },
             };
+            mutated = true;
         }
     }
-    Ok(())
+    Ok(mutated)
 }
 
 /// Externalize byte-bearing realtime user content before it enters the
@@ -307,6 +323,24 @@ pub async fn hydrate_user_images_for_realtime_projection_with_usage(
     messages: &mut [Message],
     max_decoded_bytes: usize,
 ) -> Result<usize, RealtimeUserImageHydrationError> {
+    hydrate_user_images_for_realtime_projection_reporting_lowest(
+        blob_store,
+        messages,
+        max_decoded_bytes,
+    )
+    .await
+    .map(|(decoded_total, _)| decoded_total)
+}
+
+/// [`hydrate_user_images_for_realtime_projection_with_usage`] that also
+/// reports the lowest message index it rewrote (`None` = unchanged buffer),
+/// so a caller can keep its retained transcript-digest midstate across a
+/// hydration that hydrated nothing.
+pub async fn hydrate_user_images_for_realtime_projection_reporting_lowest(
+    blob_store: &dyn BlobStore,
+    messages: &mut [Message],
+    max_decoded_bytes: usize,
+) -> Result<(usize, Option<usize>), RealtimeUserImageHydrationError> {
     struct HydratedImage {
         message_index: usize,
         block_index: usize,
@@ -409,6 +443,7 @@ pub async fn hydrate_user_images_for_realtime_projection_with_usage(
         }
     }
 
+    let mut lowest_mutated: Option<usize> = None;
     for hydrated in hydrated_images {
         let Some(Message::User(user)) = messages.get_mut(hydrated.message_index) else {
             return Err(BlobStoreError::Internal(
@@ -428,8 +463,13 @@ pub async fn hydrate_user_images_for_realtime_projection_with_usage(
                 data: hydrated.data,
             },
         };
+        lowest_mutated = Some(
+            lowest_mutated.map_or(hydrated.message_index, |lowest: usize| {
+                lowest.min(hydrated.message_index)
+            }),
+        );
     }
-    Ok(decoded_total)
+    Ok((decoded_total, lowest_mutated))
 }
 
 fn decoded_realtime_image_len(
@@ -532,23 +572,52 @@ pub async fn externalize_messages_from(
     messages: &mut [Message],
     start: usize,
 ) -> Result<(), BlobStoreError> {
-    for msg in messages.iter_mut().skip(start) {
-        match msg {
+    externalize_messages_from_reporting_lowest(blob_store, messages, start)
+        .await
+        .map(|_| ())
+}
+
+/// [`externalize_messages_from`] that reports the lowest message index it
+/// actually rewrote (`None` = the buffer is unchanged).
+///
+/// `Session::externalize_media` uses the verdict to decide whether its
+/// retained transcript-digest midstate survives the scan. Externalization is
+/// digest-neutral for most sessions (canonicalization already collapses inline
+/// and blob image forms), and text-only sessions never mutate at all, so the
+/// common case now costs zero transcript digests instead of two.
+pub async fn externalize_messages_from_reporting_lowest(
+    blob_store: &dyn BlobStore,
+    messages: &mut [Message],
+    start: usize,
+) -> Result<Option<usize>, BlobStoreError> {
+    let mut lowest_mutated: Option<usize> = None;
+    for (index, msg) in messages.iter_mut().enumerate().skip(start) {
+        let mutated = match msg {
             Message::User(user) => {
-                externalize_content_blocks(blob_store, &mut user.content).await?;
+                externalize_content_blocks_reporting_mutation(blob_store, &mut user.content).await?
             }
             Message::ToolResults { results, .. } => {
+                let mut mutated = false;
                 for result in results.iter_mut() {
-                    externalize_content_blocks(blob_store, &mut result.content).await?;
+                    mutated |= externalize_content_blocks_reporting_mutation(
+                        blob_store,
+                        &mut result.content,
+                    )
+                    .await?;
                 }
+                mutated
             }
             Message::SystemNotice(notice) => {
-                externalize_system_notice_blocks(blob_store, &mut notice.blocks).await?;
+                externalize_system_notice_blocks_reporting_mutation(blob_store, &mut notice.blocks)
+                    .await?
             }
-            _ => {}
+            _ => false,
+        };
+        if mutated && lowest_mutated.is_none() {
+            lowest_mutated = Some(index);
         }
     }
-    Ok(())
+    Ok(lowest_mutated)
 }
 
 pub async fn hydrate_messages_for_execution(
@@ -577,20 +646,22 @@ pub async fn hydrate_messages_for_execution(
     Ok(())
 }
 
-async fn externalize_system_notice_blocks(
+async fn externalize_system_notice_blocks_reporting_mutation(
     blob_store: &dyn BlobStore,
     blocks: &mut [SystemNoticeBlock],
-) -> Result<(), BlobStoreError> {
+) -> Result<bool, BlobStoreError> {
+    let mut mutated = false;
     for block in blocks {
         match block {
             SystemNoticeBlock::Comms { content, .. }
             | SystemNoticeBlock::ExternalEvent { content, .. } => {
-                externalize_content_blocks(blob_store, content).await?;
+                mutated |=
+                    externalize_content_blocks_reporting_mutation(blob_store, content).await?;
             }
             _ => {}
         }
     }
-    Ok(())
+    Ok(mutated)
 }
 
 async fn hydrate_system_notice_blocks(

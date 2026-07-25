@@ -2422,7 +2422,7 @@ impl DriverEntry {
     pub(crate) async fn machine_commit_completed_boundary_snapshot(
         &mut self,
         receipt: &meerkat_core::lifecycle::RunBoundaryReceipt,
-        session_snapshot: Option<&Vec<u8>>,
+        session_snapshot: Option<Vec<u8>>,
         owner_session_id: &SessionId,
     ) -> Result<(), RuntimeDriverError> {
         match self {
@@ -2561,6 +2561,7 @@ impl DriverEntry {
         run_id: &RunId,
         input_ids: &[InputId],
         session_snapshot: Option<Vec<u8>>,
+        owner_session_id: &SessionId,
     ) -> Result<(), RuntimeDriverError> {
         let stage_authority = machine_authorize_stage_for_run(
             self,
@@ -2575,7 +2576,7 @@ impl DriverEntry {
         })?;
         match self {
             DriverEntry::Ephemeral(d) => {
-                let _ = session_snapshot;
+                let _ = (session_snapshot, owner_session_id);
                 d.machine_realize_live_boundary_context_injected(run_id, input_ids, stage_authority)
                     .map(|_| ())
             }
@@ -2585,6 +2586,7 @@ impl DriverEntry {
                     input_ids,
                     stage_authority,
                     session_snapshot,
+                    owner_session_id,
                 )
                 .await
             }
@@ -5857,7 +5859,7 @@ pub(crate) async fn commit_runtime_loop_run(
     if let Err(err) = driver
         .machine_commit_completed_boundary_snapshot(
             &receipt,
-            session_snapshot.as_ref(),
+            session_snapshot,
             commit_authority.owner_session_id(),
         )
         .await

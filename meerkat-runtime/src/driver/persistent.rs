@@ -1195,6 +1195,7 @@ impl PersistentRuntimeDriver {
         input_ids: &[InputId],
         stage_authority: crate::meerkat_machine::driver::AuthorizedStageForRun,
         session_snapshot: Option<Vec<u8>>,
+        owner_session_id: &meerkat_core::types::SessionId,
     ) -> Result<(), RuntimeDriverError> {
         let checkpoint = self.inner.rollback_snapshot();
         let receipt = match self.inner.machine_realize_live_boundary_context_injected(
@@ -1220,18 +1221,10 @@ impl PersistentRuntimeDriver {
             .atomic_apply(
                 &self.runtime_id,
                 session_snapshot
-                    .as_ref()
-                    .map(|session_snapshot| crate::store::SessionDelta {
-                        session_snapshot: session_snapshot.clone(),
-                    }),
+                    .map(|session_snapshot| crate::store::SessionDelta { session_snapshot }),
                 receipt.clone(),
                 input_updates,
-                session_snapshot
-                    .as_deref()
-                    .and_then(|snapshot| {
-                        serde_json::from_slice::<meerkat_core::Session>(snapshot).ok()
-                    })
-                    .map(|session| session.id().clone()),
+                Some(owner_session_id.clone()),
             )
             .await
         {
@@ -1246,16 +1239,15 @@ impl PersistentRuntimeDriver {
     pub(crate) async fn machine_commit_completed_boundary_snapshot(
         &mut self,
         receipt: &RunBoundaryReceipt,
-        session_snapshot: Option<&Vec<u8>>,
+        session_snapshot: Option<Vec<u8>>,
         owner_session_id: &meerkat_core::types::SessionId,
     ) -> Result<(), RuntimeDriverError> {
         let input_updates = self.inner.authorized_stored_input_states_snapshot()?;
         self.store
             .atomic_apply(
                 &self.runtime_id,
-                session_snapshot.map(|session_snapshot| crate::store::SessionDelta {
-                    session_snapshot: session_snapshot.clone(),
-                }),
+                session_snapshot
+                    .map(|session_snapshot| crate::store::SessionDelta { session_snapshot }),
                 receipt.clone(),
                 input_updates,
                 Some(owner_session_id.clone()),

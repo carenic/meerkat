@@ -494,7 +494,7 @@ fn test_shell_tool_schema() {
     assert!(required.contains(&json!("command")));
 }
 
-/// E2E: ShellToolSet provides all four tools
+/// E2E: ShellToolSet provides all five tools
 #[test]
 fn test_shell_tool_set() {
     let temp_dir = TempDir::new().unwrap();
@@ -503,7 +503,7 @@ fn test_shell_tool_set() {
 
     let tools = tool_set.tools();
 
-    assert_eq!(tools.len(), 4, "Should have 4 shell tools");
+    assert_eq!(tools.len(), 5, "Should have 5 shell tools");
 
     let names: Vec<_> = tools.iter().map(|t| t.name()).collect();
     assert!(names.contains(&"shell"), "Should have shell tool");
@@ -515,6 +515,10 @@ fn test_shell_tool_set() {
     assert!(
         names.contains(&"shell_job_cancel"),
         "Should have shell_job_cancel tool"
+    );
+    assert!(
+        names.contains(&"monitor_start"),
+        "Should have monitor_start tool"
     );
 }
 

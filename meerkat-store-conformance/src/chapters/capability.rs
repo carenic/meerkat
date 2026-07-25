@@ -186,5 +186,31 @@ where
         via_wrapper.messages() == reverse.messages(),
         "the wrapper must serve exactly the messages written through the inner capability",
     )?;
+
+    // Range-read verb forwarding: `load_canonical_head` and
+    // `load_rewrite_commits` have conservative trait defaults (None / derive
+    // from load_rewrites), so a delegating incremental wrapper that fails to
+    // forward them silently downgrades head-trusted range reads to the
+    // whole-load path. The wrapper's capability must answer exactly what the
+    // inner capability answers.
+    let step = "range_read_verbs_forwarded";
+    let inner_canonical = steps.wrap(step, inner_inc.load_canonical_head(reverse.id()).await)?;
+    let wrapped_canonical =
+        steps.wrap(step, wrapped_inc.load_canonical_head(reverse.id()).await)?;
+    steps.ensure(
+        step,
+        wrapped_canonical == inner_canonical,
+        "delegating wrapper must forward load_canonical_head: the wrapper's capability answered \
+         differently from the inner capability (a defaulted override silently disables \
+         head-trusted range reads)",
+    )?;
+    let inner_commits = steps.wrap(step, inner_inc.load_rewrite_commits(reverse.id()).await)?;
+    let wrapped_commits = steps.wrap(step, wrapped_inc.load_rewrite_commits(reverse.id()).await)?;
+    steps.ensure(
+        step,
+        wrapped_commits == inner_commits,
+        "delegating wrapper must forward load_rewrite_commits: the wrapper's capability answered \
+         differently from the inner capability",
+    )?;
     Ok(())
 }

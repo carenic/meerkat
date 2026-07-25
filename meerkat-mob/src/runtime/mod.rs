@@ -57,6 +57,148 @@ pub(crate) fn flow_system_member_id() -> AgentIdentity {
     crate::ids::AgentIdentity::flow_system_provenance()
 }
 
+/// Upper bound between reconciler scans when no wake signal fires. The
+/// placed-kickoff, placed-completion, and remote-turn reconcilers are
+/// event-driven (machine-state watch, mob event subscription, retry
+/// deadlines); this tick only bounds drift from signals those wake sources
+/// cannot observe. It must stay slow: the historical fast idle tick made
+/// every quiescent scan's state clone / ledger replay an idle-CPU driver on
+/// restore-scale mobs.
+pub(crate) const RECONCILE_SAFETY_INTERVAL: meerkat_core::time_compat::Duration =
+    meerkat_core::time_compat::Duration::from_secs(30);
+
+/// Absolute next-scan deadline for a reconciler loop.
+///
+/// The deadline is anchored at the last COMPLETED scan ([`Self::rearm`]) and
+/// persisted across loop iterations; wakes may only pull it EARLIER
+/// ([`Self::pull_earlier`]). Persisting the absolute instant outside the
+/// `select!` wait future is load-bearing: `select!` drops and recreates the
+/// sleep future on every wake, so a deadline computed inside the wait would
+/// reset under sustained wake traffic and the safety scan would starve
+/// (the mobkit `ReconcileCadence::next_safety_deadline` lesson).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ReconcileScanDeadline {
+    next_scan_at: meerkat_core::time_compat::Instant,
+}
+
+impl ReconcileScanDeadline {
+    /// Seed the unconditional first scan one debounce interval from now.
+    ///
+    /// The tokio watch does not fire `changed()` for the value present at
+    /// subscribe time, and custody recovered during resume exists at spawn
+    /// with no subsequent publish, so the first scan must never wait for a
+    /// wake.
+    pub(crate) fn first_scan(
+        now: meerkat_core::time_compat::Instant,
+        debounce: meerkat_core::time_compat::Duration,
+    ) -> Self {
+        Self {
+            next_scan_at: now + debounce,
+        }
+    }
+
+    /// A wake signal arrived: schedule a scan within `debounce`, without ever
+    /// pushing an already-earlier deadline later.
+    pub(crate) fn pull_earlier(
+        &mut self,
+        now: meerkat_core::time_compat::Instant,
+        debounce: meerkat_core::time_compat::Duration,
+    ) {
+        self.next_scan_at = self.next_scan_at.min(now + debounce);
+    }
+
+    /// A scan completed: re-anchor the deadline `delay` from now. This is the
+    /// ONLY place the deadline may move later.
+    pub(crate) fn rearm(
+        &mut self,
+        now: meerkat_core::time_compat::Instant,
+        delay: meerkat_core::time_compat::Duration,
+    ) {
+        self.next_scan_at = now + delay;
+    }
+
+    /// Remaining sleep until the deadline (zero when already due).
+    pub(crate) fn sleep_duration(
+        &self,
+        now: meerkat_core::time_compat::Instant,
+    ) -> meerkat_core::time_compat::Duration {
+        self.next_scan_at.saturating_duration_since(now)
+    }
+}
+
+/// Await the next actor-published machine-state change, disabling the watcher
+/// permanently once the actor drops the sender.
+///
+/// A closed watch completes immediately on every poll, so leaving it
+/// selectable after `Err` would busy-wake the caller's loop; setting the
+/// `Option` to `None` parks the arm on a pending future instead (a destroyed
+/// mob must not spin its reconcilers).
+pub(crate) async fn wait_for_machine_state_change(
+    changes: &mut Option<handle::MobMachineStateChanges>,
+) {
+    match changes {
+        Some(watch) => {
+            if watch.changed().await.is_err() {
+                *changes = None;
+            }
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+#[cfg(test)]
+mod reconcile_cadence_tests {
+    use super::ReconcileScanDeadline;
+    use meerkat_core::time_compat::{Duration, Instant};
+
+    const DEBOUNCE: Duration = Duration::from_millis(100);
+
+    #[test]
+    fn reconcile_scan_deadline_survives_recreated_waits() {
+        let start = Instant::now();
+        let mut deadline = ReconcileScanDeadline::first_scan(start, DEBOUNCE);
+        let armed = start + DEBOUNCE;
+        assert_eq!(deadline.sleep_duration(start), DEBOUNCE);
+
+        // Sustained wake traffic keeps pulling; the deadline must never move
+        // later than its current anchor, so the scan fires despite each wake
+        // recreating the select! sleep future.
+        for wake_ms in [10_u64, 20, 40, 80, 95] {
+            let now = start + Duration::from_millis(wake_ms);
+            deadline.pull_earlier(now, DEBOUNCE);
+            assert!(
+                deadline.sleep_duration(start) <= DEBOUNCE,
+                "a wake must never postpone the pending scan"
+            );
+        }
+        assert_eq!(
+            deadline.sleep_duration(armed),
+            Duration::ZERO,
+            "the originally-armed deadline still fires under sustained wakes"
+        );
+    }
+
+    #[test]
+    fn reconcile_scan_deadline_rearm_anchors_at_scan_completion() {
+        let start = Instant::now();
+        let mut deadline = ReconcileScanDeadline::first_scan(start, DEBOUNCE);
+
+        let scan_done = start + Duration::from_millis(250);
+        let safety = Duration::from_secs(30);
+        deadline.rearm(scan_done, safety);
+        assert_eq!(deadline.sleep_duration(scan_done), safety);
+
+        // A wake after re-arm pulls the deadline down to the debounce window.
+        let wake = scan_done + Duration::from_secs(1);
+        deadline.pull_earlier(wake, DEBOUNCE);
+        assert_eq!(deadline.sleep_duration(wake), DEBOUNCE);
+
+        // A later wake cannot push it back out again.
+        deadline.pull_earlier(wake + Duration::from_millis(1), safety);
+        assert!(deadline.sleep_duration(wake) <= DEBOUNCE);
+    }
+}
+
 pub(crate) mod actor;
 mod actor_turn_executor;
 pub mod bridge;

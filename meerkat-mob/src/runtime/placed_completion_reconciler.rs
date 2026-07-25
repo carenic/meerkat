@@ -35,11 +35,36 @@ struct RetryState {
 
 #[cfg(test)]
 mod tests {
-    use super::MAX_CONCURRENT_HOSTS;
+    use super::{MAX_CONCURRENT_HOSTS, mob_dsl, project_placed_completion_scan};
 
     #[test]
     fn cleanup_host_window_is_bounded() {
         assert_eq!(MAX_CONCURRENT_HOSTS, 8);
+    }
+
+    #[test]
+    fn scan_projection_returns_both_custody_families() {
+        let cancel_requested = mob_dsl::PlacedCompletionObligation {
+            agent_identity: mob_dsl::AgentIdentity("cancel-worker".to_string()),
+            dispatch_sequence: 1,
+            ..Default::default()
+        };
+        let resolved = mob_dsl::PlacedCompletionObligation {
+            agent_identity: mob_dsl::AgentIdentity("resolved-worker".to_string()),
+            dispatch_sequence: 2,
+            ..Default::default()
+        };
+        let mut state = mob_dsl::MobMachineState::default();
+        state
+            .cancel_requested_placed_completion_outcomes
+            .insert(cancel_requested.clone());
+        state
+            .resolved_placed_completion_outcomes
+            .insert(resolved.clone());
+
+        let projection = project_placed_completion_scan(&state);
+        assert_eq!(projection.cancel_requested, vec![cancel_requested]);
+        assert_eq!(projection.resolved, vec![resolved]);
     }
 }
 
@@ -77,6 +102,36 @@ struct ScanSummary {
     live: usize,
     progress: usize,
     next_retry_after: Option<Duration>,
+}
+
+/// Small owned scan input projected under one machine-state watch borrow.
+///
+/// §12.3 compatibility contract: this projection returns owned work rows,
+/// never `&state`, never a full-state clone, and never a state-exposing
+/// closure, so it stays compatible with the durable-jobs execution-activity
+/// projection family expected to join it on `MobHandle`.
+pub(super) struct PlacedCompletionScanProjection {
+    pub(super) cancel_requested: Vec<mob_dsl::PlacedCompletionObligation>,
+    pub(super) resolved: Vec<mob_dsl::PlacedCompletionObligation>,
+}
+
+/// Pure projection over the actor-published machine state: both completion
+/// custody families this reconciler adopts.
+pub(super) fn project_placed_completion_scan(
+    state: &mob_dsl::MobMachineState,
+) -> PlacedCompletionScanProjection {
+    PlacedCompletionScanProjection {
+        cancel_requested: state
+            .cancel_requested_placed_completion_outcomes
+            .iter()
+            .cloned()
+            .collect(),
+        resolved: state
+            .resolved_placed_completion_outcomes
+            .iter()
+            .cloned()
+            .collect(),
+    }
 }
 
 pub(crate) fn obligation_event(
@@ -192,21 +247,38 @@ impl PlacedCompletionReconciler {
 
     async fn run(self) {
         let actor_closed = self.handle.command_tx.clone();
+        // Wake source: the actor publishes the machine-state watch on EVERY
+        // applied input, and both custody families this scan adopts
+        // (cancel-requested / resolved outcomes) are pure machine sets, so
+        // watch wakes are a superset of work arrival. Host receipts fold back
+        // through handle commands -> actor inputs -> publish.
+        let mut machine_changes = Some(self.handle.machine_state_changes());
         let mut delay = SCAN_INTERVAL;
         let mut retry = BTreeMap::<mob_dsl::PlacedCompletionObligation, RetryState>::new();
         let mut row_cursor = BTreeMap::<mob_dsl::HostId, u64>::new();
         let mut host_cursor = 0usize;
+        // Unconditional first scan: the watch does not fire for the value
+        // present at subscribe time, and custody recovered during resume
+        // exists at spawn with no subsequent publish.
+        let mut deadline = super::ReconcileScanDeadline::first_scan(Instant::now(), SCAN_INTERVAL);
         loop {
             tokio::select! {
                 () = actor_closed.closed() => break,
-                () = tokio::time::sleep(delay) => {},
+                () = super::wait_for_machine_state_change(&mut machine_changes) => {
+                    deadline.pull_earlier(Instant::now(), SCAN_INTERVAL);
+                    continue;
+                }
+                () = tokio::time::sleep(deadline.sleep_duration(Instant::now())) => {},
             }
             match self
                 .scan_once(&mut retry, &mut row_cursor, &mut host_cursor)
                 .await
             {
                 Ok(summary) if summary.live == 0 => {
-                    delay = (delay * 2).min(MAX_SCAN_INTERVAL);
+                    // Quiescent: the machine-state watch owns the wake for
+                    // any new custody row; the safety tick only bounds drift
+                    // from signals the watch cannot observe.
+                    delay = super::RECONCILE_SAFETY_INTERVAL;
                 }
                 Ok(summary) if summary.progress > 0 => delay = SCAN_INTERVAL,
                 Ok(summary) => {
@@ -224,6 +296,7 @@ impl PlacedCompletionReconciler {
                     delay = (delay * 2).min(MAX_SCAN_INTERVAL);
                 }
             }
+            deadline.rearm(Instant::now(), delay);
         }
     }
 
@@ -233,17 +306,14 @@ impl PlacedCompletionReconciler {
         row_cursor: &mut BTreeMap<mob_dsl::HostId, u64>,
         host_cursor: &mut usize,
     ) -> Result<ScanSummary, MobError> {
-        let state = self.handle.machine_state_watch_rx.borrow().clone();
-        let pending = state
-            .cancel_requested_placed_completion_outcomes
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
-        let resolved = state
-            .resolved_placed_completion_outcomes
-            .iter()
-            .cloned()
-            .collect::<Vec<_>>();
+        // One borrow-scoped projection instead of cloning the whole
+        // (potentially restore-scale) machine state per scan.
+        let PlacedCompletionScanProjection {
+            cancel_requested: pending,
+            resolved,
+        } = self
+            .handle
+            .project_placed_completion_scan_from_current_machine_state();
 
         let live = pending
             .iter()
@@ -364,17 +434,25 @@ impl PlacedCompletionReconciler {
         &self,
         obligation: &mob_dsl::PlacedCompletionObligation,
     ) -> Result<AttemptOutcome, MobError> {
-        let state = self.handle.machine_state_watch_rx.borrow().clone();
-        let pending_cancel = state
-            .cancel_requested_placed_completion_outcomes
-            .contains(obligation);
-        let resolved = state
-            .resolved_placed_completion_outcomes
-            .contains(obligation);
+        // Watch-borrow discipline: the guard stays inside this sync block and
+        // never crosses an await; the same published value answers all three
+        // gates, exactly as the historical full-state clone did.
+        let (pending_cancel, resolved, route_current) = {
+            let state = self.handle.machine_state_watch_rx.borrow();
+            (
+                state
+                    .cancel_requested_placed_completion_outcomes
+                    .contains(obligation),
+                state
+                    .resolved_placed_completion_outcomes
+                    .contains(obligation),
+                exact_route_is_current(&state, obligation),
+            )
+        };
         if !pending_cancel && !resolved {
             return Ok(AttemptOutcome::Gone);
         }
-        if !exact_route_is_current(&state, obligation) {
+        if !route_current {
             return Err(MobError::Internal(format!(
                 "placed completion '{}' retains machine custody without its exact current route",
                 obligation.input_id.0

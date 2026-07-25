@@ -192,6 +192,7 @@ sh_test(
         "//meerkat-mob:smoke_mob_flow_runtime_test",
         "//meerkat-mob:smoke_mob_generated_image_comms_test",
         "//meerkat-mob:smoke_mob_idle_burn_test",
+        "//meerkat-mob:smoke_mob_turn_latency_test",
         "//meerkat-mob:smoke_mob_resume_test",
         "//meerkat-rest:rkat_rest_bin",
         "//meerkat-rpc:live_smoke_rpc_test",
@@ -256,6 +257,7 @@ E2E_SMOKE_REMOTE_DATA = [
     "//meerkat-mob:smoke_mob_flow_runtime_test",
     "//meerkat-mob:smoke_mob_generated_image_comms_test",
     "//meerkat-mob:smoke_mob_idle_burn_test",
+    "//meerkat-mob:smoke_mob_turn_latency_test",
     "//meerkat-mob:smoke_mob_resume_test",
     "//meerkat-rest:rkat_rest_bin",
     "//meerkat-rpc:live_smoke_rpc_test",
@@ -295,6 +297,7 @@ E2E_SMOKE_TURBO_S_SUITES = [
     ("mob_live_smoke", "mob-live-smoke"),
     ("mob_external_tcp_production_drain", "mob-external-tcp-production-drain"),
     ("mob_idle_burn", "mob-idle-burn"),
+    ("mob_turn_latency", "mob-turn-latency"),
 ]
 
 E2E_SMOKE_TURBO_S_FLOW_RUNTIME_TESTS = [
@@ -431,6 +434,7 @@ test_suite(
         "//meerkat-core:runtime_turn_metadata_typed_round_trip_test",
         "//meerkat-core:source_identity_resolve_enforces_lifecycle_test",
         "//meerkat-core:tool_notice_projection_test",
+        "//meerkat-core:transcript_digest_budget_test",
         "//meerkat-gemini:meerkat_gemini_unit_test",
         "//meerkat-gemini:oauth_resolve_test",
         "//meerkat-hooks:meerkat_hooks_unit_test",
