@@ -4008,6 +4008,46 @@ impl MobHandle {
             .collect()
     }
 
+    /// Borrow-scoped scan projection for the placed-kickoff reconciler.
+    ///
+    /// §12.3 compatibility contract: returns SMALL OWNED data (work rows plus
+    /// lane tags), never `&state`, never a full-state clone, and never a
+    /// state-exposing closure; [`MobMachineStateChanges`] stays untouched and
+    /// state-opaque. The durable-jobs execution-activity projection is
+    /// expected to join this sibling family rather than generalize it.
+    /// Watch-borrow discipline: the guard stays inside this sync fn and never
+    /// crosses an await.
+    pub(super) fn project_placed_kickoff_scan_from_current_machine_state(
+        &self,
+    ) -> super::placed_kickoff_reconciler::PlacedKickoffScanProjection {
+        let machine_state = self.machine_state_watch_rx.borrow();
+        super::placed_kickoff_reconciler::project_placed_kickoff_scan(&machine_state)
+    }
+
+    /// Borrow-scoped scan projection for the placed-completion reconciler.
+    ///
+    /// Same §12.3 contract and watch-borrow discipline as
+    /// [`Self::project_placed_kickoff_scan_from_current_machine_state`].
+    pub(super) fn project_placed_completion_scan_from_current_machine_state(
+        &self,
+    ) -> super::placed_completion_reconciler::PlacedCompletionScanProjection {
+        let machine_state = self.machine_state_watch_rx.borrow();
+        super::placed_completion_reconciler::project_placed_completion_scan(&machine_state)
+    }
+
+    /// Whether the machine currently holds NO remote-turn custody in any
+    /// phase (pending/committed/resolved). One half of the remote-turn
+    /// reconciler's dual-witness quiescence check (the other half is the
+    /// durable-row read of the same scan): machine custody minted before its
+    /// private row becomes readable must keep the scanner on the busy ladder.
+    ///
+    /// Same §12.3 contract and watch-borrow discipline as
+    /// [`Self::project_placed_kickoff_scan_from_current_machine_state`].
+    pub(super) fn project_remote_turn_custody_is_quiet_from_current_machine_state(&self) -> bool {
+        let machine_state = self.machine_state_watch_rx.borrow();
+        super::remote_turn_reconciler::remote_turn_custody_is_quiet(&machine_state)
+    }
+
     /// Observation-only member projection that never enters the mob actor queue.
     ///
     /// Source truth is the shared roster projection plus the actor-published

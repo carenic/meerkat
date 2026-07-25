@@ -10006,6 +10006,17 @@ impl MobBuilder {
                     let _startup_worker_guard = ActorOwnedStartupWorkerGuard::new(actor_runtime_id);
                     kickoff_reconciler_task.await;
                 });
+                // Seed the reconciler's epoch event cache from the boot
+                // replay this function already performed for the idempotency
+                // index, so live scans never re-replay the whole multi-mob
+                // ledger. Pre-actor Record-projection repair appends land
+                // before that replay; anything appended after it is picked up
+                // by the first cursor-tailing refresh.
+                let remote_turn_event_seed =
+                    super::remote_turn_reconciler::RemoteTurnEventSeed::from_boot_replay(
+                        &durable_events,
+                        handle.mob_id(),
+                    );
                 let reconciler_task =
                     super::remote_turn_reconciler::RemoteTurnIntentReconciler::run_owned(
                         handle.mob_id().clone(),
@@ -10013,6 +10024,7 @@ impl MobBuilder {
                         intent_reconciler_provisioner,
                         intent_reconciler_tickets,
                         recovered_remote_intent_runs,
+                        remote_turn_event_seed,
                     );
                 actor.actor_io_tasks.spawn(async move {
                     #[cfg(test)]
