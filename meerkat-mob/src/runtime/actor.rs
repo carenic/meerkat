@@ -20,6 +20,40 @@ type ActorCommandFuture<'a, T> =
 #[cfg(target_arch = "wasm32")]
 type ActorCommandFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + 'a>>;
 
+// Build each command arm's future inside its own monomorphized frame.
+//
+// A debug build reserves a stack slot for every local in a function and does
+// not reuse those slots across match arms, so constructing every handler
+// future inline in `dispatch_command_boxed` reserved the SUM of their sizes on
+// entry even though exactly one arm ever runs. Measured on the mob spawn path:
+// 1322 KB of a 2 MB production worker stack consumed by that prologue alone,
+// against a whole-chain peak near 1.8 MB. Linux reserves larger frames than
+// macOS arm64, which is why `tools_full_with_explicit_auth_binding_can_spawn_
+// within_production_stack_budget` overflowed on CI while passing locally.
+//
+// Taking a thunk moves construction into this function, so the dispatch frame
+// holds only the small closures and the transient peak becomes the largest
+// single handler future instead of their sum.
+#[cfg(not(target_arch = "wasm32"))]
+#[inline(never)]
+fn boxed_arm_future<'a, T, F, Fut>(make: F) -> ActorCommandFuture<'a, T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T> + Send + 'a,
+{
+    Box::pin(make())
+}
+
+#[cfg(target_arch = "wasm32")]
+#[inline(never)]
+fn boxed_arm_future<'a, T, F, Fut>(make: F) -> ActorCommandFuture<'a, T>
+where
+    F: FnOnce() -> Fut,
+    Fut: std::future::Future<Output = T> + 'a,
+{
+    Box::pin(make())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ActorLoopControl {
     ProceedBoundary,
@@ -40,10 +74,11 @@ macro_rules! boxed_actor_dispatch {
             $(
                 $(#[$meta])*
                 $pattern => {
-                    let future: ActorCommandFuture<'_, ActorLoopControl> = Box::pin(async move {
-                        $body
-                        ActorLoopControl::ProceedBoundary
-                    });
+                    let future: ActorCommandFuture<'_, ActorLoopControl> =
+                        boxed_arm_future(move || async move {
+                            $body
+                            ActorLoopControl::ProceedBoundary
+                        });
                     future
                 }
             )*
@@ -51,7 +86,7 @@ macro_rules! boxed_actor_dispatch {
                 $(#[$control_meta])*
                 $control_pattern => {
                     let future: ActorCommandFuture<'_, ActorLoopControl> =
-                        Box::pin(async move $control_body);
+                        boxed_arm_future(move || async move $control_body);
                     future
                 }
             )*
