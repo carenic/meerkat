@@ -35,7 +35,6 @@ use meerkat_core::{
     SessionDeferredTurnState, SessionLlmIdentity, SnapshotProjectionError, SystemContextStateError,
     TurnStateHandle,
 };
-use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{
     Arc, OnceLock,
@@ -1609,12 +1608,21 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         contributing_input_ids: Vec<InputId>,
         session: &meerkat_core::Session,
     ) -> Result<RunBoundaryReceiptDraft, SessionError> {
-        let encoded_messages = serde_json::to_vec(session.messages()).map_err(|err| {
+        // Served from the session's retained SHA-256 midstate, so an ordinary
+        // append costs O(delta). Re-serializing every message and hashing the
+        // result cost a full pass over the document on every turn, which is
+        // what made a one-word reply on a large transcript scale with the
+        // transcript instead of with the reply.
+        //
+        // This digest is minted and checked inside one commit — the boundary
+        // validator only ever sees a receipt produced moments earlier against
+        // the snapshot it was produced from — so the format is an internal
+        // agreement, not a persisted wire contract.
+        let digest = session.transcript_content_digest().map_err(|err| {
             SessionError::Agent(AgentError::InternalError(format!(
-                "failed to serialize session for runtime receipt digest: {err}"
+                "failed to digest session transcript for runtime receipt: {err}"
             )))
         })?;
-        let digest = format!("{:x}", Sha256::digest(encoded_messages));
 
         // Dogma K10: the boundary sequence is machine-owned; the session
         // service returns an UNSEQUENCED draft and the runtime driver mints
@@ -1657,48 +1665,20 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         terminal: Option<CoreApplyTerminal>,
     ) -> Result<CoreApplyOutput, SessionError> {
         let session = self.export_session(id).await?;
-        let session_snapshot = serde_json::to_vec(&session).map_err(|err| {
-            SessionError::Agent(AgentError::InternalError(format!(
-                "failed to serialize session snapshot for runtime commit: {err}"
-            )))
-        })?;
         let receipt =
             Self::build_runtime_receipt(run_id, boundary, contributing_input_ids, &session)?;
 
-        Ok(match terminal {
-            Some(CoreApplyTerminal::RunResult(run_result)) => {
-                CoreApplyOutput::with_run_result(receipt, Some(session_snapshot), *run_result)
-            }
-            Some(CoreApplyTerminal::CallbackPending {
-                tool_use_id,
-                tool_name,
-                args,
-            }) => CoreApplyOutput::with_callback_pending(
-                receipt,
-                Some(session_snapshot),
-                tool_use_id,
-                tool_name,
-                args,
-            ),
-            Some(CoreApplyTerminal::CallbackBatchPending { pending_tool_calls }) => {
-                CoreApplyOutput::with_callback_batch_pending(
-                    receipt,
-                    Some(session_snapshot),
-                    pending_tool_calls,
-                )
-            }
-            Some(CoreApplyTerminal::NoPendingBoundary) => CoreApplyOutput {
-                receipt,
-                session_snapshot: Some(session_snapshot),
-                terminal: Some(CoreApplyTerminal::NoPendingBoundary),
-            },
-            Some(terminal @ CoreApplyTerminal::MachineTerminalFailure { .. }) => CoreApplyOutput {
-                receipt,
-                session_snapshot: Some(session_snapshot),
-                terminal: Some(terminal),
-            },
-            None => CoreApplyOutput::without_terminal(receipt, Some(session_snapshot)),
-        })
+        // Hand the boundary the session we already have, so nothing
+        // downstream deserializes these bytes back into it. `with_session`
+        // performs the single serialization and seals the typed session to
+        // the exact bytes it produced.
+        CoreApplyOutput::new(receipt, terminal)
+            .with_session(std::sync::Arc::new(session))
+            .map_err(|err| {
+                SessionError::Agent(AgentError::InternalError(format!(
+                    "failed to serialize session snapshot for runtime commit: {err}"
+                )))
+            })
     }
 
     async fn require_inline_video_support(

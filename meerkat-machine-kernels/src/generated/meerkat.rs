@@ -1464,6 +1464,356 @@ impl std::fmt::Display for DrainPhase {
     serde::Serialize,
     serde::Deserialize,
 )]
+pub enum DurableRecoveryInputEvidence {
+    #[default]
+    #[serde(rename = "Unfenceable")]
+    Unfenceable,
+    #[serde(rename = "UnboundContentInput")]
+    UnboundContentInput,
+    #[serde(rename = "AllBoundOrInert")]
+    AllBoundOrInert,
+}
+impl DurableRecoveryInputEvidence {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Unfenceable => "Unfenceable",
+            Self::UnboundContentInput => "UnboundContentInput",
+            Self::AllBoundOrInert => "AllBoundOrInert",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for DurableRecoveryInputEvidence {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "Unfenceable" => Ok(Self::Unfenceable),
+            "UnboundContentInput" => Ok(Self::UnboundContentInput),
+            "AllBoundOrInert" => Ok(Self::AllBoundOrInert),
+            other => Err(format!(
+                "invalid DurableRecoveryInputEvidence value `{other}`"
+            )),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for DurableRecoveryInputEvidence {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for DurableRecoveryInputEvidence {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum DurableRecoveryObservedLifecycle {
+    #[default]
+    #[serde(rename = "MissingRow")]
+    MissingRow,
+    #[serde(rename = "Idle")]
+    Idle,
+    #[serde(rename = "Retired")]
+    Retired,
+    #[serde(rename = "NonQuiescent")]
+    NonQuiescent,
+    #[serde(rename = "Undecodable")]
+    Undecodable,
+}
+impl DurableRecoveryObservedLifecycle {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::MissingRow => "MissingRow",
+            Self::Idle => "Idle",
+            Self::Retired => "Retired",
+            Self::NonQuiescent => "NonQuiescent",
+            Self::Undecodable => "Undecodable",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for DurableRecoveryObservedLifecycle {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "MissingRow" => Ok(Self::MissingRow),
+            "Idle" => Ok(Self::Idle),
+            "Retired" => Ok(Self::Retired),
+            "NonQuiescent" => Ok(Self::NonQuiescent),
+            "Undecodable" => Ok(Self::Undecodable),
+            other => Err(format!(
+                "invalid DurableRecoveryObservedLifecycle value `{other}`"
+            )),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for DurableRecoveryObservedLifecycle {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for DurableRecoveryObservedLifecycle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum DurableRecoveryObservedRun {
+    #[default]
+    #[serde(rename = "NoRun")]
+    NoRun,
+    #[serde(rename = "CandidateRun")]
+    CandidateRun,
+    #[serde(rename = "OtherRun")]
+    OtherRun,
+}
+impl DurableRecoveryObservedRun {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::NoRun => "NoRun",
+            Self::CandidateRun => "CandidateRun",
+            Self::OtherRun => "OtherRun",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for DurableRecoveryObservedRun {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "NoRun" => Ok(Self::NoRun),
+            "CandidateRun" => Ok(Self::CandidateRun),
+            "OtherRun" => Ok(Self::OtherRun),
+            other => Err(format!(
+                "invalid DurableRecoveryObservedRun value `{other}`"
+            )),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for DurableRecoveryObservedRun {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for DurableRecoveryObservedRun {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum DurableRecoveryPriorCommit {
+    #[default]
+    #[serde(rename = "DivergesFromCandidate")]
+    DivergesFromCandidate,
+    #[serde(rename = "NoPriorCommit")]
+    NoPriorCommit,
+    #[serde(rename = "PrecedesCandidate")]
+    PrecedesCandidate,
+    #[serde(rename = "MatchesCandidate")]
+    MatchesCandidate,
+}
+impl DurableRecoveryPriorCommit {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::DivergesFromCandidate => "DivergesFromCandidate",
+            Self::NoPriorCommit => "NoPriorCommit",
+            Self::PrecedesCandidate => "PrecedesCandidate",
+            Self::MatchesCandidate => "MatchesCandidate",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for DurableRecoveryPriorCommit {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "DivergesFromCandidate" => Ok(Self::DivergesFromCandidate),
+            "NoPriorCommit" => Ok(Self::NoPriorCommit),
+            "PrecedesCandidate" => Ok(Self::PrecedesCandidate),
+            "MatchesCandidate" => Ok(Self::MatchesCandidate),
+            other => Err(format!(
+                "invalid DurableRecoveryPriorCommit value `{other}`"
+            )),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for DurableRecoveryPriorCommit {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for DurableRecoveryPriorCommit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum DurableTailRecoveryClass {
+    #[default]
+    #[serde(rename = "CompletedCandidate")]
+    CompletedCandidate,
+    #[serde(rename = "InterruptedRepairableCandidate")]
+    InterruptedRepairableCandidate,
+    #[serde(rename = "Ambiguous")]
+    Ambiguous,
+}
+impl DurableTailRecoveryClass {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::CompletedCandidate => "CompletedCandidate",
+            Self::InterruptedRepairableCandidate => "InterruptedRepairableCandidate",
+            Self::Ambiguous => "Ambiguous",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for DurableTailRecoveryClass {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "CompletedCandidate" => Ok(Self::CompletedCandidate),
+            "InterruptedRepairableCandidate" => Ok(Self::InterruptedRepairableCandidate),
+            "Ambiguous" => Ok(Self::Ambiguous),
+            other => Err(format!("invalid DurableTailRecoveryClass value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for DurableTailRecoveryClass {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for DurableTailRecoveryClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub enum DurableTailRecoveryDisposition {
+    #[default]
+    #[serde(rename = "RefuseRecovery")]
+    RefuseRecovery,
+    #[serde(rename = "CommitCompleted")]
+    CommitCompleted,
+    #[serde(rename = "RepairAndCommitInterrupted")]
+    RepairAndCommitInterrupted,
+    #[serde(rename = "HoldIntact")]
+    HoldIntact,
+}
+impl DurableTailRecoveryDisposition {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::RefuseRecovery => "RefuseRecovery",
+            Self::CommitCompleted => "CommitCompleted",
+            Self::RepairAndCommitInterrupted => "RepairAndCommitInterrupted",
+            Self::HoldIntact => "HoldIntact",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for DurableTailRecoveryDisposition {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "RefuseRecovery" => Ok(Self::RefuseRecovery),
+            "CommitCompleted" => Ok(Self::CommitCompleted),
+            "RepairAndCommitInterrupted" => Ok(Self::RepairAndCommitInterrupted),
+            "HoldIntact" => Ok(Self::HoldIntact),
+            other => Err(format!(
+                "invalid DurableTailRecoveryDisposition value `{other}`"
+            )),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for DurableTailRecoveryDisposition {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for DurableTailRecoveryDisposition {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum ExternalToolSurfaceBaseState {
     #[default]
     #[serde(rename = "Absent")]
@@ -10799,6 +11149,7 @@ pub struct State {
     pub boundary_cancel_dispatch_pending: bool,
     pub boundary_cancel_dispatch_generation: u64,
     pub turn_terminal_run_id: Option<RunId>,
+    pub recovered_boundary_sequence: u64,
     pub terminal_outcome: Option<TurnTerminalOutcome>,
     pub terminal_cause_kind: Option<TurnTerminalCauseKind>,
     pub last_runtime_apply_failure_cause: Option<RuntimeApplyFailureCause>,
@@ -11118,6 +11469,18 @@ pub mod inputs {
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct RegisterSession {
         pub session_id: SessionId,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct AuthorizeDurableTailRecovery {
+        pub session_id: SessionId,
+        pub candidate_id: String,
+        pub candidate_run_id: RunId,
+        pub class: DurableTailRecoveryClass,
+        pub observed_lifecycle: DurableRecoveryObservedLifecycle,
+        pub observed_current_run: DurableRecoveryObservedRun,
+        pub last_committed_sequence: u64,
+        pub prior_commit: DurableRecoveryPriorCommit,
+        pub input_evidence: DurableRecoveryInputEvidence,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct PrepareTerminalSupervisorCleanupBindings {
@@ -12790,6 +13153,7 @@ pub mod inputs {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Input {
     RegisterSession(inputs::RegisterSession),
+    AuthorizeDurableTailRecovery(inputs::AuthorizeDurableTailRecovery),
     PrepareTerminalSupervisorCleanupBindings(inputs::PrepareTerminalSupervisorCleanupBindings),
     BeginUnregisterSession(inputs::BeginUnregisterSession),
     BeginUnregisterUnservedAttachment(inputs::BeginUnregisterUnservedAttachment),
@@ -13097,6 +13461,7 @@ impl Input {
     pub fn kind(&self) -> InputKind {
         match self {
             Self::RegisterSession(_) => InputKind::RegisterSession,
+            Self::AuthorizeDurableTailRecovery(_) => InputKind::AuthorizeDurableTailRecovery,
             Self::PrepareTerminalSupervisorCleanupBindings(_) => {
                 InputKind::PrepareTerminalSupervisorCleanupBindings
             }
@@ -13489,6 +13854,7 @@ impl Input {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum InputKind {
     RegisterSession,
+    AuthorizeDurableTailRecovery,
     PrepareTerminalSupervisorCleanupBindings,
     BeginUnregisterSession,
     BeginUnregisterUnservedAttachment,
@@ -13899,6 +14265,17 @@ pub mod effects {
     pub struct TurnRunCompleted {
         pub run_id: RunId,
         pub outcome: TurnTerminalOutcome,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct DurableTailRecoveryAuthorized {
+        pub candidate_id: String,
+        pub disposition: DurableTailRecoveryDisposition,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct DurableTailRecoveryCommitAuthorized {
+        pub candidate_id: String,
+        pub disposition: DurableTailRecoveryDisposition,
+        pub boundary_sequence: u64,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct TurnRunFailed {
@@ -14750,6 +15127,8 @@ pub enum Effect {
     TurnBoundaryApplied(effects::TurnBoundaryApplied),
     LiveBoundaryContextReceiptResolved(effects::LiveBoundaryContextReceiptResolved),
     TurnRunCompleted(effects::TurnRunCompleted),
+    DurableTailRecoveryAuthorized(effects::DurableTailRecoveryAuthorized),
+    DurableTailRecoveryCommitAuthorized(effects::DurableTailRecoveryCommitAuthorized),
     TurnRunFailed(effects::TurnRunFailed),
     TurnRunCancelled(effects::TurnRunCancelled),
     TurnCheckCompaction(effects::TurnCheckCompaction),
@@ -14920,6 +15299,8 @@ pub enum EffectKind {
     TurnBoundaryApplied,
     LiveBoundaryContextReceiptResolved,
     TurnRunCompleted,
+    DurableTailRecoveryAuthorized,
+    DurableTailRecoveryCommitAuthorized,
     TurnRunFailed,
     TurnRunCancelled,
     TurnCheckCompaction,
@@ -15482,6 +15863,25 @@ pub mod command_capabilities {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum TransitionId {
     Initialize,
+    AuthorizeDurableTailRecoveryCommitIdle,
+    AuthorizeDurableTailRecoveryCommitRetired,
+    AuthorizeDurableTailRecoveryRepairIdle,
+    AuthorizeDurableTailRecoveryRepairRetired,
+    AuthorizeDurableTailRecoveryHoldIdle,
+    AuthorizeDurableTailRecoveryHoldRetired,
+    AuthorizeDurableTailRecoveryRefusePriorCommitIdle,
+    AuthorizeDurableTailRecoveryRefusePriorCommitRetired,
+    AuthorizeDurableTailRecoveryHoldInputEvidenceIdle,
+    AuthorizeDurableTailRecoveryHoldInputEvidenceRetired,
+    AuthorizeDurableTailRecoveryRefuseRunFactsIdle,
+    AuthorizeDurableTailRecoveryRefuseRunFactsRetired,
+    AuthorizeDurableTailRecoveryRefusePersistedFactsIdle,
+    AuthorizeDurableTailRecoveryRefusePersistedFactsRetired,
+    AuthorizeDurableTailRecoveryRefuseNonQuiescentInitializing,
+    AuthorizeDurableTailRecoveryRefuseNonQuiescentAttached,
+    AuthorizeDurableTailRecoveryRefuseNonQuiescentRunning,
+    AuthorizeDurableTailRecoveryRefuseNonQuiescentStopped,
+    AuthorizeDurableTailRecoveryRefuseNonQuiescentDestroyed,
     PrepareTerminalSupervisorCleanupBindings,
     RegisterSessionIdle,
     RegisterSessionAttached,
@@ -17525,6 +17925,7 @@ pub fn initial_state() -> State {
         boundary_cancel_dispatch_pending: false,
         boundary_cancel_dispatch_generation: 0,
         turn_terminal_run_id: None,
+        recovered_boundary_sequence: 0,
         terminal_outcome: None,
         terminal_cause_kind: None,
         last_runtime_apply_failure_cause: None,

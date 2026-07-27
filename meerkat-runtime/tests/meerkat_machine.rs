@@ -27,7 +27,6 @@ use meerkat_runtime::{
     SessionDelta, SessionServiceRuntimeExt,
 };
 use meerkat_store::MemoryBlobStore;
-use sha2::{Digest, Sha256};
 
 fn memory_blob_store() -> Arc<dyn BlobStore> {
     Arc::new(MemoryBlobStore::new())
@@ -863,10 +862,14 @@ async fn failed_service_turn_atomically_commits_snapshot_receipt_and_lifecycle()
     assert_eq!(receipt.boundary, RunApplyBoundary::Immediate);
     assert!(receipt.contributing_input_ids.is_empty());
     assert_eq!(receipt.message_count, session.messages().len());
-    let encoded_messages = serde_json::to_vec(session.messages()).unwrap();
     assert_eq!(
         receipt.conversation_digest,
-        Some(format!("{:x}", Sha256::digest(encoded_messages)))
+        Some(
+            session
+                .transcript_content_digest()
+                .expect("digest session messages")
+        ),
+        "receipt must carry the canonical accumulator digest of the committed session"
     );
     assert!(
         store
@@ -1482,17 +1485,17 @@ async fn recycle_keeps_waiters_for_preserved_pending_input() {
             run_id: RunId,
             primitive: RunPrimitive,
         ) -> Result<CoreApplyOutput, CoreExecutorError> {
-            Ok(CoreApplyOutput {
-                receipt: RunBoundaryReceiptDraft {
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
                     run_id,
                     boundary: RunApplyBoundary::RunStart,
                     contributing_input_ids: primitive.contributing_input_ids().to_vec(),
                     conversation_digest: None,
                     message_count: 0,
                 },
-                session_snapshot: None,
-                terminal: None,
-            })
+                None,
+                None,
+            ))
         }
         async fn cancel_after_boundary(
             &mut self,
@@ -1567,17 +1570,17 @@ async fn recycle_attached_runtime_wakes_preserved_queued_work() {
             primitive: RunPrimitive,
         ) -> Result<CoreApplyOutput, CoreExecutorError> {
             self.apply_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(CoreApplyOutput {
-                receipt: RunBoundaryReceiptDraft {
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
                     run_id,
                     boundary: RunApplyBoundary::RunStart,
                     contributing_input_ids: primitive.contributing_input_ids().to_vec(),
                     conversation_digest: None,
                     message_count: 0,
                 },
-                session_snapshot: None,
-                terminal: None,
-            })
+                None,
+                None,
+            ))
         }
 
         async fn cancel_after_boundary(
@@ -1738,17 +1741,17 @@ async fn accept_with_executor_triggers_loop() {
             primitive: RunPrimitive,
         ) -> Result<CoreApplyOutput, CoreExecutorError> {
             self.called.store(true, Ordering::SeqCst);
-            Ok(CoreApplyOutput {
-                receipt: RunBoundaryReceiptDraft {
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
                     run_id,
                     boundary: RunApplyBoundary::RunStart,
                     contributing_input_ids: primitive.contributing_input_ids().to_vec(),
                     conversation_digest: None,
                     message_count: 0,
                 },
-                session_snapshot: None,
-                terminal: None,
-            })
+                None,
+                None,
+            ))
         }
 
         async fn cancel_after_boundary(
@@ -1864,17 +1867,17 @@ async fn runtime_comms_terminal_response_wake_drains_requester_queue() {
                 _ => RunApplyBoundary::RunStart,
             };
 
-            Ok(CoreApplyOutput {
-                receipt: RunBoundaryReceiptDraft {
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
                     run_id,
                     boundary,
                     contributing_input_ids: primitive.contributing_input_ids().to_vec(),
                     conversation_digest: None,
                     message_count: 0,
                 },
-                session_snapshot: None,
-                terminal: None,
-            })
+                None,
+                None,
+            ))
         }
 
         async fn cancel_after_boundary(
@@ -2396,17 +2399,17 @@ async fn failed_executor_continues_processing_backlog() {
                     "first run fails",
                 ));
             }
-            Ok(CoreApplyOutput {
-                receipt: RunBoundaryReceiptDraft {
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
                     run_id,
                     boundary: RunApplyBoundary::RunStart,
                     contributing_input_ids: primitive.contributing_input_ids().to_vec(),
                     conversation_digest: None,
                     message_count: 0,
                 },
-                session_snapshot: None,
-                terminal: None,
-            })
+                None,
+                None,
+            ))
         }
 
         async fn cancel_after_boundary(
@@ -2502,17 +2505,17 @@ async fn ensure_session_with_executor_upgrades_registered_session() {
             primitive: RunPrimitive,
         ) -> Result<CoreApplyOutput, CoreExecutorError> {
             self.called.store(true, Ordering::SeqCst);
-            Ok(CoreApplyOutput {
-                receipt: RunBoundaryReceiptDraft {
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
                     run_id,
                     boundary: RunApplyBoundary::RunStart,
                     contributing_input_ids: primitive.contributing_input_ids().to_vec(),
                     conversation_digest: None,
                     message_count: 0,
                 },
-                session_snapshot: None,
-                terminal: None,
-            })
+                None,
+                None,
+            ))
         }
 
         async fn cancel_after_boundary(
@@ -2601,17 +2604,17 @@ async fn ensure_session_with_executor_upgrades_racy_registration() {
             primitive: RunPrimitive,
         ) -> Result<CoreApplyOutput, CoreExecutorError> {
             self.called.store(true, Ordering::SeqCst);
-            Ok(CoreApplyOutput {
-                receipt: RunBoundaryReceiptDraft {
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
                     run_id,
                     boundary: RunApplyBoundary::RunStart,
                     contributing_input_ids: primitive.contributing_input_ids().to_vec(),
                     conversation_digest: None,
                     message_count: 0,
                 },
-                session_snapshot: None,
-                terminal: None,
-            })
+                None,
+                None,
+            ))
         }
 
         async fn cancel_after_boundary(
@@ -2699,17 +2702,17 @@ async fn ensure_session_with_executor_repairs_stale_attached_driver() {
             run_id: RunId,
             primitive: RunPrimitive,
         ) -> Result<CoreApplyOutput, CoreExecutorError> {
-            Ok(CoreApplyOutput {
-                receipt: RunBoundaryReceiptDraft {
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
                     run_id,
                     boundary: RunApplyBoundary::RunStart,
                     contributing_input_ids: primitive.contributing_input_ids().to_vec(),
                     conversation_digest: None,
                     message_count: 0,
                 },
-                session_snapshot: None,
-                terminal: None,
-            })
+                None,
+                None,
+            ))
         }
 
         async fn cancel_after_boundary(
@@ -2743,17 +2746,17 @@ async fn ensure_session_with_executor_repairs_stale_attached_driver() {
             primitive: RunPrimitive,
         ) -> Result<CoreApplyOutput, CoreExecutorError> {
             self.called.store(true, Ordering::SeqCst);
-            Ok(CoreApplyOutput {
-                receipt: RunBoundaryReceiptDraft {
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
                     run_id,
                     boundary: RunApplyBoundary::RunStart,
                     contributing_input_ids: primitive.contributing_input_ids().to_vec(),
                     conversation_digest: None,
                     message_count: 0,
                 },
-                session_snapshot: None,
-                terminal: None,
-            })
+                None,
+                None,
+            ))
         }
 
         async fn cancel_after_boundary(
@@ -2897,17 +2900,17 @@ async fn stop_runtime_executor_keeps_attachment_live_until_stop_completes() {
             run_id: RunId,
             primitive: RunPrimitive,
         ) -> Result<CoreApplyOutput, CoreExecutorError> {
-            Ok(CoreApplyOutput {
-                receipt: RunBoundaryReceiptDraft {
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
                     run_id,
                     boundary: RunApplyBoundary::RunStart,
                     contributing_input_ids: primitive.contributing_input_ids().to_vec(),
                     conversation_digest: None,
                     message_count: 0,
                 },
-                session_snapshot: None,
-                terminal: None,
-            })
+                None,
+                None,
+            ))
         }
 
         async fn cancel_after_boundary(
@@ -3014,17 +3017,17 @@ async fn completed_boundary_commit_failure_unwinds_runtime_loop_state() {
             run_id: RunId,
             primitive: RunPrimitive,
         ) -> Result<CoreApplyOutput, CoreExecutorError> {
-            Ok(CoreApplyOutput {
-                receipt: RunBoundaryReceiptDraft {
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
                     run_id,
                     boundary: RunApplyBoundary::RunStart,
                     contributing_input_ids: primitive.contributing_input_ids().to_vec(),
                     conversation_digest: None,
                     message_count: 0,
                 },
-                session_snapshot: None,
-                terminal: None,
-            })
+                None,
+                None,
+            ))
         }
 
         async fn cancel_after_boundary(
@@ -3095,17 +3098,17 @@ async fn completed_boundary_commit_failure_terminates_runtime_loop_completion_wa
             run_id: RunId,
             primitive: RunPrimitive,
         ) -> Result<CoreApplyOutput, CoreExecutorError> {
-            Ok(CoreApplyOutput {
-                receipt: RunBoundaryReceiptDraft {
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
                     run_id,
                     boundary: RunApplyBoundary::RunStart,
                     contributing_input_ids: primitive.contributing_input_ids().to_vec(),
                     conversation_digest: None,
                     message_count: 0,
                 },
-                session_snapshot: None,
-                terminal: None,
-            })
+                None,
+                None,
+            ))
         }
 
         async fn cancel_after_boundary(
@@ -3174,17 +3177,17 @@ async fn completed_run_runtime_loop_skips_terminal_lifecycle_snapshot_writer() {
             run_id: RunId,
             primitive: RunPrimitive,
         ) -> Result<CoreApplyOutput, CoreExecutorError> {
-            Ok(CoreApplyOutput {
-                receipt: RunBoundaryReceiptDraft {
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
                     run_id,
                     boundary: RunApplyBoundary::RunStart,
                     contributing_input_ids: primitive.contributing_input_ids().to_vec(),
                     conversation_digest: None,
                     message_count: 0,
                 },
-                session_snapshot: None,
-                terminal: None,
-            })
+                None,
+                None,
+            ))
         }
 
         async fn cancel_after_boundary(
@@ -3508,17 +3511,18 @@ async fn completion_handle_resolves_without_result() {
             run_id: RunId,
             primitive: RunPrimitive,
         ) -> Result<CoreApplyOutput, CoreExecutorError> {
-            Ok(CoreApplyOutput {
-                receipt: RunBoundaryReceiptDraft {
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                // No RunResult
+                RunBoundaryReceiptDraft {
                     run_id,
                     boundary: RunApplyBoundary::RunStart,
                     contributing_input_ids: primitive.contributing_input_ids().to_vec(),
                     conversation_digest: None,
                     message_count: 0,
                 },
-                session_snapshot: None,
-                terminal: None, // No RunResult
-            })
+                None,
+                None,
+            ))
         }
         async fn cancel_after_boundary(
             &mut self,
@@ -4048,17 +4052,17 @@ async fn attached_sessions_do_not_spawn_comms_drains_without_keep_alive() {
             run_id: RunId,
             primitive: RunPrimitive,
         ) -> Result<CoreApplyOutput, CoreExecutorError> {
-            Ok(CoreApplyOutput {
-                receipt: RunBoundaryReceiptDraft {
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
                     run_id,
                     boundary: RunApplyBoundary::RunStart,
                     contributing_input_ids: primitive.contributing_input_ids().to_vec(),
                     conversation_digest: None,
                     message_count: 0,
                 },
-                session_snapshot: None,
-                terminal: None,
-            })
+                None,
+                None,
+            ))
         }
 
         async fn cancel_after_boundary(
@@ -4119,17 +4123,17 @@ async fn successful_execution_fires_boundary_applied() {
             run_id: RunId,
             primitive: RunPrimitive,
         ) -> Result<CoreApplyOutput, CoreExecutorError> {
-            Ok(CoreApplyOutput {
-                receipt: RunBoundaryReceiptDraft {
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
                     run_id,
                     boundary: RunApplyBoundary::RunStart,
                     contributing_input_ids: primitive.contributing_input_ids().to_vec(),
                     conversation_digest: None,
                     message_count: 0,
                 },
-                session_snapshot: None,
-                terminal: None,
-            })
+                None,
+                None,
+            ))
         }
 
         async fn cancel_after_boundary(
@@ -4210,17 +4214,17 @@ async fn executor_attached_session_is_executor_ready() {
             run_id: RunId,
             primitive: RunPrimitive,
         ) -> Result<CoreApplyOutput, CoreExecutorError> {
-            Ok(CoreApplyOutput {
-                receipt: RunBoundaryReceiptDraft {
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
                     run_id,
                     boundary: RunApplyBoundary::RunStart,
                     contributing_input_ids: primitive.contributing_input_ids().to_vec(),
                     conversation_digest: None,
                     message_count: 0,
                 },
-                session_snapshot: None,
-                terminal: None,
-            })
+                None,
+                None,
+            ))
         }
         async fn cancel_after_boundary(
             &mut self,

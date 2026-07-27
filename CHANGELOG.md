@@ -13,6 +13,158 @@ via cargo-semver-checks against the published baselines).
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat_mob::MobSessionService` gains a REQUIRED `load_session_for_resume`
+  returning the new `ResumeSessionLoad` enum (no default: a composition over
+  the legacy optional reads can never produce `ArchivedNotRevivable`, so
+  implementers must state their own truth); `MobError` gains
+  `SessionUnavailableForResume` with a typed
+  `SessionResumeUnavailableReason`, and `MobFailureClass` gains
+  `TargetArchived`; `RuntimeProjectionRollbackDisposition` /
+  `ResolveRuntimeProjectionRollback` are replaced by
+  `RuntimeProjectionConflictDisposition` / `ResolveRuntimeProjectionConflict`
+  (and `RebuildToAuthority` no longer exists), whose input gains
+  `row_provenance`; `SessionCheckpointProvenance` gains
+  `RecoveredRunBoundaryCommit` and `RecoveredInterruptedBoundary` under a new
+  per-record stamp schema v2 (`SESSION_CHECKPOINT_STAMP_SCHEMA_VERSION_RECOVERED`
+  — ordinary stamps still write v1, so only recovered records refuse on older
+  binaries, and they refuse typed rather than as unknown-enum corruption);
+  `CoreApplyOutput`'s public `session_snapshot`/`session` fields collapse
+  into one private sealed `BoundSessionCommit` field (constructors
+  `CoreApplyOutput::new` / `with_untyped_snapshot` replace struct literals;
+  accessors `committed()` / `snapshot_bytes()` / `session()` /
+  `into_parts()`), and `with_session` returns `Result` because it mints the
+  sealed pair by serializing the session itself, so the certified typed
+  session and the persisted bytes cannot diverge or be re-paired;
+  `commit_runtime_loop_run` takes the sealed commit; `SessionError` gains
+  two typed variants, `DurableTailHeldForRecovery` and
+  `DurableEvidenceQuarantined` (stable codes
+  `SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY` /
+  `SESSION_DURABLE_EVIDENCE_QUARANTINED`, typed `durable_resume_hold`
+  structured payload), so exhaustive matches over `SessionError` need two
+  new arms; `ResolveRuntimeSnapshotReadSource` input/effect shapes changed;
+  `AuthorizeDurableTailRecovery` gains persisted-fact inputs
+  (`observed_lifecycle`, `observed_current_run`, `last_committed_sequence`)
+  plus the `prior_commit` / `input_evidence` evidence enums
+  (`DurableRecoveryPriorCommit`, `DurableRecoveryInputEvidence`), and commit
+  verdicts arrive as the `DurableTailRecoveryCommitAuthorized` effect
+  carrying the machine-minted boundary sequence;
+  `DurableTailRecoveryRequest`'s fields are private and its only
+  constructor, `from_classification`, requires the classifier's own
+  `DurableTailClassified` verdict effect; `RuntimeStore` gains
+  `load_committed_boundary_receipts` and `load_input_states_with_versions`
+  (both defaulted) and two fencing error variants
+  (`InputRowVersionConflict` / `MachineLifecycleVersionConflict`) — stores
+  applying fenced records must enforce `expected_row_digest` inside the
+  writing transaction.
+
+### Fixed
+
+- **Head-canonical cold resume no longer serves a stale runtime snapshot in
+  place of the committed durable head** (advisory
+  `ADVISORY-0.8.6-head-canonical-resume.md`, form 1) and **archived sessions
+  are no longer reported as missing** (form 2). Cold reads drive a typed,
+  machine-owned read-source table; a durable tail whose boundary commit lost
+  a shutdown race is RECOVERED through a machine-authorized pipeline
+  (classification → authorization → one atomic `atomic_apply` of recovered
+  snapshot + receipt + input terminalization) under new recovered-boundary
+  provenances anchored to the last committed authority. The recovery rule:
+  every verified durable descendant is preserved — committed as completed,
+  closed as interrupted (typed recovery notice, input terminalized not
+  requeued), or held intact. Nothing
+  rolls back; `RebuildToAuthority` is deleted, with
+  `ConvergeSupersededProjection` covering the abort-replay projection case
+  its wedge invariant proves safe. Exactly-once holds across recovery: the
+  commit terminalizes the consumed input so the delivery layer does not
+  re-run a recovered turn.
+- **Recovery hardening (external review of the recovery pipeline).** A
+  dangling `tool_use` in a durable tail now HOLDS the tail for reconciliation
+  instead of being auto-closed with synthetic results: the call proves
+  intent, not execution, and its external side effect may already have fired.
+  Recovery authorization judges the PERSISTED machine-lifecycle row and the
+  durably committed receipts (typed machine inputs) instead of a freshly
+  registered, vacuously quiescent authority; the machine MINTS the recovery
+  boundary sequence one past the last committed receipt for the run (a
+  hard-coded sequence 1 could collide with an interrupted tool loop's
+  `BoundaryContinue` receipt) and records the run terminal, and the shell
+  realizes it through the lifecycle-aware atomic seam fenced on the exact
+  observed row version. The machine also owns the already-recovered refusal:
+  a candidate the highest committed receipt already covers refuses instead
+  of minting a phantom duplicate boundary (receipt-key uniqueness fences
+  only same-sequence races, not a second recovery that observes the first
+  one's receipt), and a prior commit the candidate neither extends nor
+  equals refuses as divergent. Input terminalization now uses durable
+  identity only (persisted run bindings, receipt `contributing_input_ids`)
+  with fenced row-version CAS; text matching is gone, and an unbound
+  non-terminal content input holds the recovery instead of guessing — both
+  hold verdicts are machine-minted, the shell observes input evidence before
+  the drive and never downgrades a commit authorization on its own. A held
+  or quarantined session surfaces typed
+  (`SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY` /
+  `SESSION_DURABLE_EVIDENCE_QUARANTINED` with the `durable_resume_hold`
+  payload) instead of as internal-error prose. Run→input bindings are
+  persisted at staging, BEFORE execution, so a crash mid-run leaves identity
+  evidence to recover against. Recovery promotes the whole durable document
+  (usage, timestamps, every non-transcript metadata key — including
+  compaction projection intents) rather than messages alone. A committed
+  strict descendant now wins over a stale live snapshot regardless of local
+  actor liveness (an archived head whose runtime retirement failed was
+  masked), and projection convergence requires intra-turn row provenance so
+  two committed siblings can never overwrite each other. Read-triggered
+  recovery takes an exclusive per-session fence, re-observes the head under
+  it, and converges idempotently when a competing process wins the commit.
+  The advisory's own "Am I affected?" command no longer uses
+  `sqlite3 ?immutable=1`, which ignores the WAL and can report a false
+  "unaffected".
+- **P0: process-global verification memos no longer bless bytes nobody
+  validated.** The transcript-graph decode memo stores the proven graph
+  object (a hit substitutes proven content) with `digest_format` and
+  per-body `created_at` pinned into its key; the global stamp-verification
+  cache is replaced by a per-`Session` seal cleared by every content
+  mutation, including the three that do not bump `updated_at`.
+- Slim head-canonical projections whose carried transcript-history witness
+  exactly matches the previous graph's derived witness no longer read as
+  "would erase retained transcript history state" (both erase sites).
+- Conversation digests unified on the canonical `sha256:<hex>` accumulator
+  format across every producer and validator (the mob ephemeral producer and
+  the machine-terminal validation still minted/expected bare hex — failing
+  every completed-run commit on those paths).
+- `cargo check -p meerkat-core --no-default-features` compiles again
+  (ungated `JsonSchema` derive demanded a feature-gated impl; fixed with a
+  schema-invariant `cfg_attr` skip).
+- Debug-build stack overflow at 2 MiB worker stacks: the agent loop's
+  1700-line polling arm is split per-phase (813K → 170K frame), child-agent
+  construction runs on a fresh task via the new
+  `meerkat_runtime::stack_relief` (never nested in a parent's poll stack),
+  and the mob stack-budget gate is un-ignored at 2 MiB / opt-level 0
+  (measured high-water 1.9–2.0 MiB before, ≤1.125 MiB after; budget and
+  opt-level untouched).
+
+### Changed
+
+- The turn-latency smoke gate asserts what is actually true today: fixture
+  validity, a calibrated small-side band on bytes hashed per turn
+  (instrument honesty — a broken counter reads zero, an inflated baseline
+  reads high), and a per-fixture boundary-serialization envelope
+  (repeated-reserialize backstop, using a new
+  `global_session_encode_bytes` counter, because a digest-flat turn can
+  still hide an O(document) reserialize that hashes nothing). The
+  large/small FLATNESS ratio is recorded as a measurement, not asserted:
+  size-independent turn-boundary work has not landed, and its assertion
+  lives in `mob_turn_flatness_red_by_design`, deliberately outside every
+  lane until the witness-v3 migration arms it. Shipping a known-red
+  assertion inside a required lane would have been a false green.
+- Large-fixture turn cost 479 → 435 MB hashed per turn (sealed
+  transcript-history threading; the 8 per-turn document decodes reuse the
+  sealed parse; transcript-history extracted from `session.rs` into
+  `session/transcript_history/`). Not flat yet — remaining drivers are fully
+  attributed (history witness 109 MB/turn with a format-v3 design under
+  review; restore-seam revalidation 47; compaction-path revalidations ~59;
+  per-decode graph validation 55, proven not memoizable; checkpoint
+  canonical passes 36). Note the large fixture runs a compaction rewrite
+  every measured turn; real sessions pay that share at compaction cadence.
+
 ### Added
 
 - **`claude-opus-5`**: Claude Opus 5 joins the curated Anthropic catalog

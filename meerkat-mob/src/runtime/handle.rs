@@ -3,6 +3,23 @@ use crate::MobRuntimeMode;
 use crate::generated::adaptive_mob_bundle as adaptive_bundle;
 use crate::machines::mob_machine as mob_dsl;
 use crate::mob_machine::{MobMachineCommand, MobMachineCommandResult};
+
+/// Boxed machine-command future. Concrete (not opaque) because some command
+/// arms re-enter the seam, making opaque `Send` inference cyclic — and
+/// `Send`-bound only off-wasm: the wasm32 stores' futures are single-threaded
+/// and `!Send`, and `stack_relief` awaits inline there.
+#[cfg(not(target_arch = "wasm32"))]
+type BoxedMachineCommandFuture = std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<MobMachineCommandResult, MobError>>
+            + Send
+            + 'static,
+    >,
+>;
+#[cfg(target_arch = "wasm32")]
+type BoxedMachineCommandFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<MobMachineCommandResult, MobError>> + 'static>,
+>;
 use crate::roster::MobMemberKickoffSnapshot;
 use crate::run::{MobMachineFlowRunCommand, flow_run};
 #[cfg(test)]
@@ -1607,6 +1624,11 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         // Fork-source session history unavailable (typed W-G retype): the
         // source SESSION could not serve the read — session-class failure.
         MobError::ForkSourceUnavailable { .. } => {
+            mob_dsl::MobSpawnManyFailureObservationKind::SessionError
+        }
+        // Typed resume refusal (archived-but-intact or absent durable
+        // session): the SESSION could not serve — session-class failure.
+        MobError::SessionUnavailableForResume { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::SessionError
         }
         // Capability-contract replacement is a host bind/rebind concern, not
@@ -3246,7 +3268,23 @@ impl MobHandle {
             .map_err(|_| MobError::ActorReplyChannelClosed)
     }
 
-    async fn execute_machine_command(
+    // Machine commands are issued from inside calling agents' tool-dispatch
+    // polls (mob_create/spawn/wire/...). The routing match in
+    // `execute_machine_command_inner` has a large opt-level=0 poll frame (a
+    // slot for every arm's temporaries), so run it on its own task instead
+    // of stacking that frame onto the caller's run-loop chain (2 MiB
+    // production worker-stack budget). Returns a concrete boxed future
+    // because some command arms re-enter this seam (ensure-member/reconcile
+    // → retire/spawn), which would make opaque future types — and their
+    // `Send` inference — mutually recursive.
+    fn execute_machine_command(&self, command: MobMachineCommand) -> BoxedMachineCommandFuture {
+        let handle = self.clone();
+        Box::pin(meerkat_runtime::stack_relief::relieve_caller_stack(
+            move || async move { handle.execute_machine_command_inner(command).await },
+        ))
+    }
+
+    async fn execute_machine_command_inner(
         &self,
         command: MobMachineCommand,
     ) -> Result<MobMachineCommandResult, MobError> {
@@ -5758,14 +5796,24 @@ impl MobHandle {
     ) -> Result<CanonicalOpsOwnerContext, MobError> {
         #[cfg(feature = "runtime-adapter")]
         {
-            let adapter = self.runtime_adapter.as_ref().ok_or_else(|| {
+            let adapter = Arc::clone(self.runtime_adapter.as_ref().ok_or_else(|| {
                 MobError::Internal(
                     "mob handle cannot prepare generated ops owner context without MeerkatMachine"
                         .into(),
                 )
-            })?;
-            let bindings = adapter
-                .prepare_local_session_bindings(owner_bridge_session_id.clone())
+            })?);
+            // Session-binding preparation descends through the machine's
+            // registration chain, whose opt-level=0 poll frames are large.
+            // This is reached from inside an agent's tool-dispatch poll
+            // (mob_spawn_member), so run it on its own task instead of
+            // stacking those frames onto the caller's run-loop chain.
+            let binding_session_id = owner_bridge_session_id.clone();
+            let bindings =
+                meerkat_runtime::stack_relief::relieve_caller_stack(move || async move {
+                    adapter
+                        .prepare_local_session_bindings(binding_session_id)
+                        .await
+                })
                 .await
                 .map_err(|error| {
                     MobError::Internal(format!(

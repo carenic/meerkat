@@ -127,12 +127,14 @@ pub use budget::{
     Budget, BudgetDimension, BudgetExceeded, BudgetLimits, BudgetObservation, BudgetPool,
 };
 pub use checkpoint::{
-    AdoptedLegacySession, LegacySessionTranscriptRelation, SESSION_CHECKPOINT_STAMP_SCHEMA_VERSION,
+    AdoptedLegacySession, DIGEST_SITE_LABELS, LegacySessionTranscriptRelation,
+    SESSION_CHECKPOINT_STAMP_SCHEMA_VERSION, SESSION_CHECKPOINT_STAMP_SCHEMA_VERSION_RECOVERED,
     SessionCheckpointAncestryProof, SessionCheckpointAnchor, SessionCheckpointAuthorityBase,
     SessionCheckpointDigest, SessionCheckpointError, SessionCheckpointMetadataState,
     SessionCheckpointProvenance, SessionCheckpointRelation, SessionCheckpointRevision,
     SessionCheckpointStamp, SessionCheckpointState, SessionCheckpointer, SessionGeneration,
-    SessionLineageId, adopt_legacy_session, legacy_session_source_blob_digest,
+    SessionLineageId, adopt_legacy_session, digest_site_bytes, global_session_content_digest_bytes,
+    global_session_encode_bytes, legacy_session_source_blob_digest,
     legacy_session_transcript_relation, legacy_snapshot_vs_typed_projection_transcript_relation,
     session_checkpoint_digest, session_checkpoint_metadata_state, session_checkpoint_relation,
     session_checkpoints_are_exact, session_content_digest_bytes,
@@ -339,10 +341,11 @@ pub use session::{
     SessionLlmRequestPolicy, SessionMeta, SessionMetadata, SessionMetadataDocument,
     SessionSystemContextState, SessionToolVisibilityState, SessionTooling, SystemContextStageError,
     SystemContextStateHandle, ToolCategoryOverride, ToolVisibilityWitness, TranscriptHistoryState,
-    TranscriptRevisionBody, TranscriptRewriteRecord, VIEW_IMAGE_TOOL_NAME, WitnessedToolFilter,
-    capability_base_filter_for_image_tool_results, resolve_session_llm_identity_override,
-    session_metadata_document_from_slice, session_metadata_schema_version, session_version,
-    transcript_messages_digest, try_lifecycle_terminal_from_map, try_session_metadata_from_map,
+    TranscriptRevisionBody, TranscriptRewriteRecord, VIEW_IMAGE_TOOL_NAME,
+    ValidatedTranscriptHistory, WitnessedToolFilter, capability_base_filter_for_image_tool_results,
+    resolve_session_llm_identity_override, session_metadata_document_from_slice,
+    session_metadata_schema_version, session_version, transcript_messages_digest,
+    try_lifecycle_terminal_from_map, try_session_metadata_from_map,
 };
 pub use session_recovery::{
     BUILD_ONLY_RECOVERY_OVERRIDE_ERROR, RecoveredSessionBuild, RecoveryBackendKind,
