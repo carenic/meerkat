@@ -796,7 +796,7 @@ impl VerifiedCheckpointAuthority {
         expected_session_id: &SessionId,
         role: &str,
     ) -> Result<Self, SessionError> {
-        let session: Session = serde_json::from_slice(&serialized).map_err(|error| {
+        let session: Session = Session::from_persisted_bytes(&serialized).map_err(|error| {
             SessionError::Store(Box::new(SessionStoreError::Serialization(format!(
                 "failed to decode {role} for session {expected_session_id}: {error}"
             ))))
@@ -809,7 +809,9 @@ impl VerifiedCheckpointAuthority {
         expected_session_id: &SessionId,
         role: &str,
     ) -> Result<Self, SessionError> {
-        let serialized = serde_json::to_vec(&session).map_err(|error| {
+        // Encode + midstate admission are one core-owned operation, so the
+        // recorded midstates provably describe these exact bytes.
+        let serialized = session.to_persisted_bytes().map_err(|error| {
             SessionError::Agent(AgentError::InternalError(format!(
                 "failed to serialize {role} for session {expected_session_id}: {error}"
             )))
@@ -924,7 +926,9 @@ impl PreparedCheckpointDocument {
         session
             .install_checkpoint_stamp(stamp.clone())
             .map_err(|error| checkpoint_prepare_error(session.id(), role, error))?;
-        let serialized = serde_json::to_vec(&session).map_err(|error| {
+        // Encode + midstate admission are one core-owned operation, so the
+        // recorded midstates provably describe these exact bytes.
+        let serialized = session.to_persisted_bytes().map_err(|error| {
             SessionError::Agent(AgentError::InternalError(format!(
                 "failed to serialize stamped {role} for session {}: {error}",
                 session.id()
@@ -1074,7 +1078,7 @@ async fn load_runtime_checkpoint_copy(
     else {
         return Ok(CommittedCheckpointCopy::Absent);
     };
-    let session: Session = serde_json::from_slice(&serialized).map_err(|error| {
+    let session: Session = Session::from_persisted_bytes(&serialized).map_err(|error| {
         SessionError::Store(Box::new(SessionStoreError::Serialization(format!(
             "failed to decode {role} for session {session_id}: {error}"
         ))))
@@ -4135,7 +4139,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 )))
             })?
             .map(|bytes| {
-                serde_json::from_slice::<Session>(&bytes).map_err(|err| {
+                Session::from_persisted_bytes(&bytes).map_err(|err| {
                     SessionError::Store(Box::new(SessionStoreError::Serialization(format!(
                         "failed to deserialize runtime session snapshot for {runtime_id}: {err}"
                     ))))
@@ -4925,7 +4929,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         let Ok(Some(bytes)) = self.runtime_store.load_session_snapshot(&runtime_id).await else {
             return Ok(None);
         };
-        let Ok(current) = serde_json::from_slice::<Session>(&bytes) else {
+        let Ok(current) = Session::from_persisted_bytes(&bytes) else {
             return Ok(None);
         };
         let (Ok(current_digest), Ok(recovered_digest)) = (
