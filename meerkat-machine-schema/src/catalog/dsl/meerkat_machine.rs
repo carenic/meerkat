@@ -45,6 +45,11 @@ pub struct RunId(pub String);
 pub enum DurableTailRecoveryClass {
     CompletedCandidate,
     InterruptedRepairableCandidate,
+    /// A complete legacy turn written before run-identity bookkeeping
+    /// existed: identity-less clean EndTurn tail on a pre-witness-v3
+    /// intra-turn row, adopted under a domain-separated deterministic
+    /// legacy run identity.
+    LegacyCompletedCandidate,
     #[default]
     Ambiguous,
 }
@@ -159,6 +164,21 @@ pub enum DurableTailRecoveryDisposition {
     /// Repair the interrupted tail (synthetic interrupted tool results, typed
     /// recovery notice) and commit it as a recovered interrupted boundary.
     RepairAndCommitInterrupted,
+    /// Commit the completed LEGACY tail (pre-run-identity writer) as a
+    /// recovered legacy boundary. Distinct from `CommitCompleted` so the
+    /// commit never claims a modern run boundary was found.
+    CommitLegacyCompleted,
+    /// Commit a completed candidate whose head row carries LEGACY-ERA stamp
+    /// evidence while an unbound content input exists: the digest-proven
+    /// boundary commits and the input row is RETAINED for ordinary
+    /// redelivery — terminalize nothing. A ≤0.8.8 writer persisted staged
+    /// run bindings only inside the boundary commit, so its lost boundary
+    /// routinely leaves the executed turn's own input durably unbound;
+    /// holding on that row would wedge every such session forever on
+    /// upgrade. Retention never fabricates consumption and never drops an
+    /// input — the worst case is one duplicate redelivered turn, the legacy
+    /// fleet's own restart semantics.
+    CommitLegacyCompletedRetainInputs,
     /// Ambiguous evidence: hold intact, block autonomous execution, clear only
     /// through reconciliation.
     HoldIntact,
@@ -6450,7 +6470,7 @@ macro_rules! meerkat_catalog_machine_dsl {
         // complement — its guard pair is the exact negation of
         // (persisted_quiescent && persisted_no_current_run) under
         // in-process quiescence.
-        // A itself is cut by the two durable observation dimensions:
+        // A itself is cut by the durable observation dimensions:
         //   1. class == Ambiguous -> `...Hold` (evidence-blind: an ambiguous
         //      tail holds whatever the receipts and input rows say, so it
         //      absorbs the whole Ambiguous slice).
@@ -6458,12 +6478,20 @@ macro_rules! meerkat_catalog_machine_dsl {
         //      {MatchesCandidate, DivergesFromCandidate}
         //      -> `...RefusePriorCommit`.
         //   3. class != Ambiguous && prior_commit in
-        //      {NoPriorCommit, PrecedesCandidate} && input_evidence in
-        //      {UnboundContentInput, Unfenceable}
-        //      -> `...HoldInputEvidence`.
+        //      {NoPriorCommit, PrecedesCandidate} && input_evidence ==
+        //      Unfenceable -> `...HoldInputEvidence`; input_evidence ==
+        //      UnboundContentInput splits on the tail shape:
+        //      a COMPLETED shape (CompletedCandidate or
+        //      LegacyCompletedCandidate)
+        //      -> `...CommitLegacyRetainInputs` (commit the digest-proven
+        //      boundary; RETAIN the unbound row for ordinary redelivery —
+        //      terminalize nothing that was not proven bound; safe in
+        //      every writer era, see the arm's own comment);
+        //      an Interrupted shape -> `...HoldInputEvidence`.
         //   4. the same as 3 with input_evidence == AllBoundOrInert
         //      -> `...Commit` (CompletedCandidate) xor `...Repair`
-        //      (InterruptedRepairableCandidate).
+        //      (InterruptedRepairableCandidate) xor `...CommitLegacy`
+        //      (LegacyCompletedCandidate).
         // Each dimension is split into complementary variant sets of a closed
         // enum, so cuts 2/3/4 cover A minus the Ambiguous slice exactly once.
         // Both hold-producing dispositions are minted HERE: no shell may
@@ -6567,6 +6595,143 @@ macro_rules! meerkat_catalog_machine_dsl {
             }
         }
 
+        // Legacy adoption commit: same admissible core and durable-evidence
+        // guards as the completed commit, for the classifier's
+        // LegacyCompletedCandidate. The candidate run identity is the
+        // domain-separated deterministic legacy run id the shell minted for
+        // the identity-less tail; receipts and input rows are judged under
+        // exactly the same rules (a prior commit for the legacy run id
+        // refuses, unattributable content inputs hold — so a genuinely
+        // pending modern run's input row still blocks the adoption), and
+        // the distinct disposition keeps the commit honest: a recovered
+        // LEGACY boundary, never a claim that a modern run boundary was
+        // found.
+        transition AuthorizeDurableTailRecoveryCommitLegacy {
+            per_phase [Idle, Retired]
+            on input AuthorizeDurableTailRecovery {
+                session_id,
+                candidate_id,
+                candidate_run_id,
+                class,
+                observed_lifecycle,
+                observed_current_run,
+                last_committed_sequence,
+                prior_commit,
+                input_evidence
+            }
+            guard "no_current_run" { self.current_run_id == None }
+            guard "candidate_run_not_terminalized" {
+                self.turn_terminal_run_id != Some(candidate_run_id)
+            }
+            guard "persisted_quiescent" {
+                observed_lifecycle == DurableRecoveryObservedLifecycle::MissingRow
+                || observed_lifecycle == DurableRecoveryObservedLifecycle::Idle
+                || observed_lifecycle == DurableRecoveryObservedLifecycle::Retired
+            }
+            guard "persisted_no_current_run" {
+                observed_current_run == DurableRecoveryObservedRun::NoRun
+            }
+            guard "prior_commit_admits_recovery" {
+                prior_commit == DurableRecoveryPriorCommit::NoPriorCommit
+                || prior_commit == DurableRecoveryPriorCommit::PrecedesCandidate
+            }
+            guard "inputs_attributable" {
+                input_evidence == DurableRecoveryInputEvidence::AllBoundOrInert
+            }
+            guard "legacy_completed_class" {
+                class == DurableTailRecoveryClass::LegacyCompletedCandidate
+            }
+            update {
+                self.recovered_boundary_sequence = last_committed_sequence + 1;
+                self.turn_terminal_run_id = Some(candidate_run_id);
+            }
+            to Idle
+            emit DurableTailRecoveryCommitAuthorized {
+                candidate_id: candidate_id,
+                disposition: DurableTailRecoveryDisposition::CommitLegacyCompleted,
+                boundary_sequence: self.recovered_boundary_sequence
+            }
+        }
+
+        // Retain-inputs commit: a COMPLETED candidate (bound run or
+        // identity-less legacy) with an unbound content input row present.
+        // The ordinary input-evidence hold would wedge such a session
+        // FOREVER: every load re-observes the same durable facts and
+        // re-mints the same hold, and no repair verb exists. The commit
+        // instead adopts the digest-proven transcript and RETAINS the
+        // unbound row for ordinary redelivery: nothing is terminalized that
+        // the observation did not PROVE bound to the recovered run, no
+        // consumption is fabricated, no input can ever be dropped.
+        //
+        // This arm carries no writer-era guard because retaining is safe in
+        // BOTH eras, for different but equally sound reasons:
+        //   - PRE-0.8.9 writer: staging bindings never reached disk, so the
+        //     unbound row is routinely the executed turn's OWN input
+        //     (the HomeCore parent-2 wedge). Retaining and redelivering it
+        //     costs at most ONE duplicate turn — exactly what a pre-upgrade
+        //     restart did anyway.
+        //   - 0.8.9+ writer: staged run bindings are fenced durable BEFORE
+        //     the run executes (fail-closed at run start), so an unbound
+        //     content row is one that never started; redelivering it is not
+        //     merely safe, it is CORRECT.
+        // Holding buys no integrity in either era: the rows the observation
+        // proved bound to the recovered run are terminalized by the realize
+        // pass, and an unattributed row is never claimed as consumed —
+        // content equality is not identity, and fabricating consumption
+        // could silently drop a genuinely new identical prompt, which is
+        // strictly worse than one duplicate reply. Interrupted shapes and
+        // unfenceable rows hold exactly as before, in every era.
+        // (The transition and disposition keep their original "Legacy"
+        // spellings: the arm was introduced for the legacy-era wedge and
+        // the generated vocabulary is stable.)
+        transition AuthorizeDurableTailRecoveryCommitLegacyRetainInputs {
+            per_phase [Idle, Retired]
+            on input AuthorizeDurableTailRecovery {
+                session_id,
+                candidate_id,
+                candidate_run_id,
+                class,
+                observed_lifecycle,
+                observed_current_run,
+                last_committed_sequence,
+                prior_commit,
+                input_evidence
+            }
+            guard "no_current_run" { self.current_run_id == None }
+            guard "candidate_run_not_terminalized" {
+                self.turn_terminal_run_id != Some(candidate_run_id)
+            }
+            guard "persisted_quiescent" {
+                observed_lifecycle == DurableRecoveryObservedLifecycle::MissingRow
+                || observed_lifecycle == DurableRecoveryObservedLifecycle::Idle
+                || observed_lifecycle == DurableRecoveryObservedLifecycle::Retired
+            }
+            guard "persisted_no_current_run" {
+                observed_current_run == DurableRecoveryObservedRun::NoRun
+            }
+            guard "prior_commit_admits_recovery" {
+                prior_commit == DurableRecoveryPriorCommit::NoPriorCommit
+                || prior_commit == DurableRecoveryPriorCommit::PrecedesCandidate
+            }
+            guard "unbound_content_input" {
+                input_evidence == DurableRecoveryInputEvidence::UnboundContentInput
+            }
+            guard "completed_shape_class" {
+                class == DurableTailRecoveryClass::CompletedCandidate
+                || class == DurableTailRecoveryClass::LegacyCompletedCandidate
+            }
+            update {
+                self.recovered_boundary_sequence = last_committed_sequence + 1;
+                self.turn_terminal_run_id = Some(candidate_run_id);
+            }
+            to Idle
+            emit DurableTailRecoveryCommitAuthorized {
+                candidate_id: candidate_id,
+                disposition: DurableTailRecoveryDisposition::CommitLegacyCompletedRetainInputs,
+                boundary_sequence: self.recovered_boundary_sequence
+            }
+        }
+
         transition AuthorizeDurableTailRecoveryHold {
             per_phase [Idle, Retired]
             on input AuthorizeDurableTailRecovery {
@@ -6647,6 +6812,7 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "commit_seeking_class" {
                 class == DurableTailRecoveryClass::CompletedCandidate
                 || class == DurableTailRecoveryClass::InterruptedRepairableCandidate
+                || class == DurableTailRecoveryClass::LegacyCompletedCandidate
             }
             guard "prior_commit_conflict" {
                 prior_commit == DurableRecoveryPriorCommit::MatchesCandidate
@@ -6694,14 +6860,26 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "commit_seeking_class" {
                 class == DurableTailRecoveryClass::CompletedCandidate
                 || class == DurableTailRecoveryClass::InterruptedRepairableCandidate
+                || class == DurableTailRecoveryClass::LegacyCompletedCandidate
             }
             guard "prior_commit_admits_recovery" {
                 prior_commit == DurableRecoveryPriorCommit::NoPriorCommit
                 || prior_commit == DurableRecoveryPriorCommit::PrecedesCandidate
             }
-            guard "inputs_not_attributable" {
-                input_evidence == DurableRecoveryInputEvidence::UnboundContentInput
-                || input_evidence == DurableRecoveryInputEvidence::Unfenceable
+            // Unfenceable rows hold for every shape; an unbound content
+            // input holds only for an Interrupted shape — a COMPLETED shape
+            // is owned by the retain-inputs arm above (commit the proven
+            // boundary, retain the unbound row for redelivery; see the
+            // two-era argument there). The Interrupted hold stays because a
+            // repaired interrupted boundary explicitly does NOT requeue the
+            // interrupted run's input: an unbound content row coexisting
+            // with it may BE that input (its turn's external effects may
+            // already have fired), so it can neither be safely retained for
+            // redelivery nor proven consumed.
+            guard "inputs_not_retainable" {
+                input_evidence == DurableRecoveryInputEvidence::Unfenceable
+                || (input_evidence == DurableRecoveryInputEvidence::UnboundContentInput
+                    && class == DurableTailRecoveryClass::InterruptedRepairableCandidate)
             }
             update {}
             to Idle

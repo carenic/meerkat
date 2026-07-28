@@ -313,22 +313,30 @@ fn incoming_carries_previous_history_witness(
     incoming: &Session,
     previous_state: &crate::TranscriptHistoryState,
 ) -> Result<bool, SessionStoreError> {
-    let carried = crate::checkpoint::session_transcript_history_checkpoint_digest(incoming)
-        .map_err(|err| SessionStoreError::InvalidTranscriptRewrite {
-            id: incoming.id().clone(),
-            reason: format!("incoming transcript history witness is malformed: {err}"),
+    let carried =
+        crate::checkpoint::session_transcript_history_witness(incoming).map_err(|err| {
+            SessionStoreError::InvalidTranscriptRewrite {
+                id: incoming.id().clone(),
+                reason: format!("incoming transcript history witness is malformed: {err}"),
+            }
         })?;
     let Some(carried) = carried else {
         return Ok(false);
     };
-    let derived =
-        crate::checkpoint::transcript_history_checkpoint_digest(previous_state).map_err(|err| {
-            SessionStoreError::InvalidTranscriptRewrite {
-                id: incoming.id().clone(),
-                reason: format!("previous transcript history witness is malformed: {err}"),
-            }
-        })?;
-    Ok(derived == carried)
+    // Derive the reference witness under the format the CARRIER declares:
+    // a v3 (revision-identity) carrier over the same graph must match the
+    // v3 derivation, not the v2 whole-graph hash it was never computed as.
+    // Unknown formats already refused typed at document ingress; deriving
+    // refuses them again rather than reducing them to a mismatch.
+    let derived = crate::checkpoint::transcript_history_checkpoint_digest_in_format(
+        previous_state,
+        carried.witness_format(),
+    )
+    .map_err(|err| SessionStoreError::InvalidTranscriptRewrite {
+        id: incoming.id().clone(),
+        reason: format!("previous transcript history witness is malformed: {err}"),
+    })?;
+    Ok(derived == *carried.digest())
 }
 
 pub fn append_only_save_guard(
@@ -964,6 +972,320 @@ pub fn run_boundary_snapshot_save_guard(
             Ok(())
         }
     }
+}
+
+/// [`run_boundary_snapshot_save_guard`] accepting caller-threaded graph
+/// evidence for the one-time legacy upgrade boundary.
+///
+/// A pre-0.8.9 runtime snapshot row carries the transcript-history graph
+/// INLINE; a 0.8.9 boundary snapshot is slim and carries only the witness.
+/// When the graph evolved between the two (a resume reconciliation commit, a
+/// turn's compaction), the slim incoming's witness can never equal the
+/// witness derived from the previous inline graph, so the erase carve-out
+/// refuses every save and the session wedges. The caller — who holds durable
+/// access to the evolved graph — threads it here as `evidence`, and this
+/// guard verifies (never trusts) it:
+///
+/// 1. the evidence graph seals ([`ValidatedTranscriptHistory::seal_owned`]:
+///    every retained body digest-verified against its revision id, commit
+///    edit shapes, chain coherence);
+/// 2. the evidence is the exact graph the incoming document commits to: its
+///    witness, derived under the format the incoming CARRIER declares,
+///    equals the carried digest;
+/// 3. the previous inline graph is retained: its commits are a prefix of the
+///    evidence commits and every audited body is preserved
+///    ([`validate_rewrite_save_retains_previous_commits`] with the evidence
+///    standing in for the incoming's absent inline state);
+/// 4. the previous row's live transcript reaches the evidence head through
+///    digest-proved audited edges
+///    ([`find_transcript_rewrite_commit_chain_extending_session`] +
+///    [`transcript_rewrite_bridge_save_guard`] — the same validators the
+///    guard already runs when an incoming document carries its graph
+///    inline);
+/// 5. the incoming live transcript continues the evidence head by plain
+///    appends, proved by hashing the incoming prefix against the retained
+///    head body.
+///
+/// This is exactly the acceptance boundary the guard has for an inline
+/// incoming document, with the caller-threaded graph substituted for the
+/// absent inline state and step 2 binding that substitution to the incoming
+/// bytes. A fork — a graph whose prefix differs from the previous commits,
+/// or a live transcript with no digest-proved path from the previous head —
+/// fails the same validators it would fail inline.
+///
+/// Evidence is consulted ONLY when the unwitnessed guard refuses AND the
+/// previous row carries an inline graph AND the incoming is slim with a
+/// carried witness. Everything else — including every save against an
+/// already-slim previous row — returns the unwitnessed verdict untouched, so
+/// this path runs at most once per session: the accepted write replaces the
+/// row with the slim representation and the precondition can never hold
+/// again. Genuine erasure (no evidence, no witness, unprovable evolution)
+/// keeps today's refusal message; malformed evidence propagates as a typed
+/// error.
+/// The previous-history preservation obligation of the legacy-evidence path.
+///
+/// The commit log is compared STRICTLY — commits are the digest-carrying
+/// audit facts and round-trip exactly through every store — so the previous
+/// inline graph's commits must be a prefix of the evidence commits. Audited
+/// BODY preservation is proved at content level via
+/// [`audited_bodies_are_equivalent`], not by the byte-identical
+/// `created_at`/parent-pointer compare the inline path uses: the evidence is
+/// reconstructed from durable rewrite records
+/// ([`reconstruct_rewrite_record`] re-stamps bodies with `committed_at` and
+/// drops parent bookkeeping), which is exactly the "re-projected same
+/// conversation" shape that function documents as digest-equal but
+/// structurally different. Content is what erasure would lose; content is
+/// what this proves.
+fn validate_legacy_evidence_retains_previous_history(
+    incoming: &Session,
+    previous: &Session,
+    evidence: &ValidatedTranscriptHistory,
+) -> Result<(), SessionStoreError> {
+    let previous_state = previous.transcript_history_state_shared().map_err(|err| {
+        SessionStoreError::InvalidTranscriptRewrite {
+            id: incoming.id().clone(),
+            reason: format!("previous transcript history state is malformed: {err}"),
+        }
+    })?;
+    let Some(previous_state) = previous_state else {
+        return Ok(());
+    };
+    let evidence_state = evidence.state();
+    if evidence_state.commits.len() < previous_state.commits.len()
+        || evidence_state.commits[..previous_state.commits.len()] != previous_state.commits
+    {
+        return Err(SessionStoreError::InvalidTranscriptRewrite {
+            id: incoming.id().clone(),
+            reason:
+                "legacy upgrade history evidence would drop retained transcript rewrite commits"
+                    .to_string(),
+        });
+    }
+    let mut audited_revisions = std::collections::BTreeSet::new();
+    for commit in &previous_state.commits {
+        audited_revisions.insert(commit.parent_revision.as_str());
+        audited_revisions.insert(commit.revision.as_str());
+    }
+    for revision in audited_revisions {
+        let previous_body = previous_state
+            .revisions
+            .iter()
+            .find(|body| body.revision == revision)
+            .ok_or_else(|| SessionStoreError::InvalidTranscriptRewrite {
+                id: incoming.id().clone(),
+                reason: format!("previous transcript history omits audited body {revision}"),
+            })?;
+        let evidence_body = evidence_state
+            .revisions
+            .iter()
+            .find(|body| body.revision == revision)
+            .ok_or_else(|| SessionStoreError::InvalidTranscriptRewrite {
+                id: incoming.id().clone(),
+                reason: format!("legacy upgrade history evidence drops audited body {revision}"),
+            })?;
+        if !audited_bodies_are_equivalent(&previous_body.messages, &evidence_body.messages)? {
+            return Err(SessionStoreError::InvalidTranscriptRewrite {
+                id: incoming.id().clone(),
+                reason: format!(
+                    "legacy upgrade history evidence changes audited transcript body {revision}"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+pub fn run_boundary_snapshot_save_guard_with_legacy_history_evidence(
+    incoming: &Session,
+    previous: Option<&Session>,
+    evidence: Option<&TranscriptHistoryState>,
+) -> Result<(), SessionStoreError> {
+    let refusal = match run_boundary_snapshot_save_guard(incoming, previous) {
+        Ok(()) => return Ok(()),
+        Err(refusal) => refusal,
+    };
+    let (Some(evidence), Some(previous)) = (evidence, previous) else {
+        return Err(refusal);
+    };
+    legacy_inline_history_evolution_guard(incoming, previous, evidence, refusal)
+}
+
+fn legacy_inline_history_evolution_guard(
+    incoming: &Session,
+    previous: &Session,
+    evidence: &TranscriptHistoryState,
+    refusal: SessionStoreError,
+) -> Result<(), SessionStoreError> {
+    let _digest_site =
+        crate::checkpoint::enter_digest_site(crate::checkpoint::DIGEST_SITE_BOUNDARY_GUARD);
+    // Reachability preconditions, all fail-closed to the unwitnessed verdict:
+    // previous must still be the legacy inline representation and incoming
+    // must be a slim projection carrying a witness to bind against.
+    let previous_carries_inline_graph = previous
+        .transcript_history_state_shared()
+        .map_err(|err| SessionStoreError::InvalidTranscriptRewrite {
+            id: incoming.id().clone(),
+            reason: format!("previous transcript history state is malformed: {err}"),
+        })?
+        .is_some();
+    if !previous_carries_inline_graph {
+        return Err(refusal);
+    }
+    let incoming_carries_inline_graph = incoming
+        .transcript_history_state_shared()
+        .map_err(|err| SessionStoreError::InvalidTranscriptRewrite {
+            id: incoming.id().clone(),
+            reason: format!("incoming transcript history state is malformed: {err}"),
+        })?
+        .is_some();
+    if incoming_carries_inline_graph {
+        return Err(refusal);
+    }
+    let carried =
+        crate::checkpoint::session_transcript_history_witness(incoming).map_err(|err| {
+            SessionStoreError::InvalidTranscriptRewrite {
+                id: incoming.id().clone(),
+                reason: format!("incoming transcript history witness is malformed: {err}"),
+            }
+        })?;
+    let Some(carried) = carried else {
+        return Err(refusal);
+    };
+
+    // 1. Whole-graph proof of the threaded evidence.
+    let sealed = ValidatedTranscriptHistory::seal_owned(evidence.clone()).map_err(|err| {
+        SessionStoreError::InvalidTranscriptRewrite {
+            id: incoming.id().clone(),
+            reason: format!("legacy upgrade history evidence is malformed: {err}"),
+        }
+    })?;
+    // 2. Bind the evidence to the incoming document's own carried witness,
+    // under the format that carrier declares.
+    let derived = crate::checkpoint::transcript_history_checkpoint_digest_in_format(
+        sealed.state(),
+        carried.witness_format(),
+    )
+    .map_err(|err| SessionStoreError::InvalidTranscriptRewrite {
+        id: incoming.id().clone(),
+        reason: format!("legacy upgrade history evidence witness is malformed: {err}"),
+    })?;
+    if derived != *carried.digest() {
+        return Err(SessionStoreError::InvalidTranscriptRewrite {
+            id: incoming.id().clone(),
+            reason: format!(
+                "legacy upgrade history evidence witness {derived} does not match the witness {} carried by the incoming save",
+                carried.digest()
+            ),
+        });
+    }
+    // 3. The previous inline graph is retained by the evidence graph.
+    validate_legacy_evidence_retains_previous_history(incoming, previous, &sealed)?;
+    // 4. The previous live transcript reaches the evidence head through
+    // digest-proved audited edges.
+    let evidence_head = sealed.state().head.as_str();
+    let Some(chain) =
+        find_transcript_rewrite_commit_chain_extending_session(&sealed, previous, evidence_head)?
+    else {
+        return Err(refusal);
+    };
+    if let Some(commit) = chain.first() {
+        transcript_rewrite_bridge_save_guard(incoming, commit, &sealed, evidence_head)?;
+    }
+    // 5. The incoming live transcript continues the evidence head by plain
+    // appends: the retained head body's length names the prefix, the digest
+    // over the incoming's own messages proves it.
+    let incoming_revision = incoming
+        .transcript_content_digest()
+        .map_err(SessionStoreError::from)?;
+    if incoming_revision == evidence_head {
+        return Ok(());
+    }
+    let Some(head_body) = sealed
+        .state()
+        .revisions
+        .iter()
+        .find(|body| body.revision == evidence_head)
+    else {
+        return Err(refusal);
+    };
+    let head_len = head_body.messages.len();
+    if incoming.messages().len() < head_len {
+        return Err(refusal);
+    }
+    let incoming_prefix_revision = incoming
+        .transcript_prefix_digest(head_len)
+        .map_err(SessionStoreError::from)?;
+    if incoming_prefix_revision != evidence_head {
+        return Err(refusal);
+    }
+    Ok(())
+}
+
+/// Assemble the caller-threaded evolved-graph evidence for the one-time
+/// legacy upgrade boundary from an incremental store's durable records.
+///
+/// This is the CALLER half of
+/// [`run_boundary_snapshot_save_guard_with_legacy_history_evidence`]: rebuild
+/// the evolved graph from the store's append-only rewrite records
+/// ([`TranscriptHistoryState::from_rewrite_records`]) and, when the last
+/// pre-upgrade head write pinned a mechanical live-head body, extend the
+/// reconstruction to the durable head row so the graph names the same
+/// retained revisions the incoming document's witness was minted over. The
+/// extension body is loaded from the head's own strand rows and
+/// digest-verified by the guard when it seals the evidence, so nothing
+/// returned here is trusted — an imperfect reconstruction can only reproduce
+/// the existing refusal, never admit an unproven write.
+///
+/// Returns `Ok(None)` for every shape the plain guard already decides
+/// correctly: an incoming document carrying its graph inline, one carrying
+/// no witness, or a store with no adopted rewrites.
+pub async fn legacy_upgrade_history_evidence_from_incremental(
+    incremental: &dyn IncrementalSessionStore,
+    incoming: &Session,
+) -> Result<Option<TranscriptHistoryState>, SessionStoreError> {
+    if incoming
+        .metadata()
+        .contains_key(SESSION_TRANSCRIPT_HISTORY_STATE_KEY)
+        || !incoming
+            .metadata()
+            .contains_key(SESSION_TRANSCRIPT_HISTORY_CHECKPOINT_DIGEST_KEY)
+    {
+        return Ok(None);
+    }
+    let records = incremental.load_rewrites(incoming.id()).await?;
+    let Some(mut state) = TranscriptHistoryState::from_rewrite_records(records).map_err(|err| {
+        SessionStoreError::InvalidTranscriptRewrite {
+            id: incoming.id().clone(),
+            reason: format!("failed to rebuild transcript history for the upgrade boundary: {err}"),
+        }
+    })?
+    else {
+        return Ok(None);
+    };
+    let head = incremental.load_head(incoming.id()).await?;
+    if let Some(head) = head
+        && head.head_revision != state.head
+    {
+        if state
+            .revisions
+            .iter()
+            .any(|body| body.revision == head.head_revision)
+        {
+            state.head = head.head_revision;
+        } else {
+            let messages = incremental
+                .load_messages(incoming.id(), &head.strand, 0..head.message_count)
+                .await?;
+            state.revisions.push(TranscriptRevisionBody {
+                revision: head.head_revision.clone(),
+                parent_revision: Some(state.head.clone()),
+                messages,
+                created_at: head.updated_at,
+            });
+            state.head = head.head_revision;
+        }
+    }
+    Ok(Some(state))
 }
 
 /// Validate the invariant that a typed Session's live transcript matches its
@@ -1941,9 +2263,28 @@ pub enum SessionHeadCas {
 /// Every retained transcript body is a prefix of some strand: the parent body
 /// of commit `k` is a prefix of the strand commit `k-1` created (or the root
 /// strand), and the revision body of commit `k` is a prefix of the strand it
-/// creates. Retained history therefore costs zero duplicate storage on the
-/// live path, and compaction persists O(live-after) instead of a superset
+/// creates. Compaction therefore persists O(live-after) instead of a superset
 /// blob.
+///
+/// # Storage bound (the contract, not merely an implementation note)
+///
+/// Prefix addressing alone does NOT bound total storage: successive strands
+/// are separate address spaces, so a rewrite that shares no *prefix* with its
+/// parent — the common shape, e.g. replacing the leading system projection —
+/// costs a full transcript of fresh rows, per rewrite, forever. Measured in
+/// the field: 98 rewrites of one 371-message transcript accumulated 16,672
+/// strand rows.
+///
+/// A conforming backend's persisted rows MUST stay bounded by
+/// `live transcript + Σ retained deltas`, where a retained delta is the span
+/// a superseded strand's successor genuinely dropped or replaced
+/// ([`StrandSplice`] is the shared vocabulary for that span, derived by
+/// comparison and never caller-attested). Concretely: `N` rewrites must not
+/// cost `N × transcript`, and a backend must not retain rows no read verb of
+/// this trait can reach. The observable contract is unchanged — every verb
+/// below still serves exactly the same content — so a backend that keeps
+/// whole strands materialized (an in-memory reference store, say) stays
+/// conformant on semantics; only durable backends owe the bound.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait IncrementalSessionStore: SessionStore {
@@ -2523,6 +2864,175 @@ pub fn reconstruct_rewrite_record(
     })
 }
 
+/// Where one row of a superseded strand physically lives.
+///
+/// See [`StrandSplice`]: a superseded strand keeps only the rows its
+/// successor cannot reproduce; every other row IS a row of the successor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StrandRowSource {
+    /// Physically retained by the superseded strand itself, at this index.
+    Retained(u64),
+    /// Byte-identical to the successor strand's row at this index.
+    Successor(u64),
+}
+
+/// One contiguous run of a superseded strand's rows, resolved to a source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StrandSegment {
+    /// Rows physically retained by the superseded strand (its own indices).
+    Retained(std::ops::Range<u64>),
+    /// Rows served by the successor strand (successor indices).
+    Successor(std::ops::Range<u64>),
+}
+
+/// The minimal splice that re-expresses a superseded strand as a delta of
+/// the strand that replaced it.
+///
+/// # Why this exists
+///
+/// Every strand transition a session takes — adopting a transcript rewrite,
+/// rebasing onto an equivalence-admitted projection — produces a new strand
+/// whose rows are overwhelmingly the *same rows* as the strand it replaced.
+/// Storing each strand as an independent row vector therefore costs
+/// `O(transcript)` per transition and grows without bound: a rewrite that
+/// edits one message of a 371-message transcript persists 371 fresh rows,
+/// forever, for one changed message.
+///
+/// A splice bounds that: the superseded strand physically retains only
+/// `[splice_start, splice_end)` — the rows the successor genuinely dropped
+/// or replaced — and every other row resolves to the successor. Total
+/// storage becomes `live transcript + Σ retained spans` instead of
+/// `revisions × transcript`.
+///
+/// # Invariants
+///
+/// With `S` the superseded strand and `N` its successor:
+/// - `S[0..splice_start) == N[0..splice_start)` (shared prefix);
+/// - `S[splice_end..strand_len) == N[successor_end..successor_len())`
+///   (shared suffix);
+/// - `S[splice_start..splice_end)` is retained by `S` itself;
+/// - `splice_start <= splice_end <= strand_len` and
+///   `splice_start <= successor_end`.
+///
+/// The splice is derived by comparison ([`StrandSplice::between`]), never
+/// attested by a caller: a backend can always recompute it from the two row
+/// vectors it holds, and a wrong descriptor is structurally inexpressible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StrandSplice {
+    /// Logical row count of the superseded strand.
+    pub strand_len: u64,
+    /// First index at which the two strands differ.
+    pub splice_start: u64,
+    /// End (exclusive, in superseded-strand indices) of the replaced span.
+    pub splice_end: u64,
+    /// End (exclusive, in successor indices) of the replacement span.
+    pub successor_end: u64,
+}
+
+impl StrandSplice {
+    /// Derive the minimal splice between a superseded strand's rows and its
+    /// successor's rows by longest common prefix + longest common suffix.
+    ///
+    /// Comparison is on whatever row identity `T` provides; backends pass
+    /// the exact persisted bytes so "shared" means byte-identical, never
+    /// merely digest-equivalent.
+    pub fn between<T: PartialEq>(strand_rows: &[T], successor_rows: &[T]) -> Self {
+        let overlap = strand_rows.len().min(successor_rows.len());
+        let mut prefix = 0usize;
+        while prefix < overlap && strand_rows[prefix] == successor_rows[prefix] {
+            prefix += 1;
+        }
+        let mut suffix = 0usize;
+        while suffix < overlap - prefix
+            && strand_rows[strand_rows.len() - 1 - suffix]
+                == successor_rows[successor_rows.len() - 1 - suffix]
+        {
+            suffix += 1;
+        }
+        Self {
+            strand_len: strand_rows.len() as u64,
+            splice_start: prefix as u64,
+            splice_end: (strand_rows.len() - suffix) as u64,
+            successor_end: (successor_rows.len() - suffix) as u64,
+        }
+    }
+
+    /// Structural well-formedness of a descriptor read back from storage.
+    pub fn is_well_formed(&self) -> bool {
+        self.splice_start <= self.splice_end
+            && self.splice_end <= self.strand_len
+            && self.splice_start <= self.successor_end
+    }
+
+    /// Rows the superseded strand must physically retain.
+    pub fn retained_span(&self) -> std::ops::Range<u64> {
+        self.splice_start..self.splice_end
+    }
+
+    /// Number of rows the superseded strand must physically retain.
+    pub fn retained_rows(&self) -> u64 {
+        self.splice_end.saturating_sub(self.splice_start)
+    }
+
+    /// Logical row count the successor must serve for this splice to
+    /// resolve.
+    pub fn successor_len(&self) -> u64 {
+        self.successor_end
+            .saturating_add(self.strand_len.saturating_sub(self.splice_end))
+    }
+
+    /// Whether the splice actually shares rows. A full-transcript
+    /// compaction shares nothing (`retained_rows() == strand_len`): the
+    /// superseded strand genuinely IS its own retained delta, and no
+    /// encoding can shrink it.
+    pub fn shares_rows(&self) -> bool {
+        self.retained_rows() < self.strand_len
+    }
+
+    /// Resolve one superseded-strand index; `None` past `strand_len`.
+    pub fn source(&self, index: u64) -> Option<StrandRowSource> {
+        if index >= self.strand_len {
+            return None;
+        }
+        if index < self.splice_start {
+            return Some(StrandRowSource::Successor(index));
+        }
+        if index < self.splice_end {
+            return Some(StrandRowSource::Retained(index));
+        }
+        Some(StrandRowSource::Successor(
+            index - self.splice_end + self.successor_end,
+        ))
+    }
+
+    /// The (at most three) contiguous segments covering `range`, in order.
+    ///
+    /// `range` must already be within `0..strand_len`; out-of-range reads
+    /// are the caller's fail-closed decision, not silently clamped content.
+    pub fn segments(&self, range: std::ops::Range<u64>) -> impl Iterator<Item = StrandSegment> {
+        let start = range.start.min(self.strand_len);
+        let end = range.end.clamp(start, self.strand_len);
+        let mut spans: [Option<StrandSegment>; 3] = [None, None, None];
+        let lead_end = end.min(self.splice_start);
+        if start < lead_end {
+            spans[0] = Some(StrandSegment::Successor(start..lead_end));
+        }
+        let own_start = start.max(self.splice_start);
+        let own_end = end.min(self.splice_end);
+        if own_start < own_end {
+            spans[1] = Some(StrandSegment::Retained(own_start..own_end));
+        }
+        let tail_start = start.max(self.splice_end);
+        if tail_start < end {
+            spans[2] = Some(StrandSegment::Successor(
+                (tail_start - self.splice_end + self.successor_end)
+                    ..(end - self.splice_end + self.successor_end),
+            ));
+        }
+        spans.into_iter().flatten()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2744,6 +3254,369 @@ mod tests {
             run_boundary_snapshot_head_coherence_guard(&forged),
             Err(SessionStoreError::InvalidTranscriptRewrite { .. })
         ));
+        Ok(())
+    }
+
+    /// The pre-0.8.9 upgrade pair: `previous` is the inline (0.8.8-shaped)
+    /// runtime row after one audited rewrite; `evolved` is that session after
+    /// a resume-time system-prompt rewrite (the "agent-factory/resume" shape
+    /// from the production defect).
+    fn legacy_upgrade_fixture() -> Result<(Session, Session), Box<dyn std::error::Error>> {
+        let mut base = Session::new();
+        base.push(Message::System(SystemMessage::new("member prompt v1")));
+        base.push(Message::User(UserMessage::text(
+            "the codeword is birch seventeen".to_string(),
+        )));
+        let mut previous = base;
+        previous.commit_transcript_rewrite(
+            TranscriptRewriteSelection::MessageRange { start: 0, end: 1 },
+            vec![Message::System(SystemMessage::new("member prompt v2"))],
+            crate::TranscriptRewriteReason::new("unit-test-edit"),
+            Some("unit-test".to_string()),
+            None,
+        )?;
+        let mut evolved = previous.clone();
+        evolved.commit_transcript_rewrite(
+            TranscriptRewriteSelection::MessageRange { start: 0, end: 1 },
+            vec![Message::System(SystemMessage::new("member prompt v3"))],
+            crate::TranscriptRewriteReason::new("resume-system-prompt-refresh"),
+            Some("agent-factory/resume".to_string()),
+            None,
+        )?;
+        Ok((previous, evolved))
+    }
+
+    /// The slim 0.8.9 boundary materialization of `session`: no inline graph,
+    /// the storage-invariant witness under the reserved carrier key —
+    /// produced through the real head-projection seam, not hand-forged JSON.
+    fn slim_boundary_materialization(
+        session: &Session,
+    ) -> Result<Session, Box<dyn std::error::Error>> {
+        let rewrite_count = session
+            .transcript_history_state()?
+            .map(|state| state.commits.len() as u64)
+            .unwrap_or(0);
+        let head = SessionHead::from_session(session, TranscriptStrandId::root(), rewrite_count)?;
+        Ok(head.into_session(session.messages().to_vec())?)
+    }
+
+    /// The caller's evidence shape: rebuild the evolved graph from its own
+    /// append-only rewrite records (the incremental store's durable truth)
+    /// and extend the reconstruction to the pinned live head, exactly like
+    /// `legacy_upgrade_boundary_history_evidence` in meerkat-session.
+    #[allow(clippy::expect_used)]
+    fn rebuilt_history_evidence(
+        session: &Session,
+    ) -> Result<TranscriptHistoryState, Box<dyn std::error::Error>> {
+        let state = session
+            .transcript_history_state()?
+            .expect("evolved session retains history state");
+        let mut records = Vec::new();
+        for commit in &state.commits {
+            let parent_body = session
+                .transcript_revision_body(&commit.parent_revision)?
+                .expect("parent body retained");
+            let revision_body = session
+                .transcript_revision_body(&commit.revision)?
+                .expect("revision body retained");
+            records.push(TranscriptRewriteRecord::new(
+                commit.clone(),
+                parent_body,
+                revision_body,
+            )?);
+        }
+        let mut rebuilt = TranscriptHistoryState::from_rewrite_records(records)?
+            .expect("evolved session has adopted rewrites");
+        let live_revision = transcript_messages_digest(session.messages())?;
+        if rebuilt.head != live_revision {
+            if rebuilt
+                .revisions
+                .iter()
+                .any(|body| body.revision == live_revision)
+            {
+                rebuilt.head = live_revision;
+            } else {
+                let parent = rebuilt.head.clone();
+                rebuilt.revisions.push(TranscriptRevisionBody {
+                    revision: live_revision.clone(),
+                    parent_revision: Some(parent),
+                    messages: session.messages().to_vec(),
+                    created_at: SystemTime::now(),
+                });
+                rebuilt.head = live_revision;
+            }
+        }
+        Ok(rebuilt)
+    }
+
+    /// Pins the production defect: after the graph evolves (resume rewrite),
+    /// the slim boundary save is refused against the inline previous row —
+    /// and stays refused when no evidence is threaded (fail-closed).
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn legacy_upgrade_slim_save_refused_without_evidence() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (previous, evolved) = legacy_upgrade_fixture()?;
+        let incoming = slim_boundary_materialization(&evolved)?;
+        for verdict in [
+            run_boundary_snapshot_save_guard(&incoming, Some(&previous)),
+            run_boundary_snapshot_save_guard_with_legacy_history_evidence(
+                &incoming,
+                Some(&previous),
+                None,
+            ),
+        ] {
+            let error = verdict.expect_err("evolved slim save must be refused without evidence");
+            assert!(
+                error
+                    .to_string()
+                    .contains("incoming save would erase retained transcript history state"),
+                "unexpected refusal: {error}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The fix: the same refused save is accepted once the caller threads the
+    /// evolved graph and the guard verifies binding + ancestry over it.
+    #[test]
+    fn legacy_upgrade_slim_save_accepts_verified_evolution_evidence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (previous, evolved) = legacy_upgrade_fixture()?;
+        let incoming = slim_boundary_materialization(&evolved)?;
+        let evidence = rebuilt_history_evidence(&evolved)?;
+        assert!(
+            run_boundary_snapshot_save_guard(&incoming, Some(&previous)).is_err(),
+            "the unwitnessed guard must still refuse — the evidence path is the only admission"
+        );
+        run_boundary_snapshot_save_guard_with_legacy_history_evidence(
+            &incoming,
+            Some(&previous),
+            Some(&evidence),
+        )?;
+        Ok(())
+    }
+
+    /// The full production shape: an append between the audited rewrites, a
+    /// mechanical live-head pin after the last rewrite, and live appends
+    /// after the slim materialization (the first turn's messages). Exercises
+    /// the record-chain reconstruction, the head-row extension, and the
+    /// guard's digest-proved live continuation.
+    #[test]
+    fn legacy_upgrade_slim_save_accepts_evolution_with_appends()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (previous, _) = legacy_upgrade_fixture()?;
+        let mut evolved = previous.clone();
+        evolved.push(Message::User(UserMessage::text(
+            "resume banner".to_string(),
+        )));
+        evolved.commit_transcript_rewrite(
+            TranscriptRewriteSelection::MessageRange { start: 0, end: 1 },
+            vec![Message::System(SystemMessage::new("member prompt v3"))],
+            crate::TranscriptRewriteReason::new("resume-system-prompt-refresh"),
+            Some("agent-factory/resume".to_string()),
+            None,
+        )?;
+        // A post-rewrite append pins a mechanical live-head body into the
+        // graph the slim materialization's witness names.
+        evolved.push(Message::User(UserMessage::text(
+            "post-rewrite note".to_string(),
+        )));
+        let mut incoming = slim_boundary_materialization(&evolved)?;
+        // The first turn appends past the pinned head before the boundary
+        // save; the carried witness still names the pinned graph.
+        incoming.push(Message::User(UserMessage::text(
+            "what was the codeword?".to_string(),
+        )));
+        incoming.push(Message::User(UserMessage::text(
+            "birch seventeen".to_string(),
+        )));
+        let evidence = rebuilt_history_evidence(&evolved)?;
+        assert!(run_boundary_snapshot_save_guard(&incoming, Some(&previous)).is_err());
+        run_boundary_snapshot_save_guard_with_legacy_history_evidence(
+            &incoming,
+            Some(&previous),
+            Some(&evidence),
+        )?;
+        Ok(())
+    }
+
+    /// Fork safety: evidence over a graph whose commit prefix differs from
+    /// the previous inline graph is refused even though it is internally
+    /// consistent and matches the incoming's own carried witness.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn legacy_upgrade_slim_save_refuses_forked_evidence() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let mut base = Session::new();
+        base.push(Message::System(SystemMessage::new("member prompt v1")));
+        base.push(Message::User(UserMessage::text(
+            "the codeword is birch seventeen".to_string(),
+        )));
+        let mut previous = base.clone();
+        previous.commit_transcript_rewrite(
+            TranscriptRewriteSelection::MessageRange { start: 0, end: 1 },
+            vec![Message::System(SystemMessage::new("member prompt v2"))],
+            crate::TranscriptRewriteReason::new("unit-test-edit"),
+            Some("unit-test".to_string()),
+            None,
+        )?;
+        let mut forked = base;
+        forked.commit_transcript_rewrite(
+            TranscriptRewriteSelection::MessageRange { start: 0, end: 1 },
+            vec![Message::System(SystemMessage::new(
+                "forked prompt that never extended the audited history",
+            ))],
+            crate::TranscriptRewriteReason::new("unit-test-fork"),
+            Some("unit-test".to_string()),
+            None,
+        )?;
+        let incoming = slim_boundary_materialization(&forked)?;
+        let evidence = rebuilt_history_evidence(&forked)?;
+        let error = run_boundary_snapshot_save_guard_with_legacy_history_evidence(
+            &incoming,
+            Some(&previous),
+            Some(&evidence),
+        )
+        .expect_err("forked evidence must never be admitted");
+        assert!(
+            matches!(error, SessionStoreError::InvalidTranscriptRewrite { .. }),
+            "unexpected fork verdict: {error}"
+        );
+        Ok(())
+    }
+
+    /// Same-graph slim round-trips keep passing through the existing exact
+    /// witness carve-out, and evidence is never consulted for them: even
+    /// deliberately poisoned evidence cannot change the verdict.
+    #[test]
+    fn legacy_upgrade_same_graph_round_trip_still_accepted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (previous, _) = legacy_upgrade_fixture()?;
+        let incoming = slim_boundary_materialization(&previous)?;
+        run_boundary_snapshot_save_guard(&incoming, Some(&previous))?;
+        let poisoned = TranscriptHistoryState {
+            head: "sha256:not-a-real-revision".to_string(),
+            commits: Vec::new(),
+            revisions: Vec::new(),
+            digest_format: 0,
+        };
+        run_boundary_snapshot_save_guard_with_legacy_history_evidence(
+            &incoming,
+            Some(&previous),
+            Some(&poisoned),
+        )?;
+        Ok(())
+    }
+
+    /// A v3 (revision-identity) carrier over the SAME graph must round-trip
+    /// against an inline previous row: the carve-out derives the reference
+    /// witness under the format the carrier declares instead of assuming v2.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn legacy_upgrade_same_graph_v3_carrier_round_trip_accepted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (previous, _) = legacy_upgrade_fixture()?;
+        let mut incoming = slim_boundary_materialization(&previous)?;
+        let previous_state = previous
+            .transcript_history_state()?
+            .expect("previous retains history state");
+        let v3 =
+            crate::checkpoint::transcript_history_checkpoint_digest_in_format(&previous_state, 3)?;
+        incoming.set_metadata_unchecked_for_test(
+            SESSION_TRANSCRIPT_HISTORY_CHECKPOINT_DIGEST_KEY,
+            serde_json::json!({
+                "witness_format": 3,
+                "revision_digest_format": 2,
+                "digest": v3.as_str(),
+            }),
+        );
+        run_boundary_snapshot_save_guard(&incoming, Some(&previous))?;
+        Ok(())
+    }
+
+    /// When the previous row is already slim, the legacy path is not
+    /// reachable at all: a plain append commits through the ordinary guard
+    /// and poisoned evidence is never read.
+    #[test]
+    fn legacy_upgrade_evidence_unreachable_when_previous_is_slim()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_, evolved) = legacy_upgrade_fixture()?;
+        let previous_slim = slim_boundary_materialization(&evolved)?;
+        let mut incoming = previous_slim.clone();
+        incoming.push(Message::User(UserMessage::text(
+            "next turn message".to_string(),
+        )));
+        let poisoned = TranscriptHistoryState {
+            head: "sha256:not-a-real-revision".to_string(),
+            commits: Vec::new(),
+            revisions: Vec::new(),
+            digest_format: 0,
+        };
+        run_boundary_snapshot_save_guard_with_legacy_history_evidence(
+            &incoming,
+            Some(&previous_slim),
+            Some(&poisoned),
+        )?;
+        Ok(())
+    }
+
+    /// A slim incoming with NO carried witness is genuine erasure: evidence
+    /// cannot bind to anything and the refusal keeps its exact message.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn legacy_upgrade_missing_witness_keeps_erasure_refusal()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (previous, evolved) = legacy_upgrade_fixture()?;
+        let incoming = slim_boundary_materialization(&evolved)?;
+        let mut envelope = serde_json::to_value(&incoming)?;
+        envelope["metadata"]
+            .as_object_mut()
+            .expect("metadata object")
+            .remove(SESSION_TRANSCRIPT_HISTORY_CHECKPOINT_DIGEST_KEY);
+        let incoming: Session = serde_json::from_value(envelope)?;
+        let evidence = rebuilt_history_evidence(&evolved)?;
+        let error = run_boundary_snapshot_save_guard_with_legacy_history_evidence(
+            &incoming,
+            Some(&previous),
+            Some(&evidence),
+        )
+        .expect_err("a witnessless slim save is genuine erasure");
+        assert!(
+            error
+                .to_string()
+                .contains("incoming save would erase retained transcript history state"),
+            "unexpected refusal: {error}"
+        );
+        Ok(())
+    }
+
+    /// Malformed evidence propagates as a typed error instead of being
+    /// reduced to acceptance or to the generic erasure refusal.
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn legacy_upgrade_malformed_evidence_propagates_typed_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (previous, evolved) = legacy_upgrade_fixture()?;
+        let incoming = slim_boundary_materialization(&evolved)?;
+        let mut evidence = rebuilt_history_evidence(&evolved)?;
+        evidence.revisions[0]
+            .messages
+            .push(Message::User(UserMessage::text(
+                "tampered body no longer matching its revision digest".to_string(),
+            )));
+        let error = run_boundary_snapshot_save_guard_with_legacy_history_evidence(
+            &incoming,
+            Some(&previous),
+            Some(&evidence),
+        )
+        .expect_err("tampered evidence must refuse typed");
+        assert!(
+            error
+                .to_string()
+                .contains("legacy upgrade history evidence"),
+            "unexpected malformed-evidence verdict: {error}"
+        );
         Ok(())
     }
 
@@ -5210,5 +6083,212 @@ mod tests {
             .expect("head strand")
             .1;
         assert_eq!(head_rows.len(), compacted.messages().len());
+    }
+
+    // ---------------------------------------------------------------------
+    // StrandSplice: the pure delta math behind bounded strand storage.
+    // ---------------------------------------------------------------------
+
+    /// Every index of `strand` must resolve to the row `expected` holds
+    /// there, sourcing from `strand`'s retained span or from `successor`.
+    #[allow(clippy::expect_used)]
+    fn assert_splice_reconstructs(strand: &[&str], successor: &[&str]) -> StrandSplice {
+        let splice = StrandSplice::between(strand, successor);
+        assert!(
+            splice.is_well_formed(),
+            "derived splice must be well formed: {splice:?}"
+        );
+        assert_eq!(
+            splice.successor_len(),
+            successor.len() as u64,
+            "splice must imply the successor's true length: {splice:?}"
+        );
+        for (index, expected) in strand.iter().enumerate() {
+            let source = splice
+                .source(index as u64)
+                .expect("in-range index must resolve");
+            let actual = match source {
+                StrandRowSource::Retained(at) => {
+                    assert!(
+                        splice.retained_span().contains(&at),
+                        "retained source {at} must fall inside {:?}",
+                        splice.retained_span()
+                    );
+                    strand[at as usize]
+                }
+                StrandRowSource::Successor(at) => successor[at as usize],
+            };
+            assert_eq!(actual, *expected, "row {index} resolved to the wrong body");
+        }
+        assert!(
+            splice.source(strand.len() as u64).is_none(),
+            "past-the-end index must not resolve"
+        );
+
+        // Every sub-range must segment to exactly the same rows, in order.
+        for start in 0..=strand.len() as u64 {
+            for end in start..=strand.len() as u64 {
+                let mut served: Vec<&str> = Vec::new();
+                for segment in splice.segments(start..end) {
+                    match segment {
+                        StrandSegment::Retained(range) => {
+                            assert!(
+                                range.start >= splice.splice_start
+                                    && range.end <= splice.splice_end,
+                                "retained segment {range:?} escaped the retained span"
+                            );
+                            served.extend(strand[range.start as usize..range.end as usize].iter());
+                        }
+                        StrandSegment::Successor(range) => {
+                            served
+                                .extend(successor[range.start as usize..range.end as usize].iter());
+                        }
+                    }
+                }
+                assert_eq!(
+                    served,
+                    strand[start as usize..end as usize].to_vec(),
+                    "segments of {start}..{end} must serve the superseded strand exactly"
+                );
+            }
+        }
+        splice
+    }
+
+    #[test]
+    fn strand_splice_shares_the_prefix_when_only_the_tail_changed() {
+        let splice = assert_splice_reconstructs(&["a", "b", "c"], &["a", "b", "z", "y"]);
+        assert_eq!(splice.splice_start, 2);
+        assert_eq!(splice.splice_end, 3);
+        assert_eq!(splice.retained_rows(), 1);
+        assert!(splice.shares_rows());
+    }
+
+    /// The production shape: a one-message edit at index 0 of a long
+    /// transcript must retain exactly one row, not a whole copy.
+    #[test]
+    fn strand_splice_leading_edit_retains_one_row_of_a_long_transcript() {
+        let old: Vec<String> = (0..64).map(|i| format!("m{i}")).collect();
+        let mut new = old.clone();
+        new[0] = "system refreshed".to_string();
+        let splice = StrandSplice::between(&old, &new);
+        assert_eq!(splice.splice_start, 0);
+        assert_eq!(splice.splice_end, 1);
+        assert_eq!(splice.successor_end, 1);
+        assert_eq!(
+            splice.retained_rows(),
+            1,
+            "a one-message leading edit must retain exactly one row"
+        );
+        assert_eq!(splice.successor_len(), 64);
+        let borrowed: Vec<&str> = old.iter().map(String::as_str).collect();
+        let borrowed_new: Vec<&str> = new.iter().map(String::as_str).collect();
+        assert_splice_reconstructs(&borrowed, &borrowed_new);
+    }
+
+    #[test]
+    fn strand_splice_shares_the_suffix_when_the_head_changed() {
+        let splice = assert_splice_reconstructs(&["a", "b", "c"], &["x", "b", "c"]);
+        assert_eq!(splice.splice_start, 0);
+        assert_eq!(splice.splice_end, 1);
+        assert_eq!(splice.successor_end, 1);
+        assert_eq!(splice.retained_rows(), 1);
+    }
+
+    #[test]
+    fn strand_splice_over_a_pure_append_retains_nothing() {
+        let splice = assert_splice_reconstructs(&["a", "b"], &["a", "b", "c"]);
+        assert_eq!(splice.retained_rows(), 0);
+        assert_eq!(splice.splice_start, 2);
+        assert_eq!(splice.splice_end, 2);
+        assert_eq!(splice.successor_end, 3);
+        assert!(splice.shares_rows());
+    }
+
+    #[test]
+    fn strand_splice_over_a_truncation_retains_the_dropped_tail() {
+        let splice = assert_splice_reconstructs(&["a", "b", "c"], &["a"]);
+        assert_eq!(splice.retained_span(), 1..3);
+        assert_eq!(splice.successor_end, 1);
+    }
+
+    /// A full-transcript compaction shares nothing: the splice must say so
+    /// rather than claim a false overlap, and backends must keep the strand
+    /// materialized.
+    #[test]
+    fn strand_splice_over_a_full_replacement_shares_nothing() {
+        let splice = assert_splice_reconstructs(&["a", "b", "c"], &["summary"]);
+        assert_eq!(splice.retained_span(), 0..3);
+        assert_eq!(splice.retained_rows(), 3);
+        assert!(!splice.shares_rows());
+    }
+
+    #[test]
+    fn strand_splice_between_identical_strands_retains_nothing() {
+        let splice = assert_splice_reconstructs(&["a", "b"], &["a", "b"]);
+        assert_eq!(splice.retained_rows(), 0);
+        assert_eq!(splice.splice_start, 2);
+        assert_eq!(splice.successor_end, 2);
+    }
+
+    /// Repeated rows must not let the prefix and suffix scans overlap and
+    /// double-count a shared row.
+    #[test]
+    fn strand_splice_does_not_overlap_prefix_and_suffix_on_repeated_rows() {
+        let splice = assert_splice_reconstructs(&["a", "a", "a"], &["a", "a"]);
+        assert_eq!(splice.splice_start, 2);
+        assert_eq!(splice.splice_end, 3);
+        assert_eq!(splice.successor_end, 2);
+        assert_eq!(splice.retained_rows(), 1);
+    }
+
+    #[test]
+    fn strand_splice_over_an_empty_successor_retains_everything() {
+        let splice = assert_splice_reconstructs(&["a", "b"], &[]);
+        assert_eq!(splice.retained_span(), 0..2);
+        assert_eq!(splice.successor_len(), 0);
+        assert!(!splice.shares_rows());
+    }
+
+    #[test]
+    fn strand_splice_over_an_empty_strand_is_inert() {
+        let splice = assert_splice_reconstructs(&[], &["a"]);
+        assert_eq!(splice.strand_len, 0);
+        assert_eq!(splice.retained_rows(), 0);
+        assert!(!splice.shares_rows());
+    }
+
+    #[test]
+    fn malformed_persisted_splices_are_detectable() {
+        assert!(
+            !StrandSplice {
+                strand_len: 4,
+                splice_start: 3,
+                splice_end: 2,
+                successor_end: 3,
+            }
+            .is_well_formed(),
+            "an inverted span must not pass well-formedness"
+        );
+        assert!(
+            !StrandSplice {
+                strand_len: 4,
+                splice_start: 1,
+                splice_end: 9,
+                successor_end: 1,
+            }
+            .is_well_formed(),
+            "a span past strand_len must not pass well-formedness"
+        );
+        assert!(
+            !StrandSplice {
+                strand_len: 4,
+                splice_start: 2,
+                splice_end: 3,
+                successor_end: 1,
+            }
+            .is_well_formed(),
+            "a replacement ending before the shared prefix must not pass"
+        );
     }
 }

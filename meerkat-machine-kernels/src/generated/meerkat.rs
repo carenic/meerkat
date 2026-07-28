@@ -1706,6 +1706,8 @@ pub enum DurableTailRecoveryClass {
     CompletedCandidate,
     #[serde(rename = "InterruptedRepairableCandidate")]
     InterruptedRepairableCandidate,
+    #[serde(rename = "LegacyCompletedCandidate")]
+    LegacyCompletedCandidate,
     #[serde(rename = "Ambiguous")]
     Ambiguous,
 }
@@ -1714,6 +1716,7 @@ impl DurableTailRecoveryClass {
         match self {
             Self::CompletedCandidate => "CompletedCandidate",
             Self::InterruptedRepairableCandidate => "InterruptedRepairableCandidate",
+            Self::LegacyCompletedCandidate => "LegacyCompletedCandidate",
             Self::Ambiguous => "Ambiguous",
         }
     }
@@ -1724,6 +1727,7 @@ impl std::convert::TryFrom<&str> for DurableTailRecoveryClass {
         match value {
             "CompletedCandidate" => Ok(Self::CompletedCandidate),
             "InterruptedRepairableCandidate" => Ok(Self::InterruptedRepairableCandidate),
+            "LegacyCompletedCandidate" => Ok(Self::LegacyCompletedCandidate),
             "Ambiguous" => Ok(Self::Ambiguous),
             other => Err(format!("invalid DurableTailRecoveryClass value `{other}`")),
         }
@@ -1762,6 +1766,10 @@ pub enum DurableTailRecoveryDisposition {
     CommitCompleted,
     #[serde(rename = "RepairAndCommitInterrupted")]
     RepairAndCommitInterrupted,
+    #[serde(rename = "CommitLegacyCompleted")]
+    CommitLegacyCompleted,
+    #[serde(rename = "CommitLegacyCompletedRetainInputs")]
+    CommitLegacyCompletedRetainInputs,
     #[serde(rename = "HoldIntact")]
     HoldIntact,
 }
@@ -1771,6 +1779,8 @@ impl DurableTailRecoveryDisposition {
             Self::RefuseRecovery => "RefuseRecovery",
             Self::CommitCompleted => "CommitCompleted",
             Self::RepairAndCommitInterrupted => "RepairAndCommitInterrupted",
+            Self::CommitLegacyCompleted => "CommitLegacyCompleted",
+            Self::CommitLegacyCompletedRetainInputs => "CommitLegacyCompletedRetainInputs",
             Self::HoldIntact => "HoldIntact",
         }
     }
@@ -1782,6 +1792,8 @@ impl std::convert::TryFrom<&str> for DurableTailRecoveryDisposition {
             "RefuseRecovery" => Ok(Self::RefuseRecovery),
             "CommitCompleted" => Ok(Self::CommitCompleted),
             "RepairAndCommitInterrupted" => Ok(Self::RepairAndCommitInterrupted),
+            "CommitLegacyCompleted" => Ok(Self::CommitLegacyCompleted),
+            "CommitLegacyCompletedRetainInputs" => Ok(Self::CommitLegacyCompletedRetainInputs),
             "HoldIntact" => Ok(Self::HoldIntact),
             other => Err(format!(
                 "invalid DurableTailRecoveryDisposition value `{other}`"
@@ -15867,6 +15879,10 @@ pub enum TransitionId {
     AuthorizeDurableTailRecoveryCommitRetired,
     AuthorizeDurableTailRecoveryRepairIdle,
     AuthorizeDurableTailRecoveryRepairRetired,
+    AuthorizeDurableTailRecoveryCommitLegacyIdle,
+    AuthorizeDurableTailRecoveryCommitLegacyRetired,
+    AuthorizeDurableTailRecoveryCommitLegacyRetainInputsIdle,
+    AuthorizeDurableTailRecoveryCommitLegacyRetainInputsRetired,
     AuthorizeDurableTailRecoveryHoldIdle,
     AuthorizeDurableTailRecoveryHoldRetired,
     AuthorizeDurableTailRecoveryRefusePriorCommitIdle,

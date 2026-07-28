@@ -13,6 +13,141 @@ via cargo-semver-checks against the published baselines).
 
 ## [Unreleased]
 
+## [0.8.10] - 2026-07-28
+
+### Breaking
+
+- **Durable transcript-history retention is now anchor + splice deltas.** The
+  durable encoding of `session_transcript_history_state_v1.revisions` changed:
+  entry 0 is the chain anchor carrying full `messages`, and every later entry
+  carries `rebase {base, at, removed, insert}` — a minimal splice with the
+  shared prefix *and* suffix elided. Decode materializes front-to-back in one
+  pass, and full-body entries are still accepted on decode. **Documents
+  written by 0.8.10 cannot be read by earlier releases.** The in-memory
+  `TranscriptHistoryState` / `TranscriptRevisionBody` types are unchanged, so
+  no consumer code moves and no published wire schema changed
+  (`TranscriptRevisionBody`'s own serialization is untouched; regenerating the
+  schema artifacts produces a version-only diff).
+  Motivation, measured on a production fleet: retention was `N × document`,
+  because every rewrite retained the full transcript twice — 490.6 MB of
+  durable documents carrying 6.55 MB of conversation (74.9×; worst identity
+  118×) across 1687 retained revisions. Retention is now `one document + Σ
+  edits`: ~82 MB of history metadata on the measured session becomes ~1.4 MB.
+  Content addressing is unchanged — every retained body is still hashed after
+  materialization, so a splice that reconstructs the wrong messages fails
+  exactly the check it always did — and both transcript-history witness
+  formats are byte-identical, so checkpoint digests and stamps are unaffected.
+- **Session-store schema ledger v1 → v2** (`strand-supersession-links`). A
+  0.8.9 binary opening a v2 file refuses it wholesale as
+  `SchemaFromTheFuture`. Strand rows previously had no collection path at all,
+  and a rewrite at message 0 — the per-resume prompt-refresh shape — shares no
+  prefix, so each one wrote a complete new transcript of rows that nothing
+  ever reclaimed. A session now keeps at most ONE materialized strand (the
+  live head); superseded strands retain only their spliced span and resolve
+  the rest through their successor, with supersession derived by comparing
+  persisted bytes so it can never claim sharing that does not exist.
+- **Public API additions that are breaking under `cargo-semver-checks`:**
+  `SessionCheckpointProvenance::RecoveredLegacyBoundaryCommit` and
+  `DurableTailRecoveryClass::LegacyCompletedCandidate` are new enum variants;
+  `SessionDocumentInput::ResolveRuntimeSnapshotReadSource` and
+  `::ClassifyDurableTail` gained a required field, and the corresponding
+  generated `resolve_runtime_snapshot_read_source` / `classify_durable_tail`
+  functions gained a parameter.
+
+### Added
+
+- **Storage doctor census (read-only).** Four findings so this class of defect
+  cannot run unobserved again: `transcript-history-oversized` (warns past a
+  4.0× document-to-conversation ratio — the production shape was 74.9×),
+  `strand-duplication-reclaimable` (2.0×; the production shape was ~88×),
+  `frozen-blob-archive-reclaimable`, and `storage-census-unmeasured` so data
+  the census cannot read is reported unknown rather than healthy. A 1 MiB
+  floor keeps small sessions quiet. The 490 MB above accumulated over weeks
+  precisely because nothing measured the ratio.
+- **Store conformance: `chained_prefix_rewrites`.** Pins reconstruction
+  fidelity across rewrites that share no prefix with their parent. It
+  deliberately does not encode any one storage strategy — a backend that keeps
+  whole revisions materialized still passes.
+
+### Fixed
+
+- **0.8.8 → 0.8.9 upgrade boundary: legacy durable-tail adoption.** A clean
+  ≤0.8.8 shutdown routinely leaves a session whose durable head is one
+  committed turn ahead of the runtime snapshot (`intra_turn_checkpoint`
+  stamp over a `run_boundary_commit` base) with the turn's own input row
+  still queued — ≤0.8.8 persisted staged run bindings only inside the
+  boundary commit. 0.8.9 held such sessions forever
+  (`DurableTailHeldForRecovery`). The recovery machine now has a
+  machine-authorized legacy arm: a digest-proven completed tail whose head
+  row carries pre-witness-v3 stamp evidence commits as a recovered boundary
+  and RETAINS the unbound input row for ordinary redelivery — nothing is
+  terminalized, no consumption is fabricated, no input can be dropped; the
+  worst case is one duplicate redelivered turn, matching the legacy fleet's
+  own restart semantics. Identity-less tails written by pre-v0.7.12
+  binaries adopt through a distinct
+  `SessionCheckpointProvenance::RecoveredLegacyBoundaryCommit` (note:
+  sessions adopted under this provenance are unreadable by 0.8.9-or-older
+  binaries — same one-way door class as the v2 recovered stamps). Modern
+  (witness-v3-stamped) shapes keep the fail-closed hold byte-for-byte.
+- **0.8.8 → 0.8.9 upgrade boundary: first-boundary-save refusal over
+  inline-graph runtime rows.** The transcript-history erase guard derived
+  its reference witness for a previous INLINE graph always in format 2, so
+  a 0.8.9 slim boundary save (v3 witness carrier) could never match — even
+  a same-graph round trip refused, and any post-resume save (whose graph
+  legitimately evolved) wedged the session on its first post-upgrade turn.
+  Affects any 0.8.8-written session with a transcript graph (compacted or
+  prompt-rewritten), plain `rkat` included. The carve-out is now
+  format-aware, and legitimate evolution is accepted through caller-proved,
+  store-verified evidence: the evolved graph is sealed (every retained body
+  digest-verified), bound to the incoming document's own witness, checked
+  as a strict-prefix descendant of the previous inline graph, and the
+  accepted write replaces the row with the slim representation — a one-time
+  O(graph) migration per session, O(1) on every later turn. Evidence is
+  threaded through every boundary-commit seam, including the queued-input
+  machine boundary paths and `atomic_apply` (snapshot, receipt,
+  machine-lifecycle record, and input terminalization stay one
+  all-or-nothing transaction; the migration adds no crash window).
+
+- **Recovered boundaries no longer strand proven-consumed inputs.** The
+  durable-tail observation returned early on the first unbound input row,
+  discarding the rows the same scan had already proved bound to the recovered
+  run (durable staging bindings, or a committed boundary receipt naming
+  them). Those rows stayed non-terminal, and the input lifecycle then rolled
+  Staged back to Queued and re-admitted them — re-executing a turn the
+  boundary had just committed, with a duplicate provider call and re-fired
+  tool side effects. The scan now completes before deciding: proven-bound
+  rows are terminalized, genuinely unbound rows are retained for ordinary
+  redelivery. Pre-0.8.9 documents are unaffected by construction (their
+  staging bindings never reached disk, so they attribute nothing).
+- **The upgrade-boundary evidence source is wired on every surface.** Only
+  mob hosts wired it; the facade's `PersistenceBundle` — the production
+  machine for CLI, REST and RPC — constructed its `MeerkatMachine` without
+  it, so machine-owned boundary commits on those surfaces fell back to the
+  evidence-less default and refused the first slim save over a legacy inline
+  row. Hosts whose session store is not incremental keep the previous
+  fail-closed behavior.
+- **A transient probe failure no longer disables the upgrade path.** The
+  driver's one-shot inline-row hint cached `false` when the probe's snapshot
+  load failed, permanently disabling evidence assembly for that driver's
+  lifetime; the hint now stays unresolved so the next commit re-probes.
+
+### Upgrade notes
+
+- Identities with an in-flight input at shutdown replay it once after
+  upgrade — the same behavior as a pre-upgrade restart. Expect one
+  duplicate reply per such identity on upgrade day.
+- **Migrating a session with a large retained transcript history is
+  expensive and should be planned.** The head-canonical conversion
+  re-materializes every retained revision as strand rows; a production
+  session with 98 retained revisions over a 371-message transcript produced
+  ~16.7k rows and took minutes. Sessions whose durable document is dominated
+  by retained history should be pruned before conversion, not after.
+
+## [0.8.9] - 2026-07-27
+
+*(Consolidated section: entries below accumulated across 0.8.0–0.8.9;
+per-release stamping was not performed at release time.)*
+
 ### Breaking
 
 - **Checkpoint stamp schema v3 — the witness-v3 one-way door.** A session

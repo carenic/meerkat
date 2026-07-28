@@ -10,14 +10,24 @@
 //!   (Missing/Idle/Retired row, no persisted current run), candidate run not
 //!   already terminalized, durable receipts that do not already cover the
 //!   candidate, and fully attributable input rows: Completed ->
-//!   `CommitCompleted`, Repairable -> `RepairAndCommitInterrupted` (both with
-//!   a machine-minted boundary sequence one past the last durably committed
-//!   receipt), Ambiguous -> `HoldIntact`;
+//!   `CommitCompleted`, Repairable -> `RepairAndCommitInterrupted`, Legacy ->
+//!   `CommitLegacyCompleted` (each with a machine-minted boundary sequence
+//!   one past the last durably committed receipt), Ambiguous -> `HoldIntact`;
 //! - durable receipts that already carry the candidate's content, or content
 //!   the candidate neither extends nor equals: `RefuseRecovery` (the
 //!   cross-process duplicate-recovery phantom);
 //! - input rows durable identity cannot attribute, or blocking rows the store
-//!   cannot fence: `HoldIntact` — minted HERE, never by the shell;
+//!   cannot fence: `HoldIntact` — minted HERE, never by the shell — EXCEPT a
+//!   clean COMPLETED candidate with an unbound content input, which commits
+//!   `CommitLegacyCompletedRetainInputs` (terminalize only proven-bound
+//!   rows; the unbound input redelivers). That commit is deliberately NOT
+//!   era-gated: a pre-0.8.9 writer's lost boundary routinely leaves the
+//!   executed turn's own input unbound, so redelivery costs at most one
+//!   duplicate turn (the legacy fleet's own restart semantics), while a
+//!   0.8.9+ writer fences staged bindings durable before execution, so an
+//!   unbound content row never started and redelivery is simply correct.
+//!   Never a dropped input, never fabricated consumption; interrupted
+//!   shapes and unfenceable rows hold in every era;
 //! - conflicting in-process run facts (live run, or the candidate's run
 //!   already produced the retained turn terminal witness): `RefuseRecovery`;
 //! - conflicting PERSISTED facts (non-quiescent or undecodable lifecycle
@@ -277,6 +287,38 @@ fn idle_repairable_candidate_repairs_and_commits_interrupted() {
     );
 }
 
+/// Legacy adoption: the classifier's `LegacyCompletedCandidate` commits under
+/// the same admissible core and durable-evidence guards as the completed
+/// class, with the distinct `CommitLegacyCompleted` disposition and the
+/// domain-separated legacy run identity recorded as the turn terminal.
+#[test]
+fn idle_quiescent_legacy_candidate_commits_legacy_with_minted_sequence() {
+    let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(quiescent_state(
+        mm_dsl::MeerkatPhase::Idle,
+    ))
+    .expect("idle quiescent state must be recoverable");
+    let (candidate_id, verdict) = authorize_quiescent(
+        &mut authority,
+        "candidate-legacy",
+        "run-legacy-deterministic",
+        mm_dsl::DurableTailRecoveryClass::LegacyCompletedCandidate,
+    );
+    assert_eq!(candidate_id, "candidate-legacy");
+    assert_eq!(
+        verdict,
+        Verdict::Commit(
+            mm_dsl::DurableTailRecoveryDisposition::CommitLegacyCompleted,
+            1
+        ),
+        "no committed receipts (last=0) mints boundary sequence 1"
+    );
+    assert_eq!(
+        authority.state().turn_terminal_run_id,
+        Some(mm_dsl::RunId("run-legacy-deterministic".to_string())),
+        "a legacy commit records the minted legacy run identity as the turn terminal"
+    );
+}
+
 #[test]
 fn idle_ambiguous_candidate_holds_intact() {
     let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(quiescent_state(
@@ -307,6 +349,7 @@ fn prior_commit_covering_the_candidate_refuses_duplicate_recovery() {
     for class in [
         mm_dsl::DurableTailRecoveryClass::CompletedCandidate,
         mm_dsl::DurableTailRecoveryClass::InterruptedRepairableCandidate,
+        mm_dsl::DurableTailRecoveryClass::LegacyCompletedCandidate,
     ] {
         let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(quiescent_state(
             mm_dsl::MeerkatPhase::Idle,
@@ -369,49 +412,191 @@ fn diverging_prior_commit_refuses_recovery() {
     );
 }
 
-/// Input evidence the machine — not the shell — turns into a hold: an
-/// unattributable redeliverable input, or blocking rows the store cannot
-/// fence. Both commit-seeking classes hold, and no commit authorization is
-/// emitted, so no shell can be handed a commit verdict it then downgrades.
+/// Input evidence the machine — not the shell — turns into a hold: blocking
+/// rows the store cannot fence hold for every commit-seeking class, and an
+/// unattributable redeliverable input holds for the INTERRUPTED shape. No
+/// commit authorization is emitted on any hold, so no shell can be handed a
+/// commit verdict it then downgrades. (The COMPLETED shapes under
+/// `UnboundContentInput` belong to the retain-inputs commit, pinned below.)
 #[test]
 fn unattributable_input_evidence_holds_intact() {
-    for evidence in [
-        mm_dsl::DurableRecoveryInputEvidence::UnboundContentInput,
-        mm_dsl::DurableRecoveryInputEvidence::Unfenceable,
-    ] {
-        for class in [
+    let cases = [
+        (
+            mm_dsl::DurableRecoveryInputEvidence::Unfenceable,
             mm_dsl::DurableTailRecoveryClass::CompletedCandidate,
+        ),
+        (
+            mm_dsl::DurableRecoveryInputEvidence::Unfenceable,
             mm_dsl::DurableTailRecoveryClass::InterruptedRepairableCandidate,
-        ] {
-            let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(
-                quiescent_state(mm_dsl::MeerkatPhase::Idle),
-            )
-            .expect("idle quiescent state must be recoverable");
-            let (lifecycle, run) = quiescent_observation();
-            let (candidate_id, verdict) = authorize(
-                &mut authority,
-                "candidate-inputs",
-                "run-inputs",
-                class,
-                lifecycle,
-                run,
-                0,
-                mm_dsl::DurableRecoveryPriorCommit::NoPriorCommit,
-                evidence,
-            );
-            assert_eq!(candidate_id, "candidate-inputs");
-            assert_eq!(
-                verdict,
-                Verdict::NonCommit(mm_dsl::DurableTailRecoveryDisposition::HoldIntact),
-                "{evidence:?} with class {class:?} must hold intact"
-            );
-            assert_eq!(
-                authority.state().turn_terminal_run_id,
-                None,
-                "a hold must not record the candidate run as terminalized"
-            );
-        }
+        ),
+        (
+            mm_dsl::DurableRecoveryInputEvidence::Unfenceable,
+            mm_dsl::DurableTailRecoveryClass::LegacyCompletedCandidate,
+        ),
+        (
+            mm_dsl::DurableRecoveryInputEvidence::UnboundContentInput,
+            mm_dsl::DurableTailRecoveryClass::InterruptedRepairableCandidate,
+        ),
+    ];
+    for (evidence, class) in cases {
+        let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(quiescent_state(
+            mm_dsl::MeerkatPhase::Idle,
+        ))
+        .expect("idle quiescent state must be recoverable");
+        let (lifecycle, run) = quiescent_observation();
+        let (candidate_id, verdict) = authorize(
+            &mut authority,
+            "candidate-inputs",
+            "run-inputs",
+            class,
+            lifecycle,
+            run,
+            0,
+            mm_dsl::DurableRecoveryPriorCommit::NoPriorCommit,
+            evidence,
+        );
+        assert_eq!(candidate_id, "candidate-inputs");
+        assert_eq!(
+            verdict,
+            Verdict::NonCommit(mm_dsl::DurableTailRecoveryDisposition::HoldIntact),
+            "{evidence:?} with class {class:?} must hold intact"
+        );
+        assert_eq!(
+            authority.state().turn_terminal_run_id,
+            None,
+            "a hold must not record the candidate run as terminalized"
+        );
     }
+}
+
+/// The retain-inputs commit: a clean COMPLETED candidate with an unbound
+/// content input commits WITHOUT terminalizing the unbound row — it is
+/// retained for ordinary redelivery instead of wedging the session forever.
+/// The arm carries no writer-era guard: a pre-0.8.9 writer's lost boundary
+/// routinely leaves the executed turn's own input unbound (redelivery costs
+/// at most one duplicate turn — the legacy fleet's own restart semantics),
+/// and a 0.8.9+ writer fences staged bindings durable before execution, so
+/// an unbound content row never started and redelivery is simply correct.
+#[test]
+fn unbound_content_input_with_completed_shape_commits_retaining_inputs() {
+    for class in [
+        mm_dsl::DurableTailRecoveryClass::CompletedCandidate,
+        mm_dsl::DurableTailRecoveryClass::LegacyCompletedCandidate,
+    ] {
+        let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(quiescent_state(
+            mm_dsl::MeerkatPhase::Idle,
+        ))
+        .expect("idle quiescent state must be recoverable");
+        let (lifecycle, run) = quiescent_observation();
+        let (candidate_id, verdict) = authorize(
+            &mut authority,
+            "candidate-retain-inputs",
+            "run-retain-bound",
+            class,
+            lifecycle,
+            run,
+            0,
+            mm_dsl::DurableRecoveryPriorCommit::NoPriorCommit,
+            mm_dsl::DurableRecoveryInputEvidence::UnboundContentInput,
+        );
+        assert_eq!(candidate_id, "candidate-retain-inputs");
+        assert_eq!(
+            verdict,
+            Verdict::Commit(
+                mm_dsl::DurableTailRecoveryDisposition::CommitLegacyCompletedRetainInputs,
+                1
+            ),
+            "class {class:?}: an unbound content input on a completed shape must \
+             commit retaining inputs"
+        );
+        assert_eq!(
+            authority.state().turn_terminal_run_id,
+            Some(mm_dsl::RunId("run-retain-bound".to_string())),
+            "the retain-inputs commit still records the candidate run as the turn terminal"
+        );
+    }
+}
+
+/// The retain-inputs arm is exactly as narrow as the evidence allows: an
+/// interrupted shape stays held, unfenceable rows stay held for every class,
+/// and a prior-commit conflict refuses before the evidence cut is ever
+/// consulted.
+#[test]
+fn retain_inputs_arm_stays_fail_closed_everywhere_else() {
+    // Interrupted shape: held.
+    let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(quiescent_state(
+        mm_dsl::MeerkatPhase::Idle,
+    ))
+    .expect("idle quiescent state must be recoverable");
+    let (lifecycle, run) = quiescent_observation();
+    let (_, verdict) = authorize(
+        &mut authority,
+        "candidate-retain-interrupted",
+        "run-retain-interrupted",
+        mm_dsl::DurableTailRecoveryClass::InterruptedRepairableCandidate,
+        lifecycle,
+        run,
+        0,
+        mm_dsl::DurableRecoveryPriorCommit::NoPriorCommit,
+        mm_dsl::DurableRecoveryInputEvidence::UnboundContentInput,
+    );
+    assert_eq!(
+        verdict,
+        Verdict::NonCommit(mm_dsl::DurableTailRecoveryDisposition::HoldIntact),
+        "an interrupted tail with an unbound input must stay held"
+    );
+
+    // Unfenceable rows: held for every commit-seeking class.
+    for class in [
+        mm_dsl::DurableTailRecoveryClass::CompletedCandidate,
+        mm_dsl::DurableTailRecoveryClass::InterruptedRepairableCandidate,
+        mm_dsl::DurableTailRecoveryClass::LegacyCompletedCandidate,
+    ] {
+        let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(quiescent_state(
+            mm_dsl::MeerkatPhase::Idle,
+        ))
+        .expect("idle quiescent state must be recoverable");
+        let (lifecycle, run) = quiescent_observation();
+        let (_, verdict) = authorize(
+            &mut authority,
+            "candidate-retain-unfenceable",
+            "run-retain-unfenceable",
+            class,
+            lifecycle,
+            run,
+            0,
+            mm_dsl::DurableRecoveryPriorCommit::NoPriorCommit,
+            mm_dsl::DurableRecoveryInputEvidence::Unfenceable,
+        );
+        assert_eq!(
+            verdict,
+            Verdict::NonCommit(mm_dsl::DurableTailRecoveryDisposition::HoldIntact),
+            "class {class:?}: unfenceable rows must hold"
+        );
+    }
+
+    // Prior-commit conflict refuses before the evidence cut.
+    let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(quiescent_state(
+        mm_dsl::MeerkatPhase::Idle,
+    ))
+    .expect("idle quiescent state must be recoverable");
+    let (lifecycle, run) = quiescent_observation();
+    let (_, verdict) = authorize(
+        &mut authority,
+        "candidate-retain-duplicate",
+        "run-retain-duplicate",
+        mm_dsl::DurableTailRecoveryClass::CompletedCandidate,
+        lifecycle,
+        run,
+        4,
+        mm_dsl::DurableRecoveryPriorCommit::MatchesCandidate,
+        mm_dsl::DurableRecoveryInputEvidence::UnboundContentInput,
+    );
+    assert_eq!(
+        verdict,
+        Verdict::NonCommit(mm_dsl::DurableTailRecoveryDisposition::RefuseRecovery),
+        "an already-landed recovery must refuse before the input-evidence cut"
+    );
 }
 
 /// An ambiguous classification holds whatever the receipts and input rows
@@ -654,6 +839,7 @@ fn non_quiescent_phases_refuse_recovery() {
         for class in [
             mm_dsl::DurableTailRecoveryClass::CompletedCandidate,
             mm_dsl::DurableTailRecoveryClass::InterruptedRepairableCandidate,
+            mm_dsl::DurableTailRecoveryClass::LegacyCompletedCandidate,
             mm_dsl::DurableTailRecoveryClass::Ambiguous,
         ] {
             let mut authority = mm_dsl::MeerkatMachineAuthority::recover_from_state(state.clone())
@@ -685,6 +871,8 @@ fn no_disposition_value_discards_the_durable_tail() {
         mm_dsl::DurableTailRecoveryDisposition::RefuseRecovery,
         mm_dsl::DurableTailRecoveryDisposition::CommitCompleted,
         mm_dsl::DurableTailRecoveryDisposition::RepairAndCommitInterrupted,
+        mm_dsl::DurableTailRecoveryDisposition::CommitLegacyCompleted,
+        mm_dsl::DurableTailRecoveryDisposition::CommitLegacyCompletedRetainInputs,
         mm_dsl::DurableTailRecoveryDisposition::HoldIntact,
     ];
     for disposition in all {
@@ -696,6 +884,13 @@ fn no_disposition_value_discards_the_durable_tail() {
             // Repair appends synthetic interrupted results; it never removes
             // durable evidence.
             mm_dsl::DurableTailRecoveryDisposition::RepairAndCommitInterrupted => true,
+            // The legacy tail IS the committed transcript, adopted under the
+            // minted legacy run identity.
+            mm_dsl::DurableTailRecoveryDisposition::CommitLegacyCompleted => true,
+            // The tail IS the committed transcript; the unbound input row is
+            // retained in its own lifecycle for redelivery — nothing is
+            // terminalized, nothing discarded.
+            mm_dsl::DurableTailRecoveryDisposition::CommitLegacyCompletedRetainInputs => true,
             // Held intact, readable, blocked from resume.
             mm_dsl::DurableTailRecoveryDisposition::HoldIntact => true,
         };

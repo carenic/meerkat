@@ -93,6 +93,7 @@ pub struct RunId(pub String);
 pub enum DurableTailRecoveryClass {
     CompletedCandidate,
     InterruptedRepairableCandidate,
+    LegacyCompletedCandidate,
     #[default]
     Ambiguous,
 }
@@ -105,6 +106,8 @@ pub enum DurableTailRecoveryDisposition {
     RefuseRecovery,
     CommitCompleted,
     RepairAndCommitInterrupted,
+    CommitLegacyCompleted,
+    CommitLegacyCompletedRetainInputs,
     HoldIntact,
 }
 
