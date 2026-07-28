@@ -50,8 +50,8 @@ use transcript_history::validate::{
     assistant_tool_use_ids, message_role_name, validate_transcript_tool_result_shape,
 };
 pub use transcript_history::{
-    TranscriptHistoryState, TranscriptRevisionBody, TranscriptRewriteCommit,
-    TranscriptRewriteRecord, ValidatedTranscriptHistory,
+    TranscriptHistoryState, TranscriptReplayCursor, TranscriptRevisionBody,
+    TranscriptRewriteCommit, TranscriptRewriteRecord, ValidatedTranscriptHistory,
 };
 
 /// Current session format version.
@@ -491,6 +491,54 @@ impl SharedTranscriptHistoryState {
     }
 }
 
+/// The replay cursor this load established, waiting for a graph write to carry
+/// it to disk.
+///
+/// NON-DURABLE and deliberately so. The load that reconciles a graph with the
+/// append-only log holds only `&Session` (the audit verifier's signature), and
+/// it must not dirty the document just to record a hint — writing the graph
+/// value on a read would rotate `updated_at` and manufacture a checkpoint
+/// sibling for a session whose content did not change. So the fact is parked
+/// here and stamped onto the next graph the session writes for its own reasons.
+///
+/// That is also what makes "never stamp on a graph you did not persist" hold by
+/// construction: a hint reaches disk only inside a graph write, inside a
+/// session that is then saved. If no save happens the hint dies with the
+/// in-memory `Session` and the durable cursor stays where it was — lower, which
+/// is the safe direction.
+#[derive(Debug, Default)]
+pub(crate) struct ReplayCursorHint {
+    inner: std::sync::Mutex<Option<TranscriptReplayCursor>>,
+}
+
+impl Clone for ReplayCursorHint {
+    fn clone(&self) -> Self {
+        Self {
+            inner: std::sync::Mutex::new(self.locked().clone()),
+        }
+    }
+}
+
+impl ReplayCursorHint {
+    fn locked(&self) -> std::sync::MutexGuard<'_, Option<TranscriptReplayCursor>> {
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn clear(&self) {
+        *self.locked() = None;
+    }
+
+    fn set(&self, cursor: TranscriptReplayCursor) {
+        *self.locked() = Some(cursor);
+    }
+
+    fn get(&self) -> Option<TranscriptReplayCursor> {
+        self.locked().clone()
+    }
+}
+
 /// Canonical witness chunk of one retained revision body: the
 /// `write_canonical_json` form of `{"messages": canonicalized, "revision": r}`
 /// — exactly the per-element bytes `canonicalize_checkpoint_history_value`
@@ -662,6 +710,8 @@ pub(crate) struct SessionHistoryCaches {
     /// in-memory document. Derived cache only; cleared by every content
     /// mutation.
     verified_checkpoint_digest: std::sync::OnceLock<String>,
+    /// Replay cursor established by this load, awaiting the next graph write.
+    replay_cursor_hint: ReplayCursorHint,
 }
 
 /// Per-format memoized transcript-history witnesses; see
@@ -6028,6 +6078,11 @@ impl Session {
                 .remove(SESSION_TRANSCRIPT_HISTORY_CHECKPOINT_DIGEST_KEY);
             self.history_caches.witness = SessionWitnessMemo::default();
             self.history_caches.shared_state.clear();
+            // An UNCHECKED graph install can substitute a different lineage
+            // entirely, and a cursor established against the graph this one
+            // replaced describes nothing here. Drop it rather than let the next
+            // write stamp it onto a stranger.
+            self.history_caches.replay_cursor_hint.clear();
             self.transcript_history_metadata_validation =
                 TranscriptHistoryMetadataValidation::RequiresValidation;
         }
@@ -6069,6 +6124,69 @@ impl Session {
         record_producer_validated_transcript_graph(state, approx_bytes);
     }
 
+    /// Install a graph a typed path already validated, stamping this load's
+    /// replay cursor onto it on the way out.
+    ///
+    /// The single sink for typed graph writes, so the cursor cannot be lost by
+    /// a caller that forgot it, and the typed value cached here always agrees
+    /// with the bytes persisted from it — the field is stamped BEFORE the one
+    /// serialization, never patched into the JSON afterwards.
+    fn install_validated_transcript_history_state(
+        &mut self,
+        mut state: TranscriptHistoryState,
+    ) -> Result<(), serde_json::Error> {
+        state.replay_cursor = Self::higher_replay_cursor(
+            state.replay_cursor.take(),
+            self.history_caches.replay_cursor_hint.get(),
+        );
+        let state = std::sync::Arc::new(state);
+        let value = serde_json::to_value(state.as_ref())?;
+        self.set_validated_transcript_history_metadata_with_state(value, state);
+        Ok(())
+    }
+
+    /// The further-along of two cursors, so a graph write can only ever move
+    /// the durable position forward.
+    fn higher_replay_cursor(
+        carried: Option<TranscriptReplayCursor>,
+        hint: Option<TranscriptReplayCursor>,
+    ) -> Option<TranscriptReplayCursor> {
+        match (carried, hint) {
+            (Some(carried), Some(hint)) => Some(if hint.seq > carried.seq {
+                hint
+            } else {
+                carried
+            }),
+            (carried, hint) => carried.or(hint),
+        }
+    }
+
+    /// How far the append-only rewrite log has already been folded into this
+    /// session's durable graph.
+    ///
+    /// Read straight off the metadata value rather than the typed graph: this
+    /// runs on every authoritative load, and parsing the graph to learn where
+    /// to start reading would cost more than the read it saves.
+    #[must_use]
+    pub fn transcript_replay_cursor(&self) -> Option<TranscriptReplayCursor> {
+        serde_json::from_value(
+            self.metadata
+                .get(SESSION_TRANSCRIPT_HISTORY_STATE_KEY)?
+                .get("replay_cursor")?
+                .clone(),
+        )
+        .ok()
+    }
+
+    /// Park a replay cursor for the next graph write; see [`ReplayCursorHint`].
+    ///
+    /// Callers must have established BOTH coverage directions in the same load.
+    /// Recording nothing is always safe, so every doubtful case should simply
+    /// not call this.
+    pub fn record_transcript_replay_cursor(&self, cursor: TranscriptReplayCursor) {
+        self.history_caches.replay_cursor_hint.set(cursor);
+    }
+
     #[cfg(test)]
     pub(crate) fn set_metadata_unchecked_for_test(&mut self, key: &str, value: serde_json::Value) {
         self.set_metadata_unchecked(key, value);
@@ -6090,6 +6208,8 @@ impl Session {
                 .is_some();
             self.history_caches.witness = SessionWitnessMemo::default();
             self.history_caches.shared_state.clear();
+            // The graph this cursor described is gone.
+            self.history_caches.replay_cursor_hint.clear();
             self.transcript_history_metadata_validation =
                 TranscriptHistoryMetadataValidation::Validated;
         }
@@ -6644,6 +6764,28 @@ impl Session {
         ValidatedTranscriptHistory::seal(state).map(Some)
     }
 
+    /// This session's transcript graph, but ONLY when the session's own marker
+    /// already proves it.
+    ///
+    /// [`Self::validated_transcript_history_state`] SEALS an unmarked graph,
+    /// which costs a whole-graph hash. A caller that wants the proof as an
+    /// OPTIMIZATION — evidence that lets it skip work it would otherwise do —
+    /// has already spent the saving by the time that hash finishes, so this
+    /// reports absence rather than paying for evidence. Absence here is never
+    /// a verdict about the graph; it only means no proof is on hand for free.
+    pub fn already_validated_transcript_history_state(
+        &self,
+    ) -> Result<Option<ValidatedTranscriptHistory>, serde_json::Error> {
+        if self.transcript_history_metadata_validation
+            != TranscriptHistoryMetadataValidation::Validated
+        {
+            return Ok(None);
+        }
+        Ok(self
+            .transcript_history_state_shared()?
+            .map(ValidatedTranscriptHistory::adopt_session_validated))
+    }
+
     /// Return the already-validated transcript graph head without cloning and
     /// deserializing the full history document again.
     ///
@@ -7122,16 +7264,14 @@ impl Session {
             .clone();
         let realtime_state =
             self.reconciled_realtime_transcript_metadata_after_rewrite(&head_body.messages)?;
-        let state = std::sync::Arc::new(state);
-        let value = serde_json::to_value(state.as_ref())
-            .map_err(|err| TranscriptEditError::HistoryStateMalformed(err.to_string()))?;
         let mut updated_at = head_body.created_at;
         for commit in &state.commits {
             if commit.committed_at > updated_at {
                 updated_at = commit.committed_at;
             }
         }
-        self.set_validated_transcript_history_metadata_with_state(value, state);
+        self.install_validated_transcript_history_state(state)
+            .map_err(|err| TranscriptEditError::HistoryStateMalformed(err.to_string()))?;
         if let Some(value) = realtime_state {
             self.set_metadata_unchecked(SESSION_REALTIME_TRANSCRIPT_STATE_KEY, value);
         }
@@ -7314,6 +7454,7 @@ impl Session {
             commits: Vec::new(),
             revisions: Vec::new(),
             digest_format: TRANSCRIPT_DIGEST_FORMAT_CURRENT,
+            replay_cursor: None,
         });
         let prior_head_is_parent = state.head == commit.parent_revision;
         let parent_body_preexisted = state
@@ -7431,10 +7572,8 @@ impl Session {
         } else {
             state.compact_mechanical_revision_bodies()?;
         }
-        let state = std::sync::Arc::new(state);
-        let value = serde_json::to_value(state.as_ref())
+        self.install_validated_transcript_history_state(state)
             .map_err(|err| TranscriptEditError::HistoryStateMalformed(err.to_string()))?;
-        self.set_validated_transcript_history_metadata_with_state(value, state);
         if let Some(value) = realtime_state {
             self.set_metadata_unchecked(SESSION_REALTIME_TRANSCRIPT_STATE_KEY, value);
         }
@@ -7542,21 +7681,15 @@ impl Session {
             SystemTime::now(),
             shape,
         ) {
-            Ok(Some(state)) => match serde_json::to_value(&state) {
-                Ok(value) => {
-                    self.set_validated_transcript_history_metadata_with_state(
-                        value,
-                        std::sync::Arc::new(state),
-                    );
-                }
-                Err(error) => {
+            Ok(Some(state)) => {
+                if let Err(error) = self.install_validated_transcript_history_state(state) {
                     tracing::warn!(
                         session_id = %self.id,
                         error = %error,
                         "failed to serialize transcript history state after message mutation"
                     );
                 }
-            },
+            }
             Ok(None) => {}
             Err(error) => {
                 tracing::warn!(
@@ -9674,6 +9807,7 @@ mod tests {
         let state = TranscriptHistoryState {
             head: commit.revision.clone(),
             digest_format: 0,
+            replay_cursor: None,
             commits: vec![commit.clone()],
             revisions: vec![
                 TranscriptRevisionBody {
@@ -9766,6 +9900,7 @@ mod tests {
         let bogus = "sha256:0000000000000000000000000000000000000000000000000000000000000000";
         let state = TranscriptHistoryState {
             digest_format: 0,
+            replay_cursor: None,
             head: bogus.to_string(),
             commits: Vec::new(),
             revisions: vec![TranscriptRevisionBody {
@@ -9800,6 +9935,7 @@ mod tests {
         let messages = vec![Message::User(UserMessage::text("hello".to_string()))];
         let state = TranscriptHistoryState {
             digest_format: TRANSCRIPT_DIGEST_FORMAT_CURRENT,
+            replay_cursor: None,
             head: bogus.to_string(),
             commits: Vec::new(),
             revisions: vec![TranscriptRevisionBody {
@@ -9834,6 +9970,7 @@ mod tests {
         let revision = transcript_messages_digest(&messages).expect("content digest");
         let state = TranscriptHistoryState {
             digest_format: TRANSCRIPT_DIGEST_FORMAT_CURRENT,
+            replay_cursor: None,
             head: revision.clone(),
             commits: Vec::new(),
             revisions: vec![TranscriptRevisionBody {

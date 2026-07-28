@@ -3500,6 +3500,7 @@ mod tests {
             commits: Vec::new(),
             revisions: Vec::new(),
             digest_format: 0,
+            replay_cursor: None,
         };
         run_boundary_snapshot_save_guard_with_legacy_history_evidence(
             &incoming,
@@ -3552,6 +3553,7 @@ mod tests {
             commits: Vec::new(),
             revisions: Vec::new(),
             digest_format: 0,
+            replay_cursor: None,
         };
         run_boundary_snapshot_save_guard_with_legacy_history_evidence(
             &incoming,
@@ -4220,6 +4222,7 @@ mod tests {
         let incoming_revision = incoming.transcript_revision()?;
         let history = TranscriptHistoryState {
             digest_format: 0,
+            replay_cursor: None,
             head: incoming_revision.clone(),
             commits: Vec::new(),
             revisions: vec![
@@ -4270,6 +4273,7 @@ mod tests {
             crate::session::SESSION_TRANSCRIPT_HISTORY_STATE_KEY,
             serde_json::to_value(TranscriptHistoryState {
                 digest_format: 0,
+                replay_cursor: None,
                 head: poisoned_revision.clone(),
                 commits: Vec::new(),
                 revisions: vec![crate::TranscriptRevisionBody {
@@ -4351,6 +4355,7 @@ mod tests {
             crate::session::SESSION_TRANSCRIPT_HISTORY_STATE_KEY,
             serde_json::to_value(TranscriptHistoryState {
                 digest_format: 0,
+                replay_cursor: None,
                 head: incoming_revision.clone(),
                 commits: vec![commit],
                 revisions: vec![
@@ -4488,6 +4493,7 @@ mod tests {
             crate::session::SESSION_TRANSCRIPT_HISTORY_STATE_KEY,
             serde_json::to_value(TranscriptHistoryState {
                 digest_format: 0,
+                replay_cursor: None,
                 head: incoming_revision.clone(),
                 commits: Vec::new(),
                 revisions: vec![crate::TranscriptRevisionBody {
@@ -4622,6 +4628,7 @@ mod tests {
             crate::session::SESSION_TRANSCRIPT_HISTORY_STATE_KEY,
             serde_json::to_value(TranscriptHistoryState {
                 digest_format: 0,
+                replay_cursor: None,
                 head: incoming_revision.clone(),
                 commits: Vec::new(),
                 revisions: vec![
@@ -4671,6 +4678,7 @@ mod tests {
             crate::session::SESSION_TRANSCRIPT_HISTORY_STATE_KEY,
             serde_json::to_value(TranscriptHistoryState {
                 digest_format: 0,
+                replay_cursor: None,
                 head: incoming_revision.clone(),
                 commits: Vec::new(),
                 revisions: vec![
@@ -4741,6 +4749,7 @@ mod tests {
             crate::session::SESSION_TRANSCRIPT_HISTORY_STATE_KEY,
             serde_json::to_value(TranscriptHistoryState {
                 digest_format: 0,
+                replay_cursor: None,
                 head: incoming_revision.clone(),
                 commits: Vec::new(),
                 revisions: vec![crate::TranscriptRevisionBody {
@@ -4779,6 +4788,7 @@ mod tests {
             crate::session::SESSION_TRANSCRIPT_HISTORY_STATE_KEY,
             serde_json::to_value(TranscriptHistoryState {
                 digest_format: 0,
+                replay_cursor: None,
                 head: incoming_revision.clone(),
                 commits: Vec::new(),
                 revisions: vec![
@@ -4830,6 +4840,7 @@ mod tests {
             crate::session::SESSION_TRANSCRIPT_HISTORY_STATE_KEY,
             serde_json::to_value(TranscriptHistoryState {
                 digest_format: 0,
+                replay_cursor: None,
                 head: incoming_revision.clone(),
                 commits: vec![TranscriptRewriteCommit {
                     parent_revision: previous.transcript_revision()?,
@@ -4885,6 +4896,7 @@ mod tests {
             crate::session::SESSION_TRANSCRIPT_HISTORY_STATE_KEY,
             serde_json::to_value(TranscriptHistoryState {
                 digest_format: 0,
+                replay_cursor: None,
                 head: incoming_revision.clone(),
                 commits: vec![TranscriptRewriteCommit {
                     parent_revision: previous.transcript_revision()?,
@@ -5317,6 +5329,7 @@ mod tests {
         let mut parent = previous.clone();
         parent.apply_transcript_history_state(TranscriptHistoryState {
             digest_format: 0,
+            replay_cursor: None,
             head: parent_revision.clone(),
             commits: Vec::new(),
             revisions: vec![crate::TranscriptRevisionBody {
@@ -5379,6 +5392,7 @@ mod tests {
         let mut forged_parent = previous.clone();
         forged_parent.apply_transcript_history_state(TranscriptHistoryState {
             digest_format: 0,
+            replay_cursor: None,
             head: forged_parent_revision.clone(),
             commits: Vec::new(),
             revisions: vec![

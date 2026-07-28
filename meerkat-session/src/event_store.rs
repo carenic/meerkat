@@ -74,6 +74,28 @@ pub struct StoredEvent {
     pub event: AgentEvent,
 }
 
+/// One durable row whose payload has not been parsed.
+///
+/// Carries only what a caller can act on without the payload: the durable
+/// sequence, and the payload's own bytes. The schema-version gate that
+/// [`StoredEvent`] decoding applies is applied here too, before a row is
+/// handed out — an unparsed payload is not an unchecked one.
+#[derive(Debug, Clone)]
+pub struct RawStoredEvent {
+    /// Monotonically increasing sequence number within a session.
+    pub seq: u64,
+    /// The event payload, exactly as stored.
+    pub event: Box<serde_json::value::RawValue>,
+}
+
+/// The [`StoredEvent`] fields a raw read needs, with the payload left alone.
+#[derive(Deserialize)]
+struct RawStoredEventWire {
+    seq: u64,
+    schema_version: u32,
+    event: Box<serde_json::value::RawValue>,
+}
+
 /// Placeholder source used only to let a pre-bump row deserialize so the typed
 /// schema-version gate can reject it (see [`StoredEvent::source`]).
 fn stored_event_legacy_source() -> EventSourceIdentity {
@@ -531,6 +553,28 @@ pub trait EventStore: Send + Sync {
         from_seq: u64,
     ) -> Result<Vec<StoredEvent>, EventStoreError>;
 
+    /// [`Self::read_from`] with each row's payload left unparsed.
+    ///
+    /// A transcript-rewrite row carries two FULL transcript bodies, and the
+    /// replay's coverage decision reads one short field of it. Materializing
+    /// those bodies to reach that field is the dominant cost of an
+    /// authoritative load on a session with a long rewrite history, and a
+    /// typed read cannot avoid it: by the time the caller holds a
+    /// [`StoredEvent`] the bodies are already built.
+    ///
+    /// `None` means this store has no rawer read than the typed one. The
+    /// default returns it, so a store that does not implement this keeps
+    /// behaving exactly as it did — the caller falls back to
+    /// [`Self::read_from`] and pays what every load used to pay.
+    async fn read_raw_from(
+        &self,
+        session_id: &SessionId,
+        from_seq: u64,
+    ) -> Result<Option<Vec<RawStoredEvent>>, EventStoreError> {
+        let _ = (session_id, from_seq);
+        Ok(None)
+    }
+
     /// Read at most `max_rows` events from a sequence floor. Production
     /// stores override this to avoid materializing an unbounded backlog;
     /// the default preserves compatibility for small test stores.
@@ -910,6 +954,27 @@ impl FileEventStore {
         Ok(event)
     }
 
+    /// [`Self::decode_event_line`] without building the payload.
+    ///
+    /// Applies the same schema-version gate on the same field; only the
+    /// payload is left as stored bytes.
+    fn decode_raw_event_line(&self, line: &str) -> Result<RawStoredEvent, EventStoreError> {
+        #[cfg(test)]
+        self.decoded_rows.fetch_add(1, Ordering::Relaxed);
+        let wire: RawStoredEventWire = serde_json::from_str(line)
+            .map_err(|error| EventStoreError::Serialization(error.to_string()))?;
+        if wire.schema_version != EVENT_SCHEMA_VERSION {
+            return Err(EventStoreError::SchemaVersionMismatch {
+                expected: EVENT_SCHEMA_VERSION,
+                found: wire.schema_version,
+            });
+        }
+        Ok(RawStoredEvent {
+            seq: wire.seq,
+            event: wire.event,
+        })
+    }
+
     async fn tail_anchor_matches(
         file: &mut tokio::fs::File,
         anchor: EventLogLineAnchor,
@@ -1070,6 +1135,39 @@ impl FileEventStore {
         from_seq: u64,
         max_rows: Option<usize>,
     ) -> Result<Vec<StoredEvent>, EventStoreError> {
+        self.read_indexed_with(session_id, from_seq, max_rows, |store, line| {
+            store.decode_event_line(line).map(|row| (row.seq, row))
+        })
+        .await
+    }
+
+    /// [`Self::read_indexed`] over rows whose payloads are left unparsed.
+    async fn read_raw_indexed(
+        &self,
+        session_id: &SessionId,
+        from_seq: u64,
+        max_rows: Option<usize>,
+    ) -> Result<Vec<RawStoredEvent>, EventStoreError> {
+        self.read_indexed_with(session_id, from_seq, max_rows, |store, line| {
+            store.decode_raw_event_line(line).map(|row| (row.seq, row))
+        })
+        .await
+    }
+
+    /// The indexed read, parameterized by how a row line becomes a row.
+    ///
+    /// The index refresh, the byte-offset seek, the read-stability retry and
+    /// the fingerprint recheck are the same work whichever shape the caller
+    /// wants back; only the per-line decode differs. Two copies of this loop
+    /// would be two chances for the raw read to disagree with the typed one
+    /// about which rows a log holds.
+    async fn read_indexed_with<T>(
+        &self,
+        session_id: &SessionId,
+        from_seq: u64,
+        max_rows: Option<usize>,
+        decode: impl Fn(&Self, &str) -> Result<(u64, T), EventStoreError>,
+    ) -> Result<Vec<T>, EventStoreError> {
         if max_rows == Some(0) {
             return Ok(Vec::new());
         }
@@ -1095,7 +1193,7 @@ impl FileEventStore {
                 ))
             })?;
             let (rows, after) = self
-                .read_index_snapshot(&path, &mut file, snapshot, from_seq, max_rows)
+                .read_index_snapshot(&path, &mut file, snapshot, from_seq, max_rows, &decode)
                 .await?;
             if after == expected {
                 return Ok(rows);
@@ -1158,14 +1256,15 @@ impl FileEventStore {
             .collect())
     }
 
-    async fn read_index_snapshot(
+    async fn read_index_snapshot<T>(
         &self,
         path: &Path,
         file: &mut tokio::fs::File,
         snapshot: EventLogIndexSnapshot,
         from_seq: u64,
         max_rows: Option<usize>,
-    ) -> Result<(Vec<StoredEvent>, EventLogFingerprint), EventStoreError> {
+        decode: &impl Fn(&Self, &str) -> Result<(u64, T), EventStoreError>,
+    ) -> Result<(Vec<T>, EventLogFingerprint), EventStoreError> {
         let byte_offset = snapshot.byte_offset.ok_or_else(|| {
             EventStoreError::Store(format!(
                 "event log '{}' has a nonempty index without a page checkpoint",
@@ -1214,9 +1313,9 @@ impl FileEventStore {
             if line.trim().is_empty() {
                 continue;
             }
-            let event = self.decode_event_line(&line)?;
-            if event.seq >= from_seq {
-                rows.push(event);
+            let (seq, row) = decode(self, &line)?;
+            if seq >= from_seq {
+                rows.push(row);
                 if max_rows.is_some_and(|limit| rows.len() == limit) {
                     break;
                 }
@@ -1787,6 +1886,16 @@ impl EventStore for FileEventStore {
         from_seq: u64,
     ) -> Result<Vec<StoredEvent>, EventStoreError> {
         self.read_indexed(session_id, from_seq, None).await
+    }
+
+    async fn read_raw_from(
+        &self,
+        session_id: &SessionId,
+        from_seq: u64,
+    ) -> Result<Option<Vec<RawStoredEvent>>, EventStoreError> {
+        self.read_raw_indexed(session_id, from_seq, None)
+            .await
+            .map(Some)
     }
 
     async fn read_from_bounded(
@@ -2613,6 +2722,98 @@ mod tests {
         Ok(())
     }
 
+    /// The raw read and the typed read must agree about which rows a log holds
+    /// and in what order: the coverage decision is taken on one of them and the
+    /// rebuild runs on the other.
+    #[tokio::test]
+    async fn file_event_store_raw_read_agrees_with_the_typed_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let store = FileEventStore::new(temp.path().join("events"));
+        let session_id = SessionId::new();
+        store
+            .append(
+                &session_id,
+                &[
+                    AgentEvent::TurnStarted { turn_number: 1 },
+                    AgentEvent::TextComplete {
+                        content: "durable event".to_string(),
+                    },
+                    AgentEvent::TurnStarted { turn_number: 2 },
+                ],
+            )
+            .await?;
+
+        for from_seq in [0_u64, 1, 2, 3, 4] {
+            let typed = store.read_from(&session_id, from_seq).await?;
+            let raw = store
+                .read_raw_from(&session_id, from_seq)
+                .await?
+                .expect("a file-backed log reads raw");
+            assert_eq!(
+                raw.iter().map(|row| row.seq).collect::<Vec<_>>(),
+                typed.iter().map(|row| row.seq).collect::<Vec<_>>(),
+                "raw and typed reads disagree about the rows from {from_seq}"
+            );
+            for (raw_row, typed_row) in raw.iter().zip(typed.iter()) {
+                let reparsed: AgentEvent = serde_json::from_str(raw_row.event.get())?;
+                assert_eq!(
+                    serde_json::to_value(&reparsed)?,
+                    serde_json::to_value(&typed_row.event)?,
+                    "raw payload at seq {} does not carry the typed event",
+                    raw_row.seq
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// An unparsed payload is not an unchecked row: the raw read applies the
+    /// same schema-version gate the typed read does.
+    #[tokio::test]
+    async fn file_event_store_raw_read_rejects_a_foreign_schema_version()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("events");
+        let session_id = SessionId::new();
+        let store = FileEventStore::new(&root);
+        store
+            .append(&session_id, &[AgentEvent::TurnStarted { turn_number: 1 }])
+            .await?;
+
+        let path = root.join(format!("{session_id}.jsonl"));
+        let contents = tokio::fs::read_to_string(&path).await?;
+        let mut row: serde_json::Value = serde_json::from_str(contents.trim())?;
+        row["schema_version"] = serde_json::json!(EVENT_SCHEMA_VERSION + 7);
+        tokio::fs::write(&path, format!("{row}\n")).await?;
+
+        let error = FileEventStore::new(&root)
+            .read_raw_from(&session_id, 0)
+            .await
+            .expect_err("a foreign schema version must fail the raw read closed");
+        assert!(
+            matches!(error, EventStoreError::SchemaVersionMismatch { .. }),
+            "unexpected error: {error}"
+        );
+        Ok(())
+    }
+
+    /// A store that does not implement the raw read keeps behaving exactly as
+    /// it did; callers fall back to the typed read.
+    #[tokio::test]
+    async fn a_store_without_a_raw_read_reports_absence_rather_than_failing()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let session_id = SessionId::new();
+        assert!(
+            LegacyEventStore
+                .read_raw_from(&session_id, 0)
+                .await?
+                .is_none(),
+            "the default raw read must report absence, not an error"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn file_event_store_arbitrary_page_hint_cannot_force_capacity_panic()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2948,7 +3149,14 @@ mod tests {
         tokio::fs::rename(&replacement_path, &path).await?;
 
         let (page, observed) = store
-            .read_index_snapshot(&path, &mut opened, snapshot, 120, Some(1))
+            .read_index_snapshot(
+                &path,
+                &mut opened,
+                snapshot,
+                120,
+                Some(1),
+                &|store, line| store.decode_event_line(line).map(|row| (row.seq, row)),
+            )
             .await?;
         assert_eq!(page.first().map(|row| row.seq), Some(120));
         assert_eq!(observed.device, expected.device);

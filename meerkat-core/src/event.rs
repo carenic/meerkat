@@ -1010,9 +1010,65 @@ pub fn agent_event_type(event: &AgentEvent) -> &'static str {
         AgentEvent::StreamTruncated { .. } => "stream_truncated",
         AgentEvent::ToolConfigChanged { .. } => "tool_config_changed",
         AgentEvent::BackgroundJobCompleted { .. } => "background_job_completed",
-        AgentEvent::TranscriptRewriteCommitted { .. } => "transcript_rewrite_committed",
+        AgentEvent::TranscriptRewriteCommitted { .. } => TRANSCRIPT_REWRITE_COMMITTED_EVENT_TYPE,
         AgentEvent::PeerContentIngested { .. } => "peer_content_ingested",
     }
+}
+
+/// Wire discriminator of [`AgentEvent::TranscriptRewriteCommitted`].
+///
+/// Named because [`transcript_rewrite_commit_from_payload`] matches on it
+/// without going through the typed enum; one spelling means the partial
+/// decoder cannot drift from [`agent_event_type`].
+pub const TRANSCRIPT_REWRITE_COMMITTED_EVENT_TYPE: &str = "transcript_rewrite_committed";
+
+/// The rewrite commit carried by one durable event payload, read WITHOUT
+/// materializing the two full transcript bodies its record carries.
+///
+/// A replay's coverage decision — which commits does the log hold that this
+/// session's graph does not — reads commit identity and nothing else, and the
+/// audit verifier reads the same. Deserializing the payload to reach it
+/// materializes two complete `Vec<Message>` transcripts per record, which on a
+/// session with a long rewrite history is the dominant cost of an
+/// authoritative load. Here the tag, the session id, and the commit are
+/// decoded; every other field, both bodies included, is lexed past and
+/// discarded.
+///
+/// `Ok(None)` means the payload is some other event kind. A payload that IS
+/// this kind but does not carry a well-formed commit is an error, never a
+/// silent skip.
+///
+/// This reads a commit; it does not verify a record. Bodies that no
+/// authoritative load materializes are also bodies no authoritative load
+/// checks — see the caller's own account of what that costs.
+pub fn transcript_rewrite_commit_from_payload(
+    payload: &serde_json::value::RawValue,
+) -> Result<Option<(SessionId, crate::TranscriptRewriteCommit)>, serde_json::Error> {
+    #[derive(Deserialize)]
+    struct TypeOnly<'a> {
+        #[serde(rename = "type", borrow)]
+        event_type: std::borrow::Cow<'a, str>,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    struct CommitOnly {
+        session_id: SessionId,
+        record: RecordCommitOnly,
+    }
+
+    #[derive(Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    struct RecordCommitOnly {
+        commit: crate::TranscriptRewriteCommit,
+    }
+
+    let tagged: TypeOnly<'_> = serde_json::from_str(payload.get())?;
+    if tagged.event_type != TRANSCRIPT_REWRITE_COMMITTED_EVENT_TYPE {
+        return Ok(None);
+    }
+    let decoded: CommitOnly = serde_json::from_str(payload.get())?;
+    Ok(Some((decoded.session_id, decoded.record.commit)))
 }
 
 /// Project a committed renderable into [`AgentEvent::PeerContentIngested`]
@@ -2419,6 +2475,62 @@ mod tests {
             },
         )
         .expect("rewrite record should validate")
+    }
+
+    /// The whole point of the partial decoder: reach the commit without
+    /// building the two `Vec<Message>` transcripts the record carries.
+    #[test]
+    fn transcript_rewrite_commit_reads_the_commit_without_building_the_bodies() {
+        let session_id = SessionId::new();
+        let record = rewrite_record_fixture();
+        let payload = serde_json::to_string(&AgentEvent::TranscriptRewriteCommitted {
+            session_id: session_id.clone(),
+            record: record.clone(),
+        })
+        .expect("payload serializes");
+        let payload = serde_json::value::RawValue::from_string(payload).expect("payload is json");
+
+        let before = crate::rewrite_record_body_decodes();
+        let decoded = transcript_rewrite_commit_from_payload(&payload)
+            .expect("payload decodes")
+            .expect("payload is a transcript rewrite");
+        assert_eq!(
+            crate::rewrite_record_body_decodes(),
+            before,
+            "reading a commit must not materialize either transcript body"
+        );
+        assert_eq!(decoded.0, session_id);
+        assert_eq!(decoded.1, record.commit);
+    }
+
+    #[test]
+    fn transcript_rewrite_commit_ignores_other_event_kinds() {
+        let payload = serde_json::to_string(&AgentEvent::TurnStarted { turn_number: 1 })
+            .expect("payload serializes");
+        let payload = serde_json::value::RawValue::from_string(payload).expect("payload is json");
+        assert!(
+            transcript_rewrite_commit_from_payload(&payload)
+                .expect("payload decodes")
+                .is_none(),
+            "only the rewrite variant carries a commit"
+        );
+    }
+
+    /// A payload that IS a rewrite but does not carry a well-formed commit is
+    /// an error. Reporting it as "no commit here" would let a malformed audit
+    /// row read as an absent one, and the coverage decision downstream treats
+    /// absence as "the log holds nothing I lack".
+    #[test]
+    fn transcript_rewrite_commit_rejects_a_malformed_rewrite_payload() {
+        let payload = serde_json::json!({
+            "type": TRANSCRIPT_REWRITE_COMMITTED_EVENT_TYPE,
+            "session_id": SessionId::new(),
+            "record": {"commit": {"parent_revision": "sha256:only"}},
+        })
+        .to_string();
+        let payload = serde_json::value::RawValue::from_string(payload).expect("payload is json");
+        transcript_rewrite_commit_from_payload(&payload)
+            .expect_err("a rewrite payload with an unreadable commit must not read as absent");
     }
 
     #[test]

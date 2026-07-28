@@ -10,7 +10,7 @@ pub(crate) mod sealed;
 pub(crate) mod validate;
 
 pub use graph::{
-    TranscriptHistoryState, TranscriptRevisionBody, TranscriptRewriteCommit,
-    TranscriptRewriteRecord,
+    TranscriptHistoryState, TranscriptReplayCursor, TranscriptRevisionBody,
+    TranscriptRewriteCommit, TranscriptRewriteRecord,
 };
 pub use sealed::ValidatedTranscriptHistory;

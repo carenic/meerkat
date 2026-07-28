@@ -1354,6 +1354,81 @@ fn transcript_rewrite_store_error_to_session_error(error: SessionStoreError) -> 
     }
 }
 
+/// One authoritative load's transcript-rewrite replay outcome.
+struct TranscriptRewriteReplay {
+    session: Option<Session>,
+    /// Whether the replay materialized a transcript projection the durable row
+    /// does not yet carry.
+    materialized_from_replay: bool,
+    /// Rewrite commits carried by the append-only log, as read ONCE by this
+    /// load. `None` when no event store is wired, or when the load returned
+    /// before reading the log — never an assertion that the log is empty.
+    ///
+    /// When `replay_cursor` is `Some`, this is only the part of the log ABOVE
+    /// that cursor. Reading it as the whole log would make every commit below
+    /// the cursor look unrecorded.
+    logged_commits: Option<Vec<meerkat_core::TranscriptRewriteCommit>>,
+    /// The cursor this load read from, when it read a tail rather than the
+    /// whole log. `None` means `logged_commits` is the entire log.
+    replay_cursor: Option<meerkat_core::TranscriptReplayCursor>,
+    /// Highest event-log sequence this load observed, and therefore the
+    /// furthest a cursor stamped from it may claim.
+    observed_seq: u64,
+}
+
+impl TranscriptRewriteReplay {
+    fn absent() -> Self {
+        Self {
+            session: None,
+            materialized_from_replay: false,
+            logged_commits: None,
+            replay_cursor: None,
+            observed_seq: 0,
+        }
+    }
+
+    fn unchanged(
+        session: Session,
+        logged_commits: Option<Vec<meerkat_core::TranscriptRewriteCommit>>,
+    ) -> Self {
+        Self {
+            session: Some(session),
+            materialized_from_replay: false,
+            logged_commits,
+            replay_cursor: None,
+            observed_seq: 0,
+        }
+    }
+
+    fn materialized(
+        session: Session,
+        logged_commits: Vec<meerkat_core::TranscriptRewriteCommit>,
+    ) -> Self {
+        Self {
+            session: Some(session),
+            materialized_from_replay: true,
+            logged_commits: Some(logged_commits),
+            replay_cursor: None,
+            observed_seq: 0,
+        }
+    }
+
+    /// Record where this load read the log from and how far it got.
+    ///
+    /// Only a load that actually read the log calls this. Leaving the defaults
+    /// in place means "no position established", which costs a slow next load
+    /// and nothing else.
+    fn read_from(
+        mut self,
+        cursor: Option<meerkat_core::TranscriptReplayCursor>,
+        observed_seq: u64,
+    ) -> Self {
+        self.replay_cursor = cursor;
+        self.observed_seq = observed_seq;
+        self
+    }
+}
+
 fn transcript_rewrite_record_for_session(
     session: &Session,
     commit: &meerkat_core::TranscriptRewriteCommit,
@@ -3695,19 +3770,20 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         &self,
         id: &SessionId,
     ) -> Result<Option<Session>, SessionError> {
-        let (session, _materialized_from_replay) = self
+        let replay = self
             .load_authoritative_session_base_with_replay_info(id)
             .await?;
-        if let Some(session) = session.as_ref() {
-            self.verify_transcript_rewrite_audit_events(session).await?;
+        if let Some(session) = replay.session.as_ref() {
+            self.verify_transcript_rewrite_audit_events(session, &replay)
+                .await?;
         }
-        Ok(session)
+        Ok(replay.session)
     }
 
     async fn load_authoritative_session_base_with_replay_info(
         &self,
         id: &SessionId,
-    ) -> Result<(Option<Session>, bool), SessionError> {
+    ) -> Result<TranscriptRewriteReplay, SessionError> {
         // Once the machine has retired the runtime, the durable archived
         // projection is the authoritative read source. The runtime session
         // snapshot is frozen at the pre-retirement revision (retire commits
@@ -3869,16 +3945,28 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         self.apply_transcript_rewrite_replay(id, session).await
     }
 
-    async fn transcript_rewrite_event_records(
+    /// Ordered rewrite RECORDS from `from_seq` onward, with the highest
+    /// sequence the read observed.
+    ///
+    /// The observed high-water counts EVERY row read, not just the rewrite
+    /// rows: it is the position a later load may resume from, and an ordinary
+    /// turn event at a higher sequence is just as much "already seen".
+    async fn transcript_rewrite_event_records_from(
         &self,
         id: &SessionId,
-    ) -> Result<Option<Vec<meerkat_core::TranscriptRewriteRecord>>, SessionError> {
+        from_seq: u64,
+    ) -> Result<Option<(Vec<meerkat_core::TranscriptRewriteRecord>, u64)>, SessionError> {
         if self.event_store.is_none() {
             return Ok(None);
         }
-        let Some(events) = self.event_log_read_from(id, 1).await? else {
+        let Some(events) = self.event_log_read_from(id, from_seq).await? else {
             return Ok(None);
         };
+        let observed_seq = events
+            .iter()
+            .map(|stored| stored.seq)
+            .max()
+            .unwrap_or(from_seq.saturating_sub(1));
         let records = events
             .into_iter()
             .filter_map(|stored| match stored.event {
@@ -3889,82 +3977,316 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 _ => None,
             })
             .collect::<Vec<_>>();
-        Ok(Some(Self::ordered_transcript_rewrite_records(records)))
+        Ok(Some((
+            Self::ordered_transcript_rewrite_records(records),
+            observed_seq,
+        )))
     }
 
     fn ordered_transcript_rewrite_records(
-        mut records: Vec<(u64, meerkat_core::TranscriptRewriteRecord)>,
+        records: Vec<(u64, meerkat_core::TranscriptRewriteRecord)>,
     ) -> Vec<meerkat_core::TranscriptRewriteRecord> {
-        let mut ordered = Vec::with_capacity(records.len());
-        let produced_revisions = records
+        Self::ordered_transcript_rewrites(records, |record| &record.commit)
+    }
+
+    /// Lineage order over logged rewrites, whatever shape the caller read them
+    /// in.
+    ///
+    /// Ordering and de-duplication read commit identity only, so a commit-only
+    /// read orders identically to a full one. Keeping ONE implementation is
+    /// what makes that a fact rather than a hope: two loops could disagree
+    /// about which rewrites a log holds and in what order, and the coverage
+    /// decision is taken on one of them while the rebuild runs on the other.
+    fn ordered_transcript_rewrites<T>(
+        mut rows: Vec<(u64, T)>,
+        commit_of: impl Fn(&T) -> &meerkat_core::TranscriptRewriteCommit,
+    ) -> Vec<T> {
+        let mut ordered: Vec<T> = Vec::with_capacity(rows.len());
+        let produced_revisions = rows
             .iter()
-            .map(|(_, record)| record.commit.revision.clone())
+            .map(|(_, row)| commit_of(row).revision.clone())
             .collect::<HashSet<_>>();
-        let mut known_revisions = records
+        let mut known_revisions = rows
             .iter()
-            .filter_map(|(_, record)| {
-                let parent = &record.commit.parent_revision;
+            .filter_map(|(_, row)| {
+                let parent = &commit_of(row).parent_revision;
                 (!produced_revisions.contains(parent)).then(|| parent.clone())
             })
             .collect::<HashSet<_>>();
         if known_revisions.is_empty()
-            && let Some((_, first)) = records.iter().min_by_key(|(seq, _)| *seq)
+            && let Some((_, first)) = rows.iter().min_by_key(|(seq, _)| *seq)
         {
-            known_revisions.insert(first.commit.parent_revision.clone());
+            known_revisions.insert(commit_of(first).parent_revision.clone());
         }
 
-        while !records.is_empty() {
-            let mut candidates = records
+        while !rows.is_empty() {
+            let mut candidates = rows
                 .iter()
                 .enumerate()
                 .filter(|(_, (_, candidate))| {
-                    known_revisions.contains(&candidate.commit.parent_revision)
+                    known_revisions.contains(&commit_of(candidate).parent_revision)
                 })
                 .collect::<Vec<_>>();
             if candidates.is_empty() {
-                candidates = records.iter().enumerate().collect::<Vec<_>>();
+                candidates = rows.iter().enumerate().collect::<Vec<_>>();
             }
             candidates.sort_by_key(|(_, (seq, _))| *seq);
             let (index, _) = candidates[0];
-            let (_, record) = records.remove(index);
+            let (_, row) = rows.remove(index);
             if !ordered
                 .iter()
-                .any(|existing: &meerkat_core::TranscriptRewriteRecord| {
-                    existing.commit == record.commit
-                })
+                .any(|existing| commit_of(existing) == commit_of(&row))
             {
-                known_revisions.insert(record.commit.revision.clone());
-                ordered.push(record);
+                known_revisions.insert(commit_of(&row).revision.clone());
+                ordered.push(row);
             }
         }
 
         ordered
     }
 
-    async fn transcript_history_state_from_event_records(
+    /// Ordered rewrite COMMITS from `from_seq` onward, read without
+    /// materializing the two full transcript bodies each record carries, with
+    /// the highest sequence the read observed.
+    ///
+    /// Skipping the bodies makes each ROW cheap; starting at `from_seq` is what
+    /// makes the number of rows independent of how many rewrites the session
+    /// has accumulated. Only both together give a flat load: a commit-only read
+    /// that still begins at sequence 1 reads, lexes and copies every byte of
+    /// every record to reach the last one.
+    ///
+    /// `None` when this load cannot read commits that way — no event store, or
+    /// a store with no raw-row read. Callers then take the full typed read,
+    /// which is what every load did before this path existed.
+    async fn transcript_rewrite_event_commits_from(
         &self,
         id: &SessionId,
-    ) -> Result<Option<meerkat_core::TranscriptHistoryState>, SessionError> {
-        let Some(records) = self.transcript_rewrite_event_records(id).await? else {
+        from_seq: u64,
+    ) -> Result<Option<(Vec<meerkat_core::TranscriptRewriteCommit>, u64)>, SessionError> {
+        let Some(rows) = self.event_log_read_raw_from(id, from_seq).await? else {
             return Ok(None);
         };
-        meerkat_core::TranscriptHistoryState::from_rewrite_records(records).map_err(|err| {
-            durable_session_restore_error(id, "failed to rebuild transcript history", err)
+        let observed_seq = rows
+            .iter()
+            .map(|row| row.seq)
+            .max()
+            .unwrap_or(from_seq.saturating_sub(1));
+        let mut commits = Vec::new();
+        for row in rows {
+            let decoded = meerkat_core::event::transcript_rewrite_commit_from_payload(&row.event)
+                .map_err(|err| {
+                durable_session_restore_error(
+                    id,
+                    "failed to read transcript rewrite audit event",
+                    err,
+                )
+            })?;
+            if let Some((session_id, commit)) = decoded
+                && session_id == *id
+            {
+                commits.push((row.seq, commit));
+            }
+        }
+        Ok(Some((
+            Self::ordered_transcript_rewrites(commits, |commit| commit),
+            observed_seq,
+        )))
+    }
+
+    /// The sequence a load should start reading the rewrite log from, given
+    /// what the session's durable graph already claims to have folded.
+    ///
+    /// Returns `(from_seq, cursor)`. `cursor` is `Some` only when it is safe to
+    /// act on. Anything else yields `(1, None)` — read everything, exactly as
+    /// before cursors existed. Stamping lower is always safe; trusting a cursor
+    /// that does not describe this graph is the one way a record could be
+    /// skipped.
+    ///
+    /// TWO INDEPENDENT QUESTIONS, and both must be asked. The count and
+    /// boundary validate the cursor against the GRAPH; `log_high_water`
+    /// validates its `seq` against the LOG. Neither substitutes for the other:
+    /// a cursor whose count and boundary are perfectly honest can still carry
+    /// an arbitrary `seq`, and a `seq` past the end of the log produces an
+    /// EMPTY tail — which attaches trivially, which makes
+    /// [`Self::replay_cannot_contribute`] return true for want of a last
+    /// commit, and which leaves an empty unreconciled slice that the audit
+    /// verifier accepts vacuously. Every downstream defence is blind to it, so
+    /// it has to die here.
+    fn replay_read_floor(
+        session: &Session,
+        proved: Option<&meerkat_core::ValidatedTranscriptHistory>,
+        log_high_water: u64,
+    ) -> (u64, Option<meerkat_core::TranscriptReplayCursor>) {
+        let Some(proved) = proved else {
+            return (1, None);
+        };
+        let Some(cursor) = session.transcript_replay_cursor() else {
+            return (1, None);
+        };
+        if proved.commits_beyond_replay_cursor(&cursor).is_none() {
+            tracing::warn!(
+                session_id = %session.id(),
+                cursor_seq = cursor.seq,
+                cursor_commits = cursor.commits,
+                graph_commits = proved.commits.len(),
+                "transcript replay cursor does not describe this graph; \
+                 re-reading the rewrite log from sequence 1"
+            );
+            return (1, None);
+        }
+        if cursor.seq > log_high_water {
+            tracing::warn!(
+                session_id = %session.id(),
+                cursor_seq = cursor.seq,
+                log_high_water,
+                "transcript replay cursor claims a sequence the log never \
+                 reached; re-reading the rewrite log from sequence 1"
+            );
+            return (1, None);
+        }
+        (cursor.seq.saturating_add(1), Some(cursor))
+    }
+
+    /// The log's high-water sequence, or 0 when it cannot be established.
+    ///
+    /// Zero disables the cursor rather than granting it the benefit of the
+    /// doubt: a load that cannot see how far the log goes has no business
+    /// trusting a claim about how far it was read.
+    async fn rewrite_log_high_water(&self, id: &SessionId) -> u64 {
+        let Some(event_store) = self.event_store.as_ref() else {
+            return 0;
+        };
+        match event_store.last_seq(id).await {
+            Ok(seq) => seq,
+            Err(error) => {
+                tracing::warn!(
+                    session_id = %id,
+                    error = %error,
+                    "failed to read the event log high-water mark; ignoring the \
+                     transcript replay cursor for this load"
+                );
+                0
+            }
+        }
+    }
+
+    /// Whether every record read attaches to the graph the load already holds.
+    ///
+    /// A tail read is only meaningful if the records it returns continue the
+    /// graph. Two conditions, and the second is what makes a tail read safe
+    /// against a `seq` nobody can verify:
+    ///
+    /// - every record's parent revision is either retained by the graph or
+    ///   produced by an earlier record in the same tail; and
+    /// - the FIRST record chains from exactly the commit the cursor reconciled
+    ///   last. The cursor's `commits` covers ALL the graph's commits as of the
+    ///   stamp, so `last_commit_revision` IS the log's last reconciled commit,
+    ///   and the next record in an append-only log must therefore name it as
+    ///   parent. If a `seq` inflated within the log skipped a record, the first
+    ///   record we see chains from the SKIPPED record instead and this fires.
+    ///
+    /// Parent-is-retained alone is too weak for that: the graph retains a body
+    /// for every endpoint it carries, so a record two links further along the
+    /// chain still finds a parent it recognizes.
+    ///
+    /// Refusing is always safe — the caller re-reads from sequence 1 — so a
+    /// graph that legitimately advanced past its cursor (an audit append failed
+    /// for one commit while a later one succeeded) also lands here and gets
+    /// repaired instead of slipping through.
+    fn replay_tail_extends_graph(
+        proved: &meerkat_core::ValidatedTranscriptHistory,
+        cursor: Option<&meerkat_core::TranscriptReplayCursor>,
+        records: &[meerkat_core::TranscriptRewriteRecord],
+    ) -> bool {
+        Self::rewrite_tail_extends_graph(proved, cursor, records.iter().map(|r| &r.commit))
+    }
+
+    /// [`Self::replay_tail_extends_graph`] over a commit-only read.
+    fn replay_commit_tail_extends_graph(
+        proved: &meerkat_core::ValidatedTranscriptHistory,
+        cursor: Option<&meerkat_core::TranscriptReplayCursor>,
+        commits: &[meerkat_core::TranscriptRewriteCommit],
+    ) -> bool {
+        Self::rewrite_tail_extends_graph(proved, cursor, commits.iter())
+    }
+
+    /// The one implementation both read shapes share, so a commit-only read can
+    /// never disagree with a typed one about whether a tail is admissible.
+    fn rewrite_tail_extends_graph<'a>(
+        proved: &meerkat_core::ValidatedTranscriptHistory,
+        cursor: Option<&meerkat_core::TranscriptReplayCursor>,
+        commits: impl Iterator<Item = &'a meerkat_core::TranscriptRewriteCommit>,
+    ) -> bool {
+        let mut reachable = proved
+            .revisions
+            .iter()
+            .map(|body| body.revision.as_str())
+            .collect::<HashSet<_>>();
+        let mut boundary = cursor.and_then(|cursor| cursor.last_commit_revision.as_deref());
+        commits.into_iter().all(|commit| {
+            let parent = commit.parent_revision.as_str();
+            // The boundary applies to the first record only; after it the chain
+            // carries itself.
+            let chains_from_boundary = boundary.take().is_none_or(|last| last == parent);
+            let attaches = reachable.contains(parent);
+            reachable.insert(commit.revision.as_str());
+            attaches && chains_from_boundary
         })
+    }
+
+    /// Commits carried by the append-only log, without their bodies.
+    ///
+    /// The audit verifier below only ever diffs commit sets; materializing the
+    /// records' transcript bodies for it is the second full read of a log whose
+    /// every record carries two whole transcripts. Falls back to the typed read
+    /// only for a store with no raw-row read.
+    async fn logged_transcript_rewrite_commits(
+        &self,
+        id: &SessionId,
+    ) -> Result<Vec<meerkat_core::TranscriptRewriteCommit>, SessionError> {
+        // From sequence 1 deliberately: this is the FALLBACK, reached when a
+        // cursor was absent or could not be trusted, and its whole job is to
+        // answer without relying on one.
+        if let Some((commits, _)) = self.transcript_rewrite_event_commits_from(id, 1).await? {
+            return Ok(commits);
+        }
+        Ok(self
+            .transcript_rewrite_event_records_from(id, 1)
+            .await?
+            .map(|(records, _)| records)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|record| record.commit)
+            .collect())
+    }
+
+    fn commits_missing_from_log(
+        state: &meerkat_core::TranscriptHistoryState,
+        logged: &[meerkat_core::TranscriptRewriteCommit],
+    ) -> Vec<meerkat_core::TranscriptRewriteCommit> {
+        state
+            .commits
+            .iter()
+            .filter(|commit| !logged.contains(commit))
+            .cloned()
+            .collect()
     }
 
     async fn verify_transcript_rewrite_audit_events(
         &self,
         session: &Session,
+        replay: &TranscriptRewriteReplay,
     ) -> Result<(), SessionError> {
-        self.verify_transcript_rewrite_audit_events_locked(session)
+        self.verify_transcript_rewrite_audit_events_locked(session, replay)
             .await
     }
 
     async fn verify_transcript_rewrite_audit_events_locked(
         &self,
         session: &Session,
+        replay: &TranscriptRewriteReplay,
     ) -> Result<(), SessionError> {
+        let logged_commits = replay.logged_commits.as_deref();
         session.validate_transcript_history_state().map_err(|err| {
             durable_session_restore_error(
                 session.id(),
@@ -3972,11 +4294,28 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 err,
             )
         })?;
-        let Some(state) = session.transcript_history_state().map_err(|err| {
-            durable_session_restore_error(session.id(), "failed to read transcript history", err)
-        })?
-        else {
-            return Ok(());
+        // A proved graph is this session's own parse of the very metadata value
+        // the fallback re-parses, served from the decode-seeded shared cache.
+        let state = match session
+            .already_validated_transcript_history_state()
+            .map_err(|err| {
+                durable_session_restore_error(
+                    session.id(),
+                    "failed to read transcript history",
+                    err,
+                )
+            })? {
+            Some(proved) => proved.shared(),
+            None => match session.transcript_history_state().map_err(|err| {
+                durable_session_restore_error(
+                    session.id(),
+                    "failed to read transcript history",
+                    err,
+                )
+            })? {
+                Some(state) => Arc::new(state),
+                None => return Ok(()),
+            },
         };
         if self.event_store.is_none() {
             return Ok(());
@@ -3985,57 +4324,284 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             return Ok(());
         }
 
-        let existing_records = self
-            .transcript_rewrite_event_records(session.id())
-            .await?
-            .unwrap_or_default();
-        let existing_commits = existing_records
-            .iter()
-            .map(|record| &record.commit)
-            .collect::<Vec<_>>();
+        // This verifier reads the log in the OPPOSITE direction to the replay:
+        // it looks for graph commits the log never recorded, and appends the
+        // missing audit events. That is why the cursor has to carry a
+        // reconciled COMMIT PREFIX and not just a sequence. Handed a tail-only
+        // commit list with no way to interpret it, every commit below the
+        // cursor would read as unrecorded, this would take the re-read branch
+        // on every load, and the tail read upstream would have bought nothing.
+        //
+        // The replay half of this same load already read the log; reading it
+        // again here doubled the cost of every authoritative load, and this
+        // verifier consumes nothing but commit identity.
+        let missing_commits = match logged_commits {
+            Some(logged) => {
+                // Commits the cursor already proves are in the log need no
+                // check. `None` means the cursor does not describe this graph,
+                // so nothing may be assumed and the whole list is suspect.
+                let unreconciled = match &replay.replay_cursor {
+                    Some(cursor) => state.commits_beyond_replay_cursor(cursor),
+                    None => Some(state.commits.as_slice()),
+                };
+                if let Some(unreconciled) = unreconciled
+                    && unreconciled.iter().all(|commit| logged.contains(commit))
+                {
+                    // Both directions now hold for this load: every record it
+                    // read is folded into this graph, and every commit of this
+                    // graph is recorded in the log at or below what it observed.
+                    // That, and only that, is what the cursor asserts.
+                    if replay.observed_seq > 0 {
+                        session.record_transcript_replay_cursor(
+                            state.replay_cursor_at(replay.observed_seq),
+                        );
+                    }
+                    return Ok(());
+                }
+                // Only the repair branch re-reads. The threaded commits were
+                // read earlier in this load, so a concurrent writer that closed
+                // the gap in between would otherwise be answered with a
+                // duplicate audit event.
+                Self::commits_missing_from_log(
+                    &state,
+                    &self.logged_transcript_rewrite_commits(session.id()).await?,
+                )
+            }
+            None => Self::commits_missing_from_log(
+                &state,
+                &self.logged_transcript_rewrite_commits(session.id()).await?,
+            ),
+        };
+        if missing_commits.is_empty() {
+            return Ok(());
+        }
+        // Reached only by re-reading, and about to APPEND — which moves the
+        // log's high-water past anything this load reconciled against. No
+        // cursor is stamped on this path: when in doubt, stamp lower.
+        append_transcript_rewrite_commit_events(
+            self.event_store.as_ref(),
+            self.projector.as_ref(),
+            session,
+            &missing_commits,
+        )
+        .await
+    }
 
-        let missing_commits = state
+    /// Whether the append-only log can contribute nothing to a proved graph.
+    ///
+    /// The rebuild below exists to fold in log commits the session's own graph
+    /// does not carry. When it carries all of them the merge is the identity on
+    /// that graph, and every proof the rebuild derives — including one
+    /// whole-transcript hash pass per retained revision, the dominant cost of
+    /// an authoritative load on a long-lived session — is discarded.
+    ///
+    /// Two facts decide it, both from commit identity alone:
+    /// [`Self::merge_transcript_history_replay`] adopts the replayed head only
+    /// when the replay covers every proved commit, and the replayed head is the
+    /// last ordered record's revision.
+    ///
+    /// Commit identity is the whole of this answer, and therefore not the whole
+    /// of the caller's: a record carries two full transcript bodies that no
+    /// commit set describes. The caller must also demand
+    /// [`meerkat_core::ValidatedTranscriptHistory::proves_record`] of every
+    /// record before it may return without validating them.
+    fn replay_cannot_contribute(
+        proved: &meerkat_core::ValidatedTranscriptHistory,
+        logged_commits: &[meerkat_core::TranscriptRewriteCommit],
+    ) -> bool {
+        let Some(last) = logged_commits.last() else {
+            return true;
+        };
+        if !logged_commits
+            .iter()
+            .all(|commit| proved.commits.contains(commit))
+        {
+            return false;
+        }
+        let adopts_replayed_head = proved
             .commits
             .iter()
-            .filter(|commit| !existing_commits.contains(commit))
-            .cloned()
-            .collect::<Vec<_>>();
-        if !missing_commits.is_empty() {
-            append_transcript_rewrite_commit_events(
-                self.event_store.as_ref(),
-                self.projector.as_ref(),
-                session,
-                &missing_commits,
-            )
-            .await?;
-        }
-        Ok(())
+            .all(|commit| logged_commits.contains(commit));
+        !adopts_replayed_head || last.revision == proved.head
     }
 
     async fn apply_transcript_rewrite_replay(
         &self,
         id: &SessionId,
         session: Option<Session>,
-    ) -> Result<(Option<Session>, bool), SessionError> {
+    ) -> Result<TranscriptRewriteReplay, SessionError> {
         let Some(mut session) = session else {
-            return Ok((None, false));
-        };
-        let Some(replayed_state) = self.transcript_history_state_from_event_records(id).await?
-        else {
-            return Ok((Some(session), false));
+            return Ok(TranscriptRewriteReplay::absent());
         };
 
-        let current_digest =
-            meerkat_core::transcript_messages_digest(session.messages()).map_err(|err| {
-                durable_session_restore_error(
-                    id,
-                    "failed to digest current transcript during rewrite replay",
-                    err,
-                )
+        // Read the session's OWN graph first. It is already in memory and, when
+        // the load's marker carries the proof, already validated — so a rebuild
+        // that starts without it re-proves commits this session can already
+        // prove, at two full transcript bodies per record.
+        let proved = session
+            .already_validated_transcript_history_state()
+            .map_err(|err| {
+                durable_session_restore_error(id, "failed to read transcript history", err)
             })?;
-        let existing_state = session.transcript_history_state().map_err(|err| {
-            durable_session_restore_error(id, "failed to read transcript history", err)
+
+        // The coverage question — does the log carry a rewrite this graph does
+        // not — is decided by commit identity and the live head. Neither reads
+        // a transcript body, and the overwhelmingly common answer is "no", so
+        // the log is read WITHOUT building the two full transcripts every
+        // record carries. A load that folds nothing therefore never
+        // materializes a body, which is what makes its cost independent of how
+        // many rewrites the session has accumulated.
+        //
+        // Bodies not read are bodies not checked. That is deliberate: an
+        // authoritative load owes an integrity check on the graph it serves
+        // (its checkpoint stamp and `validate_transcript_history_state` supply
+        // one) and on any record it actually folds, not on historical log
+        // bodies it will never look at. Corruption in an unfolded body is a
+        // matter for an explicit audit pass, not for every load.
+        //
+        // Cheap per row is only half of it. The read also starts after what the
+        // graph has already folded, so the number of rows stops growing with
+        // the session's rewrite count — a commit-only read from sequence 1
+        // still touches every byte of every record on its way to the last one.
+        let log_high_water = self.rewrite_log_high_water(id).await;
+        let (from_seq, cursor) = Self::replay_read_floor(&session, proved.as_ref(), log_high_water);
+        if let Some(proved) = proved.as_ref()
+            && let Some((logged_commits, observed_seq)) = self
+                .transcript_rewrite_event_commits_from(id, from_seq)
+                .await?
+        {
+            // A tail that does not continue the graph means the cursor pointed
+            // past something neither this read nor the graph has seen. Fall back
+            // to the whole log rather than reason from a gap.
+            if from_seq > 1
+                && !Self::replay_commit_tail_extends_graph(proved, cursor.as_ref(), &logged_commits)
+            {
+                tracing::warn!(
+                    session_id = %id,
+                    cursor_seq = from_seq.saturating_sub(1),
+                    from_seq,
+                    tail_commits = logged_commits.len(),
+                    "rewrite log tail does not extend the transcript graph; \
+                     re-reading from sequence 1"
+                );
+            } else {
+                // Served from the session's own digest accumulator:
+                // byte-identical to
+                // `transcript_messages_digest(session.messages())` at O(delta).
+                let current_digest = session.transcript_content_digest().map_err(|err| {
+                    durable_session_restore_error(
+                        id,
+                        "failed to digest current transcript during rewrite replay",
+                        err,
+                    )
+                })?;
+                if current_digest == proved.head
+                    && Self::replay_cannot_contribute(proved, &logged_commits)
+                {
+                    return Ok(
+                        TranscriptRewriteReplay::unchanged(session, Some(logged_commits))
+                            .read_from(cursor, observed_seq),
+                    );
+                }
+            }
+        }
+
+        // The typed read is the fold path, and it reads from sequence 1 unless
+        // the cursor above survived every check. Records at or below a trusted
+        // cursor were validated in full when they were folded; records above it
+        // are validated in full here.
+        let Some((records, observed_seq)) = self
+            .transcript_rewrite_event_records_from(id, from_seq)
+            .await?
+        else {
+            return Ok(TranscriptRewriteReplay::unchanged(session, None));
+        };
+        let (records, cursor, observed_seq) = match proved.as_ref() {
+            Some(proved)
+                if from_seq > 1
+                    && !Self::replay_tail_extends_graph(proved, cursor.as_ref(), &records) =>
+            {
+                tracing::warn!(
+                    session_id = %id,
+                    cursor_seq = from_seq.saturating_sub(1),
+                    from_seq,
+                    tail_records = records.len(),
+                    "rewrite record tail does not extend the transcript graph; \
+                     re-reading from sequence 1"
+                );
+                match self.transcript_rewrite_event_records_from(id, 1).await? {
+                    Some((records, observed_seq)) => (records, None, observed_seq),
+                    None => return Ok(TranscriptRewriteReplay::unchanged(session, None)),
+                }
+            }
+            _ => (records, cursor, observed_seq),
+        };
+        let logged_commits = records
+            .iter()
+            .map(|record| record.commit.clone())
+            .collect::<Vec<_>>();
+        let current_digest = session.transcript_content_digest().map_err(|err| {
+            durable_session_restore_error(
+                id,
+                "failed to digest current transcript during rewrite replay",
+                err,
+            )
         })?;
+        // A merge that folds in nothing is the identity on the proved graph,
+        // but the slow path still re-materializes the projection from the head
+        // body on its way out — the one repair a fully covered replay performs.
+        // Skip the rebuild only when the live transcript already IS that body,
+        // which is the ordinary state (every mutation advances the graph head
+        // with it), so a session whose projection diverged from its graph still
+        // takes the full path and is still repaired.
+        //
+        // Reached only when the commit-only coverage decision above was
+        // unavailable (no raw-row read on this store) or said there was
+        // something to fold. Either way these records ARE deserialized, and
+        // returning here would be the one path that hands none of them to a
+        // validator — so bodies this load DID read must be proved before they
+        // may go unexamined. A `revision_body` that no longer digests to its
+        // byte-identical commit would otherwise enter the load unnoticed.
+        // Proving a record is `Vec<Message>` equality against a body the graph
+        // already verified — a byte comparison, no hashing — and any record the
+        // graph cannot prove falls through to the full validation below, which
+        // rejects it exactly as it did before this fast path existed.
+        if let Some(proved) = proved.as_ref()
+            && current_digest == proved.head
+            && Self::replay_cannot_contribute(proved, &logged_commits)
+            && records.iter().all(|record| proved.proves_record(record))
+        {
+            return Ok(
+                TranscriptRewriteReplay::unchanged(session, Some(logged_commits))
+                    .read_from(cursor, observed_seq),
+            );
+        }
+
+        let Some(replayed_state) =
+            meerkat_core::TranscriptHistoryState::from_rewrite_records_with_proved(
+                records,
+                proved.as_ref(),
+            )
+            .map_err(|err| {
+                durable_session_restore_error(id, "failed to rebuild transcript history", err)
+            })?
+        else {
+            // No records at all in the range read, so the graph trivially
+            // represents everything up to what this load observed.
+            return Ok(
+                TranscriptRewriteReplay::unchanged(session, Some(logged_commits))
+                    .read_from(cursor, observed_seq),
+            );
+        };
+
+        let existing_state = match proved.as_ref() {
+            // The proved graph IS this session's parse of the very metadata
+            // value the fallback below re-parses.
+            Some(proved) => Some(meerkat_core::TranscriptHistoryState::clone(proved.state())),
+            None => session.transcript_history_state().map_err(|err| {
+                durable_session_restore_error(id, "failed to read transcript history", err)
+            })?,
+        };
         let current_revision = existing_state
             .as_ref()
             .map(|state| state.head.clone())
@@ -4086,12 +4652,21 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                             err,
                         )
                     })?;
-                return Ok((
-                    Some(session),
-                    materialized_state_value != existing_state_value,
-                ));
+                return Ok(TranscriptRewriteReplay {
+                    session: Some(session),
+                    materialized_from_replay: materialized_state_value != existing_state_value,
+                    logged_commits: Some(logged_commits),
+                    replay_cursor: cursor,
+                    observed_seq,
+                });
             }
-            return Ok((Some(session), false));
+            // The replay did NOT fold: nothing here reached the graph, so this
+            // load established no new position. Stamping the sequence it read
+            // to would claim records the graph does not carry.
+            return Ok(TranscriptRewriteReplay::unchanged(
+                session,
+                Some(logged_commits),
+            ));
         }
 
         if replay_contains_current_digest {
@@ -4104,7 +4679,10 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                         err,
                     )
                 })?;
-            return Ok((Some(session), true));
+            return Ok(
+                TranscriptRewriteReplay::materialized(session, logged_commits)
+                    .read_from(cursor, observed_seq),
+            );
         }
         if let Some(materialized_state) =
             Self::extend_replayed_history_to_current_projection(&session, replayed_state)?
@@ -4118,9 +4696,16 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                         err,
                     )
                 })?;
-            return Ok((Some(session), true));
+            return Ok(
+                TranscriptRewriteReplay::materialized(session, logged_commits)
+                    .read_from(cursor, observed_seq),
+            );
         }
-        Ok((Some(session), false))
+        // Fell through every fold: no position established.
+        Ok(TranscriptRewriteReplay::unchanged(
+            session,
+            Some(logged_commits),
+        ))
     }
 
     fn extend_replayed_history_to_current_projection(
@@ -5297,20 +5882,20 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             return Err(SessionError::Busy { id: id.clone() });
         }
 
-        let session = match self
+        let mut replay = self
             .load_authoritative_session_base_with_replay_info(id)
-            .await?
-        {
-            (Some(session), materialized_from_replay) => {
-                if materialized_from_replay {
+            .await?;
+        let session = match replay.session.take() {
+            Some(session) => {
+                if replay.materialized_from_replay {
                     self.persist_replayed_transcript_projection_for_mutation(&session)
                         .await?;
                 }
-                self.verify_transcript_rewrite_audit_events_locked(&session)
+                self.verify_transcript_rewrite_audit_events_locked(&session, &replay)
                     .await?;
                 session
             }
-            (None, _) => match self.export_session_with_labels(id).await {
+            None => match self.export_session_with_labels(id).await {
                 Ok(session) => session,
                 Err(SessionError::NotFound { .. }) => {
                     return Err(SessionError::NotFound { id: id.clone() });
@@ -7669,6 +8254,41 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             .read_from(id, from_seq)
             .await
             .map(Some)
+            .map_err(|err| SessionError::Store(Box::new(err)))
+    }
+
+    /// [`Self::event_log_read_from`] with each row's payload left unparsed.
+    ///
+    /// Admission faults, the projection gate and the halt recheck are the same
+    /// as the typed read; only the row materialization differs. `None` when no
+    /// event store is wired, or when the wired store has no rawer read than
+    /// the typed one.
+    pub async fn event_log_read_raw_from(
+        &self,
+        id: &SessionId,
+        from_seq: u64,
+    ) -> Result<Option<Vec<crate::event_store::RawStoredEvent>>, SessionError> {
+        let Some(event_store) = self.event_store.as_ref() else {
+            return Ok(None);
+        };
+        if let Some(cause) = event_projection_admission_fault(
+            &self.event_projection_faults,
+            &self.event_projection_gates,
+            event_store,
+            id,
+        )
+        .await
+        {
+            return Err(event_projection_halted_error(id, cause));
+        }
+        let gate = event_projection_gate(&self.event_projection_gates, id).await;
+        let _guard = gate.lock().await;
+        if let Some(cause) = self.event_projection_faults.lock().await.get(id).cloned() {
+            return Err(event_projection_halted_error(id, cause));
+        }
+        event_store
+            .read_raw_from(id, from_seq)
+            .await
             .map_err(|err| SessionError::Store(Box::new(err)))
     }
 
@@ -23974,6 +24594,1076 @@ mod tests {
         assert!(replay.materialized_messages.is_empty());
     }
 
+    /// An authoritative load read and materialized EVERY transcript rewrite
+    /// record in the append-only log, and each record carries two full
+    /// transcript bodies, so resume cost grew as retained-revisions x
+    /// transcript. A steady-state load folds nothing, so it must materialize
+    /// nothing.
+    ///
+    /// Two counters, because either alone permits a false green. Hashed bytes
+    /// (the unnamed digest bucket — graph decode and checkpoint/witness
+    /// derivation are separate seams with their own named buckets) would stay
+    /// flat even if every body were still JSON-parsed; body decodes would stay
+    /// at zero even if some other seam hashed the whole graph. Both are
+    /// asserted, and both are counters, never the clock.
+    ///
+    /// Wired to [`crate::event_store::FileEventStore`] because that is what
+    /// production wires. A store that hands back typed `StoredEvent` clones
+    /// runs neither the record decode nor the raw-row read, so it cannot
+    /// observe either property — a green assertion over such a store would
+    /// certify something the shipped path does not do.
+    #[tokio::test]
+    async fn test_authoritative_load_materializes_no_rewrite_record_bodies() {
+        fn replay_bucket() -> usize {
+            meerkat_core::DIGEST_SITE_LABELS
+                .iter()
+                .position(|label| *label == "other")
+                .expect("unnamed bucket present in DIGEST_SITE_LABELS")
+        }
+
+        async fn load_cost(rewrites: usize) -> (u64, u64) {
+            let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+            let runtime_store: Arc<dyn RuntimeStore> = Arc::new(InMemoryRuntimeStore::new());
+            let dir = tempfile::tempdir().expect("temp dir");
+            let event_store: Arc<dyn EventStore> = Arc::new(
+                crate::event_store::FileEventStore::new(dir.path().join("events")),
+            );
+            let service = PersistentSessionService::new(
+                CapabilityBuilder,
+                4,
+                Arc::clone(&store),
+                Arc::clone(&runtime_store),
+                memory_blob_store(),
+            )
+            .with_event_projection(
+                event_store,
+                Arc::new(SessionProjector::new(dir.path().join(".rkat"))),
+            );
+            let created = service
+                .create_session(create_request("seed", InitialTurnPolicy::Defer))
+                .await
+                .expect("create session");
+
+            // Generation 0 grows the transcript so a per-record proof is
+            // measurable; the rest are resume-shaped `[0, 1)` refreshes over
+            // it, which is the production shape that accumulates revisions.
+            for generation in 0..=rewrites {
+                let parent = service
+                    .export_realtime_refresh_session_snapshot(&created.session_id)
+                    .await
+                    .expect("read rewrite parent");
+                let parent_revision = parent.transcript_revision().expect("parent revision");
+                let (selection, replacement) = if generation == 0 {
+                    (
+                        TranscriptRewriteSelection::MessageRange { start: 0, end: 0 },
+                        (0..12)
+                            .map(|index| Message::User(UserMessage::text(format!("turn {index}"))))
+                            .collect(),
+                    )
+                } else {
+                    (
+                        TranscriptRewriteSelection::MessageRange { start: 0, end: 1 },
+                        vec![Message::User(UserMessage::text(format!(
+                            "system prompt generation {generation}"
+                        )))],
+                    )
+                };
+                service
+                    .rewrite_session_transcript(
+                        &created.session_id,
+                        SessionTranscriptRewriteRequest {
+                            selection,
+                            replacement,
+                            reason: TranscriptRewriteReason::new(
+                                meerkat_core::session::RESUME_SYSTEM_PROMPT_REFRESH_REWRITE_REASON,
+                            ),
+                            actor: None,
+                            expected_parent_revision: Some(parent_revision),
+                            running_behavior: TranscriptEditRunningBehavior::Reject,
+                        },
+                    )
+                    .await
+                    .expect("rewrite commits");
+            }
+            service
+                .discard_live_session(&created.session_id)
+                .await
+                .expect("force the durable load path");
+            service
+                .load_authoritative_session_base(&created.session_id)
+                .await
+                .expect("warm the per-shape decode memo");
+
+            let bucket = replay_bucket();
+            let hashed_before = meerkat_core::digest_site_bytes()[bucket];
+            let decodes_before = meerkat_core::rewrite_record_body_decodes();
+            service
+                .load_authoritative_session_base(&created.session_id)
+                .await
+                .expect("measured authoritative load")
+                .expect("session remains present");
+            (
+                meerkat_core::digest_site_bytes()[bucket] - hashed_before,
+                meerkat_core::rewrite_record_body_decodes() - decodes_before,
+            )
+        }
+
+        let (few_hashed, few_decoded) = load_cost(2).await;
+        let (many_hashed, many_decoded) = load_cost(8).await;
+        println!(
+            "authoritative load: 2 rewrites hashed {few_hashed} B / decoded {few_decoded} bodies, \
+             8 rewrites hashed {many_hashed} B / decoded {many_decoded} bodies"
+        );
+        // Zero, not a bound: a load that folds nothing decides coverage from
+        // commit identity, and a commit is read without its record's two
+        // transcript bodies. One body materialized here would be N of them on
+        // a session with N retained rewrites, which is the defect.
+        assert_eq!(
+            (few_decoded, many_decoded),
+            (0, 0),
+            "a steady-state authoritative load folds no rewrite, so it must \
+             materialize no rewrite record body: 2 rewrites decoded \
+             {few_decoded}, 8 decoded {many_decoded}"
+        );
+        // Equality, not a bound: the residual is the ONE live-transcript digest
+        // the coverage decision needs, and the defect is precisely that the
+        // residual used to carry a per-retained-revision term as well.
+        assert_eq!(
+            few_hashed, many_hashed,
+            "a steady-state authoritative load must re-prove nothing the loaded \
+             session already proves, so its hashed bytes cannot grow with the \
+             retained revision count: 2 rewrites hashed {few_hashed} bytes, 8 \
+             hashed {many_hashed}"
+        );
+    }
+
+    /// A [`crate::event_store::FileEventStore`] whose reads may hand back a
+    /// rewrite record whose `revision_body` no longer digests to its
+    /// byte-identical commit — the append-only log corrupted exactly where
+    /// commit identity cannot see it, which is what bit rot, a torn write, or a
+    /// bad restore leaves behind.
+    ///
+    /// Deliberately does NOT forward `read_raw_from`, so it inherits the
+    /// trait's "no rawer read than the typed one" default. That is the shape
+    /// this wrapper is for: a load that reads record bodies, which is the only
+    /// load that owes them a check.
+    struct CorruptingEventStore {
+        inner: crate::event_store::FileEventStore,
+        corrupt: AtomicBool,
+    }
+
+    impl CorruptingEventStore {
+        fn new(root: std::path::PathBuf) -> Self {
+            Self {
+                inner: crate::event_store::FileEventStore::new(root),
+                corrupt: AtomicBool::new(false),
+            }
+        }
+
+        fn corrupt(&self) {
+            self.corrupt.store(true, Ordering::Release);
+        }
+
+        fn corrupted(&self, mut events: Vec<StoredEvent>) -> Vec<StoredEvent> {
+            if !self.corrupt.load(Ordering::Acquire) {
+                return events;
+            }
+            for stored in &mut events {
+                if let AgentEvent::TranscriptRewriteCommitted { record, .. } = &mut stored.event
+                    && let Some(message) = record.revision_body.messages.first_mut()
+                {
+                    *message = Message::User(UserMessage::text("corrupted body".to_string()));
+                    return events;
+                }
+            }
+            events
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EventStore for CorruptingEventStore {
+        async fn append_envelopes(
+            &self,
+            session_id: &SessionId,
+            envelopes: &[meerkat_core::event::EventEnvelope<AgentEvent>],
+        ) -> Result<u64, EventStoreError> {
+            self.inner.append_envelopes(session_id, envelopes).await
+        }
+
+        async fn append_interaction_terminal_exact(
+            &self,
+            session_id: &SessionId,
+            interaction_id: meerkat_core::interaction::InteractionId,
+            envelope: &meerkat_core::event::EventEnvelope<AgentEvent>,
+        ) -> Result<ExactInteractionAppend, EventStoreError> {
+            self.inner
+                .append_interaction_terminal_exact(session_id, interaction_id, envelope)
+                .await
+        }
+
+        async fn record_projection_halt(
+            &self,
+            session_id: &SessionId,
+            reason: &str,
+        ) -> Result<(), EventStoreError> {
+            self.inner.record_projection_halt(session_id, reason).await
+        }
+
+        async fn projection_halt(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<Option<crate::event_store::EventProjectionHaltMarker>, EventStoreError>
+        {
+            self.inner.projection_halt(session_id).await
+        }
+
+        async fn read_from(
+            &self,
+            session_id: &SessionId,
+            from_seq: u64,
+        ) -> Result<Vec<StoredEvent>, EventStoreError> {
+            self.inner
+                .read_from(session_id, from_seq)
+                .await
+                .map(|events| self.corrupted(events))
+        }
+
+        async fn read_from_bounded(
+            &self,
+            session_id: &SessionId,
+            from_seq: u64,
+            max_rows: usize,
+        ) -> Result<Vec<StoredEvent>, EventStoreError> {
+            self.inner
+                .read_from_bounded(session_id, from_seq, max_rows)
+                .await
+                .map(|events| self.corrupted(events))
+        }
+
+        async fn last_seq(&self, session_id: &SessionId) -> Result<u64, EventStoreError> {
+            self.inner.last_seq(session_id).await
+        }
+    }
+
+    /// A load that DOES read record bodies must not then decline to check
+    /// them. The coverage decision is commit identity, and a rewrite record is
+    /// two full transcript bodies that no commit set describes: returning on
+    /// commit identity alone, having already deserialized those bodies, let a
+    /// `revision_body` that no longer digests to its untouched commit reach the
+    /// load unnoticed.
+    ///
+    /// SCOPE, stated precisely because the shipped default is narrower than
+    /// this test: a store with a raw-row read — which is what production wires
+    /// — decides coverage from commits alone and never materializes a
+    /// historical body, so it neither reads nor checks one. That is the
+    /// deliberate trade recorded on `apply_transcript_rewrite_replay`. This
+    /// test pins the other path: the bodies a load did read are bodies it must
+    /// prove, exercised through a store that inherits the trait's no-raw-read
+    /// default.
+    ///
+    /// Corruption detection, not a security control: the digest is unkeyed, so
+    /// anyone able to write the log can edit a body and re-derive a commit that
+    /// matches. What it catches is bit rot, a torn or partial write, a
+    /// truncated log, or a bad restore.
+    ///
+    /// The graph-layer coverage calls the rebuild directly and so never crosses
+    /// this decision; only a service-level load does.
+    #[tokio::test]
+    async fn test_authoritative_load_rejects_a_corrupted_body_it_read() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let event_store = Arc::new(CorruptingEventStore::new(dir.path().join("events")));
+        let service = PersistentSessionService::new(
+            CapabilityBuilder,
+            4,
+            Arc::new(MemoryStore::new()) as Arc<dyn SessionStore>,
+            Arc::new(InMemoryRuntimeStore::new()) as Arc<dyn RuntimeStore>,
+            memory_blob_store(),
+        )
+        .with_event_projection(
+            Arc::clone(&event_store) as Arc<dyn EventStore>,
+            Arc::new(SessionProjector::new(dir.path().join(".rkat"))),
+        );
+        let created = service
+            .create_session(create_request("seed", InitialTurnPolicy::Defer))
+            .await
+            .expect("create session");
+
+        for generation in 0..3 {
+            let parent = service
+                .export_realtime_refresh_session_snapshot(&created.session_id)
+                .await
+                .expect("read rewrite parent");
+            let parent_revision = parent.transcript_revision().expect("parent revision");
+            service
+                .rewrite_session_transcript(
+                    &created.session_id,
+                    SessionTranscriptRewriteRequest {
+                        selection: TranscriptRewriteSelection::MessageRange {
+                            start: 0,
+                            end: usize::from(generation > 0),
+                        },
+                        replacement: vec![Message::User(UserMessage::text(format!(
+                            "system prompt generation {generation}"
+                        )))],
+                        reason: TranscriptRewriteReason::new(
+                            meerkat_core::session::RESUME_SYSTEM_PROMPT_REFRESH_REWRITE_REASON,
+                        ),
+                        actor: None,
+                        expected_parent_revision: Some(parent_revision),
+                        running_behavior: TranscriptEditRunningBehavior::Reject,
+                    },
+                )
+                .await
+                .expect("rewrite commits");
+        }
+        service
+            .discard_live_session(&created.session_id)
+            .await
+            .expect("force the durable load path");
+        service
+            .load_authoritative_session_base(&created.session_id)
+            .await
+            .expect("clean load succeeds")
+            .expect("session is present");
+
+        event_store.corrupt();
+        let error = service
+            .load_authoritative_session_base(&created.session_id)
+            .await
+            .expect_err("a corrupted revision body must fail the load closed");
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("transcript history"),
+            "unexpected error: {rendered}"
+        );
+    }
+
+    // ---------------------------------------------------------------
+    // Replay cursor
+    // ---------------------------------------------------------------
+
+    /// A [`crate::event_store::FileEventStore`] that records where every log
+    /// read STARTED and how many rows it returned.
+    ///
+    /// Forwards `read_raw_from`, so it is the production shape: the coverage
+    /// decision takes the commit-only path. Rows-returned is the honest
+    /// instrument for this fix — a load that decides from commit identity alone
+    /// still reads, lexes and copies every row it is handed, so "no bodies
+    /// materialized" says nothing about whether the read was flat.
+    struct ObservingEventStore {
+        inner: crate::event_store::FileEventStore,
+        reads: std::sync::Mutex<Vec<(u64, usize)>>,
+        raw_reads: std::sync::Mutex<Vec<(u64, usize)>>,
+        /// Caps what `last_seq` reports, simulating a log that lost its tail —
+        /// a truncating restore, a partial copy — which is the real-world way a
+        /// durable cursor comes to name a sequence the log never reached.
+        high_water_cap: std::sync::atomic::AtomicU64,
+    }
+
+    impl ObservingEventStore {
+        fn new(root: std::path::PathBuf) -> Self {
+            Self {
+                inner: crate::event_store::FileEventStore::new(root),
+                reads: std::sync::Mutex::new(Vec::new()),
+                raw_reads: std::sync::Mutex::new(Vec::new()),
+                high_water_cap: std::sync::atomic::AtomicU64::new(u64::MAX),
+            }
+        }
+
+        /// Make the log claim it never got past `seq`.
+        fn truncate_high_water_to(&self, seq: u64) {
+            self.high_water_cap.store(seq, Ordering::Release);
+        }
+
+        fn reset(&self) {
+            self.reads.lock().expect("reads lock").clear();
+            self.raw_reads.lock().expect("raw reads lock").clear();
+        }
+
+        /// `(from_seq, rows)` for every raw read since the last reset.
+        fn raw_reads(&self) -> Vec<(u64, usize)> {
+            self.raw_reads.lock().expect("raw reads lock").clone()
+        }
+
+        /// `(from_seq, rows)` for every typed read since the last reset.
+        fn typed_reads(&self) -> Vec<(u64, usize)> {
+            self.reads.lock().expect("reads lock").clone()
+        }
+
+        fn rows_read(&self) -> usize {
+            self.raw_reads()
+                .into_iter()
+                .chain(self.typed_reads())
+                .map(|(_, rows)| rows)
+                .sum()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl EventStore for ObservingEventStore {
+        async fn append_envelopes(
+            &self,
+            session_id: &SessionId,
+            envelopes: &[meerkat_core::event::EventEnvelope<AgentEvent>],
+        ) -> Result<u64, EventStoreError> {
+            self.inner.append_envelopes(session_id, envelopes).await
+        }
+
+        async fn append_interaction_terminal_exact(
+            &self,
+            session_id: &SessionId,
+            interaction_id: meerkat_core::interaction::InteractionId,
+            envelope: &meerkat_core::event::EventEnvelope<AgentEvent>,
+        ) -> Result<ExactInteractionAppend, EventStoreError> {
+            self.inner
+                .append_interaction_terminal_exact(session_id, interaction_id, envelope)
+                .await
+        }
+
+        async fn record_projection_halt(
+            &self,
+            session_id: &SessionId,
+            reason: &str,
+        ) -> Result<(), EventStoreError> {
+            self.inner.record_projection_halt(session_id, reason).await
+        }
+
+        async fn projection_halt(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<Option<crate::event_store::EventProjectionHaltMarker>, EventStoreError>
+        {
+            self.inner.projection_halt(session_id).await
+        }
+
+        async fn read_from(
+            &self,
+            session_id: &SessionId,
+            from_seq: u64,
+        ) -> Result<Vec<StoredEvent>, EventStoreError> {
+            let rows = self.inner.read_from(session_id, from_seq).await?;
+            self.reads
+                .lock()
+                .expect("reads lock")
+                .push((from_seq, rows.len()));
+            Ok(rows)
+        }
+
+        async fn read_raw_from(
+            &self,
+            session_id: &SessionId,
+            from_seq: u64,
+        ) -> Result<Option<Vec<crate::event_store::RawStoredEvent>>, EventStoreError> {
+            let rows = self.inner.read_raw_from(session_id, from_seq).await?;
+            if let Some(rows) = rows.as_ref() {
+                self.raw_reads
+                    .lock()
+                    .expect("raw reads lock")
+                    .push((from_seq, rows.len()));
+            }
+            Ok(rows)
+        }
+
+        async fn read_from_bounded(
+            &self,
+            session_id: &SessionId,
+            from_seq: u64,
+            max_rows: usize,
+        ) -> Result<Vec<StoredEvent>, EventStoreError> {
+            self.inner
+                .read_from_bounded(session_id, from_seq, max_rows)
+                .await
+        }
+
+        async fn last_seq(&self, session_id: &SessionId) -> Result<u64, EventStoreError> {
+            let real = self.inner.last_seq(session_id).await?;
+            Ok(real.min(self.high_water_cap.load(Ordering::Acquire)))
+        }
+    }
+
+    /// A session with `rewrites` resume-shaped refreshes over a real transcript,
+    /// wired to an [`ObservingEventStore`], discarded so loads take the durable
+    /// path.
+    async fn cursor_fixture(
+        dir: &tempfile::TempDir,
+        rewrites: usize,
+    ) -> (
+        PersistentSessionService<CapabilityBuilder>,
+        Arc<ObservingEventStore>,
+        SessionId,
+    ) {
+        let event_store = Arc::new(ObservingEventStore::new(dir.path().join("events")));
+        let service = PersistentSessionService::new(
+            CapabilityBuilder,
+            4,
+            Arc::new(MemoryStore::new()) as Arc<dyn SessionStore>,
+            Arc::new(InMemoryRuntimeStore::new()) as Arc<dyn RuntimeStore>,
+            memory_blob_store(),
+        )
+        .with_event_projection(
+            Arc::clone(&event_store) as Arc<dyn EventStore>,
+            Arc::new(SessionProjector::new(dir.path().join(".rkat"))),
+        );
+        let created = service
+            .create_session(create_request("seed", InitialTurnPolicy::Defer))
+            .await
+            .expect("create session");
+        commit_resume_shaped_rewrites(&service, &created.session_id, 0..=rewrites).await;
+        service
+            .discard_live_session(&created.session_id)
+            .await
+            .expect("force the durable load path");
+        (service, event_store, created.session_id)
+    }
+
+    /// Generation 0 grows the transcript so a per-record proof is measurable;
+    /// the rest are `[0, 1)` system-prompt refreshes over it, the production
+    /// shape that accumulates revisions.
+    async fn commit_resume_shaped_rewrites(
+        service: &PersistentSessionService<CapabilityBuilder>,
+        id: &SessionId,
+        generations: std::ops::RangeInclusive<usize>,
+    ) {
+        for generation in generations {
+            let parent = service
+                .export_realtime_refresh_session_snapshot(id)
+                .await
+                .expect("read rewrite parent");
+            let parent_revision = parent.transcript_revision().expect("parent revision");
+            let (selection, replacement) = if generation == 0 {
+                (
+                    TranscriptRewriteSelection::MessageRange { start: 0, end: 0 },
+                    (0..12)
+                        .map(|index| Message::User(UserMessage::text(format!("turn {index}"))))
+                        .collect(),
+                )
+            } else {
+                (
+                    TranscriptRewriteSelection::MessageRange { start: 0, end: 1 },
+                    vec![Message::User(UserMessage::text(format!(
+                        "system prompt generation {generation}"
+                    )))],
+                )
+            };
+            service
+                .rewrite_session_transcript(
+                    id,
+                    SessionTranscriptRewriteRequest {
+                        selection,
+                        replacement,
+                        reason: TranscriptRewriteReason::new(
+                            meerkat_core::session::RESUME_SYSTEM_PROMPT_REFRESH_REWRITE_REASON,
+                        ),
+                        actor: None,
+                        expected_parent_revision: Some(parent_revision),
+                        running_behavior: TranscriptEditRunningBehavior::Reject,
+                    },
+                )
+                .await
+                .expect("rewrite commits");
+        }
+    }
+
+    /// THE POINT OF THE CURSOR. A steady-state load must not read rows it has
+    /// already folded, and the number it does read must not grow with the
+    /// session's rewrite history.
+    ///
+    /// Asserted on rows returned by the store, not on wall time and not on
+    /// hashed bytes: a commit-only read hashes nothing and materializes nothing
+    /// while still touching every byte of every row on its way to the last one,
+    /// so only a row count can tell a flat read from a cheap-per-row one.
+    #[tokio::test]
+    async fn test_steady_state_load_reads_no_rewrite_rows_it_already_folded() {
+        async fn rows_for(rewrites: usize) -> usize {
+            let dir = tempfile::tempdir().expect("temp dir");
+            // Each rewrite already goes through the authoritative load path,
+            // stamps the cursor, writes the graph and saves — the production
+            // resume shape — so the durable row carries a cursor by now.
+            let (service, event_store, id) = cursor_fixture(&dir, rewrites).await;
+            event_store.reset();
+            let before = meerkat_core::rewrite_record_body_decodes();
+            service
+                .load_authoritative_session_base(&id)
+                .await
+                .expect("measured load")
+                .expect("session is present");
+            let decoded = meerkat_core::rewrite_record_body_decodes() - before;
+            let reads = event_store.raw_reads();
+            assert!(
+                reads.iter().all(|(from_seq, _)| *from_seq > 1),
+                "a load holding a cursor must not restart the log at sequence 1: {reads:?}"
+            );
+            let log_rows = event_store.last_seq(&id).await.expect("log high-water");
+            let rows = event_store.rows_read();
+            println!(
+                "{rewrites} rewrites: load read {rows} of {log_rows} log rows \
+                 (from {reads:?}), materialized {decoded} record bodies"
+            );
+            rows
+        }
+
+        let few = rows_for(2).await;
+        let many = rows_for(8).await;
+        assert_eq!(
+            few, many,
+            "the rows an authoritative load reads must not grow with the retained \
+             rewrite count: 2 rewrites read {few} rows, 8 read {many}"
+        );
+    }
+
+    /// The cursor must not cost the fold. A record appended after it is read
+    /// AND fully validated — bodies materialized, digests checked — which is
+    /// what keeps corruption detection alive on everything a load touches.
+    #[tokio::test]
+    async fn test_a_record_after_the_cursor_is_read_and_fully_validated() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (service, event_store, id) = cursor_fixture(&dir, 3).await;
+        event_store.reset();
+        let session = service
+            .load_authoritative_session_base(&id)
+            .await
+            .expect("load succeeds")
+            .expect("session is present");
+        let state = session
+            .transcript_history_state()
+            .expect("history decodes")
+            .expect("graph retained");
+
+        assert_eq!(
+            state.commits.len(),
+            4,
+            "every rewrite must still be present in the graph the load serves"
+        );
+        let reads = event_store.raw_reads();
+        assert!(
+            reads.iter().all(|(from_seq, _)| *from_seq > 1),
+            "a load holding a cursor must not restart the log at sequence 1: {reads:?}"
+        );
+        assert!(
+            state.replay_cursor.is_some(),
+            "a rewrite persists the cursor its own load established"
+        );
+    }
+
+    /// The attachment check, which is what makes a tail read safe: a cursor
+    /// that skipped a record leaves the next record's parent unreachable, and
+    /// the load must refuse the tail and re-read rather than reason across the
+    /// gap. Exercised directly because a durable cursor cannot be made wrong
+    /// through the service's own write paths — they only ever mint correct ones.
+    #[test]
+    fn test_a_tail_that_skips_a_record_is_refused() {
+        use meerkat_core::{TranscriptHistoryState, ValidatedTranscriptHistory};
+
+        let records = graph_test_rewrite_chain(4);
+        let full = TranscriptHistoryState::from_rewrite_records(records.clone())
+            .expect("chain rebuilds")
+            .expect("chain is non-empty");
+        let proved = ValidatedTranscriptHistory::seal_owned(full).expect("rebuilt chain seals");
+
+        assert!(
+            PersistentSessionService::<CapabilityBuilder>::replay_tail_extends_graph(
+                &proved,
+                None,
+                &records[3..]
+            ),
+            "the real tail continues the graph"
+        );
+        assert!(
+            PersistentSessionService::<CapabilityBuilder>::replay_tail_extends_graph(
+                &proved,
+                None,
+                &[]
+            ),
+            "an empty tail trivially continues the graph"
+        );
+
+        // A graph that only folded the first two records, handed the fourth:
+        // the third produced the parent revision the fourth names, and neither
+        // the graph nor this tail carries it.
+        let partial = TranscriptHistoryState::from_rewrite_records(records[..2].to_vec())
+            .expect("prefix rebuilds")
+            .expect("prefix is non-empty");
+        let partial = ValidatedTranscriptHistory::seal_owned(partial).expect("prefix seals");
+        assert!(
+            !PersistentSessionService::<CapabilityBuilder>::replay_tail_extends_graph(
+                &partial,
+                None,
+                &records[3..]
+            ),
+            "a tail whose first record's parent nothing supplies must be refused, \
+             so the load re-reads from sequence 1 instead of skipping a record"
+        );
+
+        let commits = records
+            .iter()
+            .map(|record| record.commit.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            PersistentSessionService::<CapabilityBuilder>::replay_commit_tail_extends_graph(
+                &proved,
+                None,
+                &commits[3..]
+            ),
+            "the commit-only read answers attachment identically"
+        );
+        assert!(
+            !PersistentSessionService::<CapabilityBuilder>::replay_commit_tail_extends_graph(
+                &partial,
+                None,
+                &commits[3..]
+            ),
+            "and refuses identically"
+        );
+    }
+
+    /// A `seq` inflated but still WITHIN the log skips records and returns a
+    /// NON-empty tail, so the liveness probe cannot see it and
+    /// parent-is-retained is too weak — the graph retains an endpoint body for
+    /// every commit it carries, so a record further along the chain still finds
+    /// a parent it recognizes. Only the boundary chain catches this.
+    #[test]
+    fn test_a_tail_that_starts_past_the_reconciled_boundary_is_refused() {
+        use meerkat_core::{TranscriptHistoryState, ValidatedTranscriptHistory};
+
+        let records = graph_test_rewrite_chain(4);
+        let full = TranscriptHistoryState::from_rewrite_records(records.clone())
+            .expect("chain rebuilds")
+            .expect("chain is non-empty");
+        let proved = ValidatedTranscriptHistory::seal_owned(full).expect("chain seals");
+        // Reconciled through the second commit; records three and four are the
+        // honest tail.
+        let cursor = meerkat_core::TranscriptReplayCursor {
+            seq: 2,
+            commits: 2,
+            last_commit_revision: Some(records[1].commit.revision.clone()),
+        };
+
+        assert!(
+            PersistentSessionService::<CapabilityBuilder>::replay_tail_extends_graph(
+                &proved,
+                Some(&cursor),
+                &records[2..]
+            ),
+            "the honest tail chains from the reconciled boundary"
+        );
+        assert!(
+            !PersistentSessionService::<CapabilityBuilder>::replay_tail_extends_graph(
+                &proved,
+                Some(&cursor),
+                &records[3..]
+            ),
+            "a tail starting one record late must be refused: its parent IS retained \
+             by the graph, so only the boundary chain can tell that a record between \
+             the cursor and it was never folded"
+        );
+
+        let commits = records
+            .iter()
+            .map(|record| record.commit.clone())
+            .collect::<Vec<_>>();
+        assert!(
+            PersistentSessionService::<CapabilityBuilder>::replay_commit_tail_extends_graph(
+                &proved,
+                Some(&cursor),
+                &commits[2..]
+            ),
+            "the commit-only read agrees on the honest tail"
+        );
+        assert!(
+            !PersistentSessionService::<CapabilityBuilder>::replay_commit_tail_extends_graph(
+                &proved,
+                Some(&cursor),
+                &commits[3..]
+            ),
+            "and refuses the late one identically"
+        );
+    }
+
+    /// THE FAILURE MODE THE WHOLE CURSOR RESTS ON. A `seq` past the end of the
+    /// log returns an EMPTY tail, and an empty tail defeats every other
+    /// defence: it attaches trivially, `replay_cannot_contribute` returns true
+    /// for want of a last commit, and the audit verifier's unreconciled slice
+    /// is empty so its `all()` is vacuously true. Records the graph never
+    /// folded would be skipped silently and the bad cursor re-blessed forever.
+    ///
+    /// Only the liveness probe against the log's real high-water mark can see
+    /// it, because the count and boundary answer a question about the GRAPH and
+    /// this is a lie about the LOG.
+    #[test]
+    fn test_a_cursor_past_the_log_high_water_is_refused() {
+        use meerkat_core::{TranscriptHistoryState, ValidatedTranscriptHistory};
+
+        let records = graph_test_rewrite_chain(3);
+        let state = TranscriptHistoryState::from_rewrite_records(records)
+            .expect("chain rebuilds")
+            .expect("chain is non-empty");
+        let mut session = Session::new();
+        // An honest count and boundary — this cursor lies ONLY about the log.
+        let honest_prefix = state.replay_cursor_at(3);
+        let mut with_cursor = state.clone();
+        let proved = ValidatedTranscriptHistory::seal_owned(state).expect("chain seals");
+
+        with_cursor.replay_cursor = Some(honest_prefix.clone());
+        session
+            .apply_transcript_history_state(with_cursor)
+            .expect("install the graph");
+        assert_eq!(
+            session.transcript_replay_cursor().as_ref(),
+            Some(&honest_prefix),
+            "precondition: the session reads back the cursor it was given"
+        );
+
+        let (from_seq, cursor) = PersistentSessionService::<CapabilityBuilder>::replay_read_floor(
+            &session,
+            Some(&proved),
+            3,
+        );
+        assert_eq!(
+            from_seq, 4,
+            "a cursor within the log reads the tail after it"
+        );
+        assert!(cursor.is_some());
+
+        let (from_seq, cursor) = PersistentSessionService::<CapabilityBuilder>::replay_read_floor(
+            &session,
+            Some(&proved),
+            2,
+        );
+        assert_eq!(
+            from_seq, 1,
+            "a cursor claiming a sequence the log never reached must re-read \
+             everything, or the empty tail it produces hides every record it skipped"
+        );
+        assert!(cursor.is_none(), "and must not be trusted downstream");
+
+        let (from_seq, cursor) = PersistentSessionService::<CapabilityBuilder>::replay_read_floor(
+            &session,
+            Some(&proved),
+            0,
+        );
+        assert_eq!(
+            from_seq, 1,
+            "an unreadable high-water mark disables the cursor rather than \
+             granting it the benefit of the doubt"
+        );
+        assert!(cursor.is_none());
+    }
+
+    /// END TO END, through a real durable cursor and a real store: a log that
+    /// lost its tail makes the session's own honestly-stamped cursor name a
+    /// sequence the log never reached, and the load must notice and re-read.
+    ///
+    /// This does NOT doctor the cursor — the service only ever mints correct
+    /// ones — it doctors the LOG, which is the actual corruption shape (a
+    /// truncating restore, a partial copy). And it asserts THE PROBE FIRED,
+    /// by observing that the read restarted at sequence 1, not merely that the
+    /// graph came out right: a load that skipped records would still produce a
+    /// plausible graph, so an output-only assertion would pass for the wrong
+    /// reason.
+    #[tokio::test]
+    async fn test_a_log_that_lost_its_tail_forces_a_full_reread() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (service, event_store, id) = cursor_fixture(&dir, 4).await;
+
+        // Baseline: the honest cursor is trusted and the read starts after it.
+        event_store.reset();
+        let baseline = service
+            .load_authoritative_session_base(&id)
+            .await
+            .expect("baseline load")
+            .expect("session is present")
+            .transcript_history_state()
+            .expect("history decodes")
+            .expect("graph retained");
+        let baseline_reads = event_store.raw_reads();
+        assert!(
+            baseline_reads.iter().all(|(from_seq, _)| *from_seq > 1),
+            "precondition: an honest cursor reads a tail, not the whole log: \
+             {baseline_reads:?}"
+        );
+        let cursor_seq = baseline
+            .replay_cursor
+            .as_ref()
+            .expect("precondition: the fixture persisted a cursor")
+            .seq;
+
+        // The log loses everything from the cursor's sequence onward.
+        event_store.truncate_high_water_to(cursor_seq - 1);
+
+        event_store.reset();
+        let recovered = service
+            .load_authoritative_session_base(&id)
+            .await
+            .expect("the load must survive a cursor the log cannot support")
+            .expect("session is present")
+            .transcript_history_state()
+            .expect("history decodes")
+            .expect("graph retained");
+        let reads = event_store.raw_reads();
+
+        assert!(
+            reads.iter().any(|(from_seq, _)| *from_seq == 1),
+            "THE PROBE MUST FIRE: a cursor past the log's high-water mark yields \
+             an EMPTY tail, which attaches trivially and which the audit verifier \
+             accepts vacuously, so nothing downstream can catch it. Reads: {reads:?}"
+        );
+        assert_eq!(
+            recovered
+                .commits
+                .iter()
+                .map(|commit| commit.revision.as_str())
+                .collect::<Vec<_>>(),
+            baseline
+                .commits
+                .iter()
+                .map(|commit| commit.revision.as_str())
+                .collect::<Vec<_>>(),
+            "and the fallback must produce the same history, not a truncated one"
+        );
+        assert_eq!(recovered.head, baseline.head, "and the same head");
+    }
+
+    /// A cursor that is too LOW is the safe direction and must stay cheap-ish
+    /// rather than wrong: a bigger tail, every record still folded.
+    #[test]
+    fn test_a_cursor_that_is_too_low_reads_a_bigger_tail_and_stays_correct() {
+        use meerkat_core::{TranscriptHistoryState, ValidatedTranscriptHistory};
+
+        let records = graph_test_rewrite_chain(4);
+        let state = TranscriptHistoryState::from_rewrite_records(records.clone())
+            .expect("chain rebuilds")
+            .expect("chain is non-empty");
+        let mut with_cursor = state.clone();
+        let proved = ValidatedTranscriptHistory::seal_owned(state).expect("chain seals");
+
+        let mut session = Session::new();
+        // Understates both the sequence and the reconciled prefix.
+        with_cursor.replay_cursor = Some(meerkat_core::TranscriptReplayCursor {
+            seq: 1,
+            commits: 1,
+            last_commit_revision: Some(records[0].commit.revision.clone()),
+        });
+        session
+            .apply_transcript_history_state(with_cursor)
+            .expect("install the graph");
+
+        let (from_seq, cursor) = PersistentSessionService::<CapabilityBuilder>::replay_read_floor(
+            &session,
+            Some(&proved),
+            9,
+        );
+        assert_eq!(from_seq, 2, "reads a bigger tail, starting right after it");
+        let cursor = cursor.expect("an understated cursor is still describable");
+        assert!(
+            PersistentSessionService::<CapabilityBuilder>::replay_tail_extends_graph(
+                &proved,
+                Some(&cursor),
+                &records[1..]
+            ),
+            "and the bigger tail is admitted in full, so nothing is skipped"
+        );
+        assert_eq!(
+            proved
+                .commits_beyond_replay_cursor(&cursor)
+                .expect("describable")
+                .len(),
+            3,
+            "the audit side then checks every commit the low cursor did not cover"
+        );
+    }
+
+    /// A chain of `count` resume-shaped rewrites over a fixed transcript.
+    fn graph_test_rewrite_chain(count: usize) -> Vec<meerkat_core::TranscriptRewriteRecord> {
+        let mut messages = (0..6)
+            .map(|index| Message::User(UserMessage::text(format!("turn {index}"))))
+            .collect::<Vec<_>>();
+        let body = |messages: Vec<Message>, parent: Option<&str>| {
+            let revision =
+                meerkat_core::transcript_messages_digest(&messages).expect("digest body");
+            meerkat_core::TranscriptRevisionBody {
+                revision,
+                parent_revision: parent.map(str::to_string),
+                messages,
+                created_at: meerkat_core::time_compat::SystemTime::UNIX_EPOCH,
+            }
+        };
+        let mut records = Vec::with_capacity(count);
+        for generation in 0..count {
+            let parent_body = body(messages.clone(), None);
+            messages[0] = Message::User(UserMessage::text(format!(
+                "system prompt generation {generation}"
+            )));
+            let revision_body = body(messages.clone(), Some(&parent_body.revision));
+            let commit = meerkat_core::TranscriptRewriteCommit {
+                parent_revision: parent_body.revision.clone(),
+                revision: revision_body.revision.clone(),
+                selection: TranscriptRewriteSelection::MessageRange { start: 0, end: 1 },
+                original_span_digest: meerkat_core::transcript_messages_digest(
+                    &parent_body.messages[..1],
+                )
+                .expect("digest original span"),
+                replacement_digest: meerkat_core::transcript_messages_digest(
+                    &revision_body.messages[..1],
+                )
+                .expect("digest replacement span"),
+                messages_before: parent_body.messages.len(),
+                messages_after: revision_body.messages.len(),
+                reason: TranscriptRewriteReason::new("resume-system-prompt-refresh"),
+                actor: None,
+                committed_at: meerkat_core::time_compat::SystemTime::UNIX_EPOCH,
+            };
+            records.push(
+                meerkat_core::TranscriptRewriteRecord::new(commit, parent_body, revision_body)
+                    .expect("chain record is valid"),
+            );
+        }
+        records
+    }
+
+    /// THE CONTRACT WE CHOSE, pinned so nobody later reads the absence of a
+    /// check as an oversight and "fixes" it back into a full log read per load.
+    ///
+    /// A load that folds nothing materializes no record body, and a load that
+    /// materializes no body cannot detect corruption in one. That is
+    /// verify-on-use, and it is deliberate: an authoritative load owes an
+    /// integrity check on the graph it serves and on any record it actually
+    /// folds — not on historical log bodies it will never look at. Restoring a
+    /// check here means reading every body on every load, which is exactly the
+    /// `Theta(records x transcript)` cost this work removed.
+    ///
+    /// Corruption in an unfolded body is a matter for an explicit audit pass.
+    #[tokio::test]
+    async fn test_a_load_that_folds_nothing_materializes_no_bodies_and_so_checks_none() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (service, event_store, id) = cursor_fixture(&dir, 3).await;
+        // Warm through one load so the next one has nothing left to fold.
+        service
+            .load_authoritative_session_base(&id)
+            .await
+            .expect("warming load")
+            .expect("session is present");
+
+        event_store.reset();
+        let before = meerkat_core::rewrite_record_body_decodes();
+        service
+            .load_authoritative_session_base(&id)
+            .await
+            .expect("steady-state load succeeds")
+            .expect("session is present");
+        let decoded = meerkat_core::rewrite_record_body_decodes() - before;
+
+        assert_eq!(
+            decoded, 0,
+            "a load with nothing to fold must not build a single record body; \
+             it built {decoded}"
+        );
+        assert!(
+            event_store.typed_reads().is_empty(),
+            "and must not take the typed read at all: {:?}",
+            event_store.typed_reads()
+        );
+    }
+
     #[tokio::test]
     async fn test_realtime_open_snapshot_rejects_repeated_images_over_cumulative_budget() {
         let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
@@ -30376,6 +32066,7 @@ mod tests {
                 messages: revision_messages,
                 created_at: meerkat_core::time_compat::SystemTime::now(),
             },
+            digest_format: 0,
         };
         event_store
             .append_envelopes(
@@ -32678,7 +34369,7 @@ mod tests {
         // graph-less shape must read modern and keep the fail-closed hold.
         let mut plain = Session::new();
         plain.push(Message::User(UserMessage::text("turn".to_string())));
-        let (plain, v1_stamp) = with_checkpoint_root(plain);
+        let (_, v1_stamp) = with_checkpoint_root(plain);
         assert_eq!(
             durable_head_stamp_era(&v1_stamp),
             DurableHeadStampEra::PreWitnessV3,
@@ -34047,8 +35738,6 @@ mod tests {
     fn drive_generated_service_turn_to_completed(
         turn_state: &Arc<dyn meerkat_core::TurnStateHandle>,
     ) -> RunId {
-        use meerkat_core::TurnStateHandle as _;
-
         let run_id = RunId::new();
         turn_state
             .start_conversation_run(

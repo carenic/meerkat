@@ -578,6 +578,7 @@ mod tests {
                 })
                 .collect(),
             digest_format: TRANSCRIPT_DIGEST_FORMAT_CURRENT,
+            replay_cursor: None,
         }
     }
 
@@ -663,6 +664,7 @@ mod tests {
                 })
                 .collect(),
             digest_format: TRANSCRIPT_DIGEST_FORMAT_CURRENT,
+            replay_cursor: None,
         };
         let durable_bytes = approximate_serialized_bytes(&graph).expect("graph serializes");
         let materialized_bytes: usize = graph

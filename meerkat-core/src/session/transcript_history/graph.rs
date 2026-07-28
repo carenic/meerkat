@@ -10,6 +10,7 @@ use super::decode_memo::{
     transcript_graph_heal_probe_is_memoized, transcript_graph_shape_key,
 };
 use super::heal::{heal_legacy_compaction_rewrite_semantics, heal_legacy_revision_strings};
+use super::sealed::ValidatedTranscriptHistory;
 use super::validate::{
     revision_body_extends_head, validate_transcript_history_state,
     validate_transcript_rewrite_record,
@@ -341,6 +342,19 @@ pub struct TranscriptRewriteRecord {
     pub commit: TranscriptRewriteCommit,
     pub parent_body: TranscriptRevisionBody,
     pub revision_body: TranscriptRevisionBody,
+    /// Digest-format generation of this record's revision strings. Records
+    /// stamped `>= 2` were written by the content-addressed digest format, so
+    /// decode skips the per-decode legacy-heal probe (a full-transcript hash
+    /// of BOTH bodies); absent/0 means unknown provenance and the probe runs,
+    /// exactly as it did before the marker existed. A compatibility
+    /// convenience, not an integrity boundary: the record's own validation
+    /// against its commit owns integrity, and a stamped record that does not
+    /// validate is rejected exactly as an unstamped one is.
+    ///
+    /// Records are append-only and never restamped in place, so this skips
+    /// the probe only for records minted from the version that added it.
+    #[serde(default, skip_serializing_if = "digest_format_is_unknown")]
+    pub digest_format: u32,
 }
 
 impl<'de> Deserialize<'de> for TranscriptRewriteRecord {
@@ -354,12 +368,21 @@ impl<'de> Deserialize<'de> for TranscriptRewriteRecord {
             commit: TranscriptRewriteCommit,
             parent_body: TranscriptRevisionBody,
             revision_body: TranscriptRevisionBody,
+            #[serde(default)]
+            digest_format: u32,
         }
         let wire = Wire::deserialize(deserializer)?;
+        crate::checkpoint::record_rewrite_record_body_decode();
         let mut revisions = vec![wire.parent_body, wire.revision_body];
         let mut commits = vec![wire.commit];
-        heal_legacy_revision_strings(&mut revisions, &mut commits, None)
-            .map_err(serde::de::Error::custom)?;
+        // Fast path: a record stamped with the current digest format skips the
+        // heal outright — the heal hashes both full transcript bodies, and
+        // every authoritative load decodes every record in the append-only
+        // log. Unstamped records pay the probe exactly as before.
+        if wire.digest_format < TRANSCRIPT_DIGEST_FORMAT_CURRENT {
+            heal_legacy_revision_strings(&mut revisions, &mut commits, None)
+                .map_err(serde::de::Error::custom)?;
+        }
         heal_legacy_compaction_rewrite_semantics(&mut commits, &revisions);
         let mut revisions = revisions.into_iter();
         let parent_body = revisions
@@ -376,6 +399,9 @@ impl<'de> Deserialize<'de> for TranscriptRewriteRecord {
             commit,
             parent_body,
             revision_body,
+            // The heal above leaves current-format strings behind, so the
+            // decoded value is stamped whatever the wire carried.
+            digest_format: TRANSCRIPT_DIGEST_FORMAT_CURRENT,
         })
     }
 }
@@ -391,8 +417,67 @@ impl TranscriptRewriteRecord {
             commit,
             parent_body,
             revision_body,
+            digest_format: TRANSCRIPT_DIGEST_FORMAT_CURRENT,
         })
     }
+}
+
+/// How much of the append-only rewrite log a graph has already folded and
+/// reconciled with.
+///
+/// A rewrite record carries TWO full transcript bodies, and every authoritative
+/// load read the log from sequence 1 before it could conclude the log had
+/// nothing new to say. Even a reader that never materializes a body still
+/// reads, lexes and copies every byte of every record to get there, so the cost
+/// stayed `Theta(records x transcript)` on a session that mints one record per
+/// resume. An append-only log does not need re-reading: this marks how far a
+/// load already got, so the next one starts after it.
+///
+/// The marked position is MUTUAL, and both halves are load-bearing because the
+/// log's two consumers read it in OPPOSITE directions. At stamp time every log
+/// rewrite record at or below [`Self::seq`] was represented in this graph's
+/// commits (what the replay needs), AND this graph's leading [`Self::commits`]
+/// commits were all present in the log at or below that sequence (what the
+/// audit verifier needs, since it hunts for graph commits the log never
+/// recorded). A sequence alone would answer only the first, and the second
+/// consumer would re-read the whole log anyway.
+///
+/// A compatibility convenience, not an integrity boundary. Nothing here is
+/// covered by the checkpoint stamp — the whole graph value is stripped from the
+/// checkpoint preimage and stands in as its witness, and neither witness format
+/// reads a top-level field it does not name. So a wrong cursor cannot be caught
+/// by a digest, and is instead caught by its reader: `meerkat-session` re-reads
+/// from sequence 1 on any inconsistency. Wrong means SLOW, never a missed
+/// record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub struct TranscriptReplayCursor {
+    /// Highest event-log sequence whose rewrite records are all represented in
+    /// this graph's commits. Every one of them was fully validated when it was
+    /// folded; none is re-proved.
+    pub seq: u64,
+    /// How many of this graph's LEADING commits were also present in the log at
+    /// or below [`Self::seq`]. Only the commits after that prefix can still be
+    /// missing an audit event.
+    pub commits: usize,
+    /// The revision of the last commit in that prefix; `None` exactly when the
+    /// prefix is empty.
+    ///
+    /// The prefix is trusted only while the graph still ends it here, which is
+    /// what keeps "commits are append-only" a CHECKED precondition rather than
+    /// a silent assumption. It catches truncation, a front prune, a lineage
+    /// swap and wholesale replacement.
+    ///
+    /// What it does NOT catch, stated so no reader infers a guarantee: a
+    /// reorder strictly INTERIOR to the prefix that preserves both its length
+    /// and its last element. The cost of that miss is a skipped audit-event
+    /// repair — never a missed rewrite record, because the replay side is
+    /// guarded separately by proving that every record read attaches to the
+    /// graph. Verifying the interior would mean hashing the prefix on every
+    /// load, i.e. paying for the evidence with the very quantity this cursor
+    /// exists to reduce.
+    pub last_commit_revision: Option<String>,
 }
 
 /// Typed session-local transcript revision graph state.
@@ -418,6 +503,15 @@ pub struct TranscriptHistoryState {
     /// save persists the marker. A compatibility convenience, not an
     /// integrity boundary (checkpoint stamps own integrity).
     pub digest_format: u32,
+    /// How far the append-only rewrite log has already been folded into this
+    /// graph; see [`TranscriptReplayCursor`].
+    ///
+    /// `None` claims nothing, and is byte-for-byte the behaviour of every
+    /// document written before this field existed: read the whole log from the
+    /// first sequence. Every ambiguous case resolves to `None` for that reason
+    /// — a cursor that is too low costs a slow load, one that is too high costs
+    /// a missed record, and those are not comparable.
+    pub replay_cursor: Option<TranscriptReplayCursor>,
 }
 
 /// Published shape of the durable transcript graph.
@@ -444,6 +538,10 @@ struct SchemaTranscriptHistoryState {
     /// Omitted when unknown (0).
     #[serde(default)]
     digest_format: u32,
+    /// Omitted when the graph has not been reconciled against the append-only
+    /// rewrite log; see [`TranscriptReplayCursor`].
+    #[serde(default)]
+    replay_cursor: Option<TranscriptReplayCursor>,
 }
 
 #[cfg(feature = "schema")]
@@ -457,8 +555,8 @@ impl schemars::JsonSchema for TranscriptHistoryState {
     }
 }
 
-fn digest_format_is_unknown(format: u32) -> bool {
-    format == 0
+fn digest_format_is_unknown(format: &u32) -> bool {
+    *format == 0
 }
 
 /// The digest-format generation minted by [`transcript_messages_digest`].
@@ -473,11 +571,13 @@ impl Serialize for TranscriptHistoryState {
 
         let emit_commits = !self.commits.is_empty();
         let emit_revisions = !self.revisions.is_empty();
-        let emit_digest_format = !digest_format_is_unknown(self.digest_format);
+        let emit_digest_format = !digest_format_is_unknown(&self.digest_format);
+        let emit_replay_cursor = self.replay_cursor.is_some();
         let fields = 1
             + usize::from(emit_commits)
             + usize::from(emit_revisions)
-            + usize::from(emit_digest_format);
+            + usize::from(emit_digest_format)
+            + usize::from(emit_replay_cursor);
         let mut wire = serializer.serialize_struct("TranscriptHistoryState", fields)?;
         wire.serialize_field("head", &self.head)?;
         if emit_commits {
@@ -488,6 +588,12 @@ impl Serialize for TranscriptHistoryState {
         }
         if emit_digest_format {
             wire.serialize_field("digest_format", &self.digest_format)?;
+        }
+        // Absent when unclaimed, so a graph that has never been reconciled
+        // against the log produces exactly the bytes it produced before this
+        // field existed.
+        if let Some(cursor) = &self.replay_cursor {
+            wire.serialize_field("replay_cursor", cursor)?;
         }
         wire.end()
     }
@@ -508,6 +614,8 @@ impl<'de> Deserialize<'de> for TranscriptHistoryState {
             revisions: Vec<RevisionEntryWire>,
             #[serde(default)]
             digest_format: u32,
+            #[serde(default)]
+            replay_cursor: Option<TranscriptReplayCursor>,
         }
         let wire = Wire::deserialize(deserializer)?;
         let (revisions, spliced) = decode_revision_chain::<D::Error>(wire.revisions)?;
@@ -516,6 +624,7 @@ impl<'de> Deserialize<'de> for TranscriptHistoryState {
             commits: wire.commits,
             revisions,
             digest_format: wire.digest_format,
+            replay_cursor: wire.replay_cursor,
         };
         // Pre-parent-pointer v1 snapshots serialized each body as
         // {created_at,messages,revision}. When every non-root body lacks a
@@ -584,16 +693,71 @@ impl<'de> Deserialize<'de> for TranscriptHistoryState {
                 commits,
                 digest_format: _,
                 revisions,
+                replay_cursor,
             } = &mut state;
+            // The heal rewrites revision strings, so a prefix boundary recorded
+            // under the old spelling no longer names anything in this graph.
+            // Drop the claim rather than carry a stale one: the reader falls
+            // back to a full read and re-establishes it.
+            *replay_cursor = None;
             heal_legacy_revision_strings(revisions, commits, Some(head))
                 .map_err(serde::de::Error::custom)?;
         }
         heal_legacy_compaction_rewrite_semantics(&mut state.commits, &state.revisions);
+        // `heal_legacy_compaction_rewrite_semantics` can rewrite a commit's
+        // selection semantics in place. It preserves order and length, so the
+        // prefix boundary still names the same commit and the cursor survives;
+        // the audit verifier compares whole commits, so a healed commit that no
+        // longer equals its logged form simply reads as unreconciled and takes
+        // the repair path.
         Ok(state)
     }
 }
 
 impl TranscriptHistoryState {
+    /// The cursor to stamp on this graph once a load has reconciled it with the
+    /// append-only log through `seq`.
+    ///
+    /// Callers must have established BOTH directions in that same load before
+    /// using this: every log record at or below `seq` folded into this graph,
+    /// and every one of this graph's commits present in the log. Stamping on
+    /// anything weaker is the one way this mechanism can lose a record.
+    #[must_use]
+    pub fn replay_cursor_at(&self, seq: u64) -> TranscriptReplayCursor {
+        TranscriptReplayCursor {
+            seq,
+            commits: self.commits.len(),
+            last_commit_revision: self.commits.last().map(|commit| commit.revision.clone()),
+        }
+    }
+
+    /// The commits `cursor` does NOT already prove are recorded in the log.
+    ///
+    /// `None` means the cursor does not describe this graph and nothing may be
+    /// skipped on its word — the caller must read the whole log, exactly as it
+    /// did before cursors existed. That is the self-healing path, and it fires
+    /// on a graph that lost commits, a prefix that no longer ends where the
+    /// cursor says, and a cursor minted against a different lineage.
+    #[must_use]
+    pub fn commits_beyond_replay_cursor(
+        &self,
+        cursor: &TranscriptReplayCursor,
+    ) -> Option<&[TranscriptRewriteCommit]> {
+        let boundary_holds = match cursor.commits.checked_sub(1) {
+            None => cursor.last_commit_revision.is_none(),
+            Some(last) => {
+                cursor.last_commit_revision.as_deref()
+                    == self
+                        .commits
+                        .get(last)
+                        .map(|commit| commit.revision.as_str())
+            }
+        };
+        boundary_holds
+            .then(|| self.commits.get(cursor.commits..))
+            .flatten()
+    }
+
     /// Drop mechanical append-head snapshots while preserving every body that
     /// is an endpoint of an audited rewrite plus the current live head.
     ///
@@ -696,24 +860,97 @@ impl TranscriptHistoryState {
     }
 }
 
+/// Whether `proved` already carries every fact
+/// [`validate_transcript_rewrite_record`] would derive for `record`.
+///
+/// That validator proves relations among exactly three values: the commit and
+/// the two endpoint message vectors. This returns true only when the proved
+/// graph holds all three — a byte-equal commit, and endpoint bodies whose
+/// messages equal the record's — so the relations it would derive are the ones
+/// [`validate_transcript_history_state`] already derived over those same three
+/// values when `proved` was sealed.
+///
+/// The message equality is what stands in for the hash, and it is a proof
+/// rather than a heuristic: [`transcript_messages_digest`] is a pure function
+/// of the message vector, so a vector equal to one already verified against a
+/// revision string digests to that same string. A body that no longer digests
+/// to its commit, a body the proved graph does not retain, a commit it does not
+/// carry, or a body whose own revision label disagrees with the commit all
+/// return false and take the full validation, which rejects them exactly as
+/// before.
+pub(super) fn record_is_proved_by(
+    proved: Option<&ValidatedTranscriptHistory>,
+    record: &TranscriptRewriteRecord,
+) -> bool {
+    let Some(proved) = proved else {
+        return false;
+    };
+    if record.parent_body.revision != record.commit.parent_revision
+        || record.revision_body.revision != record.commit.revision
+    {
+        return false;
+    }
+    if !proved.commits.contains(&record.commit) {
+        return false;
+    }
+    let retained = |revision: &str| {
+        proved
+            .revisions
+            .iter()
+            .find(|body| body.revision == revision)
+    };
+    let (Some(parent), Some(revision)) = (
+        retained(&record.commit.parent_revision),
+        retained(&record.commit.revision),
+    ) else {
+        return false;
+    };
+    parent.messages == record.parent_body.messages
+        && revision.messages == record.revision_body.messages
+}
+
 impl TranscriptHistoryState {
     /// Rebuild transcript revision graph state from append-only rewrite records.
     pub fn from_rewrite_records<I>(records: I) -> Result<Option<Self>, TranscriptEditError>
     where
         I: IntoIterator<Item = TranscriptRewriteRecord>,
     {
+        Self::from_rewrite_records_with_proved(records, None)
+    }
+
+    /// [`Self::from_rewrite_records`] against a graph that already proves some
+    /// of the log.
+    ///
+    /// Every authoritative load used to re-prove EVERY record in the log, and
+    /// a rewrite record carries two FULL transcript bodies, so resume cost grew
+    /// as retained-revisions x transcript — quadratic over a session's life.
+    /// `proved` is the session's own validated graph: already in memory,
+    /// already hashed. A record it covers needs no second hash pass; a record
+    /// it does not cover is validated in full, unchanged. Integrity is not
+    /// traded for the saving — `record_is_proved_by` documents exactly what
+    /// "covers" has to mean before a proof may be skipped.
+    pub fn from_rewrite_records_with_proved<I>(
+        records: I,
+        proved: Option<&ValidatedTranscriptHistory>,
+    ) -> Result<Option<Self>, TranscriptEditError>
+    where
+        I: IntoIterator<Item = TranscriptRewriteRecord>,
+    {
         let mut state: Option<Self> = None;
         for record in records {
-            validate_transcript_rewrite_record(
-                &record.commit,
-                &record.parent_body,
-                &record.revision_body,
-            )?;
+            if !record_is_proved_by(proved, &record) {
+                validate_transcript_rewrite_record(
+                    &record.commit,
+                    &record.parent_body,
+                    &record.revision_body,
+                )?;
+            }
             let state = state.get_or_insert_with(|| Self {
                 head: record.commit.parent_revision.clone(),
                 commits: Vec::new(),
                 revisions: Vec::new(),
                 digest_format: TRANSCRIPT_DIGEST_FORMAT_CURRENT,
+                replay_cursor: None,
             });
             if record.commit.parent_revision != state.head {
                 if revision_body_extends_head(&record.parent_body, &state.revisions, &state.head)? {
@@ -743,5 +980,519 @@ impl TranscriptHistoryState {
             state.commits.push(record.commit);
         }
         Ok(state)
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::redundant_clone)]
+mod tests {
+    use super::*;
+    use crate::checkpoint::session_content_digest_bytes;
+    use crate::session::{TranscriptRewriteReason, TranscriptRewriteSelection};
+    use crate::types::UserMessage;
+
+    fn message(text: &str) -> Message {
+        Message::User(UserMessage::text(text.to_string()))
+    }
+
+    fn body(messages: Vec<Message>, parent: Option<&str>) -> TranscriptRevisionBody {
+        let revision = transcript_messages_digest(&messages).expect("digest revision body");
+        TranscriptRevisionBody {
+            revision,
+            parent_revision: parent.map(str::to_string),
+            messages,
+            created_at: SystemTime::UNIX_EPOCH,
+        }
+    }
+
+    /// A chain of `count` rewrites over a fixed-length transcript, each
+    /// replacing message 0 — the shape a resume-time system-prompt refresh
+    /// mints, and the shape whose per-record proof hashes the whole transcript
+    /// on both sides of a one-message edit.
+    fn rewrite_chain(count: usize) -> Vec<TranscriptRewriteRecord> {
+        let mut messages = (0..6)
+            .map(|index| message(&format!("turn {index}")))
+            .collect::<Vec<_>>();
+        let mut records = Vec::with_capacity(count);
+        for generation in 0..count {
+            let parent_body = body(messages.clone(), None);
+            messages[0] = message(&format!("system prompt generation {generation}"));
+            let revision_body = body(messages.clone(), Some(&parent_body.revision));
+            let commit = TranscriptRewriteCommit {
+                parent_revision: parent_body.revision.clone(),
+                revision: revision_body.revision.clone(),
+                selection: TranscriptRewriteSelection::MessageRange { start: 0, end: 1 },
+                original_span_digest: transcript_messages_digest(&parent_body.messages[..1])
+                    .expect("digest original span"),
+                replacement_digest: transcript_messages_digest(&revision_body.messages[..1])
+                    .expect("digest replacement span"),
+                messages_before: parent_body.messages.len(),
+                messages_after: revision_body.messages.len(),
+                reason: TranscriptRewriteReason::new("resume-system-prompt-refresh"),
+                actor: None,
+                committed_at: SystemTime::UNIX_EPOCH,
+            };
+            records.push(
+                TranscriptRewriteRecord::new(commit, parent_body, revision_body)
+                    .expect("chain record is valid"),
+            );
+        }
+        records
+    }
+
+    fn rebuild(records: &[TranscriptRewriteRecord]) -> TranscriptHistoryState {
+        TranscriptHistoryState::from_rewrite_records(records.to_vec())
+            .expect("rebuild from records")
+            .expect("chain is non-empty")
+    }
+
+    fn sealed(records: &[TranscriptRewriteRecord]) -> ValidatedTranscriptHistory {
+        ValidatedTranscriptHistory::seal_owned(rebuild(records)).expect("rebuilt chain seals")
+    }
+
+    fn hashed_bytes<T>(operation: impl FnOnce() -> T) -> (T, u64) {
+        let before = session_content_digest_bytes();
+        let value = operation();
+        (value, session_content_digest_bytes() - before)
+    }
+
+    fn assert_same_graph(left: &TranscriptHistoryState, right: &TranscriptHistoryState) {
+        assert_eq!(left.head, right.head);
+        assert_eq!(left.commits, right.commits);
+        assert_eq!(
+            left.revisions
+                .iter()
+                .map(|body| (&body.revision, &body.messages))
+                .collect::<Vec<_>>(),
+            right
+                .revisions
+                .iter()
+                .map(|body| (&body.revision, &body.messages))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn replay_of_a_fully_proved_log_hashes_nothing() {
+        let records = rewrite_chain(6);
+        let proved = sealed(&records);
+        let (replayed, hashed) = hashed_bytes(|| {
+            TranscriptHistoryState::from_rewrite_records_with_proved(records.clone(), Some(&proved))
+        });
+        let replayed = replayed.expect("replay succeeds").expect("non-empty");
+        assert_eq!(
+            hashed, 0,
+            "every commit in the log is carried byte-equal by the proved graph, \
+             so the replay must not hash a transcript a second time"
+        );
+        assert_same_graph(&replayed, &proved);
+    }
+
+    #[test]
+    fn replay_cost_of_one_new_record_does_not_grow_with_the_proved_prefix() {
+        let hash_one_new_record = |chain_len: usize| {
+            let records = rewrite_chain(chain_len);
+            let proved = sealed(&records[..chain_len - 1]);
+            let (replayed, hashed) = hashed_bytes(|| {
+                TranscriptHistoryState::from_rewrite_records_with_proved(
+                    records.clone(),
+                    Some(&proved),
+                )
+            });
+            let replayed = replayed.expect("replay succeeds").expect("non-empty");
+            assert_same_graph(&replayed, &rebuild(&records));
+            assert!(
+                hashed > 0,
+                "the trailing record is not carried by the proved graph and must \
+                 be proved in full"
+            );
+            hashed
+        };
+        assert_eq!(
+            hash_one_new_record(2),
+            hash_one_new_record(8),
+            "resume must hash the records the session cannot already prove, and \
+             only those: a longer proved prefix is not more work"
+        );
+    }
+
+    /// The digest is unkeyed, so what a proved replay must still refuse is a
+    /// body whose bytes no longer produce its revision string — accidental
+    /// corruption, not a modification anyone able to write the log could not
+    /// simply re-derive a matching digest for.
+    #[test]
+    fn a_corrupted_body_is_rejected_when_its_commit_is_proved() {
+        let records = rewrite_chain(3);
+        let proved = sealed(&records);
+        let mut corrupted = records.clone();
+        corrupted[1].revision_body.messages[3] = message("corrupted tail");
+        let error =
+            TranscriptHistoryState::from_rewrite_records_with_proved(corrupted, Some(&proved))
+                .expect_err("a body that does not digest to its commit must be refused");
+        assert!(
+            matches!(error, TranscriptEditError::HistoryStateMalformed(_)),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_corrupted_new_record_is_rejected() {
+        let records = rewrite_chain(3);
+        let mut corrupted = records.clone();
+        corrupted[2].parent_body.messages[3] = message("corrupted tail");
+        let error = TranscriptHistoryState::from_rewrite_records(corrupted)
+            .expect_err("a body that does not digest to its commit must be refused");
+        assert!(
+            matches!(error, TranscriptEditError::HistoryStateMalformed(_)),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_proved_graph_missing_an_endpoint_body_cannot_launder_a_corrupted_record() {
+        let records = rewrite_chain(2);
+        let mut state = rebuild(&records);
+        state
+            .revisions
+            .retain(|body| body.revision != records[1].commit.revision);
+        // `seal` refuses a graph missing a commit endpoint, so a marker adopted
+        // over a graph that lost one is the only way this branch is reachable.
+        let proved = ValidatedTranscriptHistory::adopt_session_validated(Arc::new(state));
+        let mut corrupted = records.clone();
+        corrupted[1].revision_body.messages[3] = message("corrupted tail");
+        let error =
+            TranscriptHistoryState::from_rewrite_records_with_proved(corrupted, Some(&proved))
+                .expect_err("a record whose endpoint the proved graph dropped is not proved");
+        assert!(
+            matches!(error, TranscriptEditError::HistoryStateMalformed(_)),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn a_body_mislabelled_against_its_commit_is_rejected_under_a_proved_graph() {
+        let records = rewrite_chain(3);
+        let proved = sealed(&records);
+        let mut mislabelled = records.clone();
+        mislabelled[1].parent_body.revision = "sha256:not-the-parent".to_string();
+        let error =
+            TranscriptHistoryState::from_rewrite_records_with_proved(mislabelled, Some(&proved))
+                .expect_err("a body labelled with a revision it does not carry must be refused");
+        assert!(
+            matches!(error, TranscriptEditError::HistoryStateMalformed(_)),
+            "unexpected error: {error}"
+        );
+    }
+
+    /// The wire form a pre-marker writer produced: the same record, with
+    /// `digest_format` absent.
+    fn unstamped_wire(record: &TranscriptRewriteRecord) -> serde_json::Value {
+        let mut wire = serde_json::to_value(record).expect("record serializes");
+        wire.as_object_mut()
+            .expect("record wire form is an object")
+            .remove("digest_format");
+        wire
+    }
+
+    #[test]
+    fn a_stamped_record_serializes_its_marker_and_an_unknown_one_omits_it() {
+        let record = rewrite_chain(1).remove(0);
+        let wire = serde_json::to_value(&record).expect("record serializes");
+        assert_eq!(
+            wire.get("digest_format")
+                .and_then(serde_json::Value::as_u64),
+            Some(u64::from(TRANSCRIPT_DIGEST_FORMAT_CURRENT)),
+            "a minted record carries the digest-format marker"
+        );
+        let unknown = TranscriptRewriteRecord {
+            digest_format: 0,
+            ..record
+        };
+        assert!(
+            serde_json::to_value(&unknown)
+                .expect("record serializes")
+                .get("digest_format")
+                .is_none(),
+            "an unknown-provenance record must keep producing the pre-marker bytes"
+        );
+    }
+
+    #[test]
+    fn a_record_without_a_marker_decodes_to_the_same_value_as_a_stamped_one() {
+        let record = rewrite_chain(1).remove(0);
+        let unstamped: TranscriptRewriteRecord =
+            serde_json::from_value(unstamped_wire(&record)).expect("pre-marker record decodes");
+        assert_eq!(unstamped.commit, record.commit);
+        assert_eq!(unstamped.parent_body.messages, record.parent_body.messages);
+        assert_eq!(unstamped.parent_body.revision, record.parent_body.revision);
+        assert_eq!(
+            unstamped.revision_body.messages,
+            record.revision_body.messages
+        );
+        assert_eq!(
+            unstamped.revision_body.revision,
+            record.revision_body.revision
+        );
+    }
+
+    #[test]
+    fn only_an_unmarked_record_pays_the_legacy_heal_probe() {
+        let record = rewrite_chain(1).remove(0);
+        let stamped = serde_json::to_value(&record).expect("record serializes");
+        let unstamped = unstamped_wire(&record);
+
+        let (_, unstamped_hashed) = hashed_bytes(|| {
+            serde_json::from_value::<TranscriptRewriteRecord>(unstamped)
+                .expect("pre-marker record decodes")
+        });
+        let (_, stamped_hashed) = hashed_bytes(|| {
+            serde_json::from_value::<TranscriptRewriteRecord>(stamped)
+                .expect("stamped record decodes")
+        });
+        assert!(
+            unstamped_hashed > 0,
+            "an unmarked record's provenance is unknown, so decode must still \
+             probe both bodies exactly as it did before the marker existed"
+        );
+        assert_eq!(
+            stamped_hashed, 0,
+            "a record stamped with the current digest format must not hash its \
+             two transcript bodies on every decode: unmarked hashed \
+             {unstamped_hashed} bytes, stamped hashed {stamped_hashed}"
+        );
+    }
+
+    #[test]
+    fn an_unmarked_record_still_heals_legacy_revision_strings() {
+        use super::super::heal::legacy_transcript_messages_digest;
+
+        let record = rewrite_chain(1).remove(0);
+        let legacy_parent = legacy_transcript_messages_digest(&record.parent_body.messages)
+            .expect("legacy parent digest");
+        let legacy_revision = legacy_transcript_messages_digest(&record.revision_body.messages)
+            .expect("legacy revision digest");
+        // A pre-0.7.14 writer's bytes: bookkeeping-inclusive revision strings,
+        // no marker to say which format minted them.
+        let mut wire = unstamped_wire(&record);
+        wire["commit"]["parent_revision"] = legacy_parent.clone().into();
+        wire["commit"]["revision"] = legacy_revision.clone().into();
+        wire["commit"]["original_span_digest"] =
+            legacy_transcript_messages_digest(&record.parent_body.messages[..1])
+                .expect("legacy original span digest")
+                .into();
+        wire["commit"]["replacement_digest"] =
+            legacy_transcript_messages_digest(&record.revision_body.messages[..1])
+                .expect("legacy replacement span digest")
+                .into();
+        wire["parent_body"]["revision"] = legacy_parent.clone().into();
+        wire["revision_body"]["revision"] = legacy_revision.into();
+        wire["revision_body"]["parent_revision"] = legacy_parent.into();
+
+        let healed: TranscriptRewriteRecord =
+            serde_json::from_value(wire).expect("legacy record decodes");
+        assert_eq!(healed.commit.parent_revision, record.commit.parent_revision);
+        assert_eq!(healed.commit.revision, record.commit.revision);
+        assert_eq!(
+            healed.commit.original_span_digest,
+            record.commit.original_span_digest
+        );
+        assert_eq!(
+            healed.commit.replacement_digest,
+            record.commit.replacement_digest
+        );
+        validate_transcript_rewrite_record(
+            &healed.commit,
+            &healed.parent_body,
+            &healed.revision_body,
+        )
+        .expect("the healed record validates against the current digest format");
+    }
+
+    #[test]
+    fn a_proved_replay_builds_the_same_graph_as_an_unproved_one() {
+        let records = rewrite_chain(5);
+        let proved = sealed(&records);
+        let with_proof = TranscriptHistoryState::from_rewrite_records_with_proved(
+            records.clone(),
+            Some(&proved),
+        )
+        .expect("proved replay succeeds")
+        .expect("non-empty");
+        assert_same_graph(&with_proof, &rebuild(&records));
+        validate_transcript_history_state(&with_proof)
+            .expect("the proved replay's output is itself a valid graph");
+    }
+
+    // -----------------------------------------------------------------
+    // Replay cursor
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn a_cursor_survives_the_hand_written_round_trip() {
+        let mut state = rebuild(&rewrite_chain(3));
+        state.replay_cursor = Some(state.replay_cursor_at(41));
+        let decoded: TranscriptHistoryState =
+            serde_json::from_value(serde_json::to_value(&state).expect("graph serializes"))
+                .expect("graph decodes");
+        assert_eq!(
+            decoded.replay_cursor, state.replay_cursor,
+            "the cursor is threaded through FOUR hand-written impls; missing one \
+             loses it silently on the next save"
+        );
+    }
+
+    /// The compatibility contract: a graph that claims nothing must produce the
+    /// exact bytes it produced before the field existed, and decode unchanged.
+    #[test]
+    fn a_graph_without_a_cursor_is_byte_identical_to_the_pre_cursor_form() {
+        let state = rebuild(&rewrite_chain(3));
+        assert!(state.replay_cursor.is_none());
+        let wire = serde_json::to_value(&state).expect("graph serializes");
+        assert!(
+            wire.get("replay_cursor").is_none(),
+            "an unclaimed cursor must not appear on the wire at all: {wire}"
+        );
+        let decoded: TranscriptHistoryState = serde_json::from_value(wire).expect("graph decodes");
+        assert_same_graph(&decoded, &state);
+        assert_eq!(decoded.replay_cursor, None);
+    }
+
+    /// A document written before either marker existed.
+    #[test]
+    fn a_pre_marker_document_decodes_with_neither_marker_claimed() {
+        let state = rebuild(&rewrite_chain(2));
+        let mut wire = serde_json::to_value(&state).expect("graph serializes");
+        let object = wire.as_object_mut().expect("graph wire form is an object");
+        object.remove("digest_format");
+        object.remove("replay_cursor");
+        let decoded: TranscriptHistoryState =
+            serde_json::from_value(wire).expect("pre-marker graph decodes");
+        assert_same_graph(&decoded, &state);
+        assert_eq!(
+            decoded.replay_cursor, None,
+            "an absent cursor claims nothing, so the next load reads the whole log"
+        );
+    }
+
+    #[test]
+    fn a_cursor_admits_exactly_the_commits_after_its_prefix() {
+        let state = rebuild(&rewrite_chain(4));
+        let cursor = state.replay_cursor_at(9);
+        assert_eq!(cursor.commits, 4);
+        assert_eq!(
+            state
+                .commits_beyond_replay_cursor(&cursor)
+                .expect("a cursor minted from this graph describes it")
+                .len(),
+            0,
+            "a cursor stamped over the whole commit list leaves nothing unreconciled"
+        );
+
+        let earlier = TranscriptReplayCursor {
+            seq: 4,
+            commits: 2,
+            last_commit_revision: Some(state.commits[1].revision.clone()),
+        };
+        let beyond = state
+            .commits_beyond_replay_cursor(&earlier)
+            .expect("the prefix still ends where the cursor says");
+        assert_eq!(
+            beyond,
+            &state.commits[2..],
+            "only the commits the cursor never reconciled may need an audit event"
+        );
+    }
+
+    /// The self-healing precondition. Each of these must report "cannot be
+    /// trusted" rather than silently admitting a prefix that is not the one the
+    /// cursor reconciled — the caller then re-reads the whole log.
+    #[test]
+    fn a_cursor_that_does_not_describe_the_graph_is_refused() {
+        let state = rebuild(&rewrite_chain(3));
+        let valid = state.replay_cursor_at(7);
+
+        let too_high = TranscriptReplayCursor {
+            commits: valid.commits + 1,
+            ..valid.clone()
+        };
+        assert!(
+            state.commits_beyond_replay_cursor(&too_high).is_none(),
+            "a prefix longer than the graph's commit list describes some other graph"
+        );
+
+        let wrong_boundary = TranscriptReplayCursor {
+            last_commit_revision: Some("sha256:not-this-commit".to_string()),
+            ..valid.clone()
+        };
+        assert!(
+            state
+                .commits_beyond_replay_cursor(&wrong_boundary)
+                .is_none(),
+            "the prefix no longer ends at the commit the cursor reconciled"
+        );
+
+        let claims_empty_prefix = TranscriptReplayCursor {
+            commits: 0,
+            last_commit_revision: Some(state.commits[0].revision.clone()),
+            ..valid.clone()
+        };
+        assert!(
+            state
+                .commits_beyond_replay_cursor(&claims_empty_prefix)
+                .is_none(),
+            "an empty prefix cannot also name a boundary commit"
+        );
+
+        let empty_prefix = TranscriptReplayCursor {
+            seq: 1,
+            commits: 0,
+            last_commit_revision: None,
+        };
+        assert_eq!(
+            state
+                .commits_beyond_replay_cursor(&empty_prefix)
+                .expect("an honestly empty prefix is describable"),
+            state.commits.as_slice(),
+            "a cursor that reconciled nothing leaves every commit to check"
+        );
+    }
+
+    /// The heal rewrites revision strings, so a prefix boundary minted under
+    /// the old spelling names nothing in the healed graph. Carrying it would be
+    /// a claim about commits that no longer exist under those names.
+    #[test]
+    fn the_legacy_heal_drops_a_cursor_it_would_invalidate() {
+        use super::super::heal::legacy_transcript_messages_digest;
+
+        let records = rewrite_chain(1);
+        let state = rebuild(&records);
+        let head_index = state
+            .revisions
+            .iter()
+            .position(|body| body.revision == state.head)
+            .expect("head body retained");
+        let legacy_head = legacy_transcript_messages_digest(&state.revisions[head_index].messages)
+            .expect("legacy head digest");
+        let mut wire = serde_json::to_value(&state).expect("graph serializes");
+        // A pre-0.7.14 writer's spelling: the head body carries a
+        // bookkeeping-inclusive revision string, and the graph's head names it.
+        // The decode probe re-digests that body under the current algorithm,
+        // sees the mismatch, and heals.
+        wire["head"] = legacy_head.clone().into();
+        wire["revisions"][head_index]["revision"] = legacy_head.into();
+        wire["digest_format"] = serde_json::Value::from(0);
+        wire["replay_cursor"] = serde_json::json!({
+            "seq": 12,
+            "commits": 1,
+            "last_commit_revision": state.commits[0].revision,
+        });
+
+        let decoded: TranscriptHistoryState =
+            serde_json::from_value(wire).expect("legacy graph decodes");
+        assert_eq!(
+            decoded.replay_cursor, None,
+            "a healed graph must not carry a cursor minted against the pre-heal \
+             revision strings"
+        );
     }
 }

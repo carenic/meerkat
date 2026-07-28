@@ -1119,6 +1119,29 @@ pub fn global_session_encode_bytes() -> u64 {
     GLOBAL_SESSION_ENCODE_BYTES.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Process-wide count of FULL transcript-rewrite record decodes — every one
+/// materializes the two complete transcript bodies the record carries.
+///
+/// The digest counters above cannot see this: a record decode that skips the
+/// legacy-heal probe hashes nothing while still building two `Vec<Message>`
+/// transcripts, so a load whose replay parses the whole append-only log looks
+/// free on a flat digest curve. Size-independence gates assert this counter
+/// alongside them.
+static REWRITE_RECORD_BODY_DECODES: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Record one full rewrite-record decode, bodies and all.
+pub(crate) fn record_rewrite_record_body_decode() {
+    REWRITE_RECORD_BODY_DECODES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Process-wide count of full transcript-rewrite record decodes.
+#[doc(hidden)]
+#[must_use]
+pub fn rewrite_record_body_decodes() -> u64 {
+    REWRITE_RECORD_BODY_DECODES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Number of buckets in the content-digest byte attribution table.
 pub(crate) const DIGEST_SITE_COUNT: usize = 8;
 

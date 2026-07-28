@@ -128,6 +128,37 @@ via cargo-semver-checks against the published baselines).
 
 ### Fixed
 
+- **Resume no longer re-reads the whole transcript-rewrite log.** Every
+  authoritative load re-proved every retained rewrite record, hashing both
+  full transcript bodies each record carries: measured 0.17s at 7 retained
+  revisions rising to 11.9s at 79, with 1.39 GB hashed per resume and a
+  log-log slope of 2.0 in revision count. Three changes remove it. The
+  coverage check now reads each row with a commit-only partial decode instead
+  of materializing two transcripts per record; records carry an additive
+  `digest_format` marker so the legacy revision-string heal — a full-transcript
+  hash per body, previously unconditional at the serde boundary — is skipped
+  for records that cannot need it, mirroring the existing marker on
+  `TranscriptHistoryState`; and a replay cursor stamped into the session's
+  transcript graph lets a load start after the records it already folded.
+  Measured after: a load reads **1 log row regardless of retained revision
+  count** (1 of 3 at 2 rewrites, 1 of 9 at 8) and materializes **zero** record
+  bodies.
+  **Scope, because the stamp only reaches disk inside a graph write:** the flat
+  cost applies to paths that write the graph — CLI resume, which mints a
+  system-prompt-refresh rewrite every time — and *not* to read-only paths such
+  as `rkat sessions show`, which continue to read the full log.
+  Only sessions with an `EventStore` wired are affected at all, i.e. `rkat`
+  CLI/RPC/REST with disk persistence; hosts that wire no event store never
+  executed this path.
+  Verification semantics change deliberately from verify-always to
+  verify-on-use: a load proves the graph it serves (checkpoint stamp plus
+  `validate_transcript_history_state`) and every record it actually folds, but
+  no longer re-proves historical log bodies it will never materialize. A
+  cursor that does not describe its graph, that claims a sequence past the
+  log's high-water mark, or whose tail does not chain from the reconciled
+  boundary is refused, logged, and degrades to a full read from sequence 1 —
+  a wrong cursor costs a slow load, never a skipped record.
+
 - **0.8.8 → 0.8.9 upgrade boundary: legacy durable-tail adoption.** A clean
   ≤0.8.8 shutdown routinely leaves a session whose durable head is one
   committed turn ahead of the runtime snapshot (`intra_turn_checkpoint`

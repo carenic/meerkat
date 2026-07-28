@@ -450,6 +450,7 @@ export type TranscriptRewriteReason = {
 
 export interface TranscriptRewriteRecord {
   commit: TranscriptRewriteCommit;
+  digest_format?: number;
   parent_body: TranscriptRevisionBody;
   revision_body: TranscriptRevisionBody;
 }

@@ -3,7 +3,7 @@
 //! Extracted verbatim from `session.rs`; the extraction commit changes
 //! no behaviour, only where the code lives.
 
-use super::graph::TranscriptHistoryState;
+use super::graph::{TranscriptHistoryState, TranscriptRewriteRecord};
 use super::validate::validate_transcript_history_state;
 use crate::session::TranscriptEditError;
 
@@ -66,6 +66,28 @@ impl ValidatedTranscriptHistory {
         state: std::sync::Arc<TranscriptHistoryState>,
     ) -> Self {
         Self(state)
+    }
+
+    /// Whether this graph already carries every fact a full validation of
+    /// `record` would derive.
+    ///
+    /// A record is a commit plus TWO full transcript bodies. Commit identity
+    /// alone proves nothing about those bodies, so a caller that skips work on
+    /// the strength of "the log holds no commit I lack" has still not read the
+    /// bytes the log carries — and a body that no longer digests to its commit
+    /// is exactly what a full validation catches there. This is the predicate
+    /// that binds all three values;
+    /// [`super::graph::record_is_proved_by`] is its single implementation.
+    ///
+    /// What that catches, precisely: a retained body whose bytes no longer
+    /// produce its revision string — bit rot, a torn or partial write, a
+    /// truncated log, a botched hand-edit, a bad restore. The digest is
+    /// UNKEYED, so it is not a security control: anyone able to write the log
+    /// can edit a body, re-derive its digest, and rewrite the commit to match.
+    /// This detects accidental corruption, not deliberate modification.
+    #[must_use]
+    pub fn proves_record(&self, record: &TranscriptRewriteRecord) -> bool {
+        super::graph::record_is_proved_by(Some(self), record)
     }
 
     /// The proved graph.
