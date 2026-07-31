@@ -835,6 +835,7 @@ const publicMobTurnStartOptions: MobTurnStartOptions = {
   turnToolOverlay: { allowedTools: ["read"], blockedTools: [] },
   additionalInstructions: ["stay concise"],
   injectedContext: ["remembered operator preferences"],
+  transientTurnContext: "ephemeral operator context",
   keepAlive: true,
   model: "gpt-test",
   provider: "openai",
@@ -880,7 +881,8 @@ type MobTurnStartSupportedWireOptionKeys =
   | "self_hosted_server_id"
   | "skill_refs"
   | "structured_output_retries"
-  | "system_prompt";
+  | "system_prompt"
+  | "transient_turn_context";
 type MobTurnStartUncoveredWireOptionKeys = Exclude<
   keyof Omit<MobTurnStartParams, "mob_id" | "agent_identity" | "prompt">,
   MobTurnStartSupportedWireOptionKeys
