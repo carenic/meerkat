@@ -183,7 +183,9 @@ fn spawn_nondirected_runless_terminal_handoff(
     reason: String,
 ) -> crate::tokio::task::JoinHandle<Result<(), RuntimeDriverError>> {
     crate::tokio::spawn(async move {
-        let driver = driver.lock().await;
+        let mut driver = driver.lock().await;
+        let terminal_completion_witness =
+            driver.input_terminal_completion_authorization_witness(&completion_input_ids)?;
         let authority = crate::meerkat_machine::driver::machine_resolve_runtime_completion_result(
             &driver,
             None,
@@ -194,12 +196,16 @@ fn spawn_nondirected_runless_terminal_handoff(
             &[],
             None,
             authority,
+            terminal_completion_witness,
             None,
             Some(&reason),
         )
         .map_err(|error| RuntimeDriverError::RecoveryCorruption {
             reason: format!("runtime termination projection failed: {error}"),
         })?;
+        driver
+            .finalize_input_terminal_completion_batch(bundle.terminal_completion())
+            .await?;
         if let Some(completions) = completions {
             let mut completions = completions.lock().await;
             completions.resolve_authorized_runtime_terminal_bundle(completion_input_ids, bundle);
@@ -294,10 +300,15 @@ pub(crate) async fn publish_and_resolve_runless_runtime_termination_before(
             driver,
         )
         .await?;
+    let terminal_completion_witness = driver
+        .lock()
+        .await
+        .input_terminal_completion_authorization_witness(&persisted_completion_input_ids)?;
     let bundle = crate::completion::authorize_runtime_terminal_bundle(
         &interaction_ids,
         None,
         authority,
+        terminal_completion_witness,
         None,
         Some(reason),
     )
@@ -315,6 +326,9 @@ pub(crate) async fn publish_and_resolve_runless_runtime_termination_before(
         }
         {
             let mut driver = driver.lock().await;
+            driver
+                .finalize_input_terminal_completion_batch(bundle.terminal_completion())
+                .await?;
             driver
                 .finalize_interaction_terminal_outboxes(
                     candidate_owner_input_id,
@@ -430,10 +444,21 @@ async fn drain_recovered_runless_runtime_terminations_classified(
                     error,
                 )
             })?;
+        let terminal_completion_witness = driver
+            .lock()
+            .await
+            .input_terminal_completion_authorization_witness(&input_ids)
+            .map_err(|error| {
+                RunlessTerminalConvergenceError::from_driver(
+                    "authorizing the exact runtime-terminal completion batch",
+                    error,
+                )
+            })?;
         let bundle = crate::completion::authorize_runtime_terminal_bundle(
             &interaction_ids,
             None,
             authority,
+            terminal_completion_witness,
             None,
             Some(&reason),
         )
@@ -444,6 +469,17 @@ async fn drain_recovered_runless_runtime_terminations_classified(
             )
         })?;
         let events = bundle.interaction_events();
+        driver
+            .lock()
+            .await
+            .finalize_input_terminal_completion_batch(bundle.terminal_completion())
+            .await
+            .map_err(|error| {
+                RunlessTerminalConvergenceError::from_driver(
+                    "finalizing the exact runtime-terminal completion receipt",
+                    error,
+                )
+            })?;
         if let crate::meerkat_machine::driver::InteractionTerminalRecoveryPhase::Finalized {
             events: recovered_events,
             finalization,
@@ -578,8 +614,8 @@ async fn has_committed_runless_recovery_carrier(
         return Ok(false);
     }
     let stored_inputs = driver
-        .as_driver()
-        .stored_input_states_snapshot()
+        .pending_terminal_input_states()
+        .await
         .map_err(|error| {
             RunlessTerminalConvergenceError::from_driver(
                 "checking for a committed recovery carrier",
@@ -617,10 +653,13 @@ pub(crate) async fn terminalize_async_stop_once(
             &completion_input_ids,
             termination_reason.clone(),
         )?;
-        if !matches!(
-            driver.runtime_state(),
-            crate::RuntimeState::Stopped | crate::RuntimeState::Destroyed
-        ) && let Err(error) = machine_stop_runtime(&mut driver).await
+        // `Stopped` must still replay RuntimeExecutorExited so an interrupted
+        // terminalization can idempotently repair cleanup facts. `Destroyed`
+        // is different: Destroy already committed the absorbing DSL terminal
+        // while the executor stop hook was in flight, and the machine
+        // intentionally has no RuntimeExecutorExited transition from it.
+        if driver.runtime_state() != crate::RuntimeState::Destroyed
+            && let Err(error) = machine_stop_runtime(&mut driver).await
         {
             driver.rollback_prepared_runless_interaction_terminal_outboxes(prepared);
             return Err(error);
@@ -1129,19 +1168,19 @@ mod tests {
     struct RetryRecordingTerminalPublisher {
         attempts: AtomicUsize,
         published: StdMutex<Vec<meerkat_core::event::AgentEvent>>,
-        retry_entered: Arc<crate::tokio::sync::Notify>,
+        durable_append_entered: Arc<crate::tokio::sync::Notify>,
         retry_release: Arc<crate::tokio::sync::Notify>,
     }
 
     impl RetryRecordingTerminalPublisher {
         fn new(
-            retry_entered: Arc<crate::tokio::sync::Notify>,
+            durable_append_entered: Arc<crate::tokio::sync::Notify>,
             retry_release: Arc<crate::tokio::sync::Notify>,
         ) -> Self {
             Self {
                 attempts: AtomicUsize::new(0),
                 published: StdMutex::new(Vec::new()),
-                retry_entered,
+                durable_append_entered,
                 retry_release,
             }
         }
@@ -1166,11 +1205,11 @@ mod tests {
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
                 published.extend_from_slice(events);
+                self.durable_append_entered.notify_one();
                 return Err(CoreExecutorError::Internal(
                     "synthetic receipt loss after durable terminal append".to_string(),
                 ));
             }
-            self.retry_entered.notify_one();
             self.retry_release.notified().await;
             let published = self
                 .published
@@ -1273,10 +1312,10 @@ mod tests {
                 registry.register(nondirected_input_id.clone()),
             )
         };
-        let retry_entered = Arc::new(crate::tokio::sync::Notify::new());
+        let durable_append_entered = Arc::new(crate::tokio::sync::Notify::new());
         let retry_release = Arc::new(crate::tokio::sync::Notify::new());
         let publisher = Arc::new(RetryRecordingTerminalPublisher::new(
-            Arc::clone(&retry_entered),
+            Arc::clone(&durable_append_entered),
             Arc::clone(&retry_release),
         ));
         let stop_calls = Arc::new(AtomicUsize::new(0));
@@ -1303,9 +1342,12 @@ mod tests {
             .await
         });
 
-        crate::tokio::time::timeout(std::time::Duration::from_secs(1), retry_entered.notified())
-            .await
-            .expect("committed runless carrier should enter its publication retry");
+        crate::tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            durable_append_entered.notified(),
+        )
+        .await
+        .expect("first runless terminal publication must commit before losing its receipt");
         assert_eq!(
             publisher
                 .published
@@ -1517,12 +1559,24 @@ mod tests {
             CompletionOutcome::RuntimeTerminated { ref reason, .. }
                 if reason == "runtime stopped"
         ));
-        let outbox = driver
+        let durable_inputs = driver
             .lock()
             .await
             .as_driver()
             .stored_input_states_snapshot()
-            .expect("snapshot published cancellation-safe carrier")
+            .expect("snapshot published cancellation-safe carrier");
+        let durable_outcome = crate::input_state::input_terminal_completion_outcome(
+            &durable_inputs,
+            &directed_input_id,
+        )
+        .expect("published runtime termination keeps a valid exact receipt")
+        .expect("published runtime termination finalizes its exact receipt");
+        assert!(matches!(
+            durable_outcome,
+            CompletionOutcome::RuntimeTerminated { ref reason, .. }
+                if reason == "runtime stopped"
+        ));
+        let outbox = durable_inputs
             .into_iter()
             .find_map(|stored| stored.state.interaction_terminal_outbox)
             .expect("published directed proof remains compacted");

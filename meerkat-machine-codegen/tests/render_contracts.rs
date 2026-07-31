@@ -649,21 +649,17 @@ fn generated_meerkat_immediate_starts_derive_content_shape() -> Result<(), Strin
     use meerkat_core::turn_execution_authority::ContentShape;
 
     let schema = meerkat_machine();
-    for input_name in ["StartImmediateAppend", "StartImmediateContext"] {
-        let input = schema
-            .inputs
-            .variant_named(input_name)
-            .expect("immediate start input");
-        assert!(
-            input.field_named("admitted_content_shape").is_err(),
-            "{input_name} must derive its content shape instead of accepting caller-supplied shape"
-        );
-    }
+    let input_name = "StartImmediateAppend";
+    let input = schema
+        .inputs
+        .variant_named(input_name)
+        .expect("immediate start input");
+    assert!(
+        input.field_named("admitted_content_shape").is_err(),
+        "{input_name} must derive its content shape instead of accepting caller-supplied shape"
+    );
 
-    for (input_name, expected_shape) in [
-        ("StartImmediateAppend", ContentShape::ImmediateAppend),
-        ("StartImmediateContext", ContentShape::ImmediateContext),
-    ] {
+    for (input_name, expected_shape) in [("StartImmediateAppend", ContentShape::ImmediateAppend)] {
         for phase in ["Initializing", "Attached", "Running"] {
             let transition_name = format!("{input_name}{phase}");
             let transition = schema
@@ -736,14 +732,8 @@ fn generated_meerkat_kernel_content_shape_routes_wire_labels_through_core() {
     let rendered = render_machine_kernel_module(&meerkat_machine());
     for (variant, core_shape) in [
         ("Conversation", ContentShape::Conversation),
-        (
-            "ConversationAndContext",
-            ContentShape::ConversationAndContext,
-        ),
-        ("Context", ContentShape::Context),
         ("Empty", ContentShape::Empty),
         ("ImmediateAppend", ContentShape::ImmediateAppend),
-        ("ImmediateContext", ContentShape::ImmediateContext),
     ] {
         let rename = format!("    #[serde(rename = \"{}\")]", core_shape.as_str());
         assert!(

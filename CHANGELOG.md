@@ -13,12 +13,144 @@ via cargo-semver-checks against the published baselines).
 
 ## [Unreleased]
 
+## [0.8.11] - 2026-07-31
+
 ### Breaking
 
+- The durable-state compatibility floor is now Meerkat 0.8.10. Current
+  Session envelope v3 is domain state only; embedded checkpoint stamps,
+  witness formats, verification seals, representation axes, and rebind
+  operations are removed from the live persistence contract. Store-issued
+  revisions and physical tokens are the only write, resume, and recovery
+  authority. The exact 0.8.10 envelope is accepted by a one-time activation
+  importer only with same-transaction proof of the released store schema and
+  exact source row/blob identity. Old embedded stamps and witnesses are
+  untrusted migration input: they are stripped rather than treated as
+  self-authentication. State older than 0.8.10 must be migrated with an older
+  binary before upgrading.
+- `Session::set_system_prompt*`, `SystemPromptMutationKind`,
+  `SessionSystemPromptSource`, and the generated system-prompt mutation
+  authorization surface are removed. A system instruction is an ordinary
+  ordered `Message::System`; callers that construct sessions directly append
+  one with `Session::append_system_message`. The `system_prompt` turn
+  convenience appends one at that admitted boundary. Materialization and
+  resume inject nothing, regardless of host-config drift, and no request-time
+  overlay substitutes or rewrites an earlier message.
+- The unused generated embedded-checkpoint read-source/conflict surface is
+  removed: `CheckpointProvenanceClass`,
+  `RuntimeSnapshotReadDisposition`, `RuntimeProjectionConflictDisposition`,
+  `DurableTailExecutionEvidence`, and their `SessionDocumentMachine`
+  inputs/effects no longer exist. Current recovery consumes store-issued
+  committed or provisional-tail authority and retains only
+  `ClassifyDurableTail`.
+- `PreparedRuntimeSessionCommitOutcome` adds
+  `AlreadyAppliedReleasedEquivalent`. It reports the one-time case where an
+  exact 0.8.10 receipt and every surviving committed effect match, but the
+  released schema did not retain enough prior-CAS information to claim an
+  exact request retry. The migration-bound receipt marker is consumed while
+  installing the first current request witness; subsequent retries report
+  `AlreadyAppliedExact`.
 - `AnthropicCacheControlPolicy` and
   `WireAnthropicCacheControlPolicy` add the `Automatic` variant.
 - `OpenAiProviderTag` adds the `prompt_cache_enabled` field.
 - `WireProviderTag::OpenAi` adds the `prompt_cache_enabled` field.
+- `SessionError` adds the `DurableTailRecoveryRefused` variant (code
+  `SESSION_DURABLE_TAIL_RECOVERY_REFUSED`), `DurableResumeHold` adds
+  `RecoveryRefused` (wire token `recovery_refused`), and
+  `DurableTailRecoveryError` adds `InvalidEvidence`.
+  `DurableTailRecoveryOutcome` adds `AlreadyAligned { recovered }`, while
+  `Committed` gains the exact recovered `Session`. A machine-REFUSED
+  durable-tail recovery
+  (conflicting persisted runtime facts: another live runtime, or boundary
+  receipts that already cover or contradict the tail) no longer surfaces as
+  `DurableTailHeldForRecovery`; operators now get the refusal's own cause
+  and remediation (retry after the conflicting runtime quiesces) instead of
+  the hold's "await reconciliation".
+- `DurableTailRecoveryRequest` and
+  `authorize_and_commit_durable_tail_recovery` are removed. Call
+  `meerkat_runtime::recovery::recover_durable_tail(&dyn RuntimeStore,
+  &SessionId)` instead. Recovery loads and seals the exact store-owned source,
+  classification, receipt facts, candidate identity, and CAS tokens
+  internally; callers no longer provide recovered bytes or recovery facts.
+- `meerkat_core::BlobStoreError` adds the exhaustive
+  `WriteLimitExceeded { max_blob_bytes, actual_encoded_bytes }` variant —
+  the typed store-side refusal of an oversized write. Downstream exhaustive
+  matches must add an arm.
+- `meerkat::surface::schedule_attempt_idempotency_key` is renamed to
+  `schedule_delivery_idempotency_key` and the key it mints drops the
+  `:attempt:{n}` segment (occurrence-level delivery identity; see the P0
+  lease fix under **Fixed**). Hosts that persisted or matched on the old
+  attempt-bearing key shape must treat the occurrence-level key as the
+  delivery identity.
+- `meerkat_schedule::OccurrenceLifecycleInput` adds the `RenewLease` variant
+  and `OccurrenceLifecycleEffect` adds `LeaseRenewed`. Downstream exhaustive
+  matches must add arms.
+- `meerkat_schedule::ScheduleStore` adds `next_action_time_utc` and
+  `renew_occurrence_lease_if_current`. External stores must provide
+  store-clock next-action projection and atomically screen the exact
+  `{ occurrence, attempt, claim_token, owner }` renewal witness.
+- `ModelCapabilities` adds
+  `supports_mid_conversation_system_messages`. External model catalogs must
+  declare whether each model admits ordered System messages after the leading
+  prefix; unknown and older models should set it to `false`.
+- Mob work delivery adds the per-turn System carrier:
+  `WorkSpec::system_prompt`, `BridgeDeliveryPayload::system_prompt`, and
+  `PeerInput::system_prompts`. `MobBoundMemberRuntimeBridge::deliver_member_input`
+  adds the `system_prompt: Option<String>` parameter. External struct literals
+  and bridge implementations must initialize and forward these fields.
+- `StickyModelFallbackCommitOperation::wait` now returns
+  `Result<Option<SessionControlCommitReceipt>,
+  StickyModelFallbackCommitError>` instead of
+  `Result<(), StickyModelFallbackCommitError>`, exposing the exact durable
+  control receipt when one was committed. Callers that need only completion
+  may explicitly discard the optional receipt.
+- `CoreExecutor` adds
+  `acknowledge_committed_session_boundary(&CommittedSessionBoundaryAuthority)`.
+  Store-backed executors must override the rejecting default and consume the
+  exact typed authority after the runtime boundary commits.
+  `checkpoint_committed_session_snapshot` now receives `Arc<Vec<u8>>`;
+  implementations should retain or borrow the shared serialized artifact
+  instead of copying the accumulated document.
+- `RuntimeStore` adds the required
+  `session_authority_ops(&self) -> &dyn RuntimeSessionAuthorityOps` accessor.
+  This doc-hidden, implementor-only carrier owns the complete store-issued
+  session-authority capability block. All 19 operations are required, so real
+  backends must implement profile-specific support or an explicit typed
+  refusal instead of inheriting a silent `Unsupported` default. Operational
+  callers continue to use `RuntimeStore`, preserving transparent and
+  fault-injection decorator overrides; decorators forward the carrier accessor
+  and override only the individual `RuntimeStore` operations they intentionally
+  perturb.
+- `MobSessionService` adds the required
+  `acknowledge_committed_runtime_session_boundary_under_turn_finalization_boundary`
+  method. Implementations and wrappers must forward the exhaustive
+  `CommittedSessionBoundaryAuthority` carrier. Its committed-session
+  checkpoint hooks now receive `Arc<Vec<u8>>` for the same shared-artifact
+  contract.
+- `MobSessionService` adds the required
+  `prepare_session_for_resume(&SessionId) -> Result<(), SessionError>` method.
+  Persistent implementations converge any store-owned durable tail before an
+  operational resume materializes the committed Session body; transparent
+  wrappers must forward it. The composed `materialize_session_for_resume`
+  helper performs preparation followed by the existing typed resume load,
+  while observation-only callers continue using `load_session_for_resume`.
+- Archived-resume authority is renamed to match its store-owned semantics:
+  `PromotedArchivedResumeCommitLease` becomes
+  `AuthorizedArchivedResumeCommitLease`,
+  `PreparedArchivedResumeCommitLease::confirm_document_promoted` becomes
+  `confirm_runtime_store_authority`, and
+  `MobSessionService::promote_revivable_retired_session` becomes
+  `authorize_revivable_retired_session`. Revival no longer mutates or
+  persists an Archived marker in the Session document.
+- `OccurrenceLifecycleInput` and `OccurrenceLifecycleEffect` add
+  `DispatchAccepted`; exhaustive matches must add arms. The input carries
+  `DeliveryAdmissionOutcome` plus `at_utc`.
+- `PlanningTurnRequest` adds the public `planning_turn: u64` field.
+- Every `AdaptiveDriverRuntime` operation after `now_ms` now receives an
+  `&AdaptiveOperationDeadline`. The trait also adds the required
+  `cancel_planning_turn` and `cancel_layer_flow` operations. External
+  runtimes must retain exact planning/child-flow custody until terminality or
+  cancellation is acknowledged.
 
 ### Billing-affecting default change
 
@@ -62,13 +194,176 @@ via cargo-semver-checks against the published baselines).
   or any other mutation before the breakpoint can still produce repeated
   billable writes with no reads.
 
+### Fixed
+
+- **P0: scheduled deliveries longer than the 60s lease were reclaimed
+  mid-flight**, dispatching a duplicate turn every ~60s under
+  `MisfirePolicy::CatchUpWithin` (a production fleet measured its largest
+  delivery at 57s against the fixed 60s lease; a routine multi-minute session
+  turn was guaranteed to trip it). Three coordinated changes:
+  - **Lease renewal is machine authority.** `OccurrenceLifecycleMachine`
+    gains a `RenewLease` input (guarded: only the current claim-token holder,
+    only from `Dispatching`/`AwaitingCompletion`, only monotonic extensions)
+    and a `LeaseRenewed` effect. The store samples its own time, screens
+    occurrence/attempt/token/owner, and commits the extension within one
+    lock or transaction. The completion waiter renews at ~lease/2 cadence;
+    typed stale evidence stops renewal, while transient store faults retry
+    with bounded backoff inside the last proven lease budget. A genuinely
+    expired lease still means the deliverer is presumed dead.
+  - **Delivery identity is occurrence-level.** The runtime-facing
+    idempotency key drops the `:attempt:{n}` segment (now
+    `schedule:{schedule}:occurrence:{occurrence}`), so a reclaim retry of a
+    live or already-ran turn deduplicates at runtime admission and attaches
+    to the existing input's completion instead of admitting a duplicate turn.
+    Attempt counts and claim tokens remain store-side claim fencing only;
+    stale-completion screening (`ClassifyStaleCompletionArrival`) is
+    untouched.
+  - **Durable lease state is the only reclaim authority.** The abandoned
+    process-local live-waiter exemption is removed: no caller-supplied set can
+    veto a machine-classified lease expiry, and separate hosts observe the
+    same renewal/reclaim result from the store.
+- **Durable session authority is store-owned and profile-specific.**
+  WholeBlob commits are fenced by `{session_id, store_revision, blob_sha256}`;
+  HeadCanonical commits are fenced by `{session_id, store_revision,
+  boundary_head, committed_head_token}`, with the head binding exact row,
+  rewrite, graph, component, and metadata prefixes. A deserialized Session
+  can no longer authorize a write or recovery decision.
+- **Intra-turn persistence promotes exact provisional receipts.** Each
+  successful candidate write returns a `RunCheckpointReceipt` bound to one
+  committed base and run, with a contiguous candidate sequence. The final
+  boundary promotes the latest exact candidate. WholeBlob reuses the already
+  encoded, hashed, and written candidate bytes; HeadCanonical promotes the
+  exact applied physical revision/head token. Neither path reconstructs the
+  accumulated document or reapplies the delta at final commit.
+- **Session listing no longer creates a second document authority.**
+  RuntimeStore maintains a small catalog projection in the same atomic
+  boundary as the selected physical profile. It contains listing and
+  lifecycle facts only, never a transcript, graph, component body, or
+  serialized Session.
+- **Opaque JSON now has one durable transcript identity.** Tool-use arguments
+  and structured tool results serialize as recursively key-sorted JSON, and
+  transcript digest format 3 binds that canonical value instead of producer
+  spelling. Exact 0.8.10 activation accepts the released format-2 graph only
+  under store-issued physical authority, validates the observable graph and
+  row topology, remaps every revision and span identity together, drops only
+  rewrite occurrences whose endpoints become identical after
+  canonicalization, renumbers retained occurrences contiguously, and then
+  runs the full current validator. Current-format reads remain strict; the
+  one-time importer is the only relaxed boundary.
+- **Recovered WorkGraph jobs honor durable cancellation before replay.** A
+  cancelled monitor acknowledges immediately after process containment,
+  without a redundant settlement-lease CAS or diagnostic drain in front of
+  the terminal write. If the host dies in that window, recovery applies the
+  persisted cancel request from `LossObserved` before considering replay or
+  checkpoint resume, so a cancelled job cannot restart after reboot.
+- **Detached shell cancellation now converges on durable job authority.**
+  Ordinary and monitor-backed executions observe cancel requests written by
+  another manager, contain the process before acknowledging cancellation, and
+  settle from the exact store-returned terminal snapshot. Competing delivery
+  acknowledgements, lease renewals, and terminal CAS writes are reloaded and
+  converged with bounded retries instead of leaving a job indefinitely
+  `Running` or publishing a process-local shadow terminal. A committed cancel
+  also prevents generated `Complete` or `Fail` transitions from winning while
+  the job is `Running` or `WaitingExternal`.
+- **Retired session revival no longer rewrites a Session lifecycle marker.**
+  The exact prepared runtime lease authorizes the store-owned
+  `Retired -> Idle` transition while the Session body remains ordinary domain
+  state. Catalog or physical boundary authority still protects a retained
+  session, but a bare lifecycle registration left after body loss is treated
+  as executor residue instead of resurrecting archive ownership.
+
+### Added
+
+- **Request-only host context for runtime turns.**
+  REST, RPC, MCP, schedule, and mob runtime-backed turn carriers accept
+  `transient_turn_context`, a sealed text-only value retained only with the
+  pending runtime input for exact crash retry. Foreground provider requests
+  project it once immediately before the exact admitted conversational user
+  message across retries and tool-loop calls; it never becomes a System or
+  Session message and is excluded from compaction and extraction. Deferred
+  create and standalone browser/WASM live turns do not accept it.
+- **Blob content addressing exported for external stores.**
+  `content_blob_id` — the REQUIRED
+  `sha256(canonical_media_type || 0x00 || base64_payload)` addressing every
+  `BlobStore` implementation must mint byte-for-byte — is now re-exported
+  from the `meerkat_core` crate root and the `meerkat` facade (alongside
+  `BlobId`, `BlobRef`, `BlobPayload`, and `BlobStoreError`), with a published
+  known-answer vector in its docs. First-consumer feedback: with only the
+  trait re-exported, an external store re-derived the addressing by hand and
+  silently diverged from core's read-back verification.
+- **`BlobStore::max_blob_bytes` size contract.** New defaulted trait method
+  (`None` = unbounded) advertising the store's per-write bound on the encoded
+  (base64) payload. Backends with hard request/row limits can refuse an
+  oversized `put_image`/`put_artifact` with the typed
+  `BlobStoreError::WriteLimitExceeded` instead of an opaque backend
+  `WriteFailed`; the pending-blob retry classifier treats that refusal as
+  definitive (deterministic for a given payload) rather than retrying it
+  forever.
+
 ### Changed
 
+- `Message::System` is repeatable and legal anywhere in the ordered
+  transcript. `StartTurnRequest.system_prompt` is accepted on every turn and
+  appends exactly one System message at that turn boundary. It is not a
+  create-time field, does not replace an earlier System message, and is not
+  inferred from transcript text or position. `WorkSpec::system_prompt` carries
+  the same semantics through turn-driven and placed mob-member delivery,
+  including different System messages on successive turns. Controller-local
+  autonomous inbox delivery rejects it before admission because that
+  plain-event path has no authored turn boundary. Resume preserves the exact
+  ordered prefix; compaction retains every System message in relative order;
+  provider adapters preserve exact chronology where their wire supports it.
+  A limited provider wire returns a typed projection error when it cannot
+  represent the requested shape; it never makes the durable Session invalid,
+  blocks System-message authorship, or rewrites existing history. Rebinding to
+  an exact provider can execute that Session unchanged.
+- Provider lowering never changes that durable meaning. Standard OpenAI
+  Responses, OpenAI-compatible Chat Completions, and OpenAI Realtime preserve
+  System interleaving. Cataloged Anthropic Fable 5, Opus 4.8, and Opus 5
+  support mid-conversation System messages; Meerkat lowers a canonical
+  turn-scoped `System -> User` boundary to Anthropic's legal
+  `User -> System -> Assistant` placement. Other Anthropic models and Gemini
+  accept only a leading System prefix; the private ChatGPT Responses backend
+  accepts one leading System row. Other shapes receive a typed non-retryable
+  provider projection error. Empty, whitespace-only, and duplicate entries
+  are never trimmed, deduplicated, delimiter-joined, replaced, or dropped.
+  Realtime's separate `runtime_system_context` carrier is retired; reconnect
+  applies the same ordered replay-window policy to every role and replays
+  retained System rows in place, while `SystemNotice` remains an explicit
+  history event.
 - Typed peer terminal-response facts now persist as deduplicated
-  `SystemNotice` messages at the conversation tail instead of mutating the
-  leading system prompt. Active-turn delivery commits the notice to the
-  canonical transcript, and cold resume migrates legacy terminal blocks out
-  of the system prompt without losing their applied/idempotency records.
+  `SystemNotice` messages at the conversation tail without mutating any
+  ordered `System` message. Active-turn delivery commits the notice to the
+  canonical transcript, and exact 0.8.10 activation converts the released
+  terminal projection without losing its applied/idempotency records.
+- Evidence honesty across the perf/restart suites (no product behavior
+  change):
+  - `e2e_smoke_mob_turn_head_canonical_storage_cost_gate` now asserts the
+    complete ordinary HeadCanonical cost contract: delta-bounded digest work,
+    zero whole-session encodes and WholeBlob rows, store-issued HC authority,
+    bounded suffix rows/bytes, and database-plus-WAL growth;
+  - the cold-restart resume suites document the same-process caveat (teardown
+    is graceful, not a kill, and the narrow legacy-heal probe memo survives),
+    while the base contract is also proven across two OS processes: one
+    writes and exits, then a fresh process reopens, reads, and continues the
+    durable session with full validation;
+  - the BuildBuddy e2e-smoke foundation selector now builds the previously
+    omitted `smoke_mob_idle_burn`, `smoke_mob_turn_latency`, and
+    `live_meerkat_regression` targets, records the foundation build's BEP
+    stream, and the smoke materializer requires a successful terminal while
+    binding every artifact to that invocation's canonical workspace, output
+    base, and exact Bazel configuration path — a partial/failed build or a
+    warm output from another invocation/configuration cannot authorize an
+    artifact by target filename alone;
+  - Turbo-S stabilization now applies at its real execution boundary: the
+    Bazel `sh_test` cohort is forced to one active action with one Bazel retry.
+    The ineffective Nextest-only heavy-runtime override is removed;
+  - `meerkat-core/tests/fixtures/README.md` retires the committed 0.8.8
+    vectors as release-compatibility evidence: they remain historical
+    digest known-answer inputs only. The supported upgrade floor is 0.8.10,
+    and a byte-manifested synthetic realm captured with the published
+    `rkat` 0.8.10 artifact now proves the real 0.8.10→0.8.11 store migration
+    and idempotent reopen path.
 
 ## [0.8.10] - 2026-07-28
 
@@ -2134,48 +2429,21 @@ supersedes it.)
   closed on the very first post-resume persist, the live session was
   discarded, and downstream hosts fell back to fresh empty spawns (silent
   history loss on every restart, including sessions freshly written by the
-  same version). Resume now reconciles instead of replacing
-  (`Session::reconcile_resumed_system_prompt`): a base the persisted System
-  message already carries — identical, or extended only by runtime
-  system-context appends — is preserved byte-for-byte (digest unchanged),
-  and a genuinely changed base is committed as a typed transcript rewrite
-  (`resume-system-prompt-refresh`) that preserves the runtime-appended tail
-  (reconstructed byte-exactly from the new
-  `SessionBuildState.assembled_system_prompt` record, with an
-  applied-append re-render fallback), so the first post-resume persist
-  proves a transcript graph edge from the persisted head instead of failing
-  closed. The rewrite-chain continuation walker also no longer aborts as a
+  same version). The final contract removes resume-time prompt reconciliation
+  entirely: materialization restores every ordered System message
+  byte-for-byte and never injects current host configuration. New System
+  instructions enter only through an admitted turn boundary. The rewrite-chain
+  continuation walker also no longer aborts as a
   cycle when a same-length rewrite commit sits exactly at the persisted
   head (`find_transcript_rewrite_commit_chain_extending_session` skips
   commits that cannot advance the cursor), which previously rejected the
-  first post-resume turn after such a rewrite. Regression coverage: resume
-  with a runtime-context-appended prompt (unchanged and changed explicit
-  base) over durable sqlite realm stores, mob cold-restart revival with a
-  context-appended member prompt, and unit pins on the reconciliation
-  outcomes.
-- Reconciliation hardening from the adversarial review of the fix above: an
-  all-context System prompt (empty/`Disable` base plus runtime appends) is
-  carried onto a new base instead of being misread as an "empty tail"; when
-  an unverifiable tail must be dropped, the orphaned applied-append records
-  and their idempotency keys are cleared (with a warning) so keyed re-sends
-  can restore the context instead of deduplicating forever; a shortened
-  explicit base whose removed remainder merely looks like a context tail
-  (the separator is ordinary markdown) is applied through the audited
-  rewrite instead of silently ignored — byte-exact verification against the
-  recorded prior base runs first, and the structural fast path is admitted
-  by the canonical `SessionDocumentMachine` from the typed
-  `RuntimeContextAppend` provenance, not shape alone. The rewrite-chain
-  walker's plain-append fallback no longer accepts untyped leading-System
-  replacements via the system-refresh equivalence (that equivalence now
-  bridges commit PARENT bookkeeping only), and the empty-chain acceptance
-  re-checks graph-head/message-digest agreement. `run_boundary_snapshot_save_guard`
-  adopts a first runtime-boundary commit that carries a validated typed
-  rewrite graph (resume/import over fresh runtime state); the plain
-  `SessionStore::save` first-save seeding rejection is unchanged. Both
-  resume rewrite sites drive `authorize_system_prompt_mutation` (the
-  generated durable-config authority) instead of hand-stamping the mutation
-  provenance, and the append-path block rendering is shared with the
-  resume-time tail verification so the two compositions cannot drift.
+  first post-resume turn after such a rewrite. Current regression coverage
+  instead pins byte-exact ordered-System preservation across materialization,
+  persistence round-trip, compaction, and cold restart.
+- Historical resume-time prompt reconciliation was hardened against malformed
+  context tails and untyped leading-System replacement. Meerkat 0.8.11 later
+  removed that model entirely: resume is transcript-invisible and every new
+  System is an ordinary admitted event.
 
 ## [0.7.14] - 2026-07-04
 
@@ -4591,7 +4859,8 @@ Meerkat 0.5 is a large architecture and surface cutover. It formalizes runtime o
 
 Initial development release.
 
-[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.7.0...HEAD
+[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.8.11...HEAD
+[0.8.11]: https://github.com/lukacf/meerkat/compare/v0.8.10...v0.8.11
 [0.7.0]: https://github.com/lukacf/meerkat/compare/alpha/v0.7.0-alpha.0...v0.7.0
 [0.7.0-alpha.0]: https://github.com/lukacf/meerkat/releases/tag/alpha/v0.7.0-alpha.0
 [0.6.23]: https://github.com/lukacf/meerkat/compare/v0.6.22...v0.6.23

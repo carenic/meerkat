@@ -280,7 +280,9 @@ pub trait StickyModelFallbackCommitCoordinator: Send + Sync {
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 pub trait StickyModelFallbackCommitOperation: Send + Sync {
-    async fn wait(&self) -> Result<(), StickyModelFallbackCommitError>;
+    async fn wait(
+        &self,
+    ) -> Result<Option<crate::SessionControlCommitReceipt>, StickyModelFallbackCommitError>;
 }
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -767,6 +769,10 @@ impl std::fmt::Display for PeerResponseTerminalTransportIdentity {
 pub struct PeerResponseTerminalRouteIdentity(crate::comms::PeerId);
 
 impl PeerResponseTerminalRouteIdentity {
+    pub const fn from_peer_id(peer_id: crate::comms::PeerId) -> Self {
+        Self(peer_id)
+    }
+
     pub fn parse(raw: impl Into<String>) -> Result<Self, PeerResponseTerminalFactError> {
         let raw = raw.into();
         if raw.trim().is_empty() {
@@ -945,7 +951,16 @@ impl PeerResponseTerminalFact {
     }
 
     pub fn context_key(&self) -> String {
-        peer_response_terminal_context_key(&self.source.route_identity, self.correlation_id)
+        Self::context_key_for(&self.source.route_identity, self.correlation_id)
+    }
+
+    /// Derive the canonical terminal context key from the typed identity facts
+    /// before the remaining render/status facts are available.
+    pub fn context_key_for(
+        route_identity: &PeerResponseTerminalRouteIdentity,
+        correlation_id: PeerResponseTerminalCorrelationId,
+    ) -> String {
+        peer_response_terminal_context_key(route_identity, correlation_id)
     }
 
     /// Typed render payload accessor for surfaces that summarize the terminal
@@ -1130,8 +1145,6 @@ pub trait TurnStateHandle: Send + Sync {
     ) -> Result<(), DslTransitionError>;
 
     fn start_immediate_append(&self, run_id: RunId) -> Result<(), DslTransitionError>;
-
-    fn start_immediate_context(&self, run_id: RunId) -> Result<(), DslTransitionError>;
 
     fn primitive_applied(&self, run_id: RunId) -> Result<(), DslTransitionError>;
 
@@ -2400,7 +2413,7 @@ pub trait PeerInteractionCleanupObserver: Send + Sync {
 /// Shell callers fire `context_advanced(updated_at_ms)` at every site that
 /// mutates canonical session truth (prompt append, external content
 /// injection, tool-result append, external assistant output,
-/// runtime-system-context append, any `summary_tx.send_replace`). The
+/// ordinary durable System-message append, any `summary_tx.send_replace`). The
 /// transition is monotonic: the DSL guard drops ticks whose `updated_at_ms`
 /// isn't strictly greater than the last recorded watermark, so callers can
 /// fire unconditionally post-mutation.
@@ -2713,7 +2726,6 @@ mod tests {
         PeerResponseTerminalFactError, PeerResponseTerminalProjectionStatus,
         PeerResponseTerminalRenderPayload, PeerResponseTerminalRouteIdentity,
         PeerResponseTerminalSource, PeerResponseTerminalTransportIdentity,
-        peer_response_terminal_context_key,
     };
     use crate::tool_scope::{ExternalToolSurfaceDeltaOperation, ExternalToolSurfaceDeltaPhase};
 
@@ -2852,7 +2864,7 @@ mod tests {
             PeerResponseTerminalCorrelationId::parse("018f6f79-7a82-7c4e-a552-a3b86f9630f1")
                 .expect("correlation id");
         assert_eq!(
-            peer_response_terminal_context_key(&route_identity, correlation_id),
+            PeerResponseTerminalFact::context_key_for(&route_identity, correlation_id),
             "peer_response_terminal:550e8400-e29b-41d4-a716-446655440000:018f6f79-7a82-7c4e-a552-a3b86f9630f1"
         );
     }
@@ -2867,9 +2879,9 @@ mod tests {
 
     #[test]
     fn peer_terminal_fact_round_trips_through_serde() {
-        // The typed fact is now persisted on `PendingSystemContextAppend` and
-        // read back by the realtime consumer instead of re-parsing flattened
-        // prompt text, so it must survive a durable serde round-trip.
+        // The typed fact is persisted with its runtime input and realized as
+        // one ordinary SystemNotice, so it must survive a durable serde
+        // round-trip without re-parsing flattened prompt text.
         let fact = PeerResponseTerminalFact::new(
             PeerResponseTerminalSource::parse(
                 Some("inproc://analyst"),

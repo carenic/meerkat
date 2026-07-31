@@ -251,6 +251,7 @@ mod mob_member_lifecycle_projection;
 mod mob_runtime_bridge_authority;
 mod mobpack_execution;
 mod ops_adapter;
+mod panic_capture;
 pub mod path;
 mod pending_spawn_lineage;
 mod placed_carrier_cleanup;
@@ -345,7 +346,9 @@ pub use reconcile::{
 };
 pub use recovery::RestoreIncompatible;
 use roster_authority::{RosterAuthority, RosterMutator};
-pub use session_service::{MobSessionService, ResumeSessionLoad};
+pub use session_service::{
+    MobSessionService, PersistedSessionAuthorityReadCost, ResumeSessionLoad,
+};
 pub use spawn_policy::{SpawnPolicy, SpawnSpec};
 use spawn_profile_authority::{
     AuthorizedSpawnProfileMaterial, authorize_spawn_profile_input,

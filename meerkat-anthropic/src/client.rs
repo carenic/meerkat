@@ -387,6 +387,91 @@ fn project_anthropic_replay_messages(messages: &[Message]) -> Result<Vec<Message
     Ok(projected)
 }
 
+fn anthropic_mid_system_predecessor_allows(message: &Message) -> bool {
+    match message {
+        Message::User(_) | Message::SystemNotice(_) | Message::ToolResults { .. } => true,
+        Message::BlockAssistant(assistant) => assistant.blocks.last().is_some_and(|block| {
+            matches!(
+                block,
+                AssistantBlock::ServerToolContent { content, .. }
+                    if content.get("type").and_then(Value::as_str)
+                        == Some("web_search_tool_result")
+            )
+        }),
+        Message::System(_) => false,
+    }
+}
+
+fn flush_anthropic_mid_system_messages<'a>(
+    model: &str,
+    projected: &mut Vec<&'a Message>,
+    pending: &mut Vec<(usize, &'a Message)>,
+) -> Result<(), LlmError> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    if projected
+        .last()
+        .is_some_and(|message| anthropic_mid_system_predecessor_allows(message))
+    {
+        projected.extend(pending.drain(..).map(|(_, message)| message));
+        return Ok(());
+    }
+
+    let index = pending[0].0;
+    Err(LlmError::InvalidInputShape {
+        message: format!(
+            "Anthropic model {model} cannot place System message at transcript index {index}; \
+             mid-conversation System messages must follow a user turn or an assistant server-tool \
+             result"
+        ),
+    })
+}
+
+/// Lower Meerkat's canonical turn order onto Anthropic's placement contract.
+///
+/// Meerkat records turn-scoped System rows before the User row they govern.
+/// Modern Anthropic models accept the equivalent wire section after that User
+/// row and before the Assistant response. Leading System rows remain in the
+/// top-level `system` field.
+fn project_anthropic_system_message_order<'a>(
+    model: &str,
+    messages: &'a [Message],
+) -> Result<Vec<&'a Message>, LlmError> {
+    let supports_mid_conversation_system_messages =
+        crate::request_support::supports_mid_conversation_system_messages(model);
+    let mut projected = Vec::with_capacity(messages.len());
+    let mut pending = Vec::new();
+    let mut leading_system_prefix = true;
+
+    for (index, message) in messages.iter().enumerate() {
+        if matches!(message, Message::System(_)) {
+            if leading_system_prefix {
+                projected.push(message);
+            } else if supports_mid_conversation_system_messages {
+                pending.push((index, message));
+            } else {
+                return Err(LlmError::InvalidInputShape {
+                    message: format!(
+                        "Anthropic model {model} cannot represent System message at transcript \
+                         index {index}; this model requires System rows to form a leading prefix"
+                    ),
+                });
+            }
+            continue;
+        }
+
+        leading_system_prefix = false;
+        if matches!(message, Message::BlockAssistant(_)) {
+            flush_anthropic_mid_system_messages(model, &mut projected, &mut pending)?;
+        }
+        projected.push(message);
+    }
+
+    flush_anthropic_mid_system_messages(model, &mut projected, &mut pending)?;
+    Ok(projected)
+}
+
 impl AnthropicClient {
     fn model_supports_temperature(model: &str) -> bool {
         crate::request_support::supports_temperature(model)
@@ -490,20 +575,32 @@ impl AnthropicClient {
     /// Build request body for Anthropic API
     fn build_request_body(&self, request: &LlmRequest) -> Result<Value, LlmError> {
         let mut messages = Vec::new();
-        let mut system_prompt = None;
+        let mut system_messages = Vec::new();
+        let mut leading_system_prefix = true;
+        let projected_messages =
+            project_anthropic_system_message_order(&request.model, &request.messages)?;
 
-        for msg in &request.messages {
+        for msg in projected_messages {
             match msg {
                 Message::System(s) => {
-                    system_prompt = Some(s.content.clone());
+                    if leading_system_prefix {
+                        system_messages.push(s.content.clone());
+                    } else {
+                        messages.push(serde_json::json!({
+                            "role": "system",
+                            "content": s.content
+                        }));
+                    }
                 }
                 Message::SystemNotice(notice) => {
+                    leading_system_prefix = false;
                     messages.push(serde_json::json!({
                         "role": "user",
                         "content": Self::system_notice_anthropic_content(notice)
                     }));
                 }
                 Message::User(u) => {
+                    leading_system_prefix = false;
                     if meerkat_core::has_non_text_content(&u.content) {
                         let content_array: Vec<Value> = u
                             .content
@@ -522,6 +619,7 @@ impl AnthropicClient {
                     }
                 }
                 Message::BlockAssistant(a) => {
+                    leading_system_prefix = false;
                     // Ordered blocks with thinking support
                     let mut content = Vec::new();
 
@@ -630,6 +728,7 @@ impl AnthropicClient {
                     }));
                 }
                 Message::ToolResults { results, .. } => {
+                    leading_system_prefix = false;
                     let mut content = Vec::new();
 
                     for r in results {
@@ -714,8 +813,8 @@ impl AnthropicClient {
             });
         }
 
-        if let Some(system) = system_prompt {
-            body["system"] = Self::anthropic_system_prompt_value(&system, cache_control);
+        if !system_messages.is_empty() {
+            body["system"] = Self::anthropic_ordered_system_value(&system_messages, cache_control);
         }
 
         if matches!(cache_control, AnthropicCacheControlPolicy::Automatic) {
@@ -841,18 +940,32 @@ impl AnthropicClient {
         Ok(body)
     }
 
-    fn anthropic_system_prompt_value(
-        system: &str,
+    fn anthropic_ordered_system_value(
+        system_messages: &[String],
         cache_control: AnthropicCacheControlPolicy,
     ) -> Value {
-        match cache_control {
-            AnthropicCacheControlPolicy::SystemPrefix => serde_json::json!([{
-                "type": "text",
-                "text": system,
-                "cache_control": {"type": "ephemeral"}
-            }]),
-            _ => Value::String(system.to_string()),
+        if system_messages.len() == 1 && cache_control != AnthropicCacheControlPolicy::SystemPrefix
+        {
+            return Value::String(system_messages[0].clone());
         }
+        Value::Array(
+            system_messages
+                .iter()
+                .enumerate()
+                .map(|(index, system)| {
+                    let mut block = serde_json::json!({
+                        "type": "text",
+                        "text": system,
+                    });
+                    if cache_control == AnthropicCacheControlPolicy::SystemPrefix
+                        && index + 1 == system_messages.len()
+                    {
+                        block["cache_control"] = serde_json::json!({"type": "ephemeral"});
+                    }
+                    block
+                })
+                .collect(),
+        )
     }
 
     fn ensure_claude_ai_oauth_system_marker(body: &mut Value) {
@@ -861,21 +974,17 @@ impl AnthropicClient {
                 if system.contains(CLAUDE_AI_OAUTH_SYSTEM_MARKER) {
                     return;
                 }
-                if system.is_empty() {
-                    *system = CLAUDE_AI_OAUTH_SYSTEM_MARKER.to_string();
-                } else {
-                    let existing = std::mem::take(system);
-                    body["system"] = Value::Array(vec![
-                        serde_json::json!({
-                            "type": "text",
-                            "text": CLAUDE_AI_OAUTH_SYSTEM_MARKER,
-                        }),
-                        serde_json::json!({
-                            "type": "text",
-                            "text": existing,
-                        }),
-                    ]);
-                }
+                let existing = std::mem::take(system);
+                body["system"] = Value::Array(vec![
+                    serde_json::json!({
+                        "type": "text",
+                        "text": CLAUDE_AI_OAUTH_SYSTEM_MARKER,
+                    }),
+                    serde_json::json!({
+                        "type": "text",
+                        "text": existing,
+                    }),
+                ]);
             }
             Some(Value::Array(blocks)) => {
                 let already_present = blocks.iter().any(|block| {
@@ -996,6 +1105,27 @@ fn merge_usage(target: &mut Usage, update: &AnthropicUsage) {
 impl LlmClient for AnthropicClient {
     fn project_replay_messages(&self, messages: &[Message]) -> Result<Vec<Message>, LlmError> {
         project_anthropic_replay_messages(messages)
+    }
+
+    fn request_pressure(
+        &self,
+        request: &LlmRequest,
+    ) -> Result<Option<meerkat_core::ProviderRequestPressure>, LlmError> {
+        let mut projected_request = request.clone();
+        projected_request.messages = self.project_replay_messages(&request.messages)?;
+        let mut body = self.build_request_body(&projected_request)?;
+        if self.authorizer_needs_claude_ai_oauth_system_marker() {
+            Self::ensure_claude_ai_oauth_system_marker(&mut body);
+        }
+        let encoded_bytes = serde_json::to_vec(&body)
+            .map_err(|error| LlmError::InvalidRequest {
+                message: format!("failed to serialize Anthropic request body: {error}"),
+            })?
+            .len() as u64;
+        Ok(Some(meerkat_core::ProviderRequestPressure::new(
+            encoded_bytes,
+            meerkat_models::approximate_request_byte_cap(self.provider()),
+        )))
     }
 
     fn stream<'a>(&'a self, request: &'a LlmRequest) -> LlmStream<'a> {
@@ -1396,6 +1526,13 @@ impl LlmClient for AnthropicClient {
                             let error = match error_type {
                                 "overloaded_error" => LlmError::ServerOverloaded,
                                 "rate_limit_error" => LlmError::RateLimited { retry_after_ms: None },
+                                // Anthropic's typed request-size rejection
+                                // (2026-07-29 incident: an over-cap transcript
+                                // fails every turn); the constructor attaches
+                                // the curator-compaction recovery hint.
+                                "request_too_large" => {
+                                    LlmError::request_too_large(error_msg.to_string())
+                                }
                                 "api_error" => LlmError::ServerError {
                                     status: 500,
                                     message: error_msg.to_string(),
@@ -1748,6 +1885,23 @@ mod tests {
     }
 
     #[test]
+    fn claude_ai_oauth_marker_does_not_replace_authored_empty_system() {
+        let client = AnthropicClient::new("test-key".to_string()).unwrap();
+        let request = LlmRequest::new(
+            "claude-sonnet-4-6",
+            vec![Message::System(SystemMessage::new(""))],
+        );
+        let mut body = client.build_request_body(&request).unwrap();
+
+        AnthropicClient::ensure_claude_ai_oauth_system_marker(&mut body);
+
+        let system = body["system"].as_array().expect("system should be blocks");
+        assert_eq!(system.len(), 2);
+        assert_eq!(system[0]["text"], CLAUDE_AI_OAUTH_SYSTEM_MARKER);
+        assert_eq!(system[1]["text"], "");
+    }
+
+    #[test]
     fn build_request_body_does_not_add_claude_ai_oauth_marker_for_api_key_path() {
         let client = AnthropicClient::new("test-key".to_string()).unwrap();
         let request = LlmRequest::new(
@@ -1758,6 +1912,132 @@ mod tests {
         let body = client.build_request_body(&request).unwrap();
 
         assert!(body.get("system").is_none());
+    }
+
+    #[test]
+    fn leading_system_messages_are_preserved_as_distinct_anthropic_blocks() {
+        let client = AnthropicClient::new("test-key".to_string()).unwrap();
+        let messages = vec![
+            Message::System(SystemMessage::new("")),
+            Message::System(SystemMessage::new(" \t ")),
+            Message::System(SystemMessage::new("duplicate")),
+            Message::System(SystemMessage::new("duplicate")),
+            Message::User(UserMessage::text("work")),
+        ];
+        let request = LlmRequest::new("claude-sonnet-4-6", messages.clone());
+
+        let body = client.build_request_body(&request).unwrap();
+        assert_eq!(request.messages, messages);
+        let system = body["system"]
+            .as_array()
+            .expect("multiple ordered system messages should remain distinct blocks");
+        assert_eq!(system.len(), 4);
+        assert_eq!(system[0]["text"], "");
+        assert_eq!(system[1]["text"], " \t ");
+        assert_eq!(system[2]["text"], "duplicate");
+        assert_eq!(system[3]["text"], "duplicate");
+        let projected_messages = body["messages"].as_array().expect("messages array");
+        assert_eq!(projected_messages.len(), 1);
+        assert_eq!(projected_messages[0]["role"], "user");
+        assert_eq!(projected_messages[0]["content"], "work");
+    }
+
+    #[test]
+    fn older_model_rejects_interleaved_system_message_without_mutating_input() {
+        let client = AnthropicClient::new("test-key".to_string()).unwrap();
+        let messages = vec![
+            Message::User(UserMessage::text("work")),
+            Message::System(SystemMessage::new("late instruction")),
+        ];
+
+        for model in ["claude-sonnet-4-6", "claude-haiku-4-5-20251001"] {
+            let request = LlmRequest::new(model, messages.clone());
+            assert!(matches!(
+                client.build_request_body(&request),
+                Err(LlmError::InvalidInputShape { .. })
+            ));
+            assert_eq!(request.messages, messages);
+        }
+    }
+
+    #[test]
+    fn modern_model_lowers_turn_scoped_system_after_the_governing_user() {
+        let client = AnthropicClient::new("test-key".to_string()).unwrap();
+        let messages = vec![
+            Message::System(SystemMessage::new("initial instruction")),
+            Message::User(UserMessage::text("first user")),
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![AssistantBlock::Text {
+                    text: "first answer".to_string(),
+                    meta: None,
+                }],
+                StopReason::EndTurn,
+            )),
+            Message::System(SystemMessage::new("updated instruction")),
+            Message::User(UserMessage::text("second user")),
+        ];
+        let request = LlmRequest::new("claude-opus-4-8", messages.clone());
+
+        let body = client.build_request_body(&request).unwrap();
+
+        assert_eq!(request.messages, messages);
+        assert_eq!(body["system"], "initial instruction");
+        let projected = body["messages"].as_array().expect("messages array");
+        assert_eq!(projected.len(), 4);
+        assert_eq!(projected[0]["role"], "user");
+        assert_eq!(projected[0]["content"], "first user");
+        assert_eq!(projected[1]["role"], "assistant");
+        assert_eq!(projected[2]["role"], "user");
+        assert_eq!(projected[2]["content"], "second user");
+        assert_eq!(projected[3]["role"], "system");
+        assert_eq!(projected[3]["content"], "updated instruction");
+    }
+
+    #[test]
+    fn modern_model_preserves_consecutive_mid_system_rows_exactly() {
+        let client = AnthropicClient::new("test-key".to_string()).unwrap();
+        let messages = vec![
+            Message::User(UserMessage::text("work")),
+            Message::System(SystemMessage::new("")),
+            Message::System(SystemMessage::new(" repeated ")),
+            Message::System(SystemMessage::new(" repeated ")),
+        ];
+        let request = LlmRequest::new("claude-opus-5", messages.clone());
+
+        let body = client.build_request_body(&request).unwrap();
+
+        assert_eq!(request.messages, messages);
+        let projected = body["messages"].as_array().expect("messages array");
+        assert_eq!(projected.len(), 4);
+        assert_eq!(projected[0]["role"], "user");
+        assert_eq!(projected[1]["role"], "system");
+        assert_eq!(projected[1]["content"], "");
+        assert_eq!(projected[2]["role"], "system");
+        assert_eq!(projected[2]["content"], " repeated ");
+        assert_eq!(projected[3]["role"], "system");
+        assert_eq!(projected[3]["content"], " repeated ");
+    }
+
+    #[test]
+    fn modern_model_rejects_mid_system_without_legal_predecessor() {
+        let client = AnthropicClient::new("test-key".to_string()).unwrap();
+        let messages = vec![
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![AssistantBlock::Text {
+                    text: "answer".to_string(),
+                    meta: None,
+                }],
+                StopReason::EndTurn,
+            )),
+            Message::System(SystemMessage::new("late instruction")),
+        ];
+        let request = LlmRequest::new("claude-fable-5", messages.clone());
+
+        assert!(matches!(
+            client.build_request_body(&request),
+            Err(LlmError::InvalidInputShape { .. })
+        ));
+        assert_eq!(request.messages, messages);
     }
 
     // =========================================================================

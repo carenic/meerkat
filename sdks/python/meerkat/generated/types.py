@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Generated wire types for Meerkat SDK.
 
-Contract version: 0.8.10
+Contract version: 0.8.11
 """
 
 from dataclasses import dataclass, field
@@ -11,7 +11,7 @@ from typing import Any, Literal, NotRequired, Optional, Required, TypedDict
 from .errors import MeerkatError
 
 
-CONTRACT_VERSION = "0.8.10"
+CONTRACT_VERSION = "0.8.11"
 
 
 Value = Any
@@ -837,13 +837,15 @@ class HelpResponse:
 
 @dataclass
 class InjectSystemContextParams:
-    """Parameters for `session/inject_context`.
+    """Parameters for `session/inject_context`, which appends one ordinary durable
+ordered System message at the admitted transcript boundary.
 
 The injected body is the typed [`CoreRenderable`] owner rather than a bare
 `text` string: surfaces parse their inbound payload into the renderable at
 the ingress boundary and the handler threads it straight through to
 `AppendSystemContextRequest.content`. A plain-text client payload still
-deserializes via `CoreRenderable`'s tagged `text` variant."""
+deserializes via `CoreRenderable`'s tagged `text` variant. The rendered
+string is preserved exactly, including empty and whitespace-only content."""
     content: dict[str, Any]
     session_id: str
     idempotency_key: Optional[str] = None
@@ -853,7 +855,7 @@ deserializes via `CoreRenderable`'s tagged `text` variant."""
 @dataclass
 class InjectSystemContextResult:
     """Result for `session/inject_context`."""
-    status: Literal['applied', 'staged', 'duplicate']
+    status: Literal['applied', 'duplicate']
 
 
 @dataclass
@@ -1916,7 +1918,10 @@ class MobIngressInteractionResult:
 
 @dataclass
 class MobAppendSystemContextParams:
-    """Request payload for `mob/append_system_context`."""
+    """Request payload for `mob/append_system_context`.
+
+Appends one ordinary durable ordered System message to the member session
+at the admitted transcript boundary. The text is preserved exactly."""
     agent_identity: str
     mob_id: str
     text: str
@@ -1929,7 +1934,7 @@ class MobAppendSystemContextResult:
     """Response payload for `mob/append_system_context`."""
     agent_identity: str
     mob_id: str
-    status: Literal['applied', 'staged', 'duplicate']
+    status: Literal['applied', 'duplicate']
 
 
 @dataclass
@@ -2076,6 +2081,7 @@ retired `clear_*` split wire form) fail closed at the serde boundary via
     skill_refs: Optional[list[SkillKey]] = None
     structured_output_retries: Optional[int] = None
     system_prompt: Optional[str] = None
+    transient_turn_context: Optional[str] = None
     turn_tool_overlay: Optional[PublicTurnToolOverlay] = None
 
 
@@ -2149,6 +2155,7 @@ server resolves against the live roster — callers do not pass
     injected_context: Optional[list[WireContentInput]] = None
     objective_id: Optional[str] = None
     origin: Optional[Literal['external', 'internal']] = None
+    transient_turn_context: Optional[str] = None
     work_ref: Optional[str] = None
 
 
@@ -3325,7 +3332,9 @@ class BridgeDeliveryPayload:
     injected_context: Optional[list[ContentInput]] = None
     objective_id: Optional[str] = None
     outcome_tracking: Optional[Literal['interaction']] = None
+    system_prompt: Optional[str] = None
     transcript_interaction_id: Optional[str] = None
+    transient_turn_context: Optional[str] = None
     turn: Optional[BridgeTurnDirective] = None
 
 
@@ -6367,7 +6376,9 @@ class BridgeCommandDeliverMemberInput(TypedDict, total=False):
     outcome_tracking: NotRequired[Optional[Literal['interaction']]]
     protocol_version: Required[BridgeProtocolVersion]
     supervisor: Required[BridgePeerSpec]
+    system_prompt: NotRequired[Optional[str]]
     transcript_interaction_id: NotRequired[Optional[str]]
+    transient_turn_context: NotRequired[Optional[str]]
     turn: NotRequired[Optional[BridgeTurnDirective]]
 
 class BridgeCommandObserveMember(TypedDict, total=False):
@@ -7083,6 +7094,7 @@ SendTaintOverride = dict[str, SenderContentTaint] | Literal['undeclared']
 class WireSessionMessageSystem(TypedDict, total=False):
     content: Required[str]
     created_at: Required[str]
+    identity: NotRequired[Optional[dict[str, Any]]]
     role: Required[Literal['system']]
 
 class WireSessionMessageSystemNotice(TypedDict, total=False):

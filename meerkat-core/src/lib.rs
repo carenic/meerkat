@@ -20,7 +20,6 @@ pub mod artifact;
 pub mod auth;
 pub mod blob;
 pub mod budget;
-pub mod checkpoint;
 pub mod comms;
 pub mod compact;
 pub mod completion_feed;
@@ -30,6 +29,7 @@ pub mod config_runtime;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod config_store;
 pub mod connection;
+mod digest_observability;
 pub mod error;
 pub mod event;
 pub mod event_injector;
@@ -51,8 +51,10 @@ pub mod model_registry;
 pub mod oauth_identity;
 pub mod ops;
 pub mod ops_lifecycle;
+pub mod panic_payload;
 pub mod peer_correlation;
 pub mod peer_meta;
+pub mod persistence_contract;
 pub use generated::approval_lifecycle;
 pub use generated::session_document;
 pub mod pending_continuation;
@@ -62,12 +64,14 @@ pub mod provider;
 pub mod provider_matrix;
 pub mod realtime_transcript;
 pub mod realtime_transcript_revision;
+pub mod realtime_transcript_sidecar;
 pub mod retry;
 pub mod runtime_bootstrap;
 pub mod runtime_epoch;
 pub mod schema;
 pub mod service;
 pub mod session;
+pub mod session_component_sidecar;
 pub mod session_durable_config_authority;
 pub mod session_recovery;
 pub mod session_store;
@@ -92,15 +96,15 @@ pub mod web_search;
 
 // Re-export main types at crate root
 pub use agent::{
-    Agent, AgentBuildPolicyError, AgentBuilder, AgentExecutionSnapshot, AgentLlmClient,
-    AgentLlmClientDecorator, AgentLlmFallbackSkippedTarget, AgentLlmFallbackSwitch, AgentRunner,
-    AgentSessionStore, AgentToolDispatcher, BindOutcome, CancelAfterBoundaryCommand,
+    Agent, AgentBuildPolicyError, AgentBuilder, AgentControlStateError, AgentExecutionSnapshot,
+    AgentLlmClient, AgentLlmClientDecorator, AgentLlmFallbackSkippedTarget, AgentLlmFallbackSwitch,
+    AgentRunner, AgentSessionStore, AgentToolDispatcher, BindOutcome, CancelAfterBoundaryCommand,
     CancelAfterBoundarySender, CommsCapabilityError, CommsRuntime, CurrentTurnContent,
     CurrentTurnImageRef, DefaultSystemPromptPolicy, DispatcherCapabilities, ExternalToolUpdate,
     FilteredToolDispatcher, LlmStreamResult, SnapshotProjectionError,
-    StickyModelFallbackActivationProof, SystemContextStateError, ToolDispatchContext,
-    dispatch_tool_execution_plan_fenced, resolve_tool_execution_plan_fenced,
-    select_tool_catalog_mode, should_compose_tool_catalog_control_plane,
+    StickyModelFallbackActivationProof, ToolDispatchContext, dispatch_tool_execution_plan_fenced,
+    resolve_tool_execution_plan_fenced, select_tool_catalog_mode,
+    should_compose_tool_catalog_control_plane,
 };
 pub use approval::{
     ApprovalActionKind, ApprovalDecision, ApprovalDecisionRecord, ApprovalError, ApprovalId,
@@ -120,27 +124,11 @@ pub use auth::{
 };
 pub use blob::{
     BlobId, BlobPayload, BlobRef, BlobStore, BlobStoreError, ImageBlobIntegrityError,
-    VerifiedImageBlob, ensure_stored_image_blob, validate_image_blob_payload,
+    VerifiedImageBlob, content_blob_id, ensure_stored_image_blob, validate_image_blob_payload,
     verify_stored_image_blob,
 };
 pub use budget::{
     Budget, BudgetDimension, BudgetExceeded, BudgetLimits, BudgetObservation, BudgetPool,
-};
-pub use checkpoint::{
-    AdoptedLegacySession, DIGEST_SITE_LABELS, LegacySessionTranscriptRelation,
-    SESSION_CHECKPOINT_STAMP_SCHEMA_VERSION, SESSION_CHECKPOINT_STAMP_SCHEMA_VERSION_RECOVERED,
-    SESSION_CHECKPOINT_STAMP_SCHEMA_VERSION_WITNESS_V3, SessionCheckpointAncestryProof,
-    SessionCheckpointAnchor, SessionCheckpointAuthorityBase, SessionCheckpointDigest,
-    SessionCheckpointError, SessionCheckpointMetadataState, SessionCheckpointProvenance,
-    SessionCheckpointRelation, SessionCheckpointRevision, SessionCheckpointStamp,
-    SessionCheckpointState, SessionCheckpointer, SessionGeneration, SessionLineageId,
-    adopt_legacy_session, digest_site_bytes, global_session_content_digest_bytes,
-    global_session_encode_bytes, legacy_session_source_blob_digest,
-    legacy_session_transcript_relation, legacy_snapshot_vs_typed_projection_transcript_relation,
-    rewrite_record_body_decodes, session_checkpoint_digest, session_checkpoint_metadata_state,
-    session_checkpoint_relation, session_checkpoints_are_exact, session_content_digest_bytes,
-    session_content_digest_computations, session_transcript_history_checkpoint_digest,
-    transcript_history_checkpoint_digest, verified_checkpoint_stamp_relation,
 };
 pub use comms::{
     CommsCommand, EventStream, InputSource, InputStreamMode, PeerDirectoryEntry,
@@ -151,38 +139,8 @@ pub use compact::{
     COMPACTION_SUMMARY_PREFIX, CompactionConfig, CompactionContext, CompactionCurator,
     CompactionCuratorError, CompactionDiscard, CompactionResult, CompactionRetained,
     CompactionSummary, CompactionWindow, Compactor, CuratedCompactionSummary,
-    SESSION_COMPACTION_CADENCE_KEY, SessionCompactionCadence,
+    ProviderRequestPressure, SESSION_COMPACTION_CADENCE_KEY, SessionCompactionCadence,
 };
-pub use memory::{
-    CompactionCommitCoordinationError, CompactionCommitCoordinator, CompactionProjectionId,
-    CompactionProjectionIntent, CompactionProjectionPersistence, CompactionStageReceipt,
-    CompactionStageReconcileReceipt, EmbeddingModel, HnswParams, MemoryEnumerationPage,
-    MemoryEnumerationRequest, MemoryIndexBatch, MemoryIndexReceipt, MemoryIndexRequest,
-    MemoryIndexScope, MemoryMetadata, MemoryOwner, MemoryRankingPolicy, MemoryRecord, MemoryResult,
-    MemoryScopeDropReceipt, MemorySearchScope, MemorySource, MemoryStore, MemoryStoreError,
-    MessageRange, SESSION_COMPACTION_PROJECTION_INTENTS_KEY,
-};
-pub use model_profile::{ModelCatalog, ModelProfile};
-pub use model_registry::{
-    ModelCapability, ModelProfileWitness, ModelRegistry, ModelRegistryEntry, SelfHostedServerRef,
-    UnsupportedModelCapabilityEvidence, UnsupportedModelCapabilityReason,
-};
-pub use peer_correlation::{
-    InboundPeerRequestState, InteractionStreamAbandonReason, InteractionStreamState,
-    OutboundPeerRequestState, PeerCorrelationId,
-};
-pub use peer_meta::PeerMeta;
-pub use placement::{ExecutionPlacement, ExecutionPlacementIdentity, PlacementError};
-pub use streaming_tool::{
-    ToolCancellationToken, ToolProgressFrame, ToolProgressFrameError, ToolProgressReportError,
-    ToolProgressSink, ToolStreamingDispatchContext,
-};
-pub use surface_metadata::{
-    MEERKAT_METADATA_PREFIX, RESERVED_MOB_LABEL_KEYS, ReservedMetadataKey, RuntimeMetadata,
-    SurfaceMetadata, SurfaceMetadataError, is_reserved_meerkat_label_key,
-    is_reserved_meerkat_metadata_key, validate_public_app_context, validate_public_labels,
-};
-
 pub use completion_feed::{
     CompletionBatch, CompletionEnrichmentData, CompletionEnrichmentProvider, CompletionEntry,
     CompletionFeed, CompletionSeq,
@@ -205,6 +163,11 @@ pub use config_store::{
     ConfigResolvedPaths, ConfigStore, ConfigStoreMetadata, EffectiveConfigReader, FileConfigStore,
     MemoryConfigStore, RealmConfigSource, TaggedConfigStore, apply_config_patch_preview,
     merge_patch,
+};
+pub use digest_observability::{
+    DIGEST_SITE_LABELS, digest_site_bytes, global_session_content_digest_bytes,
+    global_session_encode_bytes, record_session_encode_bytes, rewrite_record_body_decodes,
+    session_content_digest_bytes, session_content_digest_computations,
 };
 pub use error::{AgentError, ToolError};
 pub use event::{
@@ -230,6 +193,7 @@ pub use handles::{
     PeerResponseTerminalRenderPayload, PeerResponseTerminalRouteIdentity,
     PeerResponseTerminalSource, PeerResponseTerminalTransportIdentity, SessionAdmissionHandle,
     SurfaceDiagnosticSnapshot, SurfaceSnapshot, TurnStateHandle, TurnStateSnapshot,
+    peer_response_terminal_context_key,
 };
 pub use hooks::{
     HookCapability, HookDecision, HookEngine, HookEngineError, HookExecutionMode,
@@ -262,17 +226,31 @@ pub use lifecycle::run_primitive::{
     ProviderParamsCarrier, ProviderParamsMergeError, ProviderParamsOverride, ProviderTag,
 };
 pub use lifecycle::{
-    ConversationAppend, ConversationAppendRole, ConversationContextAppend, CoreApplyFailureCause,
-    CoreApplyFailureCauseKind, CoreBoundaryStageError, CoreBoundaryStageOutput,
-    CoreControlFailureCause, CoreControlFailureCauseKind, CoreExecutor, CoreExecutorBoundaryHandle,
-    CoreExecutorError, CoreExecutorInterruptHandle, CoreExecutorPostStopCleanupHandle,
-    CoreExecutorPublicationHandle, CoreExecutorTeardownReason,
+    CommittedSessionBoundaryAuthority, ConversationAppend, ConversationAppendRole,
+    CoreApplyFailureCause, CoreApplyFailureCauseKind, CoreBoundaryStageError,
+    CoreBoundaryStageOutput, CoreControlFailureCause, CoreControlFailureCauseKind, CoreExecutor,
+    CoreExecutorBoundaryHandle, CoreExecutorError, CoreExecutorInterruptHandle,
+    CoreExecutorPostStopCleanupHandle, CoreExecutorPublicationHandle, CoreExecutorTeardownReason,
     CoreExecutorTurnFinalizationBoundaryHandle, CoreExecutorTurnFinalizationGuard,
     CoreInteractionTerminalPublicationReceipt, CoreRenderable, InputId, RunApplyBoundary,
     RunBoundaryReceipt, RunBoundaryReceiptDraft, RunEvent, RunId, RunPrimitive, StagedRunInput,
 };
 pub use mcp_config::{McpConfig, McpConfigError, McpScope, McpServerConfig, McpServerWithScope};
+pub use memory::{
+    CompactionCommitCoordinationError, CompactionCommitCoordinator, CompactionProjectionId,
+    CompactionProjectionIntent, CompactionProjectionPersistence, CompactionStageReceipt,
+    CompactionStageReconcileReceipt, EmbeddingModel, HnswParams, MemoryEnumerationPage,
+    MemoryEnumerationRequest, MemoryIndexBatch, MemoryIndexReceipt, MemoryIndexRequest,
+    MemoryIndexScope, MemoryMetadata, MemoryOwner, MemoryRankingPolicy, MemoryRecord, MemoryResult,
+    MemoryScopeDropReceipt, MemorySearchScope, MemorySource, MemoryStore, MemoryStoreError,
+    MessageRange, SESSION_COMPACTION_PROJECTION_INTENTS_KEY,
+};
 pub use model_defaults::ModelOperationalDefaultsResolver;
+pub use model_profile::{ModelCatalog, ModelProfile};
+pub use model_registry::{
+    ModelCapability, ModelProfileWitness, ModelRegistry, ModelRegistryEntry, SelfHostedServerRef,
+    UnsupportedModelCapabilityEvidence, UnsupportedModelCapabilityReason,
+};
 pub use oauth_identity::OAuthProviderIdentity;
 pub use ops::{
     AsyncOpRef, ConcurrencyLimits, ContextStrategy, ForkBranch, ForkBudgetPolicy, OpEvent,
@@ -286,6 +264,17 @@ pub use ops_lifecycle::{
     OperationTerminalOutcome, OpsLifecycleError, OpsLifecycleRegistry, WaitAllResult,
     WaitAllSatisfied,
 };
+pub use peer_correlation::{
+    InboundPeerRequestState, InteractionStreamAbandonReason, InteractionStreamState,
+    OutboundPeerRequestState, PeerCorrelationId,
+};
+pub use peer_meta::PeerMeta;
+pub use persistence_contract::{
+    HeadCanonicalProvisionalTailAuthority, ProvisionalTailAuthorityError, RunCheckpointAuthority,
+    RunCheckpointReceipt, SessionCheckpointer, SessionControlCommitReceipt,
+    WholeBlobProvisionalTailAuthority,
+};
+pub use placement::{ExecutionPlacement, ExecutionPlacementIdentity, PlacementError};
 pub use prompt::{AGENTS_MD_MAX_BYTES, DEFAULT_SYSTEM_PROMPT, SystemPromptConfig};
 pub use provider::Provider;
 pub use realtime_transcript::{
@@ -293,6 +282,10 @@ pub use realtime_transcript::{
     RealtimeTranscriptMaterializedMessage, RealtimeTranscriptRole, RealtimeUserContentApplyOutcome,
     RealtimeUserContentIdentity, RealtimeUserContentTombstone,
     SESSION_REALTIME_TRANSCRIPT_STATE_KEY,
+};
+pub use realtime_transcript_sidecar::{
+    REALTIME_TRANSCRIPT_SIDECAR_EVENT_SCHEMA_V1, RealtimeTranscriptSidecarError,
+    RealtimeTranscriptSidecarRecord, RealtimeTranscriptSnapshotReasonV1,
 };
 pub use retry::{
     DEFAULT_STREAM_INACTIVITY_TIMEOUT, LlmRetryFailure, LlmRetryFailureKind, LlmRetryPlan,
@@ -322,31 +315,43 @@ pub use service::{
     SessionTranscriptRevisionPage, SessionTranscriptRevisionQuery, SessionTranscriptRewriteRequest,
     SessionTranscriptRewriteResult, SessionUsage, SessionView, StageToolResultsDisposition,
     StageToolResultsRequest, StageToolResultsResult, StartTurnRequest, TranscriptEditError,
-    TranscriptEditRunningBehavior, TranscriptReplacement, TranscriptRewriteCommit,
-    TranscriptRewriteReason, TranscriptRewriteSelection, TranscriptRewriteSemantic,
-    TurnToolOverlay,
+    TranscriptEditRunningBehavior, TranscriptReplacement, TranscriptRewriteReason,
+    TranscriptRewriteSelection, TranscriptRewriteSemantic, TurnToolOverlay,
 };
 pub use session::{
     AuthorizedSessionToolVisibilityState, ConsumedDeferredTurnInputs, DeferredFirstTurnPhase,
-    DeferredToolLoadAuthority, InheritedToolVisibilityAuthority, PendingDeferredPrompt,
-    PendingSystemContextAppend, PendingToolResultsMessage, PersistedSessionMetadataView,
-    PreparedSystemContextBoundary, RESUME_SYSTEM_PROMPT_REFRESH_REWRITE_REASON,
-    ResumedSystemPromptReconciliation, SESSION_BUILD_STATE_KEY, SESSION_CHECKPOINT_STAMP_KEY,
+    DeferredToolLoadAuthority, ImportedReleased0810Session, InheritedToolVisibilityAuthority,
+    InvalidSessionLineageId, PendingDeferredPrompt, PendingToolResultsMessage,
+    PersistedSessionMetadataView, PreparedTransientTurnContextBoundary, Released0810ImportError,
+    Released0810ImportEvidence, Released0810ImportReceipt, SESSION_BUILD_STATE_KEY,
     SESSION_DEFERRED_TURN_STATE_KEY, SESSION_LIFECYCLE_TERMINAL_KEY,
-    SESSION_METADATA_SCHEMA_VERSION, SESSION_RUNTIME_CHECKPOINT_PROVENANCE_KEY,
-    SESSION_SYSTEM_CONTEXT_STATE_KEY, SESSION_TOOL_VISIBILITY_STATE_KEY,
-    SESSION_TRANSCRIPT_HISTORY_CHECKPOINT_DIGEST_KEY, SESSION_TRANSCRIPT_HISTORY_STATE_KEY,
-    SESSION_VERSION, SYSTEM_CONTEXT_SEPARATOR, SeenSystemContextKey, SeenSystemContextState,
-    Session, SessionBuildState, SessionDeferredTurnState, SessionLifecycleTerminal,
-    SessionLlmIdentity, SessionLlmIdentityOverride, SessionLlmIdentityOverrideError,
-    SessionLlmRequestPolicy, SessionMeta, SessionMetadata, SessionMetadataDocument,
-    SessionSystemContextState, SessionToolVisibilityState, SessionTooling, SystemContextStageError,
-    SystemContextStateHandle, ToolCategoryOverride, ToolVisibilityWitness, TranscriptHistoryState,
-    TranscriptReplayCursor, TranscriptRevisionBody, TranscriptRewriteRecord, VIEW_IMAGE_TOOL_NAME,
-    ValidatedTranscriptHistory, WitnessedToolFilter, capability_base_filter_for_image_tool_results,
-    resolve_session_llm_identity_override, session_metadata_document_from_slice,
-    session_metadata_schema_version, session_version, transcript_messages_digest,
-    try_lifecycle_terminal_from_map, try_session_metadata_from_map,
+    SESSION_METADATA_SCHEMA_VERSION, SESSION_TOOL_VISIBILITY_STATE_KEY,
+    SESSION_TRANSCRIPT_HISTORY_STATE_KEY, SESSION_TRANSCRIPT_REWRITE_PREFIX_AUTHORITY_KEY,
+    SESSION_VERSION, SerializedSessionArtifact, Session, SessionBuildState,
+    SessionDeferredTurnState, SessionGeneration, SessionHeadMetadataCell,
+    SessionHeadMetadataCellIdentity, SessionHeadMetadataDigest, SessionHeadMetadataIdentity,
+    SessionHeadMetadataProjection, SessionHeadMetadataValueDigest, SessionLifecycleTerminal,
+    SessionLineageId, SessionLlmIdentity, SessionLlmIdentityOverride,
+    SessionLlmIdentityOverrideError, SessionLlmRequestPolicy, SessionMeta, SessionMetadata,
+    SessionMetadataDocument, SessionToolVisibilityState, SessionTooling, SystemMessageAppendError,
+    ToolCategoryOverride, ToolVisibilityWitness, TranscriptEndpointWitness,
+    TranscriptGraphPrefixAccumulator, TranscriptHistoryState, TranscriptParentAdvance,
+    TranscriptRevisionBody, TranscriptRevisionEdge, TranscriptRewriteAuditReceiptBatch,
+    TranscriptRewriteCommit, TranscriptRewriteParentTransition, TranscriptRewritePatch,
+    TranscriptRewritePrefixAccumulator, TranscriptRewriteRecord, TransientTurnContextStateHandle,
+    VIEW_IMAGE_TOOL_NAME, ValidatedTranscriptHistory, ValidatedTranscriptRewriteSuffix,
+    WitnessedToolFilter, capability_base_filter_for_image_tool_results,
+    extend_transcript_rewrite_prefix_accumulator, import_released_0810_session,
+    released_0810_transcript_serialized_rows_digest, resolve_session_llm_identity_override,
+    session_metadata_document_from_slice, session_metadata_schema_version, session_version,
+    transcript_history_full_body_materializations, transcript_messages_digest,
+    transcript_rewrite_prefix_digest, try_lifecycle_terminal_from_map,
+    try_session_metadata_from_map, validate_current_persisted_transcript_history_slice,
+};
+pub use session_component_sidecar::{
+    ComponentEventDigest, ComponentEventPrefixAuthority, ComponentEventPrefixDigest,
+    PreparedComponentEventSuffix, SerializedComponentEvent, SessionComponentKind,
+    SessionComponentSidecarError, StoredComponentEventRow, VerifiedComponentEventSequence,
 };
 pub use session_recovery::{
     BUILD_ONLY_RECOVERY_OVERRIDE_ERROR, RecoveredSessionBuild, RecoveryBackendKind,
@@ -355,8 +360,10 @@ pub use session_recovery::{
     session_allows_first_turn_build_overrides,
 };
 pub use session_store::{
-    IncrementalSessionStore, SessionFilter, SessionHead, SessionHeadCas, SessionStore,
-    SessionStoreError, StrandLayout, StrandRewriteLayout, TranscriptStrandId,
+    IncrementalSessionStore, PreparedHeadCanonicalMutationRoute,
+    PreparedHeadCanonicalRewritePreflight, SessionFilter, SessionHead, SessionHeadCas,
+    SessionMessageRowPrefixAccumulator, SessionStore, SessionStoreError, StrandLayout,
+    StrandRewriteLayout, TranscriptStrandId, VerifiedSessionHeadMaterialization,
     head_canonical_plain_save_guard, session_head_cas_token, strand_layout_for_history,
 };
 pub use state::LoopState;
@@ -367,6 +374,15 @@ pub use storage_diagnostics::{
 pub use storage_durability::{DurabilityClass, DurabilityDeclaration, DurabilityResolution};
 pub use storage_layout::{
     ResolvedStorage, StorageLayout, StorageLayoutInputs, find_project_root, local_realms_candidate,
+};
+pub use streaming_tool::{
+    ToolCancellationToken, ToolProgressFrame, ToolProgressFrameError, ToolProgressReportError,
+    ToolProgressSink, ToolStreamingDispatchContext,
+};
+pub use surface_metadata::{
+    MEERKAT_METADATA_PREFIX, RESERVED_MOB_LABEL_KEYS, ReservedMetadataKey, RuntimeMetadata,
+    SurfaceMetadata, SurfaceMetadataError, is_reserved_meerkat_label_key,
+    is_reserved_meerkat_metadata_key, validate_public_app_context, validate_public_labels,
 };
 pub use tool_catalog::{
     ToolCallability, ToolCatalogCapabilities, ToolCatalogDeferredEligibility, ToolCatalogEntry,
@@ -411,12 +427,12 @@ pub use types::{
     ContentInput, ExtractionError, HandlingMode, ImageData, MemoryIndexExclusion,
     MemoryIndexableContent, Message, OutputSchema, ProviderMeta, RunInput, RunResult,
     SUPPORTED_VIDEO_MEDIA_TYPES, SecurityMode, ServerToolKind, SessionId, StopReason,
-    SystemMessage, SystemNoticeBlock, SystemNoticeDirection, SystemNoticeKind, SystemNoticeMessage,
-    SystemNoticePeer, SystemPromptMutationKind, ToolCall, ToolCallIter, ToolCallView, ToolDef,
-    ToolIdentity, ToolName, ToolNameSet, ToolProvenance, ToolResult, ToolSourceId, ToolSourceKind,
-    TranscriptMessageIdentity, TranscriptSource, TranscriptUserRole, Usage, UserMessage, VideoData,
-    assistant_blocks_have_visible_or_actionable_output, has_images, has_non_text_content,
-    has_video, is_supported_video_media_type, validate_inline_video_blocks,
+    SystemMessage, SystemMessageIdentity, SystemNoticeBlock, SystemNoticeDirection,
+    SystemNoticeKind, SystemNoticeMessage, SystemNoticePeer, ToolCall, ToolCallIter, ToolCallView,
+    ToolDef, ToolIdentity, ToolName, ToolNameSet, ToolProvenance, ToolResult, ToolSourceId,
+    ToolSourceKind, TranscriptMessageIdentity, TranscriptSource, TranscriptUserRole, Usage,
+    UserMessage, VideoData, assistant_blocks_have_visible_or_actionable_output, has_images,
+    has_non_text_content, has_video, is_supported_video_media_type, validate_inline_video_blocks,
 };
 pub use web_search::*;
 

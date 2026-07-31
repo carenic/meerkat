@@ -20,9 +20,9 @@ mod trigger;
 mod types;
 
 pub use driver::{
-    DeliveryCompletion, DeliveryDispatch, DeliveryTerminal, ScheduleDriver, ScheduleDriverConfig,
-    ScheduleRefillFault, ScheduleTargetDelivery, ScheduleTargetProbe, ScheduleTickReport,
-    TargetProbeOutcome,
+    DeliveryCompletion, DeliveryDispatch, DeliveryTerminal, ScheduleDeliveryIdentity,
+    ScheduleDriver, ScheduleDriverConfig, ScheduleRefillFault, ScheduleTargetDelivery,
+    ScheduleTargetProbe, ScheduleTickReport, TargetProbeOutcome,
 };
 pub use error::{ScheduleDomainError, ScheduleStoreError};
 pub use lifecycle::{
@@ -41,8 +41,10 @@ pub use runnable::{
 pub use service::ScheduleService;
 pub use store::{
     ClaimDueRequest, ClaimDueResult, DisabledScheduleStore, MemoryScheduleStore, OccurrenceFilter,
-    PendingSupersession, ScheduleFilter, ScheduleStore, ScheduleStoreKind, ScheduleStoreRowFault,
-    ScheduleStoreRowFaultKind, apply_supersession_feedback,
+    PendingSupersession, RenewOccurrenceLeaseOutcome, RenewOccurrenceLeaseRequest,
+    RenewOccurrenceLeaseResult, ScheduleFilter, ScheduleRefillBatch, ScheduleRefillCandidate,
+    ScheduleStore, ScheduleStoreActionTime, ScheduleStoreKind, ScheduleStoreRowFault,
+    ScheduleStoreRowFaultKind, ScheduleStoreWakeMode, apply_supersession_feedback,
 };
 pub use surface::wire_schedule_tools;
 pub use tool_surface::ScheduleToolSurface;
@@ -55,17 +57,18 @@ pub use tools::{
 };
 pub use trigger::{CronAuthoringSpec, next_due_after, occurrences_for_horizon};
 pub use types::{
-    CalendarFieldSpec, CalendarTriggerSpec, CreateScheduleRequest, DeliveryCompletionFailureReason,
-    DeliveryFailureReason, DeliveryReceipt, DeliveryReceiptStage, FlowParams, FlowParamsError,
-    ForkContextSpec, HelperOptionsSpec, HostRunnableName, HostRunnableNameError,
-    HostRunnableParams, HostRunnableParamsError, HostRunnableTargetBinding, IdentityTargetBinding,
-    IntervalTriggerSpec, MisfirePolicy, MissingTargetPolicy, MobTargetBinding, Occurrence,
-    OccurrenceFailureClass, OccurrenceId, OccurrenceOrdinal, OccurrencePhase,
-    OccurrenceTargetProbeOutcome, OverlapPolicy, ResolvedSpawnSnapshot, RuntimeCompletionOutcome,
-    RuntimeDeliveryOutcome, Schedule, ScheduleConfig, ScheduleId, SchedulePhase, ScheduleRevision,
-    ScheduleSpawnTooling, ScheduledMobAction, ScheduledMobBackendKind, ScheduledMobRuntimeMode,
-    ScheduledSessionAction, SessionMaterializationSpec, SessionTargetBinding, TargetBinding,
-    TriggerSpec, UpdateScheduleRequest,
+    CalendarFieldSpec, CalendarTriggerSpec, CreateScheduleRequest, DeliveryAdmissionOutcome,
+    DeliveryCompletionFailureReason, DeliveryFailureReason, DeliveryReceipt, DeliveryReceiptStage,
+    FlowParams, FlowParamsError, ForkContextSpec, HelperOptionsSpec, HostRunnableName,
+    HostRunnableNameError, HostRunnableParams, HostRunnableParamsError, HostRunnableTargetBinding,
+    IdentityTargetBinding, IntervalTriggerSpec, MisfirePolicy, MissingTargetPolicy,
+    MobTargetBinding, Occurrence, OccurrenceFailureClass, OccurrenceId, OccurrenceOrdinal,
+    OccurrencePhase, OccurrenceTargetProbeOutcome, OverlapPolicy, ResolvedSpawnSnapshot,
+    RuntimeCompletionOutcome, RuntimeDeliveryOutcome, Schedule, ScheduleConfig, ScheduleId,
+    SchedulePhase, ScheduleRevision, ScheduleSpawnTooling, ScheduledMobAction,
+    ScheduledMobBackendKind, ScheduledMobRuntimeMode, ScheduledSessionAction,
+    SessionMaterializationSpec, SessionTargetBinding, TargetBinding, TriggerSpec,
+    UpdateScheduleRequest,
 };
 
 pub const SCHEDULE_CAPABILITY_DISABLED_DESCRIPTION: &str = "config.tools.schedule_enabled is false";

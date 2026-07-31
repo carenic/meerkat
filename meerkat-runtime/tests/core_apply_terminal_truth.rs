@@ -64,15 +64,6 @@ fn assert_terminal_intent_validation_precedes_markers(
     Ok(())
 }
 
-fn assert_terminal_context_and_run_stages_pre_turn_appends(source: &str, owner: &str) {
-    assert!(
-        source.contains("primitive.is_peer_response_terminal_context_and_run()")
-            && source.contains("pending_system_context_appends(&staged.context_appends)")
-            && source.contains("pre_turn_context_appends"),
-        "{owner} must stage terminal context-and-run context into the admitted turn request"
-    );
-}
-
 fn derive_attribute_before<'a>(contents: &'a str, marker: &str) -> Result<&'a str, String> {
     let start = contents
         .find(marker)
@@ -124,14 +115,16 @@ fn core_apply_terminal_truth_has_one_authority() -> Result<(), String> {
         "CoreApplyOutput must not duplicate terminal truth with a run_result mirror"
     );
 
-    let waiter_resolver =
-        extract_braced_item(&runtime_loop, "async fn resolve_runtime_completion_waiters")?;
+    let terminal_publisher = extract_braced_item(
+        &runtime_loop,
+        "async fn publish_authorized_runtime_terminal_batch",
+    )?;
     assert!(
-        !waiter_resolver.contains("run_result:"),
+        !terminal_publisher.contains("run_result:"),
         "runtime completion resolution must branch from CoreApplyTerminal only"
     );
     assert!(
-        !waiter_resolver.contains("if let Some(result) = run_result"),
+        !terminal_publisher.contains("if let Some(result) = run_result"),
         "runtime completion resolution must not keep a separate run_result branch"
     );
 
@@ -184,7 +177,7 @@ fn core_apply_terminal_truth_has_one_authority() -> Result<(), String> {
         "completion waiter delivery must consume generated authority through Attempted -> Realized/Failed/Abandoned closure phases"
     );
     assert!(
-        !waiter_resolver.contains("authority.clone()"),
+        !terminal_publisher.contains("authority.clone()"),
         "runtime completion waiter fanout must not clone the generated authority token"
     );
     assert!(
@@ -461,52 +454,47 @@ fn core_apply_terminal_truth_has_one_authority() -> Result<(), String> {
         &persistent_driver,
         "pub(crate) async fn accept_resolved_input",
     )?;
-    let staged_equivalence = persistent_accept
-        .find("resolved.semantically_equivalent_to(&staged_resolved)")
+    let bounded_preview = persistent_accept
+        .find("preview_accept_resolved_input_bounded(&input, &resolved)")
         .ok_or_else(|| {
-            "persistent accept must compare preview and staged admission resolutions".to_string()
+            "persistent accept must preview the resolved admission without cloning full authority"
+                .to_string()
         })?;
-    let staged_flags = persistent_accept
-        .find("let flags = staged_resolved.coarse_flags();")
-        .ok_or_else(|| "persistent accept must derive flags from staged resolution".to_string())?;
-    let staged_accept = persistent_accept
-        .find(".accept_resolved_input(input.clone(), staged_resolved)")
+    let resolved_flags = persistent_accept
+        .find("let flags = resolved.coarse_flags();")
+        .ok_or_else(|| "persistent accept must derive flags from resolved authority".to_string())?;
+    let committed_accept = persistent_accept
+        .find("let mut outcome = match self.inner.accept_resolved_input(input, resolved).await")
         .ok_or_else(|| {
-            "persistent accept must stage accepted input after comparison".to_string()
+            "persistent accept must commit through the authority-revalidating inner accept"
+                .to_string()
         })?;
-    let staged_completion_signal = persistent_accept
-        .find("staged.machine_apply_accept_with_completion_signal")
+    let completion_signal = persistent_accept
+        .find(".machine_apply_accept_with_completion_signal")
         .ok_or_else(|| {
-            "persistent accept must apply completion signal after staged comparison".to_string()
+            "persistent accept must apply completion signal after committed admission".to_string()
         })?;
-    let staged_persist = persistent_accept
-        .find("self.persist_state(&staged_bundle).await?")
-        .ok_or_else(|| "persistent accept must persist staged state".to_string())?;
+    let delta_persist = persistent_accept
+        .find(".persist_input_states_atomically(&self.runtime_id, &records)")
+        .ok_or_else(|| "persistent accept must persist the exact changed-row delta".to_string())?;
     assert!(
-        staged_equivalence < staged_flags
-            && staged_flags < staged_accept
-            && staged_accept < staged_completion_signal
-            && staged_completion_signal < staged_persist,
-        "persistent accept must prove staged admission equivalence before deriving flags, accepting, signaling, or persisting"
+        bounded_preview < resolved_flags
+            && resolved_flags < committed_accept
+            && committed_accept < completion_signal
+            && completion_signal < delta_persist
+            && !persistent_accept.contains("clone_with_isolated_dsl_authority"),
+        "persistent accept must preview before committing through inner authority, signaling, and persisting only the changed-row delta"
     );
 
     let persistent_preview = extract_braced_item(
         &persistent_driver,
         "pub(crate) async fn preview_accept_resolved_input",
     )?;
-    let preview_equivalence = persistent_preview
-        .find("resolved.semantically_equivalent_to(&staged_resolved)")
-        .ok_or_else(|| {
-            "persistent preview must compare caller and staged resolutions".to_string()
-        })?;
-    let preview_accept = persistent_preview
-        .find("staged.accept_resolved_input(input, staged_resolved).await")
-        .ok_or_else(|| {
-            "persistent preview must accept only the staged resolution after comparison".to_string()
-        })?;
     assert!(
-        preview_equivalence < preview_accept,
-        "persistent preview must prove staged admission equivalence before staged accept"
+        persistent_preview.contains("preview_accept_resolved_input_bounded(&input, resolved)")
+            && !persistent_preview.contains("clone_with_isolated_dsl_authority")
+            && !persistent_preview.contains(".accept_resolved_input(input"),
+        "persistent preview must remain bounded and side-effect free"
     );
     Ok(())
 }
@@ -526,7 +514,7 @@ fn runtime_loop_terminal_snapshot_failures_are_fail_closed() -> Result<(), Strin
 }
 
 #[test]
-fn terminal_context_and_run_adapters_use_canonical_primitive_intent() -> Result<(), String> {
+fn terminal_notices_flow_through_canonical_typed_appends() -> Result<(), String> {
     let root = workspace_root()?;
     let runtime_backed = fs::read_to_string(root.join("meerkat/src/surface/runtime_backed.rs"))
         .map_err(|err| format!("read runtime-backed surface source: {err}"))?;
@@ -535,17 +523,10 @@ fn terminal_context_and_run_adapters_use_canonical_primitive_intent() -> Result<
             .map_err(|err| format!("read MCP runtime ingress source: {err}"))?;
 
     let runtime_backed_apply = extract_braced_item(&runtime_backed, "async fn apply")?;
-    assert!(
-        runtime_backed_apply.contains("primitive.is_context_only_apply_without_turn()"),
-        "runtime-backed context shortcut must use the canonical primitive intent helper"
-    );
     assert_terminal_intent_validation_precedes_markers(
         runtime_backed_apply,
         "runtime-backed apply",
-        &[
-            "primitive.is_context_only_apply_without_turn()",
-            "start_turn_request_from_primitive(&primitive)",
-        ],
+        &["start_turn_request_from_primitive(&primitive)"],
     )?;
     assert!(
         runtime_backed_apply.contains("start_turn_request_from_primitive(&primitive)")
@@ -555,28 +536,21 @@ fn terminal_context_and_run_adapters_use_canonical_primitive_intent() -> Result<
 
     let runtime_backed_request =
         extract_braced_item(&runtime_backed, "fn start_turn_request_from_primitive")?;
-    assert_terminal_context_and_run_stages_pre_turn_appends(
-        runtime_backed_request,
-        "runtime-backed turn request builder",
+    assert!(
+        runtime_backed_request.contains(".with_typed_turn_appends(primitive.typed_turn_appends())"),
+        "runtime-backed turn request must carry the primitive's ordinary typed appends"
     );
 
     let mcp_runtime_apply =
         extract_braced_item(&mcp_runtime_ingress, "async fn apply_runtime_turn")?;
-    assert!(
-        mcp_runtime_apply.contains("primitive.is_context_only_apply_without_turn()"),
-        "MCP runtime ingress must not re-derive context-only terminal behavior from append shape"
-    );
     assert_terminal_intent_validation_precedes_markers(
         mcp_runtime_apply,
         "MCP runtime ingress apply",
-        &[
-            "primitive.is_context_only_apply_without_turn()",
-            "let pre_turn_context_appends = match primitive",
-        ],
+        &["primitive.typed_turn_appends()"],
     )?;
-    assert_terminal_context_and_run_stages_pre_turn_appends(
-        mcp_runtime_apply,
-        "MCP runtime ingress apply",
+    assert!(
+        mcp_runtime_apply.contains(".with_typed_turn_appends(typed_turn_appends)"),
+        "MCP runtime ingress must carry ordinary typed appends into the admitted turn"
     );
     Ok(())
 }

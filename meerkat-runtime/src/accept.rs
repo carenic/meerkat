@@ -232,9 +232,32 @@ impl ResolvedAdmission {
         self.requires_active_pre_admission
     }
 
-    #[cfg(test)]
     pub(crate) fn policy(&self) -> &PolicyDecision {
         &self.policy
+    }
+
+    /// Exact input rows whose durable lifecycle may change when this
+    /// admission is committed. The generated plan can mutate only the newly
+    /// admitted input and, for coalesce/supersede, one named queued input.
+    pub(crate) fn persistence_changed_input_ids(&self, input_id: &InputId) -> Vec<InputId> {
+        let mut input_ids = vec![input_id.clone()];
+        let existing_id = match &self.admission_plan {
+            AdmissionPlan::Queued {
+                existing_action:
+                    Some(
+                        ExistingQueuedAdmissionAction::Coalesce { existing_id }
+                        | ExistingQueuedAdmissionAction::Supersede { existing_id },
+                    ),
+                ..
+            } => Some(existing_id),
+            AdmissionPlan::ConsumedOnAccept | AdmissionPlan::Queued { .. } => None,
+        };
+        if let Some(existing_id) = existing_id
+            && existing_id != input_id
+        {
+            input_ids.push(existing_id.clone());
+        }
+        input_ids
     }
 
     pub(crate) fn stages_run_boundary(&self) -> bool {
@@ -360,6 +383,12 @@ pub enum AcceptOutcome {
         input_id: InputId,
         /// The existing input ID that was matched.
         existing_id: InputId,
+        /// Exact machine/store-owned lifecycle seed for the matched input.
+        ///
+        /// Persistent runtimes may already have archived the terminal input
+        /// from live machine state, so consumers must classify this retained
+        /// receipt instead of re-reading a live row after admission.
+        existing_seed: InputStateSeed,
     },
     /// Input was rejected (validation failed, durability violation, etc.).
     Rejected {
@@ -438,6 +467,7 @@ mod tests {
         let outcome = AcceptOutcome::Deduplicated {
             input_id: InputId::new(),
             existing_id: InputId::new(),
+            existing_seed: InputStateSeed::new_accepted(),
         };
         assert!(!outcome.is_accepted());
         assert!(outcome.is_deduplicated());

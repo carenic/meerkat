@@ -10,7 +10,6 @@ use crate::runtime::handle::MemberSpawnReceipt;
 #[cfg(target_arch = "wasm32")]
 use crate::tokio;
 use async_trait::async_trait;
-use meerkat_core::PendingSystemContextAppend;
 use meerkat_core::comms::{PeerAddress, PeerName, TrustedPeerDescriptor};
 use meerkat_core::event_injector::SubscribableInjector;
 #[cfg(feature = "runtime-adapter")]
@@ -20,7 +19,9 @@ use meerkat_core::lifecycle::core_executor::{
     CoreExecutorTurnFinalizationBoundaryHandle, CoreExecutorTurnFinalizationGuard,
 };
 #[cfg(feature = "runtime-adapter")]
-use meerkat_core::lifecycle::run_primitive::{CoreRenderable, RunApplyBoundary, RunPrimitive};
+use meerkat_core::lifecycle::run_primitive::{
+    CoreRenderable, RunApplyBoundary, RunPrimitive, TurnRequestContext,
+};
 #[cfg(feature = "runtime-adapter")]
 use meerkat_core::lifecycle::{InputId, RunId as CoreRunId};
 use meerkat_core::ops::OperationId;
@@ -2335,7 +2336,7 @@ impl SessionBackend {
         result
     }
 
-    fn runtime_input_from_turn_request(req: &StartTurnRequest) -> Input {
+    fn runtime_input_from_turn_request(req: &StartTurnRequest) -> Result<Input, MobError> {
         // The canonical `RuntimeTurnMetadata` carrier owns render metadata and
         // skill references; only handling/overlay retain a flat fallback on
         // `StartTurnRuntimeSemantics`.
@@ -2348,17 +2349,46 @@ impl SessionBackend {
         if turn_metadata.turn_tool_overlay.is_none() {
             turn_metadata.turn_tool_overlay = req.runtime.turn_tool_overlay.clone();
         }
+        turn_metadata
+            .system_prompts
+            .extend(req.system_prompt.iter().cloned());
         let prompt = req.prompt.clone();
-        Input::Prompt(PromptInput {
+        let (idempotency_key, correlation_id) = match &req.runtime.input_identity {
+            Some(identity) => {
+                let correlation_id =
+                    uuid::Uuid::parse_str(&identity.correlation_id).map_err(|_| {
+                        MobError::Internal(
+                            "runtime turn correlation identity is not a canonical UUID".to_string(),
+                        )
+                    })?;
+                if correlation_id.is_nil() || correlation_id.to_string() != identity.correlation_id
+                {
+                    return Err(MobError::Internal(
+                        "runtime turn correlation identity must be a canonical non-nil UUID"
+                            .to_string(),
+                    ));
+                }
+                (
+                    Some(meerkat_runtime::identifiers::IdempotencyKey::new(
+                        identity.idempotency_key.clone(),
+                    )),
+                    Some(meerkat_runtime::identifiers::CorrelationId::from_uuid(
+                        correlation_id,
+                    )),
+                )
+            }
+            None => (None, None),
+        };
+        Ok(Input::Prompt(PromptInput {
             header: InputHeader {
                 id: meerkat_core::InputId::new(),
                 timestamp: chrono::Utc::now(),
                 source: InputOrigin::Operator,
                 durability: InputDurability::Durable,
                 visibility: InputVisibility::default(),
-                idempotency_key: None,
+                idempotency_key,
                 supersession_key: None,
-                correlation_id: None,
+                correlation_id,
             },
             content: prompt,
             typed_turn_appends: req.runtime.typed_turn_appends.clone(),
@@ -2369,7 +2399,7 @@ impl SessionBackend {
             // owner per mode).
             injected_context: req.injected_context.clone(),
             turn_metadata: Some(turn_metadata),
-        })
+        }))
     }
 
     async fn admit_runtime_input(
@@ -4775,17 +4805,102 @@ pub(super) async fn prepare_prepared_runtime_session_state(
 #[cfg(test)]
 #[allow(clippy::items_after_test_module)]
 mod tests {
-    use super::{
-        DeferredTurnEventOutcome, MultiBackendProvisioner,
-        defer_turn_events_until_machine_completion, runtime_completion_to_mob_result,
-        session_turn_error_to_mob_error,
-    };
+    use super::session_turn_error_to_mob_error;
     #[cfg(feature = "runtime-adapter")]
-    use super::{MemberSessionDisposalArc, RuntimeSessionDisposalTarget, RuntimeSessionState};
+    use super::{
+        DeferredTurnEventOutcome, MemberSessionDisposalArc, MultiBackendProvisioner,
+        RuntimeSessionDisposalTarget, RuntimeSessionState, SessionBackend,
+        defer_turn_events_until_machine_completion, runtime_completion_to_mob_result,
+    };
     use crate::error::MobError;
     use meerkat_core::service::SessionError;
     use meerkat_core::types::SessionId;
     use serde_json::json;
+
+    #[cfg(feature = "runtime-adapter")]
+    #[test]
+    fn runtime_turn_input_binds_stable_external_delivery_identity() {
+        let correlation_id = uuid::Uuid::new_v4();
+        let request = meerkat_core::service::StartTurnRequest {
+            injected_context: Vec::new(),
+            prompt: meerkat_core::types::ContentInput::Text("scheduled input".to_string()),
+            system_prompt: None,
+            event_tx: None,
+            runtime: meerkat_core::service::StartTurnRuntimeSemantics::default()
+                .with_input_identity(meerkat_core::service::StartTurnInputIdentity {
+                    idempotency_key: "schedule:stable-key".to_string(),
+                    correlation_id: correlation_id.to_string(),
+                }),
+        };
+
+        let input = SessionBackend::runtime_input_from_turn_request(&request)
+            .expect("valid stable runtime input identity");
+
+        assert_eq!(
+            input
+                .header()
+                .idempotency_key
+                .as_ref()
+                .map(ToString::to_string)
+                .as_deref(),
+            Some("schedule:stable-key")
+        );
+        assert_eq!(
+            input
+                .header()
+                .correlation_id
+                .as_ref()
+                .map(ToString::to_string),
+            Some(correlation_id.to_string())
+        );
+    }
+
+    #[cfg(feature = "runtime-adapter")]
+    #[test]
+    fn runtime_turn_input_preserves_per_turn_system_prompt() {
+        let request = meerkat_core::service::StartTurnRequest {
+            injected_context: Vec::new(),
+            prompt: meerkat_core::types::ContentInput::Text("do the work".to_string()),
+            system_prompt: Some("updated member instructions".to_string()),
+            event_tx: None,
+            runtime: meerkat_core::service::StartTurnRuntimeSemantics::default(),
+        };
+
+        let input = SessionBackend::runtime_input_from_turn_request(&request)
+            .expect("per-turn System content lowers into runtime metadata");
+        let meerkat_runtime::Input::Prompt(prompt) = input else {
+            panic!("member turn must lower to a prompt input");
+        };
+        assert_eq!(
+            prompt
+                .turn_metadata
+                .expect("runtime metadata is always present")
+                .system_prompts,
+            ["updated member instructions"],
+            "runtime-backed delivery must not drop the StartTurnRequest System row"
+        );
+    }
+
+    #[cfg(feature = "runtime-adapter")]
+    #[test]
+    fn runtime_turn_input_rejects_noncanonical_external_correlation() {
+        let request = meerkat_core::service::StartTurnRequest {
+            injected_context: Vec::new(),
+            prompt: meerkat_core::types::ContentInput::Text("scheduled input".to_string()),
+            system_prompt: None,
+            event_tx: None,
+            runtime: meerkat_core::service::StartTurnRuntimeSemantics::default()
+                .with_input_identity(meerkat_core::service::StartTurnInputIdentity {
+                    idempotency_key: "schedule:stable-key".to_string(),
+                    correlation_id: "not-a-uuid".to_string(),
+                }),
+        };
+
+        assert!(
+            SessionBackend::runtime_input_from_turn_request(&request).is_err(),
+            "runtime input creation must reject correlation prose before admission"
+        );
+    }
 
     #[cfg(feature = "runtime-adapter")]
     #[tokio::test]
@@ -5846,19 +5961,19 @@ impl CoreExecutorBoundaryHandle for MobSessionRuntimeBoundaryHandle {
             .map_err(|err| CoreExecutorError::control_failed_runtime(err.to_string()))
     }
 
-    async fn prepare_system_context_at_boundary(
+    async fn prepare_transient_turn_context_at_boundary(
         &self,
         expected_run_id: &CoreRunId,
-        appends: Vec<PendingSystemContextAppend>,
+        contexts: Vec<TurnRequestContext>,
     ) -> Result<
         meerkat_core::lifecycle::CoreBoundaryStageOutput,
         meerkat_core::CoreBoundaryStageError,
     > {
         self.session_service
-            .prepare_runtime_system_context_for_active_turn(
+            .prepare_transient_turn_context_for_active_turn(
                 &self.bridge_session_id,
                 expected_run_id,
-                appends,
+                contexts,
             )
             .await
     }
@@ -6092,28 +6207,6 @@ impl CoreExecutorInterruptHandle for MobSessionServiceInterruptHandle {
 }
 
 #[cfg(feature = "runtime-adapter")]
-fn pending_system_context_appends_for_runtime_executor(
-    appends: &[meerkat_core::lifecycle::run_primitive::ConversationContextAppend],
-) -> Vec<PendingSystemContextAppend> {
-    #[cfg(not(target_arch = "wasm32"))]
-    let accepted_at = meerkat_core::time_compat::SystemTime::now();
-    #[cfg(target_arch = "wasm32")]
-    let accepted_at = meerkat_core::time_compat::UNIX_EPOCH;
-    appends
-        .iter()
-        .map(|append| PendingSystemContextAppend {
-            content: append.content.clone(),
-            source: Some(append.key.clone()),
-            idempotency_key: Some(append.key.clone()),
-            // Durable keyed conversation context append — not a transient steer.
-            source_kind: meerkat_core::session::SystemContextSource::Normal,
-            accepted_at,
-            peer_response_terminal: None,
-        })
-        .collect()
-}
-
-#[cfg(feature = "runtime-adapter")]
 fn runtime_llm_reconfigure_request_from_primitive(
     primitive: &RunPrimitive,
 ) -> Option<meerkat_runtime::SessionLlmReconfigureRequest> {
@@ -6201,37 +6294,7 @@ impl CoreExecutor for MobSessionRuntimeExecutor {
             ));
         }
 
-        // Context-only staged primitives may land directly as runtime
-        // system-context appends, but terminal peer responses carry a typed
-        // apply intent that requires a requester reaction turn.
-        if primitive.is_context_only_apply_without_turn() {
-            let RunPrimitive::StagedInput(staged) = &primitive else {
-                return Err(CoreExecutorError::apply_failed_primitive_rejected(
-                    "context-only apply without turn requires a staged input primitive",
-                ));
-            };
-            return self
-                .session_service
-                .apply_runtime_context_appends_with_boundary(
-                    &self.bridge_session_id,
-                    run_id,
-                    pending_system_context_appends_for_runtime_executor(&staged.context_appends),
-                    staged.boundary,
-                    staged.contributing_input_ids.clone(),
-                )
-                .await
-                .map_err(|err| CoreExecutorError::apply_failed_runtime_context(err.to_string()));
-        }
-
         let contributing_input_ids = primitive.contributing_input_ids().to_vec();
-        let pre_turn_context_appends = match &primitive {
-            RunPrimitive::StagedInput(staged)
-                if primitive.is_peer_response_terminal_context_and_run() =>
-            {
-                pending_system_context_appends_for_runtime_executor(&staged.context_appends)
-            }
-            _ => Vec::new(),
-        };
         let queued_context = self
             .state
             .take_turn_context_for_inputs(&contributing_input_ids)
@@ -6262,7 +6325,6 @@ impl CoreExecutor for MobSessionRuntimeExecutor {
                 primitive
                     .turn_metadata()
                     .and_then(|meta| meta.turn_tool_overlay.clone()),
-                pre_turn_context_appends,
                 executor_turn_metadata,
             )
             .with_typed_turn_appends(primitive.typed_turn_appends()),
@@ -6320,12 +6382,25 @@ impl CoreExecutor for MobSessionRuntimeExecutor {
 
     async fn checkpoint_committed_session_snapshot(
         &mut self,
-        session_snapshot: &[u8],
+        session_snapshot: Arc<Vec<u8>>,
     ) -> Result<(), CoreExecutorError> {
         self.session_service
             .checkpoint_committed_runtime_session_snapshot_under_turn_finalization_boundary(
                 &self.bridge_session_id,
                 session_snapshot,
+            )
+            .await
+            .map_err(CoreExecutorError::apply_failed_from_session_error)
+    }
+
+    async fn acknowledge_committed_session_boundary(
+        &mut self,
+        authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+    ) -> Result<(), CoreExecutorError> {
+        self.session_service
+            .acknowledge_committed_runtime_session_boundary_under_turn_finalization_boundary(
+                &self.bridge_session_id,
+                authority,
             )
             .await
             .map_err(CoreExecutorError::apply_failed_from_session_error)
@@ -6775,13 +6850,13 @@ impl MobProvisioner for SessionBackend {
                     .as_ref()
                     .ok_or_else(|| {
                         MobError::Internal(format!(
-                            "revived session '{created_bridge_session_id}' lost its actor transaction before durable promotion"
+                            "revived session '{created_bridge_session_id}' lost its actor transaction before RuntimeStore authorization"
                         ))
                     })?
                     .prepared()
                     .map_err(|error| {
                     MobError::Internal(format!(
-                        "revived session '{created_bridge_session_id}' lost its exact prepared materialization before durable promotion: {error}"
+                        "revived session '{created_bridge_session_id}' lost its exact prepared materialization before RuntimeStore authorization: {error}"
                     ))
                 })?;
                 let commit_lease = prepared
@@ -6792,23 +6867,23 @@ impl MobProvisioner for SessionBackend {
                             "failed to acquire exact archived-resume commit lease for '{created_bridge_session_id}': {error}"
                         ))
                     })?;
-                let mut promoted_lease = backend.session_service
-                    .promote_revivable_retired_session(
+                let mut authorized_lease = backend.session_service
+                    .authorize_revivable_retired_session(
                         &created_bridge_session_id,
                         commit_lease,
                     )
                     .await
                     .map_err(|error| {
                         MobError::Internal(format!(
-                            "failed to promote revived durable session document '{created_bridge_session_id}': {error}"
+                            "failed to authorize revived durable session '{created_bridge_session_id}' against the shared RuntimeStore: {error}"
                         ))
                     })?;
-                promoted_lease
+                authorized_lease
                     .reset_retired_runtime()
                     .await
                     .map_err(|error| {
                         MobError::Internal(format!(
-                            "failed to promote revived durable session '{created_bridge_session_id}' to idle: {error}"
+                            "failed to reset revived durable session '{created_bridge_session_id}' to idle: {error}"
                         ))
                     })?;
                 session_origin = ProvisionSessionOrigin::RevivedRetired;
@@ -7204,12 +7279,19 @@ impl MobProvisioner for SessionBackend {
             self.ops_adapter
                 .report_member_progress(member_ref, "turn dispatched")
                 .await?;
-            let input = Self::runtime_input_from_turn_request(&req);
+            let input = Self::runtime_input_from_turn_request(&req)?;
             return self
                 .execute_runtime_input(&session_id, input, req.event_tx)
                 .await;
         }
 
+        if req.runtime.input_identity.is_some() {
+            return Err(MobError::UnsupportedForMode {
+                mode: crate::MobRuntimeMode::TurnDriven,
+                reason: "stable external input identity requires a runtime-backed member"
+                    .to_string(),
+            });
+        }
         self.session_service
             .start_turn(&session_id, req)
             .await
@@ -7241,7 +7323,7 @@ impl MobProvisioner for SessionBackend {
                 session_id = %session_id,
                 "SessionBackend::admit_turn building runtime input"
             );
-            let input = Self::runtime_input_from_turn_request(&req);
+            let input = Self::runtime_input_from_turn_request(&req)?;
             tracing::debug!(
                 session_id = %session_id,
                 input_id = %input.id(),
@@ -7252,6 +7334,13 @@ impl MobProvisioner for SessionBackend {
                 .await;
         }
 
+        if req.runtime.input_identity.is_some() {
+            return Err(MobError::UnsupportedForMode {
+                mode: crate::MobRuntimeMode::TurnDriven,
+                reason: "stable external input identity requires a runtime-backed member"
+                    .to_string(),
+            });
+        }
         let session_service = self.session_service.clone();
         let task_session_id = session_id.clone();
         let mut task = tokio::spawn(async move {
@@ -7284,7 +7373,7 @@ impl MobProvisioner for SessionBackend {
             self.ops_adapter
                 .report_member_progress(member_ref, "turn dispatched")
                 .await?;
-            let input = Self::runtime_input_from_turn_request(&req);
+            let input = Self::runtime_input_from_turn_request(&req)?;
             return self
                 .admit_runtime_input(
                     &session_id,
@@ -7296,6 +7385,13 @@ impl MobProvisioner for SessionBackend {
                 .await;
         }
 
+        if req.runtime.input_identity.is_some() {
+            return Err(MobError::UnsupportedForMode {
+                mode: crate::MobRuntimeMode::TurnDriven,
+                reason: "stable external input identity requires a runtime-backed member"
+                    .to_string(),
+            });
+        }
         if let Some(llm_identity_applied_tx) = llm_identity_applied_tx {
             let _ = llm_identity_applied_tx.send(Ok(None));
         }
@@ -7346,7 +7442,7 @@ impl MobProvisioner for SessionBackend {
                 operation_id = %operation_id,
                 "SessionBackend::admit_turn_for_operation reported member progress"
             );
-            let input = Self::runtime_input_from_turn_request(&req);
+            let input = Self::runtime_input_from_turn_request(&req)?;
             tracing::debug!(
                 session_id = %session_id,
                 input_id = %input.id(),
@@ -9620,7 +9716,9 @@ impl MobProvisioner for MultiBackendProvisioner {
                 expected_member: Some(request.expected_member.clone()),
                 // Flow steps carry no supervisor-attached injected context;
                 // the member-side admission rejects a non-empty carrier.
+                system_prompt: None,
                 injected_context: Vec::new(),
+                transient_turn_context: None,
                 turn: Some(request.directive.clone()),
                 outcome_tracking: None,
             },
@@ -10664,8 +10762,14 @@ fn plain_delivery_payload(
         content: req.prompt.clone(),
         handling_mode: req.runtime.handling_mode,
         objective_id: turn_request_objective_id(req),
+        system_prompt: req.system_prompt.clone(),
         expected_member,
         injected_context: req.injected_context.clone(),
+        transient_turn_context: req
+            .runtime
+            .turn_metadata
+            .as_ref()
+            .and_then(|metadata| metadata.transient_turn_context.clone()),
         turn: None,
         outcome_tracking,
     }

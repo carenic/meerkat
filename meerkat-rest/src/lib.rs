@@ -66,9 +66,7 @@ use meerkat_core::lifecycle::core_executor::{
     CoreApplyOutput, CoreExecutor, CoreExecutorBoundaryHandle, CoreExecutorError,
     CoreExecutorInterruptHandle, CoreExecutorPostStopCleanupHandle, CoreExecutorPublicationHandle,
 };
-use meerkat_core::lifecycle::run_primitive::{
-    ConversationContextAppend, CoreRenderable, RunApplyBoundary, RunPrimitive,
-};
+use meerkat_core::lifecycle::run_primitive::{CoreRenderable, RunApplyBoundary, RunPrimitive};
 use meerkat_core::service::{
     AppendSystemContextRequest as SvcAppendSystemContextRequest,
     CreateSessionRequest as SvcCreateSessionRequest, DeferredPromptPolicy, InitialTurnPolicy,
@@ -77,9 +75,8 @@ use meerkat_core::service::{
 };
 use meerkat_core::{
     Config, ConfigDelta, ConfigEnvelope, ConfigEnvelopePolicy, ConfigStore, ContentInput,
-    FileConfigStore, HookRunOverrides, PendingSystemContextAppend, Provider, RealmSelection,
-    RuntimeBootstrap, SessionLlmIdentity, ToolCategoryOverride, agent_event_type,
-    format_verbose_event,
+    FileConfigStore, HookRunOverrides, Provider, RealmSelection, RuntimeBootstrap,
+    SessionLlmIdentity, ToolCategoryOverride, agent_event_type, format_verbose_event,
 };
 #[cfg(feature = "mob")]
 use meerkat_mob::MobSessionService as _;
@@ -258,6 +255,24 @@ impl CoreExecutorBoundaryHandle for RestSessionRuntimeBoundaryHandle {
                 err => Err(err),
             })
             .map_err(|err| CoreExecutorError::control_failed_runtime(err.to_string()))
+    }
+
+    async fn prepare_transient_turn_context_at_boundary(
+        &self,
+        expected_run_id: &meerkat_core::lifecycle::RunId,
+        contexts: Vec<meerkat_core::lifecycle::run_primitive::TurnRequestContext>,
+    ) -> Result<
+        meerkat_core::lifecycle::CoreBoundaryStageOutput,
+        meerkat_core::lifecycle::CoreBoundaryStageError,
+    > {
+        self.context
+            .session_service
+            .prepare_live_transient_turn_context_boundary(
+                &self.session_id,
+                expected_run_id,
+                contexts,
+            )
+            .await
     }
 }
 
@@ -1364,23 +1379,6 @@ async fn require_rest_session_exists_for_read(
         })
 }
 
-fn pending_system_context_appends(
-    appends: &[ConversationContextAppend],
-) -> Vec<PendingSystemContextAppend> {
-    let accepted_at = meerkat_core::time_compat::SystemTime::now();
-    appends
-        .iter()
-        .map(|append| PendingSystemContextAppend {
-            content: append.content.clone(),
-            source: Some(append.key.clone()),
-            idempotency_key: Some(append.key.clone()),
-            accepted_at,
-            source_kind: meerkat_core::session::SystemContextSource::Normal,
-            peer_response_terminal: None,
-        })
-        .collect()
-}
-
 /// `config` MUST be the composed effective config (see
 /// [`effective_config_for_state`]) so an inherited self-hosted/custom model alias
 /// resolves the same way the agent build path sees it.
@@ -1631,61 +1629,6 @@ async fn apply_runtime_turn_under_runtime_turn_boundary(
         });
     }
 
-    // Context-only staged primitives may land directly as runtime
-    // system-context appends, but terminal peer responses carry a typed apply
-    // intent that requires a requester reaction turn.
-    if primitive.is_context_only_apply_without_turn() {
-        let RunPrimitive::StagedInput(staged) = primitive else {
-            return Err(SessionError::Agent(
-                meerkat_core::error::AgentError::InternalError(
-                    "context-only apply without turn was not carried by a staged primitive"
-                        .to_string(),
-                ),
-            ));
-        };
-        let appends = pending_system_context_appends(&staged.context_appends);
-        let boundary = primitive.apply_boundary();
-        let contributing_input_ids = staged.contributing_input_ids.clone();
-        let mut pre_admission = take_rest_runtime_pre_admission(
-            &context.runtime_pre_admissions,
-            session_id,
-            &contributing_input_ids,
-        )
-        .await;
-        let apply_result = if let Some(admission) = pre_admission.take() {
-            match context
-                .session_service
-                .apply_runtime_context_appends_with_recoverable_reserved_admission(
-                    session_id,
-                    run_id.clone(),
-                    appends.clone(),
-                    boundary,
-                    contributing_input_ids.clone(),
-                    admission,
-                )
-                .await
-            {
-                Ok(output) => Ok(output),
-                Err((error, admission)) => {
-                    drop(admission);
-                    Err(error)
-                }
-            }
-        } else {
-            context
-                .session_service
-                .apply_runtime_context_appends_with_boundary(
-                    session_id,
-                    run_id.clone(),
-                    appends.clone(),
-                    boundary,
-                    contributing_input_ids.clone(),
-                )
-                .await
-        };
-        return apply_result;
-    }
-
     let (event_tx, event_rx) = mpsc::channel::<EventEnvelope<AgentEvent>>(100);
     let forwarder = spawn_event_forwarder(
         event_rx,
@@ -1694,14 +1637,6 @@ async fn apply_runtime_turn_under_runtime_turn_boundary(
         false,
     );
     let typed_turn_appends = primitive.typed_turn_appends();
-    let pre_turn_context_appends = match primitive {
-        RunPrimitive::StagedInput(staged)
-            if primitive.is_peer_response_terminal_context_and_run() =>
-        {
-            pending_system_context_appends(&staged.context_appends)
-        }
-        _ => Vec::new(),
-    };
     let mut svc_req = SvcStartTurnRequest {
         injected_context: Vec::new(),
         prompt: prompt.clone(),
@@ -1712,7 +1647,6 @@ async fn apply_runtime_turn_under_runtime_turn_boundary(
             primitive
                 .turn_metadata()
                 .and_then(|meta| meta.turn_tool_overlay.clone()),
-            pre_turn_context_appends.clone(),
             primitive.turn_metadata().cloned(),
         )
         .with_typed_turn_appends(typed_turn_appends.clone()),
@@ -1927,13 +1861,27 @@ impl CoreExecutor for RestSessionRuntimeExecutor {
 
     async fn checkpoint_committed_session_snapshot(
         &mut self,
-        session_snapshot: &[u8],
+        session_snapshot: Arc<Vec<u8>>,
     ) -> Result<(), CoreExecutorError> {
         self.context
             .session_service
             .checkpoint_committed_runtime_session_snapshot_under_runtime_turn_boundary(
                 &self.session_id,
                 session_snapshot,
+            )
+            .await
+            .map_err(CoreExecutorError::apply_failed_from_session_error)
+    }
+
+    async fn acknowledge_committed_session_boundary(
+        &mut self,
+        authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+    ) -> Result<(), CoreExecutorError> {
+        self.context
+            .session_service
+            .acknowledge_committed_runtime_session_boundary_under_runtime_turn_boundary(
+                &self.session_id,
+                authority,
             )
             .await
             .map_err(CoreExecutorError::apply_failed_from_session_error)
@@ -2099,13 +2047,16 @@ fn rest_continue_requires_rebuild(req: &ContinueSessionRequest) -> bool {
         || req.provider.is_some()
         || req.auth_binding.is_some()
         || req.max_tokens.is_some()
-        || req.system_prompt.is_some()
         || req.output_schema.is_some()
         || req.structured_output_retries.is_some()
         || req.hooks_override.is_some()
         || req.enable_web_search.is_some()
         || req.comms_name.is_some()
         || req.peer_meta.is_some()
+}
+
+fn rest_continue_system_prompts(req: &ContinueSessionRequest) -> Vec<String> {
+    req.system_prompt.iter().cloned().collect()
 }
 
 fn create_session_resume_override_mask(
@@ -2160,7 +2111,7 @@ async fn canonical_skill_keys_for_state(
 /// Continue session request — canonical wire contract (K20).
 pub use meerkat_contracts::wire::RestContinueSessionRequest as ContinueSessionRequest;
 
-/// Append runtime system context to a session — canonical wire contract
+/// Append one ordinary durable ordered System message to a session — canonical wire contract
 /// (K20). The body is the typed [`CoreRenderable`] owner rather than a bare
 /// `text` string.
 pub use meerkat_contracts::wire::RestAppendSystemContextRequest as AppendSystemContextRequest;
@@ -4611,6 +4562,7 @@ fn help_request_to_create_session(
     Ok(CreateSessionRequest {
         prompt: prompt.into(),
         injected_context: None,
+        transient_turn_context: None,
         system_prompt: meerkat::SystemPromptOverride::Set(
             meerkat::help::help_system_prompt().to_string(),
         ),
@@ -4988,6 +4940,7 @@ async fn create_session_inner(
                     skill_references,
                     turn_tool_overlay: None,
                     additional_instructions: None,
+                    transient_turn_context: req.transient_turn_context.clone(),
                     ..Default::default()
                 },
             ),
@@ -5582,7 +5535,7 @@ fn system_context_error_to_api(err: SessionControlError) -> ApiError {
     }
 }
 
-/// Append runtime system context to a session.
+/// Append one ordinary durable ordered System message to a session.
 async fn append_system_context(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -5593,8 +5546,6 @@ async fn append_system_context(
         content: req.content,
         source: req.source,
         idempotency_key: req.idempotency_key,
-        source_kind: meerkat_core::session::SystemContextSource::Normal,
-        peer_response_terminal: None,
     };
     let result = state
         .session_service
@@ -5911,7 +5862,7 @@ async fn continue_session_inner(
             provider: llm_binding.provider,
             override_comms: Default::default(),
             self_hosted_server_id: llm_binding.self_hosted_server_id,
-            output_schema: req.output_schema,
+            output_schema: req.output_schema.clone(),
             structured_output_retries: req.structured_output_retries,
             hooks_override: req.hooks_override.clone().unwrap_or_default(),
             comms_name: req.comms_name.clone(),
@@ -6000,10 +5951,10 @@ async fn continue_session_inner(
             injected_context: Vec::new(),
             model,
             prompt: turn_prompt.clone(),
-            system_prompt: match req.system_prompt.clone() {
-                Some(prompt) => meerkat::SystemPromptOverride::Set(prompt),
-                None => meerkat::SystemPromptOverride::Inherit,
-            },
+            // A continue request authors an ordinary ordered System at the
+            // admitted turn boundary. Rebuild materialization only restores
+            // persisted build intent; it must not consume the turn message.
+            system_prompt: meerkat::SystemPromptOverride::Inherit,
             max_tokens: req.max_tokens.or(Some(state.max_tokens)),
             event_tx: Some(caller_event_tx.clone()),
             initial_turn: InitialTurnPolicy::Defer,
@@ -6149,6 +6100,7 @@ async fn continue_session_inner(
                     meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
                         keep_alive: resolve_turn_keep_alive_policy(keep_alive_override),
                         skill_references: skill_references.clone(),
+                        system_prompts: rest_continue_system_prompts(&req),
                         turn_tool_overlay: req
                             .turn_tool_overlay
                             .clone()
@@ -6156,6 +6108,7 @@ async fn continue_session_inner(
                         additional_instructions: resolve_turn_additional_instructions(
                             req.additional_instructions.clone(),
                         ),
+                        transient_turn_context: req.transient_turn_context.clone(),
                         ..Default::default()
                     },
                 ),
@@ -6461,6 +6414,7 @@ async fn continue_session_inner(
                     meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
                         keep_alive: resolve_turn_keep_alive_policy(keep_alive_override),
                         skill_references: skill_references.clone(),
+                        system_prompts: rest_continue_system_prompts(&req),
                         turn_tool_overlay: req
                             .turn_tool_overlay
                             .clone()
@@ -6468,6 +6422,7 @@ async fn continue_session_inner(
                         additional_instructions: resolve_turn_additional_instructions(
                             req.additional_instructions.clone(),
                         ),
+                        transient_turn_context: req.transient_turn_context.clone(),
                         ..Default::default()
                     },
                 ),
@@ -7656,12 +7611,164 @@ mod tests {
         fail_delete: AtomicBool,
     }
 
+    // This is a fault-injection decorator, not a reduced-capability store.
+    // Keep the inner store's typed session, input, and lifecycle authority
+    // surfaces intact; RuntimeStore's Unsupported defaults are fail-closed
+    // capability declarations and are not transparent forwarding behavior.
     #[async_trait]
     impl meerkat_runtime::RuntimeStore for FailDeleteOpsLifecycleOnceStore {
+        fn session_authority_ops(&self) -> &dyn meerkat_runtime::store::RuntimeSessionAuthorityOps {
+            self.inner.session_authority_ops()
+        }
+
+        fn session_persistence_profile(
+            &self,
+        ) -> meerkat_runtime::store::RuntimeSessionPersistenceProfile {
+            meerkat_runtime::RuntimeStore::session_persistence_profile(self.inner.as_ref())
+        }
+
+        fn session_boundary_authority_read_cost(
+            &self,
+        ) -> meerkat_runtime::store::RuntimeSessionAuthorityReadCost {
+            self.inner.session_boundary_authority_read_cost()
+        }
+
+        async fn commit_prepared_session_boundary(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+            request: meerkat_runtime::store::PreparedRuntimeSessionCommit,
+        ) -> Result<
+            meerkat_runtime::store::PreparedRuntimeSessionCommitResult,
+            meerkat_runtime::RuntimeStoreError,
+        > {
+            self.inner
+                .commit_prepared_session_boundary(runtime_id, request)
+                .await
+        }
+
+        async fn load_session_boundary_authority(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        ) -> Result<
+            Option<meerkat_runtime::store::RuntimeSessionAuthority>,
+            meerkat_runtime::RuntimeStoreError,
+        > {
+            self.inner.load_session_boundary_authority(runtime_id).await
+        }
+
+        async fn load_whole_blob_store_authority(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        ) -> Result<
+            Option<meerkat_runtime::store::WholeBlobStoreAuthority>,
+            meerkat_runtime::RuntimeStoreError,
+        > {
+            self.inner.load_whole_blob_store_authority(runtime_id).await
+        }
+
+        async fn load_committed_whole_blob_snapshot(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        ) -> Result<
+            Option<meerkat_runtime::store::CommittedWholeBlobSnapshot>,
+            meerkat_runtime::RuntimeStoreError,
+        > {
+            self.inner
+                .load_committed_whole_blob_snapshot(runtime_id)
+                .await
+        }
+
+        async fn commit_prepared_whole_blob_snapshot_cas(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+            prepared: meerkat_runtime::store::PreparedWholeBlobSnapshotCas,
+        ) -> Result<
+            meerkat_runtime::store::WholeBlobSnapshotCasOutcome,
+            meerkat_runtime::RuntimeStoreError,
+        > {
+            self.inner
+                .commit_prepared_whole_blob_snapshot_cas(runtime_id, prepared)
+                .await
+        }
+
+        async fn delete_runtime_session_catalog_entry(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        ) -> Result<(), meerkat_runtime::RuntimeStoreError> {
+            self.inner
+                .delete_runtime_session_catalog_entry(runtime_id)
+                .await
+        }
+
+        async fn load_runtime_session_catalog_entry(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        ) -> Result<
+            Option<meerkat_runtime::store::RuntimeSessionCatalogEntry>,
+            meerkat_runtime::RuntimeStoreError,
+        > {
+            self.inner
+                .load_runtime_session_catalog_entry(runtime_id)
+                .await
+        }
+
+        async fn list_runtime_session_catalog_entries(
+            &self,
+            filter: meerkat_core::SessionFilter,
+        ) -> Result<
+            Vec<meerkat_runtime::store::RuntimeSessionCatalogEntry>,
+            meerkat_runtime::RuntimeStoreError,
+        > {
+            self.inner
+                .list_runtime_session_catalog_entries(filter)
+                .await
+        }
+
+        async fn write_prepared_whole_blob_provisional_tail(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+            prepared: meerkat_runtime::store::PreparedWholeBlobProvisionalTail,
+        ) -> Result<
+            meerkat_runtime::store::WholeBlobProvisionalTailAuthority,
+            meerkat_runtime::RuntimeStoreError,
+        > {
+            self.inner
+                .write_prepared_whole_blob_provisional_tail(runtime_id, prepared)
+                .await
+        }
+
+        async fn load_whole_blob_provisional_tail(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        ) -> Result<
+            Option<meerkat_runtime::store::CommittedWholeBlobProvisionalTail>,
+            meerkat_runtime::RuntimeStoreError,
+        > {
+            self.inner
+                .load_whole_blob_provisional_tail(runtime_id)
+                .await
+        }
+
+        async fn discard_whole_blob_provisional_tail(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+            expected: &meerkat_runtime::store::WholeBlobProvisionalTailAuthority,
+        ) -> Result<bool, meerkat_runtime::RuntimeStoreError> {
+            self.inner
+                .discard_whole_blob_provisional_tail(runtime_id, expected)
+                .await
+        }
+
         fn supports_compaction_projection_outbox(&self) -> bool {
             meerkat_runtime::RuntimeStore::supports_compaction_projection_outbox(
                 self.inner.as_ref(),
             )
+        }
+
+        fn input_state_batch_cas_implementation_profile(
+            &self,
+        ) -> meerkat_runtime::store::InputStateBatchCasImplementationProfile {
+            self.inner.input_state_batch_cas_implementation_profile()
         }
 
         async fn observe_machine_lifecycle(
@@ -7688,10 +7795,30 @@ mod tests {
                 .await
         }
 
+        async fn compare_and_swap_machine_lifecycle_with_fence(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+            expected: meerkat_runtime::store::MachineLifecycleExpectedVersion,
+            replacement: meerkat_runtime::store::MachineLifecycleCommit,
+            write_fence: Arc<dyn meerkat_runtime::store::RuntimeStoreWriteFence>,
+        ) -> Result<
+            meerkat_runtime::store::FencedMachineLifecycleCasOutcome,
+            meerkat_runtime::RuntimeStoreError,
+        > {
+            self.inner
+                .compare_and_swap_machine_lifecycle_with_fence(
+                    runtime_id,
+                    expected,
+                    replacement,
+                    write_fence,
+                )
+                .await
+        }
+
         async fn commit_session_snapshot(
             &self,
             runtime_id: &meerkat_runtime::LogicalRuntimeId,
-            session_delta: meerkat_runtime::store::SessionDelta,
+            session_delta: meerkat_runtime::store::SerializedSessionSnapshot,
         ) -> Result<(), meerkat_runtime::RuntimeStoreError> {
             meerkat_runtime::RuntimeStore::commit_session_snapshot(
                 self.inner.as_ref(),
@@ -7701,10 +7828,23 @@ mod tests {
             .await
         }
 
+        async fn commit_prepared_whole_blob_rewrite_boundary(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+            boundary: meerkat_runtime::store::PreparedWholeBlobRewriteStoreParts,
+        ) -> Result<
+            meerkat_runtime::store::WholeBlobStoreAuthority,
+            meerkat_runtime::RuntimeStoreError,
+        > {
+            self.inner
+                .commit_prepared_whole_blob_rewrite_boundary(runtime_id, boundary)
+                .await
+        }
+
         async fn atomic_apply(
             &self,
             runtime_id: &meerkat_runtime::LogicalRuntimeId,
-            session_delta: Option<meerkat_runtime::store::SessionDelta>,
+            session_delta: Option<meerkat_runtime::store::SerializedSessionSnapshot>,
             receipt: meerkat_core::lifecycle::RunBoundaryReceipt,
             input_updates: Vec<meerkat_runtime::input_state::InputStatePersistenceRecord>,
             session_store_key: Option<SessionId>,
@@ -7720,12 +7860,43 @@ mod tests {
             .await
         }
 
+        async fn atomic_apply_with_machine_lifecycle(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+            session_delta: meerkat_runtime::store::SerializedSessionSnapshot,
+            receipt: meerkat_core::lifecycle::RunBoundaryReceipt,
+            machine_lifecycle: meerkat_runtime::store::MachineLifecycleCommit,
+            input_updates: Vec<meerkat_runtime::input_state::InputStatePersistenceRecord>,
+            session_store_key: SessionId,
+        ) -> Result<(), meerkat_runtime::RuntimeStoreError> {
+            self.inner
+                .atomic_apply_with_machine_lifecycle(
+                    runtime_id,
+                    session_delta,
+                    receipt,
+                    machine_lifecycle,
+                    input_updates,
+                    session_store_key,
+                )
+                .await
+        }
+
         async fn load_input_states(
             &self,
             runtime_id: &meerkat_runtime::LogicalRuntimeId,
         ) -> Result<Vec<meerkat_runtime::InputStateRow>, meerkat_runtime::RuntimeStoreError>
         {
             meerkat_runtime::RuntimeStore::load_input_states(self.inner.as_ref(), runtime_id).await
+        }
+
+        async fn load_input_states_with_versions(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        ) -> Result<
+            meerkat_runtime::store::PreparedRecoveryInputSnapshot,
+            meerkat_runtime::RuntimeStoreError,
+        > {
+            self.inner.load_input_states_with_versions(runtime_id).await
         }
 
         async fn load_boundary_receipt(
@@ -7746,10 +7917,49 @@ mod tests {
             .await
         }
 
+        async fn load_committed_boundary_receipts(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+            run_id: &meerkat_core::RunId,
+        ) -> Result<
+            Vec<meerkat_core::lifecycle::RunBoundaryReceipt>,
+            meerkat_runtime::RuntimeStoreError,
+        > {
+            self.inner
+                .load_committed_boundary_receipts(runtime_id, run_id)
+                .await
+        }
+
+        async fn load_durable_tail_recovery_receipts(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+            run_id: &meerkat_core::RunId,
+        ) -> Result<
+            Vec<meerkat_runtime::store::PreparedRecoveryReceiptSource>,
+            meerkat_runtime::RuntimeStoreError,
+        > {
+            self.inner
+                .load_durable_tail_recovery_receipts(runtime_id, run_id)
+                .await
+        }
+
+        async fn load_committed_recovery_boundary(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+            candidate_id: &str,
+        ) -> Result<
+            Option<meerkat_runtime::store::CommittedRecoveryBoundary>,
+            meerkat_runtime::RuntimeStoreError,
+        > {
+            self.inner
+                .load_committed_recovery_boundary(runtime_id, candidate_id)
+                .await
+        }
+
         async fn load_session_snapshot(
             &self,
             runtime_id: &meerkat_runtime::LogicalRuntimeId,
-        ) -> Result<Option<Vec<u8>>, meerkat_runtime::RuntimeStoreError> {
+        ) -> Result<Option<std::sync::Arc<Vec<u8>>>, meerkat_runtime::RuntimeStoreError> {
             meerkat_runtime::RuntimeStore::load_session_snapshot(self.inner.as_ref(), runtime_id)
                 .await
         }
@@ -7815,6 +8025,15 @@ mod tests {
             .await
         }
 
+        async fn is_runtime_projection_quarantined(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        ) -> Result<bool, meerkat_runtime::RuntimeStoreError> {
+            self.inner
+                .is_runtime_projection_quarantined(runtime_id)
+                .await
+        }
+
         async fn persist_input_state(
             &self,
             runtime_id: &meerkat_runtime::LogicalRuntimeId,
@@ -7826,6 +8045,88 @@ mod tests {
                 state,
             )
             .await
+        }
+
+        async fn persist_input_states_atomically(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+            states: &[meerkat_runtime::input_state::InputStatePersistenceRecord],
+        ) -> Result<(), meerkat_runtime::RuntimeStoreError> {
+            self.inner
+                .persist_input_states_atomically(runtime_id, states)
+                .await
+        }
+
+        async fn compare_and_swap_input_states_atomically(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+            expected: &[meerkat_runtime::input_state::StoredInputState],
+            replacements: &[meerkat_runtime::input_state::InputStatePersistenceRecord],
+        ) -> Result<
+            meerkat_runtime::store::InputStateBatchCasOutcome,
+            meerkat_runtime::RuntimeStoreError,
+        > {
+            self.inner
+                .compare_and_swap_input_states_atomically(runtime_id, expected, replacements)
+                .await
+        }
+
+        async fn compare_and_swap_input_states_atomically_with_fence(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+            expected: &[meerkat_runtime::input_state::StoredInputState],
+            replacements: &[meerkat_runtime::input_state::InputStatePersistenceRecord],
+            write_fence: Arc<dyn meerkat_runtime::store::RuntimeStoreWriteFence>,
+        ) -> Result<
+            meerkat_runtime::store::FencedInputStateBatchCasOutcome,
+            meerkat_runtime::RuntimeStoreError,
+        > {
+            self.inner
+                .compare_and_swap_input_states_atomically_with_fence(
+                    runtime_id,
+                    expected,
+                    replacements,
+                    write_fence,
+                )
+                .await
+        }
+
+        async fn compare_and_swap_recovery_input_states_atomically(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+            expected_revision: meerkat_runtime::store::RecoveryInputSetRevision,
+            mutations: &[meerkat_runtime::store::RecoveryInputStateMutation],
+        ) -> Result<
+            meerkat_runtime::store::InputStateBatchCasOutcome,
+            meerkat_runtime::RuntimeStoreError,
+        > {
+            self.inner
+                .compare_and_swap_recovery_input_states_atomically(
+                    runtime_id,
+                    expected_revision,
+                    mutations,
+                )
+                .await
+        }
+
+        async fn compare_and_swap_recovery_input_states_atomically_with_fence(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+            expected_revision: meerkat_runtime::store::RecoveryInputSetRevision,
+            mutations: &[meerkat_runtime::store::RecoveryInputStateMutation],
+            write_fence: Arc<dyn meerkat_runtime::store::RuntimeStoreWriteFence>,
+        ) -> Result<
+            meerkat_runtime::store::FencedInputStateBatchCasOutcome,
+            meerkat_runtime::RuntimeStoreError,
+        > {
+            self.inner
+                .compare_and_swap_recovery_input_states_atomically_with_fence(
+                    runtime_id,
+                    expected_revision,
+                    mutations,
+                    write_fence,
+                )
+                .await
         }
 
         async fn load_input_state(
@@ -7842,6 +8143,43 @@ mod tests {
                 input_id,
             )
             .await
+        }
+
+        async fn load_input_state_by_idempotency_key(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+            key: &meerkat_runtime::IdempotencyKey,
+        ) -> Result<
+            Option<meerkat_runtime::store::ExactInputStateObservation>,
+            meerkat_runtime::RuntimeStoreError,
+        > {
+            self.inner
+                .load_input_state_by_idempotency_key(runtime_id, key)
+                .await
+        }
+
+        async fn load_input_states_by_ids(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+            input_ids: &[meerkat_core::InputId],
+        ) -> Result<
+            Vec<Option<meerkat_runtime::input_state::StoredInputState>>,
+            meerkat_runtime::RuntimeStoreError,
+        > {
+            self.inner
+                .load_input_states_by_ids(runtime_id, input_ids)
+                .await
+        }
+
+        async fn load_pending_terminal_owner_ids_page(
+            &self,
+            runtime_id: &meerkat_runtime::LogicalRuntimeId,
+            after: Option<&meerkat_core::InputId>,
+            limit: usize,
+        ) -> Result<Vec<meerkat_core::InputId>, meerkat_runtime::RuntimeStoreError> {
+            self.inner
+                .load_pending_terminal_owner_ids_page(runtime_id, after, limit)
+                .await
         }
 
         async fn load_machine_lifecycle_record(
@@ -8366,83 +8704,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rest_context_only_runtime_apply_preserves_run_checkpoint_boundary() {
-        let temp = TempDir::new().unwrap();
-        let mut state = AppState::load_from(temp.path().to_path_buf())
-            .await
-            .unwrap();
-        state.llm_client_override = Some(Arc::new(MockLlmClient));
-        let pre_session = Session::new();
-        let bindings = state
-            .runtime_adapter
-            .prepare_bindings(pre_session.id().clone())
-            .await
-            .expect("runtime bindings should prepare");
-        let create_result = state
-            .session_service
-            .create_session(SvcCreateSessionRequest {
-                injected_context: Vec::new(),
-                model: resolved_default_model(&state).await,
-                prompt: "Hello".to_string().into(),
-                system_prompt: meerkat::SystemPromptOverride::Inherit,
-                max_tokens: Some(state.max_tokens),
-                event_tx: None,
-                initial_turn: InitialTurnPolicy::Defer,
-                deferred_prompt_policy: DeferredPromptPolicy::Discard,
-                build: Some(SessionBuildOptions {
-                    custom_models: std::collections::BTreeMap::new(),
-                    image_generation_provider: None,
-                    auto_compact_threshold_override: None,
-                    resume_session: Some(pre_session),
-                    llm_client_override: state
-                        .llm_client_override
-                        .clone()
-                        .map(encode_llm_client_override_for_service),
-                    runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
-                    ..Default::default()
-                }),
-                labels: None,
-            })
-            .await
-            .expect("deferred session create should succeed");
-        let session_id = create_result.session_id;
-        let input_id = meerkat_core::lifecycle::InputId::new();
-        let primitive =
-            RunPrimitive::StagedInput(meerkat_core::lifecycle::run_primitive::StagedRunInput {
-                boundary: RunApplyBoundary::RunCheckpoint,
-                appends: Vec::new(),
-                context_appends: vec![ConversationContextAppend {
-                    key: "ctx-rest-checkpoint-boundary".to_string(),
-                    content: CoreRenderable::Text {
-                        text: "checkpoint-only runtime context".to_string(),
-                    },
-                }],
-                contributing_input_ids: vec![input_id.clone()],
-                turn_metadata: Some(
-                    meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
-                        execution_kind: Some(
-                            meerkat_core::lifecycle::RuntimeExecutionKind::ResumePending,
-                        ),
-                        ..Default::default()
-                    },
-                ),
-            });
-
-        let output = super::apply_runtime_turn(
-            &state.runtime_executor_context(),
-            &session_id,
-            meerkat_core::RunId::new(),
-            &primitive,
-            ContentInput::Text(String::new()),
-        )
-        .await
-        .expect("context-only apply should succeed");
-
-        assert_eq!(output.receipt.boundary, RunApplyBoundary::RunCheckpoint);
-        assert_eq!(output.receipt.contributing_input_ids, vec![input_id]);
-    }
-
-    #[tokio::test]
     async fn rest_app_state_reopen_preserves_persistent_oauth_flow_authority() {
         let temp = TempDir::new().unwrap();
         let mut bootstrap = RuntimeBootstrap::default();
@@ -8493,137 +8754,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn rest_context_only_runtime_apply_recovers_persisted_live_missing_session() {
-        let temp = TempDir::new().unwrap();
-        let mut state = AppState::load_from(temp.path().to_path_buf())
-            .await
-            .unwrap();
-        state.llm_client_override = Some(Arc::new(MockLlmClient));
-        let created = state
-            .session_service
-            .create_session(SvcCreateSessionRequest {
-                injected_context: Vec::new(),
-                model: resolved_default_model(&state).await,
-                prompt: "Hello".to_string().into(),
-                system_prompt: meerkat::SystemPromptOverride::Inherit,
-                max_tokens: Some(state.max_tokens),
-                event_tx: None,
-                initial_turn: InitialTurnPolicy::Defer,
-                deferred_prompt_policy: DeferredPromptPolicy::Discard,
-                build: Some(SessionBuildOptions {
-                    custom_models: std::collections::BTreeMap::new(),
-                    image_generation_provider: None,
-                    auto_compact_threshold_override: None,
-                    llm_client_override: state
-                        .llm_client_override
-                        .clone()
-                        .map(encode_llm_client_override_for_service),
-                    ..Default::default()
-                }),
-                labels: None,
-            })
-            .await
-            .expect("deferred session create should succeed");
-        let session_id = created.session_id;
-        state
-            .session_service
-            .discard_live_session(&session_id)
-            .await
-            .expect("discard live session");
-        state
-            .runtime_adapter
-            .unregister_session(&session_id)
-            .await
-            .expect("runtime session should unregister cleanly");
-        assert!(
-            !state.runtime_adapter.contains_session(&session_id).await,
-            "test must remove runtime registration before context-only recovery"
-        );
-
-        let input_id = meerkat_core::lifecycle::InputId::new();
-        let primitive =
-            RunPrimitive::StagedInput(meerkat_core::lifecycle::run_primitive::StagedRunInput {
-                boundary: RunApplyBoundary::RunCheckpoint,
-                appends: Vec::new(),
-                context_appends: vec![ConversationContextAppend {
-                    key: "ctx-rest-recovered-live-missing".to_string(),
-                    content: CoreRenderable::Text {
-                        text: "rest recovered runtime context".to_string(),
-                    },
-                }],
-                contributing_input_ids: vec![input_id.clone()],
-                turn_metadata: Some(
-                    meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
-                        execution_kind: Some(
-                            meerkat_core::lifecycle::RuntimeExecutionKind::ResumePending,
-                        ),
-                        ..Default::default()
-                    },
-                ),
-            });
-
-        let admission = state
-            .session_service
-            .reserve_runtime_turn_admission(&session_id)
-            .await
-            .expect("reserve cold REST recovery admission");
-        insert_rest_runtime_pre_admission(
-            &state.runtime_pre_admissions,
-            session_id.clone(),
-            input_id.clone(),
-            admission,
-        )
-        .await
-        .expect("record cold REST recovery admission");
-        let registration_lock = rest_runtime_registration_lock(&state, &session_id);
-        let registration_guard = registration_lock.mutex().lock().await;
-        prepare_rest_session_runtime_executor_locked(&state, &session_id, &input_id)
-            .await
-            .expect("canonical REST owner should materialize before executor attach");
-        drop(registration_guard);
-        drop(registration_lock);
-
-        let output = super::apply_runtime_turn(
-            &state.runtime_executor_context(),
-            &session_id,
-            meerkat_core::RunId::new(),
-            &primitive,
-            ContentInput::Text(String::new()),
-        )
-        .await
-        .expect("context-only apply should recover persisted session");
-
-        assert_eq!(output.receipt.boundary, RunApplyBoundary::RunCheckpoint);
-        assert_eq!(output.receipt.contributing_input_ids, vec![input_id]);
-        assert!(state.runtime_adapter.contains_session(&session_id).await);
-
-        let exported: Session = serde_json::from_slice(
-            output
-                .snapshot_bytes()
-                .expect("runtime output should carry a staged session snapshot"),
-        )
-        .expect("staged REST session snapshot should deserialize");
-        let system_context = exported
-            .messages()
-            .iter()
-            .find_map(|message| match message {
-                meerkat_core::types::Message::System(system) => Some(system.content.as_str()),
-                _ => None,
-            })
-            .unwrap_or("");
-        assert!(
-            system_context.contains("ctx-rest-recovered-live-missing")
-                && system_context.contains("rest recovered runtime context"),
-            "context-only recovery should persist REST runtime context append: {system_context}"
-        );
-        let live_export = state.session_service.export_live_session(&session_id).await;
-        assert!(
-            matches!(live_export, Err(SessionError::NotFound { .. })),
-            "context-only recovery output must wait for the machine-owned commit before exporting live truth"
-        );
-    }
-
-    #[tokio::test]
     async fn rest_apply_does_not_rematerialize_session_lost_after_preparation() {
         let temp = TempDir::new().unwrap();
         let mut state = AppState::load_from(temp.path().to_path_buf())
@@ -8665,12 +8795,12 @@ mod tests {
         let primitive =
             RunPrimitive::StagedInput(meerkat_core::lifecycle::run_primitive::StagedRunInput {
                 boundary: RunApplyBoundary::RunCheckpoint,
-                appends: Vec::new(),
-                context_appends: vec![ConversationContextAppend {
-                    key: "rest-lost-after-preparation".to_string(),
+                appends: vec![meerkat_core::lifecycle::run_primitive::ConversationAppend {
+                    role: meerkat_core::lifecycle::run_primitive::ConversationAppendRole::User,
                     content: CoreRenderable::Text {
                         text: "must not rematerialize from apply".to_string(),
                     },
+                    identity: None,
                 }],
                 contributing_input_ids: vec![meerkat_core::lifecycle::InputId::new()],
                 turn_metadata: Some(
@@ -9282,6 +9412,7 @@ mod tests {
                 &target_for_turn,
                 ContinueSessionRequest {
                     injected_context: None,
+                    transient_turn_context: None,
                     session_id: body_session_id,
                     prompt: ContentInput::Text("block while peer terminal arrives".to_string()),
                     system_prompt: None,
@@ -9482,6 +9613,7 @@ mod tests {
             &target_session_id.to_string(),
             ContinueSessionRequest {
                 injected_context: None,
+                transient_turn_context: None,
                 session_id: target_session_id.to_string(),
                 prompt: ContentInput::Text("must not enter runtime queue".to_string()),
                 system_prompt: None,
@@ -9546,6 +9678,7 @@ mod tests {
                 &target_for_continue,
                 ContinueSessionRequest {
                     injected_context: None,
+                    transient_turn_context: None,
                     session_id: target_for_continue.clone(),
                     prompt: ContentInput::Text("complete after REST waiter drops".to_string()),
                     system_prompt: None,
@@ -9688,6 +9821,7 @@ mod tests {
             &target_session_id.to_string(),
             ContinueSessionRequest {
                 injected_context: None,
+                transient_turn_context: None,
                 session_id: target_session_id.to_string(),
                 prompt: ContentInput::Text("rebuild against stopped runtime".to_string()),
                 system_prompt: None,
@@ -9786,12 +9920,13 @@ mod tests {
         let request_key = ctx.key().to_string();
         let continue_state = state.clone();
         let target_for_continue = target_session_id.to_string();
-        let continue_task = tokio::spawn(async move {
+        let mut continue_task = tokio::spawn(async move {
             Box::pin(continue_session_inner(
                 &continue_state,
                 &target_for_continue,
                 ContinueSessionRequest {
                     injected_context: None,
+                    transient_turn_context: None,
                     session_id: target_for_continue.clone(),
                     prompt: ContentInput::Text("complete after rebuild cleanup".to_string()),
                     system_prompt: None,
@@ -9816,7 +9951,23 @@ mod tests {
             .await
         });
 
-        wait_for_rest_llm_calls(&calls, 1, "rebuild continue should reach blocking LLM").await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if calls.load(AtomicOrdering::SeqCst) >= 1 {
+                    break;
+                }
+                tokio::select! {
+                    result = &mut continue_task => {
+                        panic!(
+                            "rebuild continue completed before reaching the blocking LLM: {result:?}"
+                        );
+                    }
+                    () = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+                }
+            }
+        })
+        .await
+        .expect("rebuild continue should reach the blocking LLM");
         assert!(
             state
                 .runtime_adapter
@@ -9837,7 +9988,6 @@ mod tests {
             "first cleanup pass should preserve the runtime while input is active"
         );
 
-        let mut continue_task = continue_task;
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
             loop {
                 release.add_permits(1);
@@ -9922,6 +10072,7 @@ mod tests {
             &target_session_id.to_string(),
             ContinueSessionRequest {
                 injected_context: None,
+                transient_turn_context: None,
                 session_id: target_session_id.to_string(),
                 prompt: ContentInput::Text("must not persist keep_alive".to_string()),
                 system_prompt: None,
@@ -9995,6 +10146,7 @@ mod tests {
             &target_session_id.to_string(),
             ContinueSessionRequest {
                 injected_context: None,
+                transient_turn_context: None,
                 session_id: target_session_id.to_string(),
                 prompt: ContentInput::Text("must not apply MCP boundary".to_string()),
                 system_prompt: None,
@@ -10154,7 +10306,6 @@ mod tests {
             RunPrimitive::StagedInput(meerkat_core::lifecycle::run_primitive::StagedRunInput {
                 boundary: RunApplyBoundary::Immediate,
                 appends: Vec::new(),
-                context_appends: Vec::new(),
                 contributing_input_ids: vec![input_id],
                 turn_metadata: Some(
                     meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
@@ -10233,6 +10384,7 @@ mod tests {
                 content: CoreRenderable::Text {
                     text: "after archive".to_string(),
                 },
+                identity: None,
             },
         );
         let mut executor = RestSessionRuntimeExecutor {
@@ -10347,7 +10499,6 @@ mod tests {
             RunPrimitive::StagedInput(meerkat_core::lifecycle::run_primitive::StagedRunInput {
                 boundary: RunApplyBoundary::Immediate,
                 appends: Vec::new(),
-                context_appends: Vec::new(),
                 contributing_input_ids: vec![meerkat_core::lifecycle::InputId::new()],
                 turn_metadata: Some(
                     meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
@@ -11940,7 +12091,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_append_system_context_route_returns_staged_status() {
+    async fn test_append_system_context_route_returns_applied_status() {
         use axum::body::Body;
         use http_body_util::BodyExt;
         use tower::ServiceExt;
@@ -12015,7 +12166,7 @@ mod tests {
             String::from_utf8_lossy(&inject_body)
         );
         let inject_payload: serde_json::Value = serde_json::from_slice(&inject_body).unwrap();
-        assert_eq!(inject_payload["status"], "staged");
+        assert_eq!(inject_payload["status"], "applied");
     }
 
     #[tokio::test]
@@ -12697,6 +12848,7 @@ mod tests {
     fn test_rest_continue_requires_rebuild_matches_surface_contract() {
         let mut req = ContinueSessionRequest {
             injected_context: None,
+            transient_turn_context: None,
             session_id: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
             prompt: ContentInput::Text("Continue".to_string()),
             system_prompt: None,
@@ -12743,6 +12895,19 @@ mod tests {
             "additional instructions stay on the live path"
         );
         req.additional_instructions = None;
+
+        req.system_prompt = Some("ordinary turn-boundary system".to_string());
+        assert!(
+            !rest_continue_requires_rebuild(&req),
+            "system prompt stays on the live turn-boundary path"
+        );
+        assert_eq!(
+            rest_continue_system_prompts(&req),
+            vec!["ordinary turn-boundary system"],
+            "REST continue lowers the requested System exactly once"
+        );
+        req.system_prompt = None;
+        assert!(rest_continue_system_prompts(&req).is_empty());
 
         req.enable_web_search = Some(true);
         assert!(rest_continue_requires_rebuild(&req));
@@ -12883,6 +13048,7 @@ mod tests {
             &session_id.to_string(),
             ContinueSessionRequest {
                 injected_context: None,
+                transient_turn_context: None,
                 session_id: session_id.to_string(),
                 prompt: ContentInput::Text("Continue".to_string()),
                 system_prompt: None,
@@ -12969,6 +13135,7 @@ mod tests {
             &session_id.to_string(),
             ContinueSessionRequest {
                 injected_context: None,
+                transient_turn_context: None,
                 session_id: session_id.to_string(),
                 prompt: inline_video_prompt(),
                 system_prompt: None,
@@ -13062,6 +13229,7 @@ mod tests {
             &session_id.to_string(),
             ContinueSessionRequest {
                 injected_context: None,
+                transient_turn_context: None,
                 session_id: session_id.to_string(),
                 prompt: inline_video_prompt(),
                 system_prompt: None,
@@ -13155,6 +13323,7 @@ mod tests {
             &session_id.to_string(),
             ContinueSessionRequest {
                 injected_context: None,
+                transient_turn_context: None,
                 session_id: session_id.to_string(),
                 prompt: ContentInput::Text("Continue".to_string()),
                 system_prompt: None,
@@ -13242,6 +13411,7 @@ mod tests {
                 &continue_session_id.to_string(),
                 ContinueSessionRequest {
                     injected_context: None,
+                    transient_turn_context: None,
                     session_id: continue_session_id.to_string(),
                     prompt: ContentInput::Text("Continue".to_string()),
                     system_prompt: None,
@@ -14728,6 +14898,7 @@ mod tests {
             let outcome = meerkat_runtime::AcceptOutcome::Deduplicated {
                 input_id,
                 existing_id,
+                existing_seed: meerkat_runtime::input_state::InputStateSeed::new_accepted(),
             };
 
             let result = completion_handle_to_api_result(

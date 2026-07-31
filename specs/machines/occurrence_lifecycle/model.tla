@@ -3,7 +3,7 @@ EXTENDS TLC, Naturals, Sequences, FiniteSets
 
 \* Generated semantic machine model for OccurrenceLifecycleMachine.
 
-CONSTANTS BooleanValues, ClaimOwnerValues, ClaimTokenValues, ClaimedDispatchDispositionValues, ClaimedDispatchSchedulePhaseValues, CompletionSupersessionDispositionValues, CorrelationIdValues, DeliveryCompletionFailureReasonValues, DeliveryFailureReasonValues, DeliveryReceiptStageValues, LateCompletionResolutionClassValues, MisfirePolicyValues, MissingTargetPolicyValues, NatValues, OccurrenceFailureClassValues, OccurrenceIdValues, OccurrenceLifecycleInputVariantValues, OccurrenceLifecycleStateValues, OccurrenceTargetProbeOutcomeValues, OccurrenceTransitionFailureClassKindValues, OccurrenceTransitionFailureRefusalKindValues, OverlapPolicyValues, RuntimeCompletionOutcomeValues, RuntimeOutcomeKeyValues, ScheduleIdValues, SessionIdValues, StringValues, TargetBindingIdValues, TriggerKeyValues
+CONSTANTS BooleanValues, ClaimOwnerValues, ClaimTokenValues, ClaimedDispatchDispositionValues, ClaimedDispatchSchedulePhaseValues, CompletionSupersessionDispositionValues, CorrelationIdValues, DeliveryAdmissionOutcomeValues, DeliveryCompletionFailureReasonValues, DeliveryFailureReasonValues, DeliveryReceiptStageValues, LateCompletionResolutionClassValues, MisfirePolicyValues, MissingTargetPolicyValues, NatValues, OccurrenceFailureClassValues, OccurrenceIdValues, OccurrenceLifecycleInputVariantValues, OccurrenceLifecycleStateValues, OccurrenceTargetProbeOutcomeValues, OccurrenceTransitionFailureClassKindValues, OccurrenceTransitionFailureRefusalKindValues, OverlapPolicyValues, RuntimeCompletionOutcomeValues, RuntimeOutcomeKeyValues, ScheduleIdValues, SessionIdValues, StringValues, TargetBindingIdValues, TriggerKeyValues
 
 None == [tag |-> "none", value |-> "none"]
 Some(v) == [tag |-> "some", value |-> v]
@@ -666,7 +666,7 @@ ClassifyTransitionFailureNotClaimedDeliveryFailed(refusal_kind, trigger) ==
 
 ClassifyTransitionFailureNotDispatchingPending(refusal_kind, trigger) ==
     /\ phase = "Pending"
-    /\ ((trigger = "AwaitCompletion") /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
+    /\ ((IF (trigger = "DispatchAccepted") THEN TRUE ELSE (trigger = "AwaitCompletion")) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
     /\ phase' = "Pending"
     /\ model_step_count' = model_step_count + 1
     /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, trigger_key, target_binding_key, misfire_policy, misfire_policy_key, overlap_policy, overlap_policy_key, missing_target_policy, missing_target_policy_key, due_at_utc_ms, misfire_deadline_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, target_materialized_session_id, receipt_recorded_at_utc_ms, last_receipt_recorded_at_utc_ms, last_receipt_attempt, last_receipt_stage, last_receipt_failure_class, last_receipt_detail, last_receipt_correlation_id, last_receipt_materialized_session_id, runtime_outcome_key, receipt_stage, receipt_failure_class, receipt_detail, failure_class, failure_detail, dispatched_at_utc_ms, completed_at_utc_ms, attempt_count, superseded_by_revision, late_completion_recorded_at_utc_ms, late_completion_resolution, late_completion_detail, stale_completion_arrivals >>
@@ -674,7 +674,7 @@ ClassifyTransitionFailureNotDispatchingPending(refusal_kind, trigger) ==
 
 ClassifyTransitionFailureNotDispatchingClaimed(refusal_kind, trigger) ==
     /\ phase = "Claimed"
-    /\ ((trigger = "AwaitCompletion") /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
+    /\ ((IF (trigger = "DispatchAccepted") THEN TRUE ELSE (trigger = "AwaitCompletion")) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
     /\ phase' = "Claimed"
     /\ model_step_count' = model_step_count + 1
     /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, trigger_key, target_binding_key, misfire_policy, misfire_policy_key, overlap_policy, overlap_policy_key, missing_target_policy, missing_target_policy_key, due_at_utc_ms, misfire_deadline_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, target_materialized_session_id, receipt_recorded_at_utc_ms, last_receipt_recorded_at_utc_ms, last_receipt_attempt, last_receipt_stage, last_receipt_failure_class, last_receipt_detail, last_receipt_correlation_id, last_receipt_materialized_session_id, runtime_outcome_key, receipt_stage, receipt_failure_class, receipt_detail, failure_class, failure_detail, dispatched_at_utc_ms, completed_at_utc_ms, attempt_count, superseded_by_revision, late_completion_recorded_at_utc_ms, late_completion_resolution, late_completion_detail, stale_completion_arrivals >>
@@ -682,7 +682,7 @@ ClassifyTransitionFailureNotDispatchingClaimed(refusal_kind, trigger) ==
 
 ClassifyTransitionFailureNotDispatchingDispatching(refusal_kind, trigger) ==
     /\ phase = "Dispatching"
-    /\ ((trigger = "AwaitCompletion") /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
+    /\ ((IF (trigger = "DispatchAccepted") THEN TRUE ELSE (trigger = "AwaitCompletion")) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
     /\ phase' = "Dispatching"
     /\ model_step_count' = model_step_count + 1
     /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, trigger_key, target_binding_key, misfire_policy, misfire_policy_key, overlap_policy, overlap_policy_key, missing_target_policy, missing_target_policy_key, due_at_utc_ms, misfire_deadline_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, target_materialized_session_id, receipt_recorded_at_utc_ms, last_receipt_recorded_at_utc_ms, last_receipt_attempt, last_receipt_stage, last_receipt_failure_class, last_receipt_detail, last_receipt_correlation_id, last_receipt_materialized_session_id, runtime_outcome_key, receipt_stage, receipt_failure_class, receipt_detail, failure_class, failure_detail, dispatched_at_utc_ms, completed_at_utc_ms, attempt_count, superseded_by_revision, late_completion_recorded_at_utc_ms, late_completion_resolution, late_completion_detail, stale_completion_arrivals >>
@@ -690,7 +690,7 @@ ClassifyTransitionFailureNotDispatchingDispatching(refusal_kind, trigger) ==
 
 ClassifyTransitionFailureNotDispatchingAwaitingCompletion(refusal_kind, trigger) ==
     /\ phase = "AwaitingCompletion"
-    /\ ((trigger = "AwaitCompletion") /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
+    /\ ((IF (trigger = "DispatchAccepted") THEN TRUE ELSE (trigger = "AwaitCompletion")) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
     /\ phase' = "AwaitingCompletion"
     /\ model_step_count' = model_step_count + 1
     /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, trigger_key, target_binding_key, misfire_policy, misfire_policy_key, overlap_policy, overlap_policy_key, missing_target_policy, missing_target_policy_key, due_at_utc_ms, misfire_deadline_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, target_materialized_session_id, receipt_recorded_at_utc_ms, last_receipt_recorded_at_utc_ms, last_receipt_attempt, last_receipt_stage, last_receipt_failure_class, last_receipt_detail, last_receipt_correlation_id, last_receipt_materialized_session_id, runtime_outcome_key, receipt_stage, receipt_failure_class, receipt_detail, failure_class, failure_detail, dispatched_at_utc_ms, completed_at_utc_ms, attempt_count, superseded_by_revision, late_completion_recorded_at_utc_ms, late_completion_resolution, late_completion_detail, stale_completion_arrivals >>
@@ -698,7 +698,7 @@ ClassifyTransitionFailureNotDispatchingAwaitingCompletion(refusal_kind, trigger)
 
 ClassifyTransitionFailureNotDispatchingCompleted(refusal_kind, trigger) ==
     /\ phase = "Completed"
-    /\ ((trigger = "AwaitCompletion") /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
+    /\ ((IF (trigger = "DispatchAccepted") THEN TRUE ELSE (trigger = "AwaitCompletion")) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
     /\ phase' = "Completed"
     /\ model_step_count' = model_step_count + 1
     /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, trigger_key, target_binding_key, misfire_policy, misfire_policy_key, overlap_policy, overlap_policy_key, missing_target_policy, missing_target_policy_key, due_at_utc_ms, misfire_deadline_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, target_materialized_session_id, receipt_recorded_at_utc_ms, last_receipt_recorded_at_utc_ms, last_receipt_attempt, last_receipt_stage, last_receipt_failure_class, last_receipt_detail, last_receipt_correlation_id, last_receipt_materialized_session_id, runtime_outcome_key, receipt_stage, receipt_failure_class, receipt_detail, failure_class, failure_detail, dispatched_at_utc_ms, completed_at_utc_ms, attempt_count, superseded_by_revision, late_completion_recorded_at_utc_ms, late_completion_resolution, late_completion_detail, stale_completion_arrivals >>
@@ -706,7 +706,7 @@ ClassifyTransitionFailureNotDispatchingCompleted(refusal_kind, trigger) ==
 
 ClassifyTransitionFailureNotDispatchingSkipped(refusal_kind, trigger) ==
     /\ phase = "Skipped"
-    /\ ((trigger = "AwaitCompletion") /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
+    /\ ((IF (trigger = "DispatchAccepted") THEN TRUE ELSE (trigger = "AwaitCompletion")) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
     /\ phase' = "Skipped"
     /\ model_step_count' = model_step_count + 1
     /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, trigger_key, target_binding_key, misfire_policy, misfire_policy_key, overlap_policy, overlap_policy_key, missing_target_policy, missing_target_policy_key, due_at_utc_ms, misfire_deadline_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, target_materialized_session_id, receipt_recorded_at_utc_ms, last_receipt_recorded_at_utc_ms, last_receipt_attempt, last_receipt_stage, last_receipt_failure_class, last_receipt_detail, last_receipt_correlation_id, last_receipt_materialized_session_id, runtime_outcome_key, receipt_stage, receipt_failure_class, receipt_detail, failure_class, failure_detail, dispatched_at_utc_ms, completed_at_utc_ms, attempt_count, superseded_by_revision, late_completion_recorded_at_utc_ms, late_completion_resolution, late_completion_detail, stale_completion_arrivals >>
@@ -714,7 +714,7 @@ ClassifyTransitionFailureNotDispatchingSkipped(refusal_kind, trigger) ==
 
 ClassifyTransitionFailureNotDispatchingMisfired(refusal_kind, trigger) ==
     /\ phase = "Misfired"
-    /\ ((trigger = "AwaitCompletion") /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
+    /\ ((IF (trigger = "DispatchAccepted") THEN TRUE ELSE (trigger = "AwaitCompletion")) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
     /\ phase' = "Misfired"
     /\ model_step_count' = model_step_count + 1
     /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, trigger_key, target_binding_key, misfire_policy, misfire_policy_key, overlap_policy, overlap_policy_key, missing_target_policy, missing_target_policy_key, due_at_utc_ms, misfire_deadline_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, target_materialized_session_id, receipt_recorded_at_utc_ms, last_receipt_recorded_at_utc_ms, last_receipt_attempt, last_receipt_stage, last_receipt_failure_class, last_receipt_detail, last_receipt_correlation_id, last_receipt_materialized_session_id, runtime_outcome_key, receipt_stage, receipt_failure_class, receipt_detail, failure_class, failure_detail, dispatched_at_utc_ms, completed_at_utc_ms, attempt_count, superseded_by_revision, late_completion_recorded_at_utc_ms, late_completion_resolution, late_completion_detail, stale_completion_arrivals >>
@@ -722,7 +722,7 @@ ClassifyTransitionFailureNotDispatchingMisfired(refusal_kind, trigger) ==
 
 ClassifyTransitionFailureNotDispatchingSuperseded(refusal_kind, trigger) ==
     /\ phase = "Superseded"
-    /\ ((trigger = "AwaitCompletion") /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
+    /\ ((IF (trigger = "DispatchAccepted") THEN TRUE ELSE (trigger = "AwaitCompletion")) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
     /\ phase' = "Superseded"
     /\ model_step_count' = model_step_count + 1
     /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, trigger_key, target_binding_key, misfire_policy, misfire_policy_key, overlap_policy, overlap_policy_key, missing_target_policy, missing_target_policy_key, due_at_utc_ms, misfire_deadline_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, target_materialized_session_id, receipt_recorded_at_utc_ms, last_receipt_recorded_at_utc_ms, last_receipt_attempt, last_receipt_stage, last_receipt_failure_class, last_receipt_detail, last_receipt_correlation_id, last_receipt_materialized_session_id, runtime_outcome_key, receipt_stage, receipt_failure_class, receipt_detail, failure_class, failure_detail, dispatched_at_utc_ms, completed_at_utc_ms, attempt_count, superseded_by_revision, late_completion_recorded_at_utc_ms, late_completion_resolution, late_completion_detail, stale_completion_arrivals >>
@@ -730,7 +730,7 @@ ClassifyTransitionFailureNotDispatchingSuperseded(refusal_kind, trigger) ==
 
 ClassifyTransitionFailureNotDispatchingDeliveryFailed(refusal_kind, trigger) ==
     /\ phase = "DeliveryFailed"
-    /\ ((trigger = "AwaitCompletion") /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
+    /\ ((IF (trigger = "DispatchAccepted") THEN TRUE ELSE (trigger = "AwaitCompletion")) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
     /\ phase' = "DeliveryFailed"
     /\ model_step_count' = model_step_count + 1
     /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, trigger_key, target_binding_key, misfire_policy, misfire_policy_key, overlap_policy, overlap_policy_key, missing_target_policy, missing_target_policy_key, due_at_utc_ms, misfire_deadline_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, target_materialized_session_id, receipt_recorded_at_utc_ms, last_receipt_recorded_at_utc_ms, last_receipt_attempt, last_receipt_stage, last_receipt_failure_class, last_receipt_detail, last_receipt_correlation_id, last_receipt_materialized_session_id, runtime_outcome_key, receipt_stage, receipt_failure_class, receipt_detail, failure_class, failure_detail, dispatched_at_utc_ms, completed_at_utc_ms, attempt_count, superseded_by_revision, late_completion_recorded_at_utc_ms, late_completion_resolution, late_completion_detail, stale_completion_arrivals >>
@@ -738,7 +738,7 @@ ClassifyTransitionFailureNotDispatchingDeliveryFailed(refusal_kind, trigger) ==
 
 ClassifyTransitionFailureNotLeaseHoldingPending(refusal_kind, trigger) ==
     /\ phase = "Pending"
-    /\ ((IF (trigger = "LeaseExpired") THEN TRUE ELSE (trigger = "ReleaseLeaseForPausedSchedule")) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
+    /\ ((IF (trigger = "LeaseExpired") THEN TRUE ELSE (IF (trigger = "ReleaseLeaseForPausedSchedule") THEN TRUE ELSE (trigger = "RenewLease"))) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
     /\ phase' = "Pending"
     /\ model_step_count' = model_step_count + 1
     /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, trigger_key, target_binding_key, misfire_policy, misfire_policy_key, overlap_policy, overlap_policy_key, missing_target_policy, missing_target_policy_key, due_at_utc_ms, misfire_deadline_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, target_materialized_session_id, receipt_recorded_at_utc_ms, last_receipt_recorded_at_utc_ms, last_receipt_attempt, last_receipt_stage, last_receipt_failure_class, last_receipt_detail, last_receipt_correlation_id, last_receipt_materialized_session_id, runtime_outcome_key, receipt_stage, receipt_failure_class, receipt_detail, failure_class, failure_detail, dispatched_at_utc_ms, completed_at_utc_ms, attempt_count, superseded_by_revision, late_completion_recorded_at_utc_ms, late_completion_resolution, late_completion_detail, stale_completion_arrivals >>
@@ -746,7 +746,7 @@ ClassifyTransitionFailureNotLeaseHoldingPending(refusal_kind, trigger) ==
 
 ClassifyTransitionFailureNotLeaseHoldingClaimed(refusal_kind, trigger) ==
     /\ phase = "Claimed"
-    /\ ((IF (trigger = "LeaseExpired") THEN TRUE ELSE (trigger = "ReleaseLeaseForPausedSchedule")) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
+    /\ ((IF (trigger = "LeaseExpired") THEN TRUE ELSE (IF (trigger = "ReleaseLeaseForPausedSchedule") THEN TRUE ELSE (trigger = "RenewLease"))) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
     /\ phase' = "Claimed"
     /\ model_step_count' = model_step_count + 1
     /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, trigger_key, target_binding_key, misfire_policy, misfire_policy_key, overlap_policy, overlap_policy_key, missing_target_policy, missing_target_policy_key, due_at_utc_ms, misfire_deadline_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, target_materialized_session_id, receipt_recorded_at_utc_ms, last_receipt_recorded_at_utc_ms, last_receipt_attempt, last_receipt_stage, last_receipt_failure_class, last_receipt_detail, last_receipt_correlation_id, last_receipt_materialized_session_id, runtime_outcome_key, receipt_stage, receipt_failure_class, receipt_detail, failure_class, failure_detail, dispatched_at_utc_ms, completed_at_utc_ms, attempt_count, superseded_by_revision, late_completion_recorded_at_utc_ms, late_completion_resolution, late_completion_detail, stale_completion_arrivals >>
@@ -754,7 +754,7 @@ ClassifyTransitionFailureNotLeaseHoldingClaimed(refusal_kind, trigger) ==
 
 ClassifyTransitionFailureNotLeaseHoldingDispatching(refusal_kind, trigger) ==
     /\ phase = "Dispatching"
-    /\ ((IF (trigger = "LeaseExpired") THEN TRUE ELSE (trigger = "ReleaseLeaseForPausedSchedule")) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
+    /\ ((IF (trigger = "LeaseExpired") THEN TRUE ELSE (IF (trigger = "ReleaseLeaseForPausedSchedule") THEN TRUE ELSE (trigger = "RenewLease"))) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
     /\ phase' = "Dispatching"
     /\ model_step_count' = model_step_count + 1
     /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, trigger_key, target_binding_key, misfire_policy, misfire_policy_key, overlap_policy, overlap_policy_key, missing_target_policy, missing_target_policy_key, due_at_utc_ms, misfire_deadline_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, target_materialized_session_id, receipt_recorded_at_utc_ms, last_receipt_recorded_at_utc_ms, last_receipt_attempt, last_receipt_stage, last_receipt_failure_class, last_receipt_detail, last_receipt_correlation_id, last_receipt_materialized_session_id, runtime_outcome_key, receipt_stage, receipt_failure_class, receipt_detail, failure_class, failure_detail, dispatched_at_utc_ms, completed_at_utc_ms, attempt_count, superseded_by_revision, late_completion_recorded_at_utc_ms, late_completion_resolution, late_completion_detail, stale_completion_arrivals >>
@@ -762,7 +762,7 @@ ClassifyTransitionFailureNotLeaseHoldingDispatching(refusal_kind, trigger) ==
 
 ClassifyTransitionFailureNotLeaseHoldingAwaitingCompletion(refusal_kind, trigger) ==
     /\ phase = "AwaitingCompletion"
-    /\ ((IF (trigger = "LeaseExpired") THEN TRUE ELSE (trigger = "ReleaseLeaseForPausedSchedule")) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
+    /\ ((IF (trigger = "LeaseExpired") THEN TRUE ELSE (IF (trigger = "ReleaseLeaseForPausedSchedule") THEN TRUE ELSE (trigger = "RenewLease"))) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
     /\ phase' = "AwaitingCompletion"
     /\ model_step_count' = model_step_count + 1
     /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, trigger_key, target_binding_key, misfire_policy, misfire_policy_key, overlap_policy, overlap_policy_key, missing_target_policy, missing_target_policy_key, due_at_utc_ms, misfire_deadline_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, target_materialized_session_id, receipt_recorded_at_utc_ms, last_receipt_recorded_at_utc_ms, last_receipt_attempt, last_receipt_stage, last_receipt_failure_class, last_receipt_detail, last_receipt_correlation_id, last_receipt_materialized_session_id, runtime_outcome_key, receipt_stage, receipt_failure_class, receipt_detail, failure_class, failure_detail, dispatched_at_utc_ms, completed_at_utc_ms, attempt_count, superseded_by_revision, late_completion_recorded_at_utc_ms, late_completion_resolution, late_completion_detail, stale_completion_arrivals >>
@@ -770,7 +770,7 @@ ClassifyTransitionFailureNotLeaseHoldingAwaitingCompletion(refusal_kind, trigger
 
 ClassifyTransitionFailureNotLeaseHoldingCompleted(refusal_kind, trigger) ==
     /\ phase = "Completed"
-    /\ ((IF (trigger = "LeaseExpired") THEN TRUE ELSE (trigger = "ReleaseLeaseForPausedSchedule")) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
+    /\ ((IF (trigger = "LeaseExpired") THEN TRUE ELSE (IF (trigger = "ReleaseLeaseForPausedSchedule") THEN TRUE ELSE (trigger = "RenewLease"))) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
     /\ phase' = "Completed"
     /\ model_step_count' = model_step_count + 1
     /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, trigger_key, target_binding_key, misfire_policy, misfire_policy_key, overlap_policy, overlap_policy_key, missing_target_policy, missing_target_policy_key, due_at_utc_ms, misfire_deadline_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, target_materialized_session_id, receipt_recorded_at_utc_ms, last_receipt_recorded_at_utc_ms, last_receipt_attempt, last_receipt_stage, last_receipt_failure_class, last_receipt_detail, last_receipt_correlation_id, last_receipt_materialized_session_id, runtime_outcome_key, receipt_stage, receipt_failure_class, receipt_detail, failure_class, failure_detail, dispatched_at_utc_ms, completed_at_utc_ms, attempt_count, superseded_by_revision, late_completion_recorded_at_utc_ms, late_completion_resolution, late_completion_detail, stale_completion_arrivals >>
@@ -778,7 +778,7 @@ ClassifyTransitionFailureNotLeaseHoldingCompleted(refusal_kind, trigger) ==
 
 ClassifyTransitionFailureNotLeaseHoldingSkipped(refusal_kind, trigger) ==
     /\ phase = "Skipped"
-    /\ ((IF (trigger = "LeaseExpired") THEN TRUE ELSE (trigger = "ReleaseLeaseForPausedSchedule")) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
+    /\ ((IF (trigger = "LeaseExpired") THEN TRUE ELSE (IF (trigger = "ReleaseLeaseForPausedSchedule") THEN TRUE ELSE (trigger = "RenewLease"))) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
     /\ phase' = "Skipped"
     /\ model_step_count' = model_step_count + 1
     /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, trigger_key, target_binding_key, misfire_policy, misfire_policy_key, overlap_policy, overlap_policy_key, missing_target_policy, missing_target_policy_key, due_at_utc_ms, misfire_deadline_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, target_materialized_session_id, receipt_recorded_at_utc_ms, last_receipt_recorded_at_utc_ms, last_receipt_attempt, last_receipt_stage, last_receipt_failure_class, last_receipt_detail, last_receipt_correlation_id, last_receipt_materialized_session_id, runtime_outcome_key, receipt_stage, receipt_failure_class, receipt_detail, failure_class, failure_detail, dispatched_at_utc_ms, completed_at_utc_ms, attempt_count, superseded_by_revision, late_completion_recorded_at_utc_ms, late_completion_resolution, late_completion_detail, stale_completion_arrivals >>
@@ -786,7 +786,7 @@ ClassifyTransitionFailureNotLeaseHoldingSkipped(refusal_kind, trigger) ==
 
 ClassifyTransitionFailureNotLeaseHoldingMisfired(refusal_kind, trigger) ==
     /\ phase = "Misfired"
-    /\ ((IF (trigger = "LeaseExpired") THEN TRUE ELSE (trigger = "ReleaseLeaseForPausedSchedule")) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
+    /\ ((IF (trigger = "LeaseExpired") THEN TRUE ELSE (IF (trigger = "ReleaseLeaseForPausedSchedule") THEN TRUE ELSE (trigger = "RenewLease"))) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
     /\ phase' = "Misfired"
     /\ model_step_count' = model_step_count + 1
     /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, trigger_key, target_binding_key, misfire_policy, misfire_policy_key, overlap_policy, overlap_policy_key, missing_target_policy, missing_target_policy_key, due_at_utc_ms, misfire_deadline_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, target_materialized_session_id, receipt_recorded_at_utc_ms, last_receipt_recorded_at_utc_ms, last_receipt_attempt, last_receipt_stage, last_receipt_failure_class, last_receipt_detail, last_receipt_correlation_id, last_receipt_materialized_session_id, runtime_outcome_key, receipt_stage, receipt_failure_class, receipt_detail, failure_class, failure_detail, dispatched_at_utc_ms, completed_at_utc_ms, attempt_count, superseded_by_revision, late_completion_recorded_at_utc_ms, late_completion_resolution, late_completion_detail, stale_completion_arrivals >>
@@ -794,7 +794,7 @@ ClassifyTransitionFailureNotLeaseHoldingMisfired(refusal_kind, trigger) ==
 
 ClassifyTransitionFailureNotLeaseHoldingSuperseded(refusal_kind, trigger) ==
     /\ phase = "Superseded"
-    /\ ((IF (trigger = "LeaseExpired") THEN TRUE ELSE (trigger = "ReleaseLeaseForPausedSchedule")) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
+    /\ ((IF (trigger = "LeaseExpired") THEN TRUE ELSE (IF (trigger = "ReleaseLeaseForPausedSchedule") THEN TRUE ELSE (trigger = "RenewLease"))) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
     /\ phase' = "Superseded"
     /\ model_step_count' = model_step_count + 1
     /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, trigger_key, target_binding_key, misfire_policy, misfire_policy_key, overlap_policy, overlap_policy_key, missing_target_policy, missing_target_policy_key, due_at_utc_ms, misfire_deadline_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, target_materialized_session_id, receipt_recorded_at_utc_ms, last_receipt_recorded_at_utc_ms, last_receipt_attempt, last_receipt_stage, last_receipt_failure_class, last_receipt_detail, last_receipt_correlation_id, last_receipt_materialized_session_id, runtime_outcome_key, receipt_stage, receipt_failure_class, receipt_detail, failure_class, failure_detail, dispatched_at_utc_ms, completed_at_utc_ms, attempt_count, superseded_by_revision, late_completion_recorded_at_utc_ms, late_completion_resolution, late_completion_detail, stale_completion_arrivals >>
@@ -802,7 +802,7 @@ ClassifyTransitionFailureNotLeaseHoldingSuperseded(refusal_kind, trigger) ==
 
 ClassifyTransitionFailureNotLeaseHoldingDeliveryFailed(refusal_kind, trigger) ==
     /\ phase = "DeliveryFailed"
-    /\ ((IF (trigger = "LeaseExpired") THEN TRUE ELSE (trigger = "ReleaseLeaseForPausedSchedule")) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
+    /\ ((IF (trigger = "LeaseExpired") THEN TRUE ELSE (IF (trigger = "ReleaseLeaseForPausedSchedule") THEN TRUE ELSE (trigger = "RenewLease"))) /\ (IF (refusal_kind = "GuardRejected") THEN TRUE ELSE (refusal_kind = "NoMatchingTransition")))
     /\ phase' = "DeliveryFailed"
     /\ model_step_count' = model_step_count + 1
     /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, trigger_key, target_binding_key, misfire_policy, misfire_policy_key, overlap_policy, overlap_policy_key, missing_target_policy, missing_target_policy_key, due_at_utc_ms, misfire_deadline_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, target_materialized_session_id, receipt_recorded_at_utc_ms, last_receipt_recorded_at_utc_ms, last_receipt_attempt, last_receipt_stage, last_receipt_failure_class, last_receipt_detail, last_receipt_correlation_id, last_receipt_materialized_session_id, runtime_outcome_key, receipt_stage, receipt_failure_class, receipt_detail, failure_class, failure_detail, dispatched_at_utc_ms, completed_at_utc_ms, attempt_count, superseded_by_revision, late_completion_recorded_at_utc_ms, late_completion_resolution, late_completion_detail, stale_completion_arrivals >>
@@ -1528,6 +1528,33 @@ DispatchStartedFromClaimed(correlation_id, at_utc_ms) ==
     /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, trigger_key, target_binding_key, misfire_policy, misfire_policy_key, overlap_policy, overlap_policy_key, missing_target_policy, missing_target_policy_key, due_at_utc_ms, misfire_deadline_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, target_materialized_session_id, last_receipt_recorded_at_utc_ms, last_receipt_attempt, last_receipt_stage, last_receipt_failure_class, last_receipt_detail, last_receipt_correlation_id, last_receipt_materialized_session_id, runtime_outcome_key, failure_class, failure_detail, completed_at_utc_ms, attempt_count, superseded_by_revision, late_completion_recorded_at_utc_ms, late_completion_resolution, late_completion_detail, stale_completion_arrivals >>
 
 
+DispatchAcceptedFromDispatching(admission_outcome, at_utc_ms) ==
+    /\ phase = "Dispatching"
+    /\ (delivery_correlation_id # None)
+    /\ (admission_outcome = "Accepted")
+    /\ phase' = "Dispatching"
+    /\ model_step_count' = model_step_count + 1
+    /\ receipt_recorded_at_utc_ms' = Some(at_utc_ms)
+    /\ receipt_stage' = Some("DispatchAccepted")
+    /\ receipt_failure_class' = None
+    /\ receipt_detail' = None
+    /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, trigger_key, target_binding_key, misfire_policy, misfire_policy_key, overlap_policy, overlap_policy_key, missing_target_policy, missing_target_policy_key, due_at_utc_ms, misfire_deadline_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, target_materialized_session_id, last_receipt_recorded_at_utc_ms, last_receipt_attempt, last_receipt_stage, last_receipt_failure_class, last_receipt_detail, last_receipt_correlation_id, last_receipt_materialized_session_id, runtime_outcome_key, failure_class, failure_detail, dispatched_at_utc_ms, completed_at_utc_ms, attempt_count, superseded_by_revision, late_completion_recorded_at_utc_ms, late_completion_resolution, late_completion_detail, stale_completion_arrivals >>
+
+
+DispatchDeduplicatedFromDispatching(admission_outcome, at_utc_ms) ==
+    /\ phase = "Dispatching"
+    /\ (delivery_correlation_id # None)
+    /\ (admission_outcome = "Deduplicated")
+    /\ phase' = "Completed"
+    /\ model_step_count' = model_step_count + 1
+    /\ receipt_recorded_at_utc_ms' = Some(at_utc_ms)
+    /\ receipt_stage' = Some("Completed")
+    /\ receipt_failure_class' = None
+    /\ receipt_detail' = None
+    /\ completed_at_utc_ms' = Some(at_utc_ms)
+    /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, trigger_key, target_binding_key, misfire_policy, misfire_policy_key, overlap_policy, overlap_policy_key, missing_target_policy, missing_target_policy_key, due_at_utc_ms, misfire_deadline_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, target_materialized_session_id, last_receipt_recorded_at_utc_ms, last_receipt_attempt, last_receipt_stage, last_receipt_failure_class, last_receipt_detail, last_receipt_correlation_id, last_receipt_materialized_session_id, runtime_outcome_key, failure_class, failure_detail, dispatched_at_utc_ms, attempt_count, superseded_by_revision, late_completion_recorded_at_utc_ms, late_completion_resolution, late_completion_detail, stale_completion_arrivals >>
+
+
 AwaitCompletionFromDispatching(at_utc_ms) ==
     /\ phase = "Dispatching"
     /\ phase' = "AwaitingCompletion"
@@ -1938,6 +1965,26 @@ LateDeliveryFailureAfterSupersession(reason, detail, at_utc_ms) ==
     /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, trigger_key, target_binding_key, misfire_policy, misfire_policy_key, overlap_policy, overlap_policy_key, missing_target_policy, missing_target_policy_key, due_at_utc_ms, misfire_deadline_utc_ms, claimed_by, lease_expires_at_utc_ms, claimed_at_utc_ms, claim_token, delivery_correlation_id, target_materialized_session_id, receipt_recorded_at_utc_ms, last_receipt_recorded_at_utc_ms, last_receipt_attempt, last_receipt_stage, last_receipt_failure_class, last_receipt_detail, last_receipt_correlation_id, last_receipt_materialized_session_id, runtime_outcome_key, receipt_stage, receipt_failure_class, receipt_detail, failure_class, failure_detail, dispatched_at_utc_ms, completed_at_utc_ms, attempt_count, superseded_by_revision, stale_completion_arrivals >>
 
 
+RenewLeaseFromDispatching(arg_claim_token, arg_lease_expires_at_utc_ms, at_utc_ms) ==
+    /\ phase = "Dispatching"
+    /\ (claim_token = Some(arg_claim_token))
+    /\ (IF (lease_expires_at_utc_ms = None) THEN TRUE ELSE ((IF "value" \in DOMAIN lease_expires_at_utc_ms THEN lease_expires_at_utc_ms["value"] ELSE None) <= arg_lease_expires_at_utc_ms))
+    /\ phase' = "Dispatching"
+    /\ model_step_count' = model_step_count + 1
+    /\ lease_expires_at_utc_ms' = Some(arg_lease_expires_at_utc_ms)
+    /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, trigger_key, target_binding_key, misfire_policy, misfire_policy_key, overlap_policy, overlap_policy_key, missing_target_policy, missing_target_policy_key, due_at_utc_ms, misfire_deadline_utc_ms, claimed_by, claimed_at_utc_ms, claim_token, delivery_correlation_id, target_materialized_session_id, receipt_recorded_at_utc_ms, last_receipt_recorded_at_utc_ms, last_receipt_attempt, last_receipt_stage, last_receipt_failure_class, last_receipt_detail, last_receipt_correlation_id, last_receipt_materialized_session_id, runtime_outcome_key, receipt_stage, receipt_failure_class, receipt_detail, failure_class, failure_detail, dispatched_at_utc_ms, completed_at_utc_ms, attempt_count, superseded_by_revision, late_completion_recorded_at_utc_ms, late_completion_resolution, late_completion_detail, stale_completion_arrivals >>
+
+
+RenewLeaseFromAwaitingCompletion(arg_claim_token, arg_lease_expires_at_utc_ms, at_utc_ms) ==
+    /\ phase = "AwaitingCompletion"
+    /\ (claim_token = Some(arg_claim_token))
+    /\ (IF (lease_expires_at_utc_ms = None) THEN TRUE ELSE ((IF "value" \in DOMAIN lease_expires_at_utc_ms THEN lease_expires_at_utc_ms["value"] ELSE None) <= arg_lease_expires_at_utc_ms))
+    /\ phase' = "AwaitingCompletion"
+    /\ model_step_count' = model_step_count + 1
+    /\ lease_expires_at_utc_ms' = Some(arg_lease_expires_at_utc_ms)
+    /\ UNCHANGED << occurrence_id, schedule_id, schedule_revision, occurrence_ordinal, trigger_key, target_binding_key, misfire_policy, misfire_policy_key, overlap_policy, overlap_policy_key, missing_target_policy, missing_target_policy_key, due_at_utc_ms, misfire_deadline_utc_ms, claimed_by, claimed_at_utc_ms, claim_token, delivery_correlation_id, target_materialized_session_id, receipt_recorded_at_utc_ms, last_receipt_recorded_at_utc_ms, last_receipt_attempt, last_receipt_stage, last_receipt_failure_class, last_receipt_detail, last_receipt_correlation_id, last_receipt_materialized_session_id, runtime_outcome_key, receipt_stage, receipt_failure_class, receipt_detail, failure_class, failure_detail, dispatched_at_utc_ms, completed_at_utc_ms, attempt_count, superseded_by_revision, late_completion_recorded_at_utc_ms, late_completion_resolution, late_completion_detail, stale_completion_arrivals >>
+
+
 LeaseExpiredFromClaimed(at_utc_ms) ==
     /\ phase = "Claimed"
     /\ phase' = "Pending"
@@ -2211,6 +2258,8 @@ Next ==
     \/ \E correlation_id \in OptionCorrelationIdValues : \E detail \in OptionStringValues : \E materialized_session_id \in OptionSessionIdValues : \E arg_runtime_outcome_key \in OptionRuntimeOutcomeKeyValues : RecordReceiptDeliveryFailed(correlation_id, detail, materialized_session_id, arg_runtime_outcome_key)
     \/ \E owner_id \in ClaimOwnerValues : \E at_utc_ms \in 0..2 : \E arg_lease_expires_at_utc_ms \in 0..2 : \E arg_claim_token \in ClaimTokenValues : ClaimPending(owner_id, at_utc_ms, arg_lease_expires_at_utc_ms, arg_claim_token)
     \/ \E correlation_id \in OptionCorrelationIdValues : \E at_utc_ms \in 0..2 : DispatchStartedFromClaimed(correlation_id, at_utc_ms)
+    \/ \E admission_outcome \in DeliveryAdmissionOutcomeValues : \E at_utc_ms \in 0..2 : DispatchAcceptedFromDispatching(admission_outcome, at_utc_ms)
+    \/ \E admission_outcome \in DeliveryAdmissionOutcomeValues : \E at_utc_ms \in 0..2 : DispatchDeduplicatedFromDispatching(admission_outcome, at_utc_ms)
     \/ \E at_utc_ms \in 0..2 : AwaitCompletionFromDispatching(at_utc_ms)
     \/ \E at_utc_ms \in 0..2 : AwaitCompletionAfterSupersession(at_utc_ms)
     \/ \E at_utc_ms \in 0..2 : CompleteFromDispatchingOrAwaiting(at_utc_ms)
@@ -2242,6 +2291,8 @@ Next ==
     \/ \E outcome \in RuntimeCompletionOutcomeValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : LateRuntimeCompletionInternalErrorAfterSupersession(outcome, detail, at_utc_ms)
     \/ \E reason \in DeliveryCompletionFailureReasonValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : LateDeliveryCompletionFailureAfterSupersession(reason, detail, at_utc_ms)
     \/ \E reason \in DeliveryFailureReasonValues : \E detail \in OptionStringValues : \E at_utc_ms \in 0..2 : LateDeliveryFailureAfterSupersession(reason, detail, at_utc_ms)
+    \/ \E arg_claim_token \in ClaimTokenValues : \E arg_lease_expires_at_utc_ms \in 0..2 : \E at_utc_ms \in 0..2 : RenewLeaseFromDispatching(arg_claim_token, arg_lease_expires_at_utc_ms, at_utc_ms)
+    \/ \E arg_claim_token \in ClaimTokenValues : \E arg_lease_expires_at_utc_ms \in 0..2 : \E at_utc_ms \in 0..2 : RenewLeaseFromAwaitingCompletion(arg_claim_token, arg_lease_expires_at_utc_ms, at_utc_ms)
     \/ \E at_utc_ms \in 0..2 : LeaseExpiredFromClaimed(at_utc_ms)
     \/ \E at_utc_ms \in 0..2 : LeaseExpiredFromDispatching(at_utc_ms)
     \/ \E at_utc_ms \in 0..2 : LeaseExpiredFromAwaitingCompletion(at_utc_ms)

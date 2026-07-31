@@ -693,15 +693,6 @@ pub fn session_document_schema_metadata() -> MachineSchemaMetadata {
                 &["Inactive", "Pending", "Consumed"],
             ),
             NamedTypeBinding::string_enum("SessionInitialPromptStageDecision", &["Clear", "Store"]),
-            NamedTypeBinding::string_enum(
-                "SystemContextAppendDecision",
-                &["Staged", "Duplicate", "RejectEmpty", "RejectConflict"],
-            ),
-            NamedTypeBinding::string_enum(
-                "SystemContextPersistAppendAdmission",
-                &["Reject", "Admit"],
-            ),
-            NamedTypeBinding::string_enum("SystemContextSource", &["Normal", "RuntimeSteer"]),
             // Realtime-transcript region typed vocabulary (folded from the
             // retired SessionRealtimeTranscriptAuthorityMachine).
             NamedTypeBinding::string_enum("RealtimeTranscriptRoleKind", &["User", "Assistant"]),
@@ -746,19 +737,6 @@ pub fn session_document_schema_metadata() -> MachineSchemaMetadata {
                 "RealtimeUserContentBlobFinalizeDisposition",
                 &["RejectMismatch", "NoPending", "ClearCommitted"],
             ),
-            // Durable-config region typed vocabulary (folded from the retired
-            // SessionDurableConfigAuthorityMachine).
-            NamedTypeBinding::string_enum(
-                "SessionSystemPromptSource",
-                &[
-                    "DirectMutation",
-                    "ExplicitBuild",
-                    "DefaultBuild",
-                    "WasmDefaultBuild",
-                    "RuntimeContextAppend",
-                    "RuntimeSteerCleanup",
-                ],
-            ),
             // Pending-continuation region typed vocabulary (folded from the
             // retired non-canonical PendingContinuationAdmissionMachine).
             NamedTypeBinding::string_enum(
@@ -799,24 +777,6 @@ pub fn session_document_schema_metadata() -> MachineSchemaMetadata {
                 "LiveSessionAuthorityKind",
                 &["LiveAuthoritative", "DurableAuthoritative"],
             ),
-            // Runtime-projection-conflict region typed vocabulary: how a
-            // durable row relates to the committed authority transcript, and
-            // the disposition of a save whose durable row ran ahead of it.
-            // RetainForRecovery replaced RebuildToAuthority — no disposition
-            // may authorize shrinking a verified durable descendant.
-            NamedTypeBinding::string_enum(
-                "CheckpointProvenanceClass",
-                &["Unstamped", "Committed", "IntraTurn"],
-            ),
-            NamedTypeBinding::string_enum(
-                "RuntimeSnapshotReadDisposition",
-                &[
-                    "UseRuntimeSnapshot",
-                    "UseCommittedStoreHead",
-                    "RecoveryRequired",
-                    "Quarantine",
-                ],
-            ),
             NamedTypeBinding::string_enum(
                 "RunIdCardinality",
                 &["NoRunId", "SingleRunId", "MultipleRunIds"],
@@ -826,22 +786,10 @@ pub fn session_document_schema_metadata() -> MachineSchemaMetadata {
                 &["Absent", "EndTurn", "ToolUse", "Other"],
             ),
             NamedTypeBinding::string_enum(
-                "DurableTailExecutionEvidence",
-                &["NoExecutionContent", "BoundExecution", "UnboundExecution"],
-            ),
-            // Stamp-schema era of the head row's verified stamp — the
-            // corroborating legacy-writer evidence for identity-less tails.
-            // Fail-closed variant (modern) listed first.
-            NamedTypeBinding::string_enum(
-                "DurableHeadStampEra",
-                &["WitnessV3OrNewer", "PreWitnessV3"],
-            ),
-            NamedTypeBinding::string_enum(
                 "DurableTailRecoveryClass",
                 &[
                     "CompletedCandidate",
                     "InterruptedRepairableCandidate",
-                    "LegacyCompletedCandidate",
                     "Ambiguous",
                 ],
             ),
@@ -856,48 +804,18 @@ pub fn session_document_schema_metadata() -> MachineSchemaMetadata {
                 ],
             ),
             NamedTypeBinding::string_enum(
-                "RuntimeProjectionConflictDisposition",
-                &[
-                    "RejectDivergent",
-                    "ConvergeSupersededProjection",
-                    "RetainForRecovery",
-                ],
-            ),
-            NamedTypeBinding::string_enum(
                 "RuntimeCheckpointProjectionDisposition",
                 &["IgnoreArchived", "Project"],
             ),
-            // Legacy-checkpoint recovery-migration region typed vocabulary
-            // (one-time migration of pre-typed documents into typed
-            // checkpoint authority; RefuseDivergent/Divergent are the
-            // fail-closed defaults).
             NamedTypeBinding::string_enum(
-                "LegacyCheckpointTranscriptRelation",
-                &[
-                    "Divergent",
-                    "Identical",
-                    "ProjectionExtendsSnapshot",
-                    "SnapshotExtendsProjection",
-                    "NotComparable",
-                ],
-            ),
-            NamedTypeBinding::string_enum(
-                "LegacyCheckpointMigrationDisposition",
-                &[
-                    "RefuseDivergent",
-                    "MigrateCanonicalSnapshot",
-                    "AdoptProjectionExtension",
-                    "MigrateStoreProjection",
-                    "RebuildProjectionFromTypedSnapshot",
-                    "ConvergeSnapshotOntoTypedProjection",
-                ],
+                "SessionDocumentLifecycleMerge",
+                &["CarryArchived", "CarryAuthority"],
             ),
             NamedTypeBinding::string_enum(
                 "LiveSessionAuthorityReason",
                 &[
                     "StoredArchived",
                     "LiveUncommittedTranscript",
-                    "RuntimeSystemContextDiverged",
                     "StoredTranscriptRevisionDiverged",
                 ],
             ),
@@ -968,14 +886,9 @@ pub fn session_turn_admission_schema_metadata() -> MachineSchemaMetadata {
                 "StartTurnDispatchAuthorization",
                 &["Authorized", "Cancelled"],
             ),
-            // 0.7.2 disciplined shell inputs (D2a): machine-owned legality
-            // verdict for runtime system-context application, and the typed
-            // "session archived" terminal for admission inputs that
-            // legitimately race archive/discard teardown.
-            NamedTypeBinding::string_enum(
-                "RuntimeSystemContextApplicationAuthorization",
-                &["Authorized", "SessionArchived"],
-            ),
+            // 0.7.2 disciplined shell inputs (D2a): the typed "session
+            // archived" terminal for admission inputs that legitimately race
+            // archive/discard teardown.
             NamedTypeBinding::string_enum("TurnAdmissionShutdownTerminal", &["SessionArchived"]),
             // Pending-continuation disposition is owned by the canonical
             // SessionDocumentMachine and consumed here as a typed input. The
@@ -1015,7 +928,6 @@ pub fn session_persistence_version_authority_schema_metadata() -> MachineSchemaM
                 "SessionEnvelope",
                 "StoredInputState",
                 "SessionMetadataSchema",
-                "TranscriptHistoryWitnessFormat",
             ],
         )],
         Vec::new(),
@@ -1182,7 +1094,6 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                 &[
                     "CompletedCandidate",
                     "InterruptedRepairableCandidate",
-                    "LegacyCompletedCandidate",
                     "Ambiguous",
                 ],
             ),
@@ -1192,8 +1103,7 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                     "RefuseRecovery",
                     "CommitCompleted",
                     "RepairAndCommitInterrupted",
-                    "CommitLegacyCompleted",
-                    "CommitLegacyCompletedRetainInputs",
+                    "CommitCompletedRetainInputs",
                     "HoldIntact",
                 ],
             ),
@@ -1341,7 +1251,7 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
             ),
             NamedTypeBinding::string_enum(
                 "AdmissionPeerResponseTerminalApplyIntent",
-                &["AppendContextAndRun"],
+                &["AppendContentAndRun"],
             ),
             NamedTypeBinding::string_enum("AdmissionPlanKind", &["ConsumedOnAccept", "Queued"]),
             NamedTypeBinding::string_enum(
@@ -2309,7 +2219,7 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
             ),
             NamedTypeBinding::string_enum(
                 "RecoveredPeerResponseTerminalApplyIntent",
-                &["AppendContextAndRun"],
+                &["AppendContentAndRun"],
             ),
             NamedTypeBinding::string("SessionId"),
             NamedTypeBinding::string("SessionLlmCapabilitySurface"),
@@ -2396,12 +2306,7 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
             ),
             NamedTypeBinding::string_enum(
                 "TurnPrimitiveKind",
-                &[
-                    "None",
-                    "ConversationTurn",
-                    "ImmediateAppend",
-                    "ImmediateContextAppend",
-                ],
+                &["None", "ConversationTurn", "ImmediateAppend"],
             ),
             NamedTypeBinding::string_enum(
                 "TurnTerminalOutcome",
@@ -2517,7 +2422,6 @@ runtime_internal_inputs!(
         SupervisorRotationNextPublished,
         ObserveSupervisorRotation,
         ResolveSupervisorCleanupCommandAdmission,
-        AuthorizeDeferredSessionSystemContextAppend,
         AuthorizeDurableTailRecovery,
         BeginUnregisterSession,
         BeginUnregisterUnservedAttachment,
@@ -2562,6 +2466,7 @@ runtime_internal_inputs!(
         InteractionStreamCompleted,
         InteractionStreamExpired,
         InteractionStreamReserved,
+        LiveBoundaryUnavailable,
         LlmReturnedTerminal,
         LlmReturnedToolCalls,
         MarkApplied,
@@ -2626,6 +2531,7 @@ runtime_internal_inputs!(
         RunCompleted,
         RunFailed,
         RuntimeExecutorExited,
+        ServiceTurnCommitted,
         RuntimeLoopStoppedForUnregister,
         SatisfyWaitAll,
         SetModelRoutingBaseline,
@@ -2635,7 +2541,6 @@ runtime_internal_inputs!(
         StageVisibilityFilter,
         StartConversationRun,
         StartImmediateAppend,
-        StartImmediateContext,
         StartOp,
         SteerAccepted,
         StopDrain,
@@ -2671,6 +2576,7 @@ runtime_internal_inputs!(
         AuthorizeInteractionTerminalOutboxAdoption,
         AuthorizeStoredInputStateSeed,
         AuthorizeSupervisorMobPeerOverlay,
+        ArchiveTerminalInput,
         BeginDeferredSessionArchive,
         BeginDeferredSessionPromotion,
         CancelSurfaceRequest,
@@ -4047,6 +3953,10 @@ pub fn occurrence_lifecycle_schema_metadata() -> MachineSchemaMetadata {
                 ],
             ),
             NamedTypeBinding::string_enum(
+                "DeliveryAdmissionOutcome",
+                &["Accepted", "Deduplicated"],
+            ),
+            NamedTypeBinding::string_enum(
                 "DeliveryFailureReason",
                 &[
                     "TargetMaterializationFailed",
@@ -4118,6 +4028,7 @@ pub fn occurrence_lifecycle_schema_metadata() -> MachineSchemaMetadata {
                     "ClassifyCompletionSupersession",
                     "Claim",
                     "DispatchStarted",
+                    "DispatchAccepted",
                     "AwaitCompletion",
                     "Complete",
                     "ResolveRuntimeCompletion",
@@ -4126,6 +4037,7 @@ pub fn occurrence_lifecycle_schema_metadata() -> MachineSchemaMetadata {
                     "ResolveTargetProbe",
                     "ResolveDueMisfire",
                     "Supersede",
+                    "RenewLease",
                     "LeaseExpired",
                     "ReleaseLeaseForPausedSchedule",
                     "ClassifyTransitionFailure",

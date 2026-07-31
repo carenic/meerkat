@@ -753,6 +753,10 @@ fn create_session_model_resolution_error_to_tool_error(
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct MeerkatRunInput {
     pub prompt: String,
+    /// Host-regenerated text projected only into provider requests for this
+    /// logical turn.
+    #[serde(default)]
+    pub transient_turn_context: Option<meerkat_core::lifecycle::run_primitive::TurnRequestContext>,
     #[serde(default)]
     pub system_prompt: Option<String>,
     #[serde(default)]
@@ -861,7 +865,6 @@ fn mcp_resume_requires_rebuild(input: &MeerkatResumeInput) -> bool {
         || input.model.is_some()
         || input.provider.is_some()
         || input.max_tokens.is_some()
-        || input.system_prompt.is_some()
         || input.output_schema.is_some()
         || input.structured_output_retries.is_some()
         || input.provider_params.is_some()
@@ -1735,6 +1738,13 @@ fn realm_origin_from_selection(selection: &RealmSelection) -> meerkat_store::Rea
 pub struct MeerkatResumeInput {
     pub session_id: String,
     pub prompt: String,
+    /// Host-regenerated text projected only into provider requests for this
+    /// newly admitted logical turn.
+    #[serde(default)]
+    pub transient_turn_context: Option<meerkat_core::lifecycle::run_primitive::TurnRequestContext>,
+    /// Ordinary System message appended at this admitted turn boundary.
+    ///
+    /// This is not a recovered build-configuration override.
     #[serde(default)]
     pub system_prompt: Option<String>,
     /// Stream agent events to the MCP client via notifications.
@@ -3913,6 +3923,7 @@ async fn handle_meerkat_help(
     let provider = help_provider_to_mcp_provider(input.provider.clone())?;
     let run_input = MeerkatRunInput {
         prompt,
+        transient_turn_context: None,
         system_prompt: Some(meerkat::help::help_system_prompt().to_string()),
         model: input
             .model
@@ -4173,6 +4184,12 @@ async fn handle_meerkat_run(
                     .skill_references
                     .get_or_insert_with(Vec::new)
                     .extend(refs);
+            }
+            if let Some(context) = input.transient_turn_context.clone() {
+                build
+                    .initial_turn_metadata
+                    .get_or_insert_with(Default::default)
+                    .transient_turn_context = Some(context);
             }
             let request = CreateSessionRequest {
                 injected_context: Vec::new(),
@@ -4598,6 +4615,7 @@ async fn handle_meerkat_resume(
         let model_for_plan = model.clone();
         let prompt_for_plan = prompt.clone();
         let system_prompt_for_plan = input.system_prompt.clone();
+        let transient_turn_context_for_plan = input.transient_turn_context.clone();
         let event_tx_for_plan = event_tx.clone();
         let skill_references_for_plan = skill_references.clone();
         let requested_callback_tools_for_plan = requested_callback_tools.clone();
@@ -4643,14 +4661,28 @@ async fn handle_meerkat_resume(
                         .get_or_insert_with(Vec::new)
                         .extend(refs);
                 }
+                if let Some(system_prompt) = system_prompt_for_plan {
+                    build
+                        .initial_turn_metadata
+                        .get_or_insert_with(Default::default)
+                        .system_prompts
+                        .push(system_prompt);
+                }
+                if let Some(context) = transient_turn_context_for_plan {
+                    build
+                        .initial_turn_metadata
+                        .get_or_insert_with(Default::default)
+                        .transient_turn_context = Some(context);
+                }
                 let request = CreateSessionRequest {
                     injected_context: Vec::new(),
                     model: model_for_plan,
                     prompt: prompt_for_plan.into(),
-                    system_prompt: match system_prompt_for_plan {
-                        Some(prompt) => meerkat::SystemPromptOverride::Set(prompt),
-                        None => meerkat::SystemPromptOverride::Inherit,
-                    },
+                    // A resume input's `system_prompt` is an ordinary System
+                    // message for this admitted turn. Recovery restores the
+                    // durable build configuration unchanged; the initial-turn
+                    // metadata above appends the explicit System after claim.
+                    system_prompt: meerkat::SystemPromptOverride::Inherit,
                     max_tokens,
                     event_tx: event_tx_for_plan,
                     initial_turn: InitialTurnPolicy::RunImmediately,
@@ -4715,6 +4747,7 @@ async fn handle_meerkat_resume(
         let turn_seed_metadata = meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
             skill_references: skill_references.clone(),
             turn_tool_overlay: input.turn_tool_overlay.clone().map(Into::into),
+            transient_turn_context: input.transient_turn_context.clone(),
             keep_alive: keep_alive_override.map(|keep_alive| {
                 if keep_alive {
                     meerkat_core::lifecycle::run_primitive::KeepAliveDirective::Enable(
@@ -4732,12 +4765,11 @@ async fn handle_meerkat_resume(
         let turn_req = StartTurnRequest {
             injected_context: Vec::new(),
             prompt: prompt.clone().into(),
-            system_prompt: None,
+            system_prompt: input.system_prompt.clone(),
             event_tx: event_tx.clone(),
             runtime: meerkat_core::service::StartTurnRuntimeSemantics::new(
                 meerkat_core::types::HandlingMode::Queue,
                 input.turn_tool_overlay.clone().map(Into::into),
-                Vec::new(),
                 Some(meerkat_runtime::runtime_stamped_prompt_turn_metadata(Some(
                     turn_seed_metadata,
                 ))),
@@ -5067,17 +5099,6 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::time::{Duration, timeout};
-
-    fn install_session_created_checkpoint(session: &mut Session) {
-        let checkpoint = meerkat_core::SessionCheckpointStamp::root(
-            session,
-            meerkat_core::SessionCheckpointProvenance::SessionCreated,
-        )
-        .expect("fresh test session checkpoint should be valid");
-        session
-            .install_checkpoint_stamp(checkpoint)
-            .expect("fresh test session checkpoint should install");
-    }
 
     /// The head config store for the reserved `global` realm routes to the
     /// injected user-global document: an explicit state root must not shadow
@@ -5456,9 +5477,11 @@ mod tests {
 
     async fn state_with_persisted_session() -> (MeerkatMcpState, String) {
         let store: Arc<dyn SessionStore> = Arc::new(meerkat::MemoryStore::new());
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
         let state = MeerkatMcpState::new_with_store_options_and_llm(
             Arc::clone(&store),
-            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+            Arc::clone(&runtime_store),
             None,
             Some(Arc::new(TestClient::default())),
         )
@@ -5489,8 +5512,8 @@ mod tests {
         session
             .set_build_state(meerkat_core::SessionBuildState::default())
             .expect("session build state should serialize");
-        install_session_created_checkpoint(&mut session);
         store.save(&session).await.expect("persisted session");
+        seed_runtime_authority_session(&runtime_store, &session).await;
         (state, session_id)
     }
 
@@ -5617,6 +5640,7 @@ mod tests {
         MeerkatResumeInput {
             session_id,
             prompt: "Resume".to_string(),
+            transient_turn_context: None,
             system_prompt: None,
             model: None,
             max_tokens: None,
@@ -5705,6 +5729,139 @@ mod tests {
                         .contains("failed to update peer ingress context")
                 }),
             "resume must reach its post-completion boundary: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn cold_resume_appends_turn_system_once_without_rewriting_build_config() {
+        let (state, session_id) = state_with_persisted_session().await;
+        let parsed = meerkat::SessionId::parse(&session_id).expect("valid session id");
+        let mut input = bounded_resume_input(session_id, vec![]);
+        input.system_prompt = Some("cold turn system".to_string());
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            Box::pin(handle_meerkat_resume(&state, input, None, None)),
+        )
+        .await
+        .expect("cold resume with an explicit System must not deadlock");
+        assert!(
+            result.is_ok()
+                || result.as_ref().is_err_and(|error| {
+                    error
+                        .message
+                        .contains("failed to update peer ingress context")
+                }),
+            "cold resume must reach its post-completion boundary: {result:?}"
+        );
+
+        let stored = state
+            .service
+            .load_authoritative_session(&parsed)
+            .await
+            .expect("load cold-resumed session")
+            .expect("cold-resumed session remains durable");
+        let system_indices = stored
+            .messages()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, message)| match message {
+                meerkat_core::types::Message::System(message)
+                    if message.content == "cold turn system" =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            system_indices.len(),
+            1,
+            "cold materialization must append the turn System exactly once"
+        );
+        let user_index = stored
+            .messages()
+            .iter()
+            .position(|message| matches!(message, meerkat_core::types::Message::User(_)))
+            .expect("cold resume must append its user input");
+        assert!(
+            system_indices[0] < user_index,
+            "the admitted System must precede the same turn's user input"
+        );
+    }
+
+    #[tokio::test]
+    async fn live_resume_appends_turn_system_without_forcing_actor_rebuild() {
+        let store: Arc<dyn SessionStore> = Arc::new(meerkat::MemoryStore::new());
+        let state = MeerkatMcpState::new_with_store_options_and_llm(
+            store,
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+            None,
+            Some(Arc::new(TestClient::default())),
+        )
+        .await;
+        let session = Session::new();
+        let session_id = session.id().clone();
+        materialize_test_mcp_fixture(
+            &state,
+            &session_id,
+            McpActorMaterializationMode::Fresh,
+            move |bindings| {
+                let router = Arc::new(meerkat_mcp::McpRouterAdapter::new(
+                    McpRouter::new_with_surface_handle(Arc::clone(
+                        bindings.external_tool_surface(),
+                    )),
+                ));
+                let router_tools: Arc<dyn AgentToolDispatcher> = router.clone();
+                let mut request = mock_deferred_materialization_request(session, bindings, None);
+                request
+                    .build
+                    .get_or_insert_with(Default::default)
+                    .external_tools = Some(router_tools);
+                (request, router)
+            },
+        )
+        .await;
+        let attachment_before = state
+            .runtime_adapter
+            .current_executor_attachment_witness(&session_id)
+            .await
+            .expect("live fixture has an exact attachment");
+        let mut input = bounded_resume_input(session_id.to_string(), vec![]);
+        input.system_prompt = Some("live turn system".to_string());
+
+        handle_meerkat_resume(&state, input, None, None)
+            .await
+            .expect("live resume with an explicit System should run");
+
+        assert_eq!(
+            state
+                .runtime_adapter
+                .current_executor_attachment_witness(&session_id)
+                .await,
+            Some(attachment_before),
+            "an ordinary turn System must not force actor rematerialization"
+        );
+        let stored = state
+            .service
+            .load_authoritative_session(&session_id)
+            .await
+            .expect("load live-resumed session")
+            .expect("live-resumed session remains durable");
+        assert_eq!(
+            stored
+                .messages()
+                .iter()
+                .filter(|message| {
+                    matches!(
+                        message,
+                        meerkat_core::types::Message::System(message)
+                            if message.content == "live turn system"
+                    )
+                })
+                .count(),
+            1,
+            "live admission must append the explicit System exactly once"
         );
     }
 
@@ -7229,6 +7386,7 @@ mod tests {
             &state,
             MeerkatRunInput {
                 prompt: "test".to_string(),
+                transient_turn_context: None,
                 system_prompt: None,
                 model: Some(meerkat_core::lifecycle::run_primitive::ModelId::new(
                     "claude-opus-4-8",
@@ -7283,6 +7441,7 @@ mod tests {
             &state,
             MeerkatRunInput {
                 prompt: "test".to_string(),
+                transient_turn_context: None,
                 system_prompt: None,
                 model: Some(meerkat_core::lifecycle::run_primitive::ModelId::new(
                     "claude-opus-4-8",
@@ -7582,6 +7741,7 @@ mod tests {
             MeerkatResumeInput {
                 session_id,
                 prompt: "Resume".to_string(),
+                transient_turn_context: None,
                 system_prompt: None,
                 model: None,
                 max_tokens: None,
@@ -7666,6 +7826,7 @@ mod tests {
             MeerkatResumeInput {
                 session_id,
                 prompt: "Resume".to_string(),
+                transient_turn_context: None,
                 system_prompt: None,
                 model: None,
                 max_tokens: None,
@@ -7734,6 +7895,7 @@ mod tests {
             MeerkatResumeInput {
                 session_id,
                 prompt: "Resume".to_string(),
+                transient_turn_context: None,
                 system_prompt: None,
                 model: None,
                 max_tokens: None,
@@ -7790,9 +7952,10 @@ mod tests {
         runtime_store
             .commit_session_snapshot(
                 &meerkat_runtime::identifiers::LogicalRuntimeId::for_session(session.id()),
-                meerkat_runtime::store::SessionDelta {
+                meerkat_runtime::store::SerializedSessionSnapshot {
                     session_snapshot: serde_json::to_vec(session)
-                        .expect("session snapshot should serialize"),
+                        .expect("session snapshot should serialize")
+                        .into(),
                 },
             )
             .await
@@ -7833,12 +7996,11 @@ mod tests {
                 mob_member_binding: None,
             })
             .expect("session metadata should serialize");
-        install_session_created_checkpoint(&mut session);
         store.save(&session).await.expect("persisted session");
+        seed_runtime_authority_session(&runtime_store, &session).await;
 
-        let mut blocker_session = Session::new();
+        let blocker_session = Session::new();
         let blocker_id = blocker_session.id().clone();
-        install_session_created_checkpoint(&mut blocker_session);
         store
             .save(&blocker_session)
             .await
@@ -7855,6 +8017,7 @@ mod tests {
             MeerkatResumeInput {
                 session_id: session_id.to_string(),
                 prompt: "Resume".to_string(),
+                transient_turn_context: None,
                 system_prompt: None,
                 model: None,
                 max_tokens: None,
@@ -7975,9 +8138,8 @@ mod tests {
             "test starts with no runtime adapter registration"
         );
 
-        let mut blocker_session = Session::new();
+        let blocker_session = Session::new();
         let blocker_id = blocker_session.id().clone();
-        install_session_created_checkpoint(&mut blocker_session);
         store
             .save(&blocker_session)
             .await
@@ -7994,6 +8156,7 @@ mod tests {
             MeerkatResumeInput {
                 session_id: session_id.to_string(),
                 prompt: "Resume live no rebuild".to_string(),
+                transient_turn_context: None,
                 system_prompt: None,
                 model: None,
                 max_tokens: None,
@@ -8107,9 +8270,8 @@ mod tests {
             "test starts before peer ingress has been configured"
         );
 
-        let mut blocker_session = Session::new();
+        let blocker_session = Session::new();
         let blocker_id = blocker_session.id().clone();
-        install_session_created_checkpoint(&mut blocker_session);
         store
             .save(&blocker_session)
             .await
@@ -8126,6 +8288,7 @@ mod tests {
             MeerkatResumeInput {
                 session_id: session_id.to_string(),
                 prompt: "Resume live keep alive".to_string(),
+                transient_turn_context: None,
                 system_prompt: None,
                 model: None,
                 max_tokens: None,
@@ -8192,7 +8355,13 @@ mod tests {
     #[tokio::test]
     async fn test_handle_meerkat_resume_keep_alive_live_missing_failure_unregisters_runtime() {
         let store: Arc<dyn SessionStore> = Arc::new(meerkat::MemoryStore::new());
-        let state = MeerkatMcpState::new_with_store(Arc::clone(&store)).await;
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        let state = MeerkatMcpState::new_with_store_and_runtime_store(
+            Arc::clone(&store),
+            Arc::clone(&runtime_store),
+        )
+        .await;
         let mut session = Session::new();
         let session_id = session.id().clone();
         session
@@ -8219,13 +8388,14 @@ mod tests {
         session
             .set_build_state(meerkat_core::SessionBuildState::default())
             .expect("session build state should serialize");
-        install_session_created_checkpoint(&mut session);
         store.save(&session).await.expect("persisted session");
+        seed_runtime_authority_session(&runtime_store, &session).await;
         let result = Box::pin(handle_meerkat_resume(
             &state,
             MeerkatResumeInput {
                 session_id: session_id.to_string(),
                 prompt: "Resume".to_string(),
+                transient_turn_context: None,
                 system_prompt: None,
                 model: None,
                 max_tokens: None,
@@ -8277,7 +8447,13 @@ mod tests {
     async fn test_handle_meerkat_resume_keep_alive_live_missing_failure_preserves_existing_runtime()
     {
         let store: Arc<dyn SessionStore> = Arc::new(meerkat::MemoryStore::new());
-        let state = MeerkatMcpState::new_with_store(Arc::clone(&store)).await;
+        let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        let state = MeerkatMcpState::new_with_store_and_runtime_store(
+            Arc::clone(&store),
+            Arc::clone(&runtime_store),
+        )
+        .await;
         let mut session = Session::new();
         let session_id = session.id().clone();
         session
@@ -8304,8 +8480,8 @@ mod tests {
         session
             .set_build_state(meerkat_core::SessionBuildState::default())
             .expect("session build state should serialize");
-        install_session_created_checkpoint(&mut session);
         store.save(&session).await.expect("persisted session");
+        seed_runtime_authority_session(&runtime_store, &session).await;
         state
             .runtime_adapter
             .ensure_session_with_executor(
@@ -8324,6 +8500,7 @@ mod tests {
             MeerkatResumeInput {
                 session_id: session_id.to_string(),
                 prompt: "Resume".to_string(),
+                transient_turn_context: None,
                 system_prompt: None,
                 model: None,
                 max_tokens: None,
@@ -8412,6 +8589,13 @@ mod tests {
         }];
         assert!(mcp_resume_requires_rebuild(&input));
         input.tool_results.clear();
+
+        input.system_prompt = Some("ordinary turn System".to_string());
+        assert!(
+            !mcp_resume_requires_rebuild(&input),
+            "an explicit turn System is live input, not an actor build override"
+        );
+        input.system_prompt = None;
 
         input.enable_builtins = Some(false);
         assert!(mcp_resume_requires_rebuild(&input));
@@ -8945,7 +9129,6 @@ mod tests {
                 created_at: meerkat_core::types::message_timestamp_now(),
             },
         ));
-        install_session_created_checkpoint(&mut session);
         store
             .save(&session)
             .await
@@ -8976,6 +9159,22 @@ mod tests {
         ))
         .await
         .expect("archive through runtime authority should succeed");
+        let archived_runtime_state = meerkat_runtime::store::load_runtime_state(
+            runtime_store.as_ref(),
+            &meerkat_runtime::identifiers::LogicalRuntimeId::for_session(session.id()),
+        )
+        .await
+        .expect("archive runtime state should remain readable");
+        assert!(
+            matches!(
+                archived_runtime_state,
+                Some(
+                    meerkat_runtime::RuntimeState::Retired
+                        | meerkat_runtime::RuntimeState::Destroyed
+                )
+            ),
+            "archive must leave an absorbing runtime terminal, got {archived_runtime_state:?}"
+        );
 
         let archived_history = Box::pin(handle_tools_call(
             &state,
@@ -9051,7 +9250,6 @@ mod tests {
         session.push(meerkat_core::types::Message::tool_results(vec![
             meerkat_core::types::ToolResult::new("tool-2".to_string(), "done".to_string(), false),
         ]));
-        install_session_created_checkpoint(&mut session);
         store.save(&session).await.expect("persisted mixed session");
         seed_runtime_authority_session(&runtime_store, &session).await;
 

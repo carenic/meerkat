@@ -687,7 +687,9 @@ pub fn raw_deliver_member_input_command(
         handling_mode: HandlingMode::Queue,
         objective_id: None,
         expected_member: Some(expected_member),
+        system_prompt: None,
         injected_context: Vec::new(),
+        transient_turn_context: None,
         turn,
         outcome_tracking: None,
     })

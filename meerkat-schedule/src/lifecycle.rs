@@ -8,13 +8,13 @@ use crate::machines::occurrence_lifecycle as occ_dsl;
 use crate::machines::schedule_lifecycle as sched_dsl;
 use crate::store::PendingSupersession;
 use crate::types::{
-    CreateScheduleRequest, DeliveryCompletionFailureReason, DeliveryFailureReason, DeliveryReceipt,
-    DeliveryReceiptStage, Occurrence, OccurrenceFailureClass, OccurrenceId, OccurrenceOrdinal,
-    OccurrencePhase, OccurrenceTargetProbeOutcome, RuntimeCompletionOutcome,
-    RuntimeDeliveryOutcome, Schedule, ScheduleId, SchedulePhase, ScheduleRevision, TargetBinding,
-    TriggerSpec, UpdateScheduleRequest, delivery_receipt_id_from_authority,
-    target_materialized_session_id, validate_occurrence_machine_projection,
-    validate_schedule_machine_projection,
+    CreateScheduleRequest, DeliveryAdmissionOutcome, DeliveryCompletionFailureReason,
+    DeliveryFailureReason, DeliveryReceipt, DeliveryReceiptStage, Occurrence,
+    OccurrenceFailureClass, OccurrenceId, OccurrenceOrdinal, OccurrencePhase,
+    OccurrenceTargetProbeOutcome, RuntimeCompletionOutcome, RuntimeDeliveryOutcome, Schedule,
+    ScheduleId, SchedulePhase, ScheduleRevision, TargetBinding, TriggerSpec, UpdateScheduleRequest,
+    delivery_receipt_id_from_authority, target_materialized_session_id,
+    validate_occurrence_machine_projection, validate_schedule_machine_projection,
 };
 use chrono::{DateTime, Utc};
 use meerkat_core::SessionId;
@@ -385,6 +385,14 @@ pub enum OccurrenceLifecycleInput {
         correlation_id: Option<String>,
         at_utc: DateTime<Utc>,
     },
+    /// Target admission succeeded after the stable dispatch identity was
+    /// durably committed. The correlation id is intentionally absent: the
+    /// occurrence authority retains the pre-effect identity and refuses any
+    /// shell-side rewrite.
+    DispatchAccepted {
+        admission_outcome: DeliveryAdmissionOutcome,
+        at_utc: DateTime<Utc>,
+    },
     AwaitCompletion {
         at_utc: DateTime<Utc>,
     },
@@ -417,6 +425,17 @@ pub enum OccurrenceLifecycleInput {
     },
     Supersede {
         superseded_by_revision: ScheduleRevision,
+        at_utc: DateTime<Utc>,
+    },
+    /// Lease renewal presented by the live claim-token holder while its
+    /// delivery is in flight (2026-07 P0: a fixed lease with no renewal
+    /// reclaimed every delivery longer than the lease mid-flight). The
+    /// occurrence authority accepts it only from Dispatching /
+    /// AwaitingCompletion, only when `claim_token` matches the machine-owned
+    /// token, and only as a monotonic extension.
+    RenewLease {
+        claim_token: Uuid,
+        lease_expires_at_utc: DateTime<Utc>,
         at_utc: DateTime<Utc>,
     },
     LeaseExpired {
@@ -466,6 +485,7 @@ pub enum LateCompletionResolutionClass {
 pub enum OccurrenceLifecycleEffect {
     Claimed,
     DispatchStarted,
+    DispatchAccepted,
     AwaitingCompletion,
     Completed,
     Skipped,
@@ -492,6 +512,9 @@ pub enum OccurrenceLifecycleEffect {
     },
     DeliveryFailed,
     LeaseExpired,
+    /// The current claim-token holder extended its own lease while its
+    /// delivery is still in flight. Acknowledgement only; no receipt.
+    LeaseRenewed,
     /// 0.7.2 D2a: a delivery resolution arrived after this occurrence was
     /// superseded and was recorded as a typed late-arrival fact. The driver
     /// mirrors this to know the arrival landed as a late record (no fresh
@@ -1239,6 +1262,13 @@ fn convert_occurrence_input(
             correlation_id: correlation_id.clone().map(Into::into),
             at_utc_ms: occurrence_datetime_to_millis(*at_utc, "at_utc")?,
         },
+        OccurrenceLifecycleInput::DispatchAccepted {
+            admission_outcome,
+            at_utc,
+        } => occ_dsl::OccurrenceLifecycleInput::DispatchAccepted {
+            admission_outcome: to_dsl_delivery_admission_outcome(*admission_outcome),
+            at_utc_ms: occurrence_datetime_to_millis(*at_utc, "at_utc")?,
+        },
         OccurrenceLifecycleInput::AwaitCompletion { at_utc } => {
             occ_dsl::OccurrenceLifecycleInput::AwaitCompletion {
                 at_utc_ms: occurrence_datetime_to_millis(*at_utc, "at_utc")?,
@@ -1296,6 +1326,18 @@ fn convert_occurrence_input(
             at_utc,
         } => occ_dsl::OccurrenceLifecycleInput::Supersede {
             superseded_by_revision: superseded_by_revision.0,
+            at_utc_ms: occurrence_datetime_to_millis(*at_utc, "at_utc")?,
+        },
+        OccurrenceLifecycleInput::RenewLease {
+            claim_token,
+            lease_expires_at_utc,
+            at_utc,
+        } => occ_dsl::OccurrenceLifecycleInput::RenewLease {
+            claim_token: occ_dsl::ClaimToken(claim_token.to_string()),
+            lease_expires_at_utc_ms: occurrence_datetime_to_millis(
+                *lease_expires_at_utc,
+                "lease_expires_at_utc",
+            )?,
             at_utc_ms: occurrence_datetime_to_millis(*at_utc, "at_utc")?,
         },
         OccurrenceLifecycleInput::LeaseExpired { at_utc } => {
@@ -1776,6 +1818,9 @@ fn map_occurrence_effect(
         occ_dsl::OccurrenceLifecycleEffect::DispatchStarted => {
             OccurrenceLifecycleEffect::DispatchStarted
         }
+        occ_dsl::OccurrenceLifecycleEffect::DispatchAccepted => {
+            OccurrenceLifecycleEffect::DispatchAccepted
+        }
         occ_dsl::OccurrenceLifecycleEffect::AwaitingCompletion => {
             OccurrenceLifecycleEffect::AwaitingCompletion
         }
@@ -1823,6 +1868,7 @@ fn map_occurrence_effect(
             OccurrenceLifecycleEffect::DeliveryFailed
         }
         occ_dsl::OccurrenceLifecycleEffect::LeaseExpired => OccurrenceLifecycleEffect::LeaseExpired,
+        occ_dsl::OccurrenceLifecycleEffect::LeaseRenewed => OccurrenceLifecycleEffect::LeaseRenewed,
         occ_dsl::OccurrenceLifecycleEffect::LateCompletionResolutionRecorded { resolution } => {
             OccurrenceLifecycleEffect::LateCompletionResolutionRecorded {
                 resolution: late_completion_resolution_class_from_dsl(*resolution),
@@ -2838,6 +2884,15 @@ fn to_dsl_runtime_completion_outcome(
     }
 }
 
+fn to_dsl_delivery_admission_outcome(
+    outcome: DeliveryAdmissionOutcome,
+) -> occ_dsl::DeliveryAdmissionOutcome {
+    match outcome {
+        DeliveryAdmissionOutcome::Accepted => occ_dsl::DeliveryAdmissionOutcome::Accepted,
+        DeliveryAdmissionOutcome::Deduplicated => occ_dsl::DeliveryAdmissionOutcome::Deduplicated,
+    }
+}
+
 fn from_dsl_failure_class(fc: occ_dsl::FailureClass) -> OccurrenceFailureClass {
     match fc {
         occ_dsl::FailureClass::TargetMaterializationFailed => {
@@ -3007,6 +3062,101 @@ mod tests {
             .into_occurrence()
     }
 
+    /// Lease renewal is machine authority (2026-07 P0): only the current
+    /// claim-token holder may extend its own in-flight lease, the extension
+    /// is monotonic, and everything else is a typed NotLeaseHolding refusal.
+    #[test]
+    fn lease_renewal_extends_only_for_current_token_holder_in_flight() {
+        let dispatching = sample_claimed_occurrence()
+            .apply(OccurrenceLifecycleInput::DispatchStarted {
+                correlation_id: Some("corr-1".into()),
+                at_utc: Utc::now(),
+            })
+            .expect("dispatch should pass generated authority")
+            .into_occurrence();
+        let token = dispatching.claim_token().expect("claimed token");
+        let initial_expiry = dispatching
+            .lease_expires_at_utc
+            .expect("claimed occurrence must hold a lease");
+
+        // Current token holder extends from Dispatching.
+        let extended_to = initial_expiry + Duration::seconds(60);
+        let mutator = dispatching
+            .clone()
+            .apply(OccurrenceLifecycleInput::RenewLease {
+                claim_token: token,
+                lease_expires_at_utc: extended_to,
+                at_utc: Utc::now(),
+            })
+            .expect("token-holder renewal must pass generated authority");
+        assert!(
+            mutator
+                .effects
+                .contains(&OccurrenceLifecycleEffect::LeaseRenewed),
+            "renewal must emit the machine's LeaseRenewed acknowledgement"
+        );
+        let renewed = mutator.into_occurrence();
+        assert_eq!(renewed.phase, OccurrencePhase::Dispatching);
+        assert_eq!(renewed.lease_expires_at_utc, Some(extended_to));
+        assert_eq!(renewed.attempt_count, dispatching.attempt_count);
+
+        // And again from AwaitingCompletion.
+        let awaiting = renewed
+            .apply(OccurrenceLifecycleInput::AwaitCompletion { at_utc: Utc::now() })
+            .expect("await should pass generated authority")
+            .into_occurrence();
+        let later = extended_to + Duration::seconds(60);
+        let renewed = awaiting
+            .apply(OccurrenceLifecycleInput::RenewLease {
+                claim_token: token,
+                lease_expires_at_utc: later,
+                at_utc: Utc::now(),
+            })
+            .expect("in-flight renewal must pass generated authority")
+            .into_occurrence();
+        assert_eq!(renewed.phase, OccurrencePhase::AwaitingCompletion);
+        assert_eq!(renewed.lease_expires_at_utc, Some(later));
+
+        // A non-holder token is refused (typed NotLeaseHolding).
+        assert!(matches!(
+            renewed.clone().apply(OccurrenceLifecycleInput::RenewLease {
+                claim_token: Uuid::now_v7(),
+                lease_expires_at_utc: later + Duration::seconds(60),
+                at_utc: Utc::now(),
+            }),
+            Err(OccurrenceLifecycleError::NotLeaseHolding)
+        ));
+
+        // A shrinking "renewal" is refused: extensions are monotonic.
+        assert!(matches!(
+            renewed.apply(OccurrenceLifecycleInput::RenewLease {
+                claim_token: token,
+                lease_expires_at_utc: later - Duration::seconds(1),
+                at_utc: Utc::now(),
+            }),
+            Err(OccurrenceLifecycleError::NotLeaseHolding)
+        ));
+
+        // Renewal is not legal before dispatch (Claimed: nothing in flight)
+        // or after terminality.
+        assert!(matches!(
+            sample_claimed_occurrence().apply(OccurrenceLifecycleInput::RenewLease {
+                claim_token: token,
+                lease_expires_at_utc: later,
+                at_utc: Utc::now(),
+            }),
+            Err(OccurrenceLifecycleError::NotLeaseHolding)
+        ));
+        assert!(matches!(
+            sample_completed_occurrence().apply(OccurrenceLifecycleInput::RenewLease {
+                claim_token: token,
+                lease_expires_at_utc: later,
+                at_utc: Utc::now(),
+            }),
+            Err(OccurrenceLifecycleError::NotLeaseHolding)
+        ));
+    }
+
     #[test]
     fn terminality_is_decided_by_occurrence_authority() {
         // Live phases mirror `false`; terminal phases mirror `true`. The
@@ -3143,6 +3293,14 @@ mod tests {
                     at_utc: now,
                 },
                 occ_dsl::OccurrenceTransitionFailureClassKind::NotClaimed,
+            ),
+            (
+                &pending,
+                OccurrenceLifecycleInput::DispatchAccepted {
+                    admission_outcome: DeliveryAdmissionOutcome::Accepted,
+                    at_utc: now,
+                },
+                occ_dsl::OccurrenceTransitionFailureClassKind::NotDispatching,
             ),
             (
                 &pending,
@@ -3463,6 +3621,96 @@ mod tests {
             }),
             Err(OccurrenceLifecycleError::ReceiptRecordMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn dispatch_acceptance_retains_precommitted_identity_and_records_admission_outcome() {
+        let now = Utc::now();
+        let dispatching = sample_claimed_occurrence()
+            .apply(OccurrenceLifecycleInput::DispatchStarted {
+                correlation_id: Some("stable-occurrence-correlation".into()),
+                at_utc: now,
+            })
+            .expect("dispatch start should pass generated authority")
+            .into_occurrence();
+        let started_receipt = dispatching
+            .delivery_receipt_from_authority(None)
+            .expect("started receipt authority");
+        let dispatching = dispatching
+            .apply(OccurrenceLifecycleInput::RecordReceipt {
+                receipt: started_receipt,
+                runtime_outcome: None,
+            })
+            .expect("record dispatch start")
+            .into_occurrence();
+        let accepted = dispatching
+            .apply(OccurrenceLifecycleInput::DispatchAccepted {
+                admission_outcome: DeliveryAdmissionOutcome::Accepted,
+                at_utc: now + Duration::milliseconds(1),
+            })
+            .expect("dispatch acceptance should pass generated authority")
+            .into_occurrence();
+        let admission = RuntimeDeliveryOutcome::AdmissionAccepted;
+        let accepted_receipt = accepted
+            .delivery_receipt_from_authority(Some(admission.clone()))
+            .expect("accepted receipt authority");
+        assert_eq!(
+            accepted_receipt.stage,
+            DeliveryReceiptStage::DispatchAccepted
+        );
+        assert_eq!(
+            accepted_receipt.correlation_id.as_deref(),
+            Some("stable-occurrence-correlation"),
+            "post-effect transition cannot rewrite the pre-effect identity"
+        );
+        let recorded = accepted
+            .apply(OccurrenceLifecycleInput::RecordReceipt {
+                receipt: accepted_receipt,
+                runtime_outcome: Some(admission.clone()),
+            })
+            .expect("record dispatch acceptance")
+            .into_occurrence();
+        assert_eq!(recorded.runtime_outcome, Some(admission));
+        assert_eq!(
+            recorded.last_receipt.as_ref().map(|receipt| receipt.stage),
+            Some(DeliveryReceiptStage::DispatchAccepted)
+        );
+    }
+
+    #[test]
+    fn deduplicated_admission_terminalizes_completed_from_machine_authority() {
+        let now = Utc::now();
+        let dispatching = sample_claimed_occurrence()
+            .apply(OccurrenceLifecycleInput::DispatchStarted {
+                correlation_id: Some("stable-occurrence-correlation".into()),
+                at_utc: now,
+            })
+            .expect("dispatch start should pass generated authority")
+            .into_occurrence();
+
+        let mutator = dispatching
+            .apply(OccurrenceLifecycleInput::DispatchAccepted {
+                admission_outcome: DeliveryAdmissionOutcome::Deduplicated,
+                at_utc: now + Duration::milliseconds(1),
+            })
+            .expect("deduplicated admission should pass generated authority");
+        assert!(
+            mutator
+                .effects
+                .contains(&OccurrenceLifecycleEffect::Completed)
+        );
+        let completed = mutator.into_occurrence();
+        assert_eq!(completed.phase, OccurrencePhase::Completed);
+        assert_eq!(completed.failure_class, None);
+
+        let receipt = completed
+            .delivery_receipt_from_authority(Some(RuntimeDeliveryOutcome::AdmissionDeduplicated))
+            .expect("deduplicated admission should project a completed receipt");
+        assert_eq!(receipt.stage, DeliveryReceiptStage::Completed);
+        assert_eq!(
+            receipt.correlation_id.as_deref(),
+            Some("stable-occurrence-correlation")
+        );
     }
 
     #[test]

@@ -28,10 +28,26 @@ impl FailDeleteOpsLifecycleOnceStore {
 
 #[async_trait::async_trait]
 impl meerkat_runtime::store::RuntimeStore for FailDeleteOpsLifecycleOnceStore {
+    fn session_authority_ops(&self) -> &dyn meerkat_runtime::store::RuntimeSessionAuthorityOps {
+        self.inner.session_authority_ops()
+    }
+
+    fn session_persistence_profile(
+        &self,
+    ) -> meerkat_runtime::store::RuntimeSessionPersistenceProfile {
+        meerkat_runtime::store::RuntimeStore::session_persistence_profile(self.inner.as_ref())
+    }
+
     fn supports_compaction_projection_outbox(&self) -> bool {
         meerkat_runtime::store::RuntimeStore::supports_compaction_projection_outbox(
             self.inner.as_ref(),
         )
+    }
+
+    fn input_state_batch_cas_implementation_profile(
+        &self,
+    ) -> meerkat_runtime::store::InputStateBatchCasImplementationProfile {
+        self.inner.input_state_batch_cas_implementation_profile()
     }
 
     async fn observe_machine_lifecycle(
@@ -61,17 +77,30 @@ impl meerkat_runtime::store::RuntimeStore for FailDeleteOpsLifecycleOnceStore {
     async fn commit_session_snapshot(
         &self,
         runtime_id: &meerkat_runtime::LogicalRuntimeId,
-        session_delta: meerkat_runtime::store::SessionDelta,
+        session_delta: meerkat_runtime::store::SerializedSessionSnapshot,
     ) -> Result<(), meerkat_runtime::store::RuntimeStoreError> {
         self.inner
             .commit_session_snapshot(runtime_id, session_delta)
             .await
     }
 
+    async fn commit_prepared_whole_blob_rewrite_boundary(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        boundary: meerkat_runtime::store::PreparedWholeBlobRewriteStoreParts,
+    ) -> Result<
+        meerkat_runtime::store::WholeBlobStoreAuthority,
+        meerkat_runtime::store::RuntimeStoreError,
+    > {
+        self.inner
+            .commit_prepared_whole_blob_rewrite_boundary(runtime_id, boundary)
+            .await
+    }
+
     async fn atomic_apply(
         &self,
         runtime_id: &meerkat_runtime::LogicalRuntimeId,
-        session_delta: Option<meerkat_runtime::store::SessionDelta>,
+        session_delta: Option<meerkat_runtime::store::SerializedSessionSnapshot>,
         receipt: meerkat_core::lifecycle::RunBoundaryReceipt,
         input_updates: Vec<meerkat_runtime::input_state::InputStatePersistenceRecord>,
         session_store_key: Option<meerkat_core::SessionId>,
@@ -95,6 +124,16 @@ impl meerkat_runtime::store::RuntimeStore for FailDeleteOpsLifecycleOnceStore {
         self.inner.load_input_states(runtime_id).await
     }
 
+    async fn load_input_states_with_versions(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+    ) -> Result<
+        meerkat_runtime::store::PreparedRecoveryInputSnapshot,
+        meerkat_runtime::store::RuntimeStoreError,
+    > {
+        self.inner.load_input_states_with_versions(runtime_id).await
+    }
+
     async fn load_boundary_receipt(
         &self,
         runtime_id: &meerkat_runtime::LogicalRuntimeId,
@@ -112,7 +151,7 @@ impl meerkat_runtime::store::RuntimeStore for FailDeleteOpsLifecycleOnceStore {
     async fn load_session_snapshot(
         &self,
         runtime_id: &meerkat_runtime::LogicalRuntimeId,
-    ) -> Result<Option<Vec<u8>>, meerkat_runtime::store::RuntimeStoreError> {
+    ) -> Result<Option<std::sync::Arc<Vec<u8>>>, meerkat_runtime::store::RuntimeStoreError> {
         self.inner.load_session_snapshot(runtime_id).await
     }
 
@@ -172,6 +211,126 @@ impl meerkat_runtime::store::RuntimeStore for FailDeleteOpsLifecycleOnceStore {
         state: &meerkat_runtime::input_state::InputStatePersistenceRecord,
     ) -> Result<(), meerkat_runtime::store::RuntimeStoreError> {
         self.inner.persist_input_state(runtime_id, state).await
+    }
+
+    async fn persist_input_states_atomically(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        states: &[meerkat_runtime::input_state::InputStatePersistenceRecord],
+    ) -> Result<(), meerkat_runtime::store::RuntimeStoreError> {
+        self.inner
+            .persist_input_states_atomically(runtime_id, states)
+            .await
+    }
+
+    async fn compare_and_swap_input_states_atomically(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        expected: &[meerkat_runtime::input_state::StoredInputState],
+        replacements: &[meerkat_runtime::input_state::InputStatePersistenceRecord],
+    ) -> Result<
+        meerkat_runtime::store::InputStateBatchCasOutcome,
+        meerkat_runtime::store::RuntimeStoreError,
+    > {
+        self.inner
+            .compare_and_swap_input_states_atomically(runtime_id, expected, replacements)
+            .await
+    }
+
+    async fn compare_and_swap_input_states_atomically_with_fence(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        expected: &[meerkat_runtime::input_state::StoredInputState],
+        replacements: &[meerkat_runtime::input_state::InputStatePersistenceRecord],
+        write_fence: Arc<dyn meerkat_runtime::store::RuntimeStoreWriteFence>,
+    ) -> Result<
+        meerkat_runtime::store::FencedInputStateBatchCasOutcome,
+        meerkat_runtime::store::RuntimeStoreError,
+    > {
+        self.inner
+            .compare_and_swap_input_states_atomically_with_fence(
+                runtime_id,
+                expected,
+                replacements,
+                write_fence,
+            )
+            .await
+    }
+
+    async fn compare_and_swap_recovery_input_states_atomically(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        expected_revision: meerkat_runtime::store::RecoveryInputSetRevision,
+        mutations: &[meerkat_runtime::store::RecoveryInputStateMutation],
+    ) -> Result<
+        meerkat_runtime::store::InputStateBatchCasOutcome,
+        meerkat_runtime::store::RuntimeStoreError,
+    > {
+        self.inner
+            .compare_and_swap_recovery_input_states_atomically(
+                runtime_id,
+                expected_revision,
+                mutations,
+            )
+            .await
+    }
+
+    async fn compare_and_swap_recovery_input_states_atomically_with_fence(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        expected_revision: meerkat_runtime::store::RecoveryInputSetRevision,
+        mutations: &[meerkat_runtime::store::RecoveryInputStateMutation],
+        write_fence: Arc<dyn meerkat_runtime::store::RuntimeStoreWriteFence>,
+    ) -> Result<
+        meerkat_runtime::store::FencedInputStateBatchCasOutcome,
+        meerkat_runtime::store::RuntimeStoreError,
+    > {
+        self.inner
+            .compare_and_swap_recovery_input_states_atomically_with_fence(
+                runtime_id,
+                expected_revision,
+                mutations,
+                write_fence,
+            )
+            .await
+    }
+
+    async fn load_input_state_by_idempotency_key(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        key: &meerkat_runtime::IdempotencyKey,
+    ) -> Result<
+        Option<meerkat_runtime::store::ExactInputStateObservation>,
+        meerkat_runtime::store::RuntimeStoreError,
+    > {
+        self.inner
+            .load_input_state_by_idempotency_key(runtime_id, key)
+            .await
+    }
+
+    async fn load_input_states_by_ids(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        input_ids: &[meerkat_core::lifecycle::InputId],
+    ) -> Result<
+        Vec<Option<meerkat_runtime::input_state::StoredInputState>>,
+        meerkat_runtime::store::RuntimeStoreError,
+    > {
+        self.inner
+            .load_input_states_by_ids(runtime_id, input_ids)
+            .await
+    }
+
+    async fn load_pending_terminal_owner_ids_page(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        after: Option<&meerkat_core::lifecycle::InputId>,
+        limit: usize,
+    ) -> Result<Vec<meerkat_core::lifecycle::InputId>, meerkat_runtime::store::RuntimeStoreError>
+    {
+        self.inner
+            .load_pending_terminal_owner_ids_page(runtime_id, after, limit)
+            .await
     }
 
     async fn load_input_state(

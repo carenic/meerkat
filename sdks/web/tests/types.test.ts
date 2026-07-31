@@ -281,7 +281,7 @@ const sourceIdOnlyEventEnvelope: EventEnvelope = {
 
 const appendSystemContextResult: AppendSystemContextResult = {
   handle: 1,
-  status: 'staged',
+  status: 'applied',
 };
 
 const sessionState: SessionState = {
@@ -298,7 +298,7 @@ const sessionState: SessionState = {
 const mobAppendSystemContextResult: MobAppendSystemContextResult = {
   mob_id: 'mob-1',
   agent_identity: 'worker-1',
-  status: 'staged',
+  status: 'applied',
 };
 
 // ─── MobDefinition (matches Rust MobDefinition) ────────────────
@@ -438,6 +438,8 @@ function handleEvent(event: AgentEvent): string {
     case 'assistant_image_appended':
       return event.type;
     case 'transcript_rewrite_committed':
+      return event.type;
+    case 'transcript_rewrite_audit_receipt_committed':
       return event.type;
     case 'peer_content_ingested':
       // sender_taint is tri-state: absent means "no declaration", which

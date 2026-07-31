@@ -167,15 +167,19 @@ fn live_seed_window_from_params(
 
 fn live_open_projection_error_code(error: &RealtimeSessionOpenProjectionError) -> i32 {
     match error {
-        RealtimeSessionOpenProjectionError::Seed(
-            LiveSeedProjectionError::ZeroWindow | LiveSeedProjectionError::RootExceedsWindow { .. },
+        RealtimeSessionOpenProjectionError::Seed(LiveSeedProjectionError::ZeroWindow) => {
+            crate::error::INVALID_PARAMS
+        }
+        RealtimeSessionOpenProjectionError::Llm(
+            meerkat_client::error::LlmError::InvalidInputShape { .. },
         ) => crate::error::INVALID_PARAMS,
         RealtimeSessionOpenProjectionError::Session(_)
         | RealtimeSessionOpenProjectionError::Seed(
             LiveSeedProjectionError::Session(_)
             | LiveSeedProjectionError::Serialization(_)
             | LiveSeedProjectionError::SizeOverflow,
-        ) => crate::error::INTERNAL_ERROR,
+        )
+        | RealtimeSessionOpenProjectionError::Llm(_) => crate::error::INTERNAL_ERROR,
     }
 }
 
@@ -385,9 +389,12 @@ fn live_verb_error_response(id: Option<RpcId>, error: LiveChannelVerbError) -> R
         | LiveChannelVerbError::ResultProjection { message } => {
             RpcResponse::error(id, error::INTERNAL_ERROR, message)
         }
-        error @ (LiveChannelVerbError::CommitOmitted
-        | LiveChannelVerbError::HostCommit { .. }
-        | LiveChannelVerbError::RefreshConfig(_)) => {
+        LiveChannelVerbError::RefreshConfig(source) => RpcResponse::error(
+            id,
+            live_open_projection_error_code(&source),
+            format!("failed to build session config: {source}"),
+        ),
+        error @ (LiveChannelVerbError::CommitOmitted | LiveChannelVerbError::HostCommit { .. }) => {
             RpcResponse::error(id, error::INTERNAL_ERROR, error.to_string())
         }
     }
@@ -1622,58 +1629,49 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_reads_typed_system_prompt_field_not_seed_messages() {
-        // R10 (D209): the snapshot builder MUST surface the typed
-        // `RealtimeSessionOpenConfig.system_prompt` field directly — the
-        // single owner of the live-session prompt populated by the runtime
-        // projection — instead of re-deriving it from `seed_messages[0]`.
-        // The history-event projector drops `Message::System`, so inference
-        // from seed history silently wipes the prompt on the OpenAI Refresh
-        // `session.update` path. To prove the source is the typed field and
-        // NOT the seed history, the seed messages here lead with a NON-system
-        // user message while the typed field carries the resolved prompt.
-        use meerkat_core::types::{Message, UserMessage};
+    fn snapshot_carries_exact_constructor_derived_system_rows() {
+        use meerkat_core::types::{Message, SystemMessage, UserMessage};
 
-        let resolved_prompt = "you are a helpful meerkat".to_string();
         let open_config = RealtimeSessionOpenConfig::new(
             RealtimeTurningMode::ProviderManaged,
             test_live_identity(),
             Vec::new(),
-            vec![Message::User(UserMessage::text("hi".to_string()))],
+            vec![
+                Message::System(SystemMessage::new("first")),
+                Message::User(UserMessage::text("hi")),
+                Message::System(SystemMessage::new("")),
+                Message::System(SystemMessage::new("first")),
+                Message::System(SystemMessage::new(" \t ")),
+            ],
         )
-        .with_system_prompt(Some(resolved_prompt.clone()));
+        .expect("test seed must be representable");
         let session_id = SessionId::new();
         let snapshot = build_live_projection_snapshot(&session_id, &open_config, None);
         assert_eq!(
-            snapshot.system_prompt,
-            Some(resolved_prompt),
-            "snapshot.system_prompt must read the typed open_config field, not infer from seed_messages[0]"
+            snapshot.canonical_system_messages,
+            vec![
+                "first".to_string(),
+                String::new(),
+                "first".to_string(),
+                " \t ".to_string(),
+            ]
         );
     }
 
     #[test]
-    fn snapshot_system_prompt_is_none_when_typed_field_absent() {
-        // R10 (D209): a session without a resolved root system prompt must
-        // surface `None` honestly. Even when a `Message::System` happens to
-        // lead the seed history, the snapshot must NOT resurrect it as the
-        // prompt — the typed field is the only authority, and its absence is
-        // an honest `None` (not an empty string the adapter must guard).
-        use meerkat_core::types::{Message, SystemMessage};
+    fn snapshot_system_rows_are_empty_without_system_messages() {
+        use meerkat_core::types::{Message, UserMessage};
 
         let open_config = RealtimeSessionOpenConfig::new(
             RealtimeTurningMode::ProviderManaged,
             test_live_identity(),
             Vec::new(),
-            vec![Message::System(SystemMessage::new(
-                "stray seed system message",
-            ))],
-        );
+            vec![Message::User(UserMessage::text("ordinary dialogue"))],
+        )
+        .expect("ordinary dialogue must be representable");
         let session_id = SessionId::new();
         let snapshot = build_live_projection_snapshot(&session_id, &open_config, None);
-        assert_eq!(
-            snapshot.system_prompt, None,
-            "snapshot.system_prompt must mirror the absent typed field, not infer from seed_messages[0]"
-        );
+        assert_eq!(snapshot.canonical_system_messages, Vec::<String>::new());
     }
 
     #[test]
@@ -1743,11 +1741,10 @@ mod tests {
             snapshot_version: 1,
             seed_messages: Vec::new(),
             visible_tools: Vec::new(),
-            system_prompt: None,
+            canonical_system_messages: Vec::new(),
             model_id: "gpt-realtime-2".into(),
             provider_id: meerkat_core::Provider::OpenAI,
             audio_config: None,
-            runtime_system_context: Vec::new(),
             user_content_identities: Vec::new(),
             user_content_tombstones: Vec::new(),
             canonical_user_image_decoded_bytes: None,
@@ -1797,21 +1794,21 @@ mod tests {
 
     #[test]
     fn typed_live_seed_projection_errors_map_without_string_reclassification() {
-        let too_small =
-            RealtimeSessionOpenProjectionError::Seed(LiveSeedProjectionError::RootExceedsWindow {
-                required_chars: 11,
-                max_chars: 10,
-            });
-        assert_eq!(
-            super::live_open_projection_error_code(&too_small),
-            error::INVALID_PARAMS
-        );
-
         let internal =
             RealtimeSessionOpenProjectionError::Seed(LiveSeedProjectionError::SizeOverflow);
         assert_eq!(
             super::live_open_projection_error_code(&internal),
             error::INTERNAL_ERROR
+        );
+
+        let unsupported_shape = RealtimeSessionOpenProjectionError::Llm(
+            meerkat_client::error::LlmError::InvalidInputShape {
+                message: "interleaved System messages are unsupported".to_string(),
+            },
+        );
+        assert_eq!(
+            super::live_open_projection_error_code(&unsupported_shape),
+            error::INVALID_PARAMS
         );
     }
 
@@ -2137,7 +2134,8 @@ mod tests {
             test_live_identity(),
             Vec::new(),
             Vec::new(),
-        );
+        )
+        .expect("test seed must be representable");
         let session_id = SessionId::new();
         let snapshot =
             build_live_projection_snapshot(&session_id, &open_config, Some(resolved.clone()));
@@ -2304,11 +2302,10 @@ mod tests {
             snapshot_version: 7,
             seed_messages: vec![],
             visible_tools: vec![],
-            system_prompt: None,
+            canonical_system_messages: vec![],
             model_id: "gpt-realtime-2".into(),
             provider_id: meerkat_core::Provider::OpenAI,
             audio_config: None,
-            runtime_system_context: vec![],
             user_content_identities: vec![],
             user_content_tombstones: vec![],
             canonical_user_image_decoded_bytes: None,
@@ -2485,11 +2482,10 @@ mod tests {
                 snapshot_version: 0,
                 seed_messages: vec![],
                 visible_tools: vec![],
-                system_prompt: None,
+                canonical_system_messages: vec![],
                 model_id: "gpt-realtime-2".into(),
                 provider_id: meerkat_core::Provider::OpenAI,
                 audio_config: None,
-                runtime_system_context: vec![],
                 user_content_identities: vec![],
                 user_content_tombstones: vec![],
                 canonical_user_image_decoded_bytes: None,

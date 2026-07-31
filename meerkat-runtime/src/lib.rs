@@ -68,6 +68,7 @@ pub mod member_observation;
 pub mod mob_adapter;
 pub mod mob_operator_authority;
 pub mod ops_lifecycle;
+pub(crate) mod panic_boundary;
 pub mod peer_handling_mode;
 pub mod policy;
 pub mod policy_table;
@@ -547,20 +548,20 @@ pub use meerkat_core::types::HandlingMode;
 #[cfg(not(target_arch = "wasm32"))]
 pub use meerkat_machine::ProviderAuthRuntimeAuthority;
 pub use meerkat_machine::{
-    ArchivedSessionActorMaterializationAuthorization,
+    ArchivedSessionActorMaterializationAuthorization, AuthorizedArchivedResumeCommitLease,
     CommittedRuntimeExecutorAttachmentPublicationLease, CommsDrainMode, CommsDrainPhase,
     DrainExitReason, EnsureRuntimeExecutorAttachment, LocalSessionMaterializationMode,
     MachineServiceTurnCommitLease, MachineServiceTurnIdentity, MachineSessionArchiveLease,
     MachineSessionControlAuthority, MeerkatConsumerSurface, MeerkatMachine, PeerIngressOwner,
     PendingRuntimeExecutorAttachment, PreparedArchivedResumeCommitLease,
     PreparedAttachedSessionActorRecovery, PreparedRuntimeExecutorAttachmentRetirement,
-    PreparedSessionMaterialization, PromotedArchivedResumeCommitLease, RuntimeBindingsError,
-    RuntimeCleanupTaskSpawner, RuntimeExecutorAttachmentRetirementCompletion,
-    RuntimeExecutorAttachmentWitness, RuntimeLifecycleFacts, RuntimeLoopQueueAdmissionPlan,
-    RuntimeSessionLifecycleObservation, RuntimeSessionRegistrationOutcome,
-    RuntimeSessionRegistrationWitness, StandaloneSessionRuntimeAuthorities,
-    classify_runtime_lifecycle_state, classify_runtime_loop_queue_admission,
-    standalone_session_runtime_authorities, standalone_tool_visibility_owner,
+    PreparedSessionMaterialization, RuntimeBindingsError, RuntimeCleanupTaskSpawner,
+    RuntimeExecutorAttachmentRetirementCompletion, RuntimeExecutorAttachmentWitness,
+    RuntimeLifecycleFacts, RuntimeLoopQueueAdmissionPlan, RuntimeSessionLifecycleObservation,
+    RuntimeSessionRegistrationOutcome, RuntimeSessionRegistrationWitness,
+    StandaloneSessionRuntimeAuthorities, classify_runtime_lifecycle_state,
+    classify_runtime_loop_queue_admission, standalone_session_runtime_authorities,
+    standalone_tool_visibility_owner,
 };
 pub use meerkat_machine_types::{
     HydratedSessionLlmState, ImageOperationRoutingRequest, ImageOperationRoutingResult,
@@ -847,9 +848,19 @@ pub use service_ext::SessionServiceRuntimeExt;
 #[cfg(feature = "sqlite-store")]
 pub use store::SqliteRuntimeStore;
 pub use store::{
-    InMemoryRuntimeStore, InputStateRow, RuntimeDeliveryAuthorityCasOutcome,
-    RuntimeDeliveryAuthorityRecord, RuntimeDeliveryStoreRecord, RuntimeStore, RuntimeStoreError,
-    RuntimeStoreWriteFence, RuntimeStoreWriteFenceOutcome, SessionDelta,
+    CommittedRecoveryBoundary, CommittedWholeBlobProvisionalTail, CommittedWholeBlobSnapshot,
+    HeadCanonicalProvisionalTailAuthority, HeadCanonicalStoreAuthority, InMemoryRuntimeStore,
+    InputStateRow, PreparedDurableTailRecoverySource, PreparedHeadCanonicalProvisionalPromotion,
+    PreparedHeadCanonicalProvisionalTail, PreparedRecoveryEvidence,
+    PreparedRecoveryReceiptDigestEnrichment, PreparedRecoveryReceiptSource,
+    PreparedRuntimeSessionCommit, PreparedRuntimeSessionCommitKind,
+    PreparedRuntimeSessionCommitOutcome, PreparedRuntimeSessionCommitResult,
+    PreparedWholeBlobProvisionalTail, PreparedWholeBlobRewriteBoundary,
+    PreparedWholeBlobRewriteStoreParts, RecoveryCommitStatus, RuntimeDeliveryAuthorityCasOutcome,
+    RuntimeDeliveryAuthorityRecord, RuntimeDeliveryStoreRecord, RuntimeSessionAuthority,
+    RuntimeSessionPersistenceProfile, RuntimeStore, RuntimeStoreError, RuntimeStoreWriteFence,
+    RuntimeStoreWriteFenceOutcome, SerializedSessionSnapshot, VerifiedCommittedWholeBlobPayload,
+    WholeBlobProvisionalTailAuthority, WholeBlobStoreAuthority,
 };
 pub use traits::{
     DestroyReport, RecoveryReport, RecycleReport, ResetReport, RetireReport, RuntimeControlPlane,

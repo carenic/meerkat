@@ -42,6 +42,27 @@
 #[cfg(target_arch = "wasm32")]
 pub mod tokio {
     pub use tokio_with_wasm::alias::*;
+
+    pub mod time {
+        use std::future::Future;
+
+        pub use meerkat_core::time_compat::Instant;
+        pub use tokio_with_wasm::alias::time::*;
+
+        pub async fn timeout_at<F>(
+            deadline: Instant,
+            future: F,
+        ) -> Result<F::Output, tokio_with_wasm::alias::time::Elapsed>
+        where
+            F: Future,
+        {
+            tokio_with_wasm::alias::time::timeout(
+                deadline.saturating_duration_since(Instant::now()),
+                future,
+            )
+            .await
+        }
+    }
 }
 
 #[doc(hidden)]
@@ -88,8 +109,8 @@ pub use coordination::{
 };
 pub use definition::{MobDefinition, MobDefinitionSourceIdentity, MobDefinitionSourceKind};
 pub use error::{
-    FlowStepDispatchRejectKind, ForkSourceUnavailableCause, MobError, MobFailureClass,
-    RuntimeEffectKind,
+    FlowStepDispatchRejectKind, ForkSourceUnavailableCause, MemberProvisionFailureCause, MobError,
+    MobFailureClass, RuntimeEffectKind,
 };
 pub use event::{AttributedEvent, MemberWireEdge, MobEvent, MobEventKind, NewMobEvent};
 pub use identity::{
@@ -97,21 +118,16 @@ pub use identity::{
     DesiredLocalCallbackTool, DesiredMemberMaterial, DesiredMemberOverlay, DesiredMemberSpec,
     DesiredSessionAuthorityPolicy, DesiredSessionTarget, IdentityActuationPermit,
     IdentityActuatorTarget, IdentityAuthorityCondition, IdentityConvergenceCondition,
-    IdentityConvergenceStatus, IdentityDeclarationApplyPlan, IdentityDeclarationManifest,
-    IdentityDeclarationManifestApplyDisposition, IdentityDeclarationManifestApplyOutcome,
-    IdentityDeclarationMemberPlan, IdentityDeclarationScopeHead, IdentityDeclarationScopeId,
-    IdentityDeclarationScopePrecondition, IdentityExternalCeremonyCondition,
+    IdentityConvergenceStatus, IdentityDeclarationScopeId, IdentityExternalCeremonyCondition,
     IdentityExternalTrustCondition, IdentityInitialDeliveryCondition, IdentityIntent,
-    IdentityIntentApplyDisposition, IdentityIntentApplyOutcome, IdentityIntentError,
-    IdentityIntentRecord, IdentityLeaseClaim, IdentityLeaseClaimOutcome, IdentityLeaseCondition,
-    IdentityLeaseRecord, IdentityLegacyImport, IdentityMemberDeclaration,
-    IdentityMemberMaterialDeclaration, IdentityOperationKind, IdentityOperationReceipt,
+    IdentityIntentError, IdentityIntentRecord, IdentityLeaseClaim, IdentityLeaseClaimOutcome,
+    IdentityLeaseCondition, IdentityLeaseRecord, IdentityOperationKind, IdentityOperationReceipt,
     IdentityOperationReceiptInsertOutcome, IdentityOperationReceiptPayload, IdentityOperationSlot,
     IdentityOperationSubject, IdentityProfileMemberDeclaration, IdentityReceiptCondition,
     IdentityReconcileDecision, IdentityReconcileFacts, IdentityResourceCondition,
     IdentityResourceObservation, IdentityRetirementPlan, IdentitySessionCondition,
-    IdentitySessionObservation, IdentityStoredObservation, IdentityTargetObservationVersion,
-    VerifiedIdentitySessionCheckpoint, classify_identity_reconciliation,
+    IdentitySessionObservation, IdentitySessionStoreAuthority, IdentityStoredObservation,
+    IdentityTargetObservationVersion, classify_identity_reconciliation,
 };
 pub use ids::{
     AgentIdentity, AgentRuntimeId, BranchId, FenceToken, FlowId, FlowNodeId, FrameId, Generation,
@@ -227,9 +243,13 @@ pub use store::{
     ExternalBindingOverlayRecord, ExternalBindingOverlayStatus, InMemoryMobEventStore,
     InMemoryMobIdentityStatusStore, InMemoryMobIdentityStore, InMemoryMobRunStore,
     InMemoryMobRuntimeMetadataStore, InMemoryMobSpecStore, InMemoryRealmProfileStore,
-    MobEventReceiver, MobEventStore, MobHostAuthorityDeletionAuthority,
-    MobHostAuthorityPersistenceAuthority, MobHostAuthorityRecord, MobHostBindPhaseRecord,
-    MobHostCapabilityRecord, MobIdentityStatusStore, MobIdentityStore, MobIdentityStoreClock,
+    MobEventReceiver, MobEventStore, MobExternalDeliveryBeginOutcome,
+    MobExternalDeliveryCompleteOutcome, MobExternalDeliveryIdentity, MobExternalDeliveryIntent,
+    MobExternalDeliveryPhase, MobExternalDeliveryRecord, MobExternalDeliveryRepairOutcome,
+    MobExternalDeliveryRepairState, MobExternalDeliveryTargetKind, MobExternalDeliveryTerminal,
+    MobHostAuthorityDeletionAuthority, MobHostAuthorityPersistenceAuthority,
+    MobHostAuthorityRecord, MobHostBindPhaseRecord, MobHostCapabilityRecord,
+    MobIdentityStatusStore, MobIdentityStore, MobIdentityStoreClock,
     MobOperatorGrantDeletionAuthority, MobOperatorGrantPersistenceAuthority,
     MobOperatorGrantRecord, MobRunStore, MobRuntimeMetadataStore, MobSpecStore, MobStoreError,
     RealmProfileStore, StoredRealmProfile, SupervisorAuthorityRecord, SystemMobIdentityStoreClock,

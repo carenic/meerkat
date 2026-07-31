@@ -844,6 +844,17 @@ impl Config {
 }
 
 impl Config {
+    /// Return only caller-configured per-turn output limits.
+    ///
+    /// Embedded template defaults are intentionally excluded: factories use
+    /// this presence witness to distinguish an explicit pin from an unset
+    /// value that should be resolved against the active model's capabilities.
+    pub fn configured_max_tokens(&self) -> Option<u32> {
+        self.max_tokens
+            .or(self.agent.max_tokens_per_turn)
+            .filter(|value| *value > 0)
+    }
+
     /// Resolve the operative top-level per-turn output-token limit.
     ///
     /// Precedence: explicit `max_tokens` → embedded template `max_tokens` →
@@ -895,6 +906,11 @@ impl Config {
         if self.compaction.auto_compact_threshold == 0 {
             return Err(ConfigError::Validation(
                 "compaction.auto_compact_threshold must be greater than 0".to_string(),
+            ));
+        }
+        if self.compaction.max_request_bytes == Some(0) {
+            return Err(ConfigError::Validation(
+                "compaction.max_request_bytes must be greater than 0 when set".to_string(),
             ));
         }
         if self.compaction.recent_turn_budget == 0 {
@@ -1734,6 +1750,11 @@ pub struct CompactionRuntimeConfig {
     /// This preserves the difference between inheriting Meerkat's default
     /// threshold and deliberately pinning that same numeric value.
     pub auto_compact_threshold_explicit: bool,
+    /// Provider request-size cap in bytes arming the byte-aware compaction
+    /// trigger; absent means the factory fills the catalog's approximate
+    /// per-provider cap. Providers enforce request size in BYTES, and the
+    /// token trigger alone missed the 2026-07-29 request_too_large incident.
+    pub max_request_bytes: Option<u64>,
     /// Number of recent complete turns to retain after compaction.
     pub recent_turn_budget: usize,
     /// Maximum tokens for the compaction summary response.
@@ -1747,6 +1768,7 @@ impl Default for CompactionRuntimeConfig {
         Self {
             auto_compact_threshold: 100_000,
             auto_compact_threshold_explicit: false,
+            max_request_bytes: None,
             recent_turn_budget: 4,
             max_summary_tokens: 4096,
             min_turns_between_compactions: 3,
@@ -1766,10 +1788,16 @@ impl Serialize for CompactionRuntimeConfig {
         if include_threshold {
             len += 1;
         }
+        if self.max_request_bytes.is_some() {
+            len += 1;
+        }
 
         let mut state = serializer.serialize_struct("CompactionRuntimeConfig", len)?;
         if include_threshold {
             state.serialize_field("auto_compact_threshold", &self.auto_compact_threshold)?;
+        }
+        if let Some(max_request_bytes) = self.max_request_bytes {
+            state.serialize_field("max_request_bytes", &max_request_bytes)?;
         }
         state.serialize_field("recent_turn_budget", &self.recent_turn_budget)?;
         state.serialize_field("max_summary_tokens", &self.max_summary_tokens)?;
@@ -1789,6 +1817,7 @@ impl<'de> Deserialize<'de> for CompactionRuntimeConfig {
         #[derive(Deserialize)]
         struct Seed {
             auto_compact_threshold: Option<u64>,
+            max_request_bytes: Option<u64>,
             recent_turn_budget: Option<usize>,
             max_summary_tokens: Option<u32>,
             min_turns_between_compactions: Option<u32>,
@@ -1801,6 +1830,7 @@ impl<'de> Deserialize<'de> for CompactionRuntimeConfig {
                 .auto_compact_threshold
                 .unwrap_or(defaults.auto_compact_threshold),
             auto_compact_threshold_explicit: seed.auto_compact_threshold.is_some(),
+            max_request_bytes: seed.max_request_bytes,
             recent_turn_budget: seed
                 .recent_turn_budget
                 .unwrap_or(defaults.recent_turn_budget),
@@ -1818,6 +1848,7 @@ impl From<CompactionRuntimeConfig> for crate::CompactionConfig {
     fn from(value: CompactionRuntimeConfig) -> Self {
         Self {
             auto_compact_threshold: value.auto_compact_threshold,
+            max_request_bytes: value.max_request_bytes,
             recent_turn_budget: value.recent_turn_budget,
             max_summary_tokens: value.max_summary_tokens,
             min_turns_between_compactions: value.min_turns_between_compactions,
@@ -1940,11 +1971,11 @@ impl CallTimeoutOverride {
 /// shape of `TurnMetadataOverride` and the `Inherit`/`Disabled`/`Value` shape
 /// of [`CallTimeoutOverride`].
 ///
-/// This is the canonical type at every boundary that carries the decision:
-/// the wire `CreateSessionRequest`/`CoreCreateParams.system_prompt` field, the
-/// persisted `SessionBuildState.system_prompt` field, and
-/// `AgentBuildConfig.system_prompt`. Its serde implementation below IS the
-/// wire/persisted representation — there is no adapter pair:
+/// This is the canonical type at create-time boundaries that carry the
+/// decision: the wire `CreateSessionRequest`/`CoreCreateParams.system_prompt`
+/// field and `AgentBuildConfig.system_prompt`. The decision materializes one
+/// ordinary ordered System event and is not persisted as thread
+/// configuration. Its serde implementation below is the wire representation:
 ///
 /// - absent / `null` ⇔ `Inherit` (lossless with the retired `Option<String>`
 ///   `None` shape)
@@ -3666,6 +3697,50 @@ auto_compact_threshold = 100000
         assert!(
             toml.contains("auto_compact_threshold = 100000"),
             "explicit default threshold must survive persistence: {toml}"
+        );
+    }
+
+    #[test]
+    fn test_compaction_max_request_bytes_round_trips_and_defaults_absent() {
+        // Absent by default: the factory fills the catalog's approximate
+        // per-provider cap, so an inherited value must not be persisted.
+        let toml = toml::to_string_pretty(&Config::default()).expect("config should serialize");
+        assert!(
+            !toml.contains("max_request_bytes"),
+            "default config should not persist an inherited request-byte cap: {toml}"
+        );
+
+        let config: Config = toml::from_str(
+            r"
+[compaction]
+max_request_bytes = 9000000
+",
+        )
+        .expect("config should parse");
+        assert_eq!(config.compaction.max_request_bytes, Some(9_000_000));
+
+        let reserialized = toml::to_string_pretty(&config).expect("config should serialize");
+        assert!(
+            reserialized.contains("max_request_bytes = 9000000"),
+            "explicit request-byte cap must survive persistence: {reserialized}"
+        );
+    }
+
+    #[test]
+    fn test_validate_rejects_zero_compaction_max_request_bytes() {
+        let config = Config {
+            compaction: CompactionRuntimeConfig {
+                max_request_bytes: Some(0),
+                ..CompactionRuntimeConfig::default()
+            },
+            ..Config::default()
+        };
+        let err = config
+            .validate(*crate::model_profile::test_catalog::TEST_CATALOG)
+            .expect_err("max_request_bytes=0 should be invalid");
+        assert!(
+            err.to_string().contains("max_request_bytes"),
+            "unexpected validation error: {err}"
         );
     }
 

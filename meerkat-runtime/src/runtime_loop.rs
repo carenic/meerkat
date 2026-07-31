@@ -14,6 +14,7 @@ use meerkat_core::lifecycle::run_primitive::{RunApplyBoundary, RunPrimitive, Sta
 use meerkat_core::lifecycle::{InputId, RunId};
 use meerkat_core::turn_execution_authority::ContentShape as TurnContentShape;
 use meerkat_core::types::TranscriptMessageIdentity;
+use std::sync::Arc;
 
 use crate::input::Input;
 #[cfg(test)]
@@ -58,6 +59,7 @@ pub(crate) fn for_input(
         },
         Input::Peer(peer) => RuntimeTurnMetadata {
             handling_mode: peer.handling_mode,
+            system_prompts: peer.system_prompts.clone(),
             transcript_identity: TranscriptMessageIdentity {
                 objective_id: peer.objective_id,
                 ..Default::default()
@@ -87,8 +89,23 @@ pub(crate) fn for_input(
         }
         _ => {}
     }
-    if let Some(correlation_id) = input.header().correlation_id.as_ref() {
+    let transient_steer_context = crate::input::input_to_transient_turn_context(input, semantics);
+    if transient_steer_context.is_none()
+        && let Some(correlation_id) = input.header().correlation_id.as_ref()
+    {
         metadata.transcript_identity.interaction_id = Some(InteractionId(correlation_id.0));
+    }
+    if let Some(context) = transient_steer_context {
+        metadata.transient_turn_context_appends.push(context);
+    }
+    if metadata.transient_turn_context.is_some()
+        && metadata.transcript_identity.interaction_id.is_none()
+    {
+        // Caller context accompanies this input's ordinary conversational User
+        // append and therefore binds to that exact durable identity. Internal
+        // steer contexts carry no transcript identity of their own: they join
+        // the active turn's existing anchor at the request boundary.
+        metadata.transcript_identity.interaction_id = Some(InteractionId(input.header().id.0));
     }
     metadata
 }
@@ -336,85 +353,75 @@ async fn runtime_completion_result_class(
     )
 }
 
-// This is the handoff boundary for independently owned completion facts; keep
-// the arguments explicit so no shell aggregate can manufacture authority.
-#[allow(clippy::too_many_arguments)]
-async fn resolve_runtime_completion_waiters(
+/// Persist one generated-authority receipt in an independently owned task.
+///
+/// Some stores complete their CAS on a blocking worker after the awaiting
+/// runtime-loop future has been dropped. The child owns both the persistence
+/// await and the immediate shell hydration, so cancellation cannot leave a
+/// committed receipt looking pending in the live driver.
+async fn persist_authorized_terminal_completion_owned(
     driver: &crate::meerkat_machine::SharedDriver,
-    completions: Option<&crate::meerkat_machine::SharedCompletionRegistry>,
-    authority_guard: crate::tokio::sync::OwnedMutexGuard<()>,
-    input_ids: &[InputId],
-    run_id: &RunId,
-    terminal: Option<&CoreApplyTerminal>,
-    finalization: crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation,
-    finalization_error: Option<meerkat_core::TurnErrorMetadata>,
-) {
-    let Some(completions) = completions else {
-        return;
-    };
+    authorized: crate::completion::AuthorizedInputTerminalCompletion,
+) -> Result<(), crate::RuntimeDriverError> {
     let driver = std::sync::Arc::clone(driver);
-    let completions = std::sync::Arc::clone(completions);
-    let owned_input_ids = input_ids.to_vec();
-    let owned_run_id = run_id.clone();
-    let owned_terminal = terminal.cloned();
     let handoff = tokio::spawn(async move {
-        let _authority_guard = authority_guard;
-        let driver_guard = driver.lock_owned().await;
-        let completion_guard = completions.lock_owned().await;
-        let bundle = crate::meerkat_machine::driver::machine_resolve_runtime_completion_result(
-            &driver_guard,
-            Some(&owned_run_id),
-            completion_terminal_observation(owned_terminal.as_ref()),
-            finalization,
-        )
-        .map_err(|error| {
-            crate::completion::CompletionWaitError::AuthorityUnavailable(format!(
-                "runtime completion result authority missing: {error}"
-            ))
-        })
-        .and_then(|authority| {
-            crate::completion::authorize_runtime_terminal_bundle(
-                &[],
-                owned_terminal.as_ref(),
-                authority,
-                finalization_error,
-                None,
-            )
-        });
-        let _driver_guard = driver_guard;
-        let mut completion_guard = completion_guard;
-        match bundle {
-            Ok(bundle) => {
-                completion_guard
-                    .resolve_authorized_runtime_terminal_bundle(owned_input_ids, bundle);
-            }
-            Err(error) => completion_guard.fail_inputs(owned_input_ids, error),
-        }
+        driver
+            .lock_owned()
+            .await
+            .finalize_input_terminal_completion_batch(authorized)
+            .await
     });
-    if let Err(error) = handoff.await {
-        tracing::error!(
-            %error,
-            "owned runtime completion waiter handoff failed"
-        );
-    }
+    handoff.await.map_err(|error| {
+        crate::RuntimeDriverError::Internal(format!(
+            "owned terminal completion receipt task ended before publishing its outcome: {error}"
+        ))
+    })?
+}
+
+/// What an EMPTY compaction outbox obliges the checkpoint refresh to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EmptyOutboxCheckpoint {
+    /// Per-turn boundary path: the caller holds the exact snapshot bytes the
+    /// run just committed and projects them itself when this reconciliation
+    /// returns `None` (the `checkpoint_committed_session_snapshot` fallback),
+    /// so reloading and recommitting the byte-identical document here was a
+    /// second full-document cycle after EVERY successful persisted turn, for
+    /// nothing. Two obligations are still preserved on this path:
+    /// - the executor reconciliation still runs with the exact empty
+    ///   authority set — the durable memory store uses it to abort stages
+    ///   left by a crash before `RuntimeStore::atomic_apply`;
+    /// - the SessionStore compatibility projection is still refreshed, by
+    ///   the caller's own fallback over the in-memory committed bytes, which
+    ///   are exactly what a reload would return under the turn's held driver
+    ///   authority.
+    SkipIdentityRefresh,
+    /// Recovery paths (startup projection recovery, teardown): even an empty
+    /// outbox reloads, recommits, and re-projects the authoritative
+    /// snapshot. A crash between the runtime commit and its SessionStore
+    /// projection leaves a stale compatibility row that only this refresh
+    /// heals, and these callers discard the returned checkpoint, so no
+    /// fallback would project it.
+    RefreshFromStore,
 }
 
 async fn reconcile_compaction_projection_outbox(
     driver: &crate::meerkat_machine::SharedDriver,
     executor: &mut dyn meerkat_core::lifecycle::CoreExecutor,
-) -> Result<Option<Vec<u8>>, crate::RuntimeDriverError> {
+    empty_outbox: EmptyOutboxCheckpoint,
+) -> Result<Option<Arc<Vec<u8>>>, crate::RuntimeDriverError> {
     let intents = {
         let driver = driver.lock().await;
         driver.load_pending_compaction_projections().await?
     };
-    reconcile_loaded_compaction_projection_outbox(driver, executor, intents).await
+    reconcile_loaded_compaction_projection_outbox(driver, executor, intents, empty_outbox).await
 }
 
-async fn reconcile_loaded_compaction_projection_outbox(
+pub(crate) async fn reconcile_loaded_compaction_projection_outbox(
     driver: &crate::meerkat_machine::SharedDriver,
     executor: &mut dyn meerkat_core::lifecycle::CoreExecutor,
     intents: Vec<meerkat_core::CompactionProjectionIntent>,
-) -> Result<Option<Vec<u8>>, crate::RuntimeDriverError> {
+    empty_outbox: EmptyOutboxCheckpoint,
+) -> Result<Option<Arc<Vec<u8>>>, crate::RuntimeDriverError> {
     // Always invoke the executor, including for an empty outbox: the durable
     // memory store uses the exact empty authority set to abort stages left by
     // a crash before RuntimeStore::atomic_apply.
@@ -426,20 +433,51 @@ async fn reconcile_loaded_compaction_projection_outbox(
                 "compaction projection reconciliation failed: {error}"
             ))
         })?;
+    if intents.is_empty() && empty_outbox == EmptyOutboxCheckpoint::SkipIdentityRefresh {
+        // Nothing was finalized, so the checkpoint refresh below would load
+        // the committed snapshot, copy it unchanged
+        // (`compatibility_checkpoint_after_compaction_finalize` is the
+        // identity for an empty intent set), recommit the identical bytes,
+        // and re-project them. `None` routes the caller onto its own
+        // in-memory fallback projection instead; see
+        // [`EmptyOutboxCheckpoint::SkipIdentityRefresh`] for the two
+        // obligations this path keeps.
+        return Ok(None);
+    }
+    let persistence_profile = {
+        let driver = driver.lock().await;
+        driver.session_persistence_profile()
+    };
+    if persistence_profile == Some(crate::store::RuntimeSessionPersistenceProfile::HeadCanonicalV1)
+    {
+        // Head-canonical stores own the authoritative metadata-only mutation:
+        // one exact transaction verifies the physical head, removes this
+        // intent from the small canonical head, advances store authority,
+        // and tombstones the outbox. Loading and recommitting a whole Session
+        // here would both defeat O(delta) persistence and call an operation
+        // that this profile deliberately refuses.
+        for intent in &intents {
+            let driver = driver.lock().await;
+            driver
+                .mark_compaction_projection_finalized(&intent.projection)
+                .await?;
+        }
+        return Ok(None);
+    }
     let authoritative_snapshot = {
         let driver = driver.lock().await;
         driver.load_compaction_checkpoint_snapshot().await?
     };
-    let compatibility_checkpoint = if let Some(snapshot) = authoritative_snapshot.as_deref() {
+    let compatibility_checkpoint = if let Some(snapshot) = authoritative_snapshot {
         let cleaned = compatibility_checkpoint_after_compaction_finalize(snapshot, &intents)?;
         {
             let driver = driver.lock().await;
             driver
-                .commit_compaction_checkpoint_snapshot(cleaned.clone())
+                .commit_compaction_checkpoint_snapshot(Arc::clone(&cleaned))
                 .await?;
         }
         executor
-            .checkpoint_committed_session_snapshot(&cleaned)
+            .checkpoint_committed_session_snapshot(Arc::clone(&cleaned))
             .await
             .map_err(|error| {
                 crate::RuntimeDriverError::Internal(format!(
@@ -467,6 +505,159 @@ async fn reconcile_loaded_compaction_projection_outbox(
     Ok(compatibility_checkpoint)
 }
 
+async fn publish_committed_session_boundary(
+    executor: &mut dyn meerkat_core::lifecycle::CoreExecutor,
+    authoritative_checkpoint: Option<Arc<Vec<u8>>>,
+    committed_authority: Option<&crate::store::PreparedRuntimeSessionCommitResult>,
+    prepared_boundary: Option<&meerkat_core::lifecycle::core_executor::BoundSessionCommit>,
+) -> Result<(), meerkat_core::lifecycle::CoreExecutorError> {
+    if authoritative_checkpoint.is_some() {
+        // WholeBlob compaction reconciliation already projected these exact
+        // bytes through the executor.
+        return Ok(());
+    }
+    let Some(prepared_boundary) = prepared_boundary else {
+        return Ok(());
+    };
+    let Some(committed_authority) = committed_authority else {
+        // `DriverEntry::Ephemeral` deliberately returns no store-issued
+        // authority; its live Session is already the committed boundary.
+        // Persistent drivers wrap every successful store result in `Some`, so
+        // absence remains impossible for the authority-bearing profiles below.
+        if prepared_boundary.provisional_promotion_receipt().is_some()
+            || prepared_boundary.head_canonical().is_some()
+        {
+            return Err(meerkat_core::lifecycle::CoreExecutorError::Internal(
+                "authority-bearing session boundary committed without store-owned authority"
+                    .to_string(),
+            ));
+        }
+        return Ok(());
+    };
+    if let Some(checkpoint) = prepared_boundary.provisional_promotion_receipt() {
+        let committed_authority = committed_authority.authority().ok_or_else(|| {
+            meerkat_core::lifecycle::CoreExecutorError::Internal(
+                "provisional session promotion committed without store-owned authority".to_string(),
+            )
+        })?;
+        if committed_authority.session_id() != checkpoint.session_id() {
+            return Err(meerkat_core::lifecycle::CoreExecutorError::Internal(
+                "provisional session promotion returned authority for another session".to_string(),
+            ));
+        }
+        let (committed_store_revision, committed_authority_token) =
+            match (checkpoint.authority(), committed_authority) {
+                (
+                    meerkat_core::RunCheckpointAuthority::WholeBlob(checkpoint),
+                    crate::store::RuntimeSessionAuthority::WholeBlob(committed),
+                ) if checkpoint.candidate_blob_sha256() == committed.blob_sha256()
+                    && checkpoint
+                        .base_store_revision()
+                        .checked_add(1)
+                        .is_some_and(|revision| revision == committed.store_revision()) =>
+                {
+                    (committed.store_revision(), committed.blob_sha256())
+                }
+                (
+                    meerkat_core::RunCheckpointAuthority::HeadCanonical(checkpoint),
+                    crate::store::RuntimeSessionAuthority::HeadCanonical(committed),
+                ) if checkpoint.physical_head_token() == committed.committed_head_token()
+                    && checkpoint
+                        .physical_store_revision()
+                        .checked_add(1)
+                        .is_some_and(|revision| revision == committed.store_revision()) =>
+                {
+                    (committed.store_revision(), committed.committed_head_token())
+                }
+                _ => {
+                    return Err(meerkat_core::lifecycle::CoreExecutorError::Internal(
+                    "provisional session promotion returned a different profile or authority token"
+                        .to_string(),
+                ));
+                }
+            };
+        return executor
+            .acknowledge_committed_session_boundary(
+                &meerkat_core::CommittedSessionBoundaryAuthority::Provisional {
+                    session_id: committed_authority.session_id().clone(),
+                    committed_store_revision,
+                    committed_authority_token: committed_authority_token.to_string(),
+                },
+            )
+            .await;
+    }
+    if prepared_boundary.head_canonical().is_some() {
+        if committed_authority.profile()
+            != crate::store::RuntimeSessionPersistenceProfile::HeadCanonicalV1
+        {
+            return Err(meerkat_core::lifecycle::CoreExecutorError::Internal(
+                "head-canonical prepared boundary returned a whole-blob authority".to_string(),
+            ));
+        }
+        let authority = committed_authority.authority().ok_or_else(|| {
+            meerkat_core::lifecycle::CoreExecutorError::Internal(
+                "head-canonical session boundary committed without successor authority".to_string(),
+            )
+        })?;
+        let head_authority = authority.head_canonical().ok_or_else(|| {
+            meerkat_core::lifecycle::CoreExecutorError::Internal(
+                "head-canonical prepared boundary returned a non-head authority".to_string(),
+            )
+        })?;
+        let token = head_authority.committed_head_token();
+        prepared_boundary
+            .acknowledge_head_canonical_commit(token)
+            .map_err(|error| {
+                meerkat_core::lifecycle::CoreExecutorError::Internal(format!(
+                    "committed head-canonical authority differed from prepared boundary: {error}"
+                ))
+            })?;
+        return executor
+            .acknowledge_committed_session_boundary(
+                &meerkat_core::CommittedSessionBoundaryAuthority::HeadCanonical {
+                    session_id: head_authority.session_id().clone(),
+                    committed_head_token: token.to_string(),
+                },
+            )
+            .await;
+    }
+    let prepared_artifact = prepared_boundary.whole_blob_artifact().map_err(|error| {
+        meerkat_core::lifecycle::CoreExecutorError::Internal(format!(
+            "failed to materialize committed whole-blob session boundary: {error}"
+        ))
+    })?;
+    let committed_authority = committed_authority
+        .authority()
+        .and_then(crate::store::RuntimeSessionAuthority::whole_blob)
+        .ok_or_else(|| {
+            meerkat_core::lifecycle::CoreExecutorError::Internal(
+                "whole-blob session boundary committed without store-owned WholeBlob authority"
+                    .to_string(),
+            )
+        })?;
+    let prepared_session = prepared_boundary.session().ok_or_else(|| {
+        meerkat_core::lifecycle::CoreExecutorError::Internal(
+            "ordinary WholeBlob finalization requires a sealed typed Session".to_string(),
+        )
+    })?;
+    if committed_authority.session_id() != prepared_session.id()
+        || committed_authority.blob_sha256() != prepared_artifact.row_sha256_token()
+    {
+        return Err(meerkat_core::lifecycle::CoreExecutorError::Internal(
+            "committed WholeBlob authority differed from the exact prepared artifact".to_string(),
+        ));
+    }
+    executor
+        .acknowledge_committed_session_boundary(
+            &meerkat_core::CommittedSessionBoundaryAuthority::WholeBlob {
+                session_id: committed_authority.session_id().clone(),
+                committed_store_revision: committed_authority.store_revision(),
+                committed_blob_sha256: committed_authority.blob_sha256().to_string(),
+            },
+        )
+        .await
+}
+
 /// Abort every live pre-commit projection after a failed runtime boundary
 /// commit.
 ///
@@ -490,19 +681,20 @@ async fn abort_rejected_run_projections_after_commit_failure(
 }
 
 fn compatibility_checkpoint_after_compaction_finalize(
-    snapshot: &[u8],
+    snapshot: Arc<Vec<u8>>,
     finalized: &[meerkat_core::CompactionProjectionIntent],
-) -> Result<Vec<u8>, crate::RuntimeDriverError> {
+) -> Result<Arc<Vec<u8>>, crate::RuntimeDriverError> {
     if finalized.is_empty() {
-        return Ok(snapshot.to_vec());
+        return Ok(snapshot);
     }
-    let mut session: meerkat_core::Session = serde_json::from_slice(snapshot).map_err(|error| {
-        crate::RuntimeDriverError::Internal(format!(
-            "committed runtime checkpoint is not a Session: {error}"
-        ))
-    })?;
+    let mut session: meerkat_core::Session =
+        serde_json::from_slice(snapshot.as_ref()).map_err(|error| {
+            crate::RuntimeDriverError::Internal(format!(
+                "committed runtime checkpoint is not a Session: {error}"
+            ))
+        })?;
     for intent in finalized {
-        crate::store::complete_compaction_projection_checkpoint(
+        crate::store::complete_compaction_projection_intent(
             &mut session,
             &intent.projection,
         )
@@ -513,7 +705,7 @@ fn compatibility_checkpoint_after_compaction_finalize(
             ))
         })?;
     }
-    serde_json::to_vec(&session).map_err(|error| {
+    serde_json::to_vec(&session).map(Arc::new).map_err(|error| {
         crate::RuntimeDriverError::Internal(format!(
             "failed to serialize committed compatibility checkpoint: {error}"
         ))
@@ -626,7 +818,7 @@ async fn finalize_publish_and_resolve_runtime_terminals(
 }
 
 enum OwnedRuntimeLoopCommitOutcome {
-    Committed,
+    Committed(Option<crate::store::PreparedRuntimeSessionCommitResult>),
     Rejected(String),
     CleanupCarrierCorrupt(String),
 }
@@ -648,10 +840,8 @@ async fn commit_runtime_loop_output_owned(
     run_id: RunId,
     input_ids: Vec<InputId>,
     receipt: meerkat_core::lifecycle::RunBoundaryReceiptDraft,
-    // Sealed: bytes plus, when the executor certified it, the exact session
-    // they were serialized from. Carrying the pair as one value lets the
-    // boundary validator skip re-parsing the document without opening a seam
-    // where the validated and persisted documents could differ.
+    // Disjoint sealed carrier: WholeBlob keeps typed/byte authority paired;
+    // HeadCanonical carries only the bounded mutation and successor authority.
     committed: Option<meerkat_core::lifecycle::core_executor::BoundSessionCommit>,
     directed_interaction_ids: Vec<InteractionId>,
     terminal: Option<CoreApplyTerminal>,
@@ -708,7 +898,7 @@ async fn commit_runtime_loop_output_owned(
                     error,
                     crate::meerkat_machine::driver::MachineTerminalAppliedDraft {
                         receipt,
-                        session_snapshot: committed.into_snapshot_bytes(),
+                        session: committed,
                     },
                 )
                 .await
@@ -732,11 +922,11 @@ async fn commit_runtime_loop_output_owned(
         };
 
         let outcome = match commit_result {
-            Ok(()) => {
+            Ok(committed_authority) => {
                 if retain_nondirected_carrier {
                     match teardown_slot.mark_nondirected_run_terminal_persisted(&run_id) {
                         Ok(()) => match teardown_slot.clear_owned_commit_in_flight(&run_id) {
-                            Ok(()) => OwnedRuntimeLoopCommitOutcome::Committed,
+                            Ok(()) => OwnedRuntimeLoopCommitOutcome::Committed(committed_authority),
                             Err(error) => OwnedRuntimeLoopCommitOutcome::CleanupCarrierCorrupt(
                                 error.to_string(),
                             ),
@@ -750,7 +940,7 @@ async fn commit_runtime_loop_output_owned(
                     }
                 } else {
                     match teardown_slot.clear_owned_commit_in_flight(&run_id) {
-                        Ok(()) => OwnedRuntimeLoopCommitOutcome::Committed,
+                        Ok(()) => OwnedRuntimeLoopCommitOutcome::Committed(committed_authority),
                         Err(error) => {
                             OwnedRuntimeLoopCommitOutcome::CleanupCarrierCorrupt(error.to_string())
                         }
@@ -933,6 +1123,16 @@ async fn publish_authorized_runtime_terminal_batch(
     finalization_error: Option<meerkat_core::TurnErrorMetadata>,
     already_finalized_events: Option<&[meerkat_core::event::AgentEvent]>,
 ) -> Result<(), InteractionTerminalPublicationError> {
+    let terminal_completion_witness = driver
+        .lock()
+        .await
+        .input_terminal_completion_authorization_witness(input_ids)
+        .map_err(|error| {
+            InteractionTerminalPublicationError::from_driver(
+                "exact terminal completion batch authorization failed",
+                error,
+            )
+        })?;
     // A non-directed batch has no durable event/outbox carrier. Acquire the
     // driver and completion guards in canonical order before consuming its
     // one-shot generated authority, then synchronously transfer both guards
@@ -955,10 +1155,11 @@ async fn publish_authorized_runtime_terminal_batch(
                     error,
                 )
             })?;
-            let _bundle = crate::completion::authorize_runtime_terminal_bundle(
+            let bundle = crate::completion::authorize_runtime_terminal_bundle(
                 interaction_ids,
                 terminal,
                 authority,
+                terminal_completion_witness,
                 finalization_error,
                 runtime_termination_reason,
             )
@@ -967,6 +1168,14 @@ async fn publish_authorized_runtime_terminal_batch(
                     "non-directed terminal projection failed: {error}"
                 ))
             })?;
+            persist_authorized_terminal_completion_owned(driver, bundle.terminal_completion())
+                .await
+                .map_err(|error| {
+                    InteractionTerminalPublicationError::from_driver(
+                        "non-directed terminal completion receipt persistence failed",
+                        error,
+                    )
+                })?;
             return Ok(());
         };
         let Some(authority_guard) = authority_guard else {
@@ -980,6 +1189,7 @@ async fn publish_authorized_runtime_terminal_batch(
         let owned_run_id = batch_key.run_id().cloned();
         let owned_terminal = terminal.cloned();
         let owned_runtime_termination_reason = runtime_termination_reason.map(str::to_string);
+        let owned_terminal_completion_witness = terminal_completion_witness;
         let handoff = tokio::spawn(async move {
             let _authority_guard = authority_guard;
             let driver_guard = driver.lock_owned().await;
@@ -1001,6 +1211,7 @@ async fn publish_authorized_runtime_terminal_batch(
                 &[],
                 owned_terminal.as_ref(),
                 authority,
+                owned_terminal_completion_witness,
                 finalization_error,
                 owned_runtime_termination_reason.as_deref(),
             )
@@ -1009,6 +1220,16 @@ async fn publish_authorized_runtime_terminal_batch(
                     "non-directed terminal projection failed: {error}"
                 ))
             })?;
+            let mut driver_guard = driver_guard;
+            driver_guard
+                .finalize_input_terminal_completion_batch(bundle.terminal_completion())
+                .await
+                .map_err(|error| {
+                    InteractionTerminalPublicationError::from_driver(
+                        "non-directed terminal completion receipt persistence failed",
+                        error,
+                    )
+                })?;
             let _driver_guard = driver_guard;
             let mut completion_guard = completion_guard;
             completion_guard.resolve_authorized_runtime_terminal_bundle(owned_input_ids, bundle);
@@ -1038,6 +1259,7 @@ async fn publish_authorized_runtime_terminal_batch(
         interaction_ids,
         terminal,
         authority,
+        terminal_completion_witness,
         finalization_error,
         runtime_termination_reason,
     )
@@ -1046,6 +1268,14 @@ async fn publish_authorized_runtime_terminal_batch(
             "interaction terminal projection failed: {error}"
         ))
     })?;
+    persist_authorized_terminal_completion_owned(driver, bundle.terminal_completion())
+        .await
+        .map_err(|error| {
+            InteractionTerminalPublicationError::from_driver(
+                "terminal completion receipt persistence failed",
+                error,
+            )
+        })?;
     let events = bundle.interaction_events();
 
     if !events.is_empty() {
@@ -1227,6 +1457,7 @@ async fn drain_recovered_interaction_terminal_outboxes_under_authority(
     executor: &mut dyn meerkat_core::lifecycle::CoreExecutor,
     _authority_guard: &crate::tokio::sync::OwnedMutexGuard<()>,
 ) -> Result<(), InteractionTerminalPublicationError> {
+    drain_recovered_input_terminal_completions(driver, executor).await?;
     let batches = driver
         .lock()
         .await
@@ -1263,49 +1494,110 @@ async fn drain_recovered_interaction_terminal_outboxes_under_authority(
         }
         match phase {
             crate::meerkat_machine::driver::InteractionTerminalRecoveryPhase::Candidate => {
-                let committed_snapshot = if batch_key.run_id().is_some() {
+                let (requires_session_checkpoint, finalized_receipt) = {
+                    let input_id = input_ids.first().ok_or_else(|| {
+                        InteractionTerminalPublicationError::Corrupt(
+                            "interaction terminal recovery lost every completion recipient"
+                                .to_string(),
+                        )
+                    })?;
                     driver
                         .lock()
                         .await
-                        .committed_session_snapshot_for_terminal_recovery()
-                        .await
+                        .input_terminal_completion_finalization_state(input_id)
                         .map_err(|error| {
                             InteractionTerminalPublicationError::from_driver(
-                                "interaction terminal recovery snapshot load failed",
+                                "interaction terminal recovery receipt load failed",
                                 error,
                             )
                         })?
+                        .ok_or_else(|| {
+                            InteractionTerminalPublicationError::Corrupt(
+                                "interaction terminal outbox lost its exact completion receipt"
+                                    .to_string(),
+                            )
+                        })?
+                };
+                let requires_external_session_checkpoint = if requires_session_checkpoint {
+                    !matches!(
+                        driver.lock().await.session_persistence_profile(),
+                        Some(crate::store::RuntimeSessionPersistenceProfile::HeadCanonicalV1)
+                    )
+                } else {
+                    false
+                };
+                let committed_snapshot = if finalized_receipt.is_none()
+                    && requires_external_session_checkpoint
+                {
+                    Some(
+                        driver
+                            .lock()
+                            .await
+                            .committed_session_snapshot_for_terminal_recovery()
+                            .await
+                            .map_err(|error| {
+                                InteractionTerminalPublicationError::from_driver(
+                                    "interaction terminal recovery snapshot load failed",
+                                    error,
+                                )
+                            })?
+                            .ok_or_else(|| {
+                                InteractionTerminalPublicationError::Corrupt(
+                                    "interaction terminal completion required a committed session snapshot, but none was durable"
+                                        .to_string(),
+                                )
+                            })?,
+                    )
                 } else {
                     None
                 };
-                let (finalization, finalization_error) = if let Some(snapshot) =
-                    committed_snapshot.as_deref()
+                let (finalization, finalization_error) = if let Some((outcome, verdict)) =
+                    finalized_receipt.as_ref()
                 {
-                    match executor
-                            .checkpoint_committed_session_snapshot(snapshot)
-                            .await
-                        {
-                            Ok(()) => (
-                                crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Succeeded,
-                                completion_error_metadata.clone(),
-                            ),
-                            Err(error) => {
-                                let metadata = meerkat_core::TurnErrorMetadata::runtime_apply_failure(
-                                    format!(
-                                        "runtime session checkpoint failed during terminal recovery: {error}"
-                                    ),
-                                );
-                                (
-                                    crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Failed,
-                                    Some(metadata),
-                                )
-                            }
+                    // A finalized receipt is the exact result of the original
+                    // checkpoint attempt. Do not repeat that external action:
+                    // regenerate the machine bundle below and let receipt CAS
+                    // verify it is byte-identical before projecting events.
+                    let finalization = verdict.runtime_observation();
+                    let finalization_error = match finalization {
+                        crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Succeeded => {
+                            completion_error_metadata.clone()
                         }
-                } else {
-                    (
+                        crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Failed => {
+                            Some(outcome.error_metadata().cloned().ok_or_else(|| {
+                                InteractionTerminalPublicationError::Corrupt(
+                                    "failed terminal completion receipt lost its typed finalization error"
+                                        .to_string(),
+                                )
+                            })?)
+                        }
+                    };
+                    (finalization, finalization_error)
+                } else if let Some(snapshot) = committed_snapshot {
+                    match executor
+                        .checkpoint_committed_session_snapshot(snapshot)
+                        .await
+                    {
+                        Ok(()) => (
                             crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Succeeded,
                             completion_error_metadata.clone(),
-                        )
+                        ),
+                        Err(error) => {
+                            let metadata =
+                                meerkat_core::TurnErrorMetadata::runtime_apply_failure(format!(
+                                    "runtime session checkpoint failed during terminal recovery: {error}"
+                                ));
+                            (
+                                crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Failed,
+                                Some(metadata),
+                            )
+                        }
+                    }
+                } else {
+                    (
+                        crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Succeeded,
+                        completion_error_metadata.clone(),
+                    )
                 };
                 publish_authorized_runtime_terminal_batch(
                     driver,
@@ -1347,6 +1639,139 @@ async fn drain_recovered_interaction_terminal_outboxes_under_authority(
                 .await?;
             }
         }
+    }
+    Ok(())
+}
+
+/// Finalize every durable non-directed terminal candidate before startup can
+/// accept work. Directed batches continue through the interaction outbox
+/// below, whose shared authorized bundle finalizes this same receipt before
+/// event publication and waiter delivery.
+async fn drain_recovered_input_terminal_completions(
+    driver: &crate::meerkat_machine::SharedDriver,
+    executor: &mut dyn meerkat_core::lifecycle::CoreExecutor,
+) -> Result<(), InteractionTerminalPublicationError> {
+    let batches = driver
+        .lock()
+        .await
+        .input_terminal_completion_recovery_batches()
+        .await
+        .map_err(|error| {
+            InteractionTerminalPublicationError::from_driver(
+                "terminal completion recovery scan failed",
+                error,
+            )
+        })?;
+    for batch in batches
+        .into_iter()
+        .filter(|batch| !batch.has_interaction_terminal_outbox)
+    {
+        if let Some(run_id) = batch.batch_key.run_id() {
+            let driver_guard = driver.lock().await;
+            crate::meerkat_machine::driver::machine_recover_runtime_completion_result_correlation(
+                &driver_guard,
+                run_id,
+            )
+            .map_err(|error| {
+                InteractionTerminalPublicationError::from_generated_authority(
+                    "generated terminal completion recovery correlation missing",
+                    error,
+                )
+            })?;
+        }
+        let requires_external_session_checkpoint = if batch.requires_session_checkpoint {
+            !matches!(
+                driver.lock().await.session_persistence_profile(),
+                Some(crate::store::RuntimeSessionPersistenceProfile::HeadCanonicalV1)
+            )
+        } else {
+            false
+        };
+        let (finalization, finalization_error) = if requires_external_session_checkpoint {
+            let snapshot = driver
+                .lock()
+                .await
+                .committed_session_snapshot_for_terminal_recovery()
+                .await
+                .map_err(|error| {
+                    InteractionTerminalPublicationError::from_driver(
+                        "terminal completion recovery snapshot load failed",
+                        error,
+                    )
+                })?
+                .ok_or_else(|| {
+                    InteractionTerminalPublicationError::Corrupt(
+                        "terminal completion required a committed session snapshot, but none was durable"
+                            .to_string(),
+                    )
+                })?;
+            match executor
+                .checkpoint_committed_session_snapshot(snapshot)
+                .await
+            {
+                Ok(()) => (
+                    crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Succeeded,
+                    batch.completion_error_metadata.clone(),
+                ),
+                Err(error) => (
+                    crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Failed,
+                    Some(meerkat_core::TurnErrorMetadata::runtime_apply_failure(
+                        format!(
+                            "runtime session checkpoint failed during terminal completion recovery: {error}"
+                        ),
+                    )),
+                ),
+            }
+        } else {
+            (
+                crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Succeeded,
+                batch.completion_error_metadata.clone(),
+            )
+        };
+        let authority = runtime_completion_result_class(
+            driver,
+            batch.batch_key.run_id(),
+            batch.terminal_observation,
+            finalization,
+        )
+        .await
+        .map_err(|error| {
+            InteractionTerminalPublicationError::from_generated_authority(
+                "generated terminal completion recovery authority missing",
+                error,
+            )
+        })?;
+        let terminal_completion_witness = driver
+            .lock()
+            .await
+            .input_terminal_completion_authorization_witness(&batch.input_ids)
+            .map_err(|error| {
+                InteractionTerminalPublicationError::from_driver(
+                    "terminal completion recovery batch authorization failed",
+                    error,
+                )
+            })?;
+        let bundle = crate::completion::authorize_runtime_terminal_bundle(
+            &[],
+            batch.terminal.as_ref(),
+            authority,
+            terminal_completion_witness,
+            finalization_error,
+            batch.runtime_termination_reason.as_deref(),
+        )
+        .map_err(|error| {
+            InteractionTerminalPublicationError::Corrupt(format!(
+                "terminal completion recovery projection failed: {error}"
+            ))
+        })?;
+        persist_authorized_terminal_completion_owned(driver, bundle.terminal_completion())
+            .await
+            .map_err(|error| {
+                InteractionTerminalPublicationError::from_driver(
+                    "terminal completion recovery receipt persistence failed",
+                    error,
+                )
+            })?;
     }
     Ok(())
 }
@@ -1486,7 +1911,12 @@ async fn recover_committed_runtime_projections_before_teardown(
     // actor, and asking again after discard turns successful cleanup into an
     // unrecoverable `NotFound`/unsupported failure.
     if !rejected_run_projection_abort_completed {
-        reconcile_compaction_projection_outbox(driver, executor).await?;
+        reconcile_compaction_projection_outbox(
+            driver,
+            executor,
+            EmptyOutboxCheckpoint::RefreshFromStore,
+        )
+        .await?;
     }
 
     // A mixed failed batch has two disjoint public recipient sets: durable
@@ -1560,37 +1990,75 @@ async fn recover_committed_runtime_projections_before_teardown(
                 ),
             }
         })?;
-        let batch_key = crate::input_state::InteractionTerminalBatchKey::Run {
-            run_id: pending.run_id.clone(),
-        };
-        publish_authorized_runtime_terminal_batch(
-            driver,
-            Some(completions),
-            Some(authority_guard.take().ok_or_else(|| {
-                crate::RuntimeDriverError::RecoveryCorruption {
-                    reason: format!(
-                        "runtime teardown lost exact authority before non-directed recovery for {}",
+        let failed_execution_attempt = pending.terminal.is_none()
+            && pending.terminal_observation
+                == crate::meerkat_machine::dsl::RuntimeCompletionTerminalObservation::MachineTerminal
+            && pending.completion_error_metadata.is_some();
+        if failed_execution_attempt {
+            // This carrier represents durable RunFailed, not a fabricated
+            // terminal for every contributor. Reuse the live resolver so a
+            // mixed batch splits its durably terminal and requeued recipients
+            // identically during abnormal teardown.
+            let reason = pending
+                .completion_error_metadata
+                .as_ref()
+                .and_then(|metadata| metadata.detail.clone())
+                .unwrap_or_else(|| {
+                    format!(
+                        "runtime run {} failed after admission and was requeued",
                         pending.run_id
-                    ),
-                }
-            })?),
-            executor,
-            &pending.input_ids,
-            &[],
-            &batch_key,
-            pending.terminal_observation,
-            pending.terminal.as_ref(),
-            None,
-            crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Succeeded,
-            pending.completion_error_metadata,
-            None,
-        )
-        .await
-        .map_err(|error| {
-            crate::RuntimeDriverError::Internal(format!(
-                "failed to recover persisted non-directed runtime terminal: {error}"
-            ))
-        })?;
+                    )
+                });
+            resolve_machine_terminal_completion_waiters_under_authority(
+                driver,
+                completions,
+                authority_guard.take().ok_or_else(|| {
+                    crate::RuntimeDriverError::RecoveryCorruption {
+                        reason: format!(
+                            "runtime teardown lost exact authority before failed-attempt recovery for {}",
+                            pending.run_id
+                        ),
+                    }
+                })?,
+                teardown_slot,
+                &pending.input_ids,
+                &pending.run_id,
+                reason,
+            )
+            .await;
+        } else {
+            let batch_key = crate::input_state::InteractionTerminalBatchKey::Run {
+                run_id: pending.run_id.clone(),
+            };
+            publish_authorized_runtime_terminal_batch(
+                driver,
+                Some(completions),
+                Some(authority_guard.take().ok_or_else(|| {
+                    crate::RuntimeDriverError::RecoveryCorruption {
+                        reason: format!(
+                            "runtime teardown lost exact authority before non-directed recovery for {}",
+                            pending.run_id
+                        ),
+                    }
+                })?),
+                executor,
+                &pending.input_ids,
+                &[],
+                &batch_key,
+                pending.terminal_observation,
+                pending.terminal.as_ref(),
+                None,
+                crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Succeeded,
+                pending.completion_error_metadata,
+                None,
+            )
+            .await
+            .map_err(|error| {
+                crate::RuntimeDriverError::Internal(format!(
+                    "failed to recover persisted non-directed runtime terminal: {error}"
+                ))
+            })?;
+        }
         teardown_slot.clear_pending_nondirected_run_terminal(&pending.run_id);
     } else {
         drop(authority_guard.take());
@@ -1613,6 +2081,196 @@ async fn recover_committed_runtime_projections_before_teardown(
     Ok(())
 }
 
+fn resolve_process_local_failed_run_waiters(
+    driver: &crate::meerkat_machine::driver::DriverEntry,
+    completions: &mut crate::completion::CompletionRegistry,
+    input_ids: Vec<InputId>,
+    run_id: &RunId,
+    reason: String,
+) {
+    let authorized = machine_terminal_completion_error(driver, reason)
+        .and_then(|error_metadata| {
+            crate::meerkat_machine::driver::machine_resolve_runtime_completion_result(
+                driver,
+                Some(run_id),
+                crate::meerkat_machine::dsl::RuntimeCompletionTerminalObservation::MachineTerminal,
+                crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Succeeded,
+            )
+            .map(|authority| (authority, error_metadata))
+        })
+        .map_err(|error| {
+            crate::completion::CompletionWaitError::AuthorityUnavailable(format!(
+                "runtime process-local completion authority missing: {error}"
+            ))
+        });
+    match authorized {
+        Ok((authority, error_metadata)) => {
+            completions.resolve_process_local_runtime_completion_authorized(
+                input_ids,
+                None,
+                authority,
+                error_metadata,
+            );
+        }
+        Err(error) => completions.fail_inputs(input_ids, error),
+    }
+}
+
+async fn resolve_machine_terminal_completion_waiters_under_authority(
+    driver: &crate::meerkat_machine::SharedDriver,
+    completions: &crate::meerkat_machine::SharedCompletionRegistry,
+    authority_guard: crate::tokio::sync::OwnedMutexGuard<()>,
+    teardown_slot: &RuntimeLoopTeardownSlot,
+    input_ids: &[InputId],
+    run_id: &RunId,
+    reason: String,
+) {
+    let owned_input_ids = input_ids.to_vec();
+    let owned_run_id = run_id.clone();
+    let _authority_guard = authority_guard;
+    let mut driver_guard = driver.lock().await;
+    let (durable_input_ids, process_local_input_ids, already_finalized) = match driver_guard
+        .input_terminal_completion_batch_for_run(&owned_run_id, &owned_input_ids)
+    {
+        Ok(Some((durable_input_ids, already_finalized))) => {
+            let durable = durable_input_ids
+                .iter()
+                .collect::<std::collections::HashSet<_>>();
+            let process_local_input_ids = owned_input_ids
+                .iter()
+                .filter(|input_id| !durable.contains(input_id))
+                .cloned()
+                .collect::<Vec<_>>();
+            (
+                Some(durable_input_ids),
+                process_local_input_ids,
+                already_finalized,
+            )
+        }
+        Ok(None) => (None, owned_input_ids.clone(), false),
+        Err(error) => {
+            let _driver_guard = driver_guard;
+            let mut completion_guard = completions.lock().await;
+            completion_guard.fail_inputs(
+                owned_input_ids,
+                crate::completion::CompletionWaitError::AuthorityUnavailable(format!(
+                    "terminal completion receipt recovery failed: {error}"
+                )),
+            );
+            teardown_slot.clear_pending_nondirected_run_terminal(&owned_run_id);
+            return;
+        }
+    };
+    if already_finalized {
+        // Directed publication already consumed the durable batch
+        // authority and delivered its durable non-directed recipients.
+        // Any remaining IDs were requeued and therefore have no receipt;
+        // resolve only their process-local attempt observers.
+        if process_local_input_ids.is_empty() {
+            teardown_slot.clear_pending_nondirected_run_terminal(&owned_run_id);
+            return;
+        }
+        let mut completion_guard = completions.lock().await;
+        resolve_process_local_failed_run_waiters(
+            &driver_guard,
+            &mut completion_guard,
+            process_local_input_ids,
+            &owned_run_id,
+            reason,
+        );
+        teardown_slot.clear_pending_nondirected_run_terminal(&owned_run_id);
+        return;
+    }
+    let Some(durable_input_ids) = durable_input_ids else {
+        // A recoverable failed run can requeue every contributor. RunFailed
+        // is already durable here, but there is intentionally no input
+        // terminal receipt. Resolve the exact attempt observers from
+        // generated authority without changing the requeued input rows.
+        let mut completion_guard = completions.lock().await;
+        resolve_process_local_failed_run_waiters(
+            &driver_guard,
+            &mut completion_guard,
+            process_local_input_ids,
+            &owned_run_id,
+            reason,
+        );
+        teardown_slot.clear_pending_nondirected_run_terminal(&owned_run_id);
+        return;
+    };
+    let terminal_completion_witness =
+        match driver_guard.input_terminal_completion_authorization_witness(&durable_input_ids) {
+            Ok(witness) => witness,
+            Err(error) => {
+                let _driver_guard = driver_guard;
+                let mut completion_guard = completions.lock().await;
+                completion_guard.fail_inputs(
+                    owned_input_ids,
+                    crate::completion::CompletionWaitError::AuthorityUnavailable(format!(
+                        "terminal completion batch authorization failed: {error}"
+                    )),
+                );
+                teardown_slot.clear_pending_nondirected_run_terminal(&owned_run_id);
+                return;
+            }
+        };
+    let bundle = machine_terminal_completion_error(&driver_guard, reason)
+        .and_then(|error_metadata| {
+            crate::meerkat_machine::driver::machine_resolve_runtime_completion_result(
+                &driver_guard,
+                Some(&owned_run_id),
+                crate::meerkat_machine::dsl::RuntimeCompletionTerminalObservation::MachineTerminal,
+                crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Succeeded,
+            )
+            .map(|authority| (authority, error_metadata))
+        })
+        .map_err(|error| {
+            crate::completion::CompletionWaitError::AuthorityUnavailable(format!(
+                "runtime terminal completion authority missing: {error}"
+            ))
+        })
+        .and_then(|(authority, error_metadata)| {
+            let terminal = error_metadata
+                .clone()
+                .map(|error| CoreApplyTerminal::MachineTerminalFailure { error });
+            crate::completion::authorize_runtime_terminal_bundle(
+                &[],
+                terminal.as_ref(),
+                authority,
+                terminal_completion_witness,
+                error_metadata,
+                None,
+            )
+        });
+    let bundle = match bundle {
+        Ok(bundle) => match driver_guard
+            .finalize_input_terminal_completion_batch(bundle.terminal_completion())
+            .await
+        {
+            Ok(()) => Ok(bundle),
+            Err(error) => Err(
+                crate::completion::CompletionWaitError::AuthorityUnavailable(format!(
+                    "terminal completion receipt persistence failed: {error}"
+                )),
+            ),
+        },
+        Err(error) => Err(error),
+    };
+    let _driver_guard = driver_guard;
+    let completion_guard = completions.lock().await;
+    let mut completion_guard = completion_guard;
+    match bundle {
+        Ok(bundle) => {
+            // The generated result belongs to the whole failed run. Persist
+            // its terminal receipt only for the machine-terminal subset,
+            // then deliver the same non-cloneable decision to every
+            // non-directed waiter, including requeued contributors.
+            completion_guard.resolve_authorized_runtime_terminal_bundle(owned_input_ids, bundle);
+        }
+        Err(error) => completion_guard.fail_inputs(owned_input_ids, error),
+    }
+    teardown_slot.clear_pending_nondirected_run_terminal(&owned_run_id);
+}
+
 async fn resolve_machine_terminal_completion_waiters(
     driver: &crate::meerkat_machine::SharedDriver,
     completions: Option<&crate::meerkat_machine::SharedCompletionRegistry>,
@@ -1631,43 +2289,16 @@ async fn resolve_machine_terminal_completion_waiters(
     let owned_input_ids = input_ids.to_vec();
     let owned_run_id = run_id.clone();
     let handoff = tokio::spawn(async move {
-        let _authority_guard = authority_guard;
-        let driver_guard = driver.lock_owned().await;
-        let completion_guard = completions.lock_owned().await;
-        let bundle = machine_terminal_completion_error(&driver_guard, reason)
-            .and_then(|error_metadata| {
-                crate::meerkat_machine::driver::machine_resolve_runtime_completion_result(
-                    &driver_guard,
-                    Some(&owned_run_id),
-                    crate::meerkat_machine::dsl::RuntimeCompletionTerminalObservation::MachineTerminal,
-                    crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Succeeded,
-                )
-                .map(|authority| (authority, error_metadata))
-            })
-            .map_err(|error| {
-                crate::completion::CompletionWaitError::AuthorityUnavailable(format!(
-                    "runtime terminal completion authority missing: {error}"
-                ))
-            })
-            .and_then(|(authority, error_metadata)| {
-                crate::completion::authorize_runtime_terminal_bundle(
-                    &[],
-                    None,
-                    authority,
-                    error_metadata,
-                    None,
-                )
-            });
-        let _driver_guard = driver_guard;
-        let mut completion_guard = completion_guard;
-        match bundle {
-            Ok(bundle) => {
-                completion_guard
-                    .resolve_authorized_runtime_terminal_bundle(owned_input_ids, bundle);
-            }
-            Err(error) => completion_guard.fail_inputs(owned_input_ids, error),
-        }
-        teardown_slot.clear_pending_nondirected_run_terminal(&owned_run_id);
+        resolve_machine_terminal_completion_waiters_under_authority(
+            &driver,
+            &completions,
+            authority_guard,
+            &teardown_slot,
+            &owned_input_ids,
+            &owned_run_id,
+            reason,
+        )
+        .await;
     });
     if let Err(error) = handoff.await {
         tracing::error!(
@@ -1773,10 +2404,11 @@ struct RuntimeLoopRecoveryContext {
 
 /// Exact in-process recovery carrier for a persisted run outcome that has
 /// completion waiters but no directed Interaction event/outbox. The carrier is
-/// installed before the owning persistence await and is cleared only after
-/// authorized waiter delivery. Abnormal teardown can therefore replay the
-/// persisted payload with the retained executor instead of reclassifying it as
-/// a runless runtime termination.
+/// installed before the owning persistence await and is cleared only after the
+/// generated run result reaches those process-local observers. Abnormal
+/// teardown can therefore replay a terminal payload or report a durably failed
+/// execution attempt without reclassifying either as a runless runtime
+/// termination.
 #[derive(Clone)]
 struct PendingNondirectedRunTerminal {
     phase: PendingNondirectedRunTerminalPhase,
@@ -2941,12 +3573,9 @@ fn machine_terminal_completion_error(
 
 fn primitive_admitted_content_shape(primitive: &RunPrimitive) -> TurnContentShape {
     match primitive {
-        RunPrimitive::StagedInput(staged) => TurnContentShape::from_staged_presence(
-            !staged.appends.is_empty(),
-            !staged.context_appends.is_empty(),
-        ),
+        RunPrimitive::StagedInput(staged) if staged.appends.is_empty() => TurnContentShape::Empty,
+        RunPrimitive::StagedInput(_) => TurnContentShape::Conversation,
         RunPrimitive::ImmediateAppend(_) => TurnContentShape::ImmediateAppend,
-        RunPrimitive::ImmediateContextAppend(_) => TurnContentShape::ImmediateContext,
         _ => TurnContentShape::Conversation,
     }
 }
@@ -2958,32 +3587,6 @@ fn primitive_turn_start_input(
     match primitive {
         RunPrimitive::ImmediateAppend(_) => Some(
             crate::meerkat_machine::dsl::MeerkatMachineInput::StartImmediateAppend {
-                run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
-            },
-        ),
-        RunPrimitive::ImmediateContextAppend(_) => Some(
-            crate::meerkat_machine::dsl::MeerkatMachineInput::StartImmediateContext {
-                run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
-            },
-        ),
-        RunPrimitive::StagedInput(_) if primitive.is_peer_response_terminal_context_and_run() => {
-            let admitted_content_shape = crate::meerkat_machine::dsl::ContentShape::from(
-                primitive_admitted_content_shape(primitive),
-            );
-            Some(
-                crate::meerkat_machine::dsl::MeerkatMachineInput::StartConversationRun {
-                    run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
-                    primitive_kind:
-                        crate::meerkat_machine::dsl::TurnPrimitiveKind::ConversationTurn,
-                    admitted_content_shape,
-                    vision_enabled: false,
-                    image_tool_results_enabled: false,
-                    max_extraction_retries: 0,
-                },
-            )
-        }
-        RunPrimitive::StagedInput(_) if primitive.is_context_only_apply_without_turn() => Some(
-            crate::meerkat_machine::dsl::MeerkatMachineInput::StartImmediateContext {
                 run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
             },
         ),
@@ -3085,18 +3688,10 @@ pub(crate) fn try_projected_inputs_to_primitive_with_boundary(
     // transcript immediately before the turn's user/peer message, in order.
     let appends = projections
         .iter()
-        .flat_map(|projection| {
-            projection
-                .injected_context_appends
-                .clone()
-                .into_iter()
-                .chain(projection.append.clone())
-                .chain(projection.additional_appends.clone())
+        .zip(semantics.iter().copied())
+        .flat_map(|(projection, semantics)| {
+            crate::input::projection_conversation_appends(projection, semantics)
         })
-        .collect::<Vec<_>>();
-    let context_appends = projections
-        .iter()
-        .filter_map(|projection| projection.context_append.clone())
         .collect::<Vec<_>>();
     let contributing_input_ids = inputs
         .iter()
@@ -3109,7 +3704,6 @@ pub(crate) fn try_projected_inputs_to_primitive_with_boundary(
     Ok(RunPrimitive::StagedInput(StagedRunInput {
         boundary,
         appends,
-        context_appends,
         contributing_input_ids,
         turn_metadata,
     }))
@@ -3319,14 +3913,229 @@ impl RuntimeLoopAuthorityBinding {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FeedWakeOutcome {
+    /// Nothing wake-worthy is being withheld: either the batch carried no
+    /// generated wake completion (the observed cursor advanced past it) or
+    /// there was no feed to consult.
     Noop,
+    /// A wake-worthy completion was deliberately left visible in the feed and
+    /// the observed cursor did NOT advance (fail-closed hold). Re-arming the
+    /// idle wake instantly at the unchanged cursor returns immediately and
+    /// hot-spins — the 2026-07 "meerkat-machine-cleanup" incident: one held
+    /// wake pegged the process-singleton one-worker cleanup runtime (which
+    /// also dispatches every session command) at ~100% CPU, silently, until
+    /// fleet provisioning degraded to 44+ minutes. Callers must re-arm
+    /// edge-triggered past the held watermark plus a bounded re-poll.
+    NoopHeld(FeedWakeHold),
     Injected,
+    /// The generated cursor predates the bounded feed's retained window. The
+    /// runtime cannot prove whether an unavailable entry carried a wake
+    /// obligation, so it must stop this attachment rather than advance past
+    /// the gap.
+    FeedGap(meerkat_core::completion_feed::CompletionFeedGap),
     StaleAuthority,
+}
+
+// Long-lived runtime loops must not inherit the runtime of the cancellation-
+// safe attachment saga: that saga deliberately lives on the process singleton
+// one-worker cleanup runtime. They also cannot retain an application runtime
+// handle captured at machine construction because that runtime may be dropped
+// before the first session is attached. Native builds therefore use a
+// dedicated process-owned serving runtime whose lifetime is independent of
+// both construction and attachment context.
+#[cfg(not(target_arch = "wasm32"))]
+static RUNTIME_LOOP_SERVING_RUNTIME: std::sync::OnceLock<
+    std::sync::Mutex<Option<tokio::runtime::Runtime>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(not(target_arch = "wasm32"))]
+const RUNTIME_LOOP_SERVING_THREAD_STACK_SIZE: usize = 16 * 1024 * 1024;
+
+#[derive(Clone)]
+pub(crate) struct RuntimeLoopTaskSpawner {
+    #[cfg(not(target_arch = "wasm32"))]
+    handle: Option<tokio::runtime::Handle>,
+}
+
+impl RuntimeLoopTaskSpawner {
+    pub(crate) fn acquire_process_owned() -> Result<Self, crate::traits::RuntimeDriverError> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let slot = RUNTIME_LOOP_SERVING_RUNTIME.get_or_init(|| std::sync::Mutex::new(None));
+            let mut runtime = slot
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(runtime) = runtime.as_ref() {
+                return Ok(Self {
+                    handle: Some(runtime.handle().clone()),
+                });
+            }
+
+            let candidate = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(2)
+                .thread_name("meerkat-runtime-serving")
+                .thread_stack_size(RUNTIME_LOOP_SERVING_THREAD_STACK_SIZE)
+                .enable_all()
+                .build()
+                .map_err(|error| {
+                    crate::traits::RuntimeDriverError::Internal(format!(
+                        "failed to start runtime-loop serving runtime: {error}"
+                    ))
+                })?;
+            let handle = candidate.handle().clone();
+            *runtime = Some(candidate);
+            Ok(Self {
+                handle: Some(handle),
+            })
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            Ok(Self {})
+        }
+    }
+
+    #[cfg(test)]
+    fn ambient_for_test() -> Self {
+        Self {
+            #[cfg(not(target_arch = "wasm32"))]
+            handle: None,
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + Send + 'static,
+        F::Output: Send + 'static,
+    {
+        match self.handle.as_ref() {
+            Some(handle) => handle.spawn(future),
+            #[cfg(test)]
+            None => tokio::spawn(future),
+            #[cfg(not(test))]
+            None => unreachable!("production runtime-loop spawner is always process-owned"),
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn spawn<F>(&self, future: F) -> tokio::task::JoinHandle<F::Output>
+    where
+        F: std::future::Future + 'static,
+        F::Output: 'static,
+    {
+        tokio::spawn(future)
+    }
+}
+
+/// Details of one fail-closed feed-wake hold.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FeedWakeHold {
+    reason: FeedWakeHoldReason,
+    /// Feed watermark at the instant the hold was taken. Completions newer
+    /// than this must still wake the loop edge-triggered.
+    held_watermark: meerkat_core::completion_feed::CompletionSeq,
+}
+
+/// Why a wake-worthy completion was left visible instead of injected.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeedWakeHoldReason {
+    /// The session was not quiescent for a detached wake.
+    NonQuiescent,
+    /// Continuation injection failed; the completion stays visible for retry.
+    InjectionFailed,
+}
+
+/// Loop-local bookkeeping for an active feed-wake hold.
+struct FeedWakeHoldState {
+    reason: FeedWakeHoldReason,
+    /// Highest watermark already known to be held; only newer completions
+    /// re-arm the edge-triggered wake.
+    held_watermark: meerkat_core::completion_feed::CompletionSeq,
+    /// Current bounded re-poll delay (base 25ms, doubling, cap 1s — the same
+    /// ladder as the interaction-terminal recovery drain).
+    repoll_delay: std::time::Duration,
+}
+
+const FEED_HOLD_REPOLL_BASE: std::time::Duration = std::time::Duration::from_millis(25);
+const FEED_HOLD_REPOLL_CAP: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// Record a fail-closed feed-wake hold on the loop-local hold state.
+///
+/// The warn fires once per (session, hold-reason) transition — not per
+/// iteration. A fail-closed hold must never be silent: the 2026-07 hot-spin
+/// incident was invisible at every log level, which cost three misattributions
+/// and a 42-minute-per-diagnosis field hunt. Repeated holds for the same
+/// reason stay quiet and grow the bounded re-poll ladder instead.
+fn note_feed_wake_hold(
+    hold_state: &mut Option<FeedWakeHoldState>,
+    session_id: &meerkat_core::types::SessionId,
+    hold: FeedWakeHold,
+) {
+    match hold_state {
+        Some(state) if state.reason == hold.reason => {
+            state.held_watermark = state.held_watermark.max(hold.held_watermark);
+            state.repoll_delay = state
+                .repoll_delay
+                .saturating_mul(2)
+                .min(FEED_HOLD_REPOLL_CAP);
+        }
+        _ => {
+            tracing::warn!(
+                session_id = %session_id,
+                reason = ?hold.reason,
+                held_watermark = hold.held_watermark,
+                "runtime loop is holding a wake-worthy completion visible in the feed \
+                 (fail-closed hold); re-polling with bounded backoff until the hold clears"
+            );
+            *hold_state = Some(FeedWakeHoldState {
+                reason: hold.reason,
+                held_watermark: hold.held_watermark,
+                repoll_delay: FEED_HOLD_REPOLL_BASE,
+            });
+        }
+    }
+}
+
+async fn stop_runtime_loop_after_feed_gap(
+    driver: &crate::meerkat_machine::SharedDriver,
+    completions: Option<&crate::meerkat_machine::SharedCompletionRegistry>,
+    executor: &mut dyn meerkat_core::lifecycle::CoreExecutor,
+    handoff: &mut RuntimeLoopTerminalHandoff,
+    gap: meerkat_core::completion_feed::CompletionFeedGap,
+) {
+    let turn_finalization_guard = match executor.turn_finalization_boundary_handle() {
+        Some(boundary) => match boundary.acquire().await {
+            Ok(guard) => Some(guard),
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    requested_after_seq = gap.requested_after_seq,
+                    dropped_through = gap.dropped_through,
+                    watermark = gap.watermark,
+                    "failed to acquire turn-finalization boundary for completion-feed gap"
+                );
+                return;
+            }
+        },
+        None => None,
+    };
+    let _ = stop_runtime_loop_executor_from_dsl_effect(
+        driver,
+        completions,
+        executor,
+        format!(
+            "completion feed lost generated wake authority after cursor {} (dropped through {}, watermark {})",
+            gap.requested_after_seq, gap.dropped_through, gap.watermark
+        ),
+        handoff,
+        turn_finalization_guard,
+    )
+    .await;
 }
 
 /// Spawn the per-session runtime loop with optional completion registry.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_runtime_loop_with_completions(
+    task_spawner: RuntimeLoopTaskSpawner,
     driver: crate::meerkat_machine::SharedDriver,
     executor: Box<dyn meerkat_core::lifecycle::CoreExecutor>,
     mut wake_rx: tokio::sync::mpsc::Receiver<()>,
@@ -3390,7 +4199,7 @@ pub(crate) fn spawn_runtime_loop_with_completions(
     let loop_teardown_slot = std::sync::Arc::clone(&teardown_slot);
     let loop_process_teardown_slot = std::sync::Arc::clone(&teardown_slot);
     let loop_handoff_guard = RuntimeLoopHandoffGuard::new(loop_teardown_slot, executor);
-    let loop_handle = tokio::spawn(async move {
+    let loop_body = async move {
         let mut loop_handoff_guard = loop_handoff_guard;
         let mut startup_guard = startup_guard;
         macro_rules! executor_or_return {
@@ -3530,8 +4339,12 @@ pub(crate) fn spawn_runtime_loop_with_completions(
                 return;
             }
         };
-        let compaction_recovery =
-            reconcile_compaction_projection_outbox(&driver, executor_or_return!()).await;
+        let compaction_recovery = reconcile_compaction_projection_outbox(
+            &driver,
+            executor_or_return!(),
+            EmptyOutboxCheckpoint::RefreshFromStore,
+        )
+        .await;
         if let Err(error) = compaction_recovery {
             drop(startup_authority_guard);
             drop(startup_turn_finalization_guard);
@@ -3577,14 +4390,41 @@ pub(crate) fn spawn_runtime_loop_with_completions(
         loop_handoff_guard
             .set_fallback_disposition(RuntimeLoopTeardownDisposition::PreserveRegistration);
 
+        // Active fail-closed feed-wake hold, if any. While a wake-worthy
+        // completion is deliberately left visible (non-quiescent session or
+        // failed injection), the idle wake must NOT re-arm instantly at the
+        // unchanged observed cursor — that select! re-fires immediately and
+        // hot-spins forever (2026-07 "meerkat-machine-cleanup" incident:
+        // 9.94s/10s CPU on the one worker dispatching every session command).
+        let mut feed_hold: Option<FeedWakeHoldState> = None;
         loop {
             // Build a future for the idle wake. Backed by the completion feed
             // only when generated ops cursor authority is present; otherwise
             // pends forever because the feed watermark is not delivery
             // authority.
+            //
+            // Snapshot the hold parameters (Copy) before the async block so
+            // the select handlers below can mutate the hold state.
+            let feed_hold_arm = feed_hold
+                .as_ref()
+                .map(|hold| (hold.held_watermark, hold.repoll_delay));
             let idle_wake = async {
                 if let (Some(feed), Some(_)) = (completion_feed.as_ref(), ops_lifecycle.as_ref()) {
-                    feed.wait_for_advance(observed_seq).await;
+                    match feed_hold_arm {
+                        None => {
+                            feed.wait_for_advance(observed_seq).await;
+                        }
+                        // Held wake: re-arm edge-triggered so only completions
+                        // NEWER than the held batch wake the loop instantly,
+                        // plus a bounded re-poll so the hold-clearing condition
+                        // (quiescence flip, injection retry) is still observed.
+                        Some((held_watermark, repoll_delay)) => {
+                            tokio::select! {
+                                _ = feed.wait_for_advance(held_watermark) => {}
+                                () = tokio::time::sleep(repoll_delay) => {}
+                            }
+                        }
+                    }
                 } else {
                     std::future::pending::<()>().await;
                 }
@@ -3638,6 +4478,13 @@ pub(crate) fn spawn_runtime_loop_with_completions(
                             .await
                             {
                                 break;
+                            }
+                            // Effects can flip quiescence (e.g. a terminal run
+                            // effect). Re-poll a held completion promptly
+                            // instead of waiting out the current ladder step;
+                            // keep the hold episode (no re-warn).
+                            if let Some(hold) = feed_hold.as_mut() {
+                                hold.repoll_delay = FEED_HOLD_REPOLL_BASE;
                             }
                         }
                         None => {
@@ -3706,6 +4553,7 @@ pub(crate) fn spawn_runtime_loop_with_completions(
                             .await
                             {
                                 FeedWakeOutcome::Injected => {
+                                    feed_hold = None;
                                     if process_queue(
                                         &driver,
                                         executor_or_return!(),
@@ -3720,8 +4568,28 @@ pub(crate) fn spawn_runtime_loop_with_completions(
                                         break;
                                     }
                                 }
+                                FeedWakeOutcome::FeedGap(gap) => {
+                                    stop_runtime_loop_after_feed_gap(
+                                        &driver,
+                                        completions.as_ref(),
+                                        executor_or_return!(),
+                                        &mut terminal_handoff,
+                                        gap,
+                                    )
+                                    .await;
+                                    break;
+                                }
                                 FeedWakeOutcome::StaleAuthority => break,
-                                FeedWakeOutcome::Noop => {}
+                                FeedWakeOutcome::Noop => {
+                                    feed_hold = None;
+                                }
+                                FeedWakeOutcome::NoopHeld(hold) => {
+                                    note_feed_wake_hold(
+                                        &mut feed_hold,
+                                        &authority_binding.session_id,
+                                        hold,
+                                    );
+                                }
                             }
                         }
                         None => {
@@ -3773,6 +4641,7 @@ pub(crate) fn spawn_runtime_loop_with_completions(
                     .await
                     {
                         FeedWakeOutcome::Injected => {
+                            feed_hold = None;
                             if process_queue(
                                 &driver,
                                 executor_or_return!(),
@@ -3787,8 +4656,28 @@ pub(crate) fn spawn_runtime_loop_with_completions(
                                 break;
                             }
                         }
+                        FeedWakeOutcome::FeedGap(gap) => {
+                            stop_runtime_loop_after_feed_gap(
+                                &driver,
+                                completions.as_ref(),
+                                executor_or_return!(),
+                                &mut terminal_handoff,
+                                gap,
+                            )
+                            .await;
+                            break;
+                        }
                         FeedWakeOutcome::StaleAuthority => break,
-                        FeedWakeOutcome::Noop => {}
+                        FeedWakeOutcome::Noop => {
+                            feed_hold = None;
+                        }
+                        FeedWakeOutcome::NoopHeld(hold) => {
+                            note_feed_wake_hold(
+                                &mut feed_hold,
+                                &authority_binding.session_id,
+                                hold,
+                            );
+                        }
                     }
                 }
             }
@@ -3801,7 +4690,13 @@ pub(crate) fn spawn_runtime_loop_with_completions(
         if let Err(error) = loop_handoff_guard.publish(terminal_handoff) {
             tracing::error!(%error, "runtime loop failed to publish executor handoff");
         }
-    });
+    };
+    // The spawner is acquired before executor attachment and is always backed
+    // by the process-owned serving runtime in production. This makes ambient
+    // fallback unrepresentable: construction outside Tokio, construction
+    // inside a short-lived Tokio runtime, and attachment from the cleanup
+    // runtime all land on the same durable serving topology.
+    let loop_handle = task_spawner.spawn(loop_body);
     let spawned = SpawnedRuntimeLoop {
         loop_handle,
         teardown_slot,
@@ -3957,6 +4852,15 @@ async fn maybe_inject_feed_wake(
         return FeedWakeOutcome::StaleAuthority;
     };
     let batch = feed.list_since(*observed_seq);
+    if let Some(gap) = batch.gap_after(*observed_seq) {
+        tracing::error!(
+            requested_after_seq = gap.requested_after_seq,
+            dropped_through = gap.dropped_through,
+            watermark = gap.watermark,
+            "runtime loop refused to advance across a bounded completion-feed gap"
+        );
+        return FeedWakeOutcome::FeedGap(gap);
+    }
 
     let has_new_wake_completion =
         match batch_has_generated_wake_completion(&batch, *last_injected_seq, registry) {
@@ -3994,7 +4898,15 @@ async fn maybe_inject_feed_wake(
     if !d.is_quiescent_for_detached_wake() {
         // Non-quiescent: do NOT advance observed_seq. The completion
         // stays visible for the next wake so it's not permanently lost.
-        return FeedWakeOutcome::Noop;
+        // This is a HOLD, not a caught-up cursor: re-arming the idle wake
+        // instantly at the unchanged cursor spins (2026-07
+        // "meerkat-machine-cleanup" incident), so the caller must re-arm
+        // edge-triggered past this batch plus a bounded re-poll for the
+        // quiescence flip.
+        return FeedWakeOutcome::NoopHeld(FeedWakeHold {
+            reason: FeedWakeHoldReason::NonQuiescent,
+            held_watermark: batch.watermark,
+        });
     }
     drop(d);
 
@@ -4011,8 +4923,14 @@ async fn maybe_inject_feed_wake(
             // non-quiescent branch above and leave the completion visible so
             // the next wake re-presents it for retry instead of laundering the
             // failed injection into a watermark advance that hides the
-            // completion.
-            FeedWakeOutcome::Noop
+            // completion. Held, not caught up: the failure cause is external,
+            // so the caller retries on a bounded re-poll ladder rather than
+            // re-arming instantly at the same cursor (2026-07 hot-spin
+            // incident).
+            FeedWakeOutcome::NoopHeld(FeedWakeHold {
+                reason: FeedWakeHoldReason::InjectionFailed,
+                held_watermark: batch.watermark,
+            })
         }
         DetachedWakeCursorPlan::AdvanceInjectedAndObserved => {
             // Injection succeeded: advance both the injected and observed
@@ -4731,9 +5649,12 @@ async fn process_queue(
                             terminal.as_ref(),
                             Some(CoreApplyTerminal::NoPendingBoundary)
                         );
-                        let committed_session_snapshot = committed
-                            .as_ref()
-                            .map(|commit| commit.snapshot_bytes().to_vec());
+                        // Keep one cheap clone of the sealed carrier for
+                        // post-commit publication. WholeBlob clones share the
+                        // lazy byte cell; HeadCanonical clones only an Arc to
+                        // the bounded mutation and can never materialize a
+                        // Session or whole blob.
+                        let committed_session_boundary = committed.clone();
                         let machine_terminal_error = match terminal.as_ref() {
                             Some(CoreApplyTerminal::MachineTerminalFailure { error }) => {
                                 Some(error.clone())
@@ -4767,7 +5688,7 @@ async fn process_queue(
                                 }
                             };
                         let commit_result = match commit_outcome {
-                            OwnedRuntimeLoopCommitOutcome::Committed => Ok(()),
+                            OwnedRuntimeLoopCommitOutcome::Committed(authority) => Ok(authority),
                             OwnedRuntimeLoopCommitOutcome::Rejected(error) => Err(error),
                             OwnedRuntimeLoopCommitOutcome::CleanupCarrierCorrupt(error) => {
                                 tracing::error!(
@@ -4783,59 +5704,52 @@ async fn process_queue(
                                 return true;
                             }
                         };
-                        if let Err(err) = commit_result {
-                            tracing::error!(%run_id, error = %err, "failed to commit runtime loop run");
-                            let projection_cleanup_error =
-                                abort_rejected_run_projections_after_commit_failure(executor)
-                                    .await
-                                    .err();
-                            if let Some(cleanup_error) = projection_cleanup_error.as_ref() {
-                                tracing::error!(
-                                    %run_id,
-                                    error = %cleanup_error,
-                                    "failed to abort rejected runtime run projections after commit failure"
-                                );
-                            }
-                            if projection_cleanup_error.is_none() {
-                                teardown_slot.complete_rejected_commit_abort(&run_id);
-                            }
-                            let failure_detail = match projection_cleanup_error {
-                                Some(cleanup_error) => format!(
-                                    "runtime loop commit failed: {err}; rejected run projection cleanup also failed: {cleanup_error}"
-                                ),
-                                None => format!("runtime loop commit failed: {err}"),
-                            };
-                            let completion_error =
-                                meerkat_core::TurnErrorMetadata::runtime_apply_failure(
-                                    failure_detail.clone(),
-                                );
-                            if directed_interaction_ids.is_empty() {
-                                // Ordinary callers can observe the richer
-                                // per-run finalization failure immediately.
-                                // A directed turn, however, also requires one
-                                // exact durable Interaction terminal.  The
-                                // failed commit rolled its run outbox back, so
-                                // resolving that waiter here would split it
-                                // from the runless RuntimeTerminated event that
-                                // the canonical stop path publishes below.
-                                // Leave directed waiters pending until that
-                                // single durable stop authority resolves both
-                                // the event and the waiter.
-                                resolve_runtime_completion_waiters(
-                                    driver,
-                                    completions,
-                                    terminal_authority_guard,
-                                    &input_ids,
-                                    &run_id,
-                                    terminal.as_ref(),
-                                    crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Failed,
-                                    Some(completion_error),
-                                )
-                                .await;
-                            } else {
+                        let committed_authority = match commit_result {
+                            Ok(authority) => authority,
+                            Err(err) => {
+                                tracing::error!(%run_id, error = %err, "failed to commit runtime loop run");
+                                let projection_cleanup_error =
+                                    abort_rejected_run_projections_after_commit_failure(executor)
+                                        .await
+                                        .err();
+                                if let Some(cleanup_error) = projection_cleanup_error.as_ref() {
+                                    tracing::error!(
+                                        %run_id,
+                                        error = %cleanup_error,
+                                        "failed to abort rejected runtime run projections after commit failure"
+                                    );
+                                }
+                                if projection_cleanup_error.is_none() {
+                                    teardown_slot.complete_rejected_commit_abort(&run_id);
+                                }
+                                let failure_detail = match projection_cleanup_error {
+                                    Some(cleanup_error) => format!(
+                                        "runtime loop commit failed: {err}; rejected run projection cleanup also failed: {cleanup_error}"
+                                    ),
+                                    None => format!("runtime loop commit failed: {err}"),
+                                };
+                                // The rejected boundary transaction rolled back
+                                // both terminal input state and its exact receipt.
+                                // The live persistent shell has nevertheless
+                                // crossed its fail-stop terminal checkpoint, so
+                                // its contributors are no longer in the active
+                                // set used by runless stop terminalization. Fail
+                                // the exact process-local waiters while their
+                                // input identities are still owned here; waiting
+                                // for the stop path would strand them forever.
+                                // This is mechanical delivery failure only: do
+                                // not mint an ephemeral terminal outcome while a
+                                // registration-authorized reload is required.
+                                if let Some(completions) = completions.as_ref() {
+                                    let mut completions = completions.lock().await;
+                                    fail_completion_waiters(
+                                        &mut completions,
+                                        &input_ids,
+                                        failure_detail.clone(),
+                                    );
+                                }
                                 drop(terminal_authority_guard);
-                            }
-                            let should_stop = stop_runtime_loop_executor_from_dsl_effect(
+                                let should_stop = stop_runtime_loop_executor_from_dsl_effect(
                                 driver,
                                 completions,
                                 executor,
@@ -4846,100 +5760,23 @@ async fn process_queue(
                                 turn_finalization_guard,
                             )
                             .await;
-                            return should_stop;
-                        }
+                                return should_stop;
+                            }
+                        };
 
-                        let authoritative_checkpoint = match reconcile_compaction_projection_outbox(
-                            driver, executor,
+                        // Acknowledge the exact store commit before any
+                        // derived compaction projection advances that same
+                        // store-owned authority (HeadCanonical intent cleanup
+                        // is a metadata-only head mutation). Otherwise the
+                        // executor re-reads a newer cleaned head and rejects
+                        // the just-committed token as stale.
+                        let checkpoint_result = publish_committed_session_boundary(
+                            executor,
+                            None,
+                            committed_authority.as_ref(),
+                            committed_session_boundary.as_ref(),
                         )
-                        .await
-                        {
-                            Ok(checkpoint) => checkpoint,
-                            Err(err) => {
-                                tracing::error!(
-                                    %run_id,
-                                    error = %err,
-                                    "failed to finalize committed compaction projection outbox"
-                                );
-                                let completion_error =
-                                    meerkat_core::TurnErrorMetadata::runtime_apply_failure(
-                                        format!(
-                                            "runtime compaction projection finalization failed after commit: {err}"
-                                        ),
-                                    );
-                                let publication_error =
-                                    finalize_publish_and_resolve_runtime_terminals(
-                                        driver,
-                                        completions,
-                                        terminal_authority_guard,
-                                        teardown_slot,
-                                        executor,
-                                        &input_ids,
-                                        &directed_interaction_ids,
-                                        &run_id,
-                                        completion_terminal_observation(terminal.as_ref()),
-                                        terminal.as_ref(),
-                                        crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Failed,
-                                        Some(completion_error.clone()),
-                                    )
-                                    .await
-                                    .err();
-                                if let Some(publication_error) = publication_error.as_ref() {
-                                    tracing::error!(
-                                        %run_id,
-                                        error = %publication_error,
-                                        "failed to durably publish directed terminal after compaction finalization failure"
-                                    );
-                                }
-                                if publication_error.is_some()
-                                    && directed_interaction_ids.is_empty()
-                                {
-                                    // No durable interaction outbox can retry
-                                    // this batch. Exit through the abnormal
-                                    // handoff so teardown consumes the retained
-                                    // non-directed carrier before any runless
-                                    // stop terminal is minted.
-                                    return true;
-                                }
-                                if publication_error.is_some()
-                                    && drain_recovered_interaction_terminal_outboxes_until_clear(
-                                        driver,
-                                        completions,
-                                        executor,
-                                        authority_binding,
-                                        true,
-                                        RuntimeProjectionRecoveryAuthority::RuntimeLoop,
-                                    )
-                                    .await
-                                {
-                                    return true;
-                                }
-                                return stop_runtime_loop_executor_from_dsl_effect(
-                                        driver,
-                                        completions,
-                                        executor,
-                                        format!(
-                                            "runtime compaction projection finalization failed after commit for run {run_id}: {err}"
-                                        ),
-                                        handoff,
-                                        turn_finalization_guard,
-                                    )
-                                    .await;
-                            }
-                        };
-
-                        let checkpoint_result = match (
-                            authoritative_checkpoint,
-                            committed_session_snapshot.as_deref(),
-                        ) {
-                            (Some(_), _) => Ok(()),
-                            (None, Some(session_snapshot)) => {
-                                executor
-                                    .checkpoint_committed_session_snapshot(session_snapshot)
-                                    .await
-                            }
-                            (None, None) => Ok(()),
-                        };
+                        .await;
                         if let Err(err) = checkpoint_result {
                             tracing::error!(
                                 %run_id,
@@ -5003,6 +5840,88 @@ async fn process_queue(
                             .await;
                             return should_stop;
                         }
+
+                        let _authoritative_checkpoint =
+                            match reconcile_compaction_projection_outbox(
+                                driver,
+                                executor,
+                                EmptyOutboxCheckpoint::SkipIdentityRefresh,
+                            )
+                            .await
+                            {
+                                Ok(checkpoint) => checkpoint,
+                                Err(err) => {
+                                    tracing::error!(
+                                        %run_id,
+                                        error = %err,
+                                        "failed to finalize committed compaction projection outbox"
+                                    );
+                                    let completion_error =
+                                        meerkat_core::TurnErrorMetadata::runtime_apply_failure(
+                                            format!(
+                                                "runtime compaction projection finalization failed after commit: {err}"
+                                            ),
+                                        );
+                                    let publication_error =
+                                    finalize_publish_and_resolve_runtime_terminals(
+                                        driver,
+                                        completions,
+                                        terminal_authority_guard,
+                                        teardown_slot,
+                                        executor,
+                                        &input_ids,
+                                        &directed_interaction_ids,
+                                        &run_id,
+                                        completion_terminal_observation(terminal.as_ref()),
+                                        terminal.as_ref(),
+                                        crate::meerkat_machine::dsl::RuntimeCompletionFinalizationObservation::Failed,
+                                        Some(completion_error.clone()),
+                                    )
+                                    .await
+                                    .err();
+                                    if let Some(publication_error) = publication_error.as_ref() {
+                                        tracing::error!(
+                                            %run_id,
+                                            error = %publication_error,
+                                            "failed to durably publish directed terminal after compaction finalization failure"
+                                        );
+                                    }
+                                    if publication_error.is_some()
+                                        && directed_interaction_ids.is_empty()
+                                    {
+                                        // No durable interaction outbox can retry
+                                        // this batch. Exit through the abnormal
+                                        // handoff so teardown consumes the retained
+                                        // non-directed carrier before any runless
+                                        // stop terminal is minted.
+                                        return true;
+                                    }
+                                    if publication_error.is_some()
+                                    && drain_recovered_interaction_terminal_outboxes_until_clear(
+                                        driver,
+                                        completions,
+                                        executor,
+                                        authority_binding,
+                                        true,
+                                        RuntimeProjectionRecoveryAuthority::RuntimeLoop,
+                                    )
+                                    .await
+                                {
+                                    return true;
+                                }
+                                    return stop_runtime_loop_executor_from_dsl_effect(
+                                        driver,
+                                        completions,
+                                        executor,
+                                        format!(
+                                            "runtime compaction projection finalization failed after commit for run {run_id}: {err}"
+                                        ),
+                                        handoff,
+                                        turn_finalization_guard,
+                                    )
+                                    .await;
+                                }
+                            };
 
                         if let Err(err) = finalize_publish_and_resolve_runtime_terminals(
                             driver,
@@ -5409,6 +6328,52 @@ mod tests {
     const TEST_PEER_RESPONSE_REQUEST_ID: &str = "22222222-2222-4222-8222-222222222222";
     const TEST_PEER_RESPONSE_REQUEST_ID_2: &str = "33333333-3333-4333-8333-333333333333";
 
+    /// Test-only supported-floor encoder. Full-body materialization is
+    /// deliberate here: it constructs exact released 0.8.10 ingress bytes,
+    /// never a current runtime persistence path.
+    fn encode_as_released_0810_compaction_fixture(
+        session: &meerkat_core::Session,
+    ) -> serde_json::Value {
+        let history = session
+            .validated_transcript_history_state()
+            .unwrap()
+            .expect("fixture rewrite graph exists");
+        assert_eq!(
+            history.digest_format(),
+            3,
+            "fixture source must exercise the current transcript format"
+        );
+        assert_eq!(history.commit_count(), 1, "fixture has one rewrite");
+        let commit = history.last_commit().expect("fixture rewrite commit");
+        let (start, end) = commit.selection.bounds();
+        let mut released_commit = serde_json::to_value(commit).unwrap();
+        released_commit
+            .as_object_mut()
+            .unwrap()
+            .remove("rewrite_generation");
+        released_commit["selection"] = serde_json::json!({
+            "type": "compaction_message_range",
+            "range": { "start": start, "end": end }
+        });
+        let released_graph = serde_json::json!({
+            "head": history.head(),
+            "commits": [released_commit],
+            "revisions": [
+                history.materialize_revision(&commit.parent_revision).unwrap(),
+                history.materialize_revision(&commit.revision).unwrap(),
+            ],
+            "digest_format": 2,
+        });
+        let mut encoded = serde_json::to_value(session).unwrap();
+        encoded["version"] = serde_json::json!(2);
+        encoded["metadata"][meerkat_core::SESSION_TRANSCRIPT_HISTORY_STATE_KEY] = released_graph;
+        encoded["metadata"]
+            .as_object_mut()
+            .unwrap()
+            .remove(meerkat_core::SESSION_TRANSCRIPT_REWRITE_PREFIX_AUTHORITY_KEY);
+        encoded
+    }
+
     #[test]
     fn compatibility_checkpoint_clears_exact_finalized_compaction_intent() {
         let mut session = meerkat_core::Session::new();
@@ -5430,18 +6395,15 @@ mod tests {
                 Some(parent),
             )
             .unwrap();
-        let mut encoded = serde_json::to_value(&session).unwrap();
-        encoded["metadata"][meerkat_core::SESSION_TRANSCRIPT_HISTORY_STATE_KEY]["commits"][0]["selection"] = serde_json::json!({
-            "type": "compaction_message_range",
-            "range": { "start": 0, "end": 2 }
-        });
-        let mut session: meerkat_core::Session = serde_json::from_value(encoded).unwrap();
+        let encoded = encode_as_released_0810_compaction_fixture(&session);
+        let encoded = serde_json::to_vec(&encoded).unwrap();
+        let imported = meerkat_core::import_released_0810_session(&encoded).unwrap();
+        let (mut session, _import_receipt) = imported.into_parts();
         let commit = session
-            .transcript_history_state()
+            .validated_transcript_history_state()
             .unwrap()
             .unwrap()
-            .commits
-            .last()
+            .last_commit()
             .unwrap()
             .clone();
         let intent = meerkat_core::CompactionProjectionIntent {
@@ -5461,9 +6423,11 @@ mod tests {
             .unwrap();
         let stale_pre_finalize = serde_json::to_vec(&session).unwrap();
 
-        let cleaned =
-            compatibility_checkpoint_after_compaction_finalize(&stale_pre_finalize, &[intent])
-                .unwrap();
+        let cleaned = compatibility_checkpoint_after_compaction_finalize(
+            Arc::new(stale_pre_finalize),
+            &[intent],
+        )
+        .unwrap();
         let recovered: meerkat_core::Session = serde_json::from_slice(&cleaned).unwrap();
         assert!(
             recovered
@@ -5549,6 +6513,156 @@ mod tests {
             crate::meerkat_machine::dsl::RuntimeEffectKind::StopRuntimeExecutor,
             reason,
         )
+    }
+
+    struct WholeBlobFinalizationProbe {
+        snapshot_calls: Arc<AtomicUsize>,
+        authority_ack: Option<(u64, String)>,
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::CoreExecutor for WholeBlobFinalizationProbe {
+        async fn apply(
+            &mut self,
+            _run_id: meerkat_core::lifecycle::RunId,
+            _primitive: meerkat_core::lifecycle::run_primitive::RunPrimitive,
+        ) -> Result<
+            meerkat_core::lifecycle::core_executor::CoreApplyOutput,
+            meerkat_core::lifecycle::CoreExecutorError,
+        > {
+            unreachable!("WholeBlob finalization regression does not apply queued work")
+        }
+
+        async fn checkpoint_committed_session_snapshot(
+            &mut self,
+            _session_snapshot: Arc<Vec<u8>>,
+        ) -> Result<(), meerkat_core::lifecycle::CoreExecutorError> {
+            self.snapshot_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn acknowledge_committed_session_boundary(
+            &mut self,
+            authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+        ) -> Result<(), meerkat_core::lifecycle::CoreExecutorError> {
+            match authority {
+                meerkat_core::CommittedSessionBoundaryAuthority::WholeBlob {
+                    committed_store_revision,
+                    committed_blob_sha256,
+                    ..
+                } => {
+                    self.authority_ack =
+                        Some((*committed_store_revision, committed_blob_sha256.clone()));
+                    Ok(())
+                }
+                other => Err(meerkat_core::lifecycle::CoreExecutorError::Internal(
+                    format!("WholeBlob finalization probe received {other:?}"),
+                )),
+            }
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), meerkat_core::lifecycle::CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), meerkat_core::lifecycle::CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn ordinary_whole_blob_finalization_uses_exact_authority_not_document_checkpoint() {
+        let session = Arc::new(meerkat_core::Session::new());
+        let boundary = meerkat_core::lifecycle::core_executor::BoundSessionCommit::sealed(
+            Arc::clone(&session),
+        )
+        .expect("seal typed WholeBlob boundary");
+        let prepared_digest = boundary
+            .whole_blob_artifact()
+            .expect("materialize exact prepared artifact")
+            .row_sha256_token()
+            .to_string();
+        let authority = crate::store::WholeBlobStoreAuthority::issued(
+            session.id().clone(),
+            7,
+            prepared_digest.clone(),
+        )
+        .expect("issue matching store authority");
+        let result = crate::store::PreparedRuntimeSessionCommitResult::committed(
+            crate::store::RuntimeSessionAuthority::WholeBlob(authority),
+        );
+        let snapshot_calls = Arc::new(AtomicUsize::new(0));
+        let mut executor = WholeBlobFinalizationProbe {
+            snapshot_calls: Arc::clone(&snapshot_calls),
+            authority_ack: None,
+        };
+
+        publish_committed_session_boundary(&mut executor, None, Some(&result), Some(&boundary))
+            .await
+            .expect("matching store authority finalizes");
+
+        assert_eq!(
+            snapshot_calls.load(Ordering::SeqCst),
+            0,
+            "ordinary finalization must not hand the O(document) body to the executor"
+        );
+        assert_eq!(
+            executor.authority_ack,
+            Some((7, prepared_digest.clone())),
+            "executor must receive the exact store-issued revision/digest"
+        );
+
+        let mismatched = crate::store::PreparedRuntimeSessionCommitResult::committed(
+            crate::store::RuntimeSessionAuthority::WholeBlob(
+                crate::store::WholeBlobStoreAuthority::issued(
+                    session.id().clone(),
+                    8,
+                    format!("row-sha256:{}", "0".repeat(64)),
+                )
+                .expect("issue mismatched authority"),
+            ),
+        );
+        executor.authority_ack = None;
+        let error = publish_committed_session_boundary(
+            &mut executor,
+            None,
+            Some(&mismatched),
+            Some(&boundary),
+        )
+        .await
+        .expect_err("mismatched store authority must fail before executor acknowledgement");
+        assert!(
+            error
+                .to_string()
+                .contains("differed from the exact prepared artifact")
+        );
+        assert_eq!(executor.authority_ack, None);
+        assert_eq!(snapshot_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn ephemeral_whole_blob_finalization_requires_no_store_authority() {
+        let session = Arc::new(meerkat_core::Session::new());
+        let boundary = meerkat_core::lifecycle::core_executor::BoundSessionCommit::sealed(session)
+            .expect("seal ephemeral session boundary");
+        let snapshot_calls = Arc::new(AtomicUsize::new(0));
+        let mut executor = WholeBlobFinalizationProbe {
+            snapshot_calls: Arc::clone(&snapshot_calls),
+            authority_ack: None,
+        };
+
+        publish_committed_session_boundary(&mut executor, None, None, Some(&boundary))
+            .await
+            .expect("ephemeral driver has no store-issued session authority");
+
+        assert_eq!(executor.authority_ack, None);
+        assert_eq!(snapshot_calls.load(Ordering::SeqCst), 0);
     }
 
     struct BoundaryCancelFailingExecutor {
@@ -6115,6 +7229,7 @@ mod tests {
         let (wake_tx, wake_rx) = tokio::sync::mpsc::channel(1);
         let (effect_tx, effect_rx) = tokio::sync::mpsc::channel(1);
         let handle = spawn_runtime_loop_with_completions(
+            RuntimeLoopTaskSpawner::ambient_for_test(),
             driver,
             Box::new(executor),
             wake_rx,
@@ -6160,6 +7275,7 @@ mod tests {
         let (wake_tx, wake_rx) = tokio::sync::mpsc::channel(1);
         let (effect_tx, effect_rx) = tokio::sync::mpsc::channel(1);
         let handle = spawn_runtime_loop_with_completions(
+            RuntimeLoopTaskSpawner::ambient_for_test(),
             driver,
             Box::new(executor),
             wake_rx,
@@ -6202,6 +7318,7 @@ mod tests {
         let (wake_tx, wake_rx) = tokio::sync::mpsc::channel(1);
         let (effect_tx, effect_rx) = tokio::sync::mpsc::channel(1);
         let handle = spawn_runtime_loop_with_completions(
+            RuntimeLoopTaskSpawner::ambient_for_test(),
             driver,
             Box::new(executor),
             wake_rx,
@@ -6260,6 +7377,7 @@ mod tests {
         let input = Input::Peer(PeerInput {
             directed_interaction_id: None,
             objective_id: None,
+            system_prompts: Vec::new(),
             injected_context: Vec::new(),
             sender_taint: None,
             header: InputHeader {
@@ -6289,6 +7407,7 @@ mod tests {
         let input = Input::Peer(PeerInput {
             directed_interaction_id: None,
             objective_id: None,
+            system_prompts: Vec::new(),
             injected_context: Vec::new(),
             sender_taint: None,
             header: InputHeader {
@@ -6319,6 +7438,7 @@ mod tests {
         let input = Input::Peer(PeerInput {
             directed_interaction_id: None,
             objective_id: None,
+            system_prompts: Vec::new(),
             injected_context: Vec::new(),
             sender_taint: None,
             header: InputHeader {
@@ -6360,6 +7480,7 @@ mod tests {
         let input = Input::Peer(PeerInput {
             directed_interaction_id: None,
             objective_id: None,
+            system_prompts: Vec::new(),
             injected_context: Vec::new(),
             sender_taint: None,
             header: InputHeader {
@@ -6390,11 +7511,10 @@ mod tests {
         });
 
         let projection = runtime_input_projection_for_machine_batch(&input);
-        let context = projection
-            .context_append
-            .expect("terminal peer response should project in machine batch");
-        let CoreRenderable::SystemNotice { blocks, .. } = context.content else {
-            panic!("expected typed terminal context");
+        let CoreRenderable::SystemNotice { blocks, .. } =
+            projection.append.expect("durable terminal notice").content
+        else {
+            panic!("expected typed terminal notice");
         };
         assert!(matches!(
             blocks.first(),
@@ -6415,6 +7535,7 @@ mod tests {
         let input = Input::Peer(PeerInput {
             directed_interaction_id: None,
             objective_id: None,
+            system_prompts: Vec::new(),
             injected_context: Vec::new(),
             sender_taint: None,
             header: InputHeader {
@@ -6445,11 +7566,10 @@ mod tests {
         });
 
         let projection = runtime_input_projection_for_machine_batch(&input);
-        let context = projection
-            .context_append
-            .expect("terminal peer response should project in machine batch");
-        let CoreRenderable::SystemNotice { blocks, .. } = context.content else {
-            panic!("expected typed terminal context");
+        let CoreRenderable::SystemNotice { blocks, .. } =
+            projection.append.expect("durable terminal notice").content
+        else {
+            panic!("expected typed terminal notice");
         };
         let rendered = blocks
             .first()
@@ -6516,6 +7636,7 @@ mod tests {
                     content: Vec::new(),
                 }],
             },
+            identity: None,
         };
         let mut input = make_prompt("");
         let Input::Prompt(prompt) = &mut input else {
@@ -6576,6 +7697,7 @@ mod tests {
         let input = Input::Peer(PeerInput {
             directed_interaction_id: None,
             objective_id: None,
+            system_prompts: Vec::new(),
             injected_context: Vec::new(),
             sender_taint: None,
             header: InputHeader {
@@ -6617,7 +7739,6 @@ mod tests {
                 .is_some(),
             "terminal peer response with an immediate boundary must fail the typed apply invariant"
         );
-        assert!(!primitive.is_context_only_apply_without_turn());
         let staged = match primitive {
             RunPrimitive::StagedInput(staged) => staged,
             other => return Err(format!("expected staged input, got {other:?}")),
@@ -6625,14 +7746,7 @@ mod tests {
         assert_eq!(staged.boundary, RunApplyBoundary::Immediate);
         assert_eq!(staged.contributing_input_ids, vec![input_id]);
         assert_eq!(staged.appends.len(), 1);
-        assert_eq!(staged.context_appends.len(), 1);
-        assert_eq!(
-            staged.context_appends[0].key,
-            format!(
-                "peer_response_terminal:{TEST_PEER_RESPONSE_ROUTE_ID}:018f6f79-7a82-7c4e-a552-a3b86f9630f1"
-            )
-        );
-        match &staged.context_appends[0].content {
+        match &staged.appends[0].content {
             CoreRenderable::SystemNotice { blocks, .. } => {
                 assert!(matches!(
                     blocks.first(),
@@ -6656,6 +7770,7 @@ mod tests {
         let input = Input::Peer(PeerInput {
             directed_interaction_id: None,
             objective_id: None,
+            system_prompts: Vec::new(),
             injected_context: Vec::new(),
             sender_taint: None,
             header: InputHeader {
@@ -6692,11 +7807,9 @@ mod tests {
             other => return Err(format!("expected staged input, got {other:?}")),
         };
         assert_eq!(staged.boundary, RunApplyBoundary::RunStart);
-        // Terminal peer responses carry both the typed comms notice append
-        // (the model-visible content of the mandatory requester reaction
-        // turn) and the keyed runtime context append.
+        // The typed comms notice is both the durable fact and the
+        // model-visible content of the mandatory requester reaction turn.
         assert_eq!(staged.appends.len(), 1);
-        assert_eq!(staged.context_appends.len(), 1);
         Ok(())
     }
 
@@ -6705,7 +7818,7 @@ mod tests {
     {
         // Regression lock for the live mob bug where a block-less terminal
         // peer response staged a context-only primitive: the mandatory
-        // `AppendContextAndRun` reaction turn then ran with a fabricated
+        // `AppendContentAndRun` reaction turn then ran with a fabricated
         // empty user prompt, which Anthropic rejects with HTTP 400
         // ("user messages must have non-empty content"). The terminal
         // LlmFailure tore down the member's live session (and its comms
@@ -6714,6 +7827,7 @@ mod tests {
         let input = Input::Peer(PeerInput {
             directed_interaction_id: None,
             objective_id: None,
+            system_prompts: Vec::new(),
             injected_context: Vec::new(),
             sender_taint: None,
             header: InputHeader {
@@ -6740,7 +7854,7 @@ mod tests {
         });
         let primitive = inputs_to_primitive(&[(input.id().clone(), input)])
             .expect("single input metadata cannot conflict");
-        assert!(primitive.is_peer_response_terminal_context_and_run());
+        assert!(primitive.is_peer_response_terminal_notice_and_run());
         let staged = match &primitive {
             RunPrimitive::StagedInput(staged) => staged,
             other => return Err(format!("expected staged input, got {other:?}")),
@@ -6766,6 +7880,7 @@ mod tests {
         let input = Input::Peer(PeerInput {
             directed_interaction_id: None,
             objective_id: None,
+            system_prompts: Vec::new(),
             injected_context: Vec::new(),
             sender_taint: None,
             header: InputHeader {
@@ -6819,7 +7934,7 @@ mod tests {
                 );
                 assert_eq!(
                     admitted_content_shape,
-                    crate::meerkat_machine::dsl::ContentShape::ConversationAndContext
+                    crate::meerkat_machine::dsl::ContentShape::Conversation
                 );
                 Ok(())
             }
@@ -6833,6 +7948,7 @@ mod tests {
         let input = Input::Peer(PeerInput {
             directed_interaction_id: None,
             objective_id: None,
+            system_prompts: Vec::new(),
             injected_context: Vec::new(),
             sender_taint: None,
             header: InputHeader {
@@ -6877,7 +7993,7 @@ mod tests {
         );
         assert_eq!(
             semantics.peer_response_terminal_apply_intent,
-            Some(PeerResponseTerminalApplyIntent::AppendContextAndRun)
+            Some(PeerResponseTerminalApplyIntent::AppendContentAndRun)
         );
 
         let primitive = try_inputs_to_primitive_with_boundary(
@@ -6891,18 +8007,13 @@ mod tests {
             .ok_or_else(|| "terminal primitive should carry metadata".to_string())?;
         assert_eq!(
             metadata.peer_response_terminal_apply_intent,
-            Some(PeerResponseTerminalApplyIntent::AppendContextAndRun)
+            Some(PeerResponseTerminalApplyIntent::AppendContentAndRun)
         );
-        assert!(primitive.is_peer_response_terminal_context_and_run());
+        assert!(primitive.is_peer_response_terminal_notice_and_run());
         assert_eq!(
             primitive.peer_response_terminal_apply_intent_violation(),
             None
         );
-        assert!(
-            !primitive.is_context_only_apply_without_turn(),
-            "executor context-only shortcut must not swallow terminal peer responses"
-        );
-
         Ok(())
     }
 
@@ -6910,6 +8021,7 @@ mod tests {
         Input::Peer(PeerInput {
             directed_interaction_id: None,
             objective_id: None,
+            system_prompts: Vec::new(),
             injected_context: Vec::new(),
             sender_taint: None,
             header: InputHeader {
@@ -7058,6 +8170,56 @@ mod tests {
             Some(meerkat_core::types::HandlingMode::Queue),
             "the earliest admitted explicit mode deterministically owns the batch turn"
         );
+    }
+
+    #[test]
+    fn merged_live_steers_keep_caller_context_first_then_admission_order() {
+        let caller_context =
+            meerkat_core::lifecycle::run_primitive::TurnRequestContext::new("caller facts")
+                .expect("non-empty caller context");
+        let first = Input::Prompt(crate::input::PromptInput::new(
+            "first steer",
+            Some(
+                meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+                    handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
+                    transient_turn_context: Some(caller_context),
+                    ..Default::default()
+                },
+            ),
+        ));
+        let mut second =
+            make_peer_message(&uuid::Uuid::from_u128(0xA3).to_string(), "second steer");
+        if let Input::Peer(peer) = &mut second {
+            peer.handling_mode = Some(meerkat_core::types::HandlingMode::Steer);
+        }
+        let live_steer = crate::ingress_types::RuntimeInputSemantics {
+            boundary: RunApplyBoundary::RunCheckpoint,
+            execution_kind: meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn,
+            execution_handling_mode: None,
+            peer_response_terminal_apply_intent: None,
+            live_interrupt_required: true,
+        };
+        let inputs = vec![(first.id().clone(), first), (second.id().clone(), second)];
+
+        let metadata = merge_batch_turn_metadata(&inputs, &[live_steer, live_steer])
+            .expect("live steer metadata must merge")
+            .expect("live steer batch carries metadata");
+
+        assert_eq!(
+            metadata
+                .transient_turn_context
+                .as_ref()
+                .map(|context| context.as_str()),
+            Some("caller facts")
+        );
+        let internal = metadata
+            .transient_turn_context_appends
+            .iter()
+            .map(|context| context.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(internal.len(), 2);
+        assert_eq!(internal[0], "first steer");
+        assert!(internal[1].contains("second steer"));
     }
 
     #[test]
@@ -7274,6 +8436,7 @@ mod tests {
         Input::Peer(PeerInput {
             directed_interaction_id: None,
             objective_id: None,
+            system_prompts: Vec::new(),
             injected_context: Vec::new(),
             sender_taint: None,
             header: InputHeader {
@@ -7439,7 +8602,7 @@ mod tests {
                             .find_map(|semantics| semantics.peer_response_terminal_apply_intent)
                     }
                 ),
-                Some(PeerResponseTerminalApplyIntent::AppendContextAndRun)
+                Some(PeerResponseTerminalApplyIntent::AppendContentAndRun)
             );
         }
 
@@ -7492,6 +8655,7 @@ mod tests {
         let input = Input::Peer(PeerInput {
             directed_interaction_id: None,
             objective_id: None,
+            system_prompts: Vec::new(),
             injected_context: Vec::new(),
             sender_taint: None,
             header: InputHeader {
@@ -7555,6 +8719,7 @@ mod tests {
         let input = Input::Peer(PeerInput {
             directed_interaction_id: None,
             objective_id: None,
+            system_prompts: Vec::new(),
             injected_context: Vec::new(),
             sender_taint: None,
             header: InputHeader {
@@ -7612,6 +8777,7 @@ mod tests {
         let input = Input::Peer(PeerInput {
             directed_interaction_id: None,
             objective_id: None,
+            system_prompts: Vec::new(),
             injected_context: Vec::new(),
             sender_taint: None,
             header: InputHeader {
@@ -7668,6 +8834,7 @@ mod tests {
         let input = Input::Peer(PeerInput {
             directed_interaction_id: None,
             objective_id: None,
+            system_prompts: Vec::new(),
             injected_context: Vec::new(),
             sender_taint: None,
             header: InputHeader {
@@ -8028,7 +9195,7 @@ mod tests {
             args: serde_json::json!({ "value": "browser" }),
         });
 
-        registry.resolve_runtime_completion_authorized(
+        registry.resolve_process_local_runtime_completion_authorized(
             std::iter::once(input_id.clone()),
             terminal.as_ref(),
             crate::meerkat_machine::driver::test_runtime_completion_authority(
@@ -8071,7 +9238,7 @@ mod tests {
         };
         let terminal = Some(CoreApplyTerminal::RunResult(Box::new(run_result)));
 
-        registry.resolve_runtime_completion_authorized(
+        registry.resolve_process_local_runtime_completion_authorized(
             std::iter::once(input_id.clone()),
             terminal.as_ref(),
             crate::meerkat_machine::driver::test_runtime_completion_authority(
@@ -8086,6 +9253,36 @@ mod tests {
                 assert_eq!(result.text, "terminal authority");
             }
             other => panic!("Expected Completed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn process_local_failed_attempt_preserves_generated_runtime_failure() {
+        let mut registry = crate::completion::CompletionRegistry::new();
+        let input_id = InputId::new();
+        let handle = registry.register(input_id.clone());
+        let error =
+            meerkat_core::TurnErrorMetadata::runtime_apply_failure("injected runtime turn failure");
+
+        registry.resolve_process_local_runtime_completion_authorized(
+            std::iter::once(input_id),
+            None,
+            crate::meerkat_machine::driver::test_runtime_completion_authority(
+                crate::meerkat_machine::dsl::RuntimeCompletionResultClass::AbandonedWithError,
+                crate::meerkat_machine::dsl::RuntimeCompletionObservedOutcome::RuntimeApplyFailed,
+            ),
+            Some(error),
+        );
+
+        match handle.try_wait().await {
+            Ok(crate::completion::CompletionOutcome::AbandonedWithError { reason, error }) => {
+                assert_eq!(reason, "injected runtime turn failure");
+                assert_eq!(
+                    error.kind,
+                    meerkat_core::TurnTerminalCauseKind::RuntimeApplyFailure
+                );
+            }
+            other => panic!("Expected generated runtime failure, got {other:?}"),
         }
     }
 
@@ -8435,6 +9632,481 @@ mod tests {
         assert_eq!(last_injected_seq, 0);
     }
 
+    /// Fail-closed hold semantics for the 2026-07 "meerkat-machine-cleanup"
+    /// hot-spin incident: a wake-worthy completion visible while the session
+    /// is non-quiescent must be reported as a HOLD (`NoopHeld`), leaving the
+    /// observed cursor untouched and the completion visible — and once
+    /// quiescence obtains, the same feed and cursors must consume that held
+    /// completion exactly once.
+    #[tokio::test]
+    async fn maybe_inject_feed_wake_non_quiescent_holds_completion_then_injects_after_quiescence() {
+        let driver = make_shared_ephemeral_driver("feed-held-non-quiescent");
+        {
+            let mut guard = driver.lock().await;
+            assert!(
+                guard
+                    .as_driver_mut()
+                    .accept_input(make_prompt("block quiescence"))
+                    .await
+                    .is_ok(),
+                "staged input should be accepted"
+            );
+            assert!(
+                !guard.is_quiescent_for_detached_wake(),
+                "a staged non-terminal input must block quiescence"
+            );
+        }
+
+        let registry = crate::ops_lifecycle::RuntimeOpsLifecycleRegistry::new();
+        let spec = background_spec("feed-held-non-quiescent");
+        let op_id = spec.id.clone();
+        registry.register_operation(spec).unwrap();
+        registry.provisioning_succeeded(&op_id).unwrap();
+        registry
+            .complete_operation(&op_id, op_result(&op_id, "done"))
+            .unwrap();
+
+        let feed = registry.completion_feed_handle();
+        let mut observed_seq = 0;
+        let mut last_injected_seq = 0;
+        let binding = RuntimeLoopAuthorityBinding::detached_for_test();
+
+        let outcome = maybe_inject_feed_wake(
+            &driver,
+            Some(feed.as_ref()),
+            &mut observed_seq,
+            &mut last_injected_seq,
+            None,
+            Some(&registry),
+            &binding,
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            FeedWakeOutcome::NoopHeld(FeedWakeHold {
+                reason: FeedWakeHoldReason::NonQuiescent,
+                held_watermark: feed.watermark(),
+            }),
+            "non-quiescent session must HOLD the wake, not report a caught-up cursor"
+        );
+        assert_eq!(
+            observed_seq, 0,
+            "held wake must not advance the observed cursor"
+        );
+        assert_eq!(last_injected_seq, 0);
+        assert!(
+            !feed.list_since(observed_seq).entries.is_empty(),
+            "held completion must remain visible in the feed"
+        );
+        {
+            let guard = driver.lock().await;
+            assert_eq!(
+                guard.as_driver().active_input_ids().len(),
+                1,
+                "held wake must not enqueue a continuation"
+            );
+        }
+
+        // The hold clears (quiescence obtains): the SAME feed and cursors
+        // against a quiescent driver consume the held completion exactly once.
+        let quiescent_driver = make_shared_ephemeral_driver("feed-held-now-quiescent");
+        let outcome = maybe_inject_feed_wake(
+            &quiescent_driver,
+            Some(feed.as_ref()),
+            &mut observed_seq,
+            &mut last_injected_seq,
+            None,
+            Some(&registry),
+            &binding,
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            FeedWakeOutcome::Injected,
+            "the held completion must be consumed once the hold clears"
+        );
+        assert_eq!(observed_seq, feed.watermark());
+        assert_eq!(last_injected_seq, feed.watermark());
+        let mut guard = quiescent_driver.lock().await;
+        let crate::meerkat_machine::DriverEntry::Ephemeral(ephemeral) = &mut *guard else {
+            panic!("test uses an ephemeral driver");
+        };
+        let (_input_id, input) = ephemeral
+            .dequeue_next()
+            .expect("held completion must inject a continuation once the hold clears");
+        match input {
+            Input::Continuation(continuation) => {
+                assert_eq!(continuation.reason, "detached_background_op_completed");
+            }
+            other => panic!("expected continuation injection, got {other:?}"),
+        }
+    }
+
+    #[derive(Debug)]
+    struct RolledOverCompletionFeed {
+        watermark: meerkat_core::completion_feed::CompletionSeq,
+        dropped_through: meerkat_core::completion_feed::CompletionSeq,
+    }
+
+    impl meerkat_core::completion_feed::CompletionFeed for RolledOverCompletionFeed {
+        fn watermark(&self) -> meerkat_core::completion_feed::CompletionSeq {
+            self.watermark
+        }
+
+        fn list_since(
+            &self,
+            _after_seq: meerkat_core::completion_feed::CompletionSeq,
+        ) -> meerkat_core::completion_feed::CompletionBatch {
+            meerkat_core::completion_feed::CompletionBatch {
+                entries: Vec::new(),
+                watermark: self.watermark,
+                dropped_through: self.dropped_through,
+            }
+        }
+
+        fn wait_for_advance(
+            &self,
+            _after_seq: meerkat_core::completion_feed::CompletionSeq,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = meerkat_core::completion_feed::CompletionSeq>
+                    + Send
+                    + '_,
+            >,
+        > {
+            Box::pin(std::future::ready(self.watermark))
+        }
+    }
+
+    /// A held wake that rolls out of the bounded feed must fail closed at the
+    /// exact cursor gap. Before the gap witness existed, the empty retained
+    /// suffix was classified as "no wake", the observed cursor advanced, and
+    /// the machine-authorized wake disappeared permanently.
+    #[tokio::test]
+    async fn held_feed_wake_rollover_refuses_cursor_advance() {
+        let driver = make_shared_ephemeral_driver("held-wake-rollover");
+        let registry = crate::ops_lifecycle::RuntimeOpsLifecycleRegistry::new();
+        let spec = background_spec("held-wake-rollover");
+        let op_id = spec.id.clone();
+        registry.register_operation(spec).unwrap();
+        registry.provisioning_succeeded(&op_id).unwrap();
+        registry
+            .complete_operation(&op_id, op_result(&op_id, "done"))
+            .unwrap();
+
+        let original_feed = registry.completion_feed_handle();
+        let mut observed_seq = 0;
+        let mut last_injected_seq = 0;
+        {
+            let mut guard = driver.lock().await;
+            guard
+                .as_driver_mut()
+                .accept_input(make_prompt("hold quiescence"))
+                .await
+                .expect("test input should make the driver non-quiescent");
+        }
+        let held = maybe_inject_feed_wake(
+            &driver,
+            Some(original_feed.as_ref()),
+            &mut observed_seq,
+            &mut last_injected_seq,
+            None,
+            Some(&registry),
+            &RuntimeLoopAuthorityBinding::detached_for_test(),
+        )
+        .await;
+        assert!(matches!(held, FeedWakeOutcome::NoopHeld(_)));
+
+        let rolled = RolledOverCompletionFeed {
+            watermark: 2,
+            dropped_through: 1,
+        };
+        let outcome = maybe_inject_feed_wake(
+            &driver,
+            Some(&rolled),
+            &mut observed_seq,
+            &mut last_injected_seq,
+            None,
+            Some(&registry),
+            &RuntimeLoopAuthorityBinding::detached_for_test(),
+        )
+        .await;
+
+        assert_eq!(
+            outcome,
+            FeedWakeOutcome::FeedGap(meerkat_core::completion_feed::CompletionFeedGap {
+                requested_after_seq: 0,
+                dropped_through: 1,
+                watermark: 2,
+            })
+        );
+        assert_eq!(observed_seq, 0);
+        assert_eq!(last_injected_seq, 0);
+    }
+
+    fn assert_serving_runtime_thread(spawner: RuntimeLoopTaskSpawner) {
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        drop(spawner.spawn(async move {
+            let name = std::thread::current()
+                .name()
+                .unwrap_or("<unnamed>")
+                .to_string();
+            tx.send(name).expect("test receiver should remain live");
+        }));
+        let thread_name = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("process-owned serving task should run");
+        assert!(
+            thread_name.starts_with("meerkat-runtime-serving"),
+            "runtime loop task ran on unexpected thread {thread_name}"
+        );
+        assert_ne!(thread_name, "meerkat-machine-cleanup");
+    }
+
+    #[test]
+    fn runtime_loop_spawner_acquired_outside_tokio_is_process_owned() {
+        let spawner = std::thread::spawn(RuntimeLoopTaskSpawner::acquire_process_owned)
+            .join()
+            .expect("acquisition thread should not panic")
+            .expect("serving runtime should initialize");
+        assert_serving_runtime_thread(spawner);
+    }
+
+    #[test]
+    fn runtime_loop_spawner_survives_short_lived_construction_runtime() {
+        let spawner = std::thread::spawn(|| {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("short-lived construction runtime should build");
+            runtime.block_on(async {
+                RuntimeLoopTaskSpawner::acquire_process_owned()
+                    .expect("serving runtime should initialize")
+            })
+        })
+        .join()
+        .expect("construction thread should not panic");
+
+        // The construction runtime and its handle have been dropped here.
+        assert_serving_runtime_thread(spawner);
+    }
+
+    #[test]
+    fn feed_wake_hold_backoff_doubles_caps_and_resets_per_episode() {
+        let session_id = SessionId::new();
+        let mut hold_state: Option<FeedWakeHoldState> = None;
+
+        note_feed_wake_hold(
+            &mut hold_state,
+            &session_id,
+            FeedWakeHold {
+                reason: FeedWakeHoldReason::NonQuiescent,
+                held_watermark: 3,
+            },
+        );
+        {
+            let state = hold_state.as_ref().unwrap();
+            assert_eq!(state.repoll_delay, FEED_HOLD_REPOLL_BASE);
+            assert_eq!(state.held_watermark, 3);
+        }
+
+        // Same reason: the ladder doubles and the held watermark tracks the
+        // newest held batch.
+        note_feed_wake_hold(
+            &mut hold_state,
+            &session_id,
+            FeedWakeHold {
+                reason: FeedWakeHoldReason::NonQuiescent,
+                held_watermark: 5,
+            },
+        );
+        {
+            let state = hold_state.as_ref().unwrap();
+            assert_eq!(state.repoll_delay, FEED_HOLD_REPOLL_BASE * 2);
+            assert_eq!(state.held_watermark, 5);
+        }
+
+        // The ladder is capped at 1s.
+        for _ in 0..10 {
+            note_feed_wake_hold(
+                &mut hold_state,
+                &session_id,
+                FeedWakeHold {
+                    reason: FeedWakeHoldReason::NonQuiescent,
+                    held_watermark: 5,
+                },
+            );
+        }
+        assert_eq!(
+            hold_state.as_ref().unwrap().repoll_delay,
+            FEED_HOLD_REPOLL_CAP
+        );
+
+        // A different hold reason is a new episode: the ladder resets (and
+        // the transition warns again).
+        note_feed_wake_hold(
+            &mut hold_state,
+            &session_id,
+            FeedWakeHold {
+                reason: FeedWakeHoldReason::InjectionFailed,
+                held_watermark: 5,
+            },
+        );
+        let state = hold_state.as_ref().unwrap();
+        assert_eq!(state.reason, FeedWakeHoldReason::InjectionFailed);
+        assert_eq!(state.repoll_delay, FEED_HOLD_REPOLL_BASE);
+    }
+
+    /// Counts `list_since` calls so the bounded-wakeup regression below can
+    /// observe how often the runtime loop re-polls a held completion.
+    #[derive(Debug)]
+    struct CountingCompletionFeed {
+        inner: Arc<dyn meerkat_core::completion_feed::CompletionFeed>,
+        list_since_calls: Arc<AtomicUsize>,
+    }
+
+    impl meerkat_core::completion_feed::CompletionFeed for CountingCompletionFeed {
+        fn watermark(&self) -> meerkat_core::completion_feed::CompletionSeq {
+            self.inner.watermark()
+        }
+
+        fn list_since(
+            &self,
+            after_seq: meerkat_core::completion_feed::CompletionSeq,
+        ) -> meerkat_core::completion_feed::CompletionBatch {
+            self.list_since_calls.fetch_add(1, Ordering::SeqCst);
+            self.inner.list_since(after_seq)
+        }
+
+        fn wait_for_advance(
+            &self,
+            after_seq: meerkat_core::completion_feed::CompletionSeq,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = meerkat_core::completion_feed::CompletionSeq>
+                    + Send
+                    + '_,
+            >,
+        > {
+            self.inner.wait_for_advance(after_seq)
+        }
+    }
+
+    /// Idle-CPU regression for the 2026-07 field incident: a wake-worthy
+    /// completion held behind a non-quiescent session re-armed the idle wake
+    /// instantly at the unchanged observed cursor, hot-spinning the loop at
+    /// ~100% CPU with zero log output ("meerkat-machine-cleanup" thread,
+    /// 1001/1001 spindump samples in one blocking-pool task harness). A held
+    /// wake must re-poll on a bounded backoff ladder instead: over a 500ms
+    /// paused-time window the loop performs a handful of feed polls — not
+    /// thousands — while the held completion stays visible and the observed
+    /// cursor stays put.
+    #[tokio::test(start_paused = true)]
+    async fn runtime_loop_held_feed_wake_repolls_bounded_instead_of_hot_spinning() {
+        let driver = make_shared_ephemeral_driver("held-wake-bounded");
+        {
+            let mut guard = driver.lock().await;
+            assert!(
+                guard
+                    .as_driver_mut()
+                    .accept_input(make_prompt("hold quiescence"))
+                    .await
+                    .is_ok(),
+                "staged input should be accepted"
+            );
+            assert!(
+                !guard.is_quiescent_for_detached_wake(),
+                "a staged non-terminal input must block quiescence"
+            );
+        }
+
+        let registry = Arc::new(crate::ops_lifecycle::RuntimeOpsLifecycleRegistry::new());
+        let spec = background_spec("held-wake-bounded");
+        let op_id = spec.id.clone();
+        registry.register_operation(spec).unwrap();
+        registry.provisioning_succeeded(&op_id).unwrap();
+        registry
+            .complete_operation(&op_id, op_result(&op_id, "done"))
+            .unwrap();
+        let inner_feed = registry.completion_feed_handle();
+        let feed_watermark = inner_feed.watermark();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let counting_feed: Arc<dyn meerkat_core::completion_feed::CompletionFeed> =
+            Arc::new(CountingCompletionFeed {
+                inner: Arc::clone(&inner_feed),
+                list_since_calls: Arc::clone(&polls),
+            });
+
+        let stop_calls = Arc::new(AtomicUsize::new(0));
+        let apply_calls = Arc::new(AtomicUsize::new(0));
+        let executor = crate::control_plane::test_support::StopFailingExecutor::new(
+            Arc::clone(&stop_calls),
+            Arc::clone(&apply_calls),
+        );
+        let (wake_tx, wake_rx) = tokio::sync::mpsc::channel(1);
+        let (effect_tx, effect_rx) = tokio::sync::mpsc::channel(1);
+        let handle = spawn_runtime_loop_with_completions(
+            RuntimeLoopTaskSpawner::ambient_for_test(),
+            driver,
+            Box::new(executor),
+            wake_rx,
+            effect_rx,
+            None,
+            Some(counting_feed),
+            Some(
+                Arc::clone(&registry) as Arc<dyn meerkat_core::ops_lifecycle::OpsLifecycleRegistry>
+            ),
+            None,
+            std::sync::Weak::<crate::meerkat_machine::MeerkatMachine>::new(),
+            SessionId::new(),
+            false,
+        );
+
+        // Paused-time window: the bounded ladder polls at 0, 25, 75, 175 and
+        // 375ms. The pre-fix spin re-polled without ever sleeping.
+        tokio::time::sleep(Duration::from_millis(500)).await;
+
+        let observed_polls = polls.load(Ordering::SeqCst);
+        assert!(
+            observed_polls >= 2,
+            "the held completion must be re-polled (got {observed_polls} feed polls)"
+        );
+        assert!(
+            observed_polls <= 12,
+            "a held wake-worthy completion must re-poll on a bounded ladder, not \
+             hot-spin: got {observed_polls} feed polls in a 500ms window"
+        );
+        assert_eq!(
+            apply_calls.load(Ordering::SeqCst),
+            0,
+            "no continuation may be injected while the session is non-quiescent"
+        );
+
+        // Fail-closed invariant: the held completion is still visible and the
+        // observed cursor has not advanced past it.
+        assert!(
+            !inner_feed.list_since(0).entries.is_empty(),
+            "held completion must remain visible in the feed"
+        );
+        let observed_cursor = registry
+            .completion_cursor(
+                meerkat_core::ops_lifecycle::CompletionCursorConsumer::RuntimeObserved,
+            )
+            .unwrap()
+            .unwrap_or(0);
+        assert!(
+            observed_cursor < feed_watermark,
+            "observed cursor must not advance past a held completion"
+        );
+
+        drop((wake_tx, effect_tx));
+        tokio::time::timeout(Duration::from_secs(1), handle.loop_handle)
+            .await
+            .expect("runtime loop must exit after channel closure")
+            .expect("runtime loop task should not panic");
+    }
+
     /// Regression for #182: a detached wake whose continuation injection fails
     /// must leave the observed cursor UNCHANGED so the completion is
     /// re-presented on the next wake. A successful injection advances both
@@ -8598,6 +10270,7 @@ mod tests {
         let input = Input::Peer(PeerInput {
             directed_interaction_id: None,
             objective_id: None,
+            system_prompts: Vec::new(),
             injected_context: Vec::new(),
             sender_taint: None,
             header: InputHeader {
@@ -8642,6 +10315,7 @@ mod tests {
         let peer = Input::Peer(PeerInput {
             directed_interaction_id: None,
             objective_id: None,
+            system_prompts: Vec::new(),
             injected_context: Vec::new(),
             sender_taint: None,
             header: InputHeader {

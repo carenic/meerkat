@@ -3,16 +3,14 @@ use meerkat_core::AgentExecutionSnapshot;
 use meerkat_core::CommsCapabilityError;
 use meerkat_core::ExternalToolSurfaceSnapshot;
 use meerkat_core::PeerIngressRuntimeSnapshot;
-use meerkat_core::PendingSystemContextAppend;
 use meerkat_core::Session;
 use meerkat_core::ToolScopeSnapshot;
 use meerkat_core::lifecycle::core_executor::CoreApplyOutput;
-use meerkat_core::lifecycle::run_primitive::RunApplyBoundary;
+use meerkat_core::lifecycle::run_primitive::{RunApplyBoundary, TurnRequestContext};
 use meerkat_core::lifecycle::run_receipt::RunBoundaryReceiptDraft;
-use meerkat_core::service::{AppendSystemContextRequest, StartTurnRequest};
+use meerkat_core::service::StartTurnRequest;
 use meerkat_core::service::{
-    SessionControlError, SessionError, SessionServiceCommsExt, SessionServiceControlExt,
-    SessionServiceHistoryExt,
+    SessionError, SessionServiceCommsExt, SessionServiceControlExt, SessionServiceHistoryExt,
 };
 use meerkat_core::{InputId, RunId};
 #[cfg(feature = "runtime-adapter")]
@@ -89,6 +87,15 @@ impl ResumeSessionLoad {
     }
 }
 
+/// Worst-case read shape of [`MobSessionService::observe_persisted_session_authority`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PersistedSessionAuthorityReadCost {
+    /// The service does not expose exact persisted-boundary authority.
+    Unsupported,
+    /// One bounded authority-row read, independent of transcript size.
+    Bounded,
+}
+
 fn build_runtime_receipt(
     run_id: RunId,
     boundary: RunApplyBoundary,
@@ -113,15 +120,6 @@ fn build_runtime_receipt(
         conversation_digest: Some(conversation_digest),
         message_count: session.messages().len(),
     })
-}
-
-fn session_control_error_to_session_error(err: SessionControlError) -> SessionError {
-    match err {
-        SessionControlError::Session(err) => err,
-        other => SessionError::Agent(meerkat_core::error::AgentError::InternalError(
-            other.to_string(),
-        )),
-    }
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -273,13 +271,13 @@ pub trait MobSessionService:
     }
 
     #[cfg(feature = "runtime-adapter")]
-    async fn promote_revivable_retired_session(
+    async fn authorize_revivable_retired_session(
         &self,
         _session_id: &SessionId,
         _authority: meerkat_runtime::PreparedArchivedResumeCommitLease,
-    ) -> Result<meerkat_runtime::PromotedArchivedResumeCommitLease, SessionError> {
+    ) -> Result<meerkat_runtime::AuthorizedArchivedResumeCommitLease, SessionError> {
         Err(SessionError::Unsupported(
-            "session service does not support archived document revival".into(),
+            "session service does not support exact retired-session authorization".into(),
         ))
     }
     /// Subscribe to session-wide events regardless of triggering interaction.
@@ -294,6 +292,24 @@ pub trait MobSessionService:
     /// by REQ-MOB-030.
     fn supports_persistent_sessions(&self) -> bool {
         false
+    }
+
+    /// Cost contract for exact persisted-session authority observation.
+    fn persisted_session_authority_read_cost(&self) -> PersistedSessionAuthorityReadCost {
+        PersistedSessionAuthorityReadCost::Unsupported
+    }
+
+    /// Observe the runtime store's exact committed session boundary.
+    ///
+    /// The default is an explicit refusal: implementations must never silently
+    /// derive this authority from a Session body or projection-store row.
+    async fn observe_persisted_session_authority(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<crate::identity::IdentitySessionStoreAuthority>, SessionError> {
+        Err(SessionError::Unsupported(format!(
+            "session service cannot observe exact persisted authority for {session_id}"
+        )))
     }
 
     /// Mechanical presence of the live session actor, without exporting its
@@ -482,6 +498,16 @@ pub trait MobSessionService:
         Ok(None)
     }
 
+    /// Converge store-owned durable-tail authority before an operational
+    /// resume materializes a Session body.
+    ///
+    /// REQUIRED, deliberately without a default: a persistent wrapper that
+    /// forgets this transition would compile while recreating an actor from
+    /// stale committed authority whenever the physical head is ahead after a
+    /// power cut. Observation paths must continue to use
+    /// [`Self::load_session_for_resume`] directly and remain read-only.
+    async fn prepare_session_for_resume(&self, session_id: &SessionId) -> Result<(), SessionError>;
+
     /// Typed resume-seam read: never collapses "archived", "absent", and
     /// "archived but not revivable" into one `None`.
     ///
@@ -497,6 +523,16 @@ pub trait MobSessionService:
         &self,
         session_id: &SessionId,
     ) -> Result<ResumeSessionLoad, SessionError>;
+
+    /// Operational resume composition: first converge durable-tail authority,
+    /// then load the exact resulting committed body.
+    async fn materialize_session_for_resume(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<ResumeSessionLoad, SessionError> {
+        self.prepare_session_for_resume(session_id).await?;
+        self.load_session_for_resume(session_id).await
+    }
 
     /// Load the persisted session METADATA view when available.
     ///
@@ -569,79 +605,15 @@ pub trait MobSessionService:
         ))
     }
 
-    async fn apply_runtime_context_appends(
-        &self,
-        session_id: &SessionId,
-        run_id: RunId,
-        appends: Vec<PendingSystemContextAppend>,
-        contributing_input_ids: Vec<InputId>,
-    ) -> Result<CoreApplyOutput, SessionError> {
-        self.apply_runtime_context_appends_with_boundary(
-            session_id,
-            run_id,
-            appends,
-            RunApplyBoundary::Immediate,
-            contributing_input_ids,
-        )
-        .await
-    }
-
-    async fn apply_runtime_context_appends_with_boundary(
-        &self,
-        session_id: &SessionId,
-        run_id: RunId,
-        appends: Vec<PendingSystemContextAppend>,
-        boundary: RunApplyBoundary,
-        contributing_input_ids: Vec<InputId>,
-    ) -> Result<CoreApplyOutput, SessionError> {
-        for append in appends {
-            self.append_system_context(
-                session_id,
-                AppendSystemContextRequest {
-                    content: append.content,
-                    source: append.source,
-                    idempotency_key: append.idempotency_key,
-                    source_kind: append.source_kind,
-                    peer_response_terminal: None,
-                },
-            )
-            .await
-            .map_err(session_control_error_to_session_error)?;
-        }
-
-        Ok(CoreApplyOutput::without_terminal(
-            RunBoundaryReceiptDraft {
-                run_id,
-                boundary,
-                contributing_input_ids,
-                conversation_digest: None,
-                message_count: 0,
-            },
-            None,
-        ))
-    }
-
-    async fn apply_runtime_system_context_for_turn(
-        &self,
-        _session_id: &SessionId,
-        _appends: Vec<PendingSystemContextAppend>,
-    ) -> Result<(), SessionError> {
-        Err(SessionError::Agent(
-            meerkat_core::error::AgentError::InternalError(
-                "runtime-backed context staging is unavailable for this session service".into(),
-            ),
-        ))
-    }
-
     /// Prepare one exact already-active LLM boundary. Success means the actor
     /// is parked and owned by the returned non-clone commit/abort authority.
-    async fn prepare_runtime_system_context_for_active_turn(
+    async fn prepare_transient_turn_context_for_active_turn(
         &self,
         session_id: &SessionId,
         expected_run_id: &RunId,
-        appends: Vec<PendingSystemContextAppend>,
+        contexts: Vec<TurnRequestContext>,
     ) -> Result<meerkat_core::CoreBoundaryStageOutput, meerkat_core::CoreBoundaryStageError> {
-        let _ = (session_id, expected_run_id, appends);
+        let _ = (session_id, expected_run_id, contexts);
         Err(meerkat_core::CoreBoundaryStageError::unavailable(
             "session service does not support exact active-turn boundary preparation",
         ))
@@ -650,7 +622,7 @@ pub trait MobSessionService:
     async fn checkpoint_committed_runtime_session_snapshot(
         &self,
         _session_id: &SessionId,
-        _session_snapshot: &[u8],
+        _session_snapshot: Arc<Vec<u8>>,
     ) -> Result<(), SessionError> {
         Ok(())
     }
@@ -677,11 +649,24 @@ pub trait MobSessionService:
     async fn checkpoint_committed_runtime_session_snapshot_under_turn_finalization_boundary(
         &self,
         session_id: &SessionId,
-        session_snapshot: &[u8],
+        session_snapshot: Arc<Vec<u8>>,
     ) -> Result<(), SessionError> {
         self.checkpoint_committed_runtime_session_snapshot(session_id, session_snapshot)
             .await
     }
+
+    /// Confirm one exact store-issued session boundary while the outer
+    /// turn-finalization boundary is held.
+    ///
+    /// REQUIRED, deliberately without a default: wrappers must forward the
+    /// exhaustive authority carrier as one contract. They cannot compile while
+    /// accidentally inheriting an `Unsupported` or no-op implementation for
+    /// one persistence profile.
+    async fn acknowledge_committed_runtime_session_boundary_under_turn_finalization_boundary(
+        &self,
+        session_id: &SessionId,
+        authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+    ) -> Result<(), SessionError>;
 
     /// Remove the service-side live actor while the owning runtime entry is in
     /// its generated post-stop unregister window.
@@ -774,6 +759,13 @@ where
         req: meerkat_core::service::CreateSessionRequest,
     ) -> Result<meerkat_core::RunResult, SessionError> {
         <Self as meerkat_core::service::SessionService>::create_session(self, req).await
+    }
+
+    async fn prepare_session_for_resume(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<(), SessionError> {
+        Ok(())
     }
 
     /// In-memory service: nothing durable survives archive, so the two-read
@@ -1062,76 +1054,41 @@ where
         let session =
             meerkat_session::EphemeralSessionService::<B>::export_session(self, session_id).await?;
         let receipt = build_runtime_receipt(run_id, boundary, contributing_input_ids, &session)?;
-        let session_snapshot = serde_json::to_vec(&session).map_err(|err| {
-            SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
-                "failed to serialize session snapshot for runtime commit: {err}"
-            )))
-        })?;
-        Ok(CoreApplyOutput::with_run_result(
-            receipt,
-            Some(session_snapshot),
-            run_result,
-        ))
+        CoreApplyOutput::with_run_result(receipt, None, run_result)
+            .with_session(std::sync::Arc::new(session))
+            .map_err(|err| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
+                    "failed to seal typed session snapshot for runtime commit: {err}"
+                )))
+            })
     }
 
-    async fn apply_runtime_context_appends(
-        &self,
-        session_id: &SessionId,
-        run_id: RunId,
-        appends: Vec<PendingSystemContextAppend>,
-        contributing_input_ids: Vec<InputId>,
-    ) -> Result<CoreApplyOutput, SessionError> {
-        meerkat_session::EphemeralSessionService::<B>::apply_runtime_context_appends(
-            self,
-            session_id,
-            run_id,
-            appends,
-            contributing_input_ids,
-        )
-        .await
-    }
-
-    async fn apply_runtime_context_appends_with_boundary(
-        &self,
-        session_id: &SessionId,
-        run_id: RunId,
-        appends: Vec<PendingSystemContextAppend>,
-        boundary: RunApplyBoundary,
-        contributing_input_ids: Vec<InputId>,
-    ) -> Result<CoreApplyOutput, SessionError> {
-        meerkat_session::EphemeralSessionService::<B>::apply_runtime_context_appends_with_boundary(
-            self,
-            session_id,
-            run_id,
-            appends,
-            boundary,
-            contributing_input_ids,
-        )
-        .await
-    }
-
-    async fn apply_runtime_system_context_for_turn(
-        &self,
-        session_id: &SessionId,
-        appends: Vec<PendingSystemContextAppend>,
-    ) -> Result<(), SessionError> {
-        meerkat_session::EphemeralSessionService::<B>::apply_runtime_system_context(
-            self, session_id, appends,
-        )
-        .await
-    }
-
-    async fn prepare_runtime_system_context_for_active_turn(
+    async fn prepare_transient_turn_context_for_active_turn(
         &self,
         session_id: &SessionId,
         expected_run_id: &RunId,
-        appends: Vec<PendingSystemContextAppend>,
+        contexts: Vec<TurnRequestContext>,
     ) -> Result<meerkat_core::CoreBoundaryStageOutput, meerkat_core::CoreBoundaryStageError> {
-        let prepared = meerkat_session::EphemeralSessionService::<B>::prepare_runtime_system_context_for_active_turn(
-            self, session_id, expected_run_id, appends,
-        )
-        .await?;
+        let prepared =
+            meerkat_session::EphemeralSessionService::<B>::prepare_transient_turn_context_for_active_turn(
+                self,
+                session_id,
+                expected_run_id,
+                contexts,
+            )
+            .await?;
         Ok(prepared.into_stage_output(None))
+    }
+
+    async fn acknowledge_committed_runtime_session_boundary_under_turn_finalization_boundary(
+        &self,
+        _session_id: &SessionId,
+        _authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+    ) -> Result<(), SessionError> {
+        Err(SessionError::Unsupported(
+            "ephemeral session service cannot acknowledge store-owned runtime boundaries"
+                .to_string(),
+        ))
     }
 }
 
@@ -1148,6 +1105,26 @@ where
         let admission = self.reserve_create_session_admission().await?;
         self.create_session_with_reserved_admission_under_runtime_turn_boundary(req, admission)
             .await
+    }
+
+    async fn prepare_session_for_resume(&self, session_id: &SessionId) -> Result<(), SessionError> {
+        match self.recover_committed_boundary(session_id).await {
+            Ok(
+                meerkat_session::CommittedBoundaryRecovery::AlreadyCommitted
+                | meerkat_session::CommittedBoundaryRecovery::Recovered { .. },
+            ) => {
+                // Rewrite-audit replay/finalization is an operational repair,
+                // not an observation side effect. Keep it behind the explicit
+                // preparation seam, after store-owned A/H convergence.
+                let _ = self.load_authoritative_session(session_id).await?;
+                Ok(())
+            }
+            Err(SessionError::NotFound { .. }) => Ok(()),
+            Ok(meerkat_session::CommittedBoundaryRecovery::Unprovable { reason }) => Err(
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(reason)),
+            ),
+            Err(error) => Err(error),
+        }
     }
 
     async fn create_session_with_actor_witness_under_runtime_turn_boundary(
@@ -1212,16 +1189,39 @@ where
     }
 
     #[cfg(feature = "runtime-adapter")]
-    async fn promote_revivable_retired_session(
+    async fn authorize_revivable_retired_session(
         &self,
         session_id: &SessionId,
         authority: meerkat_runtime::PreparedArchivedResumeCommitLease,
-    ) -> Result<meerkat_runtime::PromotedArchivedResumeCommitLease, SessionError> {
+    ) -> Result<meerkat_runtime::AuthorizedArchivedResumeCommitLease, SessionError> {
         self.revive_archived_session_with_prepared_materialization(session_id, authority)
             .await
     }
     fn supports_persistent_sessions(&self) -> bool {
         true
+    }
+
+    fn persisted_session_authority_read_cost(&self) -> PersistedSessionAuthorityReadCost {
+        match self.runtime_store().session_boundary_authority_read_cost() {
+            meerkat_runtime::store::RuntimeSessionAuthorityReadCost::Bounded => {
+                PersistedSessionAuthorityReadCost::Bounded
+            }
+            meerkat_runtime::store::RuntimeSessionAuthorityReadCost::Unsupported => {
+                PersistedSessionAuthorityReadCost::Unsupported
+            }
+        }
+    }
+
+    async fn observe_persisted_session_authority(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<crate::identity::IdentitySessionStoreAuthority>, SessionError> {
+        let authority =
+            meerkat_session::PersistentSessionService::<B>::observe_persisted_session_authority(
+                self, session_id,
+            )
+            .await?;
+        Ok(authority.map(crate::identity::IdentitySessionStoreAuthority::from_runtime_authority))
     }
 
     async fn live_session_actor_registered(
@@ -1246,24 +1246,14 @@ where
         {
             let key = std::ptr::from_ref(self) as usize;
             let store = self.runtime_store();
-            let legacy_history_evidence_source = self.incremental_store();
             Some(cached_runtime_adapter(
                 persistent_runtime_adapter_cache(),
                 key,
                 || {
-                    let machine = Arc::new(meerkat_runtime::MeerkatMachine::persistent(
+                    Arc::new(meerkat_runtime::MeerkatMachine::persistent(
                         store,
                         self.blob_store(),
-                    ));
-                    // Wire the one-time 0.8.8 -> 0.8.9 upgrade-boundary
-                    // evidence source: machine-owned queued-input boundary
-                    // commits verify the slim replacement of a legacy inline
-                    // runtime snapshot row against the session store's own
-                    // durable rewrite records.
-                    if let Some(source) = legacy_history_evidence_source {
-                        machine.set_legacy_history_evidence_source(source);
-                    }
-                    machine
+                    ))
                 },
             ))
         }
@@ -1321,7 +1311,7 @@ where
         &self,
         session_id: &SessionId,
     ) -> Result<ResumeSessionLoad, SessionError> {
-        let Some(session) = self.load_authoritative_session(session_id).await? else {
+        let Some(session) = self.observe_authoritative_session_body(session_id).await? else {
             return Ok(ResumeSessionLoad::Absent);
         };
         let runtime_state = self.persisted_runtime_state(session_id).await?;
@@ -1338,7 +1328,7 @@ where
         }
         match runtime_state {
             // Quiescent: no executor is attached and no run is in progress, so
-            // promoting the archived document cannot race a live writer.
+            // the exact archived-resume lease cannot race a live writer.
             Some(meerkat_runtime::RuntimeState::Retired | meerkat_runtime::RuntimeState::Idle) => {
                 Ok(ResumeSessionLoad::Revivable(Box::new(session)))
             }
@@ -1543,64 +1533,17 @@ where
         .await
     }
 
-    async fn apply_runtime_context_appends(
-        &self,
-        session_id: &SessionId,
-        run_id: RunId,
-        appends: Vec<PendingSystemContextAppend>,
-        contributing_input_ids: Vec<InputId>,
-    ) -> Result<CoreApplyOutput, SessionError> {
-        meerkat_session::PersistentSessionService::<B>::apply_runtime_context_appends(
-            self,
-            session_id,
-            run_id,
-            appends,
-            contributing_input_ids,
-        )
-        .await
-    }
-
-    async fn apply_runtime_context_appends_with_boundary(
-        &self,
-        session_id: &SessionId,
-        run_id: RunId,
-        appends: Vec<PendingSystemContextAppend>,
-        boundary: RunApplyBoundary,
-        contributing_input_ids: Vec<InputId>,
-    ) -> Result<CoreApplyOutput, SessionError> {
-        meerkat_session::PersistentSessionService::<B>::apply_runtime_context_appends_with_boundary(
-            self,
-            session_id,
-            run_id,
-            appends,
-            boundary,
-            contributing_input_ids,
-        )
-        .await
-    }
-
-    async fn apply_runtime_system_context_for_turn(
-        &self,
-        session_id: &SessionId,
-        appends: Vec<PendingSystemContextAppend>,
-    ) -> Result<(), SessionError> {
-        meerkat_session::PersistentSessionService::<B>::apply_runtime_system_context_for_turn(
-            self, session_id, appends,
-        )
-        .await
-    }
-
-    async fn prepare_runtime_system_context_for_active_turn(
+    async fn prepare_transient_turn_context_for_active_turn(
         &self,
         session_id: &SessionId,
         expected_run_id: &RunId,
-        appends: Vec<PendingSystemContextAppend>,
+        contexts: Vec<TurnRequestContext>,
     ) -> Result<meerkat_core::CoreBoundaryStageOutput, meerkat_core::CoreBoundaryStageError> {
-        meerkat_session::PersistentSessionService::<B>::prepare_live_system_context_boundary(
+        meerkat_session::PersistentSessionService::<B>::prepare_live_transient_turn_context_boundary(
             self,
             session_id,
             expected_run_id,
-            appends,
+            contexts,
         )
         .await
     }
@@ -1608,7 +1551,7 @@ where
     async fn checkpoint_committed_runtime_session_snapshot(
         &self,
         session_id: &SessionId,
-        session_snapshot: &[u8],
+        session_snapshot: Arc<Vec<u8>>,
     ) -> Result<(), SessionError> {
         meerkat_session::PersistentSessionService::<B>::checkpoint_committed_runtime_session_snapshot(
             self,
@@ -1635,12 +1578,25 @@ where
     async fn checkpoint_committed_runtime_session_snapshot_under_turn_finalization_boundary(
         &self,
         session_id: &SessionId,
-        session_snapshot: &[u8],
+        session_snapshot: Arc<Vec<u8>>,
     ) -> Result<(), SessionError> {
         meerkat_session::PersistentSessionService::<B>::checkpoint_committed_runtime_session_snapshot_under_runtime_turn_boundary(
             self,
             session_id,
             session_snapshot,
+        )
+        .await
+    }
+
+    async fn acknowledge_committed_runtime_session_boundary_under_turn_finalization_boundary(
+        &self,
+        session_id: &SessionId,
+        authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+    ) -> Result<(), SessionError> {
+        meerkat_session::PersistentSessionService::<B>::acknowledge_committed_runtime_session_boundary_under_runtime_turn_boundary(
+            self,
+            session_id,
+            authority,
         )
         .await
     }

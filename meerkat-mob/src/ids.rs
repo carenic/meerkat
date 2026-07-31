@@ -21,6 +21,17 @@ impl RunId {
     pub fn as_uuid(&self) -> &Uuid {
         &self.0
     }
+
+    pub(crate) fn for_external_delivery(
+        mob_id: &MobId,
+        flow_id: &FlowId,
+        idempotency_key: &str,
+    ) -> Self {
+        Self(Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("meerkat:mob:{mob_id}:flow:{flow_id}:delivery:{idempotency_key}").as_bytes(),
+        ))
+    }
 }
 
 impl Default for RunId {
@@ -386,6 +397,18 @@ impl WorkRef {
     pub fn as_uuid(&self) -> &Uuid {
         &self.0
     }
+
+    pub(crate) fn for_external_delivery(
+        mob_id: &MobId,
+        member_id: &AgentIdentity,
+        idempotency_key: &str,
+    ) -> Self {
+        Self(Uuid::new_v5(
+            &Uuid::NAMESPACE_URL,
+            format!("meerkat:mob:{mob_id}:member:{member_id}:delivery:{idempotency_key}")
+                .as_bytes(),
+        ))
+    }
 }
 
 impl Default for WorkRef {
@@ -428,6 +451,13 @@ pub struct WorkSpec {
     /// Whether this is an externally-originated turn (user input) or an
     /// internally-originated turn (mob coordination).
     pub origin: WorkOrigin,
+    /// Optional ordinary System message authored for this exact member turn.
+    ///
+    /// This is per-turn content, not immutable member/session configuration:
+    /// repeated submissions may carry different values, and each present
+    /// value is appended at that turn's admitted transcript boundary.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub system_prompt: Option<String>,
     /// Host-attached injected context delivered alongside (not inside) the
     /// work content. Each entry materializes as a separate typed
     /// injected-context transcript message immediately before the work
@@ -436,6 +466,9 @@ pub struct WorkSpec {
     /// reject it fail-closed with a typed [`crate::MobError`].
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub injected_context: Vec<meerkat_core::types::ContentInput>,
+    /// Host-regenerated request-only context for the member's logical turn.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transient_turn_context: Option<meerkat_core::lifecycle::run_primitive::TurnRequestContext>,
     /// Host-supplied interaction identity for this unit of work.
     ///
     /// Ask-15 addendum: the delivery path carries this id to
@@ -460,10 +493,19 @@ impl WorkSpec {
         Self {
             content: content.into(),
             origin,
+            system_prompt: None,
             injected_context: Vec::new(),
+            transient_turn_context: None,
             interaction_id: None,
             objective_id: None,
         }
+    }
+
+    /// Attach one ordinary System message to this exact member turn.
+    #[must_use]
+    pub fn with_system_prompt(mut self, system_prompt: impl Into<String>) -> Self {
+        self.system_prompt = Some(system_prompt.into());
+        self
     }
 
     #[must_use]
@@ -481,6 +523,15 @@ impl WorkSpec {
         injected_context: Vec<meerkat_core::types::ContentInput>,
     ) -> Self {
         self.injected_context = injected_context;
+        self
+    }
+
+    #[must_use]
+    pub fn with_transient_turn_context(
+        mut self,
+        context: meerkat_core::lifecycle::run_primitive::TurnRequestContext,
+    ) -> Self {
+        self.transient_turn_context = Some(context);
         self
     }
 
@@ -546,6 +597,23 @@ mod tests {
     }
 
     #[test]
+    fn work_spec_system_prompt_is_per_turn_and_serde_additive() {
+        let absent = WorkSpec::new("first turn", WorkOrigin::Internal);
+        let absent_json = serde_json::to_value(&absent).unwrap();
+        assert!(absent_json.get("system_prompt").is_none());
+
+        let present = WorkSpec::new("second turn", WorkOrigin::Internal)
+            .with_system_prompt("updated instructions");
+        let json = serde_json::to_value(&present).unwrap();
+        assert_eq!(json["system_prompt"], "updated instructions");
+        let decoded: WorkSpec = serde_json::from_value(json).unwrap();
+        assert_eq!(
+            decoded.system_prompt.as_deref(),
+            Some("updated instructions")
+        );
+    }
+
+    #[test]
     fn test_run_id_roundtrip_json() {
         let run_id = RunId::new();
         let encoded = serde_json::to_string(&run_id).unwrap();
@@ -559,6 +627,21 @@ mod tests {
         let rendered = run_id.to_string();
         let reparsed = RunId::from_str(&rendered).unwrap();
         assert_eq!(reparsed, run_id);
+    }
+
+    #[test]
+    fn external_delivery_run_id_is_stable_and_flow_scoped() {
+        let mob_id = MobId::from("ops");
+        let key = "schedule:one";
+        let first = RunId::for_external_delivery(&mob_id, &FlowId::from("alpha"), key);
+        assert_eq!(
+            first,
+            RunId::for_external_delivery(&mob_id, &FlowId::from("alpha"), key)
+        );
+        assert_ne!(
+            first,
+            RunId::for_external_delivery(&mob_id, &FlowId::from("beta"), key)
+        );
     }
 
     #[test]
@@ -726,6 +809,21 @@ mod tests {
         let rendered = wr.to_string();
         let reparsed = WorkRef::from_str(&rendered).unwrap();
         assert_eq!(reparsed, wr);
+    }
+
+    #[test]
+    fn external_delivery_work_ref_is_stable_and_member_scoped() {
+        let mob_id = MobId::from("ops");
+        let key = "schedule:one";
+        let first = WorkRef::for_external_delivery(&mob_id, &AgentIdentity::from("alpha"), key);
+        assert_eq!(
+            first,
+            WorkRef::for_external_delivery(&mob_id, &AgentIdentity::from("alpha"), key)
+        );
+        assert_ne!(
+            first,
+            WorkRef::for_external_delivery(&mob_id, &AgentIdentity::from("beta"), key)
+        );
     }
 
     #[test]

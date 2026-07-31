@@ -3,14 +3,20 @@
 //! Extracted verbatim from `session.rs`; the extraction commit changes no
 //! behaviour, only where the code lives.
 
-pub(crate) mod decode_memo;
+mod audit_receipt;
 pub(crate) mod graph;
 pub(crate) mod heal;
 pub(crate) mod sealed;
 pub(crate) mod validate;
 
+pub use audit_receipt::TranscriptRewriteAuditReceiptBatch;
 pub use graph::{
-    TranscriptHistoryState, TranscriptReplayCursor, TranscriptRevisionBody,
-    TranscriptRewriteCommit, TranscriptRewriteRecord,
+    ProvenReleased0810RewriteRemap, TRANSCRIPT_HISTORY_FORMAT_CURRENT, TranscriptEndpointWitness,
+    TranscriptGraphPrefixAccumulator, TranscriptHistoryState, TranscriptParentAdvance,
+    TranscriptRevisionBody, TranscriptRevisionEdge, TranscriptRewriteCommit,
+    TranscriptRewriteParentTransition, TranscriptRewritePatch, TranscriptRewritePrefixAccumulator,
+    TranscriptRewriteRecord, extend_transcript_rewrite_prefix_accumulator,
+    remap_proven_released_0810_rewrite_record, transcript_history_full_body_materializations,
+    transcript_rewrite_prefix_digest,
 };
-pub use sealed::ValidatedTranscriptHistory;
+pub use sealed::{ValidatedTranscriptHistory, ValidatedTranscriptRewriteSuffix};

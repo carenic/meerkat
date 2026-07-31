@@ -55,6 +55,7 @@ The table below is the current **session transport** mapping (`SessionError::cod
 | `CompactionDisabled` | `SESSION_COMPACTION_DISABLED` | -32603 | tool error | exit 1 |
 | `NotRunning` | `SESSION_NOT_RUNNING` | -32603 | tool error | exit 1 |
 | `DurableTailHeldForRecovery` | `SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY` | -32003 | tool error | exit 1 |
+| `DurableTailRecoveryRefused` | `SESSION_DURABLE_TAIL_RECOVERY_REFUSED` | -32003 | tool error | exit 1 |
 | `DurableEvidenceQuarantined` | `SESSION_DURABLE_EVIDENCE_QUARANTINED` | -32003 | tool error | exit 1 |
 | `Store` | `SESSION_STORE_ERROR` | -32603 | tool error | exit 1 |
 | `Unsupported` | `SESSION_UNSUPPORTED` | -32603 | tool error | exit 1 |
@@ -65,14 +66,15 @@ The table below is the current **session transport** mapping (`SessionError::cod
 failures -32010, budget exhaustion -32011, hook denial -32012, cancellation
 -32005, config errors -32602, everything else -32603.
 
-The two durable resume holds are not service faults: the session exists, its
+The durable resume holds are not service faults: the session exists, its
 content is retained intact, and no runnable authority is handed out until
 machine-authorized recovery or reconciliation clears it. They classify as
 "durably present, not runnable" — the canonical `SessionNotRunning` wire code
 (JSON-RPC -32003, HTTP 409) — and carry a typed `durable_resume_hold`
-structured payload (`tail_held_for_recovery` / `evidence_quarantined`, plus
-`session_error_code`, `session_id`, and `content_retained: true`) so callers
-distinguish the hold class without parsing messages.
+structured payload (`tail_held_for_recovery` / `recovery_refused` /
+`evidence_quarantined`, plus `session_error_code`, `session_id`, and
+`content_retained: true`) so callers distinguish the hold class without
+parsing messages.
 
 ### Transport error mapping summary
 
@@ -111,19 +113,19 @@ v1 (recorded v2 hardening).
 ```toml
 # Minimal: just the agent loop
 [dependencies]
-meerkat = { version = "0.8.10", default-features = false, features = ["anthropic"] }
+meerkat = { version = "0.8.11", default-features = false, features = ["anthropic"] }
 
 # Add persistence
-meerkat = { version = "0.8.10", default-features = false, features = ["anthropic", "session-store"] }
+meerkat = { version = "0.8.11", default-features = false, features = ["anthropic", "session-store"] }
 
 # Add compaction
-meerkat = { version = "0.8.10", default-features = false, features = ["anthropic", "session-store", "session-compaction"] }
+meerkat = { version = "0.8.11", default-features = false, features = ["anthropic", "session-store", "session-compaction"] }
 
 # Add scheduling
-meerkat = { version = "0.8.10", default-features = false, features = ["anthropic", "session-store", "schedule"] }
+meerkat = { version = "0.8.11", default-features = false, features = ["anthropic", "session-store", "schedule"] }
 
 # Kitchen sink
-meerkat = { version = "0.8.10", features = [
+meerkat = { version = "0.8.11", features = [
   "all-providers", "openai-realtime", "session-store", "session-compaction",
   "memory-store-session", "comms", "mcp", "skills", "schedule", "workgraph", "live"
 ] }
@@ -174,6 +176,34 @@ These fields are set in `meerkat-models/src/capabilities/**` (the types live in 
 - **`ContentBlock::Image` in user messages** -- providers that do not support `vision` will not receive image content blocks in user messages.
 - **Still images on live channels** -- a realtime model's `vision` capability projects to `LiveOpenResult.capabilities.image_in`; clients must check that channel capability before sending an image chunk.
 - **Provider-native web search** -- injected by default when `supports_web_search` is `true` and the corresponding `provider_tools.*` config is enabled.
+
+## System-message projection
+
+The durable Session transcript is the authority for instructions. It retains
+every `System` and `SystemNotice` message at its exact authored position; an
+adapter projection never rewrites that transcript.
+
+| Provider wire | Provider-side representation | Relative position |
+|---------------|------------------------------|-------------------|
+| Standard OpenAI Responses | Ordinary ordered input item | Preserved |
+| OpenAI-compatible Chat Completions | Ordinary ordered message | Preserved |
+| OpenAI Realtime | Ordinary ordered conversation item | Preserved |
+| Anthropic Messages | Distinct top-level system blocks | Leading prefix only |
+| Gemini `generateContent` | Distinct `systemInstruction.parts` | Leading prefix only |
+| Private ChatGPT Responses | Singular instruction string | One leading row only |
+
+Provider limitations never redefine Session validity. Meerkat authors every
+System row as ordinary ordered history. A limited provider request projection
+returns a typed, non-retryable error when the resulting transcript is
+unrepresentable; rebinding to an exact provider can execute the same Session
+unchanged. Adapters never hoist, merge, or delimiter-join distinct canonical
+System rows.
+
+Realtime reconstruction applies the same ordered replay-window policy to every
+role and replays each retained System row as an in-conversation System item.
+`runtime_system_context` remains retired, and the provider's separate session
+instructions field is not a shadow transcript authority. `SystemNotice`
+remains an explicit in-place history event.
 
 Image generation uses provider-owned image profiles rather than `ModelProfile` chat-model flags. OpenAI and Gemini provider crates advertise image targets, supported backend plans, dimensions/aspect ratios, and provider-specific `provider_params`; the runtime exposes one model-facing `generate_image` tool and commits generated outputs as blob-backed assistant image blocks.
 

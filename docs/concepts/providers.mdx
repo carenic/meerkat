@@ -10,6 +10,35 @@ Meerkat is provider-agnostic at the session/config/runtime model level. You can 
 This page is the concept layer for provider abstraction. Use [Auth](/guides/auth) and [Self-hosting models](/guides/self-hosting-models) for setup workflows, and use reference pages for exact capability and contract details.
 </Note>
 
+## Instruction projection
+
+Provider independence does not make unlike wire formats identical. Meerkat
+keeps the exact ordered `System` / `SystemNotice` sequence in the durable
+Session transcript and derives each provider request from it:
+
+- Standard OpenAI Responses and OpenAI-compatible Chat Completions preserve
+  each instruction at its position among user and assistant messages.
+- OpenAI Realtime preserves the same ordering with in-conversation System
+  items; its separate session `instructions` field is reserved for
+  provider-owned configuration.
+- Cataloged Anthropic Fable 5, Opus 4.8, and Opus 5 support
+  mid-conversation System messages. Meerkat lowers a turn-scoped canonical
+  `System -> User` boundary to Anthropic's legal
+  `User -> System -> Assistant` placement without changing the durable
+  transcript. Other Anthropic models and Gemini can represent only a leading
+  System prefix. The private ChatGPT Responses wire can represent at most one
+  leading System message. A limited provider projection returns a typed error
+  for an unrepresentable transcript instead of hoisting or merging messages.
+  The ordinary System row remains authored in the durable Session; selecting
+  a capable wire can execute that Session without rewriting it.
+
+Empty, whitespace-only, and duplicate instructions are significant: adapters
+do not trim, deduplicate, replace, hoist, or silently drop them. System
+placement is never a Session persistence or resume restriction. Realtime
+reconnect replays the same ordered seed messages under the uniform replay
+window; a transcript change on an open channel requires exact append delivery
+or close-and-reopen rather than a retroactive instructions refresh.
+
 ## Provider setup
 
 <Tabs>
@@ -158,11 +187,11 @@ When using Meerkat as a Rust library, enable only the providers you need:
 <CodeGroup>
 
 ```toml Anthropic only (smallest binary)
-meerkat = { version = "0.8.10", features = ["anthropic", "jsonl-store"] }
+meerkat = { version = "0.8.11", features = ["anthropic", "jsonl-store"] }
 ```
 
 ```toml All providers
-meerkat = { version = "0.8.10", features = ["all-providers", "jsonl-store"] }
+meerkat = { version = "0.8.11", features = ["all-providers", "jsonl-store"] }
 ```
 
 </CodeGroup>

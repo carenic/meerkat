@@ -13,12 +13,10 @@ use meerkat_core::lifecycle::core_executor::{
     CoreApplyOutput, CoreExecutor, CoreExecutorBoundaryHandle, CoreExecutorError,
     CoreExecutorInterruptHandle, CoreExecutorPostStopCleanupHandle, CoreExecutorPublicationHandle,
 };
-use meerkat_core::lifecycle::run_primitive::{
-    ConversationContextAppend, CoreRenderable, RunPrimitive,
-};
+use meerkat_core::lifecycle::run_primitive::{CoreRenderable, RunPrimitive};
 use meerkat_core::service::{SessionError, SessionService, StartTurnRequest};
 use meerkat_core::types::{HandlingMode, SessionId};
-use meerkat_core::{ConfigRuntime, EventEnvelope, PendingSystemContextAppend};
+use meerkat_core::{ConfigRuntime, EventEnvelope};
 use meerkat_mcp::McpRouterAdapter;
 use meerkat_runtime::SessionServiceRuntimeExt as _;
 use meerkat_runtime::completion::CompletionHandle;
@@ -1274,10 +1272,29 @@ impl McpRuntimeIngressContext {
             .unwrap_or((None, None));
         let Some(attachment) = attachment else {
             if self.runtime_adapter.contains_session(session_id).await {
-                return Err(explicit_resume_required(
-                    session_id,
-                    "runtime registration exists without an exact MCP sidecar cleanup witness",
-                ));
+                // Archive may need to synthesize a machine registration solely
+                // to establish RuntimeStore's absorbing Retired authority for
+                // a durable body that had no prior lifecycle row. That
+                // registration deliberately has no MCP attachment sidecar.
+                // It is safe to remove only after the shared store proves the
+                // session is already terminal; active or unreadable authority
+                // still requires an explicit resume and an exact witness.
+                if self.authoritative_session_archived(session_id).await? {
+                    self.runtime_adapter
+                        .try_unregister_session(session_id)
+                        .await
+                        .map_err(runtime_driver_error_to_session_error)?;
+                    if self.runtime_adapter.contains_session(session_id).await {
+                        return Err(SessionError::Unsupported(format!(
+                            "terminal MCP runtime cleanup for {session_id} completed without removing the witness-less registration"
+                        )));
+                    }
+                } else {
+                    return Err(explicit_resume_required(
+                        session_id,
+                        "runtime registration exists without an exact MCP sidecar cleanup witness",
+                    ));
+                }
             }
             if let Some((incarnation, revision)) = logical_identity {
                 self.remove_unattached_logical_exact(session_id, incarnation, revision)
@@ -2330,6 +2347,24 @@ impl CoreExecutorBoundaryHandle for McpSessionRuntimeBoundaryHandle {
             })
             .map_err(|error| CoreExecutorError::control_failed_runtime(error.to_string()))
     }
+
+    async fn prepare_transient_turn_context_at_boundary(
+        &self,
+        expected_run_id: &meerkat_core::lifecycle::RunId,
+        contexts: Vec<meerkat_core::lifecycle::run_primitive::TurnRequestContext>,
+    ) -> Result<
+        meerkat_core::lifecycle::CoreBoundaryStageOutput,
+        meerkat_core::lifecycle::CoreBoundaryStageError,
+    > {
+        self.context
+            .service
+            .prepare_live_transient_turn_context_boundary(
+                &self.session_id,
+                expected_run_id,
+                contexts,
+            )
+            .await
+    }
 }
 
 struct McpSessionRuntimeInterruptHandle {
@@ -2385,27 +2420,6 @@ impl McpSessionRuntimeExecutor {
     }
 }
 
-fn pending_system_context_appends(
-    appends: &[ConversationContextAppend],
-) -> Vec<PendingSystemContextAppend> {
-    let accepted_at = meerkat_core::time_compat::SystemTime::now();
-    appends
-        .iter()
-        .map(|append| PendingSystemContextAppend {
-            content: append.content.clone(),
-            source: Some(append.key.clone()),
-            idempotency_key: Some(append.key.clone()),
-            accepted_at,
-            source_kind: meerkat_core::session::SystemContextSource::Normal,
-            peer_response_terminal: None,
-        })
-        .collect()
-}
-
-fn should_apply_context_without_turn(primitive: &RunPrimitive) -> bool {
-    primitive.is_context_only_apply_without_turn()
-}
-
 /// Apply callback invoked by `McpSessionRuntimeExecutor::apply` after the
 /// runtime loop has acquired the non-reentrant service turn-finalization
 /// boundary, including recovery and NoPending cleanup.
@@ -2428,61 +2442,10 @@ async fn apply_runtime_turn_under_runtime_turn_boundary(
         });
     }
 
-    if primitive.is_context_only_apply_without_turn() {
-        let RunPrimitive::StagedInput(staged) = primitive else {
-            unreachable!("context-only apply helper only matches staged inputs");
-        };
-        let appends = pending_system_context_appends(&staged.context_appends);
-        let boundary = primitive.apply_boundary();
-        let contributing_input_ids = staged.contributing_input_ids.clone();
-        let pre_admission = context
-            .take_runtime_pre_admission(attachment, &contributing_input_ids)
-            .await;
-        return if let Some(admission) = pre_admission {
-            match context
-                .service
-                .apply_runtime_context_appends_with_recoverable_reserved_admission(
-                    session_id,
-                    run_id.clone(),
-                    appends.clone(),
-                    boundary,
-                    contributing_input_ids.clone(),
-                    admission,
-                )
-                .await
-            {
-                Ok(output) => Ok(output),
-                Err((error, admission)) => {
-                    drop(admission);
-                    Err(error)
-                }
-            }
-        } else {
-            context
-                .service
-                .apply_runtime_context_appends_with_boundary(
-                    session_id,
-                    run_id.clone(),
-                    appends.clone(),
-                    boundary,
-                    contributing_input_ids.clone(),
-                )
-                .await
-        };
-    }
-
     let boundary = primitive.apply_boundary();
     let contributing_input_ids = primitive.contributing_input_ids().to_vec();
     let typed_turn_appends = primitive.typed_turn_appends();
     let prompt = primitive.extract_content_input();
-    let pre_turn_context_appends = match primitive {
-        RunPrimitive::StagedInput(staged)
-            if primitive.is_peer_response_terminal_context_and_run() =>
-        {
-            pending_system_context_appends(&staged.context_appends)
-        }
-        _ => Vec::new(),
-    };
     let queued_context = attachment.take_turn_context_for_inputs(&contributing_input_ids);
     let event_tx = queued_context
         .as_ref()
@@ -2498,7 +2461,6 @@ async fn apply_runtime_turn_under_runtime_turn_boundary(
             primitive
                 .turn_metadata()
                 .and_then(|meta| meta.turn_tool_overlay.clone()),
-            pre_turn_context_appends,
             primitive.turn_metadata().cloned(),
         )
         .with_typed_turn_appends(typed_turn_appends),
@@ -2679,13 +2641,27 @@ impl CoreExecutor for McpSessionRuntimeExecutor {
 
     async fn checkpoint_committed_session_snapshot(
         &mut self,
-        session_snapshot: &[u8],
+        session_snapshot: Arc<Vec<u8>>,
     ) -> Result<(), CoreExecutorError> {
         self.context
             .service
             .checkpoint_committed_runtime_session_snapshot_under_runtime_turn_boundary(
                 &self.session_id,
                 session_snapshot,
+            )
+            .await
+            .map_err(CoreExecutorError::apply_failed_from_session_error)
+    }
+
+    async fn acknowledge_committed_session_boundary(
+        &mut self,
+        authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+    ) -> Result<(), CoreExecutorError> {
+        self.context
+            .service
+            .acknowledge_committed_runtime_session_boundary_under_runtime_turn_boundary(
+                &self.session_id,
+                authority,
             )
             .await
             .map_err(CoreExecutorError::apply_failed_from_session_error)
@@ -3008,15 +2984,6 @@ mod tests {
         .session_id
     }
 
-    fn context_append() -> ConversationContextAppend {
-        ConversationContextAppend {
-            key: "peer_response_terminal:analyst:req-1".to_string(),
-            content: CoreRenderable::Text {
-                text: "done".to_string(),
-            },
-        }
-    }
-
     #[tokio::test]
     async fn mcp_runtime_ingress_rejects_malformed_terminal_peer_response_intent() {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -3029,19 +2996,18 @@ mod tests {
             .expect("test attachment should exist");
         let primitive = RunPrimitive::StagedInput(StagedRunInput {
             boundary: RunApplyBoundary::Immediate,
-            appends: Vec::new(),
-            context_appends: vec![ConversationContextAppend {
-                key: "peer_response_terminal:550e8400-e29b-41d4-a716-446655440000:req-invalid"
-                    .to_string(),
+            appends: vec![meerkat_core::lifecycle::run_primitive::ConversationAppend {
+                role: meerkat_core::lifecycle::run_primitive::ConversationAppendRole::SystemNotice,
                 content: CoreRenderable::Text {
                     text: "Peer terminal response from 550e8400-e29b-41d4-a716-446655440000\nRequest ID: req-invalid\nStatus: completed\ninvalid".to_string(),
                 },
+                identity: None,
             }],
             contributing_input_ids: vec![InputId::new()],
             turn_metadata: Some(RuntimeTurnMetadata {
                 execution_kind: Some(RuntimeExecutionKind::ContentTurn),
                 peer_response_terminal_apply_intent: Some(
-                    PeerResponseTerminalApplyIntent::AppendContextAndRun,
+                    PeerResponseTerminalApplyIntent::AppendContentAndRun,
                 ),
                 ..Default::default()
             }),
@@ -3119,12 +3085,12 @@ mod tests {
 
         let primitive = RunPrimitive::StagedInput(StagedRunInput {
             boundary: RunApplyBoundary::RunCheckpoint,
-            appends: Vec::new(),
-            context_appends: vec![ConversationContextAppend {
-                key: "lost-after-preparation".to_string(),
+            appends: vec![meerkat_core::lifecycle::run_primitive::ConversationAppend {
+                role: meerkat_core::lifecycle::run_primitive::ConversationAppendRole::User,
                 content: CoreRenderable::Text {
                     text: "must not rematerialize from apply".to_string(),
                 },
+                identity: None,
             }],
             contributing_input_ids: vec![InputId::new()],
             turn_metadata: Some(RuntimeTurnMetadata {
@@ -4228,6 +4194,7 @@ mod tests {
                 content: CoreRenderable::Text {
                     text: "after archive".to_string(),
                 },
+                identity: None,
             },
         );
         let mut executor =
@@ -4251,43 +4218,5 @@ mod tests {
                 .is_some(),
             "archived MCP apply must retain the exact attachment through executor cleanup handoff"
         );
-    }
-
-    #[test]
-    fn mcp_context_only_shortcut_excludes_terminal_peer_response() {
-        let primitive = RunPrimitive::StagedInput(StagedRunInput {
-            boundary: RunApplyBoundary::RunStart,
-            appends: Vec::new(),
-            context_appends: vec![context_append()],
-            contributing_input_ids: vec![InputId::new()],
-            turn_metadata: Some(RuntimeTurnMetadata {
-                execution_kind: Some(RuntimeExecutionKind::ContentTurn),
-                peer_response_terminal_apply_intent: Some(
-                    PeerResponseTerminalApplyIntent::AppendContextAndRun,
-                ),
-                ..Default::default()
-            }),
-        });
-
-        assert!(
-            !should_apply_context_without_turn(&primitive),
-            "terminal peer responses must append context and run a requester reaction turn"
-        );
-    }
-
-    #[test]
-    fn mcp_context_only_shortcut_keeps_plain_context_append() {
-        let primitive = RunPrimitive::StagedInput(StagedRunInput {
-            boundary: RunApplyBoundary::RunCheckpoint,
-            appends: Vec::new(),
-            context_appends: vec![context_append()],
-            contributing_input_ids: vec![InputId::new()],
-            turn_metadata: Some(RuntimeTurnMetadata {
-                execution_kind: Some(RuntimeExecutionKind::ContentTurn),
-                ..Default::default()
-            }),
-        });
-
-        assert!(should_apply_context_without_turn(&primitive));
     }
 }

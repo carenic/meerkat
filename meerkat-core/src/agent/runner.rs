@@ -4,12 +4,14 @@ use crate::budget::Budget;
 use crate::error::{AgentError, ToolError};
 use crate::event::AgentEvent;
 use crate::hooks::{HookInvocation, HookPoint};
-use crate::lifecycle::run_primitive::{ConversationAppend, ConversationAppendRole, CoreRenderable};
+use crate::lifecycle::run_primitive::{
+    ConversationAppend, ConversationAppendRole, CoreRenderable, TurnRequestContext,
+};
 use crate::ops::{ToolDispatchOutcome, ToolDispatchTimeoutPolicy};
 use crate::pending_continuation::{observe_session_tail, resolve_pending_continuation};
 use crate::retry::RetryPolicy;
 use crate::service::TurnToolOverlay;
-use crate::session::{PendingSystemContextAppend, Session};
+use crate::session::Session;
 use crate::session_document::{
     ObservedSessionTailKind, PendingContinuationDisposition, PendingContinuationPublicTerminal,
 };
@@ -99,6 +101,50 @@ fn injected_context_message_from_operator_renderable(
     }
 }
 
+fn project_turn_request_context(
+    messages: &mut Vec<Message>,
+    contexts: &[crate::lifecycle::run_primitive::TurnRequestContext],
+    active_identity: Option<&TranscriptMessageIdentity>,
+    include: bool,
+) -> Result<(), AgentError> {
+    if !include || contexts.is_empty() {
+        return Ok(());
+    }
+    let active_identity = active_identity.ok_or_else(|| {
+        AgentError::ConfigError(
+            "transient turn context requires an exact admitted transcript identity".to_string(),
+        )
+    })?;
+    let anchors = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| match message {
+            Message::User(user)
+                if user.transcript_role.is_conversational()
+                    && user.identity == *active_identity =>
+            {
+                Some(index)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    let [anchor] = anchors.as_slice() else {
+        return Err(AgentError::ConfigError(format!(
+            "transient turn context requires exactly one conversational user message for the admitted transcript identity; found {}",
+            anchors.len()
+        )));
+    };
+    messages.splice(
+        *anchor..*anchor,
+        contexts.iter().map(|context| {
+            Message::User(crate::types::UserMessage::injected_context(
+                context.as_str().to_owned(),
+            ))
+        }),
+    );
+    Ok(())
+}
+
 fn run_input_from_admitted_pending_tail(
     messages: &[Message],
     admitted_tail: ObservedSessionTailKind,
@@ -178,20 +224,13 @@ fn project_counter(field: &'static str, value: u64) -> Result<u32, SnapshotProje
     u32::try_from(value).map_err(|_| SnapshotProjectionError::CounterOverflow { field, value })
 }
 
-/// Typed failure serializing shared runtime control state into session metadata.
-///
-/// Projecting the system-context control state or the authorized tool-visibility
-/// state into the canonical session metadata map can fail to serialize. That
-/// failure must surface as a typed fault, never be laundered into a silent
-/// partial snapshot that drops the state while reporting success.
+/// Typed failure coordinating request-only boundary context or exporting
+/// durable agent control projections.
 #[derive(Debug, thiserror::Error)]
-pub enum SystemContextStateError {
+pub enum AgentControlStateError {
     /// The exact actor/run/boundary coordination failed.
-    #[error("system-context model-boundary coordination failed: {0}")]
+    #[error("transient turn-context boundary coordination failed: {0}")]
     Boundary(#[source] crate::lifecycle::CoreBoundaryStageError),
-    /// Serializing the system-context control state into session metadata failed.
-    #[error("failed to serialize system-context state into session: {0}")]
-    SystemContext(#[source] serde_json::Error),
     /// Reading the generated-authority tool visibility projection failed.
     #[error("failed to authorize tool visibility state for session export: {0}")]
     ToolVisibilityAuthorization(#[source] ToolScopeApplyError),
@@ -404,9 +443,17 @@ where
         self.active_transcript_identity = transcript_identity;
     }
 
+    pub fn set_active_turn_request_contexts(
+        &mut self,
+        contexts: Vec<crate::lifecycle::run_primitive::TurnRequestContext>,
+    ) {
+        self.active_turn_request_contexts = contexts;
+    }
+
     fn clear_runtime_execution_kind(&mut self) {
         self.runtime_execution_kind = None;
         self.active_transcript_identity = None;
+        self.active_turn_request_contexts.clear();
         self.runtime_started_run_id = None;
     }
 
@@ -714,8 +761,9 @@ where
     /// Enables hot-swapping the model/provider on a live session without
     /// rebuilding the agent. The new client takes effect on the next
     /// `run()` / `run_with_events()` call.
-    pub fn replace_client(&mut self, client: Arc<C>) {
+    pub fn replace_client(&mut self, client: Arc<C>) -> Result<(), AgentError> {
         self.client = client;
+        Ok(())
     }
 
     /// Apply the live LLM request policy paired with an identity hot-swap.
@@ -732,9 +780,10 @@ where
         &mut self,
         client: Arc<C>,
         policy: crate::SessionLlmRequestPolicy,
-    ) {
-        self.replace_client(client);
+    ) -> Result<(), AgentError> {
+        self.replace_client(client)?;
         self.apply_llm_request_policy(policy);
+        Ok(())
     }
 
     /// Atomically apply an explicit live LLM identity hot-swap.
@@ -763,7 +812,6 @@ where
                     .to_string(),
             ));
         }
-
         let target_profile = self
             .effective_model_registry
             .as_deref()
@@ -1144,6 +1192,37 @@ where
         &mut self.session
     }
 
+    /// Consume the latest successful provisional write for `run_id`.
+    ///
+    /// Fresh-run entry clears stale transport state before the first
+    /// suspension point. A mismatched receipt here is therefore invariant
+    /// corruption, not absence: fail closed so terminalization cannot fall
+    /// back to a second persistence path while a physical provisional tail may
+    /// exist.
+    pub fn take_run_checkpoint_receipt(
+        &mut self,
+        run_id: &crate::lifecycle::RunId,
+    ) -> Result<Option<crate::RunCheckpointReceipt>, crate::error::AgentError> {
+        let Some(receipt) = self.latest_run_checkpoint_receipt.take() else {
+            return Ok(None);
+        };
+        if receipt.session_id() != self.session.id() {
+            return Err(crate::error::AgentError::InternalError(format!(
+                "provisional receipt belongs to session {}, not actor session {}",
+                receipt.session_id(),
+                self.session.id()
+            )));
+        }
+        if receipt.run_id() != run_id {
+            return Err(crate::error::AgentError::InternalError(format!(
+                "provisional receipt belongs to run {}, not terminal run {}",
+                receipt.run_id(),
+                run_id
+            )));
+        }
+        Ok(Some(receipt))
+    }
+
     /// Get the current budget
     pub fn budget(&self) -> &Budget {
         &self.budget
@@ -1229,115 +1308,73 @@ where
         &self.tool_scope
     }
 
-    /// Get shared runtime system-context control state.
-    pub fn system_context_state(&self) -> crate::session::SystemContextStateHandle {
-        self.system_context_state.clone()
+    /// Clone the request-only exact-boundary context coordinator.
+    pub fn transient_turn_context_state(&self) -> crate::session::TransientTurnContextStateHandle {
+        self.transient_turn_context_state.clone()
     }
-
-    /// Clone the current session with the latest shared system-context state merged into metadata.
-    ///
-    /// A serialize failure projecting either the system-context control state or
-    /// the authorized tool-visibility state into session metadata is a typed
-    /// fault, not a silent partial snapshot: it propagates as
-    /// [`SystemContextStateError`] rather than being laundered through a
-    /// `tracing::warn!` that would hand back a session missing the state.
-    pub fn session_with_system_context_state(&self) -> Result<Session, SystemContextStateError> {
+    /// Clone the current Session and install the authorized durable tool
+    /// visibility projection. Transient turn context is deliberately absent.
+    pub fn session_with_control_state(&self) -> Result<Session, AgentControlStateError> {
         let mut session = self.session.clone();
-        let state = self.system_context_state().snapshot();
-        session
-            .set_system_context_state(state)
-            .map_err(SystemContextStateError::SystemContext)?;
         if self.tool_scope.owns_durable_visibility_projection() {
             let visibility_state = self
                 .tool_scope
                 .authorized_visibility_state()
-                .map_err(SystemContextStateError::ToolVisibilityAuthorization)?;
+                .map_err(AgentControlStateError::ToolVisibilityAuthorization)?;
             session
                 .set_tool_visibility_state(visibility_state)
-                .map_err(SystemContextStateError::ToolVisibility)?;
+                .map_err(AgentControlStateError::ToolVisibility)?;
         }
         Ok(session)
     }
-
-    /// Synchronize the shared system-context state into the in-memory session metadata.
-    ///
-    /// A serialize failure is a typed fault, not a silent partial sync: it
-    /// propagates as [`SystemContextStateError`] rather than being laundered
-    /// through a `tracing::warn!` that would leave canonical session metadata
-    /// stale while reporting success to the caller.
+    /// Synchronize only durable agent control projections into the Session.
     #[doc(hidden)]
-    pub fn sync_system_context_state_to_session(&mut self) -> Result<(), SystemContextStateError> {
-        let state = self.system_context_state().snapshot();
-        self.session
-            .set_system_context_state(state)
-            .map_err(SystemContextStateError::SystemContext)
-    }
-
-    /// Park at the exact next LLM boundary and retain pending context as
-    /// unapplied while fallible request preprocessing runs.
-    pub(crate) async fn prepare_pending_system_context_boundary(
-        &self,
-        run_id: &crate::lifecycle::RunId,
-    ) -> Result<crate::session::ModelBoundarySystemContext, SystemContextStateError> {
-        self.system_context_state
-            .take_pending_at_exact_boundary(run_id)
-            .await
-            .map_err(SystemContextStateError::Boundary)
-    }
-
-    /// Consume a preprocessed exact-boundary witness synchronously immediately
-    /// before the LLM future is entered. Session metadata serialization is
-    /// preflighted against the deterministic post-consumption projection, so a
-    /// serialization fault cannot mark canonical state applied first.
-    pub(crate) fn consume_pending_system_context_boundary(
-        &mut self,
-        boundary: crate::session::ModelBoundarySystemContext,
-    ) -> Result<(), SystemContextStateError> {
-        let pending_count = boundary.appends().len();
-        let mut next_session = self.session.clone();
-        next_session.append_peer_response_terminal_notices(boundary.appends());
-        next_session
-            .set_system_context_state(boundary.projected_state_after_consume())
-            .map_err(SystemContextStateError::SystemContext)?;
-        boundary
-            .consume()
-            .map_err(SystemContextStateError::Boundary)?;
-        if pending_count > 0 {
-            tracing::debug!(
-                pending_count,
-                "applying pending runtime system context at model boundary"
-            );
+    pub fn sync_control_state_to_session(&mut self) -> Result<(), AgentControlStateError> {
+        if self.tool_scope.owns_durable_visibility_projection() {
+            let visibility_state = self
+                .tool_scope
+                .authorized_visibility_state()
+                .map_err(AgentControlStateError::ToolVisibilityAuthorization)?;
+            self.session
+                .set_tool_visibility_state(visibility_state)
+                .map_err(AgentControlStateError::ToolVisibility)?;
         }
-        self.session = next_session;
         Ok(())
     }
-
-    pub(crate) fn llm_messages_with_runtime_system_context(
+    pub(crate) async fn take_transient_turn_context_at_boundary(
         &self,
-        appends: &[PendingSystemContextAppend],
-    ) -> Vec<Message> {
-        if appends.is_empty() {
-            return self.session.messages().to_vec();
-        }
-
-        let mut session = self.session.clone();
-        session.append_system_context_blocks(appends);
-        session.messages().to_vec()
+        run_id: &crate::lifecycle::RunId,
+    ) -> Result<Vec<TurnRequestContext>, AgentControlStateError> {
+        self.transient_turn_context_state
+            .take_pending_at_exact_boundary(run_id)
+            .await
+            .map_err(AgentControlStateError::Boundary)
     }
-
-    /// Persist the current session through the configured checkpointer after syncing control state.
-    ///
-    /// A serialize failure syncing system-context state surfaces as a typed
-    /// [`AgentError::InternalError`] rather than being swallowed, so the
-    /// checkpoint never persists a session whose control-state projection
-    /// silently failed.
-    #[doc(hidden)]
-    pub async fn checkpoint_current_session(&mut self) -> Result<(), AgentError> {
-        self.sync_system_context_state_to_session()
-            .map_err(|err| AgentError::InternalError(err.to_string()))?;
-        if let Some(ref cp) = self.checkpointer {
-            cp.checkpoint(&self.session).await;
+    pub(crate) fn llm_messages_for_boundary(
+        &self,
+        include_turn_request_context: bool,
+    ) -> Result<Vec<Message>, AgentError> {
+        let mut messages = self.session.messages_for_model_boundary();
+        if !self.active_turn_request_contexts.is_empty() {
+            project_turn_request_context(
+                &mut messages,
+                &self.active_turn_request_contexts,
+                self.active_transcript_identity.as_ref(),
+                include_turn_request_context,
+            )?;
         }
+        Ok(messages)
+    }
+    /// Synchronize actor-owned control state before the service/runtime owns the
+    /// terminal durable boundary.
+    ///
+    /// In-run checkpoints own only provisional physical successors. The
+    /// service/runtime boundary is the sole final commit authority, so a
+    /// successful run must not issue a second, unbound persistence operation.
+    #[doc(hidden)]
+    pub fn sync_current_session_control_state(&mut self) -> Result<(), AgentError> {
+        self.sync_control_state_to_session()
+            .map_err(|err| AgentError::InternalError(err.to_string()))?;
         Ok(())
     }
 
@@ -1669,7 +1706,25 @@ where
     }
 
     fn push_transcript_append(&mut self, append: ConversationAppend) -> Result<(), AgentError> {
+        if append.role != ConversationAppendRole::System && append.identity.is_some() {
+            return Err(AgentError::ConfigError(
+                "conversation append identity is valid only for role=system".to_string(),
+            ));
+        }
         match append.role {
+            ConversationAppendRole::System => {
+                let (source, idempotency_key) = append.identity.map_or((None, None), |identity| {
+                    (identity.source, identity.idempotency_key)
+                });
+                self.session
+                    .append_system_message_idempotent(
+                        append.content.render_text(),
+                        source,
+                        idempotency_key,
+                        crate::types::message_timestamp_now(),
+                    )
+                    .map_err(|error| AgentError::ConfigError(error.to_string()))?;
+            }
             ConversationAppendRole::User => {
                 let message = self.stamp_user_message_identity(
                     user_message_from_operator_renderable(append.content)?,
@@ -1864,7 +1919,7 @@ where
                         .await;
                     self.run_completed_event_emitted = true;
                 }
-                if let Err(err) = self.checkpoint_current_session().await {
+                if let Err(err) = self.sync_current_session_control_state() {
                     self.handle_run_failure(&err, event_tx.as_ref()).await;
                     let err = self.settle_compaction_after_run_error(err).await;
                     self.clear_runtime_execution_kind();
@@ -2028,7 +2083,7 @@ where
                         .await;
                     self.run_completed_event_emitted = true;
                 }
-                if let Err(err) = self.checkpoint_current_session().await {
+                if let Err(err) = self.sync_current_session_control_state() {
                     self.handle_run_failure(&err, event_tx.as_ref()).await;
                     let err = self.settle_compaction_after_run_error(err).await;
                     self.clear_runtime_execution_kind();
@@ -2215,6 +2270,71 @@ mod typed_transcript_contract_tests {
             );
         }
     }
+
+    #[test]
+    fn transient_turn_context_binds_exact_active_user_not_old_tail() {
+        let old_identity = TranscriptMessageIdentity {
+            objective_id: Some(crate::interaction::ObjectiveId::new()),
+            ..Default::default()
+        };
+        let active_identity = TranscriptMessageIdentity {
+            interaction_id: Some(crate::interaction::InteractionId(uuid::Uuid::new_v4())),
+            ..Default::default()
+        };
+        let mut old = UserMessage::text("old");
+        old.identity = old_identity;
+        let mut active = UserMessage::text("current");
+        active.identity = active_identity.clone();
+        let mut messages = vec![Message::User(old), Message::User(active)];
+        let contexts = ["caller facts", "first admitted steer"]
+            .into_iter()
+            .map(
+                |text| match crate::lifecycle::run_primitive::TurnRequestContext::new(text) {
+                    Ok(context) => context,
+                    Err(error) => panic!("fixture context rejected: {error}"),
+                },
+            )
+            .collect::<Vec<_>>();
+
+        if let Err(error) =
+            project_turn_request_context(&mut messages, &contexts, Some(&active_identity), true)
+        {
+            panic!("exact active anchor rejected: {error}");
+        }
+        assert_eq!(messages.len(), 4);
+        for (index, expected) in [(1, "caller facts"), (2, "first admitted steer")] {
+            assert!(matches!(
+                &messages[index],
+                Message::User(user)
+                    if user.transcript_role.is_injected_context()
+                        && user.text_content() == expected
+            ));
+        }
+        assert!(matches!(
+            &messages[3],
+            Message::User(user) if user.identity == active_identity
+        ));
+    }
+
+    #[test]
+    fn extraction_projection_excludes_transient_turn_context() {
+        let context = match crate::lifecycle::run_primitive::TurnRequestContext::new("large facts")
+        {
+            Ok(context) => context,
+            Err(error) => panic!("fixture context rejected: {error}"),
+        };
+        let mut messages = vec![Message::User(UserMessage::text("extraction input"))];
+        if let Err(error) =
+            project_turn_request_context(&mut messages, std::slice::from_ref(&context), None, false)
+        {
+            panic!("extraction exclusion must not require a turn anchor: {error}");
+        }
+        assert_eq!(messages.len(), 1);
+        assert!(matches!(
+            &messages[0],
+            Message::User(user) if user.transcript_role.is_conversational()
+        ));
+    }
 }
 
 /// Gate tests for per-turn skill activation as a typed operational effect.
@@ -2239,6 +2359,7 @@ mod skill_activation_effect_tests {
     };
     use crate::types::{AssistantBlock, StopReason, ToolDef, Usage};
     use std::future::Future;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn fixture_skill_key(name: &str) -> SkillKey {
         SkillKey::new(
@@ -2277,6 +2398,43 @@ mod skill_activation_effect_tests {
 
         fn model(&self) -> &'static str {
             "mock-model"
+        }
+    }
+
+    struct ProjectionRejectingLlmClient {
+        called: Arc<AtomicBool>,
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl AgentLlmClient for ProjectionRejectingLlmClient {
+        async fn stream_response(
+            &self,
+            _messages: &[Message],
+            _tools: &[Arc<ToolDef>],
+            _max_tokens: u32,
+            _temperature: Option<f32>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
+        ) -> Result<super::super::LlmStreamResult, AgentError> {
+            self.called.store(true, Ordering::SeqCst);
+            Err(AgentError::llm(
+                "anthropic",
+                crate::error::LlmFailureReason::ProviderError(
+                    crate::error::LlmProviderError::non_retryable(
+                        crate::error::LlmProviderErrorKind::InvalidRequest,
+                        serde_json::json!({"message": "unrepresentable ordered transcript"}),
+                    ),
+                ),
+                "provider request projection rejected the ordered transcript",
+            ))
+        }
+
+        fn provider(&self) -> crate::provider::Provider {
+            crate::provider::Provider::Anthropic
+        }
+
+        fn model(&self) -> &'static str {
+            "shape-limited-model"
         }
     }
 
@@ -2387,11 +2545,11 @@ mod skill_activation_effect_tests {
             .await;
 
         let err = agent
-            .session_with_system_context_state()
+            .session_with_control_state()
             .expect_err("generated owner read failures must not export partial visibility state");
         assert!(matches!(
             err,
-            SystemContextStateError::ToolVisibilityAuthorization(ToolScopeApplyError::Owner { .. })
+            AgentControlStateError::ToolVisibilityAuthorization(ToolScopeApplyError::Owner { .. })
         ));
     }
 
@@ -2949,6 +3107,7 @@ mod skill_activation_effect_tests {
                 "prompt".to_string().into(),
                 vec![crate::lifecycle::run_primitive::ConversationAppend {
                     role: ConversationAppendRole::User,
+                    identity: None,
                     content: CoreRenderable::Text {
                         text: "runtime-authored prompt".to_string(),
                     },
@@ -2971,6 +3130,81 @@ mod skill_activation_effect_tests {
         );
     }
 
+    #[tokio::test]
+    async fn provider_projection_failure_does_not_retract_authored_system_row() {
+        use crate::agent::test_turn_state_handle::TestTurnStateHandle;
+
+        let mut session = crate::Session::new();
+        session
+            .set_build_state(crate::SessionBuildState::default())
+            .expect("test session build state should serialize");
+        session.push(Message::User(UserMessage::text("existing turn")));
+        let original_messages = session.messages().to_vec();
+        let provider_called = Arc::new(AtomicBool::new(false));
+        let mut agent = AgentBuilder::new()
+            .resume_session(session)
+            .with_turn_state_handle(Arc::new(TestTurnStateHandle::new()))
+            .with_runtime_execution_kind_for_test(
+                crate::lifecycle::RuntimeExecutionKind::ContentTurn,
+            )
+            .build_standalone(
+                Arc::new(ProjectionRejectingLlmClient {
+                    called: Arc::clone(&provider_called),
+                }),
+                Arc::new(NoTools),
+                Arc::new(NoopStore),
+            )
+            .await;
+
+        let (tx, _rx) = mpsc::channel::<AgentEvent>(8);
+        let error = agent
+            .run_with_events_and_typed_turn_appends(
+                "projected prompt".to_string().into(),
+                vec![
+                    crate::lifecycle::run_primitive::ConversationAppend {
+                        role: ConversationAppendRole::System,
+                        identity: None,
+                        content: CoreRenderable::Text {
+                            text: "late instruction".to_string(),
+                        },
+                    },
+                    crate::lifecycle::run_primitive::ConversationAppend {
+                        role: ConversationAppendRole::User,
+                        identity: None,
+                        content: CoreRenderable::Text {
+                            text: "projected prompt".to_string(),
+                        },
+                    },
+                ],
+                Vec::new(),
+                None,
+                tx,
+            )
+            .await
+            .expect_err("limited provider projection must fail typed");
+
+        assert!(
+            provider_called.load(Ordering::SeqCst),
+            "the failing result must come after provider projection was attempted: {error:?}"
+        );
+        assert_eq!(
+            &agent.session().messages()[..original_messages.len()],
+            original_messages
+        );
+        assert_eq!(
+            agent.session().messages().len(),
+            original_messages.len() + 2
+        );
+        assert!(matches!(
+            &agent.session().messages()[original_messages.len()],
+            Message::System(system) if system.content == "late instruction"
+        ));
+        assert!(matches!(
+            &agent.session().messages()[original_messages.len() + 1],
+            Message::User(user) if user.text_content() == "projected prompt"
+        ));
+    }
+
     /// Runtime-mode lowering owner: an `InjectedContext`-role typed append
     /// lowers into a typed injected-context user message, preserving append
     /// order relative to the user append.
@@ -2985,12 +3219,14 @@ mod skill_activation_effect_tests {
                 vec![
                     crate::lifecycle::run_primitive::ConversationAppend {
                         role: ConversationAppendRole::InjectedContext,
+                        identity: None,
                         content: CoreRenderable::Text {
                             text: "runtime-lowered ambient context".to_string(),
                         },
                     },
                     crate::lifecycle::run_primitive::ConversationAppend {
                         role: ConversationAppendRole::User,
+                        identity: None,
                         content: CoreRenderable::Text {
                             text: "the user prompt".to_string(),
                         },
@@ -3034,6 +3270,7 @@ mod skill_activation_effect_tests {
                 "prompt".to_string().into(),
                 vec![crate::lifecycle::run_primitive::ConversationAppend {
                     role: ConversationAppendRole::InjectedContext,
+                    identity: None,
                     content: CoreRenderable::Json {
                         value: serde_json::json!({"not": "operator content"}),
                     },
@@ -3047,6 +3284,89 @@ mod skill_activation_effect_tests {
         assert!(
             matches!(err, AgentError::ConfigError(_)),
             "expected typed config error, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn keyed_system_append_converges_mirrors_and_conflicts_fail_closed() {
+        let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
+        let keyed = |text: &str| crate::lifecycle::run_primitive::ConversationAppend {
+            role: ConversationAppendRole::System,
+            identity: Some(crate::types::SystemMessageIdentity {
+                source: Some("released-0.8.10".to_string()),
+                idempotency_key: Some("accepted-context-7".to_string()),
+            }),
+            content: CoreRenderable::Text {
+                text: text.to_string(),
+            },
+        };
+
+        agent
+            .push_transcript_append(keyed(" exact bytes "))
+            .expect("first migrated copy");
+        agent
+            .push_transcript_append(keyed(" exact bytes "))
+            .expect("mirrored copy is an exact no-op");
+        let systems = agent
+            .session()
+            .messages()
+            .iter()
+            .filter_map(|message| match message {
+                Message::System(system) => Some(system),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(systems.len(), 1);
+        assert_eq!(systems[0].content, " exact bytes ");
+        assert_eq!(
+            systems[0].identity.as_ref(),
+            Some(&crate::types::SystemMessageIdentity {
+                source: Some("released-0.8.10".to_string()),
+                idempotency_key: Some("accepted-context-7".to_string()),
+            })
+        );
+        assert!(matches!(
+            agent.push_transcript_append(keyed("different")),
+            Err(AgentError::ConfigError(_))
+        ));
+        assert_eq!(
+            agent
+                .session()
+                .messages()
+                .iter()
+                .filter(|message| matches!(message, Message::System(_)))
+                .count(),
+            1,
+            "conflict must fail before a second System row is appended"
+        );
+    }
+
+    #[tokio::test]
+    async fn unkeyed_system_role_lowering_preserves_empty_whitespace_and_duplicates() {
+        let mut agent = build_agent_with_engine(SucceedingSkillEngine).await;
+        for text in ["", " \t ", " \t "] {
+            agent
+                .push_transcript_append(crate::lifecycle::run_primitive::ConversationAppend {
+                    role: ConversationAppendRole::System,
+                    identity: None,
+                    content: CoreRenderable::Text {
+                        text: text.to_string(),
+                    },
+                })
+                .expect("ordinary System append");
+        }
+
+        assert_eq!(
+            agent
+                .session()
+                .messages()
+                .iter()
+                .filter_map(|message| match message {
+                    Message::System(system) => Some(system.content.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            vec!["", " \t ", " \t "]
         );
     }
 
@@ -3280,9 +3600,6 @@ mod snapshot_projection_tests {
             Err(refused())
         }
         fn start_immediate_append(&self, _run_id: RunId) -> Result<(), DslTransitionError> {
-            Err(refused())
-        }
-        fn start_immediate_context(&self, _run_id: RunId) -> Result<(), DslTransitionError> {
             Err(refused())
         }
         fn primitive_applied(&self, _run_id: RunId) -> Result<(), DslTransitionError> {

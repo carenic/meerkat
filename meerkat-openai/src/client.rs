@@ -92,6 +92,11 @@ enum SystemMessageMode {
     ExtractToInstructions,
 }
 
+// ChatGPT's Responses wire exposes one top-level instruction string. The
+// provider request builder therefore accepts at most one leading System row;
+// distinct canonical messages are never delimiter-joined into an ambiguous
+// string.
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct OpenAiContinuationPlan {
     previous_response_id: String,
@@ -606,6 +611,7 @@ impl OpenAiClient {
                 })
         });
         let (input, instructions) = if self.is_chatgpt_backend_wire() {
+            Self::validate_chatgpt_system_messages(&request.messages)?;
             Self::convert_to_responses_input_with_system_mode(
                 &request.messages,
                 SystemMessageMode::ExtractToInstructions,
@@ -902,6 +908,28 @@ impl OpenAiClient {
         Ok(body)
     }
 
+    fn validate_chatgpt_system_messages(messages: &[Message]) -> Result<(), LlmError> {
+        let mut leading_system_prefix = true;
+        let mut system_count = 0usize;
+        for (index, message) in messages.iter().enumerate() {
+            if matches!(message, Message::System(_)) {
+                if !leading_system_prefix || system_count != 0 {
+                    return Err(LlmError::InvalidInputShape {
+                        message: format!(
+                            "ChatGPT Responses cannot exactly represent System message at \
+                             transcript index {index}; its wire supports at most one leading \
+                             System message"
+                        ),
+                    });
+                }
+                system_count += 1;
+            } else {
+                leading_system_prefix = false;
+            }
+        }
+        Ok(())
+    }
+
     fn build_request_body_with_continuation(
         &self,
         request: &LlmRequest,
@@ -1158,7 +1186,7 @@ impl OpenAiClient {
         author_explicit_breakpoints: bool,
     ) -> Result<(Vec<Value>, Option<String>), LlmError> {
         let mut items = Vec::new();
-        let mut instructions = Vec::new();
+        let mut instructions = None;
 
         for msg in messages {
             match msg {
@@ -1171,8 +1199,12 @@ impl OpenAiClient {
                         }));
                     }
                     SystemMessageMode::ExtractToInstructions => {
-                        if !s.content.trim().is_empty() {
-                            instructions.push(s.content.clone());
+                        if instructions.replace(s.content.clone()).is_some() {
+                            return Err(LlmError::InvalidInputShape {
+                                message: "a singular instructions field cannot represent multiple \
+                                          System messages"
+                                    .to_string(),
+                            });
                         }
                     }
                 },
@@ -1268,11 +1300,6 @@ impl OpenAiClient {
             }
         }
 
-        let instructions = if instructions.is_empty() {
-            None
-        } else {
-            Some(instructions.join("\n\n"))
-        };
         Ok((items, instructions))
     }
 
@@ -1950,6 +1977,39 @@ fn ensure_additional_properties_false(value: &mut Value) {
 impl LlmClient for OpenAiClient {
     fn project_replay_messages(&self, messages: &[Message]) -> Result<Vec<Message>, LlmError> {
         project_openai_replay_messages(messages, OpenAiReplayProjectionMode::Responses)
+    }
+
+    fn request_pressure(
+        &self,
+        request: &LlmRequest,
+    ) -> Result<Option<meerkat_core::ProviderRequestPressure>, LlmError> {
+        let mut projected_request = request.clone();
+        projected_request.messages = self.project_replay_messages(&request.messages)?;
+        let (body, continuation_plan) =
+            self.build_request_body_with_continuation(&projected_request)?;
+        let mut encoded_bytes = serde_json::to_vec(&body)
+            .map_err(|error| LlmError::InvalidRequest {
+                message: format!("failed to serialize OpenAI request body: {error}"),
+            })?
+            .len() as u64;
+        // A rejected continuation is retried as a full replay. The pressure
+        // witness must cover the largest body this one invocation may send.
+        if continuation_plan.is_some() {
+            let fallback_body = self.build_request_body(&projected_request)?;
+            encoded_bytes = encoded_bytes.max(
+                serde_json::to_vec(&fallback_body)
+                    .map_err(|error| LlmError::InvalidRequest {
+                        message: format!(
+                            "failed to serialize OpenAI fallback request body: {error}"
+                        ),
+                    })?
+                    .len() as u64,
+            );
+        }
+        Ok(Some(meerkat_core::ProviderRequestPressure::new(
+            encoded_bytes,
+            meerkat_models::approximate_request_byte_cap(self.provider()),
+        )))
     }
 
     fn stream<'a>(&'a self, request: &'a LlmRequest) -> LlmStream<'a> {
@@ -4224,6 +4284,97 @@ mod tests {
         assert_eq!(input.len(), 1);
         assert_eq!(input[0]["role"], "user");
         assert_eq!(input[0]["content"], "new question");
+    }
+
+    #[test]
+    fn ordered_system_messages_remain_interleaved_on_standard_responses_wire() {
+        let client = OpenAiClient::new("test-key".to_string());
+        let messages = vec![
+            Message::User(UserMessage::text("work")),
+            Message::System(meerkat_core::SystemMessage::new("")),
+            Message::User(UserMessage::text("continue")),
+            Message::System(meerkat_core::SystemMessage::new(" \t ")),
+            Message::System(meerkat_core::SystemMessage::new("duplicate")),
+            Message::System(meerkat_core::SystemMessage::new("duplicate")),
+        ];
+        let request = LlmRequest::new("gpt-5.6-sol", messages.clone());
+
+        let body = client.build_request_body(&request).expect("build request");
+        assert_eq!(request.messages, messages);
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(input.len(), 6);
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"], "work");
+        assert_eq!(input[1]["role"], "system");
+        assert_eq!(input[1]["content"], "");
+        assert_eq!(input[2]["role"], "user");
+        assert_eq!(input[2]["content"], "continue");
+        assert_eq!(input[3]["role"], "system");
+        assert_eq!(input[3]["content"], " \t ");
+        assert_eq!(input[4]["role"], "system");
+        assert_eq!(input[4]["content"], "duplicate");
+        assert_eq!(input[5]["role"], "system");
+        assert_eq!(input[5]["content"], "duplicate");
+    }
+
+    #[test]
+    fn chatgpt_backend_rejects_unrepresentable_system_message_sequence() {
+        let client = OpenAiClient::new("test-key".to_string()).with_chatgpt_backend_wire();
+        let messages = vec![
+            Message::System(meerkat_core::SystemMessage::new("")),
+            Message::User(UserMessage::text("work")),
+            Message::System(meerkat_core::SystemMessage::new("late")),
+        ];
+        let request = LlmRequest::new("gpt-5.5", messages.clone());
+
+        assert!(matches!(
+            client.build_request_body(&request),
+            Err(LlmError::InvalidInputShape { .. })
+        ));
+        assert_eq!(request.messages, messages);
+    }
+
+    #[test]
+    fn chatgpt_backend_rejects_multiple_system_rows_without_aliasing_them() {
+        let client = OpenAiClient::new("test-key".to_string()).with_chatgpt_backend_wire();
+        let request = LlmRequest::new(
+            "gpt-5.5",
+            vec![
+                Message::System(meerkat_core::SystemMessage::new("a\n\nb")),
+                Message::System(meerkat_core::SystemMessage::new("a")),
+            ],
+        );
+
+        assert!(matches!(
+            client.build_request_body(&request),
+            Err(LlmError::InvalidInputShape { .. })
+        ));
+    }
+
+    #[test]
+    fn chatgpt_backend_distinguishes_absent_empty_and_whitespace_system_messages() {
+        let client = OpenAiClient::new("test-key".to_string()).with_chatgpt_backend_wire();
+
+        let absent = client
+            .build_request_body(&LlmRequest::new("gpt-5.5", Vec::new()))
+            .expect("build absent-System request");
+        assert_eq!(absent["instructions"], "You are a helpful assistant.");
+
+        let empty = client
+            .build_request_body(&LlmRequest::new(
+                "gpt-5.5",
+                vec![Message::System(meerkat_core::SystemMessage::new(""))],
+            ))
+            .expect("build empty-System request");
+        assert_eq!(empty["instructions"], "");
+
+        let whitespace = client
+            .build_request_body(&LlmRequest::new(
+                "gpt-5.5",
+                vec![Message::System(meerkat_core::SystemMessage::new(" \t "))],
+            ))
+            .expect("build whitespace-System request");
+        assert_eq!(whitespace["instructions"], " \t ");
     }
 
     #[test]

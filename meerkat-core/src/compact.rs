@@ -34,6 +34,27 @@ pub struct CompactionContext {
     pub message_count: usize,
     /// Estimated history tokens (JSON bytes / 4).
     pub estimated_history_tokens: u64,
+    /// Estimated serialized size in bytes of the transcript as an LLM
+    /// request (content byte lengths, inline media payloads included, times
+    /// a documented safety factor — see
+    /// `crate::agent::compact::estimate_request_bytes`).
+    ///
+    /// Providers cap requests in BYTES, not tokens. A byte-heavy/token-light
+    /// transcript (2026-07-29 household incident: inline media pushed a
+    /// transcript past Anthropic's request-size cap, failing every turn with
+    /// `request_too_large` while the token trigger stayed far below its
+    /// threshold) must be visible to trigger decisions in the same unit the
+    /// provider enforces.
+    pub estimated_request_bytes: u64,
+    /// Exact provider-lowered request-body pressure, when the active client can
+    /// prove it. This is measured after ordered System-message projection,
+    /// blob hydration, tool selection, provider-parameter resolution, replay
+    /// projection, and provider-native JSON lowering.
+    ///
+    /// Custom clients default to `None`: an unavailable witness is truthful,
+    /// while relabeling the transcript estimate as exact would make the
+    /// compaction safety decision unsound.
+    pub provider_request_pressure: Option<ProviderRequestPressure>,
     /// Session-scoped pre-LLM boundary index used by the cadence guard.
     ///
     /// This is the latest successful compaction boundary or failed compaction
@@ -41,6 +62,50 @@ pub struct CompactionContext {
     pub last_compaction_boundary_index: Option<u64>,
     /// Current session-scoped pre-LLM boundary index.
     pub session_boundary_index: u64,
+}
+
+/// Provider-authored witness for the exact JSON body an invocation may send.
+///
+/// `encoded_bytes` is the largest serialized JSON body among all request
+/// bodies the invocation can issue. This matters for clients such as OpenAI
+/// Responses, where a continuation request may fall back to a full replay.
+/// `max_bytes` is the active provider's conservative request-body cap, when
+/// known. Both values are recomputed through the currently active fallback
+/// candidate for every model boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProviderRequestPressure {
+    pub encoded_bytes: u64,
+    pub max_bytes: Option<u64>,
+}
+
+impl ProviderRequestPressure {
+    pub fn new(encoded_bytes: u64, max_bytes: Option<u64>) -> Self {
+        Self {
+            encoded_bytes,
+            max_bytes,
+        }
+    }
+
+    /// Effective request-body cap after combining provider and host policy.
+    ///
+    /// Either authority may be stricter. A configured cap is not allowed to
+    /// widen the provider's real limit, and an inferred provider limit is not
+    /// allowed to widen an explicit deployment policy.
+    pub fn effective_cap(self, configured_cap: Option<u64>) -> Option<u64> {
+        match (configured_cap, self.max_bytes) {
+            (Some(configured), Some(provider)) => Some(configured.min(provider)),
+            (Some(configured), None) => Some(configured),
+            (None, Some(provider)) => Some(provider),
+            (None, None) => None,
+        }
+    }
+
+    /// Four-fifths of the effective request-size cap.
+    pub fn trigger_threshold(self, configured_cap: Option<u64>) -> Option<u64> {
+        self.effective_cap(configured_cap).map(|cap| {
+            cap.saturating_mul(REQUEST_BYTE_TRIGGER_NUMERATOR) / REQUEST_BYTE_TRIGGER_DENOMINATOR
+        })
+    }
 }
 
 /// Result of a compaction rebuild.
@@ -104,9 +169,9 @@ duplicating work:\n\n";
 /// One message removed by compaction plus its source transcript offset.
 ///
 /// The source offset is part of the compactor contract because reconstructing
-/// it from the returned discard slice loses leading retained messages (most
-/// commonly the system prompt) and cannot represent non-contiguous custom
-/// compaction strategies without guessing.
+/// it from the returned discard slice loses retained messages outside the
+/// discarded region and cannot represent non-contiguous custom compaction
+/// strategies without guessing.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CompactionDiscard {
     /// Offset of `message` in the full pre-compaction transcript.
@@ -153,11 +218,29 @@ impl CompactionRetained {
     }
 }
 
+/// Fraction of `CompactionConfig::max_request_bytes` at which the byte-aware
+/// trigger fires, mirroring the model-aware token default (4/5 of the model
+/// context window). The remaining 1/5 is headroom for the active turn's new
+/// content plus request components the estimate cannot see (tool schemas,
+/// provider parameters).
+const REQUEST_BYTE_TRIGGER_NUMERATOR: u64 = 4;
+const REQUEST_BYTE_TRIGGER_DENOMINATOR: u64 = 5;
+
 /// Configuration for the default compactor implementation.
 #[derive(Debug, Clone)]
 pub struct CompactionConfig {
     /// Compaction triggers when `last_input_tokens >= auto_compact_threshold`.
     pub auto_compact_threshold: u64,
+    /// Provider request-size cap in bytes, when known.
+    ///
+    /// `None` disables the byte-aware trigger (pre-incident behavior). When
+    /// set, compaction also triggers when the estimated serialized request
+    /// size crosses [`CompactionConfig::request_byte_trigger_threshold`]
+    /// (4/5 of this cap). The token trigger alone missed the 2026-07-29
+    /// household incident: providers cap requests in bytes, and byte-heavy /
+    /// token-light content (inline media) crosses the byte cap first, after
+    /// which every turn fails terminally with `request_too_large`.
+    pub max_request_bytes: Option<u64>,
     /// Number of recent complete turns to retain after compaction.
     pub recent_turn_budget: usize,
     /// Maximum tokens for the compaction summary LLM response.
@@ -166,10 +249,24 @@ pub struct CompactionConfig {
     pub min_turns_between_compactions: u32,
 }
 
+impl CompactionConfig {
+    /// Effective byte-trigger threshold: 4/5 of `max_request_bytes`, or
+    /// `None` when no request-size cap is configured.
+    ///
+    /// This is the one owner of the byte-trigger arithmetic so every
+    /// compactor evaluates the same fraction of the same cap.
+    pub fn request_byte_trigger_threshold(&self) -> Option<u64> {
+        self.max_request_bytes.map(|cap| {
+            cap.saturating_mul(REQUEST_BYTE_TRIGGER_NUMERATOR) / REQUEST_BYTE_TRIGGER_DENOMINATOR
+        })
+    }
+}
+
 impl Default for CompactionConfig {
     fn default() -> Self {
         Self {
             auto_compact_threshold: 100_000,
+            max_request_bytes: None,
             recent_turn_budget: 4,
             max_summary_tokens: 4096,
             min_turns_between_compactions: 3,
@@ -183,6 +280,15 @@ impl Default for CompactionConfig {
 pub trait Compactor: Send + Sync {
     /// Check whether compaction should run given the current context.
     fn should_compact(&self, ctx: &CompactionContext) -> bool;
+
+    /// Effective hard request-body cap for post-compaction fit checks.
+    ///
+    /// Custom compactors inherit the provider witness. Implementations with a
+    /// stricter host-configured cap override this so trigger and fit semantics
+    /// use the same authority.
+    fn request_byte_cap(&self, pressure: ProviderRequestPressure) -> Option<u64> {
+        pressure.max_bytes
+    }
 
     /// Return the prompt to send to the LLM for summarization.
     fn compaction_prompt(&self) -> &str;
@@ -203,11 +309,9 @@ pub trait Compactor: Send + Sync {
 
     /// Rebuild the session history from a summary and current messages.
     ///
-    /// The system prompt is extracted from `messages` directly (the first
-    /// `Message::System` if present). No dual source of truth.
-    ///
     /// The implementation should:
-    /// 1. Preserve any `Message::System` verbatim.
+    /// 1. Preserve every ordered `Message::System` verbatim and in relative
+    ///    source order.
     /// 2. Inject a summary message.
     /// 3. Retain recent complete turns per `recent_turn_budget`.
     /// 4. Return retained source messages as `retained`, with their offsets in
@@ -216,11 +320,12 @@ pub trait Compactor: Send + Sync {
     ///    the full `messages` slice.
     ///
     /// `retained` and `discarded` must partition the source transcript. The
-    /// `summary` must identify the one injected message, at offset zero or
-    /// immediately after the preserved leading system message. Its typed role
-    /// and text must match the exact summary supplied to this method. At least
-    /// one source message must be discarded, and the rebuild must not grow the
-    /// transcript.
+    /// `summary` must identify the one injected message at the rebuilt position
+    /// of the first discarded source row: every retained source row before that
+    /// boundary remains before the summary, and every retained source row after
+    /// it remains after the summary. Its typed role and text must match the
+    /// exact summary supplied to this method. At least one source message must
+    /// be discarded, and the rebuild must not grow the transcript.
     fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult;
 }
 
@@ -228,7 +333,7 @@ pub trait Compactor: Send + Sync {
 ///
 /// This is exactly the data the agent-loop compaction flow already holds when
 /// it would otherwise run the summarization LLM call: the full current
-/// transcript (including the system prompt and any prior typed
+/// transcript (including every ordered System message and any prior typed
 /// compaction-summary user message), the last observed input token count, and
 /// the session-scoped boundary index at which compaction runs.
 #[derive(Debug, Clone, Copy)]
@@ -324,5 +429,40 @@ mod tests {
         let summary = CuratedCompactionSummary::new("curated summary").unwrap();
         assert_eq!(summary.as_str(), "curated summary");
         assert_eq!(summary.into_string(), "curated summary");
+    }
+
+    #[test]
+    fn request_byte_trigger_threshold_is_four_fifths_of_the_cap() {
+        let config = CompactionConfig {
+            max_request_bytes: Some(10_000_000),
+            ..CompactionConfig::default()
+        };
+        assert_eq!(config.request_byte_trigger_threshold(), Some(8_000_000));
+
+        // Default None keeps the byte trigger disabled (pre-incident behavior).
+        assert_eq!(
+            CompactionConfig::default().request_byte_trigger_threshold(),
+            None
+        );
+    }
+
+    #[test]
+    fn provider_and_configured_request_caps_compose_by_minimum() {
+        let pressure = ProviderRequestPressure::new(1, Some(8_000_000));
+        assert_eq!(pressure.effective_cap(Some(10_000_000)), Some(8_000_000));
+        assert_eq!(pressure.effective_cap(Some(6_000_000)), Some(6_000_000));
+        assert_eq!(
+            pressure.trigger_threshold(Some(10_000_000)),
+            Some(6_400_000)
+        );
+        assert_eq!(pressure.trigger_threshold(Some(6_000_000)), Some(4_800_000));
+        assert_eq!(
+            ProviderRequestPressure::new(1, None).effective_cap(Some(6_000_000)),
+            Some(6_000_000)
+        );
+        assert_eq!(
+            ProviderRequestPressure::new(1, Some(8_000_000)).effective_cap(None),
+            Some(8_000_000)
+        );
     }
 }

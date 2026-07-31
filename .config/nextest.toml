@@ -1,7 +1,9 @@
 # Nextest configuration for meerkat-0.6-cleanups.
 #
-# Retry policy is scoped narrowly: the two known pre-existing flakes are
-# retried once, everything else runs to completion without retries.
+# Retry policy is scoped narrowly: the known pre-existing flakes are retried
+# once, everything else runs to completion without retries. The BuildBuddy
+# Turbo-S live-smoke cohort is a Bazel sh_test suite, so its serialization and
+# retry policy belongs to scripts/buildbuddy-bazel-poc rather than here.
 
 [profile.fast]
 # Cargo's default fast lane: unit + integration-fast, with dedicated e2e lane

@@ -546,7 +546,7 @@ pub struct AgentBuildConfig {
     /// Per-agent environment variables injected into shell tool subprocesses.
     pub shell_env: Option<std::collections::HashMap<String, String>>,
     /// Optional session checkpointer for host-mode persistence.
-    pub checkpointer: Option<Arc<dyn meerkat_core::checkpoint::SessionCheckpointer>>,
+    pub checkpointer: Option<Arc<dyn meerkat_core::SessionCheckpointer>>,
     /// Explicit call-timeout override at the build seam.
     ///
     /// - `Inherit` (default): defer to config override, then profile default
@@ -1538,6 +1538,9 @@ fn model_aware_compaction_config(
     build_threshold_override: Option<std::num::NonZeroU64>,
 ) -> meerkat_core::CompactionConfig {
     let mut compaction: meerkat_core::CompactionConfig = config.compaction.clone().into();
+    // Keep only an explicit host cap here. Built-in clients attach the current
+    // provider's cap to their exact lowered-request witness on every boundary,
+    // so model fallback cannot keep applying the initial provider's limit.
     // The per-build override (e.g. a mob profile's `auto_compact_threshold`)
     // wins over the global config knob and model-aware scaling.
     if let Some(threshold) = build_threshold_override {
@@ -1565,6 +1568,20 @@ fn model_aware_compaction_config(
     }
 
     compaction
+}
+
+fn model_aware_default_max_tokens(
+    registry: &ModelRegistry,
+    provider: Provider,
+    model: &str,
+) -> u32 {
+    registry
+        .profile_witness_for_provider(provider, model)
+        .filter(|profile| {
+            profile.profile().supports_thinking || profile.profile().supports_reasoning
+        })
+        .and_then(|profile| profile.max_output_tokens())
+        .unwrap_or(meerkat_core::config::DEFAULT_MAX_TOKENS_PER_TURN)
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -3145,13 +3162,25 @@ impl AgentFactory {
             return Ok(None);
         };
         let Some(metadata) = session.session_metadata() else {
-            if session.messages().is_empty()
-                && matches!(
-                    &build_config.runtime_build_mode,
-                    meerkat_core::RuntimeBuildMode::SessionOwned(bindings)
-                        if bindings.session_id() == session.id()
-                            && meerkat_runtime::session_runtime_bindings_have_machine_authority(bindings)
-                )
+            let machine_precreated = matches!(
+                &build_config.runtime_build_mode,
+                meerkat_core::RuntimeBuildMode::SessionOwned(bindings)
+                    if bindings.session_id() == session.id()
+                        && meerkat_runtime::session_runtime_bindings_have_machine_authority(bindings)
+            );
+            let generated_deferred_precreation = session
+                .try_deferred_turn_state()
+                .map_err(|error| {
+                    BuildAgentError::Config(format!(
+                        "resumed session {} has invalid durable deferred-turn state: {error}",
+                        session.id()
+                    ))
+                })?
+                .is_some_and(|state| {
+                    state.first_turn_phase() == meerkat_core::DeferredFirstTurnPhase::Pending
+                });
+            if machine_precreated
+                && (session.messages().is_empty() || generated_deferred_precreation)
             {
                 return Ok(None);
             }
@@ -4418,7 +4447,15 @@ impl AgentFactory {
         let explicit_mob_override =
             !matches!(build_config.override_mob, ToolCategoryOverride::Inherit);
         let resumed_session_metadata = Self::apply_resumed_session_metadata(&mut build_config)?;
-        let mut session = build_config.resume_session.clone().unwrap_or_default();
+        let mut session =
+            build_config.resume_session.clone().unwrap_or_else(|| {
+                match &build_config.runtime_build_mode {
+                    RuntimeBuildMode::SessionOwned(bindings) => {
+                        Session::with_id(bindings.session_id().clone())
+                    }
+                    RuntimeBuildMode::StandaloneEphemeral => Session::default(),
+                }
+            });
         if let RuntimeBuildMode::SessionOwned(bindings) = &build_config.runtime_build_mode {
             if !meerkat_runtime::session_runtime_bindings_have_machine_authority(bindings) {
                 return Err(BuildAgentError::Config(
@@ -4787,7 +4824,14 @@ impl AgentFactory {
         // presence; resolve the operative value here at point-of-use).
         let max_tokens = build_config
             .max_tokens
-            .unwrap_or_else(|| config.resolved_max_tokens());
+            .or_else(|| config.configured_max_tokens())
+            .unwrap_or_else(|| {
+                model_aware_default_max_tokens(
+                    &registry,
+                    resolved_llm_identity.provider,
+                    &resolved_llm_identity.model,
+                )
+            });
         let _realm_scope_root = self.realm_scope_root(&build_config);
         let _conventions_context_root = self
             .context_root
@@ -4860,11 +4904,8 @@ impl AgentFactory {
 
         // 6b. Build tool dispatcher (with optional external tools, per-build overrides, skill tools)
         //
-        // The typed per-request policy is persisted as-is on
-        // `SessionBuildState.system_prompt` (the tri-state round-trips
-        // losslessly, including `Disable`). The override itself is taken
-        // (leaving `Inherit`) for prompt assembly below.
-        let persisted_system_prompt = build_config.system_prompt.clone();
+        // The create-time override is consumed into the initial ordered
+        // System event. It is not persisted as thread configuration.
         let prompt_override = std::mem::take(&mut build_config.system_prompt);
         let effective_builtins = build_config.override_builtins.resolve(self.enable_builtins);
         #[allow(unused_variables)] // only consumed by non-wasm32 tool dispatcher
@@ -5703,16 +5744,12 @@ impl AgentFactory {
                 extra_sections.push(instruction.as_str());
             }
         }
-        let resume_session_is_precreated_empty = build_config
-            .resume_session
-            .as_ref()
-            .is_some_and(|session| session.messages().is_empty());
-        // An explicit per-request policy (`Set` or `Disable`) forces prompt
-        // (re)assembly even on resume; `Inherit` only assembles for fresh or
-        // pre-created-empty sessions.
-        let should_apply_system_prompt = build_config.resume_session.is_none()
-            || resume_session_is_precreated_empty
-            || prompt_override.is_explicit();
+        // A bare resume authors nothing. An explicit prompt decision on resume
+        // is different: it materializes a new ordinary System message at the
+        // current transcript boundary. Core performs the provider-wire
+        // capability check before appending it.
+        let should_apply_system_prompt =
+            resumed_session_metadata.is_none() || prompt_override.is_explicit();
         #[cfg(not(target_arch = "wasm32"))]
         let system_prompt = if should_apply_system_prompt {
             Some(
@@ -5769,7 +5806,6 @@ impl AgentFactory {
         }
 
         let persisted_build_state = meerkat_core::SessionBuildState {
-            system_prompt: persisted_system_prompt,
             output_schema: build_config.output_schema.clone(),
             hooks_override: build_config.hooks_override.clone(),
             budget_limits: build_config.budget_limits.clone(),
@@ -5784,17 +5820,6 @@ impl AgentFactory {
             shell_env: build_config.shell_env.clone(),
             mob_tool_authority_context: build_config.mob_tool_authority_context.clone(),
             call_timeout_override: build_config.call_timeout_override.clone(),
-            // Record the exact assembled base-prompt bytes (or carry the
-            // prior build's record through an Inherit resume) so a later
-            // resume can split the persisted System content into base +
-            // runtime-appended tail byte-exactly.
-            assembled_system_prompt: system_prompt.clone().or_else(|| {
-                build_config
-                    .resume_session
-                    .as_ref()
-                    .and_then(|session| session.build_state())
-                    .and_then(|state| state.assembled_system_prompt)
-            }),
         };
 
         // Resolve the structured-output retry budget exactly once, here at the
@@ -5961,40 +5986,6 @@ impl AgentFactory {
         if let Some(state) = initial_visibility_state {
             builder = builder.with_initial_tool_visibility_state(state);
         }
-        // Resume continuity: an explicit per-request prompt on a resumed,
-        // established transcript must not blind-replace the persisted System
-        // message — that discards runtime-applied system context and produces
-        // a projection that is no longer a continuation of the persisted
-        // transcript revision, so the append-only continuity guard rejects
-        // the very first post-resume persist and the live session is
-        // discarded (cold-restart transcript loss for runtime-backed hosts).
-        // Reconcile instead: a base the persisted prompt already carries is
-        // preserved byte-for-byte; a genuinely changed base is committed as a
-        // typed transcript rewrite so the persist proves a graph edge from
-        // the persisted head.
-        let system_prompt = match system_prompt {
-            Some(assembled)
-                if build_config.resume_session.is_some() && !resume_session_is_precreated_empty =>
-            {
-                let reconciliation = session
-                    .reconcile_resumed_system_prompt(
-                        assembled,
-                        Some("agent-factory/resume".to_string()),
-                    )
-                    .map_err(|err| {
-                        BuildAgentError::Config(format!(
-                            "failed to reconcile resumed system prompt: {err}"
-                        ))
-                    })?;
-                tracing::debug!(
-                    session_id = %session.id(),
-                    ?reconciliation,
-                    "reconciled explicit system prompt against resumed transcript"
-                );
-                None
-            }
-            other => other,
-        };
         if let Some(system_prompt) = system_prompt {
             builder = builder.system_prompt(system_prompt);
         }
@@ -7139,6 +7130,71 @@ mod tests {
             model_aware_compaction_config(&config, &registry, Provider::OpenAI, "gpt-5.5", None);
 
         assert_eq!(compaction.auto_compact_threshold, 840_000);
+    }
+
+    #[test]
+    fn default_compaction_byte_cap_is_resolved_per_active_provider_request() {
+        // The static config remains unset: each exact provider request witness
+        // carries the currently active fallback candidate's cap.
+        let config = Config::default();
+        let registry = config
+            .model_registry(meerkat_models::canonical())
+            .expect("registry");
+
+        let compaction = model_aware_compaction_config(
+            &config,
+            &registry,
+            Provider::Anthropic,
+            "claude-fable-5",
+            None,
+        );
+        assert_eq!(compaction.max_request_bytes, None);
+
+        let overridden = model_aware_compaction_config(
+            &config,
+            &registry,
+            Provider::Anthropic,
+            "claude-fable-5",
+            Some(std::num::NonZeroU64::new(1_234).expect("non-zero")),
+        );
+        assert_eq!(overridden.auto_compact_threshold, 1_234);
+        assert_eq!(overridden.max_request_bytes, None);
+    }
+
+    #[test]
+    fn thinking_model_default_uses_catalog_output_cap() {
+        let config = Config::default();
+        let registry = config
+            .model_registry(meerkat_models::canonical())
+            .expect("registry");
+        assert_eq!(
+            model_aware_default_max_tokens(&registry, Provider::Anthropic, "claude-fable-5",),
+            128_000
+        );
+        assert_eq!(
+            model_aware_default_max_tokens(&registry, Provider::OpenAI, "gpt-5.5"),
+            128_000,
+            "reasoning-capable models need the same catalog-aware output allowance"
+        );
+    }
+
+    #[test]
+    fn explicit_compaction_byte_cap_config_wins_over_catalog() {
+        let mut config = Config::default();
+        config.compaction.max_request_bytes = Some(4_000_000);
+        let registry = config
+            .model_registry(meerkat_models::canonical())
+            .expect("registry");
+
+        let compaction = model_aware_compaction_config(
+            &config,
+            &registry,
+            Provider::Anthropic,
+            "claude-fable-5",
+            None,
+        );
+
+        assert_eq!(compaction.max_request_bytes, Some(4_000_000));
     }
 
     #[test]
@@ -8596,12 +8652,6 @@ mod tests {
         external_filter: &ToolFilter,
         original_prompt: &str,
     ) {
-        assert!(matches!(
-            session
-                .try_checkpoint_state()
-                .expect("sticky fallback checkpoint evidence must remain coherent"),
-            meerkat_core::SessionCheckpointState::Verified(_)
-        ));
         let identity = session
             .session_metadata()
             .expect("fallback session must retain canonical metadata")
@@ -9015,6 +9065,25 @@ mod tests {
                 .expect("fallback runtime snapshot should exist");
             let runtime_snapshot: Session = serde_json::from_slice(&runtime_snapshot_bytes)
                 .expect("fallback runtime snapshot should deserialize");
+            assert_eq!(
+                authoritative
+                    .transcript_content_digest()
+                    .expect("authoritative fallback transcript digest"),
+                runtime_snapshot
+                    .transcript_content_digest()
+                    .expect("runtime fallback transcript digest"),
+                "session projection and store-owned runtime snapshot must bind the same transcript"
+            );
+            let committed_snapshot = runtime_store
+                .load_committed_whole_blob_snapshot(&runtime_id)
+                .await
+                .expect("load exact committed fallback snapshot")
+                .expect("fallback runtime authority must exist");
+            assert_eq!(
+                committed_snapshot.bytes(),
+                runtime_snapshot_bytes.as_slice(),
+                "bounded store authority must bind the exact runtime snapshot bytes"
+            );
             assert_persisted_sticky_fallback_state(
                 &runtime_snapshot,
                 BACKUP_MODEL,
@@ -9050,6 +9119,21 @@ mod tests {
             .await
             .expect("load fallback target from retained persistence")
             .expect("retained fallback session should exist");
+        let retained_snapshot = runtime_store
+            .load_committed_whole_blob_snapshot(&runtime_id)
+            .await
+            .expect("load retained fallback authority")
+            .expect("retained fallback authority must exist");
+        assert_eq!(
+            resume_session
+                .transcript_content_digest()
+                .expect("retained fallback session digest"),
+            retained_snapshot
+                .session()
+                .transcript_content_digest()
+                .expect("retained runtime authority digest"),
+            "cold resume source must match the exact store-owned runtime authority"
+        );
         assert_persisted_sticky_fallback_state(
             &resume_session,
             BACKUP_MODEL,
@@ -9124,6 +9208,25 @@ mod tests {
             .expect("rematerialized runtime snapshot should exist");
         let reloaded_snapshot: Session = serde_json::from_slice(&reloaded_snapshot_bytes)
             .expect("rematerialized runtime snapshot should deserialize");
+        assert_eq!(
+            reloaded_authoritative
+                .transcript_content_digest()
+                .expect("reloaded authoritative transcript digest"),
+            reloaded_snapshot
+                .transcript_content_digest()
+                .expect("reloaded runtime transcript digest"),
+            "rematerialized projection and runtime authority must bind the same transcript"
+        );
+        let reloaded_committed = runtime_store
+            .load_committed_whole_blob_snapshot(&runtime_id)
+            .await
+            .expect("load rematerialized exact runtime snapshot")
+            .expect("rematerialized runtime authority must exist");
+        assert_eq!(
+            reloaded_committed.bytes(),
+            reloaded_snapshot_bytes.as_slice(),
+            "store authority must bind the exact rematerialized runtime bytes"
+        );
         assert_persisted_sticky_fallback_state(
             &reloaded_snapshot,
             BACKUP_MODEL,
@@ -9353,6 +9456,7 @@ mod tests {
                 Vec::new(),
                 Vec::new(),
             )
+            .expect("empty seed must be representable")
         }
 
         fn recording_wrapper(

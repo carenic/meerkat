@@ -283,6 +283,56 @@ impl std::fmt::Display for CorrelationId {
     serde::Serialize,
     serde::Deserialize,
 )]
+pub enum DeliveryAdmissionOutcome {
+    #[default]
+    #[serde(rename = "Accepted")]
+    Accepted,
+    #[serde(rename = "Deduplicated")]
+    Deduplicated,
+}
+impl DeliveryAdmissionOutcome {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Accepted => "Accepted",
+            Self::Deduplicated => "Deduplicated",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for DeliveryAdmissionOutcome {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "Accepted" => Ok(Self::Accepted),
+            "Deduplicated" => Ok(Self::Deduplicated),
+            other => Err(format!("invalid DeliveryAdmissionOutcome value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for DeliveryAdmissionOutcome {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for DeliveryAdmissionOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum DeliveryCompletionFailureReason {
     #[default]
     #[serde(rename = "CompletionFutureFailed")]
@@ -795,6 +845,8 @@ pub enum OccurrenceLifecycleInputVariant {
     Claim,
     #[serde(rename = "DispatchStarted")]
     DispatchStarted,
+    #[serde(rename = "DispatchAccepted")]
+    DispatchAccepted,
     #[serde(rename = "AwaitCompletion")]
     AwaitCompletion,
     #[serde(rename = "Complete")]
@@ -811,6 +863,8 @@ pub enum OccurrenceLifecycleInputVariant {
     ResolveDueMisfire,
     #[serde(rename = "Supersede")]
     Supersede,
+    #[serde(rename = "RenewLease")]
+    RenewLease,
     #[serde(rename = "LeaseExpired")]
     LeaseExpired,
     #[serde(rename = "ReleaseLeaseForPausedSchedule")]
@@ -832,6 +886,7 @@ impl OccurrenceLifecycleInputVariant {
             Self::ClassifyCompletionSupersession => "ClassifyCompletionSupersession",
             Self::Claim => "Claim",
             Self::DispatchStarted => "DispatchStarted",
+            Self::DispatchAccepted => "DispatchAccepted",
             Self::AwaitCompletion => "AwaitCompletion",
             Self::Complete => "Complete",
             Self::ResolveRuntimeCompletion => "ResolveRuntimeCompletion",
@@ -840,6 +895,7 @@ impl OccurrenceLifecycleInputVariant {
             Self::ResolveTargetProbe => "ResolveTargetProbe",
             Self::ResolveDueMisfire => "ResolveDueMisfire",
             Self::Supersede => "Supersede",
+            Self::RenewLease => "RenewLease",
             Self::LeaseExpired => "LeaseExpired",
             Self::ReleaseLeaseForPausedSchedule => "ReleaseLeaseForPausedSchedule",
             Self::ClassifyTransitionFailure => "ClassifyTransitionFailure",
@@ -860,6 +916,7 @@ impl std::convert::TryFrom<&str> for OccurrenceLifecycleInputVariant {
             "ClassifyCompletionSupersession" => Ok(Self::ClassifyCompletionSupersession),
             "Claim" => Ok(Self::Claim),
             "DispatchStarted" => Ok(Self::DispatchStarted),
+            "DispatchAccepted" => Ok(Self::DispatchAccepted),
             "AwaitCompletion" => Ok(Self::AwaitCompletion),
             "Complete" => Ok(Self::Complete),
             "ResolveRuntimeCompletion" => Ok(Self::ResolveRuntimeCompletion),
@@ -868,6 +925,7 @@ impl std::convert::TryFrom<&str> for OccurrenceLifecycleInputVariant {
             "ResolveTargetProbe" => Ok(Self::ResolveTargetProbe),
             "ResolveDueMisfire" => Ok(Self::ResolveDueMisfire),
             "Supersede" => Ok(Self::Supersede),
+            "RenewLease" => Ok(Self::RenewLease),
             "LeaseExpired" => Ok(Self::LeaseExpired),
             "ReleaseLeaseForPausedSchedule" => Ok(Self::ReleaseLeaseForPausedSchedule),
             "ClassifyTransitionFailure" => Ok(Self::ClassifyTransitionFailure),
@@ -1570,6 +1628,11 @@ pub mod inputs {
         pub at_utc_ms: u64,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct DispatchAccepted {
+        pub admission_outcome: DeliveryAdmissionOutcome,
+        pub at_utc_ms: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct AwaitCompletion {
         pub at_utc_ms: u64,
     }
@@ -1612,6 +1675,12 @@ pub mod inputs {
         pub at_utc_ms: u64,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RenewLease {
+        pub claim_token: ClaimToken,
+        pub lease_expires_at_utc_ms: u64,
+        pub at_utc_ms: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct LeaseExpired {
         pub at_utc_ms: u64,
     }
@@ -1641,6 +1710,7 @@ pub enum Input {
     ClassifyCompletionSupersession(inputs::ClassifyCompletionSupersession),
     Claim(inputs::Claim),
     DispatchStarted(inputs::DispatchStarted),
+    DispatchAccepted(inputs::DispatchAccepted),
     AwaitCompletion(inputs::AwaitCompletion),
     Complete(inputs::Complete),
     ResolveRuntimeCompletion(inputs::ResolveRuntimeCompletion),
@@ -1649,6 +1719,7 @@ pub enum Input {
     ResolveTargetProbe(inputs::ResolveTargetProbe),
     ResolveDueMisfire(inputs::ResolveDueMisfire),
     Supersede(inputs::Supersede),
+    RenewLease(inputs::RenewLease),
     LeaseExpired(inputs::LeaseExpired),
     ReleaseLeaseForPausedSchedule(inputs::ReleaseLeaseForPausedSchedule),
     ClassifyTransitionFailure(inputs::ClassifyTransitionFailure),
@@ -1668,6 +1739,7 @@ impl Input {
             Self::ClassifyCompletionSupersession(_) => InputKind::ClassifyCompletionSupersession,
             Self::Claim(_) => InputKind::Claim,
             Self::DispatchStarted(_) => InputKind::DispatchStarted,
+            Self::DispatchAccepted(_) => InputKind::DispatchAccepted,
             Self::AwaitCompletion(_) => InputKind::AwaitCompletion,
             Self::Complete(_) => InputKind::Complete,
             Self::ResolveRuntimeCompletion(_) => InputKind::ResolveRuntimeCompletion,
@@ -1678,6 +1750,7 @@ impl Input {
             Self::ResolveTargetProbe(_) => InputKind::ResolveTargetProbe,
             Self::ResolveDueMisfire(_) => InputKind::ResolveDueMisfire,
             Self::Supersede(_) => InputKind::Supersede,
+            Self::RenewLease(_) => InputKind::RenewLease,
             Self::LeaseExpired(_) => InputKind::LeaseExpired,
             Self::ReleaseLeaseForPausedSchedule(_) => InputKind::ReleaseLeaseForPausedSchedule,
             Self::ClassifyTransitionFailure(_) => InputKind::ClassifyTransitionFailure,
@@ -1696,6 +1769,7 @@ pub enum InputKind {
     ClassifyCompletionSupersession,
     Claim,
     DispatchStarted,
+    DispatchAccepted,
     AwaitCompletion,
     Complete,
     ResolveRuntimeCompletion,
@@ -1704,6 +1778,7 @@ pub enum InputKind {
     ResolveTargetProbe,
     ResolveDueMisfire,
     Supersede,
+    RenewLease,
     LeaseExpired,
     ReleaseLeaseForPausedSchedule,
     ClassifyTransitionFailure,
@@ -1717,6 +1792,8 @@ pub mod effects {
     pub struct Claimed {}
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct DispatchStarted {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct DispatchAccepted {}
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct AwaitingCompletion {}
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -1759,6 +1836,8 @@ pub mod effects {
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct LeaseExpired {}
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct LeaseRenewed {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct TransitionFailureClassified {
         pub phase: OccurrenceLifecycleState,
         pub refusal_kind: OccurrenceTransitionFailureRefusalKind,
@@ -1780,6 +1859,7 @@ pub mod effects {
 pub enum Effect {
     Claimed(effects::Claimed),
     DispatchStarted(effects::DispatchStarted),
+    DispatchAccepted(effects::DispatchAccepted),
     AwaitingCompletion(effects::AwaitingCompletion),
     Completed(effects::Completed),
     Skipped(effects::Skipped),
@@ -1795,6 +1875,7 @@ pub enum Effect {
     CompletionSupersessionClassified(effects::CompletionSupersessionClassified),
     DeliveryFailed(effects::DeliveryFailed),
     LeaseExpired(effects::LeaseExpired),
+    LeaseRenewed(effects::LeaseRenewed),
     TransitionFailureClassified(effects::TransitionFailureClassified),
     LateCompletionResolutionRecorded(effects::LateCompletionResolutionRecorded),
     StaleCompletionArrivalClassified(effects::StaleCompletionArrivalClassified),
@@ -1803,6 +1884,7 @@ pub enum Effect {
 pub enum EffectKind {
     Claimed,
     DispatchStarted,
+    DispatchAccepted,
     AwaitingCompletion,
     Completed,
     Skipped,
@@ -1818,6 +1900,7 @@ pub enum EffectKind {
     CompletionSupersessionClassified,
     DeliveryFailed,
     LeaseExpired,
+    LeaseRenewed,
     TransitionFailureClassified,
     LateCompletionResolutionRecorded,
     StaleCompletionArrivalClassified,
@@ -1989,6 +2072,8 @@ pub enum TransitionId {
     RecordReceiptDeliveryFailed,
     ClaimPending,
     DispatchStartedFromClaimed,
+    DispatchAcceptedFromDispatching,
+    DispatchDeduplicatedFromDispatching,
     AwaitCompletionFromDispatching,
     AwaitCompletionAfterSupersession,
     CompleteFromDispatchingOrAwaiting,
@@ -2020,6 +2105,8 @@ pub enum TransitionId {
     LateRuntimeCompletionInternalErrorAfterSupersession,
     LateDeliveryCompletionFailureAfterSupersession,
     LateDeliveryFailureAfterSupersession,
+    RenewLeaseFromDispatching,
+    RenewLeaseFromAwaitingCompletion,
     LeaseExpiredFromClaimed,
     LeaseExpiredFromDispatching,
     LeaseExpiredFromAwaitingCompletion,

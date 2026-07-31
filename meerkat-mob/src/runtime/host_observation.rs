@@ -33,8 +33,8 @@ use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 use meerkat_contracts::wire::supervisor_bridge::{
     BRIDGE_TURN_OUTCOME_ACK_MAX, BridgeDeliveryRejectionCause, BridgeHostRuntimeIncarnation,
-    BridgeTrackedInputCancelOutcome, BridgeTurnOutcomeAck, BridgeTurnOutcomeRecord,
-    WireFlowFailureDetail, WireFlowTurnOutcome,
+    BridgeMemberIncarnation, BridgeTrackedInputCancelOutcome, BridgeTurnOutcomeAck,
+    BridgeTurnOutcomeRecord, WireFlowFailureDetail, WireFlowTurnOutcome,
 };
 use meerkat_core::event::{AgentEvent, EventEnvelope, EventSourceIdentity};
 use meerkat_core::interaction::InteractionId;
@@ -65,8 +65,21 @@ pub(crate) const TURN_OUTCOME_PAGE_MAX: usize = 64;
 /// authority is bounded to at most 16 MiB plus small row framing per member.
 pub(crate) const TURN_OUTCOME_RETAINED_MAX: usize = 256;
 
-/// Long-poll fallback re-read tick (DEC-P6E-4).
-const POLL_FALLBACK_TICK: Duration = Duration::from_millis(250);
+/// Slow safety re-read for facts that have no causal wake (DEC-P6E-4).
+///
+/// Session-event and host-projection subscriptions are the ordinary wake
+/// sources. This timer only bounds cross-process projection drift and a
+/// missing/closed subscription; it must not turn every idle member long-poll
+/// into four durable-log reads per second.
+const POLL_SAFETY_TICK: Duration = Duration::from_secs(5);
+
+/// Retry ladder after a causal wake raced ahead of its durable projection.
+///
+/// The first retry keeps normal completion latency low. Repeated empty/error
+/// reads back off to the same slow safety cadence instead of hammering the
+/// runtime/event stores throughout the 30-second terminal-bind window.
+const CAUSAL_RETRY_MIN: Duration = Duration::from_millis(100);
+const CAUSAL_RETRY_MAX: Duration = POLL_SAFETY_TICK;
 
 /// Bounded liveness window after generated completion authority resolves.
 /// A projection that misses this budget leaves the durable Pending row in
@@ -84,6 +97,10 @@ const TERMINAL_SEQ_SCAN_PAGE: usize = 256;
 
 const EVENT_SEQUENCE_EXHAUSTED: &str =
     "member event sequence space is exhausted; no successor cursor can be represented";
+
+fn advance_causal_retry(delay: Duration) -> Duration {
+    delay.saturating_mul(2).min(CAUSAL_RETRY_MAX)
+}
 
 fn checked_event_sequence_successor(
     sequence: u64,
@@ -829,6 +846,69 @@ impl Drop for ActiveTurnWatcherClaim {
     }
 }
 
+/// Await one optional session-event signal. A closed stream disables itself
+/// before returning so callers cannot busy-select a permanently-ready EOF.
+async fn wait_for_optional_event_signal(stream: &mut Option<meerkat_core::EventStream>) -> bool {
+    let Some(active) = stream.as_mut() else {
+        return std::future::pending::<bool>().await;
+    };
+    if active.next().await.is_some() {
+        true
+    } else {
+        *stream = None;
+        false
+    }
+}
+
+/// Decide whether the broad host projection changed in a way that can affect
+/// one exact member poll. Host actors republish this watch after every served
+/// command, so treating every version bump as causal would merely replace the
+/// old fixed timer with load-driven durable-store polling.
+fn projection_change_requires_poll(
+    projection: &HostObservationProjection,
+    session_key: &str,
+    expected_member: &BridgeMemberIncarnation,
+    event_frontier_exclusive: u64,
+) -> bool {
+    let Some(facts) = projection.sessions.get(session_key) else {
+        return true;
+    };
+    &facts.incarnation != expected_member
+        || facts
+            .turn_outcomes
+            .iter()
+            .any(|record| record.terminal_seq < event_frontier_exclusive)
+}
+
+/// Await one relevant host-projection signal. Unrelated host command
+/// publications are consumed inside this helper without waking a durable log
+/// read. As with the event helper, a closed watch is removed after its single
+/// terminal wake.
+async fn wait_for_relevant_projection_signal(
+    projection: &mut Option<watch::Receiver<HostObservationProjection>>,
+    session_key: &str,
+    expected_member: &BridgeMemberIncarnation,
+    event_frontier_exclusive: u64,
+) -> bool {
+    loop {
+        let Some(active) = projection.as_mut() else {
+            return std::future::pending::<bool>().await;
+        };
+        if active.changed().await.is_err() {
+            *projection = None;
+            return false;
+        }
+        if projection_change_requires_poll(
+            &active.borrow(),
+            session_key,
+            expected_member,
+            event_frontier_exclusive,
+        ) {
+            return true;
+        }
+    }
+}
+
 async fn run_pending_recovery_reconciler<F, Fut>(
     mut projection: watch::Receiver<HostObservationProjection>,
     mut recover_once: F,
@@ -837,6 +917,7 @@ async fn run_pending_recovery_reconciler<F, Fut>(
     Fut: Future<Output = usize>,
 {
     let mut backoff = PENDING_RECOVERY_RETRY_MIN;
+    let mut previous_pending_count = 0usize;
     loop {
         let pending_count = recover_once().await;
         if pending_count == 0 {
@@ -844,22 +925,33 @@ async fn run_pending_recovery_reconciler<F, Fut>(
                 return;
             }
             backoff = PENDING_RECOVERY_RETRY_MIN;
+            previous_pending_count = 0;
             continue;
         }
 
-        tokio::select! {
-            changed = projection.changed() => {
-                if changed.is_err() {
-                    return;
+        if previous_pending_count != 0 && previous_pending_count != pending_count {
+            backoff = PENDING_RECOVERY_RETRY_MIN;
+        }
+        previous_pending_count = pending_count;
+
+        // Projection changes are useful shutdown/liveness signals, but are not
+        // proof that runtime readiness changed for a durable Pending row. Keep
+        // one absolute retry deadline across any number of unrelated host
+        // projection updates so degraded recovery cannot become an unbounded
+        // zero-delay loop on a busy host.
+        let retry_at = tokio::time::Instant::now() + backoff;
+        loop {
+            tokio::select! {
+                biased;
+                () = tokio::time::sleep_until(retry_at) => break,
+                changed = projection.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
                 }
-                backoff = PENDING_RECOVERY_RETRY_MIN;
-            }
-            () = tokio::time::sleep(backoff) => {
-                backoff = backoff
-                    .saturating_mul(2)
-                    .min(PENDING_RECOVERY_RETRY_MAX);
             }
         }
+        backoff = backoff.saturating_mul(2).min(PENDING_RECOVERY_RETRY_MAX);
     }
 }
 
@@ -993,9 +1085,30 @@ impl HostMemberObservation {
         let Some(adapter) = self.session_service.runtime_adapter() else {
             return 0;
         };
-        let projection = self.projection.borrow().clone();
+        // Project only Pending custody out of the actor watch. Cloning the
+        // whole projection here also cloned every retained outcome payload
+        // (up to 16 MiB per member) on each degraded retry even though
+        // recovery never reads those rows.
+        let pending_projection = {
+            let projection = self.projection.borrow();
+            projection
+                .sessions
+                .iter()
+                .map(|(session_text, facts)| {
+                    (
+                        session_text.clone(),
+                        facts.incarnation.clone(),
+                        facts.generation,
+                        facts.fence_token,
+                        facts.pending_turns.clone(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
         let mut pending_count = 0usize;
-        for (session_text, facts) in projection.sessions {
+        for (session_text, incarnation, generation, fence_token, pending_turns) in
+            pending_projection
+        {
             let Ok(session) = SessionId::parse(&session_text) else {
                 tracing::error!(
                     session_id = %session_text,
@@ -1003,20 +1116,20 @@ impl HostMemberObservation {
                 );
                 continue;
             };
-            for pending in facts.pending_turns {
+            for pending in pending_turns {
                 pending_count = pending_count.saturating_add(1);
-                if pending.generation != facts.generation
-                    || pending.fence_token != facts.fence_token
-                    || facts.incarnation.generation != facts.generation
-                    || facts.incarnation.fence_token != facts.fence_token
-                    || facts.incarnation.member_session_id != session_text
+                if pending.generation != generation
+                    || pending.fence_token != fence_token
+                    || incarnation.generation != generation
+                    || incarnation.fence_token != fence_token
+                    || incarnation.member_session_id != session_text
                 {
                     tracing::error!(
                         session_id = %session,
                         input_id = %pending.input_id,
                         pending_generation = pending.generation,
                         pending_fence_token = pending.fence_token,
-                        projected_incarnation = ?facts.incarnation,
+                        projected_incarnation = ?incarnation,
                         "Pending recovery projection key differs from its exact current residency; retaining Pending"
                     );
                     continue;
@@ -1079,11 +1192,11 @@ impl HostMemberObservation {
                     );
                     continue;
                 };
-                if journal.member_incarnation() != &facts.incarnation {
+                if journal.member_incarnation() != &incarnation {
                     tracing::error!(
                         session_id = %session,
                         input_id = %pending.input_id,
-                        expected = ?facts.incarnation,
+                        expected = ?incarnation,
                         journal = ?journal.member_incarnation(),
                         "accepted Pending recovery found a journal for a different residency; retaining Pending"
                     );
@@ -1108,7 +1221,7 @@ impl HostMemberObservation {
                         .accept_input_with_completion_for_member_residency(
                             &session,
                             persisted_input,
-                            Some(&facts.incarnation),
+                            Some(&incarnation),
                         )
                         .await
                     {
@@ -1171,7 +1284,7 @@ impl HostMemberObservation {
                 let admission = DirectedTurnAdmission {
                     input_id: pending.input_id.clone(),
                     window: DirectedTurnWindow {
-                        expected_member: facts.incarnation.clone(),
+                        expected_member: incarnation.clone(),
                         subscription,
                         window_start: pending.window_start,
                         generation: pending.generation,
@@ -1631,12 +1744,15 @@ impl HostMemberObservation {
         let deadline = tokio::time::Instant::now() + wait;
         // Long-poll wake: subscribe the live session stream as the SIGNAL and
         // re-read the DURABLE log after each wake — the durable log is the
-        // single read authority; detached projection lag costs one extra
-        // wake/read cycle (DEC-P6E-4).
-        let mut wake =
+        // single read authority. A wake that races the detached projection
+        // enters the bounded settle ladder below (DEC-P6E-4).
+        let mut event_wake =
             MobSessionService::subscribe_session_events(self.session_service.as_ref(), session)
                 .await
                 .ok();
+        let mut projection_wake = Some(self.projection.clone());
+        let session_key = session.to_string();
+        let mut causal_retry = None;
         loop {
             // Outcomes are published through the host projection rather than
             // the durable event log. Refresh that sidecar on every long-poll
@@ -1691,22 +1807,34 @@ impl HostMemberObservation {
                 });
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let tick = remaining.min(POLL_FALLBACK_TICK);
-            match wake.as_mut() {
-                Some(stream) => {
-                    tokio::select! {
-                        item = stream.next() => {
-                            if item.is_none() {
-                                // Stream ended (session teardown): a finished
-                                // stream must never be re-polled — fall back
-                                // to the tick for the rest of the window.
-                                wake = None;
-                            }
-                        }
-                        () = tokio::time::sleep(tick) => {}
+            let delay = causal_retry.unwrap_or(POLL_SAFETY_TICK);
+            let tick = remaining.min(delay);
+            tokio::select! {
+                signalled = wait_for_optional_event_signal(&mut event_wake) => {
+                    if signalled {
+                        // The live event may precede its detached durable
+                        // projection. Re-read immediately, then use the bounded
+                        // settle ladder if the row has not landed yet.
+                        causal_retry = Some(CAUSAL_RETRY_MIN);
                     }
                 }
-                None => tokio::time::sleep(tick).await,
+                signalled = wait_for_relevant_projection_signal(
+                    &mut projection_wake,
+                    &session_key,
+                    &facts.incarnation,
+                    from_seq,
+                ) => {
+                    if signalled {
+                        // Turn-outcome sidecars are projection-owned and may
+                        // become answerable without another session event.
+                        causal_retry = Some(CAUSAL_RETRY_MIN);
+                    }
+                }
+                () = tokio::time::sleep(tick) => {
+                    if let Some(delay) = causal_retry {
+                        causal_retry = Some(advance_causal_retry(delay));
+                    }
+                }
             }
         }
     }
@@ -1762,10 +1890,13 @@ impl HostMemberObservation {
                 });
             }
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let tick = remaining.min(POLL_FALLBACK_TICK);
+            // `notified()` was created before the snapshot, so this is the
+            // race-free local condition-variable pattern: the exact ring signal
+            // or the caller's own deadline is sufficient. A periodic tick only
+            // re-locks the same unchanged in-memory rows.
             tokio::select! {
                 () = notified => {}
-                () = tokio::time::sleep(tick) => {}
+                () = tokio::time::sleep(remaining) => {}
             }
         }
     }
@@ -2354,7 +2485,7 @@ struct DirectedTurnRuntimeAttribution {
     last_boundary_sequence: Option<u64>,
     terminal_outcome: Option<meerkat_runtime::input_state::InputTerminalOutcome>,
     phase: meerkat_runtime::input_state::InputLifecycleState,
-    expected_content: meerkat_core::types::ContentInput,
+    expected_content_digest: String,
     tracking_kind: DirectedTurnTrackingKind,
 }
 
@@ -2365,16 +2496,26 @@ enum DirectedTurnTrackingKind {
 }
 
 impl DirectedTurnRuntimeAttribution {
-    /// Prove that the idempotency lookup, the stored shell, and the persisted
-    /// runtime input all name the exact Pending obligation. A Pending row is
-    /// deliberately not acceptance evidence; only this runtime-owned binding
-    /// can authorize recovery.
+    /// Prove that the idempotency lookup and runtime-owned compact attribution
+    /// name the exact Pending obligation. Nonterminal rows additionally bind
+    /// the retained replay payload; terminal rows remain recoverable after
+    /// that payload is deliberately retired.
     fn from_stored(
         pending_input_id: &str,
         stored: &meerkat_runtime::input_state::StoredInputState,
     ) -> Result<Self, String> {
         use meerkat_runtime::input_state::{InputLifecycleState, InputTerminalOutcome};
 
+        let pending_uuid = uuid::Uuid::parse_str(pending_input_id).map_err(|error| {
+            format!("Pending directed input id '{pending_input_id}' is not a UUID: {error}")
+        })?;
+        let pending_runtime_input_id = meerkat_core::lifecycle::InputId::from_uuid(pending_uuid);
+        if stored.state.input_id != pending_runtime_input_id {
+            return Err(format!(
+                "runtime input id '{}' differs from Pending '{}'",
+                stored.state.input_id, pending_input_id
+            ));
+        }
         let shell_key = stored
             .state
             .idempotency_key
@@ -2386,51 +2527,25 @@ impl DirectedTurnRuntimeAttribution {
                 shell_key.0, pending_input_id
             ));
         }
-        let persisted = stored
+        if stored.state.durability != Some(meerkat_runtime::input::InputDurability::Durable) {
+            return Err("directed-turn runtime input is not durably admitted".to_string());
+        }
+        let compact_attribution = stored
             .state
-            .persisted_input
+            .directed_run_started_attribution
             .as_ref()
-            .ok_or_else(|| "runtime input has no persisted replay payload".to_string())?;
-        if persisted.id() != &stored.state.input_id {
-            return Err(format!(
-                "persisted runtime input id '{}' differs from stored shell '{}'",
-                persisted.id(),
-                stored.state.input_id
-            ));
-        }
-        let header_key = persisted
-            .header()
-            .idempotency_key
-            .as_ref()
-            .ok_or_else(|| "persisted runtime input has no idempotency key".to_string())?;
-        if header_key.0 != pending_input_id {
-            return Err(format!(
-                "persisted input key '{}' differs from Pending '{}'",
-                header_key.0, pending_input_id
-            ));
-        }
-        if persisted.header().durability != meerkat_runtime::input::InputDurability::Durable {
-            return Err("directed-turn runtime input is not durable".to_string());
-        }
-        let expected_content = meerkat_runtime::input::directed_input_run_started_content(
-            persisted,
-        )
-        .map_err(|reason| {
-            format!(
-                "directed-turn idempotency binding points at an invalid {:?} input: {reason}",
-                persisted.kind()
-            )
-        })?;
-        let tracking_kind = match persisted {
-            meerkat_runtime::input::Input::FlowStep(_) => DirectedTurnTrackingKind::FlowStep,
-            meerkat_runtime::input::Input::Peer(_) => DirectedTurnTrackingKind::PeerInteraction,
-            other => {
-                return Err(format!(
-                    "directed-turn validation admitted unsupported {:?} input",
-                    other.kind()
-                ));
+            .ok_or_else(|| {
+                "runtime input has no compact directed RunStarted attribution".to_string()
+            })?;
+        let tracking_kind = match compact_attribution.kind() {
+            meerkat_runtime::input_state::DirectedInputKind::FlowStep => {
+                DirectedTurnTrackingKind::FlowStep
+            }
+            meerkat_runtime::input_state::DirectedInputKind::PeerMessage => {
+                DirectedTurnTrackingKind::PeerInteraction
             }
         };
+        let expected_content_digest = compact_attribution.content_digest().to_string();
         let admission_sequence = stored.seed.admission_sequence.ok_or_else(|| {
             "accepted directed-turn runtime input has no admission sequence".to_string()
         })?;
@@ -2476,6 +2591,64 @@ impl DirectedTurnRuntimeAttribution {
                     .to_string(),
             );
         }
+        if let Some(persisted) = stored.state.persisted_input.as_ref() {
+            if persisted.kind() != compact_attribution.kind().input_kind() {
+                return Err(
+                    "persisted runtime input kind disagrees with admission-stamped kind"
+                        .to_string(),
+                );
+            }
+            if persisted.id() != &stored.state.input_id {
+                return Err(format!(
+                    "persisted runtime input id '{}' differs from stored shell '{}'",
+                    persisted.id(),
+                    stored.state.input_id
+                ));
+            }
+            let header_key = persisted
+                .header()
+                .idempotency_key
+                .as_ref()
+                .ok_or_else(|| "persisted runtime input has no idempotency key".to_string())?;
+            if header_key.0 != pending_input_id {
+                return Err(format!(
+                    "persisted input key '{}' differs from Pending '{}'",
+                    header_key.0, pending_input_id
+                ));
+            }
+            if persisted.header().durability != meerkat_runtime::input::InputDurability::Durable {
+                return Err("directed-turn runtime input is not durable".to_string());
+            }
+            let payload_digest = meerkat_runtime::input::directed_input_run_started_content_digest(
+                persisted,
+            )
+            .map_err(|reason| {
+                format!(
+                    "directed-turn idempotency binding points at an invalid {:?} input: {reason}",
+                    persisted.kind()
+                )
+            })?;
+            if payload_digest != expected_content_digest {
+                return Err(
+                    "persisted directed input disagrees with compact RunStarted attribution"
+                        .to_string(),
+                );
+            }
+        } else if !phase_is_terminal {
+            return Err("nonterminal runtime input has no persisted replay payload".to_string());
+        } else {
+            let published = stored
+                .published_directed_terminal_binding()?
+                .ok_or_else(|| {
+                    "payloadless terminal directed input has no published terminal binding"
+                        .to_string()
+                })?;
+            if !published.binds(&pending_runtime_input_id, InteractionId(pending_uuid)) {
+                return Err(
+                    "published terminal binding differs from the Pending interaction".to_string(),
+                );
+            }
+        }
 
         Ok(Self {
             runtime_input_id: stored.state.input_id.clone(),
@@ -2483,7 +2656,7 @@ impl DirectedTurnRuntimeAttribution {
             last_boundary_sequence: stored.seed.last_boundary_sequence,
             terminal_outcome: stored.seed.terminal_outcome.clone(),
             phase: stored.seed.phase,
-            expected_content,
+            expected_content_digest,
             tracking_kind,
         })
     }
@@ -2491,7 +2664,7 @@ impl DirectedTurnRuntimeAttribution {
     fn same_binding(&self, next: &Self) -> bool {
         self.runtime_input_id == next.runtime_input_id
             && self.admission_sequence == next.admission_sequence
-            && self.expected_content == next.expected_content
+            && self.expected_content_digest == next.expected_content_digest
             && self.tracking_kind == next.tracking_kind
     }
 
@@ -2622,7 +2795,7 @@ struct DurableTerminalScan {
 async fn scan_durable_terminals(
     session: &SessionId,
     window_start: u64,
-    expected_content: &meerkat_core::types::ContentInput,
+    expected_content_digest: &str,
     log: &Arc<dyn DurableEventLogRead>,
 ) -> Result<DurableTerminalScan, MemberObservationError> {
     let watermark = log.latest_seq(session).await?.unwrap_or(0);
@@ -2656,7 +2829,10 @@ async fn scan_durable_terminals(
             if let AgentEvent::RunStarted { input, .. } = &envelope.payload {
                 classifier = meerkat_core::turn_terminal::TurnTerminalClassifier::default();
                 run_started_in_window = true;
-                run_matches_expected_content = input.content() == Some(expected_content);
+                run_matches_expected_content = input.content().is_some_and(|content| {
+                    meerkat_runtime::input::run_started_content_digest(content)
+                        .is_ok_and(|digest| digest == expected_content_digest)
+                });
                 matching_run_starts =
                     matching_run_starts.saturating_add(usize::from(run_matches_expected_content));
             }
@@ -2865,6 +3041,7 @@ async fn refresh_terminal_attribution(
 ) -> Option<DirectedTurnRuntimeAttribution> {
     use meerkat_runtime::service_ext::SessionServiceRuntimeExt as _;
 
+    let mut retry_delay = CAUSAL_RETRY_MIN;
     loop {
         match adapter
             .input_state_by_idempotency_key(session, pending_input_id)
@@ -2919,7 +3096,8 @@ async fn refresh_terminal_attribution(
             );
             return None;
         }
-        tokio::time::sleep(remaining.min(POLL_FALLBACK_TICK)).await;
+        tokio::time::sleep(remaining.min(retry_delay)).await;
+        retry_delay = advance_causal_retry(retry_delay);
     }
 }
 
@@ -2972,7 +3150,7 @@ async fn run_directed_turn_watcher(
     } = admission;
     let DirectedTurnWindow {
         expected_member,
-        mut subscription,
+        subscription,
         window_start,
         generation,
         fence_token,
@@ -3093,11 +3271,17 @@ async fn run_directed_turn_watcher(
         }
     };
 
-    let mut subscription_open = true;
+    let mut event_wake = Some(subscription);
+    let mut retry_delay = CAUSAL_RETRY_MIN;
     let mut traced_watermark = None;
     loop {
-        match scan_durable_terminals(&session, window_start, &attribution.expected_content, &log)
-            .await
+        match scan_durable_terminals(
+            &session,
+            window_start,
+            &attribution.expected_content_digest,
+            &log,
+        )
+        .await
         {
             Ok(scan) => {
                 if traced_watermark != Some(scan.watermark) {
@@ -3110,7 +3294,7 @@ async fn run_directed_turn_watcher(
                         watermark = scan.watermark,
                         admission_sequence = attribution.admission_sequence,
                         boundary_sequence = ?attribution.last_boundary_sequence,
-                        expected_content = ?attribution.expected_content,
+                        expected_content_digest = %attribution.expected_content_digest,
                         matching_run_starts = scan.matching_run_starts,
                         terminals = ?scan.terminals,
                         expectation = ?expectation,
@@ -3188,18 +3372,19 @@ async fn run_directed_turn_watcher(
             );
             return;
         }
-        let tick = remaining.min(POLL_FALLBACK_TICK);
-        if subscription_open {
-            tokio::select! {
-                event = subscription.next() => {
-                    if event.is_none() {
-                        subscription_open = false;
-                    }
+        let tick = remaining.min(retry_delay);
+        tokio::select! {
+            signalled = wait_for_optional_event_signal(&mut event_wake) => {
+                if signalled {
+                    // A causal event makes an immediate durable re-read useful;
+                    // if its projection is still catching up, the next empty
+                    // pass resumes at the minimum bounded delay.
+                    retry_delay = CAUSAL_RETRY_MIN;
                 }
-                () = tokio::time::sleep(tick) => {}
             }
-        } else {
-            tokio::time::sleep(tick).await;
+            () = tokio::time::sleep(tick) => {
+                retry_delay = advance_causal_retry(retry_delay);
+            }
         }
     }
 }
@@ -3317,6 +3502,24 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MobSessionService for BoundarySessionService {
+        async fn prepare_session_for_resume(
+            &self,
+            _session_id: &meerkat_core::SessionId,
+        ) -> Result<(), meerkat_core::service::SessionError> {
+            Ok(())
+        }
+
+        async fn acknowledge_committed_runtime_session_boundary_under_turn_finalization_boundary(
+            &self,
+            _session_id: &SessionId,
+            _authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+        ) -> Result<(), meerkat_core::service::SessionError> {
+            Err(meerkat_core::service::SessionError::Unsupported(
+                "boundary-observation test service has no store-owned boundary authority"
+                    .to_string(),
+            ))
+        }
+
         /// Test double: nothing durable survives archive here, so the two-read
         /// composition is the exact truth — `ArchivedNotRevivable` cannot exist.
         async fn load_session_for_resume(
@@ -3450,6 +3653,30 @@ mod tests {
         ) -> Result<Option<Vec<(u64, EventEnvelope<AgentEvent>)>>, MemberObservationError> {
             self.entered.notify_one();
             self.release.notified().await;
+            Ok(Some(Vec::new()))
+        }
+
+        async fn latest_seq(
+            &self,
+            _session: &SessionId,
+        ) -> Result<Option<u64>, MemberObservationError> {
+            Ok(Some(0))
+        }
+    }
+
+    struct CountingEmptyLog {
+        reads: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl DurableEventLogRead for CountingEmptyLog {
+        async fn read_from(
+            &self,
+            _session: &SessionId,
+            _from_seq: u64,
+            _max_rows: usize,
+        ) -> Result<Option<Vec<(u64, EventEnvelope<AgentEvent>)>>, MemberObservationError> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
             Ok(Some(Vec::new()))
         }
 
@@ -3604,6 +3831,13 @@ mod tests {
         }
     }
 
+    fn current_content_digest() -> String {
+        meerkat_runtime::input::run_started_content_digest(
+            &meerkat_core::types::ContentInput::Text("current".to_string()),
+        )
+        .expect("fixture RunStarted content should digest")
+    }
+
     fn terminal_attribution(boundary_sequence: u64) -> DirectedTurnRuntimeAttribution {
         DirectedTurnRuntimeAttribution {
             runtime_input_id: meerkat_core::lifecycle::InputId::new(),
@@ -3611,7 +3845,7 @@ mod tests {
             last_boundary_sequence: Some(boundary_sequence),
             terminal_outcome: Some(meerkat_runtime::input_state::InputTerminalOutcome::Consumed),
             phase: meerkat_runtime::input_state::InputLifecycleState::Consumed,
-            expected_content: meerkat_core::types::ContentInput::Text("current".to_string()),
+            expected_content_digest: current_content_digest(),
             tracking_kind: DirectedTurnTrackingKind::FlowStep,
         }
     }
@@ -3636,9 +3870,13 @@ mod tests {
         .expect("test directed input id is a UUID");
         let mut stored =
             meerkat_runtime::input_state::StoredInputState::new_accepted(input.id().clone());
+        stored.state.directed_run_started_attribution =
+            meerkat_runtime::input_state::DirectedRunStartedAttribution::from_input(&input)
+                .expect("fixture directed input should validate");
         stored.state.idempotency_key = Some(meerkat_runtime::identifiers::IdempotencyKey::new(
             pending_input_id,
         ));
+        stored.state.durability = Some(meerkat_runtime::input::InputDurability::Durable);
         stored.state.persisted_input = Some(input);
         stored.seed.phase = meerkat_runtime::input_state::InputLifecycleState::Queued;
         stored.seed.admission_sequence = Some(12);
@@ -3653,6 +3891,7 @@ mod tests {
         let input = meerkat_runtime::input::Input::Peer(meerkat_runtime::input::PeerInput {
             directed_interaction_id: Some(InteractionId(stable)),
             objective_id: Some(meerkat_core::interaction::ObjectiveId::new()),
+            system_prompts: Vec::new(),
             injected_context: vec![meerkat_core::types::ContentInput::Text(
                 "private ambient context".to_string(),
             )],
@@ -3694,13 +3933,57 @@ mod tests {
         });
         let mut stored =
             meerkat_runtime::input_state::StoredInputState::new_accepted(input.id().clone());
+        stored.state.directed_run_started_attribution =
+            meerkat_runtime::input_state::DirectedRunStartedAttribution::from_input(&input)
+                .expect("fixture directed peer input should validate");
         stored.state.idempotency_key = Some(meerkat_runtime::identifiers::IdempotencyKey::new(
             pending_input_id,
         ));
+        stored.state.durability = Some(meerkat_runtime::input::InputDurability::Durable);
         stored.state.persisted_input = Some(input);
         stored.seed.phase = meerkat_runtime::input_state::InputLifecycleState::Queued;
         stored.seed.admission_sequence = Some(13);
         stored
+    }
+
+    fn published_payloadless_terminal(
+        stored: meerkat_runtime::input_state::StoredInputState,
+        pending_input_id: &str,
+    ) -> meerkat_runtime::input_state::StoredInputState {
+        let mut json = serde_json::to_value(stored).expect("serialize directed fixture");
+        json["current_state"] = serde_json::json!("consumed");
+        json["terminal_outcome"] = serde_json::json!({ "outcome_type": "consumed" });
+        json["last_run_id"] = serde_json::json!("00000000-0000-4000-8000-0000000000bb");
+        json["last_boundary_sequence"] = serde_json::json!(17);
+        json.as_object_mut()
+            .expect("stored input fixture is an object")
+            .remove("persisted_input");
+        json["interaction_terminal_outbox"] = serde_json::json!({
+            "interaction_id": pending_input_id,
+            "input_id": pending_input_id,
+            "batch_ordinal": 0,
+            "batch_key": {
+                "scope": "run",
+                "run_id": "00000000-0000-4000-8000-0000000000bb"
+            },
+            "owner_session_id": "00000000-0000-4000-8000-0000000000cc",
+            "owner_agent_runtime_id": "runtime-a",
+            "owner_fence_token": 7,
+            "owner_runtime_generation": 3,
+            "owner_runtime_epoch_id": "epoch-3",
+            "candidate_owner_input_id": pending_input_id,
+            "candidate_digest": "candidate-digest",
+            "completion_input_ids_digest": "recipient-digest",
+            "phase": {
+                "phase": "published",
+                "finalization_failed": false,
+                "publication": {
+                    "terminal_seq": 19,
+                    "payload_digest": "published-payload-digest"
+                }
+            }
+        });
+        serde_json::from_value(json).expect("decode published payloadless directed fixture")
     }
 
     fn outcome(input_id: &str) -> BridgeTurnOutcomeRecord {
@@ -3877,6 +4160,77 @@ mod tests {
                 "same_generation_fence_rotation={same_generation_fence_rotation}: {error:?}"
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_durable_poll_uses_slow_safety_sweep() {
+        let session = SessionId::new();
+        let expected = incarnation(&session, 3, 5);
+        let facts = SessionObservationFacts {
+            mob_id: expected.mob_id.clone(),
+            agent_identity: expected.agent_identity.clone(),
+            generation: expected.generation,
+            fence_token: expected.fence_token,
+            incarnation: expected.clone(),
+            generation_start_seq: 1,
+            pending_turns: Vec::new(),
+            turn_outcomes: Vec::new(),
+        };
+        let (_projection_tx, projection_rx) = watch::channel(HostObservationProjection {
+            sessions: BTreeMap::from([(session.to_string(), facts)]),
+        });
+        let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let log = Arc::new(CountingEmptyLog {
+            reads: Arc::clone(&reads),
+        });
+        let (pending_tx, _pending_rx) = mpsc::channel(1);
+        let (outcome_ack_tx, _outcome_ack_rx) = mpsc::channel(1);
+        let observation = Arc::new(HostMemberObservation::new(
+            BridgeHostRuntimeIncarnation::new(),
+            Arc::new(BoundarySessionService::default()),
+            Some(log),
+            projection_rx,
+            pending_tx,
+            outcome_ack_tx,
+        ));
+        let poll_observation = Arc::clone(&observation);
+        let poll_session = session.clone();
+        let poll_expected = expected.clone();
+        let poll = tokio::spawn(async move {
+            poll_observation
+                .poll_events(
+                    &poll_session,
+                    MemberEventsPollRequest {
+                        expected_member: &poll_expected,
+                        cursor: MemberObservationCursor::Tail,
+                        max: 1,
+                        wait: POLL_SAFETY_TICK * 2,
+                        outcome_acks: &[],
+                        max_outcomes: 1,
+                    },
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(reads.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(
+            POLL_SAFETY_TICK
+                .checked_sub(Duration::from_millis(1))
+                .expect("safety tick exceeds one millisecond"),
+        )
+        .await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "idle durable polling must not restore the historical 250ms scan"
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        poll.abort();
     }
 
     #[tokio::test]
@@ -4676,14 +5030,10 @@ mod tests {
                 run_started(&session, "current"),
             ),
         ]));
-        let scan = scan_durable_terminals(
-            &session,
-            41,
-            &meerkat_core::types::ContentInput::Text("current".to_string()),
-            &log,
-        )
-        .await
-        .expect("scan");
+        let expected_content_digest = current_content_digest();
+        let scan = scan_durable_terminals(&session, 41, &expected_content_digest, &log)
+            .await
+            .expect("scan");
         assert_eq!(scan.matching_run_starts, 2);
 
         let expectation = CompletionTerminalExpectation::Completed {
@@ -4744,14 +5094,10 @@ mod tests {
                 interaction_completed(interaction_b, "same-result"),
             ),
         ]));
-        let scan = scan_durable_terminals(
-            &session,
-            41,
-            &meerkat_core::types::ContentInput::Text("current".to_string()),
-            &log,
-        )
-        .await
-        .expect("scan");
+        let expected_content_digest = current_content_digest();
+        let scan = scan_durable_terminals(&session, 41, &expected_content_digest, &log)
+            .await
+            .expect("scan");
         assert_eq!(scan.matching_run_starts, 2);
         assert!(
             scan.terminals
@@ -4905,7 +5251,15 @@ mod tests {
         assert!(
             DirectedTurnRuntimeAttribution::from_stored(PENDING_ONE, &runtime_id_mismatch)
                 .expect_err("runtime input-id mismatch must fail closed")
-                .contains("persisted runtime input id")
+                .contains("runtime input id")
+        );
+
+        let mut nondurable = stored_directed_turn(PENDING_ONE);
+        nondurable.state.durability = Some(meerkat_runtime::input::InputDurability::Ephemeral);
+        assert!(
+            DirectedTurnRuntimeAttribution::from_stored(PENDING_ONE, &nondurable)
+                .expect_err("nondurable runtime input must fail closed")
+                .contains("not durably admitted")
         );
     }
 
@@ -4918,8 +5272,11 @@ mod tests {
         assert!(!attribution.is_terminal());
         assert_eq!(attribution.admission_sequence, 12);
         assert_eq!(
-            attribution.expected_content,
-            meerkat_core::types::ContentInput::Text("Flow step step-1\ncurrent".to_string())
+            attribution.expected_content_digest,
+            meerkat_runtime::input::run_started_content_digest(
+                &meerkat_core::types::ContentInput::Text("Flow step step-1\ncurrent".to_string())
+            )
+            .expect("expected fixture content should digest")
         );
 
         let mut missing_payload = stored;
@@ -4932,6 +5289,29 @@ mod tests {
     }
 
     #[test]
+    fn payloadless_terminal_requires_exact_published_runtime_binding() {
+        let stored = stored_directed_turn(PENDING_ONE);
+        let mut unproved = stored.clone();
+        unproved.seed.phase = meerkat_runtime::input_state::InputLifecycleState::Consumed;
+        unproved.seed.terminal_outcome =
+            Some(meerkat_runtime::input_state::InputTerminalOutcome::Consumed);
+        unproved.seed.last_run_id = Some(meerkat_core::lifecycle::RunId::new());
+        unproved.seed.last_boundary_sequence = Some(17);
+        unproved.state.persisted_input = None;
+        assert!(
+            DirectedTurnRuntimeAttribution::from_stored(PENDING_ONE, &unproved)
+                .expect_err("payloadless terminal without publication proof must fail closed")
+                .contains("no published terminal binding")
+        );
+
+        let published = published_payloadless_terminal(stored, PENDING_ONE);
+        let attribution = DirectedTurnRuntimeAttribution::from_stored(PENDING_ONE, &published)
+            .expect("published terminal binding authorizes compact recovery");
+        assert!(attribution.is_terminal());
+        assert_eq!(attribution.last_boundary_sequence, Some(17));
+    }
+
+    #[test]
     fn tracked_peer_live_attach_and_pending_recovery_share_exact_attribution() {
         let stored = stored_directed_peer_turn(ACCEPTED_BEFORE_WATCHER);
         let persisted = stored
@@ -4941,6 +5321,8 @@ mod tests {
             .expect("tracked peer remains replayable");
         let expected = meerkat_runtime::input::directed_input_run_started_content(persisted)
             .expect("tracked peer has a canonical RunStarted projection");
+        let expected_digest = meerkat_runtime::input::run_started_content_digest(&expected)
+            .expect("tracked peer projection should digest");
 
         // `admit_directed_turn` and the cold Pending reconciler both enter
         // through this constructor. A peer accepted before watcher attachment
@@ -4956,20 +5338,12 @@ mod tests {
             live.tracking_kind,
             DirectedTurnTrackingKind::PeerInteraction
         );
-        assert_eq!(live.expected_content, expected);
+        assert_eq!(live.expected_content_digest, expected_digest);
         assert_eq!(live.admission_sequence, 13);
+        assert!(expected.text_content().contains("private ambient context"));
+        assert!(expected.text_content().contains("durable placed kickoff"));
         assert!(
-            live.expected_content
-                .text_content()
-                .contains("private ambient context")
-        );
-        assert!(
-            live.expected_content
-                .text_content()
-                .contains("durable placed kickoff")
-        );
-        assert!(
-            matches!(live.expected_content, meerkat_core::types::ContentInput::Blocks(ref blocks) if blocks.iter().any(|block| matches!(block, meerkat_core::types::ContentBlock::Image { .. })))
+            matches!(expected, meerkat_core::types::ContentInput::Blocks(ref blocks) if blocks.iter().any(|block| matches!(block, meerkat_core::types::ContentBlock::Image { .. })))
         );
 
         let mut untracked = stored;
@@ -5046,6 +5420,100 @@ mod tests {
             .expect("second pass reattaches without a host restart");
         assert_eq!(attempts.load(Ordering::SeqCst), 2);
         task.abort();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_projection_churn_cannot_bypass_retry_deadline() {
+        let (projection_tx, projection_rx) = watch::channel(HostObservationProjection::default());
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let task_attempts = Arc::clone(&attempts);
+        let task = tokio::spawn(run_pending_recovery_reconciler(projection_rx, move || {
+            let attempts = Arc::clone(&task_attempts);
+            async move {
+                attempts.fetch_add(1, Ordering::SeqCst);
+                1
+            }
+        }));
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        // Busy host-projection traffic is not runtime-readiness evidence. It
+        // may be consumed for closure detection, but cannot trigger another
+        // durable recovery pass before the absolute retry deadline.
+        for _ in 0..32 {
+            projection_tx.send_replace(HostObservationProjection::default());
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+
+        tokio::time::advance(PENDING_RECOVERY_RETRY_MIN).await;
+        tokio::task::yield_now().await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        task.abort();
+    }
+
+    #[test]
+    fn causal_retry_reaches_safety_cadence_without_overflow() {
+        let mut delay = CAUSAL_RETRY_MIN;
+        let mut observed = Vec::new();
+        for _ in 0..16 {
+            observed.push(delay);
+            delay = advance_causal_retry(delay);
+        }
+        assert_eq!(observed.first().copied(), Some(CAUSAL_RETRY_MIN));
+        assert_eq!(delay, CAUSAL_RETRY_MAX);
+        assert!(
+            observed.windows(2).all(|pair| pair[0] <= pair[1]),
+            "causal retry delay must be monotonic"
+        );
+    }
+
+    #[test]
+    fn broad_projection_wake_is_causal_only_for_exact_member_poll() {
+        let session = SessionId::new();
+        let expected = incarnation(&session, 3, 5);
+        let facts = SessionObservationFacts {
+            incarnation: expected.clone(),
+            mob_id: expected.mob_id.clone(),
+            agent_identity: expected.agent_identity.clone(),
+            generation: expected.generation,
+            fence_token: expected.fence_token,
+            generation_start_seq: 1,
+            pending_turns: Vec::new(),
+            turn_outcomes: vec![outcome("directed")],
+        };
+        let projection = HostObservationProjection {
+            sessions: BTreeMap::from([(session.to_string(), facts)]),
+        };
+
+        assert!(
+            !projection_change_requires_poll(&projection, &session.to_string(), &expected, 7),
+            "a sidecar at the event frontier is not answerable yet"
+        );
+        assert!(
+            projection_change_requires_poll(&projection, &session.to_string(), &expected, 8),
+            "an exact-member sidecar below the event frontier must wake the poll"
+        );
+        assert!(projection_change_requires_poll(
+            &HostObservationProjection::default(),
+            &session.to_string(),
+            &expected,
+            7,
+        ));
+
+        let mut replacement = projection;
+        replacement
+            .sessions
+            .get_mut(&session.to_string())
+            .expect("session facts")
+            .incarnation
+            .fence_token += 1;
+        assert!(projection_change_requires_poll(
+            &replacement,
+            &session.to_string(),
+            &expected,
+            7,
+        ));
     }
 
     #[test]

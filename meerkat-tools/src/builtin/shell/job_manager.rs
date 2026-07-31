@@ -40,12 +40,19 @@ use super::monitor_protocol::{
     MonitorAction, MonitorLineOutcome, MonitorOutputProtocol, MonitorProtocolDecoder,
     MonitorProtocolLimits,
 };
-use super::process_lifecycle::{OwnedProcessGroup, join_output_bounded};
+use super::process_lifecycle::{OwnedProcessGroup, join_output_bounded, join_reader_bounded};
 use super::types::{BackgroundJob, JobId, JobStatus, JobSummary, JobSummaryStatus};
 
 const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
 const MAX_VISIBLE_ORIGIN_JOBS: usize = 10_000;
 const LEASE_SETTLEMENT_MARGIN: Duration = Duration::from_secs(60);
+#[cfg(not(test))]
+const MONITOR_SETTLEMENT_STORE_TIMEOUT: Duration = Duration::from_secs(2);
+#[cfg(test)]
+const MONITOR_SETTLEMENT_STORE_TIMEOUT: Duration = Duration::from_millis(50);
+const ATTEMPT_SETTLEMENT_BASE_CONFLICT_BUDGET: usize = 4;
+const ATTEMPT_SETTLEMENT_MAX_BACKOFF: Duration = Duration::from_millis(16);
+const PROCESS_CONTAINMENT_MAX_BACKOFF: Duration = Duration::from_secs(1);
 const SHELL_RUNNER_MEDIA_TYPE: &str = "application/vnd.meerkat.shell-runner+json";
 const SHELL_RESULT_MEDIA_TYPE: &str = "application/vnd.meerkat.shell-result+json";
 
@@ -325,6 +332,17 @@ impl JobManager {
             .map_err(shell_job_error)?;
         for job in &loss_observed {
             if job.machine_state.lifecycle_phase != JobPhase::LossObserved {
+                continue;
+            }
+            // A cancellation accepted before the worker lease expired remains
+            // the durable lifecycle intent. Let the generated
+            // RequestCancelLossObserved arm terminalize it before considering
+            // replay, checkpoint resume, or worker-loss classification.
+            if job.machine_state.cancel_requested {
+                service
+                    .request_cancel(&job.job_id)
+                    .await
+                    .map_err(shell_job_error)?;
                 continue;
             }
             match job.spec.restart_class {
@@ -1111,13 +1129,16 @@ impl JobManager {
                 })?;
             return Ok(CancelJobDisposition::Cancelled);
         }
+        if requested.terminal_result.is_some() {
+            return Err(ShellError::JobNotRunning);
+        }
         if let Some(attempt) = self.active_attempts.lock().await.get(job_id) {
             attempt.cancel.notify_one();
-            return Ok(CancelJobDisposition::CancellationRequested);
         }
-        Err(shell_io(
-            "cancel request is durable but no live shell attempt can acknowledge containment",
-        ))
+        // The active attempt may be owned by another manager instance. Its
+        // heartbeat observes the durable cancel_requested fact and performs
+        // containment; local Notify is only a latency optimization.
+        Ok(CancelJobDisposition::CancellationRequested)
     }
 
     pub async fn remove_job(&self, job_id: &JobId) -> bool {
@@ -1322,6 +1343,7 @@ fn spawn_monitor_attempt_task(
         }
         let service = durable.service();
         let mut last_progress_cursor = resume_progress_cursor;
+        let mut last_heartbeat_at_ms = unix_time_ms();
         let mut stdout_open = true;
         let wait_outcome = {
             let child_wait = child.wait();
@@ -1371,29 +1393,64 @@ fn spawn_monitor_attempt_task(
                                         .map_err(shell_job_error)
                                         {
                                             Ok(notification) => {
-                                                match service
-                                                    .emit_notification(
-                                                        &job_id,
-                                                        write.clone(),
-                                                        unix_time_ms(),
-                                                        notification,
-                                                    )
-                                                    .await
-                                                {
-                                                    Ok(_) => {
-                                                        if let Err(error) = durable
-                                                            .delivery_projector
-                                                            .project_job(public_job_id.as_ref())
-                                                            .await
-                                                        {
-                                                            warn!(
-                                                                job_id = %public_job_id,
-                                                                %error,
-                                                                "monitor notification remains pending in the durable job outbox"
-                                                            );
-                                                        }
+                                                // A notification commit may
+                                                // wait behind a contended
+                                                // persistent store. Keep that
+                                                // write independently owned so
+                                                // cancel/timeout remains a
+                                                // control-plane edge, not a
+                                                // best-effort poll between
+                                                // application awaits.
+                                                let notification_service = service.clone();
+                                                let notification_job_id = job_id.clone();
+                                                let notification_write = write.clone();
+                                                let notification_public_job_id =
+                                                    public_job_id.clone();
+                                                let notification_commit = tokio::spawn(async move {
+                                                    let result = notification_service
+                                                        .emit_notification(
+                                                            &notification_job_id,
+                                                            notification_write,
+                                                            unix_time_ms(),
+                                                            notification,
+                                                        )
+                                                        .await;
+                                                    if let Err(error) = &result {
+                                                        warn!(
+                                                            job_id = %notification_public_job_id,
+                                                            %error,
+                                                            "monitor notification commit failed"
+                                                        );
+                                                    }
+                                                    result
+                                                });
+                                                let notification_result = tokio::select! {
+                                                    biased;
+                                                    () = cancel.notified() => {
+                                                        break MonitorWaitOutcome::Cancelled;
+                                                    }
+                                                    () = &mut timeout => {
+                                                        break MonitorWaitOutcome::TimedOut;
+                                                    }
+                                                    result = notification_commit => result,
+                                                };
+                                                match notification_result {
+                                                    Ok(Ok(_)) => {
+                                                        // Runtime-inbox
+                                                        // projection is owned
+                                                        // by the durable
+                                                        // delivery driver. It
+                                                        // must never delay
+                                                        // monitor liveness.
                                                     }
                                                     Err(error) => {
+                                                        break MonitorWaitOutcome::WaitFailed(
+                                                            format!(
+                                                                "monitor notification task failed: {error}"
+                                                            ),
+                                                        );
+                                                    }
+                                                    Ok(Err(error)) => {
                                                         break MonitorWaitOutcome::WaitFailed(
                                                             format!(
                                                                 "monitor notification commit failed: {error}"
@@ -1564,18 +1621,40 @@ fn spawn_monitor_attempt_task(
                         let heartbeat_at_ms = unix_time_ms();
                         let lease_expires_at_ms =
                             attempt_lease_expiry_ms(heartbeat_at_ms, timeout_secs);
-                        if let Err(error) = service
-                            .renew_lease(
-                                &job_id,
-                                write.clone(),
-                                heartbeat_at_ms,
-                                lease_expires_at_ms,
-                            )
-                            .await
-                        {
-                            break MonitorWaitOutcome::WaitFailed(format!(
-                                "monitor lease renewal failed: {error}"
-                            ));
+                        let renewal = spawn_attempt_lease_renewal(
+                            service.clone(),
+                            job_id.clone(),
+                            write.clone(),
+                            heartbeat_at_ms,
+                            lease_expires_at_ms,
+                        );
+                        let renewal_result = tokio::select! {
+                            biased;
+                            () = cancel.notified() => {
+                                break MonitorWaitOutcome::Cancelled;
+                            }
+                            () = &mut timeout => {
+                                break MonitorWaitOutcome::TimedOut;
+                            }
+                            result = renewal => result,
+                        };
+                        match renewal_result {
+                            Ok(Ok(snapshot)) if snapshot.cancel_requested => {
+                                break MonitorWaitOutcome::Cancelled;
+                            }
+                            Ok(Ok(_)) => {
+                                last_heartbeat_at_ms = heartbeat_at_ms;
+                            }
+                            Ok(Err(error)) => {
+                                break MonitorWaitOutcome::WaitFailed(format!(
+                                    "monitor lease renewal failed: {error}"
+                                ));
+                            }
+                            Err(error) => {
+                                break MonitorWaitOutcome::WaitFailed(format!(
+                                    "monitor lease renewal task failed: {error}"
+                                ));
+                            }
                         }
                     }
                 }
@@ -1586,25 +1665,149 @@ fn spawn_monitor_attempt_task(
         // before containment so a producer cannot remain pipe-blocked behind
         // post-completion output while the process group is asked to exit.
         drop(stdout_rx);
+        // Containment is the first await after the control loop. No store or
+        // delivery work may delay revoking the process group's ability to
+        // execute.
+        let mut containment_failures = 0usize;
         loop {
             match process_group.terminate(&mut child).await {
                 Ok(()) => break,
                 Err(error) => {
-                    warn!(job_id = %public_job_id, %error, "monitor containment unproven; retrying");
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    containment_failures = containment_failures.saturating_add(1);
+                    warn!(
+                        job_id = %public_job_id,
+                        %error,
+                        containment_failures,
+                        "monitor containment unproven; retaining ownership and retrying"
+                    );
+                    let heartbeat_at_ms = unix_time_ms();
+                    match spawn_attempt_lease_renewal(
+                        service.clone(),
+                        job_id.clone(),
+                        write.clone(),
+                        heartbeat_at_ms,
+                        attempt_lease_expiry_ms(heartbeat_at_ms, timeout_secs),
+                    )
+                    .await
+                    {
+                        Ok(Ok(_)) => last_heartbeat_at_ms = heartbeat_at_ms,
+                        Ok(Err(renew_error)) => {
+                            warn!(
+                                job_id = %public_job_id,
+                                %renew_error,
+                                "monitor containment retry lease renewal was rejected"
+                            );
+                        }
+                        Err(renew_error) => {
+                            warn!(
+                                job_id = %public_job_id,
+                                %renew_error,
+                                "monitor containment retry lease task failed"
+                            );
+                        }
+                    }
+                    tokio::time::sleep(process_containment_retry_backoff(containment_failures))
+                        .await;
                 }
             }
         }
+        let mut cancellation_was_requested = matches!(&wait_outcome, MonitorWaitOutcome::Cancelled);
+        // Containment is the cancellation acknowledgement boundary. Commit it
+        // before bounded reader drains, diagnostic processing, or any other
+        // store write can consume the lease's settlement margin.
+        let mut cancellation_terminal = if cancellation_was_requested {
+            Some(
+                settle_attempt_after_containment(
+                    &service,
+                    &job_id,
+                    write.clone(),
+                    unix_time_ms(),
+                    AttemptSettlement::Cancel,
+                )
+                .await,
+            )
+        } else {
+            None
+        };
         if let Some(task) = stdout_task {
-            let _ = task.await;
+            join_reader_bounded(task, "durable monitor stdout").await;
         }
         let stderr = match stderr_task {
             Some(task) => join_output_bounded(task, "durable monitor stderr").await,
             None => Vec::new(),
         };
+        // Cancellation was acknowledged immediately after containment. A
+        // redundant renewal here would add a second SQLite CAS between the
+        // durable cancel request and terminality; if that best-effort write
+        // timed out, returning would strand the job in Running with
+        // cancel_requested=true.
+        if !cancellation_was_requested {
+            let heartbeat_at_ms = unix_time_ms().max(last_heartbeat_at_ms.saturating_add(1));
+            if let Err(error) = renew_monitor_settlement_lease_bounded(
+                service.clone(),
+                job_id.clone(),
+                write.clone(),
+                heartbeat_at_ms,
+                attempt_lease_expiry_ms(heartbeat_at_ms, timeout_secs),
+            )
+            .await
+            {
+                match acknowledge_committed_monitor_cancel(
+                    &service,
+                    &job_id,
+                    write.clone(),
+                    unix_time_ms(),
+                )
+                .await
+                {
+                    Ok(Some(cancelled)) => {
+                        cancellation_was_requested = true;
+                        cancellation_terminal = Some(Ok(cancelled));
+                    }
+                    Ok(None) => {
+                        warn!(
+                            job_id = %public_job_id,
+                            %error,
+                            "monitor settlement lease renewal failed; converging terminal state against any late renewal"
+                        );
+                    }
+                    Err(cancel_error) => {
+                        warn!(
+                            job_id = %public_job_id,
+                            %error,
+                            %cancel_error,
+                            "monitor settlement renewal failed and cancellation observation was unavailable; converging terminal state"
+                        );
+                    }
+                }
+            }
+            if !cancellation_was_requested {
+                match acknowledge_committed_monitor_cancel(
+                    &service,
+                    &job_id,
+                    write.clone(),
+                    unix_time_ms(),
+                )
+                .await
+                {
+                    Ok(Some(cancelled)) => {
+                        cancellation_was_requested = true;
+                        cancellation_terminal = Some(Ok(cancelled));
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        warn!(
+                            job_id = %public_job_id,
+                            %error,
+                            "monitor cancellation observation failed before terminal settlement; settlement will reload authoritative state"
+                        );
+                    }
+                }
+            }
+        }
         let diagnostics = decoder.retained_diagnostics();
         let protocol_health = decoder.health();
-        if protocol_health.diagnostic_bytes_dropped > 0 {
+        if !cancellation_was_requested && protocol_health.diagnostic_bytes_dropped > 0 {
             report_monitor_health(
                 &service,
                 &job_id,
@@ -1626,6 +1829,11 @@ fn spawn_monitor_attempt_task(
         );
         let duration_secs = started.elapsed().as_secs_f64();
         let completed_at_ms = unix_time_ms();
+        let wait_outcome = if cancellation_was_requested {
+            MonitorWaitOutcome::Cancelled
+        } else {
+            wait_outcome
+        };
         let (view_status, terminal) = match wait_outcome {
             MonitorWaitOutcome::Exited(Some(0)) | MonitorWaitOutcome::ExplicitComplete => {
                 let result = ShellResultRecord {
@@ -1642,48 +1850,58 @@ fn spawn_monitor_attempt_task(
                             stderr,
                             duration_secs,
                         },
-                        service
-                            .complete_attempt(
-                                &job_id,
-                                write.clone(),
-                                completed_at_ms,
-                                Some(result_ref),
-                            )
-                            .await,
+                        settle_attempt_after_containment(
+                            &service,
+                            &job_id,
+                            write.clone(),
+                            completed_at_ms,
+                            AttemptSettlement::Complete {
+                                result_ref: Some(result_ref),
+                            },
+                        )
+                        .await,
                     ),
                     Err(error) => (
                         JobStatus::Failed {
                             error: error.to_string(),
                             duration_secs,
                         },
-                        fail_shell_attempt(
+                        settle_attempt_after_containment(
                             &service,
                             &job_id,
                             write.clone(),
                             completed_at_ms,
-                            "monitor_result_persistence_failed",
+                            AttemptSettlement::Fail {
+                                code: "monitor_result_persistence_failed",
+                                detail_ref: None,
+                            },
                         )
                         .await,
                     ),
                 }
             }
-            MonitorWaitOutcome::Cancelled => (
-                JobStatus::Cancelled { duration_secs },
-                service
-                    .acknowledge_cancel(&job_id, write.clone(), completed_at_ms)
-                    .await,
-            ),
+            MonitorWaitOutcome::Cancelled => {
+                let terminal = cancellation_terminal.unwrap_or_else(|| {
+                    Err(DetachedJobError::Store(
+                        "monitor cancellation reached settlement without an acknowledgement".into(),
+                    ))
+                });
+                (JobStatus::Cancelled { duration_secs }, terminal)
+            }
             MonitorWaitOutcome::TimedOut => (
                 JobStatus::Failed {
                     error: "monitor timed out".into(),
                     duration_secs,
                 },
-                fail_shell_attempt(
+                settle_attempt_after_containment(
                     &service,
                     &job_id,
                     write.clone(),
                     completed_at_ms,
-                    "monitor_timeout",
+                    AttemptSettlement::Fail {
+                        code: "monitor_timeout",
+                        detail_ref: None,
+                    },
                 )
                 .await,
             ),
@@ -1692,12 +1910,15 @@ fn spawn_monitor_attempt_task(
                     error: format!("monitor exited with {exit_code:?}"),
                     duration_secs,
                 },
-                fail_shell_attempt(
+                settle_attempt_after_containment(
                     &service,
                     &job_id,
                     write.clone(),
                     completed_at_ms,
-                    "monitor_exit_nonzero",
+                    AttemptSettlement::Fail {
+                        code: "monitor_exit_nonzero",
+                        detail_ref: None,
+                    },
                 )
                 .await,
             ),
@@ -1706,12 +1927,15 @@ fn spawn_monitor_attempt_task(
                     error,
                     duration_secs,
                 },
-                fail_shell_attempt(
+                settle_attempt_after_containment(
                     &service,
                     &job_id,
                     write.clone(),
                     completed_at_ms,
-                    "monitor_runner_failed",
+                    AttemptSettlement::Fail {
+                        code: "monitor_runner_failed",
+                        detail_ref: None,
+                    },
                 )
                 .await,
             ),
@@ -1860,6 +2084,17 @@ async fn finalize_attempt_projection(
 ) {
     match terminal {
         Ok(snapshot) => {
+            let view_status = match reconcile_terminal_view(&snapshot, view_status) {
+                Ok(status) => status,
+                Err(error) => {
+                    warn!(
+                        job_id = %public_job_id,
+                        %error,
+                        "durable terminal snapshot could not be reconciled; refusing projection"
+                    );
+                    return;
+                }
+            };
             if let Some(projection) = projections.lock().await.get_mut(public_job_id) {
                 projection.view.status = view_status.clone();
             }
@@ -1910,6 +2145,47 @@ async fn finalize_attempt_projection(
                 "durable attempt terminal commit failed; refusing volatile terminal projection"
             );
         }
+    }
+}
+
+fn reconcile_terminal_view(
+    snapshot: &meerkat_jobs::JobSnapshot,
+    proposed: JobStatus,
+) -> Result<JobStatus, DetachedJobError> {
+    let duration_secs = match &proposed {
+        JobStatus::Completed { duration_secs, .. }
+        | JobStatus::Failed { duration_secs, .. }
+        | JobStatus::Cancelled { duration_secs } => *duration_secs,
+        JobStatus::Queued
+        | JobStatus::Running { .. }
+        | JobStatus::WorkerLost { .. }
+        | JobStatus::NeedsAttention { .. } => 0.0,
+    };
+    match snapshot.terminal_result.as_ref() {
+        Some(JobTerminalResult::Succeeded { .. }) => match proposed {
+            completed @ JobStatus::Completed { .. } => Ok(completed),
+            _ => Ok(JobStatus::Completed {
+                exit_code: None,
+                stdout: String::new(),
+                stderr: String::new(),
+                duration_secs,
+            }),
+        },
+        Some(JobTerminalResult::Failed { code, .. }) => Ok(JobStatus::Failed {
+            error: code.to_string(),
+            duration_secs,
+        }),
+        Some(JobTerminalResult::Cancelled) => Ok(JobStatus::Cancelled { duration_secs }),
+        Some(JobTerminalResult::WorkerLost) => Ok(JobStatus::WorkerLost {
+            error: "non-resumable shell worker was lost".to_string(),
+        }),
+        Some(JobTerminalResult::NeedsAttention { reason }) => Ok(JobStatus::NeedsAttention {
+            error: reason.to_string(),
+        }),
+        None => Err(DetachedJobError::Store(format!(
+            "job {} returned a non-terminal settlement snapshot",
+            snapshot.job_id
+        ))),
     }
 }
 
@@ -1975,45 +2251,80 @@ fn spawn_attempt_task(task: AttemptTask) -> JoinHandle<()> {
                         let heartbeat_at_ms = unix_time_ms();
                         let lease_expires_at_ms =
                             attempt_lease_expiry_ms(heartbeat_at_ms, timeout_secs);
-                        if let Err(error) = service
-                            .renew_lease(
-                                &job_id,
-                                write.clone(),
-                                heartbeat_at_ms,
-                                lease_expires_at_ms,
-                            )
-                            .await
-                        {
-                            break WaitOutcome::WaitFailed(format!(
-                                "shell attempt lease renewal failed: {error}"
-                            ));
+                        let renewal = spawn_attempt_lease_renewal(
+                            service.clone(),
+                            job_id.clone(),
+                            write.clone(),
+                            heartbeat_at_ms,
+                            lease_expires_at_ms,
+                        );
+                        let renewal_result = tokio::select! {
+                            biased;
+                            () = cancel.notified() => break WaitOutcome::Cancelled,
+                            () = &mut timeout => break WaitOutcome::TimedOut,
+                            result = renewal => result,
+                        };
+                        match renewal_result {
+                            Ok(Ok(snapshot)) if snapshot.cancel_requested => {
+                                break WaitOutcome::Cancelled;
+                            }
+                            Ok(Ok(_)) => {}
+                            Ok(Err(error)) => {
+                                break WaitOutcome::WaitFailed(format!(
+                                    "shell attempt lease renewal failed: {error}"
+                                ));
+                            }
+                            Err(error) => {
+                                break WaitOutcome::WaitFailed(format!(
+                                    "shell attempt lease renewal task failed: {error}"
+                                ));
+                            }
                         }
                     }
                 }
             }
         };
+        let settled_at_ms = unix_time_ms();
+        let mut containment_failures = 0usize;
         loop {
             match process_group.terminate(&mut child).await {
                 Ok(()) => break,
                 Err(error) => {
-                    warn!(job_id = %public_job_id, %error, "shell containment unproven; retrying");
+                    containment_failures = containment_failures.saturating_add(1);
+                    warn!(
+                        job_id = %public_job_id,
+                        %error,
+                        containment_failures,
+                        "shell containment unproven; retaining ownership and retrying"
+                    );
                     let heartbeat_at_ms = unix_time_ms();
-                    if let Err(renew_error) = service
-                        .renew_lease(
-                            &job_id,
-                            write.clone(),
-                            heartbeat_at_ms,
-                            attempt_lease_expiry_ms(heartbeat_at_ms, timeout_secs),
-                        )
-                        .await
+                    match spawn_attempt_lease_renewal(
+                        service.clone(),
+                        job_id.clone(),
+                        write.clone(),
+                        heartbeat_at_ms,
+                        attempt_lease_expiry_ms(heartbeat_at_ms, timeout_secs),
+                    )
+                    .await
                     {
-                        warn!(
-                            job_id = %public_job_id,
-                            %renew_error,
-                            "shell containment continues after lease renewal was rejected"
-                        );
+                        Ok(Ok(_)) => {}
+                        Ok(Err(renew_error)) => {
+                            warn!(
+                                job_id = %public_job_id,
+                                %renew_error,
+                                "shell containment retry lease renewal was rejected"
+                            );
+                        }
+                        Err(renew_error) => {
+                            warn!(
+                                job_id = %public_job_id,
+                                %renew_error,
+                                "shell containment retry lease task failed"
+                            );
+                        }
                     }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    tokio::time::sleep(process_containment_retry_backoff(containment_failures))
+                        .await;
                 }
             }
         }
@@ -2030,7 +2341,6 @@ fn spawn_attempt_task(task: AttemptTask) -> JoinHandle<()> {
             &redactions,
         );
         let duration_secs = started.elapsed().as_secs_f64();
-        let completed_at_ms = unix_time_ms();
         let (view_status, terminal) = match wait_outcome {
             WaitOutcome::Completed(exit_code) => {
                 let result = ShellResultRecord {
@@ -2047,14 +2357,16 @@ fn spawn_attempt_task(task: AttemptTask) -> JoinHandle<()> {
                             stderr,
                             duration_secs,
                         },
-                        service
-                            .complete_attempt(
-                                &job_id,
-                                write.clone(),
-                                completed_at_ms,
-                                Some(result_ref),
-                            )
-                            .await,
+                        settle_attempt_after_containment(
+                            &service,
+                            &job_id,
+                            write.clone(),
+                            settled_at_ms,
+                            AttemptSettlement::Complete {
+                                result_ref: Some(result_ref),
+                            },
+                        )
+                        .await,
                     ),
                     Err(error) => {
                         warn!(job_id = %public_job_id, %error, "shell result persistence failed");
@@ -2063,12 +2375,15 @@ fn spawn_attempt_task(task: AttemptTask) -> JoinHandle<()> {
                                 error: format!("shell result persistence failed: {error}"),
                                 duration_secs,
                             },
-                            fail_shell_attempt(
+                            settle_attempt_after_containment(
                                 &service,
                                 &job_id,
                                 write.clone(),
-                                completed_at_ms,
-                                "shell_result_persistence_failed",
+                                settled_at_ms,
+                                AttemptSettlement::Fail {
+                                    code: "shell_result_persistence_failed",
+                                    detail_ref: None,
+                                },
                             )
                             .await,
                         )
@@ -2077,21 +2392,29 @@ fn spawn_attempt_task(task: AttemptTask) -> JoinHandle<()> {
             }
             WaitOutcome::Cancelled => (
                 JobStatus::Cancelled { duration_secs },
-                service
-                    .acknowledge_cancel(&job_id, write.clone(), completed_at_ms)
-                    .await,
+                settle_attempt_after_containment(
+                    &service,
+                    &job_id,
+                    write.clone(),
+                    settled_at_ms,
+                    AttemptSettlement::Cancel,
+                )
+                .await,
             ),
             WaitOutcome::TimedOut => (
                 JobStatus::Failed {
                     error: "background job timed out".to_string(),
                     duration_secs,
                 },
-                fail_shell_attempt(
+                settle_attempt_after_containment(
                     &service,
                     &job_id,
                     write.clone(),
-                    completed_at_ms,
-                    "shell_timeout",
+                    settled_at_ms,
+                    AttemptSettlement::Fail {
+                        code: "shell_timeout",
+                        detail_ref: None,
+                    },
                 )
                 .await,
             ),
@@ -2100,69 +2423,29 @@ fn spawn_attempt_task(task: AttemptTask) -> JoinHandle<()> {
                     error,
                     duration_secs,
                 },
-                fail_shell_attempt(
+                settle_attempt_after_containment(
                     &service,
                     &job_id,
                     write,
-                    completed_at_ms,
-                    "shell_wait_failed",
+                    settled_at_ms,
+                    AttemptSettlement::Fail {
+                        code: "shell_wait_failed",
+                        detail_ref: None,
+                    },
                 )
                 .await,
             ),
         };
-        match terminal {
-            Ok(snapshot) => {
-                if let Some(projection) = projections.lock().await.get_mut(&public_job_id) {
-                    projection.view.status = view_status.clone();
-                }
-                match durable
-                    .delivery_projector
-                    .project_job(public_job_id.as_ref())
-                    .await
-                {
-                    Ok(()) => {
-                        if let Err(error) =
-                            project_legacy_operation(&*ops_registry, &operation_id, &view_status)
-                        {
-                            warn!(
-                                job_id = %public_job_id,
-                                %error,
-                                "runtime delivery committed but completion-feed projection remains pending"
-                            );
-                        } else if let Err(error) = durable
-                            .delivery_projector
-                            .acknowledge_applied(public_job_id.as_ref())
-                            .await
-                        {
-                            warn!(
-                                job_id = %public_job_id,
-                                %error,
-                                "completion-feed projection committed but runtime delivery acknowledgement remains pending"
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        warn!(
-                            job_id = %public_job_id,
-                            %error,
-                            "durable job delivery remains pending; refusing early completion-feed projection"
-                        );
-                    }
-                }
-                debug!(
-                    job_id = %public_job_id,
-                    phase = ?snapshot.phase,
-                    "durable shell terminal committed"
-                );
-            }
-            Err(error) => {
-                warn!(
-                    job_id = %public_job_id,
-                    %error,
-                    "durable shell terminal commit failed; refusing volatile terminal projection"
-                );
-            }
-        }
+        finalize_attempt_projection(
+            &public_job_id,
+            view_status,
+            terminal,
+            &durable,
+            &projections,
+            &*ops_registry,
+            &operation_id,
+        )
+        .await;
         active_attempts.lock().await.remove(&public_job_id);
     })
 }
@@ -2429,6 +2712,176 @@ fn lease_heartbeat_interval() -> Duration {
     }
 }
 
+#[derive(Clone)]
+enum AttemptSettlement {
+    Cancel,
+    Complete {
+        result_ref: Option<JobResultRef>,
+    },
+    Fail {
+        code: &'static str,
+        detail_ref: Option<JobResultRef>,
+    },
+}
+
+async fn acknowledge_committed_monitor_cancel(
+    service: &DetachedJobService,
+    job_id: &meerkat_jobs::JobId,
+    write: AttemptWriteAuthority,
+    acknowledged_at_ms: u64,
+) -> Result<Option<meerkat_jobs::JobSnapshot>, DetachedJobError> {
+    let snapshot = service
+        .get(job_id)
+        .await?
+        .ok_or_else(|| DetachedJobError::NotFound(job_id.clone()))?;
+    if snapshot.terminal_result == Some(JobTerminalResult::Cancelled) {
+        return Ok(Some(snapshot));
+    }
+    if !snapshot.cancel_requested {
+        return Ok(None);
+    }
+    settle_attempt_after_containment(
+        service,
+        job_id,
+        write,
+        acknowledged_at_ms,
+        AttemptSettlement::Cancel,
+    )
+    .await
+    .map(Some)
+}
+
+async fn settle_attempt_after_containment(
+    service: &DetachedJobService,
+    job_id: &meerkat_jobs::JobId,
+    write: AttemptWriteAuthority,
+    settled_at_ms: u64,
+    settlement: AttemptSettlement,
+) -> Result<meerkat_jobs::JobSnapshot, DetachedJobError> {
+    let initial = service
+        .get(job_id)
+        .await?
+        .ok_or_else(|| DetachedJobError::NotFound(job_id.clone()))?;
+    ensure_attempt_snapshot_matches(job_id, &initial, &write)?;
+    if initial.terminal_result.is_some() {
+        return Ok(initial);
+    }
+    // After process containment, the only legitimate revision writers are:
+    // one already-in-flight attempt mutation, one durable cancellation
+    // request, one late heartbeat, and delivery acknowledgements for the
+    // finite pending outbox. Budget exactly that closed writer set.
+    let pending_delivery_writers = initial.outbox.iter().filter(|entry| !entry.applied).count();
+    let conflict_budget =
+        pending_delivery_writers.saturating_add(ATTEMPT_SETTLEMENT_BASE_CONFLICT_BUDGET);
+    let mut conflicts = 0usize;
+    loop {
+        let current = service
+            .get(job_id)
+            .await?
+            .ok_or_else(|| DetachedJobError::NotFound(job_id.clone()))?;
+        ensure_attempt_snapshot_matches(job_id, &current, &write)?;
+        if current.terminal_result.is_some() {
+            return Ok(current);
+        }
+        let outcome = match &settlement {
+            AttemptSettlement::Cancel => {
+                service
+                    .acknowledge_cancel(job_id, write.clone(), settled_at_ms)
+                    .await
+            }
+            AttemptSettlement::Complete { result_ref } => {
+                service
+                    .complete_attempt(job_id, write.clone(), settled_at_ms, result_ref.clone())
+                    .await
+            }
+            AttemptSettlement::Fail { code, detail_ref } => {
+                service
+                    .fail_attempt(
+                        job_id,
+                        write.clone(),
+                        settled_at_ms,
+                        JobFailureCode::new(*code)?,
+                        detail_ref.clone(),
+                    )
+                    .await
+            }
+        };
+        match outcome {
+            Err(DetachedJobError::StaleRevision { .. }) if conflicts < conflict_budget => {
+                conflicts = conflicts.saturating_add(1);
+                tokio::time::sleep(attempt_settlement_backoff(conflicts)).await;
+            }
+            outcome => return outcome,
+        }
+    }
+}
+
+fn ensure_attempt_snapshot_matches(
+    job_id: &meerkat_jobs::JobId,
+    snapshot: &meerkat_jobs::JobSnapshot,
+    write: &AttemptWriteAuthority,
+) -> Result<(), DetachedJobError> {
+    if snapshot.current_attempt_id.as_ref() != Some(&write.attempt_id)
+        || snapshot.current_fence != write.fence
+    {
+        return Err(DetachedJobError::StaleAttempt {
+            job_id: job_id.clone(),
+            attempt_id: write.attempt_id.clone(),
+            fence: write.fence,
+        });
+    }
+    Ok(())
+}
+
+fn attempt_settlement_backoff(conflicts: usize) -> Duration {
+    let shift = conflicts.saturating_sub(1).min(4);
+    let millis = 1u64 << shift;
+    Duration::from_millis(millis).min(ATTEMPT_SETTLEMENT_MAX_BACKOFF)
+}
+
+fn process_containment_retry_backoff(failures: usize) -> Duration {
+    let shift = failures.saturating_sub(1).min(4);
+    let millis = 100u64.saturating_mul(1u64 << shift);
+    Duration::from_millis(millis).min(PROCESS_CONTAINMENT_MAX_BACKOFF)
+}
+
+async fn renew_monitor_settlement_lease_bounded(
+    service: DetachedJobService,
+    job_id: meerkat_jobs::JobId,
+    write: AttemptWriteAuthority,
+    heartbeat_at_ms: u64,
+    lease_expires_at_ms: u64,
+) -> Result<(), String> {
+    let renewal =
+        spawn_attempt_lease_renewal(service, job_id, write, heartbeat_at_ms, lease_expires_at_ms);
+    match tokio::time::timeout(MONITOR_SETTLEMENT_STORE_TIMEOUT, renewal).await {
+        Ok(Ok(Ok(_))) => Ok(()),
+        Ok(Ok(Err(error))) => Err(error.to_string()),
+        Ok(Err(error)) => Err(format!("settlement lease task failed: {error}")),
+        Err(_) => Err(format!(
+            "settlement lease renewal exceeded {} ms",
+            MONITOR_SETTLEMENT_STORE_TIMEOUT.as_millis()
+        )),
+    }
+}
+
+fn spawn_attempt_lease_renewal(
+    service: DetachedJobService,
+    job_id: meerkat_jobs::JobId,
+    write: AttemptWriteAuthority,
+    heartbeat_at_ms: u64,
+    lease_expires_at_ms: u64,
+) -> JoinHandle<Result<meerkat_jobs::JobSnapshot, DetachedJobError>> {
+    // SQLite-backed DetachedJobStore methods currently perform their
+    // rusqlite work synchronously inside the async trait future. Every monitor
+    // lease write therefore runs on the blocking pool: a 60-second SQLite busy
+    // wait must not pin the monitor control task between cancel/timeout polls.
+    let runtime = tokio::runtime::Handle::current();
+    tokio::task::spawn_blocking(move || {
+        runtime.block_on(service.renew_lease(&job_id, write, heartbeat_at_ms, lease_expires_at_ms))
+    })
+}
+
 fn shell_io(message: impl Into<String>) -> ShellError {
     ShellError::Io(std::io::Error::other(message.into()))
 }
@@ -2494,9 +2947,11 @@ impl CompletionEnrichmentProvider for JobManager {
 #[allow(clippy::panic)]
 mod durable_tests {
     use super::*;
-    use meerkat_jobs::{DetachedJobService, SqliteDetachedJobStore};
+    use meerkat_jobs::{
+        DetachedJobService, InsertJobOutcome, JobOutboxEntry, SqliteDetachedJobStore, StoredJob,
+    };
     use meerkat_store::FsBlobStore;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     #[derive(Debug)]
@@ -2524,9 +2979,296 @@ mod durable_tests {
         }
     }
 
-    fn durable_fixture(
+    #[derive(Debug, Default)]
+    struct RecordingDeliveryProjector {
+        project_calls: AtomicUsize,
+        acknowledge_calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl ShellJobDeliveryProjector for RecordingDeliveryProjector {
+        async fn project_job(&self, _job_id: &str) -> Result<(), String> {
+            self.project_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn acknowledge_applied(&self, _job_id: &str) -> Result<(), String> {
+            self.acknowledge_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct BlockingDeliveryProjector {
+        calls: AtomicUsize,
+        entered: Notify,
+        release: Notify,
+    }
+
+    #[async_trait]
+    impl ShellJobDeliveryProjector for BlockingDeliveryProjector {
+        async fn project_job(&self, _job_id: &str) -> Result<(), String> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.entered.notify_one();
+            self.release.notified().await;
+            Ok(())
+        }
+    }
+
+    #[derive(Debug)]
+    struct PausingHeartbeatStore {
+        inner: Arc<SqliteDetachedJobStore>,
+        heartbeat_pause_armed: AtomicBool,
+        heartbeat_paused_once: AtomicBool,
+        reject_cancel_settlement_renewal: AtomicBool,
+        cancel_ack_stale_once: AtomicBool,
+        cancel_ack_attempts: AtomicUsize,
+        terminal_ack_cas_wins_remaining: AtomicUsize,
+        terminal_ack_cas_wins: AtomicUsize,
+        non_cancel_terminal_pause_armed: AtomicBool,
+        non_cancel_terminal_paused_once: AtomicBool,
+        cancel_request_pause_armed: AtomicBool,
+        cancel_request_paused_once: AtomicBool,
+        heartbeat_entered: Notify,
+        heartbeat_release: Notify,
+        non_cancel_terminal_entered: Notify,
+        non_cancel_terminal_release: Notify,
+        cancel_request_entered: Notify,
+        cancel_request_release: Notify,
+    }
+
+    impl PausingHeartbeatStore {
+        fn open(path: PathBuf) -> Self {
+            Self {
+                inner: Arc::new(
+                    SqliteDetachedJobStore::open(path).expect("open detached job store"),
+                ),
+                heartbeat_pause_armed: AtomicBool::new(false),
+                heartbeat_paused_once: AtomicBool::new(false),
+                reject_cancel_settlement_renewal: AtomicBool::new(false),
+                cancel_ack_stale_once: AtomicBool::new(false),
+                cancel_ack_attempts: AtomicUsize::new(0),
+                terminal_ack_cas_wins_remaining: AtomicUsize::new(0),
+                terminal_ack_cas_wins: AtomicUsize::new(0),
+                non_cancel_terminal_pause_armed: AtomicBool::new(false),
+                non_cancel_terminal_paused_once: AtomicBool::new(false),
+                cancel_request_pause_armed: AtomicBool::new(false),
+                cancel_request_paused_once: AtomicBool::new(false),
+                heartbeat_entered: Notify::new(),
+                heartbeat_release: Notify::new(),
+                non_cancel_terminal_entered: Notify::new(),
+                non_cancel_terminal_release: Notify::new(),
+                cancel_request_entered: Notify::new(),
+                cancel_request_release: Notify::new(),
+            }
+        }
+
+        fn arm_heartbeat_pause(&self) {
+            self.heartbeat_pause_armed.store(true, Ordering::SeqCst);
+        }
+
+        fn reject_cancel_settlement_renewal(&self) {
+            self.reject_cancel_settlement_renewal
+                .store(true, Ordering::SeqCst);
+        }
+
+        fn inject_one_cancel_ack_stale_revision(&self) {
+            self.cancel_ack_stale_once.store(true, Ordering::SeqCst);
+        }
+
+        fn arm_non_cancel_terminal_pause(&self) {
+            self.non_cancel_terminal_pause_armed
+                .store(true, Ordering::SeqCst);
+        }
+
+        fn inject_delivery_ack_cas_wins(&self, count: usize) {
+            self.terminal_ack_cas_wins_remaining
+                .store(count, Ordering::SeqCst);
+        }
+
+        fn arm_cancel_request_pause(&self) {
+            self.cancel_request_pause_armed
+                .store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl DetachedJobStore for PausingHeartbeatStore {
+        async fn insert_deduplicated(
+            &self,
+            job: StoredJob,
+        ) -> Result<InsertJobOutcome, DetachedJobError> {
+            self.inner.insert_deduplicated(job).await
+        }
+
+        async fn get(
+            &self,
+            job_id: &meerkat_jobs::JobId,
+        ) -> Result<Option<StoredJob>, DetachedJobError> {
+            self.inner.get(job_id).await
+        }
+
+        async fn compare_and_swap(
+            &self,
+            expected_revision: u64,
+            replacement: StoredJob,
+        ) -> Result<StoredJob, DetachedJobError> {
+            let current = self.inner.get(&replacement.job_id).await?;
+            let is_cancel_request = current.as_ref().is_some_and(|current| {
+                !current.machine_state.cancel_requested
+                    && replacement.machine_state.cancel_requested
+                    && replacement.terminal_result.is_none()
+            });
+            if is_cancel_request
+                && self.cancel_request_pause_armed.load(Ordering::SeqCst)
+                && self
+                    .cancel_request_paused_once
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                self.cancel_request_entered.notify_one();
+                self.cancel_request_release.notified().await;
+            }
+            if replacement.terminal_result.is_some()
+                && self
+                    .terminal_ack_cas_wins_remaining
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                        remaining.checked_sub(1)
+                    })
+                    .is_ok()
+            {
+                let current = current
+                    .as_ref()
+                    .ok_or_else(|| DetachedJobError::NotFound(replacement.job_id.clone()))?;
+                let delivery_sequence = current
+                    .outbox
+                    .iter()
+                    .find(|entry| !entry.applied)
+                    .map(|entry| entry.delivery_sequence)
+                    .ok_or_else(|| {
+                        DetachedJobError::Store(
+                            "injected delivery acknowledgement has no pending outbox entry".into(),
+                        )
+                    })?;
+                let applied = DetachedJobService::new(self.inner.clone())
+                    .mark_delivery_applied(&replacement.job_id, delivery_sequence)
+                    .await?;
+                self.terminal_ack_cas_wins.fetch_add(1, Ordering::SeqCst);
+                return Err(DetachedJobError::StaleRevision {
+                    job_id: replacement.job_id,
+                    expected: expected_revision,
+                    actual: applied.revision,
+                });
+            }
+            if replacement.terminal_result == Some(JobTerminalResult::Cancelled) {
+                self.cancel_ack_attempts.fetch_add(1, Ordering::SeqCst);
+                if self.cancel_ack_stale_once.swap(false, Ordering::SeqCst) {
+                    return Err(DetachedJobError::StaleRevision {
+                        job_id: replacement.job_id,
+                        expected: expected_revision,
+                        actual: expected_revision.saturating_add(1),
+                    });
+                }
+            }
+            if replacement.terminal_result.is_some()
+                && replacement.terminal_result != Some(JobTerminalResult::Cancelled)
+                && self.non_cancel_terminal_pause_armed.load(Ordering::SeqCst)
+                && self
+                    .non_cancel_terminal_paused_once
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                self.non_cancel_terminal_entered.notify_one();
+                self.non_cancel_terminal_release.notified().await;
+            }
+            let is_heartbeat = current.as_ref().is_some_and(|current| {
+                current.machine_state.heartbeat_at_ms != replacement.machine_state.heartbeat_at_ms
+                    && current.machine_state.cancel_requested
+                        == replacement.machine_state.cancel_requested
+                    && current.outbox == replacement.outbox
+                    && current.terminal_result == replacement.terminal_result
+            });
+            if is_heartbeat
+                && current
+                    .as_ref()
+                    .is_some_and(|current| current.machine_state.cancel_requested)
+                && self.reject_cancel_settlement_renewal.load(Ordering::SeqCst)
+            {
+                return Err(DetachedJobError::Store(
+                    "injected cancellation settlement renewal failure".into(),
+                ));
+            }
+            if is_heartbeat
+                && self.heartbeat_pause_armed.load(Ordering::SeqCst)
+                && self
+                    .heartbeat_paused_once
+                    .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+            {
+                self.heartbeat_entered.notify_one();
+                self.heartbeat_release.notified().await;
+            }
+            self.inner
+                .compare_and_swap(expected_revision, replacement)
+                .await
+        }
+
+        async fn list_pending_outbox(
+            &self,
+            limit: usize,
+        ) -> Result<Vec<JobOutboxEntry>, DetachedJobError> {
+            self.inner.list_pending_outbox(limit).await
+        }
+
+        async fn list_for_origin(
+            &self,
+            realm_id: &str,
+            origin_session_id: &SessionId,
+            limit: usize,
+        ) -> Result<Vec<StoredJob>, DetachedJobError> {
+            self.inner
+                .list_for_origin(realm_id, origin_session_id, limit)
+                .await
+        }
+
+        async fn list_all(&self, limit: usize) -> Result<Vec<StoredJob>, DetachedJobError> {
+            self.inner.list_all(limit).await
+        }
+
+        fn is_persistent(&self) -> bool {
+            true
+        }
+    }
+
+    fn durable_fixture_with_store_and_projector(
         temp: &TempDir,
         session_id: SessionId,
+        job_store: Arc<dyn DetachedJobStore>,
+        delivery_projector: Arc<dyn ShellJobDeliveryProjector>,
+    ) -> (
+        DurableShellJobRuntime,
+        Arc<dyn DetachedJobStore>,
+        ShellConfig,
+    ) {
+        let blob_store: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(temp.path().join("blobs")));
+        let runtime = DurableShellJobRuntime::new(
+            "test-realm",
+            session_id,
+            job_store.clone(),
+            blob_store,
+            delivery_projector,
+        )
+        .expect("durable shell runtime");
+        let mut config = ShellConfig::with_project_root(temp.path().to_path_buf());
+        config.shell = "sh".to_string();
+        config.shell_path = Some(PathBuf::from("/bin/sh"));
+        (runtime, job_store, config)
+    }
+
+    fn durable_fixture_with_projector(
+        temp: &TempDir,
+        session_id: SessionId,
+        delivery_projector: Arc<dyn ShellJobDeliveryProjector>,
     ) -> (
         DurableShellJobRuntime,
         Arc<dyn DetachedJobStore>,
@@ -2536,19 +3278,18 @@ mod durable_tests {
             SqliteDetachedJobStore::open(temp.path().join("jobs.db"))
                 .expect("open detached job store"),
         );
-        let blob_store: Arc<dyn BlobStore> = Arc::new(FsBlobStore::new(temp.path().join("blobs")));
-        let runtime = DurableShellJobRuntime::new(
-            "test-realm",
-            session_id,
-            job_store.clone(),
-            blob_store,
-            Arc::new(NoopDeliveryProjector),
-        )
-        .expect("durable shell runtime");
-        let mut config = ShellConfig::with_project_root(temp.path().to_path_buf());
-        config.shell = "sh".to_string();
-        config.shell_path = Some(PathBuf::from("/bin/sh"));
-        (runtime, job_store, config)
+        durable_fixture_with_store_and_projector(temp, session_id, job_store, delivery_projector)
+    }
+
+    fn durable_fixture(
+        temp: &TempDir,
+        session_id: SessionId,
+    ) -> (
+        DurableShellJobRuntime,
+        Arc<dyn DetachedJobStore>,
+        ShellConfig,
+    ) {
+        durable_fixture_with_projector(temp, session_id, Arc::new(NoopDeliveryProjector))
     }
 
     fn test_job_spec(session_id: SessionId) -> JobSpec {
@@ -2710,6 +3451,70 @@ mod durable_tests {
             .expect("read")
             .expect("job");
         assert_eq!(recovered.phase, JobPhase::WorkerLost);
+        assert_eq!(recovered.attempt_count, 1);
+        assert_eq!(
+            recovered.current_attempt_id.as_ref(),
+            Some(&claimed.attempt_id)
+        );
+        assert_eq!(recovered.current_fence, claimed.fence);
+    }
+
+    #[tokio::test]
+    async fn recovery_terminalizes_persisted_cancel_before_checkpoint_resume() {
+        let temp = TempDir::new().expect("tempdir");
+        let session_id = SessionId::new();
+        let (runtime, job_store, config) = durable_fixture(&temp, session_id.clone());
+        let service = DetachedJobService::new(job_store);
+        let receipt = service
+            .submit(
+                test_monitor_job_spec(&runtime, session_id, "cancel-before-recovery-resume").await,
+            )
+            .await
+            .expect("submit");
+        let claimed = service
+            .claim_attempt(
+                &receipt.job_id,
+                AttemptClaim::new(
+                    WorkerId::new("worker-before-cancelled-recovery").expect("worker"),
+                    1,
+                    2,
+                    RunnerHandleRef::new("monitor-before-cancelled-recovery").expect("handle"),
+                ),
+            )
+            .await
+            .expect("claim");
+        service
+            .record_checkpoint(
+                &receipt.job_id,
+                (&claimed).into(),
+                meerkat_jobs::CheckpointRef::new("checkpoint:cancelled").expect("checkpoint"),
+                2,
+            )
+            .await
+            .expect("checkpoint");
+        let requested = service
+            .request_cancel(&receipt.job_id)
+            .await
+            .expect("persist cancellation before crash");
+        assert_eq!(requested.phase, JobPhase::Running);
+        assert!(requested.cancel_requested);
+
+        let manager = JobManager::new(config).with_durable_job_runtime(runtime);
+        manager
+            .ensure_recovered()
+            .await
+            .expect("cancel intent wins recovery");
+
+        let recovered = service
+            .get(&receipt.job_id)
+            .await
+            .expect("read")
+            .expect("job");
+        assert_eq!(recovered.phase, JobPhase::Cancelled);
+        assert_eq!(
+            recovered.terminal_result,
+            Some(JobTerminalResult::Cancelled)
+        );
         assert_eq!(recovered.attempt_count, 1);
         assert_eq!(
             recovered.current_attempt_id.as_ref(),
@@ -2959,7 +3764,7 @@ mod durable_tests {
             .await
             .expect("spawn monitor");
         let job_id = meerkat_jobs::JobId::new(public_job_id.to_string()).expect("domain job id");
-        let completed = tokio::time::timeout(Duration::from_secs(60), async {
+        let completion = tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 let snapshot = service.get(&job_id).await.expect("read").expect("job");
                 if snapshot.terminal_result.is_some() {
@@ -2968,8 +3773,30 @@ mod durable_tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .expect("monitor completion");
+        .await;
+        let completed = match completion {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                let snapshot = service
+                    .get(&job_id)
+                    .await
+                    .expect("read timed-out monitor")
+                    .expect("timed-out monitor job");
+                let active = manager
+                    .active_attempts
+                    .lock()
+                    .await
+                    .contains_key(&public_job_id);
+                let stored = job_store
+                    .get(&job_id)
+                    .await
+                    .expect("read timed-out stored monitor")
+                    .expect("timed-out stored monitor job");
+                panic!(
+                    "monitor completion timed out; active={active}; snapshot={snapshot:?}; stored={stored:?}"
+                );
+            }
+        };
 
         let stored = job_store
             .get(&job_id)
@@ -3266,6 +4093,676 @@ mod durable_tests {
     }
 
     #[tokio::test]
+    async fn settlement_converges_after_one_and_two_delivery_acknowledgement_cas_wins() {
+        for acknowledgement_wins in 1..=2 {
+            let temp = TempDir::new().expect("tempdir");
+            let session_id = SessionId::new();
+            let pausing_store = Arc::new(PausingHeartbeatStore::open(temp.path().join("jobs.db")));
+            let (runtime, job_store, _config) = durable_fixture_with_store_and_projector(
+                &temp,
+                session_id.clone(),
+                pausing_store.clone(),
+                Arc::new(NoopDeliveryProjector),
+            );
+            let service = DetachedJobService::new(job_store);
+            let receipt = service
+                .submit(
+                    test_monitor_job_spec(
+                        &runtime,
+                        session_id,
+                        &format!("delivery-ack-race-{acknowledgement_wins}"),
+                    )
+                    .await,
+                )
+                .await
+                .expect("submit");
+            let claim = service
+                .claim_attempt(
+                    &receipt.job_id,
+                    AttemptClaim::new(
+                        WorkerId::new(format!("delivery-ack-worker-{acknowledgement_wins}"))
+                            .expect("worker"),
+                        1,
+                        100,
+                        RunnerHandleRef::new(format!(
+                            "inproc-monitor:delivery-ack-{acknowledgement_wins}"
+                        ))
+                        .expect("handle"),
+                    ),
+                )
+                .await
+                .expect("claim");
+            let write = AttemptWriteAuthority::from(&claim);
+            for index in 0..acknowledgement_wins {
+                let key = format!("delivery-ack:{acknowledgement_wins}:{index}");
+                service
+                    .emit_notification(
+                        &receipt.job_id,
+                        write.clone(),
+                        2 + u64::try_from(index).expect("small index"),
+                        JobNotification::new(
+                            monitor_notification_id(&receipt.job_id, &key),
+                            key,
+                            "delivery acknowledgement race",
+                            "pending",
+                        )
+                        .expect("notification"),
+                    )
+                    .await
+                    .expect("seed pending delivery");
+            }
+            pausing_store.inject_delivery_ack_cas_wins(acknowledgement_wins);
+
+            let settled = settle_attempt_after_containment(
+                &service,
+                &receipt.job_id,
+                write,
+                50,
+                AttemptSettlement::Complete { result_ref: None },
+            )
+            .await
+            .expect("settlement must converge after finite delivery acknowledgements");
+
+            assert_eq!(
+                settled.terminal_result,
+                Some(JobTerminalResult::Succeeded { result_ref: None })
+            );
+            assert_eq!(
+                pausing_store.terminal_ack_cas_wins.load(Ordering::SeqCst),
+                acknowledgement_wins
+            );
+            assert_eq!(
+                settled
+                    .outbox
+                    .iter()
+                    .filter(|entry| matches!(
+                        entry.payload,
+                        meerkat_jobs::JobOutboxPayload::Notification(_)
+                    ))
+                    .filter(|entry| entry.applied)
+                    .count(),
+                acknowledgement_wins
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn settlement_converges_after_timed_out_renewal_commits_late() {
+        let temp = TempDir::new().expect("tempdir");
+        let session_id = SessionId::new();
+        let pausing_store = Arc::new(PausingHeartbeatStore::open(temp.path().join("jobs.db")));
+        let (runtime, job_store, _config) = durable_fixture_with_store_and_projector(
+            &temp,
+            session_id.clone(),
+            pausing_store.clone(),
+            Arc::new(NoopDeliveryProjector),
+        );
+        let service = DetachedJobService::new(job_store);
+        let receipt = service
+            .submit(test_monitor_job_spec(&runtime, session_id, "late-renewal").await)
+            .await
+            .expect("submit");
+        let claim = service
+            .claim_attempt(
+                &receipt.job_id,
+                AttemptClaim::new(
+                    WorkerId::new("late-renewal-worker").expect("worker"),
+                    1,
+                    100,
+                    RunnerHandleRef::new("inproc-monitor:late-renewal").expect("handle"),
+                ),
+            )
+            .await
+            .expect("claim");
+        let write = AttemptWriteAuthority::from(&claim);
+
+        pausing_store.arm_heartbeat_pause();
+        let renewal = tokio::spawn(renew_monitor_settlement_lease_bounded(
+            service.clone(),
+            receipt.job_id.clone(),
+            write.clone(),
+            20,
+            200,
+        ));
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            pausing_store.heartbeat_entered.notified(),
+        )
+        .await
+        .expect("renewal should enter the deterministic store gate");
+        let renewal_error = tokio::time::timeout(Duration::from_secs(5), renewal)
+            .await
+            .expect("bounded renewal should return")
+            .expect("renewal task")
+            .expect_err("blocked store write must exceed the settlement timeout");
+        assert!(renewal_error.contains("exceeded"));
+
+        pausing_store.arm_non_cancel_terminal_pause();
+        let settle_service = service.clone();
+        let settle_job_id = receipt.job_id.clone();
+        let settlement = tokio::spawn(async move {
+            settle_attempt_after_containment(
+                &settle_service,
+                &settle_job_id,
+                write,
+                30,
+                AttemptSettlement::Fail {
+                    code: "shell_timeout",
+                    detail_ref: None,
+                },
+            )
+            .await
+        });
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            pausing_store.non_cancel_terminal_entered.notified(),
+        )
+        .await
+        .expect("terminal write should enter the deterministic store gate");
+
+        pausing_store.heartbeat_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let stored = pausing_store
+                    .inner
+                    .get(&receipt.job_id)
+                    .await
+                    .expect("read")
+                    .expect("job");
+                if stored.machine_state.heartbeat_at_ms == Some(20) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("timed-out renewal must be allowed to commit late");
+        pausing_store.non_cancel_terminal_release.notify_one();
+
+        let settled = tokio::time::timeout(Duration::from_secs(5), settlement)
+            .await
+            .expect("settlement should converge")
+            .expect("settlement task")
+            .expect("late renewal must only cause a retry");
+        assert_eq!(settled.phase, JobPhase::Failed);
+        assert!(matches!(
+            settled.terminal_result,
+            Some(JobTerminalResult::Failed { ref code, .. })
+                if code.as_str() == "shell_timeout"
+        ));
+        assert_eq!(
+            settled
+                .outbox
+                .iter()
+                .filter(|entry| matches!(
+                    entry.payload,
+                    meerkat_jobs::JobOutboxPayload::Terminal(_)
+                ))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn committed_cancel_dominates_complete_and_fail_in_every_public_projection() {
+        for proposed_terminal in ["complete", "fail"] {
+            let temp = TempDir::new().expect("tempdir");
+            let session_id = SessionId::new();
+            let projector = Arc::new(RecordingDeliveryProjector::default());
+            let (runtime, job_store, config) =
+                durable_fixture_with_projector(&temp, session_id.clone(), projector.clone());
+            let service = DetachedJobService::new(job_store);
+            let receipt = service
+                .submit(
+                    test_monitor_job_spec(
+                        &runtime,
+                        session_id.clone(),
+                        &format!("cancel-vs-{proposed_terminal}"),
+                    )
+                    .await,
+                )
+                .await
+                .expect("submit");
+            let claim = service
+                .claim_attempt(
+                    &receipt.job_id,
+                    AttemptClaim::new(
+                        WorkerId::new(format!("cancel-vs-{proposed_terminal}-worker"))
+                            .expect("worker"),
+                        1,
+                        100,
+                        RunnerHandleRef::new(format!(
+                            "inproc-monitor:cancel-vs-{proposed_terminal}"
+                        ))
+                        .expect("handle"),
+                    ),
+                )
+                .await
+                .expect("claim");
+            service
+                .request_cancel(&receipt.job_id)
+                .await
+                .expect("commit cancellation");
+            let settlement = match proposed_terminal {
+                "complete" => AttemptSettlement::Complete { result_ref: None },
+                "fail" => AttemptSettlement::Fail {
+                    code: "shell_wait_failed",
+                    detail_ref: None,
+                },
+                _ => unreachable!(),
+            };
+            let terminal = settle_attempt_after_containment(
+                &service,
+                &receipt.job_id,
+                AttemptWriteAuthority::from(&claim),
+                50,
+                settlement,
+            )
+            .await
+            .expect("committed cancellation must settle as cancelled");
+            assert_eq!(terminal.terminal_result, Some(JobTerminalResult::Cancelled));
+            assert!(terminal.outbox.iter().any(|entry| matches!(
+                entry.payload,
+                meerkat_jobs::JobOutboxPayload::Terminal(JobTerminalResult::Cancelled)
+            )));
+
+            let registry = Arc::new(RuntimeOpsLifecycleRegistry::new());
+            let manager = JobManager::new(config)
+                .bind_canonical_async_ops(session_id, registry.clone())
+                .with_durable_job_runtime(runtime.clone());
+            let public_job_id = JobId::from_string(receipt.job_id.as_str());
+            let operation_id = manager
+                .register_operation(&public_job_id)
+                .expect("register operation");
+            manager.projections.lock().await.insert(
+                public_job_id.clone(),
+                JobProjection {
+                    view: BackgroundJob {
+                        id: public_job_id.clone(),
+                        command: proposed_terminal.to_string(),
+                        working_dir: None,
+                        placement: None,
+                        timeout_secs: 5,
+                        started_at_unix: unix_time_secs(),
+                        status: JobStatus::Running {
+                            started_at_unix: unix_time_secs(),
+                        },
+                    },
+                },
+            );
+            let proposed_view = match proposed_terminal {
+                "complete" => JobStatus::Completed {
+                    exit_code: Some(0),
+                    stdout: "optimistic success".to_string(),
+                    stderr: String::new(),
+                    duration_secs: 1.0,
+                },
+                "fail" => JobStatus::Failed {
+                    error: "optimistic failure".to_string(),
+                    duration_secs: 1.0,
+                },
+                _ => unreachable!(),
+            };
+            finalize_attempt_projection(
+                &public_job_id,
+                proposed_view,
+                Ok(terminal),
+                &runtime,
+                &manager.projections,
+                &*registry,
+                &operation_id,
+            )
+            .await;
+
+            let projected = manager
+                .projections
+                .lock()
+                .await
+                .get(&public_job_id)
+                .expect("projection")
+                .view
+                .status
+                .clone();
+            assert!(matches!(projected, JobStatus::Cancelled { .. }));
+            let operation = registry
+                .snapshot(&operation_id)
+                .expect("operation snapshot")
+                .expect("operation");
+            assert_eq!(
+                operation.status,
+                meerkat_core::ops_lifecycle::OperationStatus::Cancelled
+            );
+            assert_eq!(
+                operation.public_result_class,
+                meerkat_core::ops_lifecycle::OperationPublicResultClass::Cancelled
+            );
+            assert!(matches!(
+                operation.terminal_outcome,
+                Some(meerkat_core::ops_lifecycle::OperationTerminalOutcome::Cancelled { .. })
+            ));
+            assert_eq!(projector.project_calls.load(Ordering::SeqCst), 1);
+            assert_eq!(projector.acknowledge_calls.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn committed_cancel_wins_after_non_cancel_settlement_has_started() {
+        let temp = TempDir::new().expect("tempdir");
+        let session_id = SessionId::new();
+        let pausing_store = Arc::new(PausingHeartbeatStore::open(temp.path().join("jobs.db")));
+        let (runtime, job_store, _config) = durable_fixture_with_store_and_projector(
+            &temp,
+            session_id.clone(),
+            pausing_store.clone(),
+            Arc::new(NoopDeliveryProjector),
+        );
+        let service = DetachedJobService::new(job_store);
+        let receipt = service
+            .submit(
+                test_monitor_job_spec(&runtime, session_id, "late-cancel-settlement-race").await,
+            )
+            .await
+            .expect("submit");
+        let claim = service
+            .claim_attempt(
+                &receipt.job_id,
+                AttemptClaim::new(
+                    WorkerId::new("late-cancel-worker").expect("worker"),
+                    1,
+                    100,
+                    RunnerHandleRef::new("inproc-monitor:late-cancel").expect("handle"),
+                ),
+            )
+            .await
+            .expect("claim");
+        let write = AttemptWriteAuthority::from(&claim);
+
+        pausing_store.arm_non_cancel_terminal_pause();
+        let settle_service = service.clone();
+        let settle_job_id = receipt.job_id.clone();
+        let settle_write = write.clone();
+        let settlement = tokio::spawn(async move {
+            settle_attempt_after_containment(
+                &settle_service,
+                &settle_job_id,
+                settle_write,
+                2,
+                AttemptSettlement::Complete { result_ref: None },
+            )
+            .await
+        });
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            pausing_store.non_cancel_terminal_entered.notified(),
+        )
+        .await
+        .expect("non-cancel settlement should enter the deterministic CAS gate");
+
+        let requested = service
+            .request_cancel(&receipt.job_id)
+            .await
+            .expect("commit cancellation during settlement");
+        assert_eq!(requested.phase, JobPhase::Running);
+        assert!(requested.cancel_requested);
+        pausing_store.non_cancel_terminal_release.notify_one();
+
+        let cancelled = tokio::time::timeout(Duration::from_secs(5), settlement)
+            .await
+            .expect("bounded settlement should finish")
+            .expect("settlement task")
+            .expect("committed cancellation should win");
+        assert_eq!(cancelled.phase, JobPhase::Cancelled);
+        assert_eq!(
+            cancelled.terminal_result,
+            Some(JobTerminalResult::Cancelled)
+        );
+        assert_eq!(cancelled.current_attempt_id, Some(claim.attempt_id));
+        assert_eq!(cancelled.current_fence, claim.fence);
+        assert_eq!(
+            pausing_store.cancel_ack_attempts.load(Ordering::SeqCst),
+            1,
+            "one stale non-cancel CAS must reload directly into cancellation acknowledgement"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn sqlite_recovered_monitor_cancel_preempts_racing_notification_projection() {
+        let temp = TempDir::new().expect("tempdir");
+        let session_id = SessionId::new();
+        let projector = Arc::new(BlockingDeliveryProjector::default());
+        let pausing_store = Arc::new(PausingHeartbeatStore::open(temp.path().join("jobs.db")));
+        let (runtime, job_store, config) = durable_fixture_with_store_and_projector(
+            &temp,
+            session_id.clone(),
+            pausing_store.clone(),
+            projector.clone(),
+        );
+        let service = DetachedJobService::new(job_store);
+        let resolved_dir = config
+            .default_working_dir_async()
+            .await
+            .expect("working dir");
+        let placement = config
+            .execution_placement_for_working_dir_async(&resolved_dir)
+            .await
+            .expect("placement");
+        let command = concat!(
+            "test \"$MEERKAT_MONITOR_CHECKPOINT\" = 'cancel-baseline:v1' || exit 9; ",
+            "printf '%s\\n' ",
+            "'{\"type\":\"progress\",\"cursor\":10,\"message\":\"resumed for cancellation\"}' ",
+            "'{\"type\":\"notify\",\"key\":\"cancel:resumed\",\"message\":\"ready\"}'; ",
+            "while true; do sleep 1; done"
+        );
+        let runner_spec = ShellRunnerSpecification {
+            command: command.to_string(),
+            working_dir: resolved_dir.display().to_string(),
+            placement,
+            timeout_secs: 30,
+            monitor: Some(MonitorRunnerSpecification {
+                protocol: MonitorOutputProtocol::FramedJsonl,
+                limits: MonitorProtocolLimits::default(),
+                delivery: meerkat_jobs::JobDeliveryKind::Record,
+            }),
+        };
+        let encoded = serde_json::to_string(&runner_spec).expect("encode");
+        let blob = runtime
+            .blob_store
+            .put_artifact(SHELL_RUNNER_MEDIA_TYPE, &encoded)
+            .await
+            .expect("persist runner spec");
+        let receipt = service
+            .submit(
+                JobSpec::new(
+                    "test-realm",
+                    session_id.clone(),
+                    ExecutionIntentId::from_string("monitor-cancel-recovery-intent")
+                        .expect("intent"),
+                    InteractionLineageId::from_string("monitor-cancel-recovery-lineage")
+                        .expect("lineage"),
+                    ToolIdentity::new("monitor_start", "v1").expect("tool"),
+                    RunnerIdentity::new("meerkat.monitor_script", "v1").expect("runner"),
+                    RestartClass::CheckpointResumable,
+                    CanonicalArgumentsHash::new(blob.blob_id.to_string()).expect("hash"),
+                    JobSubmissionKey::new("monitor-cancel-recovery-submission").expect("key"),
+                )
+                .with_runner_specification_ref(
+                    RunnerSpecificationRef::new(blob.blob_id.to_string()).expect("ref"),
+                ),
+            )
+            .await
+            .expect("submit");
+        let first = service
+            .claim_attempt(
+                &receipt.job_id,
+                AttemptClaim::new(
+                    WorkerId::new("monitor-before-cancel-recovery").expect("worker"),
+                    1,
+                    10,
+                    RunnerHandleRef::new("inproc-monitor:cancel-lost").expect("handle"),
+                ),
+            )
+            .await
+            .expect("claim");
+        service
+            .record_checkpoint(
+                &receipt.job_id,
+                (&first).into(),
+                meerkat_jobs::CheckpointRef::new("cancel-baseline:v1").expect("checkpoint"),
+                2,
+            )
+            .await
+            .expect("baseline");
+
+        let manager = JobManager::new(config)
+            .bind_canonical_async_ops(session_id, Arc::new(RuntimeOpsLifecycleRegistry::new()))
+            .with_durable_job_runtime(runtime);
+        manager.ensure_recovered().await.expect("recover and claim");
+        let resumed = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let snapshot = service
+                    .get(&receipt.job_id)
+                    .await
+                    .expect("read")
+                    .expect("job");
+                if snapshot.phase == JobPhase::Running
+                    && snapshot.attempt_count == 2
+                    && snapshot
+                        .progress
+                        .as_ref()
+                        .is_some_and(|progress| progress.cursor == 10)
+                    && snapshot.outbox.iter().any(|entry| {
+                        matches!(
+                            &entry.payload,
+                            meerkat_jobs::JobOutboxPayload::Notification(notification)
+                                if notification.idempotency_key() == "cancel:resumed"
+                        )
+                    })
+                {
+                    break snapshot;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("recovered monitor must resume");
+        assert_ne!(resumed.current_attempt_id.as_ref(), Some(&first.attempt_id));
+        let notification_sequence = resumed
+            .outbox
+            .iter()
+            .find_map(|entry| {
+                matches!(
+                    &entry.payload,
+                    meerkat_jobs::JobOutboxPayload::Notification(notification)
+                        if notification.idempotency_key() == "cancel:resumed"
+                )
+                .then_some(entry.delivery_sequence)
+            })
+            .expect("resumed notification delivery");
+
+        // Model the production delivery driver's race: it can acknowledge the
+        // durable job outbox while a monitor-owned inline projector is still
+        // blocked. The monitor must not call the projector for notifications
+        // at all; otherwise the applied row below would make the public
+        // snapshot look ready while cancellation remained trapped in that
+        // blocking call.
+        service
+            .mark_delivery_applied(&receipt.job_id, notification_sequence)
+            .await
+            .expect("racing delivery driver applies notification");
+        assert_eq!(
+            projector.calls.load(Ordering::SeqCst),
+            0,
+            "notification projection must not execute on the monitor liveness task"
+        );
+
+        // Deterministically park the monitor in the exact production failure
+        // seam: a SQLite-backed heartbeat CAS whose async trait future is
+        // blocked while the cancellation writer remains able to commit on a
+        // separate connection. Cancel/timeout must preempt this heartbeat
+        // owner; merely moving notification projection out of the loop is
+        // insufficient.
+        pausing_store.arm_heartbeat_pause();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            pausing_store.heartbeat_entered.notified(),
+        )
+        .await
+        .expect("monitor heartbeat should enter the deterministic SQLite gate");
+        pausing_store.reject_cancel_settlement_renewal();
+        pausing_store.inject_one_cancel_ack_stale_revision();
+
+        let public_job_id = JobId::from_string(receipt.job_id.as_str());
+        assert_eq!(
+            manager
+                .cancel_job(&public_job_id)
+                .await
+                .expect("request cancellation"),
+            CancelJobDisposition::CancellationRequested
+        );
+        let cancelled = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let snapshot = service
+                    .get(&receipt.job_id)
+                    .await
+                    .expect("read")
+                    .expect("job");
+                if snapshot.phase == JobPhase::Cancelled {
+                    break snapshot;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("recovered monitor cancellation must terminalize");
+        assert_eq!(cancelled.attempt_count, 2);
+        assert_eq!(
+            cancelled.terminal_result,
+            Some(JobTerminalResult::Cancelled)
+        );
+        assert!(cancelled.outbox.iter().any(|entry| {
+            matches!(
+                &entry.payload,
+                meerkat_jobs::JobOutboxPayload::Terminal(JobTerminalResult::Cancelled)
+            )
+        }));
+        assert_eq!(
+            pausing_store.cancel_ack_attempts.load(Ordering::SeqCst),
+            2,
+            "one preempted monitor mutation permits exactly one cancellation authority reload"
+        );
+
+        // Terminal delivery remains deliberately sequenced after the durable
+        // cancellation commit. Release that projection so the attempt task can
+        // finish and prove the blocking test double did not merely get leaked.
+        tokio::time::timeout(Duration::from_secs(5), projector.entered.notified())
+            .await
+            .expect("terminal projector should run after cancellation commit");
+        projector.release.notify_one();
+        pausing_store.heartbeat_release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !manager
+                    .active_attempts
+                    .lock()
+                    .await
+                    .contains_key(&public_job_id)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("attempt task should retire after terminal projection release");
+        assert_eq!(
+            projector.calls.load(Ordering::SeqCst),
+            1,
+            "only terminal projection belongs on the attempt settlement path"
+        );
+    }
+
+    #[tokio::test]
     async fn running_shell_attempt_renews_its_committed_lease() {
         let temp = TempDir::new().expect("tempdir");
         let session_id = SessionId::new();
@@ -3296,6 +4793,160 @@ mod durable_tests {
         })
         .await
         .expect("completion");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn ordinary_shell_observes_cancellation_requested_by_another_manager() {
+        let temp = TempDir::new().expect("tempdir");
+        let session_id = SessionId::new();
+        let projector = Arc::new(RecordingDeliveryProjector::default());
+        let pausing_store = Arc::new(PausingHeartbeatStore::open(temp.path().join("jobs.db")));
+        let (runtime, job_store, config) = durable_fixture_with_store_and_projector(
+            &temp,
+            session_id.clone(),
+            pausing_store.clone(),
+            projector.clone(),
+        );
+        let service = DetachedJobService::new(job_store);
+        let owner_registry = Arc::new(RuntimeOpsLifecycleRegistry::new());
+        let owner = JobManager::new(config.clone())
+            .bind_canonical_async_ops(session_id.clone(), owner_registry.clone())
+            .with_durable_job_runtime(runtime.clone());
+        let remote = Arc::new(
+            JobManager::new(config)
+                .bind_canonical_async_ops(session_id, Arc::new(RuntimeOpsLifecycleRegistry::new()))
+                .with_durable_job_runtime(runtime),
+        );
+
+        let public_job_id = owner
+            .spawn_job_for_call("while :; do sleep 1; done", None, 5, "cross-manager-cancel")
+            .await
+            .expect("spawn");
+        let job_id =
+            meerkat_jobs::JobId::new(public_job_id.to_string()).expect("domain job identity");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if service
+                    .get(&job_id)
+                    .await
+                    .expect("read")
+                    .is_some_and(|snapshot| snapshot.phase == JobPhase::Running)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("attempt should be running");
+
+        let baseline_heartbeat = pausing_store
+            .inner
+            .get(&job_id)
+            .await
+            .expect("read baseline")
+            .expect("job")
+            .machine_state
+            .heartbeat_at_ms;
+        pausing_store.arm_cancel_request_pause();
+        let cancel_remote = Arc::clone(&remote);
+        let cancel_job_id = public_job_id.clone();
+        let cancellation =
+            tokio::spawn(async move { cancel_remote.cancel_job(&cancel_job_id).await });
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            pausing_store.cancel_request_entered.notified(),
+        )
+        .await
+        .expect("cancel request should enter the deterministic CAS gate");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let heartbeat = pausing_store
+                    .inner
+                    .get(&job_id)
+                    .await
+                    .expect("read racing heartbeat")
+                    .expect("job")
+                    .machine_state
+                    .heartbeat_at_ms;
+                if heartbeat != baseline_heartbeat {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owner heartbeat must win the first cancellation CAS");
+        pausing_store.cancel_request_release.notify_one();
+        assert_eq!(
+            cancellation
+                .await
+                .expect("cancellation task")
+                .expect("remote cancellation request must converge"),
+            CancelJobDisposition::CancellationRequested
+        );
+        let cancelled = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = service.get(&job_id).await.expect("read").expect("job");
+                if snapshot.phase == JobPhase::Cancelled {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owner heartbeat must observe durable cancellation");
+        assert_eq!(
+            cancelled.terminal_result,
+            Some(JobTerminalResult::Cancelled)
+        );
+        assert!(cancelled.outbox.iter().any(|entry| matches!(
+            entry.payload,
+            meerkat_jobs::JobOutboxPayload::Terminal(JobTerminalResult::Cancelled)
+        )));
+
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !owner
+                    .active_attempts
+                    .lock()
+                    .await
+                    .contains_key(&public_job_id)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owning attempt should finish projection");
+        let view = owner
+            .projections
+            .lock()
+            .await
+            .get(&public_job_id)
+            .expect("projection")
+            .view
+            .clone();
+        assert!(matches!(view.status, JobStatus::Cancelled { .. }));
+        let operation = owner_registry
+            .snapshot(&operation_id_for_job(&public_job_id))
+            .expect("operation snapshot")
+            .expect("operation");
+        assert_eq!(
+            operation.status,
+            meerkat_core::ops_lifecycle::OperationStatus::Cancelled
+        );
+        assert_eq!(
+            operation.public_result_class,
+            meerkat_core::ops_lifecycle::OperationPublicResultClass::Cancelled
+        );
+        assert!(matches!(
+            operation.terminal_outcome,
+            Some(meerkat_core::ops_lifecycle::OperationTerminalOutcome::Cancelled { .. })
+        ));
+        assert_eq!(projector.project_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(projector.acknowledge_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

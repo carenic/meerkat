@@ -878,6 +878,7 @@ impl LiveProjectionError {
             SessionError::Store(_)
             | SessionError::Agent(_)
             | SessionError::DurableTailHeldForRecovery { .. }
+            | SessionError::DurableTailRecoveryRefused { .. }
             | SessionError::DurableEvidenceQuarantined { .. }
             | SessionError::FailedWithData { .. } => Self::Session { code, message },
         }
@@ -1536,6 +1537,7 @@ impl LiveToolDispatchError {
             SessionError::Store(_)
             | SessionError::Agent(_)
             | SessionError::DurableTailHeldForRecovery { .. }
+            | SessionError::DurableTailRecoveryRefused { .. }
             | SessionError::DurableEvidenceQuarantined { .. }
             | SessionError::FailedWithData { .. } => Self::Session { code, message },
         }
@@ -3986,11 +3988,10 @@ mod tests {
             snapshot_version: 1,
             seed_messages: vec![],
             visible_tools: vec![],
-            system_prompt: None,
+            canonical_system_messages: vec![],
             model_id: "model-a".into(),
             provider_id: meerkat_core::Provider::Other,
             audio_config: None,
-            runtime_system_context: vec![],
             user_content_identities: vec![],
             user_content_tombstones: vec![],
             canonical_user_image_decoded_bytes: None,

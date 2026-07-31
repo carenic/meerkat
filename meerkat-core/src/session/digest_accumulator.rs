@@ -12,7 +12,9 @@
 //!
 //! # What this does NOT change
 //!
-//! The digest VALUE. `digest_format` stays `2`; nothing new is persisted. The
+//! The digest VALUE for the current format. `digest_format = 3` adds canonical
+//! opaque-JSON values; the incremental byte stream itself remains element-wise.
+//! The
 //! byte stream that `serde_json::to_vec(&canonicalize_messages_for_digest(m))`
 //! produces is
 //!
@@ -22,7 +24,7 @@
 //!
 //! which is append-extendable, and `sha2::Sha256` is `Clone`. So a retained
 //! hasher midstate over the identity byte stream plus the appended suffix
-//! yields the EXACT format-2 digest of the grown transcript. Every value this
+//! yields the EXACT format-3 digest of the grown transcript. Every value this
 //! module serves is byte-identical to a full recompute; only the cost differs.
 //!
 //! # Invalidation
@@ -40,6 +42,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use sha2::{Digest, Sha256};
 
+use crate::session_store::SessionMessageRowPrefixAccumulator;
 use crate::types::Message;
 
 /// Bounded ring of retained prefix midstates, keyed by covered message count.
@@ -77,39 +80,11 @@ impl Midstate {
         }
         let canonical = super::canonicalize_message_for_digest(message);
         let bytes = serde_json::to_vec(&canonical)?;
-        crate::checkpoint::record_content_digest_bytes(bytes.len() as u64);
+        crate::digest_observability::record_content_digest_bytes(bytes.len() as u64);
         self.hasher.update(bytes);
         self.covered += 1;
         Ok(())
     }
-}
-
-/// Retained canonical-SORTED bytes of the current message vector: the
-/// `write_canonical_json` form (lexicographic object keys) of
-/// `canonicalize_messages_for_digest(messages)`, interior only (no closing
-/// `]`). This is the byte stream the transcript-history checkpoint WITNESS
-/// hashes for the live head body — a different byte stream from the
-/// `to_vec` identity stream the midstates cover, which is why it is retained
-/// separately. Seeded lazily on the first witness assembly; extended per
-/// append; invalidated with the midstates.
-#[derive(Debug, Clone)]
-struct SortedStream {
-    bytes: Vec<u8>,
-    covered: usize,
-}
-
-/// SHA-256 midstate over `prefix ++ "[" ++ sorted canonical elements` (no
-/// closing `]`) — the canonical checkpoint DOCUMENT's transcript span. The
-/// canonical document sorts only the immutable `created_at` and `id` before
-/// `messages`, so the prefix is constant per session instance and everything
-/// after the array is turn-sized; finalizing with `"]" ++ suffix` yields the
-/// byte-identical whole-document digest. Keyed by the exact prefix bytes so
-/// a document-framing change reseeds instead of serving a wrong digest.
-#[derive(Debug, Clone)]
-struct FramedMidstate {
-    prefix: Vec<u8>,
-    hasher: Sha256,
-    covered: usize,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -120,10 +95,20 @@ struct AccumulatorState {
     stream_a: Option<Midstate>,
     /// Retained prefix midstates at previously witnessed boundaries.
     boundaries: VecDeque<Midstate>,
-    /// Canonical-sorted byte stream for witness assembly, when enabled.
-    sorted_stream: Option<SortedStream>,
-    /// Canonical checkpoint-document midstate, when enabled.
-    framed: Option<FramedMidstate>,
+    /// Exact audited-graph endpoint retained across ordinary appends and
+    /// store-boundary acknowledgements.
+    exact_row_anchor: Option<SessionMessageRowPrefixAccumulator>,
+    /// Latest exact store-owned boundary installed by a verified
+    /// head-canonical materialization or acknowledged commit.
+    exact_row_committed: Option<SessionMessageRowPrefixAccumulator>,
+    /// The installed lineage extended through every append performed on this
+    /// buffer. Non-append mutations invalidate this live-current witness.
+    exact_row_current: Option<SessionMessageRowPrefixAccumulator>,
+    /// Store-verified WholeBlob bytes establish exact serialized-row lineage,
+    /// but deriving its prefix eagerly would add another O(document) pass to
+    /// every resume. The count advances across appends and materializes the
+    /// prefix only if a rewrite or HeadCanonical conversion actually asks.
+    lazy_exact_row_current_count: Option<u64>,
     /// Monotonic count of non-append transcript mutations. Observability for
     /// tests and diagnostics; correctness does not depend on it.
     epoch: u64,
@@ -157,9 +142,10 @@ impl Clone for TranscriptDigestAccumulator {
 }
 
 thread_local! {
-    /// Debug/test builds cross-check every witness-served digest against a
-    /// full recompute, so a missed invalidation seam fails loudly in CI
-    /// instead of silently persisting a wrong `head_revision`.
+    /// Focused meerkat-core unit tests cross-check every witness-served digest
+    /// against a full recompute, so a missed invalidation seam fails loudly
+    /// without turning every downstream debug/integration build back into an
+    /// O(document) runtime.
     ///
     /// The cross-check deliberately uses the UNCOUNTED digest helper: it is
     /// verification scaffolding, so it must not appear in the
@@ -168,33 +154,16 @@ thread_local! {
     static CROSS_CHECK_ENABLED: std::cell::Cell<bool> = const { std::cell::Cell::new(true) };
 }
 
-/// Release-mode sampled verification budget: the first N witness-served
-/// digests per process are recomputed and compared even in release builds.
-/// Debug/test builds verify every serve (the thread-local above); release
-/// builds otherwise had ZERO runtime verification — the entire safety
-/// argument rested on the type-level no-`DerefMut` enforcement, while a
-/// wrong `head_revision` would be persisted into two durable stores and
-/// make sessions unloadable. Sampling converts that argument into evidence
-/// at bounded cost; a mismatch panics before anything wrong is persisted.
-/// 64, not 32: three sampled cross-checks now share this budget (the
-/// accumulator witness, the framed checkpoint digest, and the rewrite
-/// fast-path validator), so the original 32 would halve-or-worse each
-/// check's coverage. Raised deliberately when the framed and fast-path
-/// samples were added (2026-07-27).
-static RELEASE_VERIFICATION_BUDGET: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(64);
-
 pub(crate) fn take_verification_sample() -> bool {
-    if cfg!(any(test, debug_assertions)) {
+    if cfg!(test) {
         CROSS_CHECK_ENABLED.with(std::cell::Cell::get)
     } else {
-        RELEASE_VERIFICATION_BUDGET
-            .fetch_update(
-                std::sync::atomic::Ordering::Relaxed,
-                std::sync::atomic::Ordering::Relaxed,
-                |budget| budget.checked_sub(1),
-            )
-            .is_ok()
+        // Production hot paths must remain O(delta) from the first turn after
+        // every restart. Correctness comes from byte-bound structural
+        // witnesses and mutation-exhaustive invalidation; full recomputation
+        // belongs to explicit verification/migration phases, not a hidden
+        // process-start sampling cliff.
+        false
     }
 }
 
@@ -213,8 +182,10 @@ impl TranscriptDigestAccumulator {
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         state.stream_a = None;
         state.boundaries.clear();
-        state.sorted_stream = None;
-        state.framed = None;
+        state.exact_row_anchor = None;
+        state.exact_row_committed = None;
+        state.exact_row_current = None;
+        state.lazy_exact_row_current_count = None;
         state.parked = None;
         state.epoch = state.epoch.saturating_add(1);
     }
@@ -226,6 +197,23 @@ impl TranscriptDigestAccumulator {
     /// boundaries survive an append by construction.
     fn extend(&mut self, appended: &[Message]) {
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        state.lazy_exact_row_current_count =
+            state
+                .lazy_exact_row_current_count
+                .and_then(|current_count| {
+                    u64::try_from(appended.len())
+                        .ok()
+                        .and_then(|appended_count| current_count.checked_add(appended_count))
+                });
+        if let Some(current) = state.exact_row_current.take() {
+            let serialized = appended
+                .iter()
+                .map(serde_json::to_vec)
+                .collect::<Result<Vec<_>, _>>();
+            state.exact_row_current = serialized
+                .ok()
+                .and_then(|rows| current.extend_serialized_rows(&rows).ok());
+        }
         if let Some(stream) = state.stream_a.as_mut() {
             for message in appended {
                 if stream.absorb(message).is_err() {
@@ -234,37 +222,8 @@ impl TranscriptDigestAccumulator {
                     // recompute surface the typed error at the call site.
                     state.stream_a = None;
                     state.boundaries.clear();
-                    state.sorted_stream = None;
-                    state.framed = None;
                     state.epoch = state.epoch.saturating_add(1);
                     return;
-                }
-            }
-        }
-        if state.sorted_stream.is_some() || state.framed.is_some() {
-            for message in appended {
-                match sorted_canonical_message_bytes(message) {
-                    Ok(bytes) => {
-                        if let Some(sorted) = state.sorted_stream.as_mut() {
-                            if sorted.covered > 0 {
-                                sorted.bytes.push(b',');
-                            }
-                            sorted.bytes.extend_from_slice(&bytes);
-                            sorted.covered += 1;
-                        }
-                        if let Some(framed) = state.framed.as_mut() {
-                            if framed.covered > 0 {
-                                framed.hasher.update(b",");
-                            }
-                            framed.hasher.update(&bytes);
-                            framed.covered += 1;
-                        }
-                    }
-                    Err(_) => {
-                        state.sorted_stream = None;
-                        state.framed = None;
-                        break;
-                    }
                 }
             }
         }
@@ -275,16 +234,20 @@ impl TranscriptDigestAccumulator {
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         if state.stream_a.is_none()
             && state.boundaries.is_empty()
-            && state.sorted_stream.is_none()
-            && state.framed.is_none()
+            && state.exact_row_anchor.is_none()
+            && state.exact_row_committed.is_none()
+            && state.exact_row_current.is_none()
+            && state.lazy_exact_row_current_count.is_none()
         {
             return;
         }
         let parked = AccumulatorState {
             stream_a: state.stream_a.take(),
             boundaries: std::mem::take(&mut state.boundaries),
-            sorted_stream: state.sorted_stream.take(),
-            framed: state.framed.take(),
+            exact_row_anchor: state.exact_row_anchor.take(),
+            exact_row_committed: state.exact_row_committed.take(),
+            exact_row_current: state.exact_row_current.take(),
+            lazy_exact_row_current_count: state.lazy_exact_row_current_count.take(),
             epoch: state.epoch,
             parked: None,
         };
@@ -293,28 +256,145 @@ impl TranscriptDigestAccumulator {
 
     /// Resolve a parked in-place scan.
     ///
-    /// `None` (the scan changed nothing) restores the parked midstate;
-    /// anything else discards it and bumps the epoch. Dropping the scope
-    /// without calling this — an early `?` return — leaves the accumulator
-    /// invalidated, which is the fail-safe direction.
+    /// `None` (the scan changed nothing) restores the parked state. A mutation
+    /// invalidates every content/current-row witness and bumps the epoch, but
+    /// may retain an exact durable-row ANCHOR when the lowest changed index is
+    /// at or beyond the anchor's row count: by construction no row committed
+    /// by that prefix changed. Dropping the scope without calling this — an
+    /// early `?` return — leaves the accumulator invalidated, which is the
+    /// fail-safe direction.
     fn finish_in_place_scan(&mut self, lowest_mutated_index: Option<usize>) {
         let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
         let Some(parked) = state.parked.take() else {
             if lowest_mutated_index.is_some() {
                 state.stream_a = None;
                 state.boundaries.clear();
+                state.exact_row_anchor = None;
+                state.exact_row_committed = None;
+                state.exact_row_current = None;
+                state.lazy_exact_row_current_count = None;
                 state.epoch = state.epoch.saturating_add(1);
             }
             return;
         };
-        if lowest_mutated_index.is_some() {
+        if let Some(lowest_mutated_index) = lowest_mutated_index {
+            state.exact_row_anchor = parked.exact_row_anchor.filter(|anchor| {
+                u64::try_from(lowest_mutated_index).is_ok_and(|index| index >= anchor.row_count())
+            });
+            state.exact_row_committed = parked.exact_row_committed.filter(|committed| {
+                u64::try_from(lowest_mutated_index)
+                    .is_ok_and(|index| index >= committed.row_count())
+            });
             state.epoch = state.epoch.saturating_add(1);
             return;
         }
         state.stream_a = parked.stream_a;
         state.boundaries = parked.boundaries;
-        state.sorted_stream = parked.sorted_stream;
-        state.framed = parked.framed;
+        state.exact_row_anchor = parked.exact_row_anchor;
+        state.exact_row_committed = parked.exact_row_committed;
+        state.exact_row_current = parked.exact_row_current;
+        state.lazy_exact_row_current_count = parked.lazy_exact_row_current_count;
+    }
+
+    /// Re-derive the live-current lineage after a known-index mutation kept an
+    /// exact prefix. Only rows after the nearest retained prefix are encoded.
+    fn rebuild_exact_row_current_from_retained_prefix(&mut self, messages: &[Message]) {
+        let state = self.state.get_mut().unwrap_or_else(PoisonError::into_inner);
+        let Some(base) = [
+            state.exact_row_anchor.as_ref(),
+            state.exact_row_committed.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|prefix| prefix.row_count() <= messages.len() as u64)
+        .max_by_key(|prefix| prefix.row_count())
+        .cloned() else {
+            return;
+        };
+        let Ok(start) = usize::try_from(base.row_count()) else {
+            return;
+        };
+        let serialized = messages[start..]
+            .iter()
+            .map(serde_json::to_vec)
+            .collect::<Result<Vec<_>, _>>();
+        state.exact_row_current = serialized
+            .ok()
+            .and_then(|rows| base.extend_serialized_rows(&rows).ok());
+    }
+
+    fn install_exact_row_prefix(&self, prefix: SessionMessageRowPrefixAccumulator) {
+        let mut state = self.locked();
+        state.lazy_exact_row_current_count = None;
+        if state.exact_row_anchor.is_none() {
+            state.exact_row_anchor = Some(prefix.clone());
+        }
+        state.exact_row_committed = Some(prefix.clone());
+        state.exact_row_current = Some(prefix);
+    }
+
+    fn install_exact_row_lineage(
+        &self,
+        anchor: SessionMessageRowPrefixAccumulator,
+        current: SessionMessageRowPrefixAccumulator,
+    ) {
+        let mut state = self.locked();
+        state.lazy_exact_row_current_count = None;
+        state.exact_row_anchor = Some(anchor);
+        // Graph replay can install a new semantic endpoint before its rewrite
+        // is physically committed. Preserve an already witnessed store
+        // boundary across that preflight; cold materialization has no prior
+        // boundary and therefore adopts the verified current prefix.
+        if state.exact_row_committed.is_none() {
+            state.exact_row_committed = Some(current.clone());
+        }
+        state.exact_row_current = Some(current);
+    }
+
+    fn exact_row_prefix_at(&self, row_count: u64) -> Option<SessionMessageRowPrefixAccumulator> {
+        let state = self.locked();
+        state
+            .exact_row_current
+            .as_ref()
+            .filter(|prefix| prefix.row_count() == row_count)
+            .or_else(|| {
+                state
+                    .exact_row_committed
+                    .as_ref()
+                    .filter(|prefix| prefix.row_count() == row_count)
+            })
+            .or_else(|| {
+                state
+                    .exact_row_anchor
+                    .as_ref()
+                    .filter(|prefix| prefix.row_count() == row_count)
+            })
+            .cloned()
+    }
+
+    fn mark_lazy_exact_row_current(&self, row_count: u64) {
+        let mut state = self.locked();
+        if state.exact_row_current.is_none() {
+            state.lazy_exact_row_current_count = Some(row_count);
+        }
+    }
+
+    fn lazy_exact_row_current_matches(&self, row_count: u64) -> bool {
+        self.locked().lazy_exact_row_current_count == Some(row_count)
+    }
+
+    fn exact_row_lineage_extends(
+        &self,
+        anchor: &SessionMessageRowPrefixAccumulator,
+        current_count: u64,
+    ) -> bool {
+        let state = self.locked();
+        (state.exact_row_anchor.as_ref() == Some(anchor)
+            || state.exact_row_committed.as_ref() == Some(anchor))
+            && state
+                .exact_row_current
+                .as_ref()
+                .is_some_and(|current| current.row_count() == current_count)
     }
 
     /// Digest of `messages` — witness-served when the retained midstate covers
@@ -337,7 +417,7 @@ impl TranscriptDigestAccumulator {
             covered: 0,
         };
         stream.hasher.update(b"[");
-        crate::checkpoint::record_content_digest_computation();
+        crate::digest_observability::record_content_digest_computation();
         for message in messages {
             stream.absorb(message)?;
         }
@@ -398,343 +478,6 @@ impl TranscriptDigestAccumulator {
         }
         Some(digest)
     }
-
-    /// Feed the canonical-sorted byte form of `messages` (a complete
-    /// canonical JSON array) into `hasher`.
-    ///
-    /// Seeds the retained sorted stream on first use (one O(transcript)
-    /// canonicalization), then serves and extends in O(delta) per append.
-    /// Returns `false` when the stream cannot prove it covers exactly this
-    /// vector (parked scan, count mismatch it cannot reseed, serialization
-    /// failure); the caller falls back to the full canonicalization path.
-    fn hash_sorted_canonical_into(&self, messages: &[Message], hasher: &mut Sha256) -> bool {
-        let mut state = self.locked();
-        if state.parked.is_some() {
-            return false;
-        }
-        let serve = match state.sorted_stream.as_ref() {
-            Some(sorted) if sorted.covered == messages.len() => true,
-            _ => {
-                let mut sorted = SortedStream {
-                    bytes: Vec::new(),
-                    covered: 0,
-                };
-                for message in messages {
-                    let Ok(bytes) = sorted_canonical_message_bytes(message) else {
-                        return false;
-                    };
-                    if sorted.covered > 0 {
-                        sorted.bytes.push(b',');
-                    }
-                    sorted.bytes.extend_from_slice(&bytes);
-                    sorted.covered += 1;
-                }
-                state.sorted_stream = Some(sorted);
-                true
-            }
-        };
-        if !serve {
-            return false;
-        }
-        let Some(sorted) = state.sorted_stream.as_ref() else {
-            return false;
-        };
-        hasher.update(b"[");
-        hasher.update(&sorted.bytes);
-        hasher.update(b"]");
-        crate::checkpoint::record_content_digest_bytes(sorted.bytes.len() as u64 + 2);
-        true
-    }
-
-    /// SHA-256 midstate over `prefix ++ "[" ++ canonical elements of exactly
-    /// this vector` (no closing `]`) — a clone the caller finalizes with
-    /// `"]" ++ suffix` to obtain the byte-identical canonical checkpoint
-    /// document digest.
-    ///
-    /// Serves the retained midstate when it covers exactly this vector under
-    /// exactly this prefix; otherwise reseeds with one full canonicalization
-    /// pass (counted — that is the pass the digest budget observes) and
-    /// retains the result. `None` when the accumulator is parked or a
-    /// message fails to serialize; the caller falls back to the full
-    /// document path — the fail-safe direction.
-    fn framed_document_hasher(&self, messages: &[Message], prefix: &[u8]) -> Option<Sha256> {
-        let mut state = self.locked();
-        if state.parked.is_some() {
-            return None;
-        }
-        if let Some(framed) = state.framed.as_ref()
-            && framed.covered == messages.len()
-            && framed.prefix == prefix
-        {
-            return Some(framed.hasher.clone());
-        }
-        let mut hasher = Sha256::new();
-        hasher.update(prefix);
-        hasher.update(b"[");
-        let mut element_bytes = 0u64;
-        let mut covered = 0usize;
-        for message in messages {
-            let Ok(bytes) = sorted_canonical_message_bytes(message) else {
-                return None;
-            };
-            if covered > 0 {
-                hasher.update(b",");
-                element_bytes = element_bytes.saturating_add(1);
-            }
-            hasher.update(&bytes);
-            element_bytes = element_bytes.saturating_add(bytes.len() as u64);
-            covered += 1;
-        }
-        crate::checkpoint::record_content_digest_bytes(element_bytes);
-        state.framed = Some(FramedMidstate {
-            prefix: prefix.to_vec(),
-            hasher: hasher.clone(),
-            covered,
-        });
-        Some(hasher)
-    }
-}
-
-/// Canonical-sorted bytes of one message: `write_canonical_json` over the
-/// digest-canonicalized message value. This is the per-element form of the
-/// history-witness byte stream (canonical array writing is element-wise).
-fn sorted_canonical_message_bytes(message: &Message) -> Result<Vec<u8>, serde_json::Error> {
-    let canonical = serde_json::to_value(super::canonicalize_message_for_digest(message))?;
-    let mut bytes = Vec::new();
-    crate::checkpoint::write_canonical_json(&canonical, &mut bytes)?;
-    Ok(bytes)
-}
-
-/// Process-global bounded memo carrying accumulator midstates across the
-/// serialize → deserialize boundary, keyed by the SHA-256 of the EXACT
-/// serialized session bytes.
-///
-/// Every fact in an [`AccumulatorState`] is a pure function of the message
-/// vector, and the message vector is a pure function of the serialized
-/// bytes, so a key that is a collision-resistant hash of those exact bytes
-/// binds precisely what a fresh recompute would bind — this is the
-/// byte-binding discipline the P0 memo review required, not a shape key.
-/// Producers record the WARM state at the moment they serialize a session
-/// (or fully verify a decoded one); a decode of the same bytes adopts the
-/// snapshot instead of reseeding every midstate with an O(document)
-/// canonicalize-and-hash pass per guard, head build, and checkpoint
-/// verification. The debug/release sampled witness cross-checks
-/// (`take_verification_sample`) keep verifying adopted midstates against
-/// full recomputes, so a keying defect fails loudly instead of persisting a
-/// wrong digest. Entries are byte-budgeted (the sorted stream retains the
-/// canonical transcript bytes); eviction only costs a reseed. Honors
-/// `MEERKAT_DISABLE_GRAPH_DECODE_MEMO` so the established kill-switch
-/// restores the full pre-memo decode cost end to end.
-struct ByteBoundAccumulatorMemo {
-    budget_bytes: usize,
-    entry_cap_bytes: usize,
-    retained_bytes: usize,
-    entries: std::collections::HashMap<[u8; 32], (Arc<AccumulatorState>, usize)>,
-    order: VecDeque<[u8; 32]>,
-}
-
-const BYTE_BOUND_ACCUMULATOR_MEMO_BUDGET: usize = 128 * 1024 * 1024;
-const BYTE_BOUND_ACCUMULATOR_MEMO_ENTRY_CAP: usize = BYTE_BOUND_ACCUMULATOR_MEMO_BUDGET / 2;
-
-impl ByteBoundAccumulatorMemo {
-    fn get(&mut self, key: &[u8; 32]) -> Option<Arc<AccumulatorState>> {
-        let (state, _) = self.entries.get(key)?;
-        let state = Arc::clone(state);
-        if let Some(position) = self.order.iter().position(|entry| entry == key)
-            && let Some(entry) = self.order.remove(position)
-        {
-            self.order.push_back(entry);
-        }
-        Some(state)
-    }
-
-    fn record(&mut self, key: [u8; 32], state: Arc<AccumulatorState>, bytes: usize) {
-        if bytes > self.entry_cap_bytes {
-            return;
-        }
-        if let Some((_, existing)) = self.entries.remove(&key) {
-            self.retained_bytes = self.retained_bytes.saturating_sub(existing);
-            if let Some(position) = self.order.iter().position(|entry| entry == &key) {
-                self.order.remove(position);
-            }
-        }
-        while self.retained_bytes + bytes > self.budget_bytes {
-            let Some(evicted) = self.order.pop_front() else {
-                break;
-            };
-            if let Some((_, evicted_bytes)) = self.entries.remove(&evicted) {
-                self.retained_bytes = self.retained_bytes.saturating_sub(evicted_bytes);
-            }
-        }
-        self.order.push_back(key);
-        self.retained_bytes += bytes;
-        self.entries.insert(key, (state, bytes));
-    }
-}
-
-static BYTE_BOUND_ACCUMULATOR_MEMO: std::sync::OnceLock<Mutex<ByteBoundAccumulatorMemo>> =
-    std::sync::OnceLock::new();
-
-fn byte_bound_accumulator_memo() -> &'static Mutex<ByteBoundAccumulatorMemo> {
-    BYTE_BOUND_ACCUMULATOR_MEMO.get_or_init(|| {
-        Mutex::new(ByteBoundAccumulatorMemo {
-            budget_bytes: BYTE_BOUND_ACCUMULATOR_MEMO_BUDGET,
-            entry_cap_bytes: BYTE_BOUND_ACCUMULATOR_MEMO_ENTRY_CAP,
-            retained_bytes: 0,
-            entries: std::collections::HashMap::new(),
-            order: VecDeque::new(),
-        })
-    })
-}
-
-fn session_bytes_key(serialized: &[u8]) -> [u8; 32] {
-    let digest = Sha256::digest(serialized);
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&digest);
-    key
-}
-
-fn accumulator_state_retained_bytes(state: &AccumulatorState) -> usize {
-    let sorted = state
-        .sorted_stream
-        .as_ref()
-        .map_or(0, |sorted| sorted.bytes.len());
-    let framed = state
-        .framed
-        .as_ref()
-        .map_or(0, |framed| framed.prefix.len() + 128);
-    // Midstates and the boundary ring are ~constant-size hasher states.
-    sorted + framed + 4096
-}
-
-/// Shared handle to a message vector plus the accumulator midstates proven
-/// for it — the value type of the slim-materialization substitution memo.
-/// The vector rides the buffer's own copy-on-write `Arc`, so recording is
-/// O(1) and retention is shared with the live session while it is alive.
-#[derive(Debug, Clone)]
-pub(crate) struct SharedTranscriptSnapshot {
-    messages: Arc<Vec<Message>>,
-    state: Arc<AccumulatorState>,
-}
-
-impl SharedTranscriptSnapshot {
-    pub(crate) fn message_count(&self) -> usize {
-        self.messages.len()
-    }
-
-    pub(crate) fn messages(&self) -> &Arc<Vec<Message>> {
-        &self.messages
-    }
-}
-
-impl TranscriptMessages {
-    /// Snapshot the current buffer and its midstates for the substitution
-    /// memo. `None` when the accumulator is parked or a retained midstate
-    /// does not cover exactly this vector.
-    pub(crate) fn shared_snapshot(&self) -> Option<SharedTranscriptSnapshot> {
-        let state = self.accumulator.locked();
-        if state.parked.is_some()
-            || state
-                .stream_a
-                .as_ref()
-                .is_some_and(|stream| stream.covered != self.messages.len())
-            || state
-                .sorted_stream
-                .as_ref()
-                .is_some_and(|sorted| sorted.covered != self.messages.len())
-            || state
-                .framed
-                .as_ref()
-                .is_some_and(|framed| framed.covered != self.messages.len())
-        {
-            return None;
-        }
-        let snapshot = (**state).clone();
-        drop(state);
-        Some(SharedTranscriptSnapshot {
-            messages: Arc::clone(&self.messages),
-            state: Arc::new(snapshot),
-        })
-    }
-
-    /// Rebuild a buffer from a snapshot: the shared vector plus the exact
-    /// midstates proven for it.
-    pub(crate) fn from_shared_snapshot(snapshot: &SharedTranscriptSnapshot) -> Self {
-        Self {
-            messages: Arc::clone(&snapshot.messages),
-            accumulator: Box::new(TranscriptDigestAccumulator {
-                state: Mutex::new(Box::new((*snapshot.state).clone())),
-            }),
-        }
-    }
-
-    /// Record this buffer's retained midstates under the SHA-256 of the
-    /// exact bytes the enclosing session just serialized to (or was fully
-    /// verified against). No-op when nothing is retained, when the
-    /// accumulator is parked mid-scan, or when the kill-switch is set.
-    pub(crate) fn record_state_for_serialized_bytes(&self, serialized: &[u8]) {
-        if std::env::var_os("MEERKAT_DISABLE_GRAPH_DECODE_MEMO").is_some() {
-            return;
-        }
-        let state = self.accumulator.locked();
-        if state.parked.is_some()
-            || (state.stream_a.is_none() && state.sorted_stream.is_none() && state.framed.is_none())
-        {
-            return;
-        }
-        // Only snapshot states that cover exactly the current buffer: a
-        // stale-but-uninvalidated midstate cannot exist by construction, but
-        // count agreement is cheap and keeps the recorded fact self-evident.
-        if state
-            .stream_a
-            .as_ref()
-            .is_some_and(|stream| stream.covered != self.messages.len())
-        {
-            return;
-        }
-        let snapshot: AccumulatorState = (**state).clone();
-        drop(state);
-        let bytes = accumulator_state_retained_bytes(&snapshot);
-        if let Ok(mut memo) = byte_bound_accumulator_memo().lock() {
-            memo.record(session_bytes_key(serialized), Arc::new(snapshot), bytes);
-        }
-    }
-
-    /// Adopt the midstates previously recorded for these EXACT serialized
-    /// bytes. Sound because the key is a collision-resistant hash of the
-    /// bytes this buffer was just decoded from: the recorded state was
-    /// computed over the identical message vector. Count mismatches (or a
-    /// recorded parked state) are discarded, and every witness serve stays
-    /// covered by the sampled full-recompute cross-check.
-    pub(crate) fn adopt_state_for_serialized_bytes(&mut self, serialized: &[u8]) {
-        if std::env::var_os("MEERKAT_DISABLE_GRAPH_DECODE_MEMO").is_some() {
-            return;
-        }
-        let Some(snapshot) = byte_bound_accumulator_memo()
-            .lock()
-            .ok()
-            .and_then(|mut memo| memo.get(&session_bytes_key(serialized)))
-        else {
-            return;
-        };
-        if snapshot.parked.is_some()
-            || snapshot
-                .stream_a
-                .as_ref()
-                .is_some_and(|stream| stream.covered != self.messages.len())
-            || snapshot
-                .sorted_stream
-                .as_ref()
-                .is_some_and(|sorted| sorted.covered != self.messages.len())
-            || snapshot
-                .framed
-                .as_ref()
-                .is_some_and(|framed| framed.covered != self.messages.len())
-        {
-            return;
-        }
-        **self.accumulator.locked() = (*snapshot).clone();
-    }
 }
 
 fn record_boundary(state: &mut AccumulatorState, stream: &Midstate) {
@@ -756,12 +499,24 @@ fn record_boundary(state: &mut AccumulatorState, stream: &Midstate) {
 /// Reads deref to the message vector. Writes have no `DerefMut`: they must go
 /// through the typed mutators below, each of which states its effect on the
 /// accumulator. That is the whole invalidation-exhaustiveness argument.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub(crate) struct TranscriptMessages {
     messages: Arc<Vec<Message>>,
     /// Boxed for the same reason the state inside it is: `Session` rides the
     /// agent's nested async futures against a 2 MB production stack budget.
     accumulator: Box<TranscriptDigestAccumulator>,
+}
+
+impl Default for TranscriptMessages {
+    fn default() -> Self {
+        let accumulator = TranscriptDigestAccumulator::default();
+        let empty = SessionMessageRowPrefixAccumulator::empty();
+        accumulator.install_exact_row_lineage(empty.clone(), empty);
+        Self {
+            messages: Arc::default(),
+            accumulator: Box::new(accumulator),
+        }
+    }
 }
 
 impl Clone for TranscriptMessages {
@@ -798,6 +553,83 @@ impl TranscriptMessages {
         }
     }
 
+    /// Adopt a fresh branch transcript whose current rows establish a new
+    /// lineage origin rather than continuing a durable store strand.
+    pub(crate) fn from_fresh_branch(messages: Vec<Message>) -> Self {
+        let transcript = Self::from_vec(messages);
+        if let Ok(prefix) = SessionMessageRowPrefixAccumulator::from_messages(&transcript.messages)
+        {
+            transcript
+                .accumulator
+                .install_exact_row_lineage(prefix.clone(), prefix);
+        }
+        transcript
+    }
+
+    /// Install exact durable-row lineage proven by a head materialization or
+    /// acknowledged prepared commit.
+    pub(crate) fn install_exact_row_prefix(
+        &self,
+        prefix: SessionMessageRowPrefixAccumulator,
+    ) -> bool {
+        if prefix.row_count() != self.messages.len() as u64 {
+            return false;
+        }
+        self.accumulator.install_exact_row_prefix(prefix);
+        true
+    }
+
+    pub(crate) fn install_exact_row_lineage(
+        &self,
+        anchor: SessionMessageRowPrefixAccumulator,
+        current: SessionMessageRowPrefixAccumulator,
+    ) -> bool {
+        if anchor.row_count() > current.row_count()
+            || current.row_count() != self.messages.len() as u64
+        {
+            return false;
+        }
+        self.accumulator.install_exact_row_lineage(anchor, current);
+        true
+    }
+
+    /// Exact durable-row prefix witnessed at `row_count`, if it is either the
+    /// last installed authority or that authority extended only by appends.
+    pub(crate) fn exact_row_prefix_at(
+        &self,
+        row_count: u64,
+    ) -> Option<SessionMessageRowPrefixAccumulator> {
+        if let Some(prefix) = self.accumulator.exact_row_prefix_at(row_count) {
+            return Some(prefix);
+        }
+        if u64::try_from(self.messages.len()).ok() != Some(row_count)
+            || !self.accumulator.lazy_exact_row_current_matches(row_count)
+        {
+            return None;
+        }
+        let prefix = SessionMessageRowPrefixAccumulator::from_messages(&self.messages).ok()?;
+        self.accumulator
+            .install_exact_row_lineage(prefix.clone(), prefix.clone());
+        Some(prefix)
+    }
+
+    /// Mark exact row lineage proven by store-owned WholeBlob bytes without
+    /// reserializing the transcript during every load.
+    pub(crate) fn mark_lazy_whole_blob_row_lineage(&self) {
+        if let Ok(row_count) = u64::try_from(self.messages.len()) {
+            self.accumulator.mark_lazy_exact_row_current(row_count);
+        }
+    }
+
+    pub(crate) fn exact_row_lineage_extends(
+        &self,
+        anchor: &SessionMessageRowPrefixAccumulator,
+        current_count: u64,
+    ) -> bool {
+        self.accumulator
+            .exact_row_lineage_extends(anchor, current_count)
+    }
+
     /// SEAM (append): fold one appended message into the accumulator.
     pub(crate) fn push(&mut self, message: Message) {
         let Self {
@@ -832,6 +664,7 @@ impl TranscriptMessages {
     }
 
     /// SEAM (in-place rewrite of unknown shape): invalidates unconditionally.
+    #[cfg(test)]
     pub(crate) fn mutate_in_place(&mut self) -> &mut Vec<Message> {
         self.accumulator.invalidate();
         Arc::make_mut(&mut self.messages)
@@ -850,6 +683,10 @@ impl TranscriptMessages {
     /// (`None` = the scan changed nothing, so the witness stays valid).
     pub(crate) fn finish_in_place_scan(&mut self, lowest_mutated_index: Option<usize>) {
         self.accumulator.finish_in_place_scan(lowest_mutated_index);
+        if lowest_mutated_index.is_some() {
+            self.accumulator
+                .rebuild_exact_row_current_from_retained_prefix(&self.messages);
+        }
     }
 
     /// Format-2 transcript digest of the current buffer.
@@ -873,20 +710,6 @@ impl TranscriptMessages {
     /// Non-append mutation count of this buffer.
     pub(crate) fn mutation_epoch(&self) -> u64 {
         self.accumulator.epoch()
-    }
-
-    /// Feed the canonical-sorted form of the current buffer into `hasher`;
-    /// see [`TranscriptDigestAccumulator::hash_sorted_canonical_into`].
-    pub(crate) fn hash_sorted_canonical_into(&self, hasher: &mut Sha256) -> bool {
-        self.accumulator
-            .hash_sorted_canonical_into(&self.messages, hasher)
-    }
-
-    /// Canonical checkpoint-document midstate for the current buffer under
-    /// `prefix`; see [`TranscriptDigestAccumulator::framed_document_hasher`].
-    pub(crate) fn framed_document_hasher(&self, prefix: &[u8]) -> Option<Sha256> {
-        self.accumulator
-            .framed_document_hasher(&self.messages, prefix)
     }
 }
 
@@ -1024,6 +847,124 @@ mod tests {
             messages.digest().unwrap(),
             super::super::transcript_messages_digest(&messages).unwrap()
         );
+    }
+
+    fn exact_row_prefix(
+        messages: &[Message],
+    ) -> crate::session_store::SessionMessageRowPrefixAccumulator {
+        let rows = messages
+            .iter()
+            .map(serde_json::to_vec)
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        crate::session_store::SessionMessageRowPrefixAccumulator::from_serialized_rows(&rows)
+            .unwrap()
+    }
+
+    #[test]
+    fn fresh_transcript_owns_exact_genesis_row_lineage() {
+        let mut messages = TranscriptMessages::default();
+        assert_eq!(
+            messages.exact_row_prefix_at(0),
+            Some(crate::session_store::SessionMessageRowPrefixAccumulator::empty())
+        );
+
+        messages.push(user("first"));
+        assert_eq!(
+            messages.exact_row_prefix_at(1),
+            Some(exact_row_prefix(&messages)),
+            "ordinary appends must extend fresh construction authority without a full rescan"
+        );
+    }
+
+    #[test]
+    fn committed_boundary_survives_appends_beside_graph_anchor_and_live_current() {
+        let mut messages = TranscriptMessages::default();
+        let graph_anchor = crate::session_store::SessionMessageRowPrefixAccumulator::empty();
+        messages.push(user("committed"));
+        let committed = exact_row_prefix(&messages);
+        assert!(messages.install_exact_row_prefix(committed.clone()));
+
+        messages.push(user("live tail"));
+        let current = exact_row_prefix(&messages);
+
+        assert_eq!(messages.exact_row_prefix_at(0), Some(graph_anchor));
+        assert_eq!(messages.exact_row_prefix_at(1), Some(committed));
+        assert_eq!(messages.exact_row_prefix_at(2), Some(current));
+        assert!(
+            messages.exact_row_lineage_extends(
+                &messages.exact_row_prefix_at(1).expect("committed boundary"),
+                2,
+            ),
+            "ordinary successor preparation must accept the durable boundary beside the graph anchor"
+        );
+    }
+
+    #[test]
+    fn graph_replay_preflight_preserves_existing_committed_boundary() {
+        let mut messages = TranscriptMessages::default();
+        messages.push(user("committed predecessor"));
+        let committed = exact_row_prefix(&messages);
+        assert!(messages.install_exact_row_prefix(committed.clone()));
+
+        let rewritten = TranscriptMessages::from_vec(vec![user("rewritten endpoint")]);
+        let graph_anchor = exact_row_prefix(&rewritten);
+        let mut rewritten_with_tail = rewritten;
+        rewritten_with_tail.push(user("live tail"));
+        let live_current = exact_row_prefix(&rewritten_with_tail);
+
+        messages.push(user("live tail"));
+        assert!(messages.install_exact_row_lineage(graph_anchor.clone(), live_current.clone()));
+        assert_ne!(graph_anchor, committed);
+        assert_eq!(messages.exact_row_prefix_at(1), Some(committed));
+        assert_eq!(messages.exact_row_prefix_at(2), Some(live_current));
+    }
+
+    #[test]
+    fn suffix_only_in_place_scan_preserves_exact_durable_row_anchor() {
+        let mut messages = TranscriptMessages::from_vec(transcript(4));
+        let anchor = exact_row_prefix(&messages[..2]);
+        let current = exact_row_prefix(&messages);
+        assert!(messages.install_exact_row_lineage(anchor.clone(), current.clone()));
+
+        {
+            let buffer = messages.begin_in_place_scan();
+            buffer[2] = user("externalized suffix");
+        }
+        messages.finish_in_place_scan(Some(2));
+
+        let rebuilt_current = exact_row_prefix(&messages);
+        assert_eq!(messages.exact_row_prefix_at(2), Some(anchor));
+        assert_ne!(
+            rebuilt_current, current,
+            "the rebuilt current-row prefix must bind the changed suffix"
+        );
+        assert_eq!(
+            messages.exact_row_prefix_at(4),
+            Some(rebuilt_current),
+            "a suffix rewrite must rebuild the exact current-row prefix from the retained anchor"
+        );
+        assert!(
+            messages.digest_witness().is_none(),
+            "a suffix rewrite must invalidate the whole-transcript digest witness"
+        );
+    }
+
+    #[test]
+    fn in_place_scan_inside_exact_durable_prefix_drops_row_anchor() {
+        let mut messages = TranscriptMessages::from_vec(transcript(4));
+        let anchor = exact_row_prefix(&messages[..2]);
+        let current = exact_row_prefix(&messages);
+        assert!(messages.install_exact_row_lineage(anchor, current));
+
+        {
+            let buffer = messages.begin_in_place_scan();
+            buffer[1] = user("rewritten durable prefix");
+        }
+        messages.finish_in_place_scan(Some(1));
+
+        assert!(messages.exact_row_prefix_at(2).is_none());
+        assert!(messages.exact_row_prefix_at(4).is_none());
     }
 
     #[test]

@@ -9,8 +9,8 @@ use meerkat_contracts::{
     RealtimeVideoChunk,
 };
 use meerkat_core::{
-    PendingSystemContextAppend, Provider, RealtimeTranscriptEvent, RealtimeUserContentIdentity,
-    RealtimeUserContentTombstone, ToolResult,
+    Provider, RealtimeTranscriptEvent, RealtimeUserContentIdentity, RealtimeUserContentTombstone,
+    ToolResult,
 };
 use meerkat_core::{
     RealtimeOpenProjectionLease, RealtimeOpenProjectionLeaseSlot, SessionLlmIdentity, StopReason,
@@ -228,7 +228,7 @@ pub struct RealtimeSessionOpenConfig {
     pub turning_mode: RealtimeTurningMode,
     pub llm_identity: SessionLlmIdentity,
     pub visible_tools: Vec<ToolDef>,
-    pub seed_messages: Vec<Message>,
+    seed_messages: Vec<Message>,
     /// Take-once process memory custody spanning canonical image hydration
     /// through provider seed acknowledgement.
     ///
@@ -236,27 +236,12 @@ pub struct RealtimeSessionOpenConfig {
     /// reusing or concurrently opening from another clone must acquire fresh
     /// custody instead of reusing the original reservation.
     open_projection_lease: RealtimeOpenProjectionLeaseSlot,
-    /// Authoritative resolved root system prompt for this realtime session.
+    /// Exact canonical System payload sequence at projection time.
     ///
-    /// This is the canonical owner of the live session's system prompt. It is
-    /// populated at projection time by the runtime from the resolved root
-    /// system message (`realtime_projection_root_system_message`) — the same
-    /// content that, when present, is materialized into `seed_messages[0]`.
-    ///
-    /// Provider adapters and snapshot builders MUST consume this typed field
-    /// when they need the prompt as a distinct value (e.g. the OpenAI Refresh
-    /// path rebuilding the realtime `session.update` instructions field). They
-    /// MUST NOT re-derive prompt truth by inspecting `seed_messages[0]`: the
-    /// history-event projector drops `Message::System` / `Message::SystemNotice`
-    /// entries, so inference from seed history silently wipes the prompt on
-    /// refresh. `None` means the session has no resolved root system prompt.
-    pub system_prompt: Option<String>,
-    /// Runtime-authored system context carried as typed provenance.
-    ///
-    /// Provider adapters must treat this as the only authoritative realtime
-    /// reconstruction source for runtime context. Rendered transcript markers
-    /// are projections only and must not be parsed back into authority.
-    pub runtime_system_context: Vec<PendingSystemContextAppend>,
+    /// This is a refresh drift witness, not a provider instruction field.
+    /// Provider adapters replay the actual `Message::System` rows from
+    /// `seed_messages` in their authored transcript positions.
+    canonical_system_messages: Vec<String>,
     /// Durable caller-id bindings for committed non-text user inputs. Provider
     /// adapters rebuild this registry on reconnect before accepting retries.
     pub user_content_identities: Vec<RealtimeUserContentIdentity>,
@@ -286,12 +271,62 @@ pub struct RealtimeSessionOpenConfig {
 }
 
 impl RealtimeSessionOpenConfig {
+    /// Collect exact System payloads in authored System-message order.
     #[must_use]
+    pub fn canonical_system_messages(messages: &[Message]) -> Vec<String> {
+        messages
+            .iter()
+            .filter_map(|message| match message {
+                Message::System(system) => Some(system.content.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn new(
         turning_mode: RealtimeTurningMode,
         llm_identity: SessionLlmIdentity,
         visible_tools: Vec<ToolDef>,
         seed_messages: Vec<Message>,
+    ) -> Result<Self, LlmError> {
+        let canonical_system_messages = Self::canonical_system_messages(&seed_messages);
+        Ok(Self::new_with_projection(
+            turning_mode,
+            llm_identity,
+            visible_tools,
+            seed_messages,
+            canonical_system_messages,
+        ))
+    }
+
+    /// Construct an open projection from a caller-selected replay seed while
+    /// retaining the complete canonical System subsequence as a drift witness.
+    ///
+    /// The replay seed applies the same ordered window policy to every role.
+    /// Any retained System row is replayed natively at its transcript position.
+    pub fn for_open_from_messages(
+        turning_mode: RealtimeTurningMode,
+        llm_identity: SessionLlmIdentity,
+        visible_tools: Vec<ToolDef>,
+        seed_messages: Vec<Message>,
+        canonical_messages: &[Message],
+    ) -> Result<Self, LlmError> {
+        let canonical_system_messages = Self::canonical_system_messages(canonical_messages);
+        Ok(Self::new_with_projection(
+            turning_mode,
+            llm_identity,
+            visible_tools,
+            seed_messages,
+            canonical_system_messages,
+        ))
+    }
+
+    fn new_with_projection(
+        turning_mode: RealtimeTurningMode,
+        llm_identity: SessionLlmIdentity,
+        visible_tools: Vec<ToolDef>,
+        seed_messages: Vec<Message>,
+        canonical_system_messages: Vec<String>,
     ) -> Self {
         Self {
             turning_mode,
@@ -299,8 +334,7 @@ impl RealtimeSessionOpenConfig {
             visible_tools,
             seed_messages,
             open_projection_lease: RealtimeOpenProjectionLeaseSlot::default(),
-            system_prompt: None,
-            runtime_system_context: Vec::new(),
+            canonical_system_messages,
             user_content_identities: Vec::new(),
             user_content_tombstones: Vec::new(),
             canonical_user_image_decoded_bytes: None,
@@ -308,6 +342,19 @@ impl RealtimeSessionOpenConfig {
             response_nudge_timeout_ms: None,
             response_nudge_max_attempts: None,
         }
+    }
+
+    /// Construct a refresh-only projection. Refresh has no seed replay; the
+    /// exact System sequence is retained only to detect a required reopen.
+    pub fn for_refresh_from_messages(
+        turning_mode: RealtimeTurningMode,
+        llm_identity: SessionLlmIdentity,
+        visible_tools: Vec<ToolDef>,
+        canonical_messages: &[Message],
+    ) -> Result<Self, LlmError> {
+        let mut config = Self::new(turning_mode, llm_identity, visible_tools, Vec::new())?;
+        config.canonical_system_messages = Self::canonical_system_messages(canonical_messages);
+        Ok(config)
     }
 
     /// Carry an already-acquired open-projection lease from the runtime's
@@ -328,25 +375,28 @@ impl RealtimeSessionOpenConfig {
         self.open_projection_lease.take()
     }
 
-    /// Builder-style typed root system prompt for provider reconstruction.
-    ///
-    /// The runtime populates this from the resolved root system message so the
-    /// provider refresh path consumes the authoritative prompt instead of
-    /// inferring it from `seed_messages[0]`.
+    /// Exact canonical System payload sequence used for refresh drift checks.
     #[must_use]
-    pub fn with_system_prompt(mut self, system_prompt: Option<String>) -> Self {
-        self.system_prompt = system_prompt;
-        self
+    pub fn canonical_system_messages_ref(&self) -> &[String] {
+        &self.canonical_system_messages
     }
 
-    /// Builder-style typed runtime context for provider reconstruction.
+    /// Immutable canonical seed transcript paired with
+    /// [`Self::canonical_system_messages_ref`].
+    ///
+    /// Mutation is intentionally unavailable: changing the seed after
+    /// construction would invalidate the canonical System drift witness.
     #[must_use]
-    pub fn with_runtime_system_context(
-        mut self,
-        runtime_system_context: Vec<PendingSystemContextAppend>,
-    ) -> Self {
-        self.runtime_system_context = runtime_system_context;
-        self
+    pub fn seed_messages(&self) -> &[Message] {
+        &self.seed_messages
+    }
+
+    /// Replace the canonical seed while atomically re-deriving its System
+    /// drift witness.
+    pub fn with_seed_messages(mut self, seed_messages: Vec<Message>) -> Result<Self, LlmError> {
+        self.canonical_system_messages = Self::canonical_system_messages(&seed_messages);
+        self.seed_messages = seed_messages;
+        Ok(self)
     }
 
     /// Builder-style durable user-content idempotency registry.
@@ -463,7 +513,7 @@ mod tests {
     use super::*;
 
     use meerkat_core::Provider;
-    use meerkat_core::types::{SystemMessage, UserMessage};
+    use meerkat_core::types::{SystemMessage, SystemNoticeKind, SystemNoticeMessage, UserMessage};
 
     fn sample_identity() -> SessionLlmIdentity {
         SessionLlmIdentity {
@@ -484,55 +534,99 @@ mod tests {
         assert!(matches!(error, LlmError::InvalidRequest { .. }));
     }
 
-    /// Row #209 gate: the realtime open config carries the resolved system
-    /// prompt as a typed field, and the prompt's authority is independent of
-    /// `seed_messages[0]`. A refresh that consumes `config.system_prompt` must
-    /// preserve the prompt even when the seed history has been projected to
-    /// drop its lead `Message::System` (the history-event projector path), so
-    /// no consumer needs to re-infer prompt truth from `seed_messages`.
     #[test]
-    fn open_config_system_prompt_is_typed_and_independent_of_seed_history() {
-        let resolved_prompt = "You are a careful realtime assistant.".to_string();
-
-        // Seed history WITHOUT a lead `Message::System` — i.e. the
-        // history-event projection already dropped the system message, which
-        // is exactly the case where `seed_messages[0]` inference returns the
-        // wrong answer and silently wipes the prompt on refresh.
+    fn open_config_collects_every_system_message_in_authored_order() {
         let config = RealtimeSessionOpenConfig::new(
             RealtimeTurningMode::ProviderManaged,
             sample_identity(),
             Vec::new(),
-            vec![Message::User(UserMessage::text("hello".to_string()))],
+            vec![
+                Message::System(SystemMessage::new("first")),
+                Message::System(SystemMessage::new("")),
+                Message::System(SystemMessage::new(" \t ")),
+                Message::SystemNotice(SystemNoticeMessage::new(SystemNoticeKind::Generic, "")),
+                Message::User(UserMessage::text("hello")),
+                Message::System(SystemMessage::new("later")),
+            ],
         )
-        .with_system_prompt(Some(resolved_prompt.clone()));
-
-        // The typed field is the authoritative source for the refresh path.
+        .expect("ordered System messages must be representable");
         assert_eq!(
-            config.system_prompt.as_deref(),
-            Some(resolved_prompt.as_str())
+            config.canonical_system_messages_ref(),
+            &["first", "", " \t ", "later"]
         );
-
-        // Authority does NOT come from inspecting the seed history lead: the
-        // first seed message is a user turn, not a system message.
-        assert!(matches!(
-            config.seed_messages.first(),
-            Some(Message::User(_))
-        ));
     }
 
-    /// Row #209 gate: `new` defaults the typed prompt to `None`, and the
-    /// builder is the single populate-point used by the runtime projection.
     #[test]
-    fn open_config_system_prompt_defaults_none_and_builder_sets_it() {
+    fn open_without_system_rows_is_none_and_refresh_derives_without_seed_replay() {
+        let open = RealtimeSessionOpenConfig::new(
+            RealtimeTurningMode::ExplicitCommit,
+            sample_identity(),
+            Vec::new(),
+            vec![Message::User(UserMessage::text("hello"))],
+        )
+        .expect("ordinary dialogue must be representable");
+        assert!(open.canonical_system_messages_ref().is_empty());
+
+        let refresh = RealtimeSessionOpenConfig::for_refresh_from_messages(
+            RealtimeTurningMode::ExplicitCommit,
+            sample_identity(),
+            Vec::new(),
+            &[
+                Message::User(UserMessage::text("work")),
+                Message::System(SystemMessage::new("authoritative")),
+                Message::System(SystemMessage::new("")),
+                Message::System(SystemMessage::new(" \t ")),
+            ],
+        )
+        .expect("every ordered System row is projected");
+        assert_eq!(
+            refresh.canonical_system_messages_ref(),
+            &["authoritative", "", " \t "]
+        );
+    }
+
+    #[test]
+    fn bounded_open_seed_retains_full_system_drift_witness() {
+        let recent = Message::User(UserMessage::text("recent"));
+        let seed = vec![recent.clone()];
+        let active_messages = vec![
+            Message::System(SystemMessage::new("outside replay window")),
+            Message::User(UserMessage::text("old dialogue")),
+            Message::System(SystemMessage::new("")),
+            recent.clone(),
+        ];
+
+        let config = RealtimeSessionOpenConfig::for_open_from_messages(
+            RealtimeTurningMode::ExplicitCommit,
+            sample_identity(),
+            Vec::new(),
+            seed.clone(),
+            &active_messages,
+        )
+        .expect("all System rows in the full materialization are projected");
+        assert_eq!(
+            config.canonical_system_messages_ref(),
+            &["outside replay window", ""]
+        );
+        assert_eq!(seed, vec![recent]);
+    }
+
+    #[test]
+    fn replacing_seed_atomically_rederives_system_drift_witness() {
         let config = RealtimeSessionOpenConfig::new(
             RealtimeTurningMode::ExplicitCommit,
             sample_identity(),
             Vec::new(),
-            vec![Message::System(SystemMessage::new("seed-lead".to_string()))],
-        );
-        assert_eq!(config.system_prompt, None);
+            vec![Message::System(SystemMessage::new("stale"))],
+        )
+        .expect("System messages must be representable")
+        .with_seed_messages(vec![
+            Message::System(SystemMessage::new("current")),
+            Message::System(SystemMessage::new("")),
+            Message::User(UserMessage::text("work")),
+        ])
+        .expect("ordered System messages must be representable");
 
-        let config = config.with_system_prompt(Some("authoritative".to_string()));
-        assert_eq!(config.system_prompt.as_deref(), Some("authoritative"));
+        assert_eq!(config.canonical_system_messages_ref(), &["current", ""]);
     }
 }

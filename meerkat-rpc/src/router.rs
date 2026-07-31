@@ -3197,8 +3197,6 @@ impl MethodRouter {
             content: params.content,
             source: params.source,
             idempotency_key: params.idempotency_key,
-            source_kind: meerkat_core::session::SystemContextSource::Normal,
-            peer_response_terminal: None,
         };
         match self.resolve_session_owner(&session_id).await {
             Some(SessionOwner::Runtime) => {
@@ -5608,6 +5606,18 @@ mod tests {
         })
     }
 
+    fn exact_system_message_count(messages: &[Message], expected: &str) -> usize {
+        messages
+            .iter()
+            .filter(|message| {
+                matches!(
+                    message,
+                    Message::System(system) if system.content == expected
+                )
+            })
+            .count()
+    }
+
     // -----------------------------------------------------------------------
     // Tests
     // -----------------------------------------------------------------------
@@ -6083,6 +6093,7 @@ mod tests {
     #[cfg(feature = "mob")]
     #[tokio::test]
     async fn router_created_deferred_sessions_project_mob_tools_to_live_open_config() {
+        let _projection_guard = crate::session_runtime::realtime_open_projection_test_guard().await;
         let (router, _notif_rx) = test_router().await;
 
         let create_resp = router
@@ -6129,6 +6140,7 @@ mod tests {
     #[cfg(feature = "comms")]
     #[tokio::test]
     async fn router_created_deferred_live_session_exposes_comms_tools_before_peers_exist() {
+        let _projection_guard = crate::session_runtime::realtime_open_projection_test_guard().await;
         let (router, _notif_rx) = test_router().await;
 
         let create_resp = router
@@ -6351,6 +6363,7 @@ mod tests {
     #[cfg(feature = "comms")]
     #[tokio::test]
     async fn live_open_starts_peer_ingress_for_deferred_keep_alive_controller() {
+        let _projection_guard = crate::session_runtime::realtime_open_projection_test_guard().await;
         let (router, session_id, _command_log) =
             open_deferred_keep_alive_live_controller("live-smoke-controller-drain-test").await;
 
@@ -6375,12 +6388,14 @@ mod tests {
     #[cfg(feature = "comms")]
     #[tokio::test]
     async fn live_peer_ingress_forwards_peer_message_to_active_live_adapter() {
+        let _projection_guard = crate::session_runtime::realtime_open_projection_test_guard().await;
         let (router, session_id, command_log) =
             open_deferred_keep_alive_live_controller("live-smoke-controller-forward-test").await;
 
         let input = meerkat_runtime::Input::Peer(meerkat_runtime::PeerInput {
             directed_interaction_id: None,
             objective_id: None,
+            system_prompts: Vec::new(),
             injected_context: Vec::new(),
             sender_taint: None,
             header: meerkat_runtime::InputHeader {
@@ -6427,12 +6442,14 @@ mod tests {
     #[cfg(feature = "comms")]
     #[tokio::test]
     async fn live_peer_ingress_steer_interrupts_before_forwarding_to_active_live_adapter() {
+        let _projection_guard = crate::session_runtime::realtime_open_projection_test_guard().await;
         let (router, session_id, command_log) =
             open_deferred_keep_alive_live_controller("live-smoke-controller-steer-test").await;
 
         let input = meerkat_runtime::Input::Peer(meerkat_runtime::PeerInput {
             directed_interaction_id: None,
             objective_id: None,
+            system_prompts: Vec::new(),
             injected_context: Vec::new(),
             sender_taint: None,
             header: meerkat_runtime::InputHeader {
@@ -6480,63 +6497,10 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "comms")]
-    #[tokio::test]
-    async fn live_peer_ingress_does_not_forward_context_only_primitives_to_live_adapter() {
-        let (router, session_id, command_log) =
-            open_deferred_keep_alive_live_controller("live-smoke-controller-context-test").await;
-
-        let primitive = meerkat_core::lifecycle::run_primitive::RunPrimitive::StagedInput(
-            meerkat_core::lifecycle::run_primitive::StagedRunInput {
-                boundary: meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunCheckpoint,
-                appends: Vec::new(),
-                context_appends: vec![
-                    meerkat_core::lifecycle::run_primitive::ConversationContextAppend {
-                        key: "peer_response_progress:helper".to_string(),
-                        content: meerkat_core::lifecycle::run_primitive::CoreRenderable::Text {
-                            text: "helper is still working".to_string(),
-                        },
-                    },
-                ],
-                contributing_input_ids: vec![meerkat_core::lifecycle::InputId::new()],
-                turn_metadata: Some(
-                    meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
-                        execution_kind: Some(
-                            meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn,
-                        ),
-                        ..Default::default()
-                    },
-                ),
-            },
-        );
-        assert!(
-            primitive.is_context_only_apply_without_turn(),
-            "fixture must exercise the context-only executor path"
-        );
-
-        let forwarded = router
-            .runtime
-            .try_forward_runtime_primitive_to_live_adapter(
-                &session_id,
-                meerkat_core::lifecycle::RunId::new(),
-                &primitive,
-            )
-            .await
-            .expect("live forward check should not fail");
-
-        assert!(
-            forwarded.is_none(),
-            "context-only runtime facts must stay in Meerkat context instead of becoming hosted live user text"
-        );
-        assert!(
-            command_log.lock().await.is_empty(),
-            "context-only primitive must not send commands to the live adapter"
-        );
-    }
-
     #[cfg(feature = "mob")]
     #[tokio::test]
     async fn router_created_deferred_sessions_apply_tool_filter_to_live_open_config() {
+        let _projection_guard = crate::session_runtime::realtime_open_projection_test_guard().await;
         let (router, _notif_rx) = test_router().await;
 
         let create_resp = router
@@ -6586,6 +6550,7 @@ mod tests {
     #[cfg(feature = "mob")]
     #[tokio::test]
     async fn live_tool_dispatcher_routes_through_session_composed_tools() {
+        let _projection_guard = crate::session_runtime::realtime_open_projection_test_guard().await;
         let (router, _notif_rx) = test_router().await;
 
         let create_resp = router
@@ -6694,7 +6659,7 @@ mod tests {
             .await
             .unwrap();
         let appended = result_value(&append_resp);
-        assert_eq!(appended["status"], "staged");
+        assert_eq!(appended["status"], "applied");
     }
 
     #[cfg(feature = "mob")]
@@ -7843,7 +7808,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(result_value(&inject_resp)["status"], "staged");
+        assert_eq!(result_value(&inject_resp)["status"], "applied");
     }
 
     #[tokio::test]
@@ -8188,7 +8153,7 @@ mod tests {
         );
     }
 
-    async fn archived_session_read_remains_available_and_mutations_reject_inner() {
+    async fn archived_session_is_not_found_and_mutations_reject_inner() {
         let (router, _notif_rx) = test_router().await;
 
         let create_resp = router
@@ -8222,13 +8187,11 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert!(
-            read_resp.error.is_none(),
-            "archived session should remain readable: {:?}",
-            read_resp.error
+        assert_eq!(
+            error_code(&read_resp),
+            error::SESSION_NOT_FOUND,
+            "archive is an absorbing lifecycle terminal projected as NotFound"
         );
-        let read = result_value(&read_resp);
-        assert_eq!(read["session_id"], session_id);
 
         let stream_resp = router
             .dispatch(make_request(
@@ -8254,7 +8217,7 @@ mod tests {
             .unwrap();
         assert!(
             inject_resp.error.is_some(),
-            "archived session must reject staged context append"
+            "archived session must reject System-message append"
         );
 
         let peers_resp = router
@@ -9342,9 +9305,9 @@ mod tests {
         assert!(found, "Created session should appear in list");
     }
 
-    /// 5b. `session/inject_context` stages runtime system context for the session.
+    /// 5b. `session/inject_context` appends an ordinary durable System message.
     #[tokio::test]
-    async fn session_inject_context_returns_staged_status() {
+    async fn session_inject_context_returns_applied_status() {
         let (router, _notif_rx) = test_router().await;
 
         let create_req = make_request("session/create", serde_json::json!({"prompt": "Hello"}));
@@ -9363,11 +9326,11 @@ mod tests {
         );
         let inject_resp = router.dispatch(inject_req).await.unwrap();
         let injected = result_value(&inject_resp);
-        assert_eq!(injected["status"], "staged");
+        assert_eq!(injected["status"], "applied");
     }
 
     #[tokio::test]
-    async fn session_inject_context_is_consumed_by_next_turn_exactly_once() {
+    async fn session_inject_context_is_durable_across_later_turns() {
         let recorded_requests = Arc::new(std::sync::Mutex::new(Vec::<Vec<Message>>::new()));
         let (router, mut notif_rx) = test_router_with_llm(Arc::new(RecordingMockLlmClient::new(
             Arc::clone(&recorded_requests),
@@ -9404,7 +9367,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(result_value(&inject_resp)["status"], "staged");
+        assert_eq!(result_value(&inject_resp)["status"], "applied");
 
         let first_turn_resp = router
             .dispatch(make_request(
@@ -9428,13 +9391,11 @@ mod tests {
             .last()
             .cloned()
             .expect("first follow-up request");
-        let first_system_prompt =
-            system_prompt_from_request(&first_request).expect("system prompt on first turn");
-        assert!(
-            first_system_prompt.contains(injected_text),
-            "next eligible turn must include staged context in the LLM system prompt: {first_system_prompt}"
+        assert_eq!(
+            exact_system_message_count(&first_request, injected_text),
+            1,
+            "next eligible turn must include the durable ordered System message: {first_request:?}"
         );
-        assert_eq!(first_system_prompt.matches(injected_text).count(), 1);
         recorded_requests
             .lock()
             .expect("recorded requests lock poisoned")
@@ -9465,11 +9426,10 @@ mod tests {
             .last()
             .cloned()
             .expect("second follow-up request");
-        let second_system_prompt =
-            system_prompt_from_request(&second_request).expect("system prompt on second turn");
-        assert!(
-            !second_system_prompt.contains(injected_text),
-            "staged context must be consumed exactly once, not replayed on later turns: {second_system_prompt}"
+        assert_eq!(
+            exact_system_message_count(&second_request, injected_text),
+            1,
+            "durable System messages must remain in transcript order on later turns: {second_request:?}"
         );
     }
 
@@ -9529,7 +9489,7 @@ mod tests {
         .await
         .expect("first request should reach the LLM");
 
-        let injected_text = "Late staged context";
+        let injected_text = "Late durable System message";
         let inject_resp = router
             .dispatch(make_request(
                 "session/inject_context",
@@ -9542,7 +9502,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(result_value(&inject_resp)["status"], "staged");
+        assert_eq!(result_value(&inject_resp)["status"], "applied");
 
         let first_turn_resp = first_turn.await.expect("first turn join");
         assert!(
@@ -9555,11 +9515,10 @@ mod tests {
             .first()
             .cloned()
             .expect("first request");
-        let first_system_prompt =
-            system_prompt_from_request(&first_request).expect("system prompt on first turn");
-        assert!(
-            !first_system_prompt.contains(injected_text),
-            "context appended during an active RPC turn must not affect the in-flight request"
+        assert_eq!(
+            exact_system_message_count(&first_request, injected_text),
+            0,
+            "context appended during an active RPC turn must not affect the in-flight request: {first_request:?}"
         );
 
         let second_turn_resp = router
@@ -9582,11 +9541,10 @@ mod tests {
             .last()
             .cloned()
             .expect("second request");
-        let second_system_prompt =
-            system_prompt_from_request(&second_request).expect("system prompt on second turn");
-        assert!(
-            second_system_prompt.contains(injected_text),
-            "context appended during an active RPC turn must apply on the next eligible turn"
+        assert_eq!(
+            exact_system_message_count(&second_request, injected_text),
+            1,
+            "context appended during an active RPC turn must apply on the next eligible turn: {second_request:?}"
         );
     }
 
@@ -9628,7 +9586,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(result_value(&first_inject)["status"], "staged");
+        assert_eq!(result_value(&first_inject)["status"], "applied");
 
         let second_inject = router
             .dispatch(make_request(
@@ -9663,12 +9621,10 @@ mod tests {
             .last()
             .cloned()
             .expect("follow-up request");
-        let system_prompt =
-            system_prompt_from_request(&request).expect("system prompt on follow-up turn");
         assert_eq!(
-            system_prompt.matches(injected_text).count(),
+            exact_system_message_count(&request, injected_text),
             1,
-            "duplicate idempotency keys must not enqueue multiple staged copies: {system_prompt}"
+            "duplicate idempotency keys must not enqueue multiple ordered System rows: {request:?}"
         );
     }
 
@@ -10149,7 +10105,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn archived_session_drops_unapplied_staged_context_before_any_later_turn() {
+    async fn archived_session_rejects_later_turn_after_system_append() {
         let recorded_requests = Arc::new(std::sync::Mutex::new(Vec::<Vec<Message>>::new()));
         let (router, mut notif_rx) = test_router_with_llm(Arc::new(RecordingMockLlmClient::new(
             Arc::clone(&recorded_requests),
@@ -10173,7 +10129,7 @@ mod tests {
             .expect("recorded requests lock poisoned")
             .clear();
 
-        let injected_text = "This context must be dropped on archive.";
+        let injected_text = "This System message precedes archive.";
         let inject_resp = router
             .dispatch(make_request(
                 "session/inject_context",
@@ -10186,7 +10142,7 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(result_value(&inject_resp)["status"], "staged");
+        assert_eq!(result_value(&inject_resp)["status"], "applied");
 
         let archive_resp = router
             .dispatch(make_request(
@@ -10209,14 +10165,14 @@ mod tests {
             .unwrap();
         assert!(
             rejected_turn.error.is_some(),
-            "archived session must reject later turns after staged context was accepted"
+            "archived session must reject later turns after the System append"
         );
         assert!(
             recorded_requests
                 .lock()
                 .expect("recorded requests lock poisoned")
                 .is_empty(),
-            "archived session must not reach the LLM again after staged context is dropped"
+            "archived session must not reach the LLM again"
         );
 
         let notification = tokio::time::timeout(std::time::Duration::from_millis(200), async {
@@ -10236,15 +10192,15 @@ mod tests {
                         && params["event"]["payload"]["prompt"]
                             .as_str()
                             .is_some_and(|prompt| prompt.contains(injected_text))),
-                    "archived session must not emit a later run_started that replays dropped staged context"
+                    "archived session must not emit a later run_started"
                 );
             }
         }
     }
 
     #[tokio::test]
-    async fn archived_session_read_remains_available_and_mutations_reject() {
-        Box::pin(archived_session_read_remains_available_and_mutations_reject_inner()).await;
+    async fn archived_session_is_not_found_and_mutations_reject() {
+        Box::pin(archived_session_is_not_found_and_mutations_reject_inner()).await;
     }
 
     /// 7. `turn/start` returns a result for an existing session.

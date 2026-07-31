@@ -13,7 +13,11 @@
 #![cfg(not(target_arch = "wasm32"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use meerkat::{AgentFactory, Config, FactoryAgentBuilder, SessionHistoryQuery, SessionStore};
+use meerkat::{
+    AgentFactory, Config, FactoryAgentBuilder, SessionHistoryQuery, SessionServiceControlExt,
+    SessionStore,
+};
+use meerkat_core::session_store::IncrementalSessionStore as _;
 use meerkat_core::types::HandlingMode;
 use meerkat_core::{CommsCommand, PeerRoute, SendReceipt};
 use meerkat_mob::definition::{OrchestratorConfig, WiringRules};
@@ -24,42 +28,13 @@ use meerkat_mob::{
     ToolConfig,
 };
 use meerkat_session::PersistentSessionService;
-use meerkat_store::{JsonlStore, StoreAdapter};
+use meerkat_store::{JsonlStore, SqliteSessionStore, StoreAdapter};
 use serde_json::to_string;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::time::{Duration, Instant, sleep};
-
-fn mutate_test_session_with_checkpoint(
-    session: &mut meerkat_core::Session,
-    mutate: impl FnOnce(&mut meerkat_core::Session),
-) {
-    let predecessor = match session
-        .try_checkpoint_state()
-        .expect("test checkpoint should verify before fixture mutation")
-    {
-        meerkat_core::SessionCheckpointState::Verified(stamp) => Some(stamp),
-        meerkat_core::SessionCheckpointState::LegacyUnverified { .. } => None,
-    };
-    mutate(session);
-    let checkpoint = match predecessor {
-        Some(predecessor) => meerkat_core::SessionCheckpointStamp::successor(
-            session,
-            &predecessor,
-            meerkat_core::SessionCheckpointProvenance::RunBoundaryCommit,
-        ),
-        None => meerkat_core::SessionCheckpointStamp::root(
-            session,
-            meerkat_core::SessionCheckpointProvenance::SessionCreated,
-        ),
-    }
-    .expect("test checkpoint should be valid for the exact fixture document");
-    session
-        .install_checkpoint_stamp(checkpoint)
-        .expect("test checkpoint should install");
-}
 
 #[derive(Clone)]
 struct Paths {
@@ -68,6 +43,7 @@ struct Paths {
     project_root: PathBuf,
     context_root: PathBuf,
     sessions_root: PathBuf,
+    realm_db_path: PathBuf,
     mob_db_path: PathBuf,
 }
 
@@ -79,6 +55,7 @@ impl Paths {
             project_root: root.join("project-root"),
             context_root: root.join("context-root"),
             sessions_root: root.join("sessions-jsonl"),
+            realm_db_path: root.join("realm.sqlite3"),
             mob_db_path: root.join("mob.db"),
         }
     }
@@ -117,6 +94,36 @@ fn persistent_service(
     let mut builder = FactoryAgentBuilder::new(factory, Config::default());
     builder.default_llm_client = Some(Arc::new(meerkat_client::TestClient::default()));
     let store = Arc::new(JsonlStore::new(paths.sessions_root.clone()));
+    builder.default_session_store = Some(Arc::new(StoreAdapter::new(store.clone())));
+
+    let store_dyn: Arc<dyn meerkat::SessionStore> = store.clone();
+    let blob_store: Arc<dyn meerkat_core::BlobStore> =
+        Arc::new(meerkat_store::MemoryBlobStore::default());
+    let service = Arc::new(PersistentSessionService::new(
+        builder,
+        32,
+        store_dyn,
+        runtime_store,
+        blob_store,
+    ));
+    (service, store)
+}
+
+fn persistent_head_canonical_service(
+    paths: &Paths,
+    runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
+) -> (
+    Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    Arc<SqliteSessionStore>,
+) {
+    paths.materialize_project_context();
+    let factory = factory(paths);
+    let mut builder = FactoryAgentBuilder::new(factory, Config::default());
+    builder.default_llm_client = Some(Arc::new(meerkat_client::TestClient::default()));
+    let store = Arc::new(
+        SqliteSessionStore::open(&paths.realm_db_path)
+            .expect("open co-tenant SQLite session store"),
+    );
     builder.default_session_store = Some(Arc::new(StoreAdapter::new(store.clone())));
 
     let store_dyn: Arc<dyn meerkat::SessionStore> = store.clone();
@@ -313,6 +320,25 @@ fn assert_member_active(entry: &MobMemberListEntry, context: &str) {
     );
 }
 
+fn assert_member_broken_after_authority_loss(entry: &MobMemberListEntry, context: &str) {
+    assert_eq!(
+        entry.status,
+        MobMemberStatus::Broken,
+        "[{context}] member {} should fail closed after RuntimeStore authority loss; error={:?}",
+        entry.agent_identity,
+        entry.error
+    );
+    assert!(
+        entry
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("missing durable session snapshot")),
+        "[{context}] member {} broke for an unexpected reason: {:?}",
+        entry.agent_identity,
+        entry.error
+    );
+}
+
 /// Drive the full mob cold-restart shape:
 ///   lifetime 1: create mob, spawn lead+worker, run turns, peer message,
 ///               stop without archiving;
@@ -365,24 +391,17 @@ async fn run_cold_restart_scenario(reuse_runtime_store: bool, lead_mode: MobRunt
     )
     .await;
 
-    // Upstream 0.7.21 transcript-loss shape: a runtime system-context append
-    // (comms roster) lands on the worker's System message before the cold
-    // stop. The resumed projection must continue this appended prompt instead
-    // of failing the continuity preflight and fresh-spawning.
-    let roster_append = meerkat_core::PendingSystemContextAppend {
-        content: meerkat_core::lifecycle::run_primitive::CoreRenderable::Text {
-            text: "peer roster: lead-1, w-1".to_string(),
-        },
+    // Append one ordinary durable System message before the cold stop. Resume
+    // must preserve its exact role, position, and bytes without reinjection.
+    let roster_append = meerkat_core::AppendSystemContextRequest {
+        content: meerkat_core::CoreRenderable::text("peer roster: lead-1, w-1"),
         source: Some("comms:roster".to_string()),
         idempotency_key: Some("comms:roster:v1".to_string()),
-        source_kind: meerkat_core::session::SystemContextSource::Normal,
-        peer_response_terminal: None,
-        accepted_at: std::time::SystemTime::now(),
     };
     service_1
-        .apply_runtime_system_context_for_turn(&w1_sid, vec![roster_append])
+        .append_system_context(&w1_sid, roster_append)
         .await
-        .expect("apply runtime system context to worker");
+        .expect("append ordinary System message to worker");
     send_and_wait(
         &handle_1,
         service_1.as_ref(),
@@ -419,6 +438,21 @@ async fn run_cold_restart_scenario(reuse_runtime_store: bool, lead_mode: MobRunt
 
     let lead_history_before = history_blob(service_1.as_ref(), &lead_sid).await;
     let w1_history_before = history_blob(service_1.as_ref(), &w1_sid).await;
+    let w1_roster_position_before = service_1
+        .load_authoritative_session(&w1_sid)
+        .await
+        .expect("load worker before restart")
+        .expect("worker session before restart")
+        .messages()
+        .iter()
+        .position(|message| {
+            matches!(
+                message,
+                meerkat_core::Message::System(system)
+                    if system.content == "peer roster: lead-1, w-1"
+            )
+        })
+        .expect("interleaved roster System message before restart");
     eprintln!(
         "[lifetime1] lead history bytes={} w1 history bytes={}",
         lead_history_before.len(),
@@ -461,6 +495,12 @@ async fn run_cold_restart_scenario(reuse_runtime_store: bool, lead_mode: MobRunt
     let w1_after = member_entry(&handle_2, "w-1").await;
     eprintln!("[lifetime2] lead={lead_after:?}");
     eprintln!("[lifetime2] w1={w1_after:?}");
+    if !reuse_runtime_store {
+        assert_member_broken_after_authority_loss(&lead_after, "post-reset");
+        assert_member_broken_after_authority_loss(&w1_after, "post-reset");
+        handle_2.shutdown().await.expect("final shutdown");
+        return;
+    }
     assert_member_active(&lead_after, "post-resume");
     assert_member_active(&w1_after, "post-resume");
 
@@ -500,20 +540,27 @@ async fn run_cold_restart_scenario(reuse_runtime_store: bool, lead_mode: MobRunt
     )
     .await;
 
-    // The runtime-appended system context must have survived the resume
-    // byte-for-byte on the worker's leading System message.
+    // The ordinary System message must survive byte-for-byte at the same
+    // interleaved transcript position; it is not a special row-zero prompt.
     let w1_resumed = service_2
         .load_authoritative_session(&w1_sid)
         .await
         .expect("load resumed worker session")
         .expect("worker session must survive restart");
-    let w1_prompt = match w1_resumed.messages().first() {
-        Some(meerkat_core::Message::System(system)) => system.content.clone(),
-        other => panic!("expected leading system message on resumed worker, got {other:?}"),
-    };
-    assert!(
-        w1_prompt.contains("peer roster: lead-1, w-1"),
-        "runtime-applied system context must survive the mob cold restart: {w1_prompt}"
+    let w1_roster_position_after = w1_resumed
+        .messages()
+        .iter()
+        .position(|message| {
+            matches!(
+                message,
+                meerkat_core::Message::System(system)
+                    if system.content == "peer roster: lead-1, w-1"
+            )
+        })
+        .expect("interleaved roster System message after restart");
+    assert_eq!(
+        w1_roster_position_after, w1_roster_position_before,
+        "ordinary System message must retain its exact transcript position across restart"
     );
 
     // First post-restart member turn: this drives the resumed projection into
@@ -588,9 +635,9 @@ async fn mob_cold_restart_resume_with_durable_runtime_store() {
     run_cold_restart_scenario(true, MobRuntimeMode::TurnDriven).await;
 }
 
-/// Runtime store is lost at restart (the shape the live smoke exercises): the
-/// runtime authority is re-created empty and the session-store row is the only
-/// resume source.
+/// RuntimeStore is the singular committed body/catalog authority. Replacing it
+/// with a blank store is durable data loss, so stale non-authoritative
+/// SessionStore projections must not resurrect either member.
 #[tokio::test(flavor = "multi_thread")]
 async fn mob_cold_restart_resume_with_reset_runtime_store() {
     run_cold_restart_scenario(false, MobRuntimeMode::TurnDriven).await;
@@ -608,8 +655,9 @@ async fn mob_cold_restart_resume_autonomous_lead_durable_runtime_store() {
 }
 
 /// An explicitly resumed member may adopt its archived+Retired session after a
-/// full host restart. The revival must promote both lifecycle projections and
-/// preserve the exact bridge-session identity and transcript.
+/// full host restart. Revival crosses the store-owned Retired terminal through
+/// the exact machine lease while preserving the content-only body, bridge
+/// session identity, and transcript.
 #[tokio::test(flavor = "multi_thread")]
 async fn mob_cold_restart_explicit_resume_revives_archived_retired_session_in_place() {
     let temp = tempfile::tempdir().expect("temp dir");
@@ -626,7 +674,7 @@ async fn mob_cold_restart_explicit_resume_revives_archived_retired_session_in_pl
     };
 
     // ---------------- Lifetime 1: create, use, then retire ----------------
-    let (service_1, store_1) = persistent_service(&paths, runtime_store.clone());
+    let (service_1, _store_1) = persistent_service(&paths, runtime_store.clone());
     let storage_1 = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
     let handle_1 = MobBuilder::new(definition, storage_1)
         .with_session_service(service_1.clone())
@@ -666,7 +714,7 @@ async fn mob_cold_restart_explicit_resume_revives_archived_retired_session_in_pl
             .is_none(),
         "ordinary reads must continue to hide archived sessions"
     );
-    let mut archived = service_1
+    let archived = service_1
         .load_revivable_retired_session(&original_session_id)
         .await
         .expect("load retired session through explicit revival seam")
@@ -686,39 +734,15 @@ async fn mob_cold_restart_explicit_resume_revives_archived_retired_session_in_pl
         "retirement must durably retire runtime authority"
     );
 
-    // Mob retirement also accepts the older Retired-only compatibility shape,
-    // where the explicit document marker is absent. Exercise the stronger
-    // archived-document variant as well: older stores and direct machine
-    // archive authority can carry an explicit Archived marker, and revival
-    // must synchronize that promoted Active snapshot into the already-created
-    // live agent before its first checkpoint.
-    mutate_test_session_with_checkpoint(&mut archived, |session| {
-        session
-            .set_lifecycle_terminal(meerkat_core::session::SessionLifecycleTerminal::Archived)
-            .expect("stamp explicit archived document fixture");
-    });
-    runtime_store
-        .commit_session_snapshot(
-            &runtime_id,
-            meerkat_runtime::store::SessionDelta {
-                session_snapshot: serde_json::to_vec(&archived)
-                    .expect("serialize explicit archived runtime snapshot"),
-            },
-        )
-        .await
-        .expect("persist explicit archived runtime snapshot");
-    store_1
-        .save_authoritative_projection(&archived)
-        .await
-        .expect("persist explicit archived compatibility projection");
-    assert_eq!(
+    assert_ne!(
         service_1
             .load_revivable_retired_session(&original_session_id)
             .await
-            .expect("reload explicit archived session")
-            .expect("explicit archived session remains revivable")
+            .expect("reload retired session")
+            .expect("retired session remains revivable")
             .lifecycle_terminal(),
-        Some(meerkat_core::session::SessionLifecycleTerminal::Archived)
+        Some(meerkat_core::session::SessionLifecycleTerminal::Archived),
+        "archive authority must remain store-owned instead of being copied into the Session body"
     );
 
     handle_1
@@ -729,7 +753,7 @@ async fn mob_cold_restart_explicit_resume_revives_archived_retired_session_in_pl
     drop(service_1);
 
     // ---------------- Lifetime 2: reopen, then explicitly revive ----------
-    let (service_2, store_2) = persistent_service(&paths, runtime_store.clone());
+    let (service_2, _store_2) = persistent_service(&paths, runtime_store.clone());
     let storage_2 = MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage");
     let handle_2 = MobBuilder::for_resume(storage_2)
         .with_session_service(service_2.clone())
@@ -759,10 +783,10 @@ async fn mob_cold_restart_explicit_resume_revives_archived_retired_session_in_pl
         .await
         .expect("load revived authoritative session")
         .expect("revived session must remain durable");
-    assert_eq!(
+    assert_ne!(
         revived.lifecycle_terminal(),
-        Some(meerkat_core::session::SessionLifecycleTerminal::Active),
-        "revival must promote the durable session document to Active"
+        Some(meerkat_core::session::SessionLifecycleTerminal::Archived),
+        "revival must preserve the content-only Session body"
     );
     assert!(
         service_2
@@ -808,20 +832,10 @@ async fn mob_cold_restart_explicit_resume_revives_archived_retired_session_in_pl
         .await
         .expect("load authoritative session after revived turn")
         .expect("revived session remains authoritative after turn");
-    assert_eq!(
+    assert_ne!(
         after_turn.lifecycle_terminal(),
-        Some(meerkat_core::session::SessionLifecycleTerminal::Active),
-        "the revived live agent must not checkpoint its stale Archived snapshot over durable Active"
-    );
-    let compatibility_projection = store_2
-        .load(&original_session_id)
-        .await
-        .expect("load compatibility projection after revived turn")
-        .expect("compatibility projection remains present after revived turn");
-    assert_eq!(
-        compatibility_projection.lifecycle_terminal(),
-        Some(meerkat_core::session::SessionLifecycleTerminal::Active),
-        "the first revived turn must preserve the Active compatibility projection"
+        Some(meerkat_core::session::SessionLifecycleTerminal::Archived),
+        "the revived live agent must preserve the content-only Session body"
     );
     assert!(
         service_2
@@ -844,7 +858,7 @@ async fn mob_cold_restart_partial_resume_respawns_wired_member() {
     let paths = Paths::new(temp.path());
     let runtime_store_1: Arc<dyn meerkat_runtime::RuntimeStore> =
         Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
-    let (service_1, store_1) = persistent_service(&paths, runtime_store_1);
+    let (service_1, store_1) = persistent_service(&paths, runtime_store_1.clone());
     let storage_1 = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
     let definition = mob_definition(MobRuntimeMode::TurnDriven);
     let replacement_w2_comms_name = format!("{}/worker/w-2", definition.id);
@@ -897,12 +911,14 @@ async fn mob_cold_restart_partial_resume_respawns_wired_member() {
     store_1
         .delete(&w2_sid)
         .await
-        .expect("delete w2 durable session row");
+        .expect("delete stale w2 compatibility projection");
     drop(store_1);
+    runtime_store_1
+        .clear_session_snapshot(&meerkat_runtime::LogicalRuntimeId::for_session(&w2_sid))
+        .await
+        .expect("delete exact w2 RuntimeStore authority");
 
-    let runtime_store_2: Arc<dyn meerkat_runtime::RuntimeStore> =
-        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
-    let (service_2, _store_2) = persistent_service(&paths, runtime_store_2);
+    let (service_2, _store_2) = persistent_service(&paths, runtime_store_1);
     let storage_2 = MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage");
     let handle_2 = MobBuilder::for_resume(storage_2)
         .with_session_service(service_2.clone())
@@ -982,40 +998,40 @@ async fn mob_cold_restart_partial_resume_respawns_wired_member() {
 // commit points of a single member turn:
 //   (1) the agent loop's intra-turn best-effort checkpoint
 //       (`Agent::save_session_best_effort` → injected `StoreCheckpointer`)
-//       writes the durable SessionStore row with the completed turn, then
-//   (2) the MeerkatMachine boundary commit (`RuntimeStore::atomic_apply` /
-//       `commit_session_snapshot`) would persist the runtime-store snapshot.
-// A kill in that window leaves the durable row AHEAD of the runtime-store
-// snapshot. On cold restart `load_authoritative_session…` prefers the
-// (now stale) runtime snapshot because the runtime lifecycle is not Retired,
-// so the resumed projection is behind the persisted row and the first
-// post-resume persist trips the append-only save guard.
+//       advances the canonical SQLite head with the completed turn, then
+//   (2) the MeerkatMachine prepared boundary commit would atomically advance
+//       the retained runtime authority plus receipt/input/lifecycle effects.
+// A kill in that window leaves the physical head AHEAD of the exact retained
+// runtime boundary. Cold restart must classify and recover that durable tail;
+// neither projection may silently overwrite the other.
 //
 // The power cut is simulated by a RuntimeStore wrapper with a SURGICAL loud
 // failure: input-admission writes (durable-before-ack) still land so the turn
-// is admitted and runs into the window, while the boundary-commit writes (the
-// ones carrying a session snapshot delta) fail loudly — exactly the durable
-// state a host killed at the boundary-commit write leaves behind: the
-// intra-turn checkpointer already wrote the durable row (with its typed
-// provenance stamp), the runtime snapshot never advanced, and the admitted
-// input never reached a terminal state (so restart redelivers it). A blanket
+// is admitted and runs into the window, while the prepared boundary commit
+// fails loudly — exactly the durable state a host killed before that SQLite
+// transaction leaves behind: the intra-turn checkpointer already advanced the
+// store-owned physical head, runtime authority did not advance, and the
+// admitted input did not settle. A blanket
 // silent cut is wrong (it launders lost durable writes into "committed"
 // in-memory state a real kill also destroys); a blanket loud cut is wrong
 // (it rejects the turn at input admission, before the window).
 // ===========================================================================
 
 struct PowerCutRuntimeStore {
-    inner: meerkat_runtime::InMemoryRuntimeStore,
+    inner: meerkat_runtime::store::SqliteRuntimeStore,
     cut: std::sync::atomic::AtomicBool,
-    boundary_commit_rejections: std::sync::atomic::AtomicUsize,
+    prepared_boundary_commit_rejections: std::sync::atomic::AtomicUsize,
+    legacy_boundary_commit_rejections: std::sync::atomic::AtomicUsize,
 }
 
 impl PowerCutRuntimeStore {
-    fn new() -> Self {
+    fn new(path: &Path) -> Self {
         Self {
-            inner: meerkat_runtime::InMemoryRuntimeStore::new(),
+            inner: meerkat_runtime::store::SqliteRuntimeStore::new_head_canonical(path)
+                .expect("open co-tenant HeadCanonical runtime store"),
             cut: std::sync::atomic::AtomicBool::new(false),
-            boundary_commit_rejections: std::sync::atomic::AtomicUsize::new(0),
+            prepared_boundary_commit_rejections: std::sync::atomic::AtomicUsize::new(0),
+            legacy_boundary_commit_rejections: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1027,19 +1043,181 @@ impl PowerCutRuntimeStore {
         self.cut.load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn boundary_commit_rejections(&self) -> usize {
-        self.boundary_commit_rejections
+    fn prepared_boundary_commit_rejections(&self) -> usize {
+        self.prepared_boundary_commit_rejections
             .load(std::sync::atomic::Ordering::SeqCst)
     }
 
-    fn record_boundary_commit_rejection(&self) {
-        self.boundary_commit_rejections
+    fn legacy_boundary_commit_rejections(&self) -> usize {
+        self.legacy_boundary_commit_rejections
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn record_prepared_boundary_commit_rejection(&self) {
+        self.prepared_boundary_commit_rejections
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    fn record_legacy_boundary_commit_rejection(&self) {
+        self.legacy_boundary_commit_rejections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
 #[async_trait::async_trait]
 impl meerkat_runtime::RuntimeStore for PowerCutRuntimeStore {
+    fn session_authority_ops(&self) -> &dyn meerkat_runtime::store::RuntimeSessionAuthorityOps {
+        self.inner.session_authority_ops()
+    }
+
+    fn session_persistence_profile(
+        &self,
+    ) -> meerkat_runtime::store::RuntimeSessionPersistenceProfile {
+        meerkat_runtime::RuntimeStore::session_persistence_profile(&self.inner)
+    }
+
+    fn session_boundary_authority_read_cost(
+        &self,
+    ) -> meerkat_runtime::store::RuntimeSessionAuthorityReadCost {
+        self.inner.session_boundary_authority_read_cost()
+    }
+
+    async fn commit_prepared_session_boundary(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        request: meerkat_runtime::store::PreparedRuntimeSessionCommit,
+    ) -> Result<
+        meerkat_runtime::store::PreparedRuntimeSessionCommitResult,
+        meerkat_runtime::RuntimeStoreError,
+    > {
+        if self.is_cut() {
+            self.record_prepared_boundary_commit_rejection();
+            return Err(meerkat_runtime::RuntimeStoreError::WriteFailed(
+                "power cut (commit_prepared_session_boundary): durable runtime-store write lost"
+                    .to_string(),
+            ));
+        }
+        self.inner
+            .commit_prepared_session_boundary(runtime_id, request)
+            .await
+    }
+
+    async fn load_session_boundary_authority(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+    ) -> Result<
+        Option<meerkat_runtime::store::RuntimeSessionAuthority>,
+        meerkat_runtime::RuntimeStoreError,
+    > {
+        self.inner.load_session_boundary_authority(runtime_id).await
+    }
+
+    async fn delete_runtime_session_catalog_entry(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+    ) -> Result<(), meerkat_runtime::RuntimeStoreError> {
+        self.inner
+            .delete_runtime_session_catalog_entry(runtime_id)
+            .await
+    }
+
+    async fn load_runtime_session_catalog_entry(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+    ) -> Result<
+        Option<meerkat_runtime::store::RuntimeSessionCatalogEntry>,
+        meerkat_runtime::RuntimeStoreError,
+    > {
+        self.inner
+            .load_runtime_session_catalog_entry(runtime_id)
+            .await
+    }
+
+    async fn list_runtime_session_catalog_entries(
+        &self,
+        filter: meerkat_core::SessionFilter,
+    ) -> Result<
+        Vec<meerkat_runtime::store::RuntimeSessionCatalogEntry>,
+        meerkat_runtime::RuntimeStoreError,
+    > {
+        self.inner
+            .list_runtime_session_catalog_entries(filter)
+            .await
+    }
+
+    async fn write_prepared_head_canonical_provisional_tail(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        prepared: meerkat_runtime::store::PreparedHeadCanonicalProvisionalTail,
+    ) -> Result<
+        meerkat_runtime::store::HeadCanonicalProvisionalTailAuthority,
+        meerkat_runtime::RuntimeStoreError,
+    > {
+        self.inner
+            .write_prepared_head_canonical_provisional_tail(runtime_id, prepared)
+            .await
+    }
+
+    async fn load_head_canonical_provisional_tail(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+    ) -> Result<
+        Option<meerkat_runtime::store::HeadCanonicalProvisionalTailAuthority>,
+        meerkat_runtime::RuntimeStoreError,
+    > {
+        self.inner
+            .load_head_canonical_provisional_tail(runtime_id)
+            .await
+    }
+
+    async fn discard_head_canonical_provisional_tail(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        expected: &meerkat_runtime::store::HeadCanonicalProvisionalTailAuthority,
+    ) -> Result<bool, meerkat_runtime::RuntimeStoreError> {
+        self.inner
+            .discard_head_canonical_provisional_tail(runtime_id, expected)
+            .await
+    }
+
+    async fn load_durable_tail_recovery_source(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+    ) -> Result<
+        Option<meerkat_runtime::store::PreparedDurableTailRecoverySource>,
+        meerkat_runtime::RuntimeStoreError,
+    > {
+        self.inner
+            .load_durable_tail_recovery_source(runtime_id)
+            .await
+    }
+
+    async fn load_durable_tail_recovery_receipts(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        run_id: &meerkat_core::lifecycle::RunId,
+    ) -> Result<
+        Vec<meerkat_runtime::store::PreparedRecoveryReceiptSource>,
+        meerkat_runtime::RuntimeStoreError,
+    > {
+        self.inner
+            .load_durable_tail_recovery_receipts(runtime_id, run_id)
+            .await
+    }
+
+    async fn load_committed_recovery_boundary(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        candidate_id: &str,
+    ) -> Result<
+        Option<meerkat_runtime::store::CommittedRecoveryBoundary>,
+        meerkat_runtime::RuntimeStoreError,
+    > {
+        self.inner
+            .load_committed_recovery_boundary(runtime_id, candidate_id)
+            .await
+    }
+
     fn supports_compaction_projection_outbox(&self) -> bool {
         meerkat_runtime::RuntimeStore::supports_compaction_projection_outbox(&self.inner)
     }
@@ -1065,6 +1243,26 @@ impl meerkat_runtime::RuntimeStore for PowerCutRuntimeStore {
     > {
         self.inner
             .compare_and_swap_machine_lifecycle(runtime_id, expected, replacement)
+            .await
+    }
+
+    async fn compare_and_swap_machine_lifecycle_with_fence(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        expected: meerkat_runtime::store::MachineLifecycleExpectedVersion,
+        replacement: meerkat_runtime::store::MachineLifecycleCommit,
+        write_fence: Arc<dyn meerkat_runtime::store::RuntimeStoreWriteFence>,
+    ) -> Result<
+        meerkat_runtime::store::FencedMachineLifecycleCasOutcome,
+        meerkat_runtime::RuntimeStoreError,
+    > {
+        self.inner
+            .compare_and_swap_machine_lifecycle_with_fence(
+                runtime_id,
+                expected,
+                replacement,
+                write_fence,
+            )
             .await
     }
 
@@ -1095,10 +1293,10 @@ impl meerkat_runtime::RuntimeStore for PowerCutRuntimeStore {
     async fn commit_session_snapshot(
         &self,
         runtime_id: &meerkat_runtime::LogicalRuntimeId,
-        session_delta: meerkat_runtime::SessionDelta,
+        session_delta: meerkat_runtime::SerializedSessionSnapshot,
     ) -> Result<(), meerkat_runtime::RuntimeStoreError> {
         if self.is_cut() {
-            self.record_boundary_commit_rejection();
+            self.record_legacy_boundary_commit_rejection();
             return Err(meerkat_runtime::RuntimeStoreError::WriteFailed(
                 "power cut (commit_session_snapshot): durable runtime-store write lost".to_string(),
             ));
@@ -1108,26 +1306,27 @@ impl meerkat_runtime::RuntimeStore for PowerCutRuntimeStore {
             .await
     }
 
-    async fn commit_session_transcript_rewrite_snapshot(
+    async fn commit_prepared_whole_blob_rewrite_boundary(
         &self,
         runtime_id: &meerkat_runtime::LogicalRuntimeId,
-        session_delta: meerkat_runtime::SessionDelta,
-        commit: &meerkat_core::TranscriptRewriteCommit,
-    ) -> Result<(), meerkat_runtime::RuntimeStoreError> {
+        boundary: meerkat_runtime::store::PreparedWholeBlobRewriteStoreParts,
+    ) -> Result<meerkat_runtime::store::WholeBlobStoreAuthority, meerkat_runtime::RuntimeStoreError>
+    {
         if self.is_cut() {
+            self.record_legacy_boundary_commit_rejection();
             return Err(meerkat_runtime::RuntimeStoreError::WriteFailed(
-                "power cut (commit_session_transcript_rewrite_snapshot): durable runtime-store write lost".to_string(),
+                "power cut (commit_prepared_whole_blob_rewrite_boundary): durable runtime-store write lost".to_string(),
             ));
         }
         self.inner
-            .commit_session_transcript_rewrite_snapshot(runtime_id, session_delta, commit)
+            .commit_prepared_whole_blob_rewrite_boundary(runtime_id, boundary)
             .await
     }
 
     async fn atomic_apply(
         &self,
         runtime_id: &meerkat_runtime::LogicalRuntimeId,
-        session_delta: Option<meerkat_runtime::SessionDelta>,
+        session_delta: Option<meerkat_runtime::SerializedSessionSnapshot>,
         receipt: meerkat_core::lifecycle::RunBoundaryReceipt,
         input_updates: Vec<meerkat_runtime::input_state::InputStatePersistenceRecord>,
         session_store_key: Option<meerkat_core::types::SessionId>,
@@ -1138,7 +1337,7 @@ impl meerkat_runtime::RuntimeStore for PowerCutRuntimeStore {
         // loudly, modeling a host that dies at the boundary-commit write
         // AFTER the intra-turn checkpointer already wrote the durable row.
         if self.is_cut() && session_delta.is_some() {
-            self.record_boundary_commit_rejection();
+            self.record_legacy_boundary_commit_rejection();
             return Err(meerkat_runtime::RuntimeStoreError::WriteFailed(
                 "power cut (atomic_apply): durable runtime-store write lost".to_string(),
             ));
@@ -1160,22 +1359,21 @@ impl meerkat_runtime::RuntimeStore for PowerCutRuntimeStore {
     ) -> Result<Vec<meerkat_runtime::InputStateRow>, meerkat_runtime::RuntimeStoreError> {
         self.inner.load_input_states(runtime_id).await
     }
-    /// The lifecycle-aware atomic seam is what machine-authorized recovery
-    /// commits through. The cut applies to it exactly as it does to
-    /// `atomic_apply` — it always carries a session delta — so a recovery
-    /// attempted DURING the cut fails, and one attempted after restart
-    /// (when the cut is lifted) commits.
+    /// Keep the legacy whole-blob lifecycle seam under the same cut as every
+    /// other boundary write. Head-canonical recovery uses the dedicated
+    /// prepared boundary seam; this forwarding remains part of the wrapper's
+    /// truthful delegated capability surface.
     async fn atomic_apply_with_machine_lifecycle(
         &self,
         runtime_id: &meerkat_runtime::LogicalRuntimeId,
-        session_delta: meerkat_runtime::SessionDelta,
+        session_delta: meerkat_runtime::SerializedSessionSnapshot,
         receipt: meerkat_core::lifecycle::RunBoundaryReceipt,
         machine_lifecycle: meerkat_runtime::store::MachineLifecycleCommit,
         input_updates: Vec<meerkat_runtime::input_state::InputStatePersistenceRecord>,
         session_store_key: meerkat_core::types::SessionId,
     ) -> Result<(), meerkat_runtime::RuntimeStoreError> {
         if self.is_cut() {
-            self.record_boundary_commit_rejection();
+            self.record_legacy_boundary_commit_rejection();
             return Err(meerkat_runtime::RuntimeStoreError::WriteFailed(
                 "power cut (atomic_apply_with_machine_lifecycle): durable runtime-store write lost"
                     .to_string(),
@@ -1208,7 +1406,7 @@ impl meerkat_runtime::RuntimeStore for PowerCutRuntimeStore {
         &self,
         runtime_id: &meerkat_runtime::LogicalRuntimeId,
     ) -> Result<
-        Vec<(meerkat_runtime::input_state::StoredInputState, String)>,
+        meerkat_runtime::store::PreparedRecoveryInputSnapshot,
         meerkat_runtime::RuntimeStoreError,
     > {
         self.inner.load_input_states_with_versions(runtime_id).await
@@ -1231,7 +1429,7 @@ impl meerkat_runtime::RuntimeStore for PowerCutRuntimeStore {
     async fn load_session_snapshot(
         &self,
         runtime_id: &meerkat_runtime::LogicalRuntimeId,
-    ) -> Result<Option<Vec<u8>>, meerkat_runtime::RuntimeStoreError> {
+    ) -> Result<Option<std::sync::Arc<Vec<u8>>>, meerkat_runtime::RuntimeStoreError> {
         self.inner.load_session_snapshot(runtime_id).await
     }
 
@@ -1280,7 +1478,10 @@ impl meerkat_runtime::RuntimeStore for PowerCutRuntimeStore {
         replacement: Vec<u8>,
     ) -> Result<bool, meerkat_runtime::RuntimeStoreError> {
         if self.is_cut() {
-            return Ok(true);
+            return Err(meerkat_runtime::RuntimeStoreError::WriteFailed(
+                "power cut (replace_session_snapshot_if_current): conditional write lost"
+                    .to_string(),
+            ));
         }
         self.inner
             .replace_session_snapshot_if_current(runtime_id, expected_current, replacement)
@@ -1293,7 +1494,9 @@ impl meerkat_runtime::RuntimeStore for PowerCutRuntimeStore {
         expected_current: &[u8],
     ) -> Result<bool, meerkat_runtime::RuntimeStoreError> {
         if self.is_cut() {
-            return Ok(true);
+            return Err(meerkat_runtime::RuntimeStoreError::WriteFailed(
+                "power cut (clear_session_snapshot_if_current): conditional write lost".to_string(),
+            ));
         }
         self.inner
             .clear_session_snapshot_if_current(runtime_id, expected_current)
@@ -1332,6 +1535,12 @@ impl meerkat_runtime::RuntimeStore for PowerCutRuntimeStore {
             .await
     }
 
+    fn input_state_batch_cas_implementation_profile(
+        &self,
+    ) -> meerkat_runtime::store::InputStateBatchCasImplementationProfile {
+        self.inner.input_state_batch_cas_implementation_profile()
+    }
+
     async fn compare_and_swap_input_states_atomically(
         &self,
         runtime_id: &meerkat_runtime::LogicalRuntimeId,
@@ -1344,6 +1553,62 @@ impl meerkat_runtime::RuntimeStore for PowerCutRuntimeStore {
             .await
     }
 
+    async fn compare_and_swap_input_states_atomically_with_fence(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        expected: &[meerkat_runtime::input_state::StoredInputState],
+        replacements: &[meerkat_runtime::input_state::InputStatePersistenceRecord],
+        write_fence: std::sync::Arc<dyn meerkat_runtime::store::RuntimeStoreWriteFence>,
+    ) -> Result<
+        meerkat_runtime::store::FencedInputStateBatchCasOutcome,
+        meerkat_runtime::RuntimeStoreError,
+    > {
+        self.inner
+            .compare_and_swap_input_states_atomically_with_fence(
+                runtime_id,
+                expected,
+                replacements,
+                write_fence,
+            )
+            .await
+    }
+
+    async fn compare_and_swap_recovery_input_states_atomically(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        expected_revision: meerkat_runtime::store::RecoveryInputSetRevision,
+        mutations: &[meerkat_runtime::store::RecoveryInputStateMutation],
+    ) -> Result<meerkat_runtime::store::InputStateBatchCasOutcome, meerkat_runtime::RuntimeStoreError>
+    {
+        self.inner
+            .compare_and_swap_recovery_input_states_atomically(
+                runtime_id,
+                expected_revision,
+                mutations,
+            )
+            .await
+    }
+
+    async fn compare_and_swap_recovery_input_states_atomically_with_fence(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        expected_revision: meerkat_runtime::store::RecoveryInputSetRevision,
+        mutations: &[meerkat_runtime::store::RecoveryInputStateMutation],
+        write_fence: std::sync::Arc<dyn meerkat_runtime::store::RuntimeStoreWriteFence>,
+    ) -> Result<
+        meerkat_runtime::store::FencedInputStateBatchCasOutcome,
+        meerkat_runtime::RuntimeStoreError,
+    > {
+        self.inner
+            .compare_and_swap_recovery_input_states_atomically_with_fence(
+                runtime_id,
+                expected_revision,
+                mutations,
+                write_fence,
+            )
+            .await
+    }
+
     async fn load_input_state(
         &self,
         runtime_id: &meerkat_runtime::LogicalRuntimeId,
@@ -1353,6 +1618,43 @@ impl meerkat_runtime::RuntimeStore for PowerCutRuntimeStore {
         meerkat_runtime::RuntimeStoreError,
     > {
         self.inner.load_input_state(runtime_id, input_id).await
+    }
+
+    async fn load_input_state_by_idempotency_key(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        key: &meerkat_runtime::IdempotencyKey,
+    ) -> Result<
+        Option<meerkat_runtime::store::ExactInputStateObservation>,
+        meerkat_runtime::RuntimeStoreError,
+    > {
+        self.inner
+            .load_input_state_by_idempotency_key(runtime_id, key)
+            .await
+    }
+
+    async fn load_input_states_by_ids(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        input_ids: &[meerkat_core::lifecycle::InputId],
+    ) -> Result<
+        Vec<Option<meerkat_runtime::input_state::StoredInputState>>,
+        meerkat_runtime::RuntimeStoreError,
+    > {
+        self.inner
+            .load_input_states_by_ids(runtime_id, input_ids)
+            .await
+    }
+
+    async fn load_pending_terminal_owner_ids_page(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+        after: Option<&meerkat_core::lifecycle::InputId>,
+        limit: usize,
+    ) -> Result<Vec<meerkat_core::lifecycle::InputId>, meerkat_runtime::RuntimeStoreError> {
+        self.inner
+            .load_pending_terminal_owner_ids_page(runtime_id, after, limit)
+            .await
     }
 
     async fn load_machine_lifecycle_record(
@@ -1455,7 +1757,7 @@ impl meerkat_runtime::RuntimeStore for PowerCutRuntimeStore {
 }
 
 async fn wait_for_row_contains(
-    store: &JsonlStore,
+    store: &dyn SessionStore,
     session_id: &meerkat::SessionId,
     needle: &str,
     context: &str,
@@ -1481,20 +1783,92 @@ async fn wait_for_row_contains(
     }
 }
 
+async fn wait_for_head_canonical_authority_convergence(
+    store: &SqliteSessionStore,
+    runtime_store: &dyn meerkat_runtime::RuntimeStore,
+    session_id: &meerkat::SessionId,
+    required_history: &str,
+    context: &str,
+) {
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(session_id);
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let physical_head = store
+            .load_head(session_id)
+            .await
+            .expect("load physical canonical head");
+        let authority = runtime_store
+            .load_session_boundary_authority(&runtime_id)
+            .await
+            .expect("load retained runtime boundary authority");
+        if let (Some(physical_head), Some(authority)) = (physical_head.as_ref(), authority.as_ref())
+        {
+            assert_eq!(
+                authority.profile(),
+                meerkat_runtime::store::RuntimeSessionPersistenceProfile::HeadCanonicalV1,
+                "[{context}] runtime authority changed persistence profile"
+            );
+            let physical_token = meerkat_core::session_store::session_head_cas_token(physical_head)
+                .expect("physical head has a canonical CAS token");
+            let authority = authority
+                .head_canonical()
+                .expect("head-canonical runtime authority");
+            if authority.boundary_head() == physical_head
+                && authority.committed_head_token() == physical_token
+            {
+                let session = store
+                    .load(session_id)
+                    .await
+                    .expect("load converged canonical session")
+                    .expect("converged canonical session exists");
+                let history =
+                    to_string(session.messages()).expect("serialize converged session history");
+                if history.contains(required_history) {
+                    assert_eq!(
+                        session.messages().len() as u64,
+                        physical_head.message_count,
+                        "[{context}] materialized session count differs from the authoritative physical head"
+                    );
+                    assert_eq!(
+                        session
+                            .transcript_content_digest()
+                            .expect("converged session transcript digest"),
+                        physical_head.head_revision,
+                        "[{context}] materialized session digest differs from the authoritative physical head"
+                    );
+                    return;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "[{context}] runtime authority did not converge to physical head containing \
+             '{required_history}' for {session_id}; physical={physical_head:?}, authority={authority:?}"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
 /// Host dies between the intra-turn durable-row checkpoint and the runtime
-/// boundary commit. The durable SessionStore row carries the final turn; the
-/// durable runtime-store snapshot does not. Cold restart resumes the mob over
-/// both stores.
+/// boundary commit. The canonical SQLite head carries the final turn while the
+/// co-tenant runtime authority still names its predecessor. Cold restart must
+/// recover that exact durable tail through the real HeadCanonical transaction.
+///
+/// The test-support feature supplies the deliberately non-product crash-stop
+/// command needed to quiesce lifetime 1 without graceful terminalization.
+/// Both Cargo integration lanes invoke this exact target with the feature and
+/// `--no-tests=fail`; the generated Bazel target also enables it.
+#[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread")]
 async fn mob_cold_restart_resume_after_kill_between_commit_points() {
     let temp = tempfile::tempdir().expect("temp dir");
     let paths = Paths::new(temp.path());
 
-    let power_store = Arc::new(PowerCutRuntimeStore::new());
+    let power_store = Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
     let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = power_store.clone();
 
     // ---------------- Lifetime 1 ----------------
-    let (service_1, store_1) = persistent_service(&paths, runtime_store.clone());
+    let (service_1, store_1) = persistent_head_canonical_service(&paths, runtime_store.clone());
     let storage_1 = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
     let handle_1 = MobBuilder::new(mob_definition(MobRuntimeMode::TurnDriven), storage_1)
         .with_session_service(service_1.clone())
@@ -1517,7 +1891,8 @@ async fn mob_cold_restart_resume_after_kill_between_commit_points() {
         .await
         .expect("w1 session id");
 
-    // Turn A commits cleanly to BOTH stores.
+    // Turn A commits cleanly to the co-tenant canonical head and retained
+    // runtime boundary in one SQLite resource.
     send_and_wait(
         &handle_1,
         service_1.as_ref(),
@@ -1526,9 +1901,24 @@ async fn mob_cold_restart_resume_after_kill_between_commit_points() {
         "kill-window-lifetime1",
     )
     .await;
+    wait_for_head_canonical_authority_convergence(
+        store_1.as_ref(),
+        runtime_store.as_ref(),
+        &w1_sid,
+        "PRE_CUT_W1_TURN",
+        "pre-cut-boundary",
+    )
+    .await;
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&w1_sid);
+    let pre_cut_boundary_authority = runtime_store
+        .load_session_boundary_authority(&runtime_id)
+        .await
+        .expect("load pre-cut runtime session authority")
+        .expect("pre-cut runtime session authority present");
 
-    // Power cut: every runtime-store write from here on fails — the process
-    // "dies" before the runtime boundary commit of the next turn.
+    // Power cut: durable-before-ack admission still lands, but the next
+    // prepared session boundary is rejected as if the process died before
+    // SQLite began that transaction.
     power_store.set_cut(true);
 
     // Turn B: the agent loop completes agent-side and the injected
@@ -1549,95 +1939,106 @@ async fn mob_cold_restart_resume_after_kill_between_commit_points() {
     .await;
     eprintln!("[kill-window] send during cut => {send_result:?}");
 
-    // Prove the divergence arose from real code paths: the durable row now
-    // carries turn B while the runtime snapshot (frozen by the cut) does not.
-    let row_blob =
-        wait_for_row_contains(&store_1, &w1_sid, "POST_CUT_W1_TURN", "kill-window-row").await;
+    // Prove the divergence arose from real code paths: the physical canonical
+    // head now carries turn B while the retained runtime boundary does not.
+    let row_blob = wait_for_row_contains(
+        store_1.as_ref(),
+        &w1_sid,
+        "POST_CUT_W1_TURN",
+        "kill-window-row",
+    )
+    .await;
     eprintln!(
-        "[kill-window] durable row advanced past runtime snapshot; row bytes={}",
+        "[kill-window] physical head advanced past retained boundary; row bytes={}",
         row_blob.len()
     );
-    let stale_snapshot = runtime_store
-        .load_session_snapshot(&meerkat_runtime::LogicalRuntimeId::for_session(&w1_sid))
+    let committed_boundary_authority = runtime_store
+        .load_session_boundary_authority(&runtime_id)
         .await
-        .expect("load runtime snapshot")
-        .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
-        .unwrap_or_default();
-    assert!(
-        !stale_snapshot.contains("POST_CUT_W1_TURN"),
-        "runtime snapshot must be frozen before turn B by the cut"
+        .expect("load runtime session authority")
+        .expect("runtime session authority present");
+    assert_eq!(
+        committed_boundary_authority, pre_cut_boundary_authority,
+        "the rejected boundary commit must leave the exact pre-cut RuntimeStore authority current"
     );
-    assert!(
-        stale_snapshot.contains("PRE_CUT_W1_TURN"),
-        "runtime snapshot must still carry turn A: {stale_snapshot}"
+    assert_eq!(
+        committed_boundary_authority.profile(),
+        meerkat_runtime::store::RuntimeSessionPersistenceProfile::HeadCanonicalV1
     );
-    let stale_snapshot_session: meerkat_core::Session =
-        serde_json::from_str(&stale_snapshot).expect("decode frozen runtime snapshot");
-
+    let committed_boundary_authority = committed_boundary_authority
+        .head_canonical()
+        .expect("head-canonical boundary authority");
+    let boundary_head = committed_boundary_authority.boundary_head().clone();
     // Synchronize on the kill window actually having happened: the boundary
     // commit for turn B must have been rejected BEFORE power is restored,
     // otherwise a late commit could converge the stores and the scenario
     // degenerates to a plain resume (vacuous pass).
     {
         let deadline = Instant::now() + Duration::from_secs(20);
-        while power_store.boundary_commit_rejections() == 0 {
+        while power_store.prepared_boundary_commit_rejections() == 0 {
             assert!(
                 Instant::now() < deadline,
-                "[kill-window] boundary commit was never rejected under the cut"
+                "[kill-window] prepared boundary commit was never rejected under the cut"
             );
             sleep(Duration::from_millis(50)).await;
         }
     }
-
-    // The rollback precondition is durable: the row's last writer was the
-    // intra-turn checkpointer, so it carries the typed provenance stamp.
-    let stamped_row = store_1
+    // The durable-tail adoption precondition is store-owned: the physical head
+    // is a strict continuation of the retained runtime boundary and binds the
+    // exact materialized row by count, digest, and CAS token.
+    let ahead_row = store_1
         .load(&w1_sid)
         .await
         .expect("load durable row before restart")
         .expect("durable row present before restart");
+    let ahead_head = store_1
+        .load_head(&w1_sid)
+        .await
+        .expect("load ahead physical head")
+        .expect("ahead physical head exists");
+    let ahead_token = meerkat_core::session_store::session_head_cas_token(&ahead_head)
+        .expect("ahead physical head has a canonical token");
+    assert_eq!(
+        ahead_row.messages().len() as u64,
+        ahead_head.message_count,
+        "ahead physical head must bind the exact materialized row count"
+    );
+    assert_eq!(
+        ahead_row
+            .transcript_content_digest()
+            .expect("ahead row transcript digest"),
+        ahead_head.head_revision,
+        "ahead physical head must bind the exact materialized transcript"
+    );
+    assert_ne!(
+        ahead_token,
+        committed_boundary_authority.committed_head_token(),
+        "the physical head must remain strictly ahead of retained runtime authority"
+    );
     assert!(
-        stamped_row
-            .try_has_runtime_checkpoint_provenance()
-            .expect("typed checkpoint provenance must decode"),
-        "the ahead-of-authority row must carry the checkpointer's provenance stamp"
-    );
-    let stale_snapshot_checkpoint = match stale_snapshot_session
-        .try_checkpoint_state()
-        .expect("decode frozen runtime checkpoint")
-    {
-        meerkat_core::SessionCheckpointState::Verified(stamp) => stamp,
-        other => panic!("frozen runtime snapshot lacks typed authority: {other:?}"),
-    };
-    let stamped_row_checkpoint = match stamped_row
-        .try_checkpoint_state()
-        .expect("decode ahead-row checkpoint")
-    {
-        meerkat_core::SessionCheckpointState::Verified(stamp) => stamp,
-        other => panic!("ahead row lacks typed checkpoint authority: {other:?}"),
-    };
-    assert_eq!(
-        stamped_row_checkpoint.authority_base(),
-        &meerkat_core::SessionCheckpointAuthorityBase::Typed {
-            anchor: meerkat_core::SessionCheckpointAnchor::from_stamp(&stale_snapshot_checkpoint,),
-        },
-        "the ahead intra-turn row must name the exact frozen runtime authority"
-    );
-    assert_eq!(
-        meerkat_core::session_checkpoint_relation(&stale_snapshot_session, &stamped_row)
-            .expect("classify frozen/ahead checkpoint relation"),
-        meerkat_core::SessionCheckpointRelation::LeftRevisionOlder,
-        "the durable row must be an exact typed successor of the frozen runtime snapshot"
+        ahead_head.message_count > boundary_head.message_count,
+        "the ahead physical head must contain a strict transcript continuation"
     );
 
-    // The process is dead: drop everything without graceful shutdown.
+    // Quiesce every actor-owned volatile producer without writing graceful
+    // cancellation. Dropping a MobHandle alone does not stop the actor because
+    // internal clones retain its command channel.
+    handle_1
+        .crash_stop_preserving_durable_work_for_test()
+        .await
+        .expect("crash-stop lifetime-1 actor before restoring power");
+    assert_eq!(
+        power_store.legacy_boundary_commit_rejections(),
+        0,
+        "HeadCanonical lifetime must reach only the prepared boundary seam"
+    );
     drop(handle_1);
     drop(service_1);
     drop(store_1);
 
     // ---------------- Lifetime 2 (power restored) ----------------
     power_store.set_cut(false);
-    let (service_2, _store_2) = persistent_service(&paths, runtime_store.clone());
+    let (service_2, store_2) = persistent_head_canonical_service(&paths, runtime_store.clone());
     let storage_2 = MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage");
     let resume_result = MobBuilder::for_resume(storage_2)
         .with_session_service(service_2.clone())
@@ -1658,19 +2059,24 @@ async fn mob_cold_restart_resume_after_kill_between_commit_points() {
     eprintln!("[kill-window] post-resume lead={lead_after:?}");
     eprintln!("[kill-window] post-resume w1={w1_after:?}");
 
-    // Resume contract (Ask B): the runtime authority is singular — the
-    // machine boundary commit is the only commit point. The durable row's
-    // ahead-of-authority tail (turn B, whose boundary commit never landed)
-    // carries the intra-turn checkpointer's typed provenance stamp, so the
-    // revival persist resolves the machine-authorized projection ROLLBACK:
-    // the row rebuilds onto committed truth instead of the pre-fix behavior —
-    // the append-only save guard rejecting the newer row ("save rejected: …
-    // without transcript-continuity proof"), the live session discarded
-    // fail-closed, and the member terminally Broken.
+    // Resume contract: the store-owned exact predecessor/head evidence is
+    // classified and machine-authorized, then SQLite realizes the recovered
+    // physical head, runtime authority, receipt, lifecycle, and input effects
+    // in one transaction. A wrapper that merely advertises HeadCanonical or a
+    // split JSONL/runtime topology cannot satisfy these assertions.
     assert_member_active(&w1_after, "kill-window-post-resume");
+    wait_for_head_canonical_authority_convergence(
+        store_2.as_ref(),
+        runtime_store.as_ref(),
+        &w1_sid,
+        "POST_CUT_W1_TURN",
+        "kill-window-recovered-boundary",
+    )
+    .await;
 
     // Drive a post-restart turn on the worker to force the first post-resume
-    // persist through the save guard.
+    // persist through the save guard, then prove the ordinary boundary also
+    // converges rather than merely advancing the physical checkpointer head.
     send_and_wait(
         &handle_2,
         service_2.as_ref(),
@@ -1679,15 +2085,20 @@ async fn mob_cold_restart_resume_after_kill_between_commit_points() {
         "kill-window-lifetime2",
     )
     .await;
+    wait_for_head_canonical_authority_convergence(
+        store_2.as_ref(),
+        runtime_store.as_ref(),
+        &w1_sid,
+        "POST_RESTART_W1_TURN",
+        "kill-window-post-recovery-boundary",
+    )
+    .await;
 
-    // No user input is lost and no uncommitted output is laundered: the
-    // uncommitted TURN was discarded by the rollback, but its durably
-    // admitted INPUT (durable-before-ack admission — the sender holds a
-    // delivery receipt) is redelivered after restart and re-executes through
-    // a fresh machine-committed run. All three inputs land in committed
-    // history EXACTLY ONCE — a laundered (rolled-back-then-resurrected) copy
-    // of the uncommitted turn or a duplicate redelivery would show up as a
-    // second occurrence.
+    // No user input is lost and no completed durable tail is duplicated:
+    // recovery adopts turn B exactly once and fences its input effects. All
+    // three inputs land in committed history exactly once; either laundering
+    // a second copy of the recovered turn or redelivering its already-settled
+    // input would show up as a duplicate.
     let w1_final = wait_for_history_contains_all(
         service_2.as_ref(),
         &w1_sid,
@@ -1710,17 +2121,17 @@ async fn mob_cold_restart_resume_after_kill_between_commit_points() {
             "'{needle}' must appear exactly once in committed history              (laundering or duplicate redelivery detected): {w1_final}"
         );
     }
-    // The committed pre-restart turn stays first. (The relative order of the
-    // REDELIVERED input vs the fresh post-restart input is queue-admission
-    // order, not part of the contract, so it is deliberately not asserted.)
+    // The machine-authorized durable tail is the already-existing physical
+    // head at resume. It must therefore precede the fresh post-resume input;
+    // A,C,B would prove discard/redelivery rather than exact adoption.
     let pre_cut_at = w1_final.find("PRE_CUT_W1_TURN").expect("pre-cut present");
     let post_cut_at = w1_final.find("POST_CUT_W1_TURN").expect("post-cut present");
     let post_restart_at = w1_final
         .find("POST_RESTART_W1_TURN")
         .expect("post-restart present");
     assert!(
-        pre_cut_at < post_cut_at && pre_cut_at < post_restart_at,
-        "committed pre-restart history must precede post-restart turns: {w1_final}"
+        pre_cut_at < post_cut_at && post_cut_at < post_restart_at,
+        "durable tail must remain ordered before fresh post-restart work: {w1_final}"
     );
     assert_member_active(&member_entry(&handle_2, "w-1").await, "kill-window-final");
 }

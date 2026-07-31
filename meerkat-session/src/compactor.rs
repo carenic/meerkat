@@ -124,6 +124,10 @@ fn project_messages_for_summarization(messages: &[Message]) -> Vec<Message> {
 }
 
 impl Compactor for DefaultCompactor {
+    fn request_byte_cap(&self, pressure: meerkat_core::ProviderRequestPressure) -> Option<u64> {
+        pressure.effective_cap(self.config.max_request_bytes)
+    }
+
     fn should_compact(&self, ctx: &CompactionContext) -> bool {
         // Never compact on the first-ever session LLM boundary.
         if ctx.session_boundary_index == 0 {
@@ -139,29 +143,57 @@ impl Compactor for DefaultCompactor {
             return false;
         }
 
-        // Trigger on either threshold. `last_input_tokens` is the
+        // Trigger on any crossing threshold. `last_input_tokens` is the
         // authoritative provider-reported cost of the last LLM call;
         // `estimated_history_tokens` is the fallback used when the provider
         // never reports usage (voice-only sessions can run for hours
         // without an agent-loop turn, so the fallback is what keeps history
-        // bounded). Both paths are traced so operators can see which branch
-        // fired in production.
+        // bounded). The byte trigger measures the transcript in the unit
+        // providers actually enforce: the 2026-07-29 household incident grew
+        // a byte-heavy/token-light transcript past Anthropic's request-size
+        // cap and failed every turn with `request_too_large` while both
+        // token triggers stayed far below threshold. All paths are traced so
+        // operators can see which branch fired in production.
         let input_trigger = ctx.last_input_tokens >= self.config.auto_compact_threshold;
         let history_trigger = ctx.estimated_history_tokens >= self.config.auto_compact_threshold;
-        if input_trigger || history_trigger {
+        let (request_bytes, byte_threshold, request_measurement) =
+            match ctx.provider_request_pressure {
+                Some(pressure) => (
+                    pressure.encoded_bytes,
+                    pressure.trigger_threshold(self.config.max_request_bytes),
+                    "provider_lowered_exact",
+                ),
+                None => (
+                    ctx.estimated_request_bytes,
+                    self.config.request_byte_trigger_threshold(),
+                    "transcript_estimate",
+                ),
+            };
+        let byte_trigger = byte_threshold.is_some_and(|threshold| request_bytes >= threshold);
+        if input_trigger || history_trigger || byte_trigger {
             tracing::trace!(
                 input_tokens = ctx.last_input_tokens,
                 estimated_history_tokens = ctx.estimated_history_tokens,
+                estimated_request_bytes = ctx.estimated_request_bytes,
+                provider_request_bytes = ctx
+                    .provider_request_pressure
+                    .map(|pressure| pressure.encoded_bytes),
                 threshold = self.config.auto_compact_threshold,
+                byte_threshold,
+                request_measurement,
                 branch = if input_trigger {
                     "last_input_tokens"
-                } else {
+                } else if history_trigger {
                     "estimated_history_tokens_fallback"
+                } else if ctx.provider_request_pressure.is_some() {
+                    "provider_request_bytes"
+                } else {
+                    "estimated_request_bytes"
                 },
                 "compaction trigger fired",
             );
         }
-        input_trigger || history_trigger
+        input_trigger || history_trigger || byte_trigger
     }
 
     fn prepare_for_summarization(&self, messages: &[Message]) -> Vec<Message> {
@@ -180,41 +212,14 @@ impl Compactor for DefaultCompactor {
         let mut rebuilt = Vec::new();
         let mut retained = Vec::new();
         let mut discarded = Vec::new();
-
-        // 1. Preserve system prompt (extracted from messages, single source of truth)
-        if let Some(Message::System(sys)) = messages.first() {
-            let message = Message::System(sys.clone());
-            retained.push(meerkat_core::compact::CompactionRetained::new(
-                0,
-                u64::try_from(rebuilt.len()).unwrap_or(u64::MAX),
-                message.clone(),
-            ));
-            rebuilt.push(message);
-        }
-
-        // 2. Inject summary as a user message carrying the typed compaction-
-        //    summary transcript role so the transcript-continuity save-guard
-        //    recognizes the rebuilt-transcript boundary from a typed field, not
-        //    the rendered `[Context compacted]` prefix.
         let summary_content = format!("{COMPACTION_SUMMARY_PREFIX}{summary}");
         let summary_message = Message::User(meerkat_core::types::UserMessage::compaction_summary(
             summary_content,
         ));
-        let summary_mapping = CompactionSummary::new(
-            u64::try_from(rebuilt.len()).unwrap_or(u64::MAX),
-            summary_message.clone(),
-        );
-        rebuilt.push(summary_message);
 
-        // 3. Identify recent complete turns to retain
+        // Identify recent complete turns to retain.
         // A "turn" is User -> BlockAssistant -> ToolResults sequence.
         // We work backward from the end to find `recent_turn_budget` turns.
-        let non_system_start = messages
-            .iter()
-            .position(|m| !matches!(m, Message::System(_)))
-            .unwrap_or(0);
-        let history = &messages[non_system_start..];
-
         // Find turn boundaries. Only a CONVERSATIONAL user message starts a
         // turn: a prior compaction summary is a runtime boundary marker (and
         // is discarded wholesale at the next compaction), and injected-context
@@ -224,12 +229,12 @@ impl Compactor for DefaultCompactor {
         // the contiguous injected-context run preceding it, so a kept user
         // message never loses the ambient context the model responded with.
         let mut turn_starts: Vec<usize> = Vec::new();
-        for (i, msg) in history.iter().enumerate() {
+        for (i, msg) in messages.iter().enumerate() {
             if matches!(msg, Message::User(u) if u.transcript_role.is_conversational()) {
                 let mut start = i;
                 while start > 0
                     && matches!(
-                        &history[start - 1],
+                        &messages[start - 1],
                         Message::User(u) if u.transcript_role.is_injected_context()
                     )
                 {
@@ -253,35 +258,55 @@ impl Compactor for DefaultCompactor {
                 .min(turn_starts.len().saturating_sub(1))
         };
         let retain_from = if retain_turn_count == 0 {
-            history.len()
+            messages.len()
         } else {
             turn_starts[turn_starts.len() - retain_turn_count]
         };
 
-        // Everything before retain_from goes to discarded
-        for (relative_offset, msg) in history[..retain_from].iter().enumerate() {
-            let source_offset =
-                u64::try_from(non_system_start.saturating_add(relative_offset)).unwrap_or(u64::MAX);
+        // System is an ordinary ordered event: retain every occurrence exactly.
+        // Insert the summary where the first discarded source row stood, so an
+        // arbitrary retained prefix (including any number of Systems) remains
+        // before it without granting row zero a singleton/config role.
+        let first_discarded_source_offset = messages
+            .iter()
+            .enumerate()
+            .find_map(|(source_offset, message)| {
+                (!matches!(message, Message::System(_)) && source_offset < retain_from)
+                    .then_some(source_offset)
+            })
+            .unwrap_or(messages.len());
+        let mut summary_mapping = None;
+        for (source_offset, message) in messages.iter().enumerate() {
+            if source_offset == first_discarded_source_offset {
+                summary_mapping = Some(CompactionSummary::new(
+                    u64::try_from(rebuilt.len()).unwrap_or(u64::MAX),
+                    summary_message.clone(),
+                ));
+                rebuilt.push(summary_message.clone());
+            }
+            let retain = matches!(message, Message::System(_)) || source_offset >= retain_from;
+            if retain {
+                retained.push(meerkat_core::compact::CompactionRetained::new(
+                    u64::try_from(source_offset).unwrap_or(u64::MAX),
+                    u64::try_from(rebuilt.len()).unwrap_or(u64::MAX),
+                    message.clone(),
+                ));
+                rebuilt.push(message.clone());
+                continue;
+            }
             discarded.push(meerkat_core::compact::CompactionDiscard::new(
-                source_offset,
-                msg.clone(),
-            ));
-        }
-
-        // Everything from retain_from remains active history. Summary LLM input
-        // uses a separate text projection; retained messages keep typed
-        // media/blob references verbatim so compaction does not lose context.
-        for (relative_offset, msg) in history[retain_from..].iter().enumerate() {
-            let source_offset = non_system_start
-                .saturating_add(retain_from)
-                .saturating_add(relative_offset);
-            retained.push(meerkat_core::compact::CompactionRetained::new(
                 u64::try_from(source_offset).unwrap_or(u64::MAX),
-                u64::try_from(rebuilt.len()).unwrap_or(u64::MAX),
-                msg.clone(),
+                message.clone(),
             ));
-            rebuilt.push(msg.clone());
         }
+        let summary_mapping = summary_mapping.unwrap_or_else(|| {
+            let mapping = CompactionSummary::new(
+                u64::try_from(rebuilt.len()).unwrap_or(u64::MAX),
+                summary_message.clone(),
+            );
+            rebuilt.push(summary_message);
+            mapping
+        });
 
         CompactionResult {
             messages: rebuilt,
@@ -302,6 +327,7 @@ mod tests {
     fn make_config() -> CompactionConfig {
         CompactionConfig {
             auto_compact_threshold: 100_000,
+            max_request_bytes: None,
             recent_turn_budget: 2,
             max_summary_tokens: 4096,
             min_turns_between_compactions: 3,
@@ -389,6 +415,8 @@ mod tests {
             last_input_tokens: 200_000,
             message_count: 100,
             estimated_history_tokens: 200_000,
+            estimated_request_bytes: 0,
+            provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 0,
         };
@@ -402,6 +430,8 @@ mod tests {
             last_input_tokens: 200_000,
             message_count: 100,
             estimated_history_tokens: 200_000,
+            estimated_request_bytes: 0,
+            provider_request_pressure: None,
             last_compaction_boundary_index: Some(5),
             session_boundary_index: 7, // Only 2 boundaries since last compaction, threshold is 3
         };
@@ -415,6 +445,8 @@ mod tests {
             last_input_tokens: 200_000,
             message_count: 100,
             estimated_history_tokens: 200_000,
+            estimated_request_bytes: 0,
+            provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 1,
         };
@@ -430,6 +462,8 @@ mod tests {
             last_input_tokens: 100_000,
             message_count: 50,
             estimated_history_tokens: 50_000,
+            estimated_request_bytes: 0,
+            provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 5,
         };
@@ -440,6 +474,8 @@ mod tests {
             last_input_tokens: 50_000,
             message_count: 50,
             estimated_history_tokens: 100_000,
+            estimated_request_bytes: 0,
+            provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 5,
         };
@@ -458,6 +494,8 @@ mod tests {
             last_input_tokens: 0,
             message_count: 200,
             estimated_history_tokens: 150_000,
+            estimated_request_bytes: 0,
+            provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 42,
         };
@@ -479,6 +517,8 @@ mod tests {
             last_input_tokens: 50_000,
             message_count: 20,
             estimated_history_tokens: 50_000,
+            estimated_request_bytes: 0,
+            provider_request_pressure: None,
             last_compaction_boundary_index: None,
             session_boundary_index: 5,
         };
@@ -486,7 +526,125 @@ mod tests {
     }
 
     #[test]
-    fn test_rebuild_preserves_system_prompt() {
+    fn test_byte_trigger_fires_below_token_threshold_on_byte_heavy_transcript() {
+        // The 2026-07-29 incident shape: inline media dominates request BYTES
+        // while both token measures sit far below the token threshold. The
+        // byte trigger must fire at 4/5 of the configured cap.
+        let c = DefaultCompactor::new(CompactionConfig {
+            max_request_bytes: Some(9_000_000),
+            ..make_config()
+        });
+        let ctx = CompactionContext {
+            last_input_tokens: 10_000,
+            message_count: 40,
+            estimated_history_tokens: 12_000,
+            estimated_request_bytes: 7_200_000, // exactly 4/5 of the 9 MB cap
+            provider_request_pressure: None,
+            last_compaction_boundary_index: None,
+            session_boundary_index: 5,
+        };
+        assert!(
+            c.should_compact(&ctx),
+            "byte trigger must fire on a byte-heavy transcript before any token threshold"
+        );
+
+        // One byte below the 4/5 threshold must not fire.
+        let below = CompactionContext {
+            estimated_request_bytes: 7_199_999,
+            ..ctx
+        };
+        assert!(!c.should_compact(&below));
+    }
+
+    #[test]
+    fn test_token_trigger_unchanged_when_byte_trigger_unset() {
+        // With max_request_bytes unset (the default), even an absurd byte
+        // estimate must not fire — pre-incident behavior is preserved.
+        let c = DefaultCompactor::new(make_config());
+        let ctx = CompactionContext {
+            last_input_tokens: 50_000,
+            message_count: 50,
+            estimated_history_tokens: 50_000,
+            estimated_request_bytes: u64::MAX,
+            provider_request_pressure: None,
+            last_compaction_boundary_index: None,
+            session_boundary_index: 5,
+        };
+        assert!(
+            !c.should_compact(&ctx),
+            "an unset byte cap must leave the trigger decision to the token thresholds"
+        );
+
+        // And the token trigger still fires exactly as before.
+        let token_crossing = CompactionContext {
+            last_input_tokens: 100_000,
+            ..ctx
+        };
+        assert!(c.should_compact(&token_crossing));
+    }
+
+    #[test]
+    fn exact_provider_witness_supplies_the_dynamic_active_cap() {
+        let c = DefaultCompactor::new(make_config());
+        let ctx = CompactionContext {
+            last_input_tokens: 1,
+            message_count: 2,
+            estimated_history_tokens: 1,
+            // The transcript estimate cannot see a cold-resumed blob payload.
+            estimated_request_bytes: 128,
+            provider_request_pressure: Some(meerkat_core::ProviderRequestPressure::new(
+                7_200_000,
+                Some(9_000_000),
+            )),
+            last_compaction_boundary_index: None,
+            session_boundary_index: 5,
+        };
+        assert!(
+            c.should_compact(&ctx),
+            "the active provider's exact lowered body and cap must override the blind transcript estimate"
+        );
+    }
+
+    #[test]
+    fn test_both_triggers_set_first_crossing_wins() {
+        // With both thresholds armed, whichever crosses first fires — the
+        // triggers are independent, not conjunctive.
+        let c = DefaultCompactor::new(CompactionConfig {
+            max_request_bytes: Some(9_000_000),
+            ..make_config()
+        });
+        let neither = CompactionContext {
+            last_input_tokens: 50_000,
+            message_count: 50,
+            estimated_history_tokens: 50_000,
+            estimated_request_bytes: 1_000_000,
+            provider_request_pressure: None,
+            last_compaction_boundary_index: None,
+            session_boundary_index: 5,
+        };
+        assert!(!c.should_compact(&neither));
+
+        let bytes_first = CompactionContext {
+            estimated_request_bytes: 8_000_000,
+            ..neither
+        };
+        assert!(
+            c.should_compact(&bytes_first),
+            "byte crossing alone must fire when both triggers are armed"
+        );
+
+        let tokens_first = CompactionContext {
+            last_input_tokens: 100_000,
+            ..neither
+        };
+        assert!(
+            c.should_compact(&tokens_first),
+            "token crossing alone must fire when both triggers are armed"
+        );
+    }
+
+    #[test]
+    fn rebuild_preserves_ordered_system_message() {
         let c = DefaultCompactor::new(make_config());
         let messages = vec![
             Message::System(SystemMessage::new("system")),
@@ -506,6 +664,84 @@ mod tests {
         ));
         assert_eq!(result.retained[0].source_offset, 0);
         assert_eq!(result.retained[0].rebuilt_offset, 0);
+    }
+
+    #[test]
+    fn rebuild_preserves_mid_thread_system_in_order_across_compaction() {
+        let c = DefaultCompactor::new(CompactionConfig {
+            recent_turn_budget: 1,
+            ..make_config()
+        });
+        let messages = vec![
+            Message::System(SystemMessage::new("initial prompt")),
+            Message::User(UserMessage::text("turn1")),
+            Message::System(SystemMessage::new("mid-thread instruction")),
+            Message::User(UserMessage::text("turn2")),
+            Message::User(UserMessage::text("turn3")),
+        ];
+
+        let result = c.rebuild_history(&messages, "summary");
+
+        assert!(matches!(
+            &result.messages[0],
+            Message::System(system) if system.content == "initial prompt"
+        ));
+        assert_eq!(result.messages[1], result.summary.message);
+        assert!(matches!(
+            &result.messages[2],
+            Message::System(system) if system.content == "mid-thread instruction"
+        ));
+        assert!(
+            result
+                .retained
+                .iter()
+                .any(|retention| retention.source_offset == 2 && retention.rebuilt_offset == 2),
+            "the mid-thread System message must remain an exact retained row"
+        );
+        assert!(
+            result
+                .discarded
+                .iter()
+                .all(|discard| !matches!(discard.message, Message::System(_))),
+            "compaction may never discard an ordered System message"
+        );
+    }
+
+    #[test]
+    fn rebuild_places_summary_after_complete_retained_instruction_prefix() {
+        let c = DefaultCompactor::new(CompactionConfig {
+            recent_turn_budget: 1,
+            ..make_config()
+        });
+        let messages = vec![
+            Message::System(SystemMessage::new("system A")),
+            Message::System(SystemMessage::new("system B")),
+            Message::User(UserMessage::text("old turn")),
+            Message::User(UserMessage::text("recent turn")),
+        ];
+
+        let result = c.rebuild_history(&messages, "summary");
+
+        assert!(matches!(
+            &result.messages[0],
+            Message::System(system) if system.content == "system A"
+        ));
+        assert!(matches!(
+            &result.messages[1],
+            Message::System(system) if system.content == "system B"
+        ));
+        assert_eq!(result.summary.rebuilt_offset, 2);
+        assert_eq!(result.messages[2], result.summary.message);
+        assert_eq!(
+            result
+                .retained
+                .iter()
+                .map(|retention| (retention.source_offset, retention.rebuilt_offset))
+                .collect::<Vec<_>>(),
+            vec![(0, 0), (1, 1), (3, 3)]
+        );
+        assert_eq!(result.discarded.len(), 1);
+        assert_eq!(result.discarded[0].source_offset, 2);
     }
 
     #[test]

@@ -115,6 +115,7 @@ config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy}"
 command="${BUILDBUDDY_BAZEL_COMMAND:-build}"
 requested_command="${command}"
 extra_args=()
+enforced_args=()
 fast_test_tag_filters="-local,-e2e,-system,-live,-integration,-slow,-required-feature,-trybuild,-snapshot,-fixture"
 e2e_test_env=(
   --test_env=ANTHROPIC_API_KEY
@@ -323,7 +324,14 @@ case "${command}" in
   e2e-smoke-rbe)
     command="build"
     config="${BUILDBUDDY_BAZEL_CONFIG:-buildbuddy-macos-rbe}"
-    default_target="@wasm_pack_darwin_arm64//:wasm-pack //tests/integration:e2e_smoke_lane_test //tests/integration:e2e_artifacts_bin //meerkat-cli:rkat //meerkat-cli:cli_mobpack_live_smoke_test //meerkat-cli:live_smoke_cli_test //meerkat-comms:e2e_test //meerkat-mcp-server:rkat_mcp_bin //meerkat-mob:smoke_mob_flow_runtime_test //meerkat-mob:smoke_mob_generated_image_comms_test //meerkat-mob:smoke_mob_resume_test //meerkat-rest:rkat_rest_bin //meerkat-rpc:rkat_rpc_bin //meerkat-rpc:live_smoke_rpc_test //tests/integration:smoke_shared_realm_test"
+    # This foundation selector must build EVERY artifact the smoke-lane
+    # materializer can resolve from the lane output base (the bazel test
+    # mapping in tests/integration/src/e2e_lanes.rs): with a warm output
+    # base, an omitted target's path can still hold a stale binary from an
+    # older build, and the lane would run it silently. The materializer now
+    # cross-checks each artifact against this invocation's build events, so
+    # an omission fails loudly at materialize time instead.
+    default_target="@wasm_pack_darwin_arm64//:wasm-pack //tests/integration:e2e_smoke_lane_test //tests/integration:e2e_artifacts_bin //meerkat:live_meerkat_regression_test //meerkat-cli:rkat //meerkat-cli:cli_mobpack_live_smoke_test //meerkat-cli:live_smoke_cli_test //meerkat-comms:e2e_test //meerkat-mcp-server:rkat_mcp_bin //meerkat-mob:smoke_mob_flow_runtime_test //meerkat-mob:smoke_mob_generated_image_comms_test //meerkat-mob:smoke_mob_idle_burn_test //meerkat-mob:smoke_mob_resume_test //meerkat-mob:smoke_mob_turn_latency_test //meerkat-rest:rkat_rest_bin //meerkat-rpc:rkat_rpc_bin //meerkat-rpc:live_smoke_rpc_test //tests/integration:smoke_shared_realm_test"
     extra_args+=(
       --remote_download_outputs=toplevel
       --color=no
@@ -354,6 +362,12 @@ case "${command}" in
       --test_summary=terse
       --color=no
       --curses=no
+    )
+    # Turbo-S is a Bazel sh_test cohort, not a Nextest run. Retry a failed
+    # shard once at the Bazel boundary where aggregate-load flakes occur,
+    # while preserving Bazel/BuildBuddy parallelism across independent shards.
+    enforced_args+=(
+      --flaky_test_attempts=2
     )
     ;;
   machine-authority-rbe)
@@ -805,6 +819,26 @@ if [[ -n "${BUILDBUDDY_MAX_IDLE_SECS:-}" ]]; then
   startup_args+=(--max_idle_secs="${BUILDBUDDY_MAX_IDLE_SECS}")
 fi
 
+if [[ "${requested_command}" == e2e-smoke-rbe ]]; then
+  # Build provenance for the smoke foundation: the warm lane output base can
+  # hold a stale binary from an earlier invocation at exactly the path the
+  # e2e artifact materializer resolves, and an exists+executable check
+  # cannot tell it apart from a fresh one. Record this invocation's Build
+  # Event Protocol stream so the materializer can require every artifact it
+  # serves to be an output of THIS build (consumed via
+  # MEERKAT_E2E_BAZEL_BUILD_EVENTS in tests/integration/src/e2e_lanes.rs;
+  # scripts/e2e-smoke-lane refuses to materialize without it).
+  e2e_smoke_bep_file="${MEERKAT_E2E_BAZEL_BUILD_EVENTS:-}"
+  if [[ -z "${e2e_smoke_bep_file}" && -n "${BUILDBUDDY_OUTPUT_BASE:-}" ]]; then
+    e2e_smoke_bep_file="${BUILDBUDDY_OUTPUT_BASE}/meerkat-e2e-smoke-build-events.json"
+  fi
+  if [[ -n "${e2e_smoke_bep_file}" ]]; then
+    mkdir -p "$(dirname "${e2e_smoke_bep_file}")"
+    rm -f "${e2e_smoke_bep_file}"
+    extra_args+=(--build_event_json_file="${e2e_smoke_bep_file}")
+  fi
+fi
+
 lockfile="${workspace_root}/MODULE.bazel.lock"
 module_lock_args=()
 if [[ -n "${BUILDBUDDY_KEEP_LOCK_REFRESH:-}" ]]; then
@@ -941,6 +975,9 @@ if [[ -n "${target}" ]]; then
   fi
 fi
 bb_args+=("$@")
+if [[ "${#enforced_args[@]}" -gt 0 ]]; then
+  bb_args+=("${enforced_args[@]}")
+fi
 
 # --- Corrupt external-repo state detection and auto-repair -------------------
 # Bazel 9's shared repo contents cache (now disabled above) used to symlink

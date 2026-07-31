@@ -152,6 +152,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `admission_authorized_existing_actions`: `Map<String, AdmissionExistingQueuedActionKind>`
 - `admission_authorized_existing_targets`: `Map<String, String>`
 - `admission_idempotency_inputs`: `Map<String, String>`
+- `input_idempotency_keys`: `Map<String, String>`
 - `recovered_admitted_inputs`: `Set<String>`
 - `recovered_admitted_lanes`: `Map<String, InputLane>`
 - `op_statuses`: `Map<String, OperationStatus>`
@@ -348,7 +349,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `AcceptWithCompletion`(input_id: InputId, request_immediate_processing: Bool, interrupt_yielding: Bool, wake_if_idle: Bool)
 - `AcceptWithoutWake`(input_id: InputId)
 - `Recycle`
-- `ServiceTurnCommitted`(run_id: RunId)
 - `RequestDeferredTools`(authorities: Map<ToolName, ToolVisibilityWitness>)
 
 ## Surface-only Inputs
@@ -382,7 +382,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `StageDeferredSession`(session_id: SessionId, keep_alive: Bool, has_comms_name: Bool, llm_identity: SessionLlmIdentity, machine_archived_resume_authorized: Bool)
 - `UpdateDeferredSessionKeepAlive`(session_id: SessionId, keep_alive: Bool, has_comms_name: Bool)
 - `UpdateDeferredSessionLlmIdentity`(session_id: SessionId, llm_identity: SessionLlmIdentity)
-- `AuthorizeDeferredSessionSystemContextAppend`(session_id: SessionId)
 - `BeginDeferredSessionPromotion`(session_id: SessionId)
 - `AuthorizeDeferredSessionMachineArchivedResume`(session_id: SessionId)
 - `AbandonDeferredSessionPromotion`(session_id: SessionId)
@@ -414,6 +413,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RequestUntilChangedSwitchTurn`(request_id: String, target_model: String, target_realtime_capable: Bool, requires_approval: Bool, approval_available: Bool, approval_denied: Bool, approval_reason: Option<RoutingSwitchApprovalReason>, realtime_detach_allowed: Bool)
 - `CompleteUntilChangedSwitchTurnReconfigure`(request_id: String)
 - `ResolveLiveBoundaryContextReceipt`(run_id: RunId, input_id: String)
+- `LiveBoundaryUnavailable`(input_id: String)
 - `ResolveAdmissionPlan`(input_id: String, input_kind: AdmissionInputKind, requested_lane: Option<InputLane>, continuation_kind: AdmissionContinuationKind, silent_intent_match: Bool, existing_superseded_input_id: Option<String>, runtime_running: Bool, active_turn_boundary_available: Bool, without_wake: Bool)
 - `ResolveAdmissionValidation`(input_id: String, input_kind: AdmissionInputKind, input_origin: AdmissionInputOriginKind, durability: InputDurabilityKind, peer_handling_mode_valid: Bool, peer_response_terminal_structurally_valid: Bool, peer_response_terminal_observed_status: PeerResponseTerminalObservedStatus)
 - `ResolveAdmissionIdempotency`(input_id: String, idempotency_key: Option<String>)
@@ -441,7 +441,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RollbackRun`(run_id: RunId)
 - `StartConversationRun`(run_id: RunId, primitive_kind: TurnPrimitiveKind, admitted_content_shape: ContentShape, vision_enabled: Bool, image_tool_results_enabled: Bool, max_extraction_retries: u64)
 - `StartImmediateAppend`(run_id: RunId)
-- `StartImmediateContext`(run_id: RunId)
 - `PrimitiveApplied`(run_id: RunId)
 - `LlmReturnedToolCalls`(run_id: RunId, tool_count: u64)
 - `CallbackPending`(run_id: RunId)
@@ -468,6 +467,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `TimeBudgetExceeded`(run_id: RunId)
 - `ForceCancelNoRun`
 - `RunCompleted`(run_id: RunId)
+- `ServiceTurnCommitted`(run_id: RunId)
 - `RunFailed`(run_id: RunId, runtime_apply_failure_cause: Option<RuntimeApplyFailureCause>, runtime_apply_failure_message: Option<String>, machine_terminal_failure_observed: Bool, terminal_failure_source: Option<RunFailureSourceKind>, error: String)
 - `RunCancelled`(run_id: RunId)
 - `RecoverAdmittedInput`(input_id: String, input_kind: RecoveredInputKind, runtime_boundary: RecoveredRunApplyBoundary, runtime_execution_kind: RecoveredRuntimeExecutionKind, runtime_peer_response_terminal_apply_intent: Option<RecoveredPeerResponseTerminalApplyIntent>, lane: InputLane)
@@ -488,6 +488,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `SupersedeInput`(input_id: String, superseded_by: String)
 - `CoalesceInput`(input_id: String, aggregate_id: String)
 - `AbandonInput`(input_id: String, reason: InputAbandonReason, attempt_count: u64)
+- `ArchiveTerminalInput`(input_id: String, phase: InputPhase, terminal_kind: InputTerminalKind, superseded_by: Option<String>, aggregate_id: Option<String>, abandon_reason: Option<InputAbandonReason>, abandon_attempt_count: Option<u64>, attempt_count: u64, run_id: Option<RunId>, boundary_sequence: Option<u64>, admission_sequence: Option<u64>, idempotency_key: Option<String>)
 - `RecordBoundarySeq`(input_id: String, run_id: RunId)
 - `RegisterOp`(operation_id: String, kind: OperationKind, source: Option<OperationSource>, max_concurrent: Option<u64>)
 - `StartOp`(operation_id: String)
@@ -674,6 +675,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `InitiateRecycle`
 - `IngressAccepted`
 - `AdmissionResolved`(input_id: String, policy_version: u64, policy_apply_mode: AdmissionPolicyApplyMode, policy_wake_mode: AdmissionPolicyWakeMode, policy_queue_mode: AdmissionPolicyQueueMode, policy_consume_point: AdmissionPolicyConsumePoint, policy_drain_policy: AdmissionPolicyDrainPolicy, policy_routing_disposition: AdmissionRoutingDisposition, lane: InputLane, plan: AdmissionPlanKind, queue_action: AdmissionQueueActionKind, existing_action: AdmissionExistingQueuedActionKind, existing_input_id: Option<String>, requires_active_pre_admission: Bool, runtime_boundary: AdmissionRunApplyBoundary, runtime_execution_kind: AdmissionRuntimeExecutionKind, runtime_peer_response_terminal_apply_intent: Option<AdmissionPeerResponseTerminalApplyIntent>, record_transcript: Bool, request_immediate_processing: Bool, interrupt_yielding: Bool, wake_if_idle: Bool, execution_handling_mode: Option<InputLane>, live_interrupt_required: Bool)
+- `LiveBoundaryUnavailableNormalized`(input_id: String, execution_handling_mode: InputLane, live_interrupt_required: Bool)
 - `AdmissionValidationResolved`(input_id: String, result: AdmissionValidationResultKind, reject_reason: Option<AdmissionRejectReasonKind>)
 - `AdmissionIdempotencyResolved`(input_id: String, result: AdmissionIdempotencyResultKind, existing_input_id: Option<String>)
 - `RecoveredInputLifecycleNormalized`(input_id: String, phase: InputPhase, terminal_kind: Option<InputTerminalKind>, recovered: Bool, abandoned: Bool, requeued: Bool, history_reason: Option<RecoveredInputNormalizationReasonKind>)
@@ -1111,35 +1113,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `DurableTailRecoveryCommitAuthorized`
 - To: `Retired`
 
-### `AuthorizeDurableTailRecoveryCommitLegacyIdle`
-- From: `Idle`
-- On: `AuthorizeDurableTailRecovery`(session_id, candidate_id, candidate_run_id, class, observed_lifecycle, observed_current_run, last_committed_sequence, prior_commit, input_evidence)
-- Guards:
-  - `no_current_run`
-  - `candidate_run_not_terminalized`
-  - `persisted_quiescent`
-  - `persisted_no_current_run`
-  - `prior_commit_admits_recovery`
-  - `inputs_attributable`
-  - `legacy_completed_class`
-- Emits: `DurableTailRecoveryCommitAuthorized`
-- To: `Idle`
-
-### `AuthorizeDurableTailRecoveryCommitLegacyRetired`
-- From: `Retired`
-- On: `AuthorizeDurableTailRecovery`(session_id, candidate_id, candidate_run_id, class, observed_lifecycle, observed_current_run, last_committed_sequence, prior_commit, input_evidence)
-- Guards:
-  - `no_current_run`
-  - `candidate_run_not_terminalized`
-  - `persisted_quiescent`
-  - `persisted_no_current_run`
-  - `prior_commit_admits_recovery`
-  - `inputs_attributable`
-  - `legacy_completed_class`
-- Emits: `DurableTailRecoveryCommitAuthorized`
-- To: `Retired`
-
-### `AuthorizeDurableTailRecoveryCommitLegacyRetainInputsIdle`
+### `AuthorizeDurableTailRecoveryCommitCompletedRetainInputsIdle`
 - From: `Idle`
 - On: `AuthorizeDurableTailRecovery`(session_id, candidate_id, candidate_run_id, class, observed_lifecycle, observed_current_run, last_committed_sequence, prior_commit, input_evidence)
 - Guards:
@@ -1153,7 +1127,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `DurableTailRecoveryCommitAuthorized`
 - To: `Idle`
 
-### `AuthorizeDurableTailRecoveryCommitLegacyRetainInputsRetired`
+### `AuthorizeDurableTailRecoveryCommitCompletedRetainInputsRetired`
 - From: `Retired`
 - On: `AuthorizeDurableTailRecovery`(session_id, candidate_id, candidate_run_id, class, observed_lifecycle, observed_current_run, last_committed_sequence, prior_commit, input_evidence)
 - Guards:
@@ -1430,22 +1404,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `UpdateDeferredSessionLlmIdentity`(session_id, llm_identity)
 - Guards:
   - `staged_or_promoting`
-  - `session_matches`
-- To: `Initializing`
-
-### `AuthorizeDeferredSessionSystemContextAppendStaged`
-- From: `Initializing`
-- On: `AuthorizeDeferredSessionSystemContextAppend`(session_id)
-- Guards:
-  - `staged`
-  - `session_matches`
-- To: `Initializing`
-
-### `AuthorizeDeferredSessionSystemContextAppendPromoting`
-- From: `Initializing`
-- On: `AuthorizeDeferredSessionSystemContextAppend`(session_id)
-- Guards:
-  - `promoting`
   - `session_matches`
 - To: `Initializing`
 
@@ -8868,30 +8826,6 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `TurnRunStarted`
 - To: `Running`
 
-### `StartImmediateContextInitializing`
-- From: `Initializing`
-- On: `StartImmediateContext`(run_id)
-- Guards:
-  - `turn_resettable`
-- Emits: `TurnRunStarted`
-- To: `Running`
-
-### `StartImmediateContextAttached`
-- From: `Attached`
-- On: `StartImmediateContext`(run_id)
-- Guards:
-  - `turn_resettable`
-- Emits: `TurnRunStarted`
-- To: `Running`
-
-### `StartImmediateContextRunning`
-- From: `Running`
-- On: `StartImmediateContext`(run_id)
-- Guards:
-  - `turn_resettable`
-- Emits: `TurnRunStarted`
-- To: `Running`
-
 ### `PrimitiveAppliedConversation`
 - From: `Running`
 - On: `PrimitiveApplied`(run_id)
@@ -10571,6 +10505,15 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `LiveBoundaryContextReceiptResolved`
 - To: `Running`
 
+### `LiveBoundaryUnavailableRunning`
+- From: `Running`
+- On: `LiveBoundaryUnavailable`(input_id)
+- Guards:
+  - `input_tracked`
+  - `input_is_queued_steer`
+- Emits: `LiveBoundaryUnavailableNormalized`
+- To: `Running`
+
 ### `ConsumeOnAcceptIdle`
 - From: `Idle`
 - On: `ConsumeOnAccept`(input_id)
@@ -10825,6 +10768,126 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `input_tracked`
 - Emits: `RecordTerminalOutcome`
 - To: `Stopped`
+
+### `ArchiveTerminalInputIdle`
+- From: `Idle`
+- On: `ArchiveTerminalInput`(input_id, phase, terminal_kind, superseded_by, aggregate_id, abandon_reason, abandon_attempt_count, attempt_count, run_id, boundary_sequence, admission_sequence, idempotency_key)
+- Guards:
+  - `archive_phase_is_terminal`
+  - `archive_exact_phase`
+  - `archive_exact_terminal_kind`
+  - `archive_exact_superseded_by`
+  - `archive_exact_aggregate_id`
+  - `archive_exact_abandon_reason`
+  - `archive_exact_abandon_attempt_count`
+  - `archive_exact_attempt_count`
+  - `archive_exact_run`
+  - `archive_exact_boundary_sequence`
+  - `archive_exact_admission_sequence`
+  - `archive_exact_idempotency_binding`
+  - `archive_not_live_in_lane`
+- Emits: `InputLifecycleNotice`
+- To: `Idle`
+
+### `ArchiveTerminalInputAttached`
+- From: `Attached`
+- On: `ArchiveTerminalInput`(input_id, phase, terminal_kind, superseded_by, aggregate_id, abandon_reason, abandon_attempt_count, attempt_count, run_id, boundary_sequence, admission_sequence, idempotency_key)
+- Guards:
+  - `archive_phase_is_terminal`
+  - `archive_exact_phase`
+  - `archive_exact_terminal_kind`
+  - `archive_exact_superseded_by`
+  - `archive_exact_aggregate_id`
+  - `archive_exact_abandon_reason`
+  - `archive_exact_abandon_attempt_count`
+  - `archive_exact_attempt_count`
+  - `archive_exact_run`
+  - `archive_exact_boundary_sequence`
+  - `archive_exact_admission_sequence`
+  - `archive_exact_idempotency_binding`
+  - `archive_not_live_in_lane`
+- Emits: `InputLifecycleNotice`
+- To: `Attached`
+
+### `ArchiveTerminalInputRunning`
+- From: `Running`
+- On: `ArchiveTerminalInput`(input_id, phase, terminal_kind, superseded_by, aggregate_id, abandon_reason, abandon_attempt_count, attempt_count, run_id, boundary_sequence, admission_sequence, idempotency_key)
+- Guards:
+  - `archive_phase_is_terminal`
+  - `archive_exact_phase`
+  - `archive_exact_terminal_kind`
+  - `archive_exact_superseded_by`
+  - `archive_exact_aggregate_id`
+  - `archive_exact_abandon_reason`
+  - `archive_exact_abandon_attempt_count`
+  - `archive_exact_attempt_count`
+  - `archive_exact_run`
+  - `archive_exact_boundary_sequence`
+  - `archive_exact_admission_sequence`
+  - `archive_exact_idempotency_binding`
+  - `archive_not_live_in_lane`
+- Emits: `InputLifecycleNotice`
+- To: `Running`
+
+### `ArchiveTerminalInputRetired`
+- From: `Retired`
+- On: `ArchiveTerminalInput`(input_id, phase, terminal_kind, superseded_by, aggregate_id, abandon_reason, abandon_attempt_count, attempt_count, run_id, boundary_sequence, admission_sequence, idempotency_key)
+- Guards:
+  - `archive_phase_is_terminal`
+  - `archive_exact_phase`
+  - `archive_exact_terminal_kind`
+  - `archive_exact_superseded_by`
+  - `archive_exact_aggregate_id`
+  - `archive_exact_abandon_reason`
+  - `archive_exact_abandon_attempt_count`
+  - `archive_exact_attempt_count`
+  - `archive_exact_run`
+  - `archive_exact_boundary_sequence`
+  - `archive_exact_admission_sequence`
+  - `archive_exact_idempotency_binding`
+  - `archive_not_live_in_lane`
+- Emits: `InputLifecycleNotice`
+- To: `Retired`
+
+### `ArchiveTerminalInputStopped`
+- From: `Stopped`
+- On: `ArchiveTerminalInput`(input_id, phase, terminal_kind, superseded_by, aggregate_id, abandon_reason, abandon_attempt_count, attempt_count, run_id, boundary_sequence, admission_sequence, idempotency_key)
+- Guards:
+  - `archive_phase_is_terminal`
+  - `archive_exact_phase`
+  - `archive_exact_terminal_kind`
+  - `archive_exact_superseded_by`
+  - `archive_exact_aggregate_id`
+  - `archive_exact_abandon_reason`
+  - `archive_exact_abandon_attempt_count`
+  - `archive_exact_attempt_count`
+  - `archive_exact_run`
+  - `archive_exact_boundary_sequence`
+  - `archive_exact_admission_sequence`
+  - `archive_exact_idempotency_binding`
+  - `archive_not_live_in_lane`
+- Emits: `InputLifecycleNotice`
+- To: `Stopped`
+
+### `ArchiveTerminalInputDestroyed`
+- From: `Destroyed`
+- On: `ArchiveTerminalInput`(input_id, phase, terminal_kind, superseded_by, aggregate_id, abandon_reason, abandon_attempt_count, attempt_count, run_id, boundary_sequence, admission_sequence, idempotency_key)
+- Guards:
+  - `archive_phase_is_terminal`
+  - `archive_exact_phase`
+  - `archive_exact_terminal_kind`
+  - `archive_exact_superseded_by`
+  - `archive_exact_aggregate_id`
+  - `archive_exact_abandon_reason`
+  - `archive_exact_abandon_attempt_count`
+  - `archive_exact_attempt_count`
+  - `archive_exact_run`
+  - `archive_exact_boundary_sequence`
+  - `archive_exact_admission_sequence`
+  - `archive_exact_idempotency_binding`
+  - `archive_not_live_in_lane`
+- Emits: `InputLifecycleNotice`
+- To: `Destroyed`
 
 ### `RegisterOpAlreadyRegisteredRejectedIdle`
 - From: `Idle`

@@ -698,6 +698,25 @@ impl meerkat_core::service::SessionServiceHistoryExt for FailingOnceSessionServi
 
 #[async_trait::async_trait]
 impl meerkat_mob::MobSessionService for FailingOnceSessionService {
+    async fn prepare_session_for_resume(
+        &self,
+        session_id: &meerkat_core::SessionId,
+    ) -> Result<(), meerkat_core::service::SessionError> {
+        self.inner.prepare_session_for_resume(session_id).await
+    }
+
+    async fn acknowledge_committed_runtime_session_boundary_under_turn_finalization_boundary(
+        &self,
+        session_id: &meerkat_core::SessionId,
+        authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+    ) -> Result<(), meerkat_core::service::SessionError> {
+        self.inner
+            .acknowledge_committed_runtime_session_boundary_under_turn_finalization_boundary(
+                session_id, authority,
+            )
+            .await
+    }
+
     /// Test double: the two-read composition is the exact truth here.
     async fn load_session_for_resume(
         &self,
@@ -785,16 +804,16 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
         Ok(self.finish_create_call(call, result))
     }
 
-    async fn promote_revivable_retired_session(
+    async fn authorize_revivable_retired_session(
         &self,
         session_id: &meerkat_core::SessionId,
         authority: meerkat_runtime::PreparedArchivedResumeCommitLease,
     ) -> Result<
-        meerkat_runtime::PromotedArchivedResumeCommitLease,
+        meerkat_runtime::AuthorizedArchivedResumeCommitLease,
         meerkat_core::service::SessionError,
     > {
         self.inner
-            .promote_revivable_retired_session(session_id, authority)
+            .authorize_revivable_retired_session(session_id, authority)
             .await
     }
 
@@ -3109,6 +3128,12 @@ pub fn controlling_mob_definition(mob_id: meerkat_mob::MobId) -> meerkat_mob::Mo
 pub struct ControllingMob {
     pub handle: meerkat_mob::MobHandle,
     pub service: Arc<meerkat_session::PersistentSessionService<meerkat::FactoryAgentBuilder>>,
+    /// Durable RuntimeStore authority retained across fixture process restarts.
+    ///
+    /// The service and runtime machine are process-local, but the RuntimeStore
+    /// is the singular persisted session authority. Replacing it with a fresh
+    /// in-memory store would model data loss, not a cold restart.
+    pub runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
     pub storage_metadata: Arc<dyn meerkat_mob::store::MobRuntimeMetadataStore>,
     pub storage_identity: Arc<dyn meerkat_mob::store::MobIdentityStore>,
     pub storage_identity_status: Arc<dyn meerkat_mob::store::MobIdentityStatusStore>,
@@ -3237,7 +3262,7 @@ async fn create_controlling_mob_composed(
     let paths = ControllingMobPaths::new(temp.path());
     let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
         Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
-    let service = persistent_service(&paths, runtime_store);
+    let service = persistent_service(&paths, Arc::clone(&runtime_store));
 
     let mob_id = meerkat_mob::MobId::from(format!("{label}-{}", uuid::Uuid::new_v4().simple()));
     let metadata: Arc<dyn meerkat_mob::store::MobRuntimeMetadataStore> =
@@ -3312,6 +3337,7 @@ async fn create_controlling_mob_composed(
     ControllingMob {
         handle,
         service,
+        runtime_store,
         storage_metadata: metadata,
         storage_identity: identity,
         storage_identity_status: identity_status,
@@ -3458,6 +3484,7 @@ impl ControllingMob {
         let ControllingMob {
             handle,
             service,
+            runtime_store,
             storage_metadata,
             storage_identity,
             storage_identity_status,
@@ -3545,13 +3572,11 @@ impl ControllingMob {
         // previous process's generated-owner tokens and made this fixture a
         // same-runtime hot rebuild instead. The fail-stopped lane deliberately
         // drops that volatile process and constructs a new one while retaining
-        // the JSONL session/event roots below.
+        // both the SessionStore files and the singular RuntimeStore authority.
         let service = if mode == ControllingMobRestartMode::ActorAlreadyFailStopped {
             drop(service);
             let paths = ControllingMobPaths::new(temp.path());
-            let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
-                Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
-            persistent_service(&paths, runtime_store)
+            persistent_service(&paths, Arc::clone(&runtime_store))
         } else {
             service
         };
@@ -3630,6 +3655,7 @@ impl ControllingMob {
         ControllingMob {
             handle,
             service,
+            runtime_store,
             storage_metadata,
             storage_identity,
             storage_identity_status,

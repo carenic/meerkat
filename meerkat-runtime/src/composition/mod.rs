@@ -384,7 +384,8 @@ impl From<String> for ConsumerError {
 /// per resolved [`RoutedInput`]. The implementation is responsible for
 /// materializing the consumer-side typed input — the dispatcher only moves
 /// typed data across the seam.
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait ConsumerSurface: Send + Sync {
     /// Instance id this surface serves. The dispatcher matches against
     /// [`RoutedInput::instance_id`] to pick the right surface.
@@ -450,7 +451,8 @@ impl FieldValue<'_> {
 /// (rather than a generic on the method) keeps the trait dyn-safe — a
 /// `MeerkatMachine` can hold `Arc<dyn CompositionDispatcher<Effect = ...>>`
 /// without leaking the machine kernel's monomorphization concerns.
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 pub trait CompositionDispatcher: Send + Sync {
     /// Seam-effect sum this dispatcher handles. Matches the codegen-emitted
     /// `{Composition}Effect` enum.
@@ -760,7 +762,8 @@ impl<S: ProducerSignal> CatalogCompositionSignalDispatcher<S> {
     }
 }
 
-#[async_trait]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+#[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 impl<E: ProducerEffect> CompositionDispatcher for CatalogCompositionDispatcher<E> {
     type Effect = E;
 

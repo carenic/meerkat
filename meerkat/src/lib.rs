@@ -223,11 +223,12 @@ pub use meerkat_schedule::{
     MissingTargetPolicy, MobTargetBinding, Occurrence, OccurrenceFailureClass, OccurrenceFilter,
     OccurrenceId, OccurrenceOrdinal, OccurrencePhase, OverlapPolicy, ResolvedSpawnSnapshot,
     RunnableProbe, SCHEDULE_TOOL_CAPABILITY_UNAVAILABLE, SCHEDULE_TOOL_INVALID_ARGUMENTS,
-    SCHEDULE_TOOL_NOT_FOUND, Schedule, ScheduleDomainError, ScheduleDriver, ScheduleDriverConfig,
-    ScheduleFilter, ScheduleId, SchedulePhase, ScheduleRevision, ScheduleRunnableHost,
-    ScheduleService, ScheduleSpawnTooling, ScheduleStore, ScheduleStoreError, ScheduleStoreKind,
-    ScheduleTargetDelivery, ScheduleTargetProbe, ScheduleToolDispatcher, ScheduleToolError,
-    ScheduledMobAction, ScheduledMobBackendKind, ScheduledMobRuntimeMode, ScheduledSessionAction,
+    SCHEDULE_TOOL_NOT_FOUND, Schedule, ScheduleDeliveryIdentity, ScheduleDomainError,
+    ScheduleDriver, ScheduleDriverConfig, ScheduleFilter, ScheduleId, SchedulePhase,
+    ScheduleRevision, ScheduleRunnableHost, ScheduleService, ScheduleSpawnTooling, ScheduleStore,
+    ScheduleStoreError, ScheduleStoreKind, ScheduleStoreWakeMode, ScheduleTargetDelivery,
+    ScheduleTargetProbe, ScheduleToolDispatcher, ScheduleToolError, ScheduledMobAction,
+    ScheduledMobBackendKind, ScheduledMobRuntimeMode, ScheduledSessionAction,
     SessionMaterializationSpec, SessionTargetBinding, TargetBinding, TargetProbeOutcome,
     TriggerSpec, UpdateScheduleRequest, handle_schedule_tools_call, schedule_tools_list,
 };
@@ -258,10 +259,9 @@ pub use meerkat_workgraph::{
     WorkItemFilter, WorkItemId, WorkItemRef, WorkNamespace, WorkOwner, WorkOwnerKey, WorkOwnerKind,
     WorkPriority, WorkStatus, handle_unscoped_workgraph_tools_call, handle_workgraph_tools_call,
     unscoped_workgraph_tools_list, validate_workgraph_attention_projection_current,
-    workgraph_attention_context_append, workgraph_attention_continuation_key,
-    workgraph_attention_projection_from_overlay, workgraph_attention_supersession_key,
-    workgraph_attention_turn_append, workgraph_rest_path_catalog,
-    workgraph_rest_request_response_schema, workgraph_tools_list,
+    workgraph_attention_continuation_key, workgraph_attention_projection_from_overlay,
+    workgraph_attention_supersession_key, workgraph_attention_turn_append,
+    workgraph_rest_path_catalog, workgraph_rest_request_response_schema, workgraph_tools_list,
 };
 
 // AgentFactory and build_agent types
@@ -372,12 +372,11 @@ pub use meerkat_session::{
 };
 // Maintenance compositions (offline `rkat storage migrate`): a builder that
 // refuses agent construction, composed with the persistent service to drive
-// machine-owned storage maintenance (bulk legacy-checkpoint adoption).
-pub use meerkat_session::maintenance::MaintenanceAgentBuilder;
+// storage maintenance.
 #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
-pub use meerkat_session::{LegacyCheckpointAdoptionOptions, LegacyCheckpointAdoptionReport};
-// Memory store implementation, re-exported for maintenance verbs that stamp
-// the memory database's schema ledger through its normal constructor.
+pub use meerkat_session::CommittedBoundaryRecovery;
+pub use meerkat_session::maintenance::MaintenanceAgentBuilder;
+// Memory store implementation, re-exported for maintenance verbs.
 #[cfg(feature = "memory-store-session")]
 pub use meerkat_memory::HnswMemoryStore;
 // Durable stored-event row (typed envelope identity) for replay surfaces.
@@ -392,6 +391,13 @@ pub use meerkat_client::OpenAiClient;
 
 #[cfg(feature = "gemini")]
 pub use meerkat_client::GeminiClient;
+
+// Blob seam vocabulary plus the REQUIRED content-addressing function.
+// External `BlobStore` implementations must mint ids via `content_blob_id`
+// (first-consumer feedback: with only the trait re-exported, implementors
+// re-derived the addressing by hand and silently diverged from core's
+// read-back verification).
+pub use meerkat_core::{BlobId, BlobPayload, BlobRef, BlobStoreError, content_blob_id};
 
 // Re-export store types (trait + filter + error from core, backend error from meerkat-store)
 pub use meerkat_store::{

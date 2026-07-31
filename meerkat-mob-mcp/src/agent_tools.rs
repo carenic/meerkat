@@ -3551,7 +3551,7 @@ mod tests {
                 return Err(SessionError::NotFound { id: id.clone() }.into());
             }
             Ok(AppendSystemContextResult {
-                status: AppendSystemContextStatus::Staged,
+                status: AppendSystemContextStatus::Applied,
             })
         }
     }
@@ -3572,6 +3572,23 @@ mod tests {
 
     #[async_trait]
     impl meerkat_mob::MobSessionService for RealCommsSessionSvc {
+        async fn prepare_session_for_resume(
+            &self,
+            _session_id: &SessionId,
+        ) -> Result<(), SessionError> {
+            Ok(())
+        }
+
+        async fn acknowledge_committed_runtime_session_boundary_under_turn_finalization_boundary(
+            &self,
+            _session_id: &SessionId,
+            _authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+        ) -> Result<(), SessionError> {
+            Err(SessionError::Unsupported(
+                "real-comms test service has no store-owned boundary authority".to_string(),
+            ))
+        }
+
         /// Test double: the two-read composition is the exact truth here.
         async fn load_session_for_resume(
             &self,
