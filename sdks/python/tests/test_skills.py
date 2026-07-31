@@ -59,6 +59,7 @@ class _MockClient:
         turn_tool_overlay=None,
         additional_instructions=None,
         injected_context=None,
+        transient_turn_context=None,
         keep_alive=None,
         model=None,
         provider=None,
@@ -75,6 +76,7 @@ class _MockClient:
             "skill_refs": skill_refs,
             "turn_tool_overlay": turn_tool_overlay,
             "additional_instructions": additional_instructions,
+            "transient_turn_context": transient_turn_context,
             "keep_alive": keep_alive,
             "model": model,
             "provider": provider,
@@ -144,6 +146,7 @@ async def test_invoke_skill_with_skill_key():
     call = client._calls[0]
     assert call["prompt"] == "run the extractor"
     assert call["skill_refs"] == [key]
+    assert call["transient_turn_context"] is None
 
 
 @pytest.mark.asyncio
