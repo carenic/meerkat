@@ -16591,7 +16591,7 @@ async fn stale_exact_boundary_preserves_twenty_five_peer_fan_in_inputs() {
 }
 
 #[tokio::test]
-async fn run_advancing_during_live_boundary_preparation_uses_queued_fallback() {
+async fn run_advancing_during_live_boundary_preparation_preserves_successor_claim() {
     let prepare_release = Arc::new(Notify::new());
     let probe = InterruptYieldingProbe::blocked(
         BoundaryPreparationResult::Stale,
@@ -16627,23 +16627,27 @@ async fn run_advancing_during_live_boundary_preparation_uses_queued_fallback() {
     .expect("live-boundary preparation should start");
 
     rig.allow_finish.notify_waiters();
-    tokio::time::timeout(Duration::from_secs(1), async {
-        loop {
-            let snapshot = rig
-                .adapter
-                .meerkat_machine_spine_snapshot(&rig.session_id)
-                .await
-                .expect("snapshot should remain available while preparation is pending");
-            if snapshot.control.phase == RuntimeState::Attached
-                && snapshot.control.current_run_id.is_none()
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("the original run should finish while boundary preparation is pending");
+    rig.wait_for_apply_calls(2).await;
+    let successor_claim = rig
+        .adapter
+        .meerkat_machine_spine_snapshot(&rig.session_id)
+        .await
+        .expect("snapshot should remain available while preparation is pending");
+    assert_eq!(
+        successor_claim.inputs.current_run_contributors,
+        vec![peer_id.clone()],
+        "the successor run must claim the accepted peer before the stale boundary is released"
+    );
+    assert_eq!(
+        successor_claim
+            .inputs
+            .admission_order
+            .iter()
+            .find(|input| input.input_id == peer_id)
+            .and_then(|input| input.lifecycle),
+        Some(crate::input_state::InputLifecycleState::Staged),
+        "the regression must exercise revalidation after successor-run staging"
+    );
 
     prepare_release.notify_one();
     let (outcome, completion_handle) = tokio::time::timeout(Duration::from_secs(1), accept)
@@ -16654,14 +16658,13 @@ async fn run_advancing_during_live_boundary_preparation_uses_queued_fallback() {
     assert!(outcome.is_accepted());
     assert!(completion_handle.is_some());
 
-    rig.wait_for_apply_calls(2).await;
-    let during_fallback = rig
+    let during_successor_run = rig
         .adapter
         .meerkat_machine_spine_snapshot(&rig.session_id)
         .await
         .expect("snapshot should exist while queued fallback runs");
     assert_eq!(
-        during_fallback.inputs.current_run_contributors,
+        during_successor_run.inputs.current_run_contributors,
         vec![peer_id],
         "the next run must own the peer input that lost its stale live boundary"
     );
