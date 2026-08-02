@@ -5,7 +5,7 @@ use meerkat_core::time_compat::Instant;
 enum LiveBoundaryAttachmentRevalidation {
     CurrentRun,
     RunAdvancedQueued,
-    RunAdvancedClaimed { current_run_active: bool },
+    RunAdvancedClaimed { wake_needed: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -151,10 +151,10 @@ impl MeerkatMachine {
                 // Terminal successor progress may retire the input before this
                 // stale preparation reacquires M. The old run no longer owns
                 // it, so preserve that completed machine transition. Retain
-                // the outer wake only when no current run already owns one.
-                return Ok(LiveBoundaryAttachmentRevalidation::RunAdvancedClaimed {
-                    current_run_active: current_run_id.is_some(),
-                });
+                // the outer wake only when other queued work still needs it.
+                let wake_needed = current_run_id.is_none()
+                    && driver.has_queued_input_outside(std::slice::from_ref(input_id));
+                return Ok(LiveBoundaryAttachmentRevalidation::RunAdvancedClaimed { wake_needed });
             }
             return Err(RuntimeDriverError::StaleAuthority {
                 reason: format!(
@@ -199,9 +199,9 @@ impl MeerkatMachine {
             InputLifecycleState::Accepted | InputLifecycleState::Queued => false,
         };
         if successor_owns_input {
-            return Ok(LiveBoundaryAttachmentRevalidation::RunAdvancedClaimed {
-                current_run_active: current_run_id.is_some(),
-            });
+            let wake_needed = current_run_id.is_none()
+                && driver.has_queued_input_outside(std::slice::from_ref(input_id));
+            return Ok(LiveBoundaryAttachmentRevalidation::RunAdvancedClaimed { wake_needed });
         }
 
         Err(RuntimeDriverError::StaleAuthority {
@@ -540,7 +540,7 @@ impl MeerkatMachine {
                     LiveBoundaryInputDisposition::QueuedFallback,
                 ));
             }
-            LiveBoundaryAttachmentRevalidation::RunAdvancedClaimed { current_run_active } => {
+            LiveBoundaryAttachmentRevalidation::RunAdvancedClaimed { wake_needed } => {
                 if let Ok(prepared) = prepared
                     && let Err(error) = prepared.abort()
                 {
@@ -556,18 +556,16 @@ impl MeerkatMachine {
                     session_id = %session_id,
                     run_id = %run_id,
                     input_id = %input_id,
-                    current_run_active,
+                    wake_needed,
                     "live-boundary run advanced during preparation; successor run already owns accepted input"
                 );
                 // The successor owns the input, so the old-run cancel must not
                 // race it. A currently active successor already owns its
-                // executor wake. Once the successor has retired, the outer
-                // wake is the liveness edge that lets queued work continue.
+                // executor wake. Once the successor has retired, retain the
+                // outer wake only when other queued work still needs it.
                 return Ok((
                     held_mutation_gate,
-                    LiveBoundaryInputDisposition::SuccessorClaimed {
-                        wake_needed: !current_run_active,
-                    },
+                    LiveBoundaryInputDisposition::SuccessorClaimed { wake_needed },
                 ));
             }
             LiveBoundaryAttachmentRevalidation::CurrentRun => {}
