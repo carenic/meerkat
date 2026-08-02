@@ -17830,7 +17830,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 (!self.live_boundary_context_sequence_by_run.contains_key(run_id)
                     && boundary_sequence == 1)
                 || (self.live_boundary_context_sequence_by_run.contains_key(run_id)
-                    && self.live_boundary_context_sequence_by_run.get_cloned(run_id).get("value") < 18446744073709551615
+                    && self.live_boundary_context_sequence_by_run.get_cloned(run_id).get("value") < u64::MAX
                     && boundary_sequence == self.live_boundary_context_sequence_by_run.get_cloned(run_id).get("value") + 1)
             }
             update {
