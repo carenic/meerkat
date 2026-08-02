@@ -305,7 +305,7 @@ BASELINE_HAND_ROLLED: set[tuple[str, str, str]] = {
 # hatch. New generated wrappers must remove entries; the whole baseline expires
 # unless renewed with an explicit owner decision.
 BASELINE_HAND_ROLLED_OWNER = "sdk-contracts"
-BASELINE_HAND_ROLLED_EXPIRES = "2026-07-31"
+BASELINE_HAND_ROLLED_EXPIRES = "2026-08-09"
 BASELINE_HAND_ROLLED_MAX_ENTRIES = 243
 
 

@@ -17812,12 +17812,13 @@ macro_rules! meerkat_catalog_machine_dsl {
             }
         }
 
-        // A typed Unavailable result means the active live target vanished;
-        // Stale and Fault remain failures and never drive this transition.
-        // Normalize the admitted Steer input before the runtime takes its
-        // ordinary queued fallback so no stale live-only disposition survives.
+        // An Unavailable or Stale delivery witness means the active live target
+        // cannot accept this attempt. Normalize the independently admitted
+        // Steer input before the runtime takes its ordinary queued fallback so
+        // no stale live-only disposition survives. Fault remains a failure and
+        // never drives this transition.
         transition LiveBoundaryUnavailable {
-            per_phase [Running]
+            per_phase [Attached, Running]
             on input LiveBoundaryUnavailable { input_id }
             guard "input_tracked" { self.input_phases.contains_key(input_id) }
             guard "input_is_queued_steer" {

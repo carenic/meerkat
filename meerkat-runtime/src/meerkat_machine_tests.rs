@@ -15971,6 +15971,7 @@ enum BoundaryPreparationResult {
 struct InterruptYieldingProbe {
     prepare_calls: Arc<AtomicUsize>,
     prepared_texts: Arc<std::sync::Mutex<Vec<String>>>,
+    prepare_release: Option<Arc<Notify>>,
     result: BoundaryPreparationResult,
 }
 
@@ -15979,6 +15980,16 @@ impl InterruptYieldingProbe {
         Self {
             prepare_calls: Arc::new(AtomicUsize::new(0)),
             prepared_texts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            prepare_release: None,
+            result,
+        }
+    }
+
+    fn blocked(result: BoundaryPreparationResult, prepare_release: Arc<Notify>) -> Self {
+        Self {
+            prepare_calls: Arc::new(AtomicUsize::new(0)),
+            prepared_texts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            prepare_release: Some(prepare_release),
             result,
         }
     }
@@ -16023,6 +16034,9 @@ impl CoreExecutorBoundaryHandle for InterruptYieldingBoundaryHandle {
                     .into_iter()
                     .map(|context| context.as_str().to_owned()),
             );
+        if let Some(prepare_release) = self.probe.prepare_release.as_ref() {
+            prepare_release.notified().await;
+        }
         match self.probe.result {
             BoundaryPreparationResult::Unavailable => Err(
                 meerkat_core::lifecycle::CoreBoundaryStageError::unavailable(
@@ -16118,12 +16132,26 @@ impl InterruptYieldingTestRig {
         result: BoundaryPreparationResult,
         publisher: Option<Arc<RuntimeRecoveryTerminalPublisher>>,
     ) -> Self {
-        let adapter = Arc::new(MeerkatMachine::ephemeral());
+        let probe = with_live_boundary.then(|| InterruptYieldingProbe::new(result));
+        Self::new_with_probe(probe, publisher).await
+    }
+
+    async fn new_with_probe(
+        probe: Option<InterruptYieldingProbe>,
+        publisher: Option<Arc<RuntimeRecoveryTerminalPublisher>>,
+    ) -> Self {
+        Self::new_with_adapter(Arc::new(MeerkatMachine::ephemeral()), probe, publisher).await
+    }
+
+    async fn new_with_adapter(
+        adapter: Arc<MeerkatMachine>,
+        probe: Option<InterruptYieldingProbe>,
+        publisher: Option<Arc<RuntimeRecoveryTerminalPublisher>>,
+    ) -> Self {
         let session_id = SessionId::new();
         let apply_calls = Arc::new(AtomicUsize::new(0));
         let apply_started = Arc::new(Notify::new());
         let allow_finish = Arc::new(Notify::new());
-        let probe = with_live_boundary.then(|| InterruptYieldingProbe::new(result));
 
         adapter
             .register_session_with_executor(
@@ -16414,7 +16442,7 @@ async fn interrupt_yielding_without_live_boundary_handle_falls_back_to_steer_que
 }
 
 #[tokio::test]
-async fn unavailable_exact_boundary_is_the_only_queued_fallback() {
+async fn unavailable_exact_boundary_uses_queued_fallback() {
     let rig = InterruptYieldingTestRig::new(true, BoundaryPreparationResult::Unavailable).await;
     rig.start_busy_turn().await;
     let probe = rig.probe.clone().expect("live boundary probe installed");
@@ -16465,7 +16493,185 @@ async fn unavailable_exact_boundary_is_the_only_queued_fallback() {
     rig.wait_until_attached_and_empty().await;
 }
 
-async fn assert_boundary_failure_terminalizes_exact_input(result: BoundaryPreparationResult) {
+#[tokio::test]
+async fn stale_exact_boundary_uses_queued_fallback() {
+    let rig = InterruptYieldingTestRig::new(true, BoundaryPreparationResult::Stale).await;
+    rig.start_busy_turn().await;
+    let probe = rig.probe.clone().expect("live boundary probe installed");
+
+    let (peer_input, peer_id) = interrupt_yielding_peer_input(
+        "stale exact boundary remains queued",
+        Some(meerkat_core::types::HandlingMode::Steer),
+    );
+    let (outcome, completion_handle) = rig
+        .adapter
+        .accept_input_with_completion(&rig.session_id, peer_input)
+        .await
+        .expect("typed stale should preserve queued admission");
+    assert!(outcome.is_accepted());
+    assert!(completion_handle.is_some());
+    assert_eq!(probe.prepare_calls.load(Ordering::SeqCst), 1);
+
+    let during_busy = rig
+        .adapter
+        .meerkat_machine_spine_snapshot(&rig.session_id)
+        .await
+        .expect("snapshot should exist while busy");
+    assert_eq!(during_busy.inputs.queue, vec![peer_id.clone()]);
+    assert!(!during_busy.inputs.steer_queue.contains(&peer_id));
+    assert_eq!(
+        during_busy
+            .inputs
+            .admission_order
+            .iter()
+            .find(|input| input.input_id == peer_id)
+            .and_then(|input| input.lifecycle),
+        Some(crate::input_state::InputLifecycleState::Queued)
+    );
+
+    rig.allow_finish.notify_waiters();
+    rig.wait_for_apply_calls(2).await;
+    rig.allow_finish.notify_waiters();
+    rig.wait_until_attached_and_empty().await;
+}
+
+#[tokio::test]
+async fn stale_exact_boundary_preserves_twenty_five_peer_fan_in_inputs() {
+    const FAN_IN: usize = 25;
+
+    let rig = InterruptYieldingTestRig::new(true, BoundaryPreparationResult::Stale).await;
+    rig.start_busy_turn().await;
+    let probe = rig.probe.clone().expect("live boundary probe installed");
+    let mut input_ids = Vec::with_capacity(FAN_IN);
+    let mut accepts = Vec::with_capacity(FAN_IN);
+
+    for index in 0..FAN_IN {
+        let (peer_input, input_id) = interrupt_yielding_peer_input(
+            &format!("concurrent peer report {index}"),
+            Some(meerkat_core::types::HandlingMode::Steer),
+        );
+        input_ids.push(input_id);
+        let adapter = Arc::clone(&rig.adapter);
+        let session_id = rig.session_id.clone();
+        accepts.push(tokio::spawn(async move {
+            adapter
+                .accept_input_with_completion(&session_id, peer_input)
+                .await
+        }));
+    }
+
+    for accept in accepts {
+        let (outcome, completion_handle) = accept
+            .await
+            .expect("fan-in acceptance task should not panic")
+            .expect("a stale live witness must not reject a peer report");
+        assert!(outcome.is_accepted());
+        assert!(completion_handle.is_some());
+    }
+
+    assert_eq!(probe.prepare_calls.load(Ordering::SeqCst), FAN_IN);
+    let during_busy = rig
+        .adapter
+        .meerkat_machine_spine_snapshot(&rig.session_id)
+        .await
+        .expect("snapshot should exist after fan-in acceptance");
+    assert_eq!(during_busy.inputs.queue.len(), FAN_IN);
+    assert!(during_busy.inputs.steer_queue.is_empty());
+    for input_id in &input_ids {
+        assert!(
+            during_busy.inputs.queue.contains(input_id),
+            "every accepted peer report must remain queued after its stale live witness"
+        );
+    }
+
+    rig.allow_finish.notify_waiters();
+    rig.wait_for_apply_calls(2).await;
+    rig.allow_finish.notify_waiters();
+    rig.wait_until_attached_and_empty().await;
+}
+
+#[tokio::test]
+async fn run_advancing_during_live_boundary_preparation_uses_queued_fallback() {
+    let prepare_release = Arc::new(Notify::new());
+    let probe = InterruptYieldingProbe::blocked(
+        BoundaryPreparationResult::Stale,
+        Arc::clone(&prepare_release),
+    );
+    let adapter = Arc::new(MeerkatMachine::persistent(
+        Arc::new(crate::store::InMemoryRuntimeStore::new()),
+        memory_blob_store(),
+    ));
+    let rig = InterruptYieldingTestRig::new_with_adapter(adapter, Some(probe.clone()), None).await;
+    rig.start_busy_turn().await;
+
+    let (peer_input, peer_id) = interrupt_yielding_peer_input(
+        "run advance must not drop accepted peer input",
+        Some(meerkat_core::types::HandlingMode::Steer),
+    );
+    let accept = {
+        let adapter = Arc::clone(&rig.adapter);
+        let session_id = rig.session_id.clone();
+        tokio::spawn(async move {
+            adapter
+                .accept_input_with_completion(&session_id, peer_input)
+                .await
+        })
+    };
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while probe.prepare_calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("live-boundary preparation should start");
+
+    rig.allow_finish.notify_waiters();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            let snapshot = rig
+                .adapter
+                .meerkat_machine_spine_snapshot(&rig.session_id)
+                .await
+                .expect("snapshot should remain available while preparation is pending");
+            if snapshot.control.phase == RuntimeState::Attached
+                && snapshot.control.current_run_id.is_none()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the original run should finish while boundary preparation is pending");
+
+    prepare_release.notify_one();
+    let (outcome, completion_handle) = tokio::time::timeout(Duration::from_secs(1), accept)
+        .await
+        .expect("acceptance should return after stale preparation is released")
+        .expect("acceptance task should not panic")
+        .expect("a run advance must preserve accepted peer input");
+    assert!(outcome.is_accepted());
+    assert!(completion_handle.is_some());
+
+    rig.wait_for_apply_calls(2).await;
+    let during_fallback = rig
+        .adapter
+        .meerkat_machine_spine_snapshot(&rig.session_id)
+        .await
+        .expect("snapshot should exist while queued fallback runs");
+    assert_eq!(
+        during_fallback.inputs.current_run_contributors,
+        vec![peer_id],
+        "the next run must own the peer input that lost its stale live boundary"
+    );
+
+    rig.allow_finish.notify_waiters();
+    rig.wait_until_attached_and_empty().await;
+}
+
+async fn assert_faulted_boundary_terminalizes_exact_input() {
+    let result = BoundaryPreparationResult::Fault;
     let rig = InterruptYieldingTestRig::new(true, result).await;
     rig.start_busy_turn().await;
     let probe = rig.probe.clone().expect("live boundary probe installed");
@@ -16482,17 +16688,7 @@ async fn assert_boundary_failure_terminalizes_exact_input(result: BoundaryPrepar
     .await
     .expect("failure terminalization must not await publication while the active turn owns B")
     .expect_err("stale/fault boundary preparation must fail closed");
-    match result {
-        BoundaryPreparationResult::Stale => {
-            assert!(error.to_string().contains("became stale"), "{error}");
-        }
-        BoundaryPreparationResult::Fault => {
-            assert!(error.to_string().contains("preparation failed"), "{error}");
-        }
-        BoundaryPreparationResult::Unavailable => {
-            panic!("unavailable is covered by queued-fallback test")
-        }
-    }
+    assert!(error.to_string().contains("preparation failed"), "{error}");
     assert_eq!(probe.prepare_calls.load(Ordering::SeqCst), 1);
 
     let during_busy = rig
@@ -16531,13 +16727,8 @@ async fn assert_boundary_failure_terminalizes_exact_input(result: BoundaryPrepar
 }
 
 #[tokio::test]
-async fn stale_exact_boundary_terminalizes_instead_of_falling_back() {
-    assert_boundary_failure_terminalizes_exact_input(BoundaryPreparationResult::Stale).await;
-}
-
-#[tokio::test]
 async fn faulted_exact_boundary_terminalizes_instead_of_falling_back() {
-    assert_boundary_failure_terminalizes_exact_input(BoundaryPreparationResult::Fault).await;
+    assert_faulted_boundary_terminalizes_exact_input().await;
 }
 
 #[tokio::test]

@@ -3011,6 +3011,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `ResolveLiveBoundaryContextReceiptRunning`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `LiveBoundaryUnavailableAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `LiveBoundaryUnavailableRunning`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)

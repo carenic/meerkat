@@ -10505,6 +10505,15 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `LiveBoundaryContextReceiptResolved`
 - To: `Running`
 
+### `LiveBoundaryUnavailableAttached`
+- From: `Attached`
+- On: `LiveBoundaryUnavailable`(input_id)
+- Guards:
+  - `input_tracked`
+  - `input_is_queued_steer`
+- Emits: `LiveBoundaryUnavailableNormalized`
+- To: `Attached`
+
 ### `LiveBoundaryUnavailableRunning`
 - From: `Running`
 - On: `LiveBoundaryUnavailable`(input_id)

@@ -13,6 +13,16 @@ via cargo-semver-checks against the published baselines).
 
 ## [Unreleased]
 
+## [0.8.12] - 2026-08-02
+
+### Fixed
+
+- Concurrent peer fan-in to a member that is already turning no longer loses
+  accepted messages when the exact live-boundary witness becomes stale or its
+  run advances during preparation. Those conditions now discard only the
+  transient delivery attempt and atomically normalize the durable input to the
+  ordinary queued path. Genuine boundary mechanism faults still fail closed.
+
 ## [0.8.11] - 2026-07-31
 
 ### Breaking
@@ -4863,7 +4873,8 @@ Meerkat 0.5 is a large architecture and surface cutover. It formalizes runtime o
 
 Initial development release.
 
-[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.8.11...HEAD
+[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.8.12...HEAD
+[0.8.12]: https://github.com/lukacf/meerkat/compare/v0.8.11...v0.8.12
 [0.8.11]: https://github.com/lukacf/meerkat/compare/v0.8.10...v0.8.11
 [0.7.0]: https://github.com/lukacf/meerkat/compare/alpha/v0.7.0-alpha.0...v0.7.0
 [0.7.0-alpha.0]: https://github.com/lukacf/meerkat/releases/tag/alpha/v0.7.0-alpha.0

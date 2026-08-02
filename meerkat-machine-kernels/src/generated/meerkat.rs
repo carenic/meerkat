@@ -16856,6 +16856,7 @@ pub enum TransitionId {
     MarkAppliedPendingConsumptionRetired,
     MarkAppliedPendingConsumptionStopped,
     ResolveLiveBoundaryContextReceiptRunning,
+    LiveBoundaryUnavailableAttached,
     LiveBoundaryUnavailableRunning,
     ConsumeOnAcceptIdle,
     ConsumeOnAcceptAttached,
