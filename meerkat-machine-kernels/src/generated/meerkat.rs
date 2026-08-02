@@ -11993,6 +11993,11 @@ pub mod inputs {
         pub input_id: String,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct CommitTerminalBoundarySequence {
+        pub run_id: RunId,
+        pub boundary_sequence: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct LiveBoundaryUnavailable {
         pub input_id: String,
     }
@@ -13237,6 +13242,7 @@ pub enum Input {
     AcceptWithCompletion(inputs::AcceptWithCompletion),
     AcceptWithoutWake(inputs::AcceptWithoutWake),
     ResolveLiveBoundaryContextReceipt(inputs::ResolveLiveBoundaryContextReceipt),
+    CommitTerminalBoundarySequence(inputs::CommitTerminalBoundarySequence),
     LiveBoundaryUnavailable(inputs::LiveBoundaryUnavailable),
     ResolveAdmissionPlan(inputs::ResolveAdmissionPlan),
     ResolveAdmissionValidation(inputs::ResolveAdmissionValidation),
@@ -13577,6 +13583,7 @@ impl Input {
             Self::ResolveLiveBoundaryContextReceipt(_) => {
                 InputKind::ResolveLiveBoundaryContextReceipt
             }
+            Self::CommitTerminalBoundarySequence(_) => InputKind::CommitTerminalBoundarySequence,
             Self::LiveBoundaryUnavailable(_) => InputKind::LiveBoundaryUnavailable,
             Self::ResolveAdmissionPlan(_) => InputKind::ResolveAdmissionPlan,
             Self::ResolveAdmissionValidation(_) => InputKind::ResolveAdmissionValidation,
@@ -13932,6 +13939,7 @@ pub enum InputKind {
     AcceptWithCompletion,
     AcceptWithoutWake,
     ResolveLiveBoundaryContextReceipt,
+    CommitTerminalBoundarySequence,
     LiveBoundaryUnavailable,
     ResolveAdmissionPlan,
     ResolveAdmissionValidation,
@@ -14250,6 +14258,11 @@ pub mod effects {
         pub run_id: RunId,
         pub input_id: String,
         pub boundary: AdmissionRunApplyBoundary,
+        pub boundary_sequence: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct TerminalBoundarySequenceCommitted {
+        pub run_id: RunId,
         pub boundary_sequence: u64,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -15123,6 +15136,7 @@ pub enum Effect {
     TurnRunStarted(effects::TurnRunStarted),
     TurnBoundaryApplied(effects::TurnBoundaryApplied),
     LiveBoundaryContextReceiptResolved(effects::LiveBoundaryContextReceiptResolved),
+    TerminalBoundarySequenceCommitted(effects::TerminalBoundarySequenceCommitted),
     TurnRunCompleted(effects::TurnRunCompleted),
     DurableTailRecoveryAuthorized(effects::DurableTailRecoveryAuthorized),
     DurableTailRecoveryCommitAuthorized(effects::DurableTailRecoveryCommitAuthorized),
@@ -15296,6 +15310,7 @@ pub enum EffectKind {
     TurnRunStarted,
     TurnBoundaryApplied,
     LiveBoundaryContextReceiptResolved,
+    TerminalBoundarySequenceCommitted,
     TurnRunCompleted,
     DurableTailRecoveryAuthorized,
     DurableTailRecoveryCommitAuthorized,
@@ -16856,6 +16871,7 @@ pub enum TransitionId {
     MarkAppliedPendingConsumptionRetired,
     MarkAppliedPendingConsumptionStopped,
     ResolveLiveBoundaryContextReceiptRunning,
+    CommitTerminalBoundarySequenceRunning,
     LiveBoundaryUnavailableAttached,
     LiveBoundaryUnavailableRunning,
     ConsumeOnAcceptIdle,

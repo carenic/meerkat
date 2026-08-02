@@ -348,6 +348,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `LoadBoundaryReceipt`(runtime_id: String, sequence: u64)
 - `AcceptWithCompletion`(input_id: InputId, request_immediate_processing: Bool, interrupt_yielding: Bool, wake_if_idle: Bool)
 - `AcceptWithoutWake`(input_id: InputId)
+- `CommitTerminalBoundarySequence`(run_id: RunId, boundary_sequence: u64)
 - `Recycle`
 - `RequestDeferredTools`(authorities: Map<ToolName, ToolVisibilityWitness>)
 
@@ -640,6 +641,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `TurnRunStarted`(run_id: RunId)
 - `TurnBoundaryApplied`(run_id: RunId, boundary_sequence: u64)
 - `LiveBoundaryContextReceiptResolved`(run_id: RunId, input_id: String, boundary: AdmissionRunApplyBoundary, boundary_sequence: u64)
+- `TerminalBoundarySequenceCommitted`(run_id: RunId, boundary_sequence: u64)
 - `TurnRunCompleted`(run_id: RunId, outcome: TurnTerminalOutcome)
 - `DurableTailRecoveryAuthorized`(candidate_id: String, disposition: DurableTailRecoveryDisposition)
 - `DurableTailRecoveryCommitAuthorized`(candidate_id: String, disposition: DurableTailRecoveryDisposition, boundary_sequence: u64)
@@ -10503,6 +10505,15 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `current_run_matches`
   - `input_tracked`
 - Emits: `LiveBoundaryContextReceiptResolved`
+- To: `Running`
+
+### `CommitTerminalBoundarySequenceRunning`
+- From: `Running`
+- On: `CommitTerminalBoundarySequence`(run_id, boundary_sequence)
+- Guards:
+  - `current_run_matches`
+  - `boundary_sequence_is_dense_successor`
+- Emits: `TerminalBoundarySequenceCommitted`
 - To: `Running`
 
 ### `LiveBoundaryUnavailableAttached`

@@ -3292,6 +3292,31 @@ impl DriverEntry {
         }
     }
 
+    pub(crate) fn terminal_boundary_sequence(
+        &self,
+        run_id: &RunId,
+    ) -> Result<u64, RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(d) => d.terminal_boundary_sequence(run_id),
+            DriverEntry::Persistent(d) => d.inner_ref().terminal_boundary_sequence(run_id),
+        }
+    }
+
+    pub(crate) fn machine_commit_terminal_boundary_sequence(
+        &mut self,
+        run_id: &RunId,
+        boundary_sequence: u64,
+    ) -> Result<(), RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(d) => {
+                d.machine_commit_terminal_boundary_sequence(run_id, boundary_sequence)
+            }
+            DriverEntry::Persistent(d) => d
+                .inner_mut()
+                .machine_commit_terminal_boundary_sequence(run_id, boundary_sequence),
+        }
+    }
+
     pub(crate) fn as_driver_mut(&mut self) -> &mut dyn RuntimeDriver {
         match self {
             DriverEntry::Ephemeral(d) => d,
@@ -4681,10 +4706,11 @@ impl AuthorizedRuntimeLoopRunCommit {
         consumed_input_ids: Vec<InputId>,
         receipt: meerkat_core::lifecycle::RunBoundaryReceiptDraft,
     ) -> Result<Self, RuntimeDriverError> {
-        // Dogma K10: mint the final receipt from the machine-owned per-run
-        // boundary counter — the executor's draft carries no sequence, so the
-        // durable receipt can never diverge from `RecordBoundarySeq`'s value.
-        let receipt = receipt.into_sequenced(driver.run_boundary_sequence(&run_id));
+        // A terminal receipt is the dense successor of every checkpoint that
+        // preceded it in this run. The generated machine commits this exact
+        // candidate before terminal realization; executor drafts remain
+        // unable to fabricate durable receipt sequences.
+        let receipt = receipt.into_sequenced(driver.terminal_boundary_sequence(&run_id)?);
         machine_validate_run_commit_receipt(driver, &run_id, &consumed_input_ids, &receipt)?;
         let commit_input_id = consumed_input_ids.first().cloned().ok_or_else(|| {
             RuntimeDriverError::Internal(
@@ -5156,9 +5182,17 @@ pub(crate) async fn machine_commit_service_turn_terminal_receipt(
         contributing_input_ids: Vec::new(),
         conversation_digest: Some(terminal_digest),
         message_count: committed_message_count,
-        sequence: driver.run_boundary_sequence(&run_id),
+        sequence: driver.terminal_boundary_sequence(&run_id)?,
     };
     let terminal_checkpoint = driver.begin_terminal_transition("service_turn_terminal_commit")?;
+    if let Err(error) = driver.machine_commit_terminal_boundary_sequence(&run_id, receipt.sequence)
+    {
+        return Err(driver.fail_terminal_transition(
+            terminal_checkpoint,
+            "service_turn_terminal_boundary_sequence",
+            error,
+        ));
+    }
     let authority = driver.shared_dsl_authority();
     let service_turn_commit_result = {
         let mut auth = authority
@@ -7333,6 +7367,16 @@ pub(crate) async fn commit_runtime_loop_run(
         );
         return Err(RuntimeLoopRunCommitError::Rejected(error));
     }
+    if let Err(err) =
+        driver.machine_commit_terminal_boundary_sequence(&completed_run_id, receipt.sequence)
+    {
+        let error = driver.fail_terminal_transition(
+            terminal_checkpoint,
+            "completed_run_terminal_boundary_sequence",
+            err,
+        );
+        return Err(RuntimeLoopRunCommitError::BoundaryCommit(error));
+    }
     if let Err(err) = driver.machine_realize_boundary_applied_in_memory(&completed_run_id, &receipt)
     {
         let error =
@@ -8014,7 +8058,7 @@ fn validate_machine_terminal_applied_commit(
 
     let receipt = applied
         .receipt
-        .into_sequenced(driver.run_boundary_sequence(failed_run_id));
+        .into_sequenced(driver.terminal_boundary_sequence(failed_run_id)?);
     machine_validate_run_commit_receipt(driver, failed_run_id, staged_input_ids, &receipt)?;
     if receipt.message_count != committed_message_count {
         return Err(machine_terminal_carrier_validation_failed(format!(
@@ -8147,6 +8191,29 @@ async fn fail_runtime_loop_run_inner(
             let error = driver.fail_terminal_transition(
                 terminal_checkpoint,
                 "failed_run_terminal_outbox_stage",
+                error,
+            );
+            return Err(RuntimeLoopRunFailError::Rejected(error));
+        }
+        let terminal_boundary_sequence = match prepared_applied_commit.as_ref() {
+            Some(commit) => commit.receipt.sequence,
+            None => {
+                let error = driver.fail_terminal_transition(
+                    terminal_checkpoint,
+                    "failed_run_terminal_boundary_sequence",
+                    RuntimeDriverError::Internal(
+                        "machine-terminal failure lost its prepared boundary sequence".to_string(),
+                    ),
+                );
+                return Err(RuntimeLoopRunFailError::Rejected(error));
+            }
+        };
+        if let Err(error) = driver
+            .machine_commit_terminal_boundary_sequence(&failed_run_id, terminal_boundary_sequence)
+        {
+            let error = driver.fail_terminal_transition(
+                terminal_checkpoint,
+                "failed_run_terminal_boundary_sequence",
                 error,
             );
             return Err(RuntimeLoopRunFailError::Rejected(error));

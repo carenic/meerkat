@@ -918,7 +918,7 @@ async fn service_turn_terminal_atomic_commit_failure_rolls_back_lifecycle_public
     );
     assert!(
         store
-            .load_boundary_receipt(&runtime_id, &run_id, 0)
+            .load_boundary_receipt(&runtime_id, &run_id, 1)
             .await
             .unwrap()
             .is_none()
@@ -980,7 +980,7 @@ async fn service_turn_commit_rejects_nonterminal_generated_state_before_publicat
     );
     assert!(
         store
-            .load_boundary_receipt(&runtime_id, &run_id, 0)
+            .load_boundary_receipt(&runtime_id, &run_id, 1)
             .await
             .unwrap()
             .is_none()
@@ -1060,7 +1060,7 @@ async fn failed_service_turn_atomically_commits_snapshot_receipt_and_lifecycle()
         Some(session_snapshot)
     );
     let receipt = store
-        .load_boundary_receipt(&runtime_id, &run_id, 0)
+        .load_boundary_receipt(&runtime_id, &run_id, 1)
         .await
         .unwrap()
         .expect("failed service turn receipt must be durable");

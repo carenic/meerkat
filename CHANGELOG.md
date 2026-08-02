@@ -29,6 +29,10 @@ via cargo-semver-checks against the published baselines).
   singular transcript identity and conversational User row. Heterogeneous and
   peer-only fan-in now projects the already-authorized context at the model
   request tail without mutating durable session history.
+- Terminal run receipts now take the machine-authorized dense successor after
+  any live-boundary checkpoints. A run that accepts transient context no longer
+  reuses its last checkpoint sequence, repair-blocks on the receipt collision,
+  and loses the projected actor stream.
 
 ## [0.8.11] - 2026-07-31
 

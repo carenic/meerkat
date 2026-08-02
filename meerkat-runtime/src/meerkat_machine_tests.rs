@@ -1879,7 +1879,7 @@ async fn legacy_terminal_error_after_generated_failure_stops_without_applied_ter
         .expect("staged legacy input should retain its run identity");
     assert!(
         store
-            .load_boundary_receipt(&runtime_id, &run_id, 0)
+            .load_boundary_receipt(&runtime_id, &run_id, 1)
             .await
             .expect("load legacy terminal receipt")
             .is_none(),
@@ -26945,7 +26945,7 @@ async fn completed_run_rejects_foreign_session_witness_before_mutation() {
     drop(entry);
     assert!(
         store
-            .load_boundary_receipt(&runtime_id, &run_id, 0)
+            .load_boundary_receipt(&runtime_id, &run_id, 1)
             .await
             .unwrap()
             .is_none()
@@ -26987,7 +26987,7 @@ async fn persistent_commit_atomic_apply_failure_publishes_no_durable_terminal_st
 
     assert!(
         inner
-            .load_boundary_receipt(&runtime_id, &run_id, 0)
+            .load_boundary_receipt(&runtime_id, &run_id, 1)
             .await
             .unwrap()
             .is_none(),
@@ -27026,7 +27026,7 @@ async fn persistent_commit_success_persists_receipt_and_terminalizes_once() {
 
     assert!(
         inner
-            .load_boundary_receipt(&runtime_id, &run_id, 0)
+            .load_boundary_receipt(&runtime_id, &run_id, 1)
             .await
             .unwrap()
             .is_some(),
@@ -27042,7 +27042,7 @@ async fn persistent_commit_success_persists_receipt_and_terminalizes_once() {
     // the machine-owned per-run boundary counter; executors return an
     // unsequenced draft and cannot fabricate it.
     let persisted_receipt = inner
-        .load_boundary_receipt(&runtime_id, &run_id, 0)
+        .load_boundary_receipt(&runtime_id, &run_id, 1)
         .await
         .unwrap()
         .expect("committed receipt must be durable");
@@ -27098,6 +27098,89 @@ async fn persistent_commit_success_persists_receipt_and_terminalizes_once() {
 }
 
 #[tokio::test]
+async fn terminal_receipt_follows_live_boundary_checkpoint_without_sequence_collision() {
+    let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let store: Arc<dyn RuntimeStore> = inner.clone();
+    let (driver, runtime_id, run_id, input_id) = persistent_staged_run_driver(store).await;
+    let owner_session_id = SessionId::parse(&runtime_id.to_string()).unwrap();
+
+    let live_input = Input::Prompt(crate::input::PromptInput::new(
+        "context admitted at the active boundary",
+        Some(
+            meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+                handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
+                ..Default::default()
+            },
+        ),
+    ));
+    let live_input_id = live_input.id().clone();
+    {
+        let mut entry = driver.lock().await;
+        let resolved = entry
+            .resolve_admission_with_active_turn_boundary(&live_input, true)
+            .expect("active boundary should authorize the live input");
+        entry
+            .accept_resolved_input(live_input, resolved)
+            .await
+            .expect("live input should be durably accepted");
+        entry
+            .machine_realize_live_boundary_context_injected(
+                &run_id,
+                std::slice::from_ref(&live_input_id),
+                None,
+                &owner_session_id,
+            )
+            .await
+            .expect("live boundary checkpoint should commit");
+    }
+
+    let checkpoint = inner
+        .load_boundary_receipt(&runtime_id, &run_id, 1)
+        .await
+        .unwrap()
+        .expect("checkpoint receipt must occupy sequence 1");
+    assert_eq!(
+        checkpoint.boundary,
+        meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunCheckpoint
+    );
+
+    let session = meerkat_core::Session::with_id(owner_session_id);
+    commit_runtime_loop_run(
+        &driver,
+        run_id.clone(),
+        vec![input_id.clone()],
+        machine_terminal_receipt(run_id.clone(), vec![input_id.clone()], &session),
+        Some(BoundSessionCommit::sealed(Arc::new(session)).expect("seal terminal session")),
+        Vec::new(),
+        None,
+    )
+    .await
+    .expect("terminal receipt must follow the live checkpoint");
+
+    let terminal = inner
+        .load_boundary_receipt(&runtime_id, &run_id, 2)
+        .await
+        .unwrap()
+        .expect("terminal receipt must occupy sequence 2");
+    assert_ne!(terminal.boundary, checkpoint.boundary);
+    assert_eq!(
+        inner
+            .load_committed_boundary_receipts(&runtime_id, &run_id)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "checkpoint and terminal receipts must both remain durable"
+    );
+    let entry = driver.lock().await;
+    assert_eq!(entry.run_boundary_sequence(&run_id), 2);
+    assert_eq!(
+        entry.input_phase(&input_id),
+        Some(crate::input_state::InputLifecycleState::Consumed)
+    );
+}
+
+#[tokio::test]
 async fn persistent_commit_success_uses_one_durable_receipt_terminal_write() {
     let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
     let counting_store = Arc::new(RuntimeCommitAtomicityStore::pass_through(Arc::clone(
@@ -27127,7 +27210,7 @@ async fn persistent_commit_success_uses_one_durable_receipt_terminal_write() {
     );
     assert!(
         inner
-            .load_boundary_receipt(&runtime_id, &run_id, 0)
+            .load_boundary_receipt(&runtime_id, &run_id, 1)
             .await
             .unwrap()
             .is_some(),
@@ -27270,7 +27353,7 @@ async fn machine_terminal_carrier_validation_rejects_adversarial_witnesses_befor
 
         assert!(
             store
-                .load_boundary_receipt(&runtime_id, &run_id, 0)
+                .load_boundary_receipt(&runtime_id, &run_id, 1)
                 .await
                 .expect("load rejected carrier receipt")
                 .is_none(),
@@ -27329,7 +27412,7 @@ async fn persistent_machine_terminal_atomic_failure_publishes_no_durable_termina
     );
     assert!(
         inner
-            .load_boundary_receipt(&runtime_id, &run_id, 0)
+            .load_boundary_receipt(&runtime_id, &run_id, 1)
             .await
             .expect("load terminal receipt")
             .is_none(),
@@ -27380,11 +27463,11 @@ async fn persistent_machine_terminal_commit_recovers_consumed_input_and_failed_t
     );
     assert!(
         inner
-            .load_boundary_receipt(&runtime_id, &run_id, 0)
+            .load_boundary_receipt(&runtime_id, &run_id, 1)
             .await
             .expect("load machine-terminal receipt")
             .is_some(),
-        "machine-terminal commit must persist its sequence-zero receipt"
+        "machine-terminal commit must persist its terminal receipt"
     );
     let stored_input = inner
         .load_input_state(&runtime_id, &input_id)
