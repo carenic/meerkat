@@ -25,6 +25,10 @@ via cargo-semver-checks against the published baselines).
 - Recoverable runtime-turn failures no longer delete the live actor projection
   while leaving its durable machine state `Attached`. The error still surfaces,
   but the actor and its event stream remain available for queued work.
+- Exact live-boundary steer context no longer re-proves its authority through a
+  singular transcript identity and conversational User row. Heterogeneous and
+  peer-only fan-in now projects the already-authorized context at the model
+  request tail without mutating durable session history.
 
 ## [0.8.11] - 2026-07-31
 
