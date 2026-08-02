@@ -22,6 +22,9 @@ via cargo-semver-checks against the published baselines).
   run advances during preparation. Those conditions now discard only the
   transient delivery attempt and atomically normalize the durable input to the
   ordinary queued path. Genuine boundary mechanism faults still fail closed.
+- Recoverable runtime-turn failures no longer delete the live actor projection
+  while leaving its durable machine state `Attached`. The error still surfaces,
+  but the actor and its event stream remain available for queued work.
 
 ## [0.8.11] - 2026-07-31
 
