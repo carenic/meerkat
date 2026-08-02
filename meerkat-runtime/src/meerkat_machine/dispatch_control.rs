@@ -530,7 +530,7 @@ impl MeerkatMachine {
                     )
                 };
 
-                let live_boundary_consumed = if signal.should_interrupt_yielding()
+                let live_boundary_disposition = if signal.should_interrupt_yielding()
                     && stages_run_boundary
                     && let (Some(input_id), Some(boundary_handle), Some(attachment_id)) = (
                         accepted_input_id.as_ref(),
@@ -550,7 +550,7 @@ impl MeerkatMachine {
                                 .to_string(),
                         )
                     })?;
-                    let (returned_gate, consumed) = self
+                    let (returned_gate, disposition) = self
                         .commit_live_boundary_input_if_available(
                             &session_id,
                             &witness,
@@ -563,21 +563,21 @@ impl MeerkatMachine {
                         .await
                         .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
                     gate_guard = Some(returned_gate);
-                    consumed
+                    disposition
                 } else {
-                    false
+                    super::dispatch_ingress::LiveBoundaryInputDisposition::QueuedFallback
                 };
 
-                // Exact context injection supersedes the older
-                // cancel-after-boundary fallback. Dropping the un-dispatched
-                // plan under M lets its guard clear the pending generated
-                // dispatch fact without invoking the live cancel handle.
-                let cancel_plan = if live_boundary_consumed {
+                // Exact injection and successor ownership both supersede the
+                // old-run cancel. Only exact injection also consumes the wake;
+                // a successor claim retains that liveness edge.
+                let cancel_plan = if live_boundary_disposition.suppress_cancel() {
                     None
                 } else {
                     cancel_plan
                 };
-                let should_wake = signal.should_wake() && !live_boundary_consumed;
+                let should_wake =
+                    signal.should_wake() && !live_boundary_disposition.suppress_wake();
                 if cancel_plan.is_some() || should_wake {
                     let held_mutation_gate = gate_guard.take().ok_or_else(|| {
                         RuntimeControlPlaneError::Internal(

@@ -8,6 +8,23 @@ enum LiveBoundaryAttachmentRevalidation {
     RunAdvancedClaimed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum LiveBoundaryInputDisposition {
+    QueuedFallback,
+    ExactInjected,
+    SuccessorClaimed,
+}
+
+impl LiveBoundaryInputDisposition {
+    pub(super) fn suppress_cancel(self) -> bool {
+        matches!(self, Self::ExactInjected | Self::SuccessorClaimed)
+    }
+
+    pub(super) fn suppress_wake(self) -> bool {
+        matches!(self, Self::ExactInjected)
+    }
+}
+
 enum RetryableLiveBoundaryPreparation {
     Prepared(meerkat_core::lifecycle::CoreBoundaryStageOutput),
     Unavailable { reason: String },
@@ -121,16 +138,25 @@ impl MeerkatMachine {
         }
 
         let driver = witness.driver.lock().await;
-        let phase = driver
+        let current_run_id = driver.current_run_id();
+        let Some(phase) = driver
             .as_driver()
             .stored_input_state(input_id)
             .map(|stored| stored.seed.phase)
-            .ok_or_else(|| RuntimeDriverError::StaleAuthority {
+        else {
+            if current_run_id.as_ref() != Some(expected_run_id) {
+                // Terminal successor progress may retire the input before this
+                // stale preparation reacquires M. The old run no longer owns
+                // it, so preserve that completed machine transition and retain
+                // only the outer runtime wake.
+                return Ok(LiveBoundaryAttachmentRevalidation::RunAdvancedClaimed);
+            }
+            return Err(RuntimeDriverError::StaleAuthority {
                 reason: format!(
-                    "accepted live-boundary input {input_id} disappeared before commit"
+                    "accepted live-boundary input {input_id} disappeared during its original run"
                 ),
-            })?;
-        let current_run_id = driver.current_run_id();
+            });
+        };
         if current_run_id.as_ref() == Some(expected_run_id) {
             if phase == InputLifecycleState::Queued {
                 return Ok(LiveBoundaryAttachmentRevalidation::CurrentRun);
@@ -372,7 +398,13 @@ impl MeerkatMachine {
         completions: &SharedCompletionRegistry,
         publication_handle: Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>>,
         fallback_wake: &mut AcceptedIngressFallbackWakeGuard,
-    ) -> Result<(crate::tokio::sync::OwnedMutexGuard<()>, bool), RuntimeDriverError> {
+    ) -> Result<
+        (
+            crate::tokio::sync::OwnedMutexGuard<()>,
+            LiveBoundaryInputDisposition,
+        ),
+        RuntimeDriverError,
+    > {
         let live_boundary_plan = {
             let driver = witness.driver.lock().await;
             let Some(run_id) = driver.current_run_id() else {
@@ -381,7 +413,10 @@ impl MeerkatMachine {
                     input_id = %input_id,
                     "no active run is available for exact live-boundary context; retaining queued fallback"
                 );
-                return Ok((held_mutation_gate, false));
+                return Ok((
+                    held_mutation_gate,
+                    LiveBoundaryInputDisposition::QueuedFallback,
+                ));
             };
             let Some(projection) = driver.driver_ingress().primitive_projection(input_id) else {
                 let error = RuntimeDriverError::Internal(format!(
@@ -427,7 +462,10 @@ impl MeerkatMachine {
                 // Idle-normalized steers and peer-terminal facts are ordinary
                 // queued transcript work. Leave the fallback armed so the
                 // runtime loop realizes that durable path.
-                return Ok((held_mutation_gate, false));
+                return Ok((
+                    held_mutation_gate,
+                    LiveBoundaryInputDisposition::QueuedFallback,
+                ));
             }
             (run_id, contexts)
         };
@@ -490,21 +528,36 @@ impl MeerkatMachine {
                     input_id = %input_id,
                     "live-boundary run advanced during preparation; normalized durable queued fallback"
                 );
-                return Ok((held_mutation_gate, false));
+                return Ok((
+                    held_mutation_gate,
+                    LiveBoundaryInputDisposition::QueuedFallback,
+                ));
             }
             LiveBoundaryAttachmentRevalidation::RunAdvancedClaimed => {
-                drop(prepared);
+                if let Ok(prepared) = prepared
+                    && let Err(error) = prepared.abort()
+                {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        run_id = %run_id,
+                        input_id = %input_id,
+                        error = %error,
+                        "failed to abort stale parked boundary after successor claim"
+                    );
+                }
                 tracing::debug!(
                     session_id = %session_id,
                     run_id = %run_id,
                     input_id = %input_id,
                     "live-boundary run advanced during preparation; successor run already owns accepted input"
                 );
-                // Operationally this has the same outer-dispatch consequence
-                // as a successful live injection: the accepted input already
-                // has a run owner, so the stale cancel and wake plan must not
-                // race that successor.
-                return Ok((held_mutation_gate, true));
+                // The successor owns the input, so the old-run cancel must not
+                // race it. The runtime wake is different: it is the liveness
+                // edge that lets a staged successor continue.
+                return Ok((
+                    held_mutation_gate,
+                    LiveBoundaryInputDisposition::SuccessorClaimed,
+                ));
             }
             LiveBoundaryAttachmentRevalidation::CurrentRun => {}
         }
@@ -555,7 +608,10 @@ impl MeerkatMachine {
                     reason = %reason,
                     "exact live boundary unavailable; normalized durable queued fallback"
                 );
-                return Ok((held_mutation_gate, false));
+                return Ok((
+                    held_mutation_gate,
+                    LiveBoundaryInputDisposition::QueuedFallback,
+                ));
             }
             RetryableLiveBoundaryPreparation::Stale { reason } => {
                 self.normalize_live_boundary_queued_fallback(
@@ -574,7 +630,10 @@ impl MeerkatMachine {
                     reason = %reason,
                     "exact live boundary became stale; normalized durable queued fallback"
                 );
-                return Ok((held_mutation_gate, false));
+                return Ok((
+                    held_mutation_gate,
+                    LiveBoundaryInputDisposition::QueuedFallback,
+                ));
             }
         };
 
@@ -653,7 +712,10 @@ impl MeerkatMachine {
             None,
         )
         .await?;
-        Ok((held_mutation_gate, true))
+        Ok((
+            held_mutation_gate,
+            LiveBoundaryInputDisposition::ExactInjected,
+        ))
     }
 
     async fn require_directed_terminal_publication_capability(
@@ -1286,7 +1348,7 @@ impl MeerkatMachine {
                     (signal, None)
                 };
 
-                let live_boundary_consumed = if signal.should_interrupt_yielding()
+                let live_boundary_disposition = if signal.should_interrupt_yielding()
                     && stages_run_boundary
                     && let (Some(input_id), Some(boundary_handle), Some(attachment_id)) = (
                         accepted_input_id.as_ref(),
@@ -1306,7 +1368,7 @@ impl MeerkatMachine {
                                 .to_string(),
                         )
                     })?;
-                    let (returned_gate, consumed) = self
+                    let (returned_gate, disposition) = self
                         .commit_live_boundary_input_if_available(
                             &session_id,
                             &witness,
@@ -1318,21 +1380,21 @@ impl MeerkatMachine {
                         )
                         .await?;
                     gate_guard = Some(returned_gate);
-                    consumed
+                    disposition
                 } else {
-                    false
+                    LiveBoundaryInputDisposition::QueuedFallback
                 };
 
-                // Exact context injection supersedes the older
-                // cancel-after-boundary fallback. Dropping the un-dispatched
-                // plan under M lets its guard clear the pending generated
-                // dispatch fact without invoking the live cancel handle.
-                let cancel_plan = if live_boundary_consumed {
+                // Exact injection and successor ownership both supersede the
+                // old-run cancel. Only exact injection also consumes the wake;
+                // a successor claim retains that liveness edge.
+                let cancel_plan = if live_boundary_disposition.suppress_cancel() {
                     None
                 } else {
                     cancel_plan
                 };
-                let should_wake = signal.should_wake() && !live_boundary_consumed;
+                let should_wake =
+                    signal.should_wake() && !live_boundary_disposition.suppress_wake();
                 if cancel_plan.is_some() || should_wake {
                     let held_mutation_gate = gate_guard.take().ok_or_else(|| {
                         RuntimeDriverError::Internal(
