@@ -5,23 +5,26 @@ use meerkat_core::time_compat::Instant;
 enum LiveBoundaryAttachmentRevalidation {
     CurrentRun,
     RunAdvancedQueued,
-    RunAdvancedClaimed,
+    RunAdvancedClaimed { current_run_active: bool },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LiveBoundaryInputDisposition {
     QueuedFallback,
     ExactInjected,
-    SuccessorClaimed,
+    SuccessorClaimed { wake_needed: bool },
 }
 
 impl LiveBoundaryInputDisposition {
     pub(super) fn suppress_cancel(self) -> bool {
-        matches!(self, Self::ExactInjected | Self::SuccessorClaimed)
+        matches!(self, Self::ExactInjected | Self::SuccessorClaimed { .. })
     }
 
     pub(super) fn suppress_wake(self) -> bool {
-        matches!(self, Self::ExactInjected)
+        matches!(
+            self,
+            Self::ExactInjected | Self::SuccessorClaimed { wake_needed: false }
+        )
     }
 }
 
@@ -147,9 +150,11 @@ impl MeerkatMachine {
             if current_run_id.as_ref() != Some(expected_run_id) {
                 // Terminal successor progress may retire the input before this
                 // stale preparation reacquires M. The old run no longer owns
-                // it, so preserve that completed machine transition and retain
-                // only the outer runtime wake.
-                return Ok(LiveBoundaryAttachmentRevalidation::RunAdvancedClaimed);
+                // it, so preserve that completed machine transition. Retain
+                // the outer wake only when no current run already owns one.
+                return Ok(LiveBoundaryAttachmentRevalidation::RunAdvancedClaimed {
+                    current_run_active: current_run_id.is_some(),
+                });
             }
             return Err(RuntimeDriverError::StaleAuthority {
                 reason: format!(
@@ -194,7 +199,9 @@ impl MeerkatMachine {
             InputLifecycleState::Accepted | InputLifecycleState::Queued => false,
         };
         if successor_owns_input {
-            return Ok(LiveBoundaryAttachmentRevalidation::RunAdvancedClaimed);
+            return Ok(LiveBoundaryAttachmentRevalidation::RunAdvancedClaimed {
+                current_run_active: current_run_id.is_some(),
+            });
         }
 
         Err(RuntimeDriverError::StaleAuthority {
@@ -533,7 +540,7 @@ impl MeerkatMachine {
                     LiveBoundaryInputDisposition::QueuedFallback,
                 ));
             }
-            LiveBoundaryAttachmentRevalidation::RunAdvancedClaimed => {
+            LiveBoundaryAttachmentRevalidation::RunAdvancedClaimed { current_run_active } => {
                 if let Ok(prepared) = prepared
                     && let Err(error) = prepared.abort()
                 {
@@ -549,14 +556,18 @@ impl MeerkatMachine {
                     session_id = %session_id,
                     run_id = %run_id,
                     input_id = %input_id,
+                    current_run_active,
                     "live-boundary run advanced during preparation; successor run already owns accepted input"
                 );
                 // The successor owns the input, so the old-run cancel must not
-                // race it. The runtime wake is different: it is the liveness
-                // edge that lets a staged successor continue.
+                // race it. A currently active successor already owns its
+                // executor wake. Once the successor has retired, the outer
+                // wake is the liveness edge that lets queued work continue.
                 return Ok((
                     held_mutation_gate,
-                    LiveBoundaryInputDisposition::SuccessorClaimed,
+                    LiveBoundaryInputDisposition::SuccessorClaimed {
+                        wake_needed: !current_run_active,
+                    },
                 ));
             }
             LiveBoundaryAttachmentRevalidation::CurrentRun => {}

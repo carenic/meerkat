@@ -16593,14 +16593,25 @@ async fn stale_exact_boundary_preserves_twenty_five_peer_fan_in_inputs() {
 #[tokio::test]
 async fn run_advancing_during_live_boundary_preparation_preserves_successor_claim() {
     assert!(
-        crate::meerkat_machine::dispatch_ingress::LiveBoundaryInputDisposition::SuccessorClaimed
-            .suppress_cancel(),
+        crate::meerkat_machine::dispatch_ingress::LiveBoundaryInputDisposition::SuccessorClaimed {
+            wake_needed: true,
+        }
+        .suppress_cancel(),
         "successor ownership must suppress the stale old-run cancel"
     );
     assert!(
-        !crate::meerkat_machine::dispatch_ingress::LiveBoundaryInputDisposition::SuccessorClaimed
-            .suppress_wake(),
-        "successor ownership must retain the runtime wake liveness edge"
+        !crate::meerkat_machine::dispatch_ingress::LiveBoundaryInputDisposition::SuccessorClaimed {
+            wake_needed: true,
+        }
+        .suppress_wake(),
+        "retired successor ownership must retain the runtime wake liveness edge"
+    );
+    assert!(
+        crate::meerkat_machine::dispatch_ingress::LiveBoundaryInputDisposition::SuccessorClaimed {
+            wake_needed: false,
+        }
+        .suppress_wake(),
+        "an active successor already owns its executor wake"
     );
 
     let prepare_release = Arc::new(Notify::new());
