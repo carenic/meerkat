@@ -77,11 +77,11 @@ repos:
     hooks:
       - id: trailing-whitespace
         # Released fixture bytes are manifest-hashed and must not be rewritten.
-        exclude: '^meerkat-runtime/tests/fixtures/v0_8_10_released_realm/corpus/realm/'
+        exclude: '^(meerkat-runtime/tests/fixtures/v0_8_10_released_realm/corpus/realm/|meerkat-core/tests/fixtures/v0_8_10_ob3_recovery_migration_session\.json$)'
         stages: [pre-push]
       - id: end-of-file-fixer
         # Released fixture bytes are manifest-hashed and must not be rewritten.
-        exclude: '^meerkat-runtime/tests/fixtures/v0_8_10_released_realm/corpus/realm/'
+        exclude: '^(meerkat-runtime/tests/fixtures/v0_8_10_released_realm/corpus/realm/|meerkat-core/tests/fixtures/v0_8_10_ob3_recovery_migration_session\.json$)'
         stages: [pre-push]
       - id: check-yaml
         stages: [pre-push]
