@@ -3011,6 +3011,12 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `ResolveLiveBoundaryContextReceiptRunning`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `CommitTerminalBoundarySequenceRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `LiveBoundaryUnavailableAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `LiveBoundaryUnavailableRunning`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
@@ -5957,6 +5963,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: `meerkat_machine`
   - scenarios: (unclaimed)
 - `LiveBoundaryContextReceiptResolved`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `TerminalBoundarySequenceCommitted`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `TurnRunCompleted`

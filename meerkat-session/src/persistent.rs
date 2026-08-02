@@ -7893,18 +7893,11 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                     // through the live actor before cleanup can remove it.
                     Err((error, None))
                 } else {
-                    tracing::debug!(
+                    tracing::warn!(
                         session_id = %id,
                         error = %error,
-                        "runtime turn failed; discarding live session in favor of durable authority"
+                        "runtime turn failed; preserving the live session for the next queued input"
                     );
-                    if let Err(discard_error) = self.discard_live_session_unfenced(id).await {
-                        tracing::warn!(
-                            session_id = %id,
-                            error = %discard_error,
-                            "failed to discard live session after failed runtime turn"
-                        );
-                    }
                     Err((error, None))
                 }
             }
@@ -7985,13 +7978,11 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                     // exact cancellation terminal under its existing boundary.
                     Err(error)
                 } else {
-                    if let Err(discard_error) = self.discard_live_session_unfenced(id).await {
-                        tracing::warn!(
-                            session_id = %id,
-                            error = %discard_error,
-                            "failed to discard live session after failed runtime turn"
-                        );
-                    }
+                    tracing::warn!(
+                        session_id = %id,
+                        error = %error,
+                        "runtime turn failed; preserving the live session for the next queued input"
+                    );
                     Err(error)
                 }
             }
@@ -20345,11 +20336,10 @@ mod tests {
             "unexpected unclassified failure: {error}"
         );
         assert!(
-            !service
-                .has_live_session(&created.session_id)
-                .await
-                .expect("live-session status should succeed"),
-            "stale terminal truth must not preserve speculative live mutation"
+            service
+                .live_session_actor_registered(&created.session_id)
+                .await,
+            "an unclassified runtime failure must not remove the live actor while the machine remains registered"
         );
     }
 

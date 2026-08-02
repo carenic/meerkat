@@ -3983,6 +3983,7 @@ macro_rules! meerkat_catalog_machine_dsl {
             AcceptWithCompletion { input_id: InputId, request_immediate_processing: bool, interrupt_yielding: bool, wake_if_idle: bool },
             AcceptWithoutWake { input_id: InputId },
             ResolveLiveBoundaryContextReceipt { run_id: RunId, input_id: String },
+            CommitTerminalBoundarySequence { run_id: RunId, boundary_sequence: u64 },
             // Typed observation from the live boundary adapter: the active
             // target disappeared before this admitted Steer input could be
             // prepared. The machine, not the shell, authorizes the exact
@@ -4835,6 +4836,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 boundary: Enum<AdmissionRunApplyBoundary>,
                 boundary_sequence: u64,
             },
+            TerminalBoundarySequenceCommitted { run_id: RunId, boundary_sequence: u64 },
             TurnRunCompleted { run_id: RunId, outcome: Enum<TurnTerminalOutcome> },
             // Recovery verdict for a classified durable tail on the
             // non-commit branches (refuse / hold). No disposition authorizes
@@ -5522,6 +5524,7 @@ macro_rules! meerkat_catalog_machine_dsl {
         disposition TurnRunStarted => local seam NoOwnerRealization,
         disposition TurnBoundaryApplied => local seam NoOwnerRealization,
         disposition LiveBoundaryContextReceiptResolved => local seam NoOwnerRealization,
+        disposition TerminalBoundarySequenceCommitted => local seam NoOwnerRealization,
         disposition LiveBoundaryUnavailableNormalized => local seam NoOwnerRealization,
         disposition TurnRunCompleted => local seam NoOwnerRealization,
         disposition DurableTailRecoveryAuthorized => local seam NoOwnerRealization,
@@ -17812,12 +17815,41 @@ macro_rules! meerkat_catalog_machine_dsl {
             }
         }
 
-        // A typed Unavailable result means the active live target vanished;
-        // Stale and Fault remain failures and never drive this transition.
-        // Normalize the admitted Steer input before the runtime takes its
-        // ordinary queued fallback so no stale live-only disposition survives.
-        transition LiveBoundaryUnavailable {
+        // A terminal receipt follows every live checkpoint in the same dense
+        // per-run sequence. The shell presents the checked successor, while
+        // the machine validates and commits the canonical frontier before any
+        // terminal input records that sequence.
+        transition CommitTerminalBoundarySequence {
             per_phase [Running]
+            on input CommitTerminalBoundarySequence { run_id, boundary_sequence }
+            guard "current_run_matches" {
+                self.current_run_id != None
+                && self.current_run_id.get("value") == run_id
+            }
+            guard "boundary_sequence_is_dense_successor" {
+                (!self.live_boundary_context_sequence_by_run.contains_key(run_id)
+                    && boundary_sequence == 1)
+                || (self.live_boundary_context_sequence_by_run.contains_key(run_id)
+                    && self.live_boundary_context_sequence_by_run.get_cloned(run_id).get("value") < u64::MAX
+                    && boundary_sequence == self.live_boundary_context_sequence_by_run.get_cloned(run_id).get("value") + 1)
+            }
+            update {
+                self.live_boundary_context_sequence_by_run.insert(run_id, boundary_sequence);
+            }
+            to Running
+            emit TerminalBoundarySequenceCommitted {
+                run_id: run_id,
+                boundary_sequence: boundary_sequence
+            }
+        }
+
+        // An Unavailable or Stale delivery witness means the active live target
+        // cannot accept this attempt. Normalize the independently admitted
+        // Steer input before the runtime takes its ordinary queued fallback so
+        // no stale live-only disposition survives. Fault remains a failure and
+        // never drives this transition.
+        transition LiveBoundaryUnavailable {
+            per_phase [Attached, Running]
             on input LiveBoundaryUnavailable { input_id }
             guard "input_tracked" { self.input_phases.contains_key(input_id) }
             guard "input_is_queued_steer" {
@@ -17863,8 +17895,9 @@ macro_rules! meerkat_catalog_machine_dsl {
         // The sequence is MACHINE-derived from the canonical per-run boundary
         // counter (`live_boundary_context_sequence_by_run`), never accepted
         // from the shell — there is exactly one producer of the boundary
-        // sequence fact. Runs without a live-boundary counter entry (direct
-        // service turns) record the base sequence 0.
+        // sequence fact. Terminal realization first commits its dense
+        // successor, so every durably applied input records the exact receipt
+        // sequence that owns it.
         transition RecordBoundarySeq {
             per_phase [Idle, Attached, Running, Retired, Stopped]
             on input RecordBoundarySeq { input_id, run_id }

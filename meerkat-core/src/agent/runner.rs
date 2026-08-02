@@ -104,45 +104,22 @@ fn injected_context_message_from_operator_renderable(
 fn project_turn_request_context(
     messages: &mut Vec<Message>,
     contexts: &[crate::lifecycle::run_primitive::TurnRequestContext],
-    active_identity: Option<&TranscriptMessageIdentity>,
     include: bool,
-) -> Result<(), AgentError> {
+) {
     if !include || contexts.is_empty() {
-        return Ok(());
+        return;
     }
-    let active_identity = active_identity.ok_or_else(|| {
-        AgentError::ConfigError(
-            "transient turn context requires an exact admitted transcript identity".to_string(),
-        )
-    })?;
-    let anchors = messages
-        .iter()
-        .enumerate()
-        .filter_map(|(index, message)| match message {
-            Message::User(user)
-                if user.transcript_role.is_conversational()
-                    && user.identity == *active_identity =>
-            {
-                Some(index)
-            }
-            _ => None,
-        })
-        .collect::<Vec<_>>();
-    let [anchor] = anchors.as_slice() else {
-        return Err(AgentError::ConfigError(format!(
-            "transient turn context requires exactly one conversational user message for the admitted transcript identity; found {}",
-            anchors.len()
-        )));
-    };
-    messages.splice(
-        *anchor..*anchor,
-        contexts.iter().map(|context| {
-            Message::User(crate::types::UserMessage::injected_context(
-                context.as_str().to_owned(),
-            ))
-        }),
-    );
-    Ok(())
+    // The transient-boundary coordinator has already bound these contexts to
+    // the exact actor incarnation, run, and request boundary. Project them at
+    // the request tail, where a live steer chronologically arrives. Do not
+    // reconstruct that authority from transcript identity: heterogeneous
+    // fan-in legitimately has no singular identity, and peer-only turns have
+    // no conversational User row to use as an anchor.
+    messages.extend(contexts.iter().map(|context| {
+        Message::User(crate::types::UserMessage::injected_context(
+            context.as_str().to_owned(),
+        ))
+    }));
 }
 
 fn run_input_from_admitted_pending_tail(
@@ -1359,9 +1336,8 @@ where
             project_turn_request_context(
                 &mut messages,
                 &self.active_turn_request_contexts,
-                self.active_transcript_identity.as_ref(),
                 include_turn_request_context,
-            )?;
+            );
         }
         Ok(messages)
     }
@@ -2272,20 +2248,17 @@ mod typed_transcript_contract_tests {
     }
 
     #[test]
-    fn transient_turn_context_binds_exact_active_user_not_old_tail() {
-        let old_identity = TranscriptMessageIdentity {
-            objective_id: Some(crate::interaction::ObjectiveId::new()),
-            ..Default::default()
-        };
-        let active_identity = TranscriptMessageIdentity {
-            interaction_id: Some(crate::interaction::InteractionId(uuid::Uuid::new_v4())),
-            ..Default::default()
-        };
-        let mut old = UserMessage::text("old");
-        old.identity = old_identity;
-        let mut active = UserMessage::text("current");
-        active.identity = active_identity.clone();
-        let mut messages = vec![Message::User(old), Message::User(active)];
+    fn transient_turn_context_projects_at_request_tail_without_transcript_anchor() {
+        let mut messages = vec![
+            Message::SystemNotice(crate::types::SystemNoticeMessage::new(
+                crate::types::SystemNoticeKind::Comms,
+                "first peer delivery",
+            )),
+            Message::SystemNotice(crate::types::SystemNoticeMessage::new(
+                crate::types::SystemNoticeKind::Comms,
+                "second peer delivery",
+            )),
+        ];
         let contexts = ["caller facts", "first admitted steer"]
             .into_iter()
             .map(
@@ -2296,13 +2269,15 @@ mod typed_transcript_contract_tests {
             )
             .collect::<Vec<_>>();
 
-        if let Err(error) =
-            project_turn_request_context(&mut messages, &contexts, Some(&active_identity), true)
-        {
-            panic!("exact active anchor rejected: {error}");
-        }
+        project_turn_request_context(&mut messages, &contexts, true);
         assert_eq!(messages.len(), 4);
-        for (index, expected) in [(1, "caller facts"), (2, "first admitted steer")] {
+        assert!(
+            matches!(&messages[0], Message::SystemNotice(notice) if notice.body.as_deref() == Some("first peer delivery"))
+        );
+        assert!(
+            matches!(&messages[1], Message::SystemNotice(notice) if notice.body.as_deref() == Some("second peer delivery"))
+        );
+        for (index, expected) in [(2, "caller facts"), (3, "first admitted steer")] {
             assert!(matches!(
                 &messages[index],
                 Message::User(user)
@@ -2310,10 +2285,6 @@ mod typed_transcript_contract_tests {
                         && user.text_content() == expected
             ));
         }
-        assert!(matches!(
-            &messages[3],
-            Message::User(user) if user.identity == active_identity
-        ));
     }
 
     #[test]
@@ -2324,11 +2295,7 @@ mod typed_transcript_contract_tests {
             Err(error) => panic!("fixture context rejected: {error}"),
         };
         let mut messages = vec![Message::User(UserMessage::text("extraction input"))];
-        if let Err(error) =
-            project_turn_request_context(&mut messages, std::slice::from_ref(&context), None, false)
-        {
-            panic!("extraction exclusion must not require a turn anchor: {error}");
-        }
+        project_turn_request_context(&mut messages, std::slice::from_ref(&context), false);
         assert_eq!(messages.len(), 1);
         assert!(matches!(
             &messages[0],

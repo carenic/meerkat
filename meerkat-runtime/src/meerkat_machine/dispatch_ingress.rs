@@ -1,6 +1,19 @@
 use super::*;
 use meerkat_core::time_compat::Instant;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveBoundaryAttachmentRevalidation {
+    CurrentRun,
+    RunAdvancedQueued,
+    RunAdvancedClaimed,
+}
+
+enum RetryableLiveBoundaryPreparation {
+    Prepared(meerkat_core::lifecycle::CoreBoundaryStageOutput),
+    Unavailable { reason: String },
+    Stale { reason: String },
+}
+
 impl MeerkatMachine {
     /// Select whether generated admission should attempt exact live-boundary
     /// staging. The machine-owned current run plus the exact captured
@@ -73,7 +86,7 @@ impl MeerkatMachine {
         witness: &RuntimeLiveBoundaryAttachmentWitness,
         expected_run_id: &RunId,
         input_id: &InputId,
-    ) -> Result<(), RuntimeDriverError> {
+    ) -> Result<LiveBoundaryAttachmentRevalidation, RuntimeDriverError> {
         {
             let sessions = self.sessions.read().await;
             let entry =
@@ -108,25 +121,61 @@ impl MeerkatMachine {
         }
 
         let driver = witness.driver.lock().await;
-        if driver.current_run_id().as_ref() != Some(expected_run_id) {
-            return Err(RuntimeDriverError::StaleAuthority {
-                reason: format!(
-                    "live-boundary run changed before committing accepted input {input_id}"
-                ),
-            });
-        }
         let phase = driver
             .as_driver()
             .stored_input_state(input_id)
-            .map(|stored| stored.seed.phase);
-        if phase != Some(InputLifecycleState::Queued) {
+            .map(|stored| stored.seed.phase)
+            .ok_or_else(|| RuntimeDriverError::StaleAuthority {
+                reason: format!(
+                    "accepted live-boundary input {input_id} disappeared before commit"
+                ),
+            })?;
+        let current_run_id = driver.current_run_id();
+        if current_run_id.as_ref() == Some(expected_run_id) {
+            if phase == InputLifecycleState::Queued {
+                return Ok(LiveBoundaryAttachmentRevalidation::CurrentRun);
+            }
             return Err(RuntimeDriverError::StaleAuthority {
                 reason: format!(
-                    "accepted live-boundary input {input_id} changed phase before commit: {phase:?}"
+                    "accepted live-boundary input {input_id} changed phase during its original run before commit: {phase:?}"
                 ),
             });
         }
-        Ok(())
+
+        if phase == InputLifecycleState::Queued {
+            return Ok(LiveBoundaryAttachmentRevalidation::RunAdvancedQueued);
+        }
+
+        // M is intentionally released while the actor prepares the transient
+        // boundary. During that window the old run may finish and the ordinary
+        // queued path may claim this exact input for a successor run. Accept
+        // only machine-owned progress: active phases must belong to the exact
+        // current successor, Consumed must name a successor, and runless
+        // terminal phases are already resolved by their generated transition.
+        let last_run_id = driver.input_last_run_id(input_id);
+        let successor_owns_input = match phase {
+            InputLifecycleState::Staged
+            | InputLifecycleState::Applied
+            | InputLifecycleState::AppliedPendingConsumption => current_run_id
+                .as_ref()
+                .is_some_and(|current_run_id| last_run_id.as_ref() == Some(current_run_id)),
+            InputLifecycleState::Consumed => last_run_id
+                .as_ref()
+                .is_some_and(|last_run_id| last_run_id != expected_run_id),
+            InputLifecycleState::Superseded
+            | InputLifecycleState::Coalesced
+            | InputLifecycleState::Abandoned => true,
+            InputLifecycleState::Accepted | InputLifecycleState::Queued => false,
+        };
+        if successor_owns_input {
+            return Ok(LiveBoundaryAttachmentRevalidation::RunAdvancedClaimed);
+        }
+
+        Err(RuntimeDriverError::StaleAuthority {
+            reason: format!(
+                "accepted live-boundary input {input_id} reached {phase:?} without successor-run ownership"
+            ),
+        })
     }
 
     async fn terminalize_failed_accepted_input(
@@ -220,15 +269,48 @@ impl MeerkatMachine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    async fn normalize_live_boundary_queued_fallback(
+        &self,
+        session_id: &SessionId,
+        witness: &RuntimeLiveBoundaryAttachmentWitness,
+        completions: &SharedCompletionRegistry,
+        publication_handle: Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>>,
+        input_id: &InputId,
+        fallback_wake: &mut AcceptedIngressFallbackWakeGuard,
+    ) -> Result<(), RuntimeDriverError> {
+        if let Err(error) = witness
+            .driver
+            .lock()
+            .await
+            .machine_normalize_live_boundary_unavailable(input_id)
+            .await
+        {
+            return Err(self
+                .finish_live_boundary_failure(
+                    session_id,
+                    witness,
+                    completions,
+                    publication_handle,
+                    input_id,
+                    error,
+                    fallback_wake,
+                )
+                .await);
+        }
+        Ok(())
+    }
+
     /// Attempt one exact active-turn context injection.
     ///
     /// The caller enters with M. Preparation runs without M so the session actor
     /// can park and call back into runtime mechanics. The same exact attachment
     /// is then revalidated under M before the durable driver/store commit. If
     /// no run is active yet, the input remains queued for the outer runtime wake.
-    /// Once an exact run exists, only typed `Unavailable` leaves the input queued;
-    /// `Stale` and `Fault` converge the exact accepted input to a durable terminal
-    /// before surfacing failure.
+    /// `Unavailable`, `Stale`, and a run advancing during preparation invalidate
+    /// only the transient delivery attempt, so the durably accepted input remains
+    /// queued. `Fault` still converges the exact accepted input to a durable
+    /// terminal before surfacing failure.
     async fn finalize_live_boundary_completion_owned(
         driver: &SharedDriver,
         completions: &SharedCompletionRegistry,
@@ -368,63 +450,13 @@ impl MeerkatMachine {
             .await;
         let held_mutation_gate = Arc::clone(&witness.mutation_gate).lock_owned().await;
 
-        if let Err(error) = self
+        let revalidation = match self
             .revalidate_live_boundary_attachment(session_id, witness, &run_id, input_id)
             .await
         {
-            drop(prepared);
-            let error = self
-                .finish_live_boundary_failure(
-                    session_id,
-                    witness,
-                    completions,
-                    publication_handle,
-                    input_id,
-                    error,
-                    fallback_wake,
-                )
-                .await;
-            return Err(error);
-        }
-
-        let prepared = match prepared {
-            Ok(prepared) => prepared,
-            Err(meerkat_core::lifecycle::CoreBoundaryStageError::Unavailable { reason }) => {
-                let normalization = witness
-                    .driver
-                    .lock()
-                    .await
-                    .machine_normalize_live_boundary_unavailable(input_id)
-                    .await;
-                if let Err(error) = normalization {
-                    let error = self
-                        .finish_live_boundary_failure(
-                            session_id,
-                            witness,
-                            completions,
-                            publication_handle,
-                            input_id,
-                            error,
-                            fallback_wake,
-                        )
-                        .await;
-                    return Err(error);
-                }
-                tracing::debug!(
-                    session_id = %session_id,
-                    run_id = %run_id,
-                    input_id = %input_id,
-                    reason = %reason,
-                    "exact live boundary unavailable; normalized durable queued fallback"
-                );
-                return Ok((held_mutation_gate, false));
-            }
-            Err(meerkat_core::lifecycle::CoreBoundaryStageError::Stale { reason }) => {
-                let error = RuntimeDriverError::StaleAuthority {
-                    reason: format!(
-                        "live-boundary preparation became stale for input {input_id}: {reason}"
-                    ),
-                };
+            Ok(revalidation) => revalidation,
+            Err(error) => {
+                drop(prepared);
                 let error = self
                     .finish_live_boundary_failure(
                         session_id,
@@ -437,6 +469,53 @@ impl MeerkatMachine {
                     )
                     .await;
                 return Err(error);
+            }
+        };
+
+        match revalidation {
+            LiveBoundaryAttachmentRevalidation::RunAdvancedQueued => {
+                drop(prepared);
+                self.normalize_live_boundary_queued_fallback(
+                    session_id,
+                    witness,
+                    completions,
+                    publication_handle.clone(),
+                    input_id,
+                    fallback_wake,
+                )
+                .await?;
+                tracing::debug!(
+                    session_id = %session_id,
+                    run_id = %run_id,
+                    input_id = %input_id,
+                    "live-boundary run advanced during preparation; normalized durable queued fallback"
+                );
+                return Ok((held_mutation_gate, false));
+            }
+            LiveBoundaryAttachmentRevalidation::RunAdvancedClaimed => {
+                drop(prepared);
+                tracing::debug!(
+                    session_id = %session_id,
+                    run_id = %run_id,
+                    input_id = %input_id,
+                    "live-boundary run advanced during preparation; successor run already owns accepted input"
+                );
+                // Operationally this has the same outer-dispatch consequence
+                // as a successful live injection: the accepted input already
+                // has a run owner, so the stale cancel and wake plan must not
+                // race that successor.
+                return Ok((held_mutation_gate, true));
+            }
+            LiveBoundaryAttachmentRevalidation::CurrentRun => {}
+        }
+
+        let prepared = match prepared {
+            Ok(prepared) => RetryableLiveBoundaryPreparation::Prepared(prepared),
+            Err(meerkat_core::lifecycle::CoreBoundaryStageError::Unavailable { reason }) => {
+                RetryableLiveBoundaryPreparation::Unavailable { reason }
+            }
+            Err(meerkat_core::lifecycle::CoreBoundaryStageError::Stale { reason }) => {
+                RetryableLiveBoundaryPreparation::Stale { reason }
             }
             Err(meerkat_core::lifecycle::CoreBoundaryStageError::Fault { reason }) => {
                 let error = RuntimeDriverError::Internal(format!(
@@ -454,6 +533,48 @@ impl MeerkatMachine {
                     )
                     .await;
                 return Err(error);
+            }
+        };
+
+        let prepared = match prepared {
+            RetryableLiveBoundaryPreparation::Prepared(prepared) => prepared,
+            RetryableLiveBoundaryPreparation::Unavailable { reason } => {
+                self.normalize_live_boundary_queued_fallback(
+                    session_id,
+                    witness,
+                    completions,
+                    publication_handle.clone(),
+                    input_id,
+                    fallback_wake,
+                )
+                .await?;
+                tracing::debug!(
+                    session_id = %session_id,
+                    run_id = %run_id,
+                    input_id = %input_id,
+                    reason = %reason,
+                    "exact live boundary unavailable; normalized durable queued fallback"
+                );
+                return Ok((held_mutation_gate, false));
+            }
+            RetryableLiveBoundaryPreparation::Stale { reason } => {
+                self.normalize_live_boundary_queued_fallback(
+                    session_id,
+                    witness,
+                    completions,
+                    publication_handle.clone(),
+                    input_id,
+                    fallback_wake,
+                )
+                .await?;
+                tracing::debug!(
+                    session_id = %session_id,
+                    run_id = %run_id,
+                    input_id = %input_id,
+                    reason = %reason,
+                    "exact live boundary became stale; normalized durable queued fallback"
+                );
+                return Ok((held_mutation_gate, false));
             }
         };
 

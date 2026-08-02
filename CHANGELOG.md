@@ -13,6 +13,27 @@ via cargo-semver-checks against the published baselines).
 
 ## [Unreleased]
 
+## [0.8.12] - 2026-08-02
+
+### Fixed
+
+- Concurrent peer fan-in to a member that is already turning no longer loses
+  accepted messages when the exact live-boundary witness becomes stale or its
+  run advances during preparation. Those conditions now discard only the
+  transient delivery attempt and atomically normalize the durable input to the
+  ordinary queued path. Genuine boundary mechanism faults still fail closed.
+- Recoverable runtime-turn failures no longer delete the live actor projection
+  while leaving its durable machine state `Attached`. The error still surfaces,
+  but the actor and its event stream remain available for queued work.
+- Exact live-boundary steer context no longer re-proves its authority through a
+  singular transcript identity and conversational User row. Heterogeneous and
+  peer-only fan-in now projects the already-authorized context at the model
+  request tail without mutating durable session history.
+- Terminal run receipts now take the machine-authorized dense successor after
+  any live-boundary checkpoints. A run that accepts transient context no longer
+  reuses its last checkpoint sequence, repair-blocks on the receipt collision,
+  and loses the projected actor stream.
+
 ## [0.8.11] - 2026-07-31
 
 ### Breaking
@@ -4863,7 +4884,8 @@ Meerkat 0.5 is a large architecture and surface cutover. It formalizes runtime o
 
 Initial development release.
 
-[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.8.11...HEAD
+[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.8.12...HEAD
+[0.8.12]: https://github.com/lukacf/meerkat/compare/v0.8.11...v0.8.12
 [0.8.11]: https://github.com/lukacf/meerkat/compare/v0.8.10...v0.8.11
 [0.7.0]: https://github.com/lukacf/meerkat/compare/alpha/v0.7.0-alpha.0...v0.7.0
 [0.7.0-alpha.0]: https://github.com/lukacf/meerkat/releases/tag/alpha/v0.7.0-alpha.0

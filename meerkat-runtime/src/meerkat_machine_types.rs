@@ -776,6 +776,7 @@ meerkat_machine_runtime_internal_inputs!(
         ClassifyTurnTerminality,
         ClearSessionLlmState,
         Commit,
+        CommitTerminalBoundarySequence,
         Fail,
         HydrateSessionLlmState,
         LlmReturnedTerminal,

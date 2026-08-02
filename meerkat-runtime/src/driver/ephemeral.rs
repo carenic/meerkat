@@ -896,11 +896,10 @@ impl EphemeralRuntimeDriver {
 
     /// Read the machine-owned per-run boundary counter for a run.
     ///
-    /// This is the SINGLE producer of the run-boundary receipt sequence
-    /// (dogma K10): live boundary-context checkpoints advance it inside the
-    /// generated machine; runs without an entry are at the base sequence 0.
-    /// The driver mints final `RunBoundaryReceipt`s from this value — shells
-    /// and executors never fabricate it.
+    /// This is the canonical committed run-boundary receipt frontier (dogma
+    /// K10). Live checkpoints and the terminal boundary advance it through
+    /// generated transitions; a run with no committed boundary has frontier
+    /// 0 and its first durable receipt uses sequence 1.
     pub fn run_boundary_sequence(&self, run_id: &RunId) -> u64 {
         let key = mm_dsl::RunId::from_domain(run_id);
         self.with_dsl_state(|state| {
@@ -910,6 +909,58 @@ impl EphemeralRuntimeDriver {
                 .copied()
                 .unwrap_or(0)
         })
+    }
+
+    /// Derive the dense successor reserved for the run's terminal receipt.
+    /// The generated machine validates and commits this candidate through
+    /// `CommitTerminalBoundarySequence` before terminal realization.
+    pub(crate) fn terminal_boundary_sequence(
+        &self,
+        run_id: &RunId,
+    ) -> Result<u64, RuntimeDriverError> {
+        self.run_boundary_sequence(run_id)
+            .checked_add(1)
+            .ok_or_else(|| {
+                RuntimeDriverError::Internal(format!(
+                    "terminal boundary sequence overflow for run {run_id}"
+                ))
+            })
+    }
+
+    pub(crate) fn machine_commit_terminal_boundary_sequence(
+        &mut self,
+        run_id: &RunId,
+        boundary_sequence: u64,
+    ) -> Result<(), RuntimeDriverError> {
+        let expected_run_id = mm_dsl::RunId::from_domain(run_id);
+        let effects = self.dsl_apply_effects(
+            mm_dsl::MeerkatMachineInput::CommitTerminalBoundarySequence {
+                run_id: expected_run_id.clone(),
+                boundary_sequence,
+            },
+            "CommitTerminalBoundarySequence",
+        )?;
+        let mut committed = effects.into_iter().filter_map(|effect| match effect {
+            mm_dsl::MeerkatMachineEffect::TerminalBoundarySequenceCommitted {
+                run_id,
+                boundary_sequence,
+            } => Some((run_id, boundary_sequence)),
+            _ => None,
+        });
+        let Some((effect_run_id, effect_sequence)) = committed.next() else {
+            return Err(RuntimeDriverError::Internal(format!(
+                "generated machine emitted no terminal boundary sequence for run {run_id}"
+            )));
+        };
+        if committed.next().is_some()
+            || effect_run_id != expected_run_id
+            || effect_sequence != boundary_sequence
+        {
+            return Err(RuntimeDriverError::Internal(format!(
+                "generated machine emitted a mismatched terminal boundary sequence for run {run_id}"
+            )));
+        }
+        Ok(())
     }
 
     /// Read the typed terminal outcome for an input, reconstructed from the

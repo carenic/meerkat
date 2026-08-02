@@ -1188,10 +1188,11 @@ impl CoreInteractionTerminalPublicationReceipt {
 
 /// Typed failure while preparing or resolving an exact live turn boundary.
 ///
-/// Only [`CoreBoundaryStageError::Unavailable`] permits a caller to fall back
-/// to queued delivery. `Stale` means an exact actor/run/generation witness was
-/// invalidated, while `Fault` means the preparation mechanism itself failed;
-/// neither may be laundered into ordinary unavailability.
+/// `Unavailable` and `Stale` invalidate only the transient delivery attempt,
+/// so a caller may retain an independently accepted durable input for queued
+/// delivery. `Stale` specifically means the exact actor/run/generation witness
+/// was invalidated. `Fault` means the preparation mechanism itself failed and
+/// must not be laundered into ordinary unavailability.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum CoreBoundaryStageError {
     #[error("active turn boundary is unavailable: {reason}")]

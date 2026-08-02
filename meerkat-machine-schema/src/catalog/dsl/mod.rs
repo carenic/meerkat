@@ -2440,6 +2440,7 @@ runtime_internal_inputs!(
         CoalesceInput,
         CommitStickyModelFallback,
         Commit,
+        CommitTerminalBoundarySequence,
         CommitDeferredNames,
         CommitVisibilityFilter,
         CommsDrainExitedForUnregister,

@@ -1879,7 +1879,7 @@ async fn legacy_terminal_error_after_generated_failure_stops_without_applied_ter
         .expect("staged legacy input should retain its run identity");
     assert!(
         store
-            .load_boundary_receipt(&runtime_id, &run_id, 0)
+            .load_boundary_receipt(&runtime_id, &run_id, 1)
             .await
             .expect("load legacy terminal receipt")
             .is_none(),
@@ -15971,6 +15971,7 @@ enum BoundaryPreparationResult {
 struct InterruptYieldingProbe {
     prepare_calls: Arc<AtomicUsize>,
     prepared_texts: Arc<std::sync::Mutex<Vec<String>>>,
+    prepare_release: Option<Arc<Notify>>,
     result: BoundaryPreparationResult,
 }
 
@@ -15979,6 +15980,16 @@ impl InterruptYieldingProbe {
         Self {
             prepare_calls: Arc::new(AtomicUsize::new(0)),
             prepared_texts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            prepare_release: None,
+            result,
+        }
+    }
+
+    fn blocked(result: BoundaryPreparationResult, prepare_release: Arc<Notify>) -> Self {
+        Self {
+            prepare_calls: Arc::new(AtomicUsize::new(0)),
+            prepared_texts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            prepare_release: Some(prepare_release),
             result,
         }
     }
@@ -16023,6 +16034,9 @@ impl CoreExecutorBoundaryHandle for InterruptYieldingBoundaryHandle {
                     .into_iter()
                     .map(|context| context.as_str().to_owned()),
             );
+        if let Some(prepare_release) = self.probe.prepare_release.as_ref() {
+            prepare_release.notified().await;
+        }
         match self.probe.result {
             BoundaryPreparationResult::Unavailable => Err(
                 meerkat_core::lifecycle::CoreBoundaryStageError::unavailable(
@@ -16118,12 +16132,26 @@ impl InterruptYieldingTestRig {
         result: BoundaryPreparationResult,
         publisher: Option<Arc<RuntimeRecoveryTerminalPublisher>>,
     ) -> Self {
-        let adapter = Arc::new(MeerkatMachine::ephemeral());
+        let probe = with_live_boundary.then(|| InterruptYieldingProbe::new(result));
+        Self::new_with_probe(probe, publisher).await
+    }
+
+    async fn new_with_probe(
+        probe: Option<InterruptYieldingProbe>,
+        publisher: Option<Arc<RuntimeRecoveryTerminalPublisher>>,
+    ) -> Self {
+        Self::new_with_adapter(Arc::new(MeerkatMachine::ephemeral()), probe, publisher).await
+    }
+
+    async fn new_with_adapter(
+        adapter: Arc<MeerkatMachine>,
+        probe: Option<InterruptYieldingProbe>,
+        publisher: Option<Arc<RuntimeRecoveryTerminalPublisher>>,
+    ) -> Self {
         let session_id = SessionId::new();
         let apply_calls = Arc::new(AtomicUsize::new(0));
         let apply_started = Arc::new(Notify::new());
         let allow_finish = Arc::new(Notify::new());
-        let probe = with_live_boundary.then(|| InterruptYieldingProbe::new(result));
 
         adapter
             .register_session_with_executor(
@@ -16414,7 +16442,7 @@ async fn interrupt_yielding_without_live_boundary_handle_falls_back_to_steer_que
 }
 
 #[tokio::test]
-async fn unavailable_exact_boundary_is_the_only_queued_fallback() {
+async fn unavailable_exact_boundary_uses_queued_fallback() {
     let rig = InterruptYieldingTestRig::new(true, BoundaryPreparationResult::Unavailable).await;
     rig.start_busy_turn().await;
     let probe = rig.probe.clone().expect("live boundary probe installed");
@@ -16465,7 +16493,188 @@ async fn unavailable_exact_boundary_is_the_only_queued_fallback() {
     rig.wait_until_attached_and_empty().await;
 }
 
-async fn assert_boundary_failure_terminalizes_exact_input(result: BoundaryPreparationResult) {
+#[tokio::test]
+async fn stale_exact_boundary_uses_queued_fallback() {
+    let rig = InterruptYieldingTestRig::new(true, BoundaryPreparationResult::Stale).await;
+    rig.start_busy_turn().await;
+    let probe = rig.probe.clone().expect("live boundary probe installed");
+
+    let (peer_input, peer_id) = interrupt_yielding_peer_input(
+        "stale exact boundary remains queued",
+        Some(meerkat_core::types::HandlingMode::Steer),
+    );
+    let (outcome, completion_handle) = rig
+        .adapter
+        .accept_input_with_completion(&rig.session_id, peer_input)
+        .await
+        .expect("typed stale should preserve queued admission");
+    assert!(outcome.is_accepted());
+    assert!(completion_handle.is_some());
+    assert_eq!(probe.prepare_calls.load(Ordering::SeqCst), 1);
+
+    let during_busy = rig
+        .adapter
+        .meerkat_machine_spine_snapshot(&rig.session_id)
+        .await
+        .expect("snapshot should exist while busy");
+    assert_eq!(during_busy.inputs.queue, vec![peer_id.clone()]);
+    assert!(!during_busy.inputs.steer_queue.contains(&peer_id));
+    assert_eq!(
+        during_busy
+            .inputs
+            .admission_order
+            .iter()
+            .find(|input| input.input_id == peer_id)
+            .and_then(|input| input.lifecycle),
+        Some(crate::input_state::InputLifecycleState::Queued)
+    );
+
+    rig.allow_finish.notify_waiters();
+    rig.wait_for_apply_calls(2).await;
+    rig.allow_finish.notify_waiters();
+    rig.wait_until_attached_and_empty().await;
+}
+
+#[tokio::test]
+async fn stale_exact_boundary_preserves_twenty_five_peer_fan_in_inputs() {
+    const FAN_IN: usize = 25;
+
+    let rig = InterruptYieldingTestRig::new(true, BoundaryPreparationResult::Stale).await;
+    rig.start_busy_turn().await;
+    let probe = rig.probe.clone().expect("live boundary probe installed");
+    let mut input_ids = Vec::with_capacity(FAN_IN);
+    let mut accepts = Vec::with_capacity(FAN_IN);
+
+    for index in 0..FAN_IN {
+        let (peer_input, input_id) = interrupt_yielding_peer_input(
+            &format!("concurrent peer report {index}"),
+            Some(meerkat_core::types::HandlingMode::Steer),
+        );
+        input_ids.push(input_id);
+        let adapter = Arc::clone(&rig.adapter);
+        let session_id = rig.session_id.clone();
+        accepts.push(tokio::spawn(async move {
+            adapter
+                .accept_input_with_completion(&session_id, peer_input)
+                .await
+        }));
+    }
+
+    for accept in accepts {
+        let (outcome, completion_handle) = accept
+            .await
+            .expect("fan-in acceptance task should not panic")
+            .expect("a stale live witness must not reject a peer report");
+        assert!(outcome.is_accepted());
+        assert!(completion_handle.is_some());
+    }
+
+    assert_eq!(probe.prepare_calls.load(Ordering::SeqCst), FAN_IN);
+    let during_busy = rig
+        .adapter
+        .meerkat_machine_spine_snapshot(&rig.session_id)
+        .await
+        .expect("snapshot should exist after fan-in acceptance");
+    assert_eq!(during_busy.inputs.queue.len(), FAN_IN);
+    assert!(during_busy.inputs.steer_queue.is_empty());
+    for input_id in &input_ids {
+        assert!(
+            during_busy.inputs.queue.contains(input_id),
+            "every accepted peer report must remain queued after its stale live witness"
+        );
+    }
+
+    rig.allow_finish.notify_waiters();
+    rig.wait_for_apply_calls(2).await;
+    rig.allow_finish.notify_waiters();
+    rig.wait_until_attached_and_empty().await;
+}
+
+#[tokio::test]
+async fn run_advancing_during_live_boundary_preparation_preserves_successor_claim() {
+    let prepare_release = Arc::new(Notify::new());
+    let probe = InterruptYieldingProbe::blocked(
+        BoundaryPreparationResult::Stale,
+        Arc::clone(&prepare_release),
+    );
+    let adapter = Arc::new(MeerkatMachine::persistent(
+        Arc::new(crate::store::InMemoryRuntimeStore::new()),
+        memory_blob_store(),
+    ));
+    let rig = InterruptYieldingTestRig::new_with_adapter(adapter, Some(probe.clone()), None).await;
+    rig.start_busy_turn().await;
+
+    let (peer_input, peer_id) = interrupt_yielding_peer_input(
+        "run advance must not drop accepted peer input",
+        Some(meerkat_core::types::HandlingMode::Steer),
+    );
+    let accept = {
+        let adapter = Arc::clone(&rig.adapter);
+        let session_id = rig.session_id.clone();
+        tokio::spawn(async move {
+            adapter
+                .accept_input_with_completion(&session_id, peer_input)
+                .await
+        })
+    };
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        while probe.prepare_calls.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("live-boundary preparation should start");
+
+    rig.allow_finish.notify_waiters();
+    rig.wait_for_apply_calls(2).await;
+    let successor_claim = rig
+        .adapter
+        .meerkat_machine_spine_snapshot(&rig.session_id)
+        .await
+        .expect("snapshot should remain available while preparation is pending");
+    assert_eq!(
+        successor_claim.inputs.current_run_contributors,
+        vec![peer_id.clone()],
+        "the successor run must claim the accepted peer before the stale boundary is released"
+    );
+    assert_eq!(
+        successor_claim
+            .inputs
+            .admission_order
+            .iter()
+            .find(|input| input.input_id == peer_id)
+            .and_then(|input| input.lifecycle),
+        Some(crate::input_state::InputLifecycleState::Staged),
+        "the regression must exercise revalidation after successor-run staging"
+    );
+
+    prepare_release.notify_one();
+    let (outcome, completion_handle) = tokio::time::timeout(Duration::from_secs(1), accept)
+        .await
+        .expect("acceptance should return after stale preparation is released")
+        .expect("acceptance task should not panic")
+        .expect("a run advance must preserve accepted peer input");
+    assert!(outcome.is_accepted());
+    assert!(completion_handle.is_some());
+
+    let during_successor_run = rig
+        .adapter
+        .meerkat_machine_spine_snapshot(&rig.session_id)
+        .await
+        .expect("snapshot should exist while queued fallback runs");
+    assert_eq!(
+        during_successor_run.inputs.current_run_contributors,
+        vec![peer_id],
+        "the next run must own the peer input that lost its stale live boundary"
+    );
+
+    rig.allow_finish.notify_waiters();
+    rig.wait_until_attached_and_empty().await;
+}
+
+async fn assert_faulted_boundary_terminalizes_exact_input() {
+    let result = BoundaryPreparationResult::Fault;
     let rig = InterruptYieldingTestRig::new(true, result).await;
     rig.start_busy_turn().await;
     let probe = rig.probe.clone().expect("live boundary probe installed");
@@ -16482,17 +16691,7 @@ async fn assert_boundary_failure_terminalizes_exact_input(result: BoundaryPrepar
     .await
     .expect("failure terminalization must not await publication while the active turn owns B")
     .expect_err("stale/fault boundary preparation must fail closed");
-    match result {
-        BoundaryPreparationResult::Stale => {
-            assert!(error.to_string().contains("became stale"), "{error}");
-        }
-        BoundaryPreparationResult::Fault => {
-            assert!(error.to_string().contains("preparation failed"), "{error}");
-        }
-        BoundaryPreparationResult::Unavailable => {
-            panic!("unavailable is covered by queued-fallback test")
-        }
-    }
+    assert!(error.to_string().contains("preparation failed"), "{error}");
     assert_eq!(probe.prepare_calls.load(Ordering::SeqCst), 1);
 
     let during_busy = rig
@@ -16531,13 +16730,8 @@ async fn assert_boundary_failure_terminalizes_exact_input(result: BoundaryPrepar
 }
 
 #[tokio::test]
-async fn stale_exact_boundary_terminalizes_instead_of_falling_back() {
-    assert_boundary_failure_terminalizes_exact_input(BoundaryPreparationResult::Stale).await;
-}
-
-#[tokio::test]
 async fn faulted_exact_boundary_terminalizes_instead_of_falling_back() {
-    assert_boundary_failure_terminalizes_exact_input(BoundaryPreparationResult::Fault).await;
+    assert_faulted_boundary_terminalizes_exact_input().await;
 }
 
 #[tokio::test]
@@ -26754,7 +26948,7 @@ async fn completed_run_rejects_foreign_session_witness_before_mutation() {
     drop(entry);
     assert!(
         store
-            .load_boundary_receipt(&runtime_id, &run_id, 0)
+            .load_boundary_receipt(&runtime_id, &run_id, 1)
             .await
             .unwrap()
             .is_none()
@@ -26796,7 +26990,7 @@ async fn persistent_commit_atomic_apply_failure_publishes_no_durable_terminal_st
 
     assert!(
         inner
-            .load_boundary_receipt(&runtime_id, &run_id, 0)
+            .load_boundary_receipt(&runtime_id, &run_id, 1)
             .await
             .unwrap()
             .is_none(),
@@ -26835,7 +27029,7 @@ async fn persistent_commit_success_persists_receipt_and_terminalizes_once() {
 
     assert!(
         inner
-            .load_boundary_receipt(&runtime_id, &run_id, 0)
+            .load_boundary_receipt(&runtime_id, &run_id, 1)
             .await
             .unwrap()
             .is_some(),
@@ -26851,7 +27045,7 @@ async fn persistent_commit_success_persists_receipt_and_terminalizes_once() {
     // the machine-owned per-run boundary counter; executors return an
     // unsequenced draft and cannot fabricate it.
     let persisted_receipt = inner
-        .load_boundary_receipt(&runtime_id, &run_id, 0)
+        .load_boundary_receipt(&runtime_id, &run_id, 1)
         .await
         .unwrap()
         .expect("committed receipt must be durable");
@@ -26907,6 +27101,89 @@ async fn persistent_commit_success_persists_receipt_and_terminalizes_once() {
 }
 
 #[tokio::test]
+async fn terminal_receipt_follows_live_boundary_checkpoint_without_sequence_collision() {
+    let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let store: Arc<dyn RuntimeStore> = inner.clone();
+    let (driver, runtime_id, run_id, input_id) = persistent_staged_run_driver(store).await;
+    let owner_session_id = SessionId::parse(&runtime_id.to_string()).unwrap();
+
+    let live_input = Input::Prompt(crate::input::PromptInput::new(
+        "context admitted at the active boundary",
+        Some(
+            meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+                handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
+                ..Default::default()
+            },
+        ),
+    ));
+    let live_input_id = live_input.id().clone();
+    {
+        let mut entry = driver.lock().await;
+        let resolved = entry
+            .resolve_admission_with_active_turn_boundary(&live_input, true)
+            .expect("active boundary should authorize the live input");
+        entry
+            .accept_resolved_input(live_input, resolved)
+            .await
+            .expect("live input should be durably accepted");
+        entry
+            .machine_realize_live_boundary_context_injected(
+                &run_id,
+                std::slice::from_ref(&live_input_id),
+                None,
+                &owner_session_id,
+            )
+            .await
+            .expect("live boundary checkpoint should commit");
+    }
+
+    let checkpoint = inner
+        .load_boundary_receipt(&runtime_id, &run_id, 1)
+        .await
+        .unwrap()
+        .expect("checkpoint receipt must occupy sequence 1");
+    assert_eq!(
+        checkpoint.boundary,
+        meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunCheckpoint
+    );
+
+    let session = meerkat_core::Session::with_id(owner_session_id);
+    commit_runtime_loop_run(
+        &driver,
+        run_id.clone(),
+        vec![input_id.clone()],
+        machine_terminal_receipt(run_id.clone(), vec![input_id.clone()], &session),
+        Some(BoundSessionCommit::sealed(Arc::new(session)).expect("seal terminal session")),
+        Vec::new(),
+        None,
+    )
+    .await
+    .expect("terminal receipt must follow the live checkpoint");
+
+    let terminal = inner
+        .load_boundary_receipt(&runtime_id, &run_id, 2)
+        .await
+        .unwrap()
+        .expect("terminal receipt must occupy sequence 2");
+    assert_ne!(terminal.boundary, checkpoint.boundary);
+    assert_eq!(
+        inner
+            .load_committed_boundary_receipts(&runtime_id, &run_id)
+            .await
+            .unwrap()
+            .len(),
+        2,
+        "checkpoint and terminal receipts must both remain durable"
+    );
+    let entry = driver.lock().await;
+    assert_eq!(entry.run_boundary_sequence(&run_id), 2);
+    assert_eq!(
+        entry.input_phase(&input_id),
+        Some(crate::input_state::InputLifecycleState::Consumed)
+    );
+}
+
+#[tokio::test]
 async fn persistent_commit_success_uses_one_durable_receipt_terminal_write() {
     let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
     let counting_store = Arc::new(RuntimeCommitAtomicityStore::pass_through(Arc::clone(
@@ -26936,7 +27213,7 @@ async fn persistent_commit_success_uses_one_durable_receipt_terminal_write() {
     );
     assert!(
         inner
-            .load_boundary_receipt(&runtime_id, &run_id, 0)
+            .load_boundary_receipt(&runtime_id, &run_id, 1)
             .await
             .unwrap()
             .is_some(),
@@ -27079,7 +27356,7 @@ async fn machine_terminal_carrier_validation_rejects_adversarial_witnesses_befor
 
         assert!(
             store
-                .load_boundary_receipt(&runtime_id, &run_id, 0)
+                .load_boundary_receipt(&runtime_id, &run_id, 1)
                 .await
                 .expect("load rejected carrier receipt")
                 .is_none(),
@@ -27138,7 +27415,7 @@ async fn persistent_machine_terminal_atomic_failure_publishes_no_durable_termina
     );
     assert!(
         inner
-            .load_boundary_receipt(&runtime_id, &run_id, 0)
+            .load_boundary_receipt(&runtime_id, &run_id, 1)
             .await
             .expect("load terminal receipt")
             .is_none(),
@@ -27189,11 +27466,11 @@ async fn persistent_machine_terminal_commit_recovers_consumed_input_and_failed_t
     );
     assert!(
         inner
-            .load_boundary_receipt(&runtime_id, &run_id, 0)
+            .load_boundary_receipt(&runtime_id, &run_id, 1)
             .await
             .expect("load machine-terminal receipt")
             .is_some(),
-        "machine-terminal commit must persist its sequence-zero receipt"
+        "machine-terminal commit must persist its terminal receipt"
     );
     let stored_input = inner
         .load_input_state(&runtime_id, &input_id)
