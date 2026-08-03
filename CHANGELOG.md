@@ -20,8 +20,9 @@ via cargo-semver-checks against the published baselines).
 - Mob work submission can now carry a store-owned `MobDeliveryIdentity`
   through `MobHandle::submit_work_with_mode_and_delivery_identity`. The
   runtime derives a stable work reference and uses the exact identity for
-  durable turn admission, so a scheduler can redeliver the same occurrence
-  after a crash without executing it twice.
+  durable turn admission in both turn-driven and autonomous-host modes, so a
+  scheduler can redeliver the same occurrence after a crash without executing
+  it twice.
 
 ### Changed
 
