@@ -1463,7 +1463,18 @@ impl MemberSessionDisposalArc {
         &self,
         session_id: &SessionId,
     ) -> Result<(), SessionError> {
-        let Some(adapter) = &self.runtime_adapter else {
+        Self::cancel_active_runtime_turn_before_retire_with_adapter(
+            self.runtime_adapter.as_ref(),
+            session_id,
+        )
+        .await
+    }
+
+    pub(super) async fn cancel_active_runtime_turn_before_retire_with_adapter(
+        runtime_adapter: Option<&Arc<MeerkatMachine>>,
+        session_id: &SessionId,
+    ) -> Result<(), SessionError> {
+        let Some(adapter) = runtime_adapter else {
             return Ok(());
         };
         let deadline = Instant::now() + Duration::from_secs(30);

@@ -2074,6 +2074,12 @@ impl MobOpsAdapter {
                 if let Some(latest) = Self::newest_operation_snapshot(&snapshots)
                     && Self::snapshot_is_terminal(latest)
                 {
+                    // A hard-cancel can terminalize the operation before the
+                    // member retirement reaches this adapter. Retirement still
+                    // owns release of the adapter-local binding; retaining it
+                    // would reject the replacement registry incarnation for
+                    // this same durable session.
+                    self.clear_member_binding(&member_key)?;
                     return Ok(());
                 }
                 return Ok(());
@@ -2121,9 +2127,10 @@ impl MobOpsAdapter {
     /// Complete the ops-lifecycle half of an archive-confirmed retirement.
     ///
     /// A missing binding remains fail-closed for a fresh archive. It is
-    /// idempotent only when the typed disposal authority proves the durable
-    /// archive already held: in that case an absent binding is the exact
-    /// terminal-publication retry state produced after the prior ops
+    /// idempotent only when the typed disposal authority proves either that
+    /// the durable archive already held or that the host-owned runtime release
+    /// already reached its stable terminal classification. In both cases an
+    /// absent binding is the exact retry state produced after the prior ops
     /// retirement succeeded and cleared its binding.
     pub(crate) async fn mark_member_retired_after_disposal(
         &self,
@@ -2131,8 +2138,11 @@ impl MobOpsAdapter {
         disposal: super::provisioner::MemberSessionDisposalVerdict,
     ) -> Result<(), MobError> {
         let member_key = Self::require_member_key(member_ref, "mark retired for")?;
-        if disposal == super::provisioner::MemberSessionDisposalVerdict::AlreadyArchived
-            && self.binding_for_key(&member_key).is_none()
+        if matches!(
+            disposal,
+            super::provisioner::MemberSessionDisposalVerdict::AlreadyArchived
+                | super::provisioner::MemberSessionDisposalVerdict::RuntimeReleasedOnlyHostOwned
+        ) && self.binding_for_key(&member_key).is_none()
         {
             tracing::debug!(
                 member_key = ?member_key,
@@ -2727,6 +2737,42 @@ mod tests {
             .expect("snapshot projection")
             .expect("snapshot");
         assert_eq!(retired_snapshot.status, OperationStatus::Retired);
+    }
+
+    #[tokio::test]
+    async fn retirement_releases_binding_after_operation_was_already_terminalized() {
+        let adapter = MobOpsAdapter::new();
+        let owner_bridge_session_id = SessionId::new();
+        let session_id = SessionId::new();
+        let member_ref = MemberRef::from_bridge_session_id(session_id.clone());
+        let registry = Arc::new(RuntimeOpsLifecycleRegistry::new());
+        adapter
+            .bind_session_registry(
+                session_id.clone(),
+                owner_bridge_session_id.clone(),
+                Arc::clone(&registry) as Arc<dyn OpsLifecycleRegistry>,
+            )
+            .expect("bind original session registry");
+
+        let operation_id = adapter
+            .mark_member_provisioned(&session_id, "mob/member/hard-cancelled")
+            .await
+            .expect("register member operation");
+        registry
+            .cancel_operation(&operation_id, Some("runtime hard cancel".to_string()))
+            .expect("terminalize operation before member retirement");
+
+        adapter
+            .mark_member_retired(&member_ref)
+            .await
+            .expect("retirement releases already-terminal binding");
+        adapter
+            .bind_session_registry(
+                session_id,
+                owner_bridge_session_id,
+                Arc::new(RuntimeOpsLifecycleRegistry::new()) as Arc<dyn OpsLifecycleRegistry>,
+            )
+            .expect("replacement session registry may bind");
     }
 
     #[tokio::test]
