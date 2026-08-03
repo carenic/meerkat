@@ -243,7 +243,7 @@ pub use store::{
     ExternalBindingOverlayRecord, ExternalBindingOverlayStatus, InMemoryMobEventStore,
     InMemoryMobIdentityStatusStore, InMemoryMobIdentityStore, InMemoryMobRunStore,
     InMemoryMobRuntimeMetadataStore, InMemoryMobSpecStore, InMemoryRealmProfileStore,
-    MobEventReceiver, MobEventStore, MobExternalDeliveryBeginOutcome,
+    MobDeliveryIdentity, MobEventReceiver, MobEventStore, MobExternalDeliveryBeginOutcome,
     MobExternalDeliveryCompleteOutcome, MobExternalDeliveryIdentity, MobExternalDeliveryIntent,
     MobExternalDeliveryPhase, MobExternalDeliveryRecord, MobExternalDeliveryRepairOutcome,
     MobExternalDeliveryRepairState, MobExternalDeliveryTargetKind, MobExternalDeliveryTerminal,

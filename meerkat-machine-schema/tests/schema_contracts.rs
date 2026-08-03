@@ -728,6 +728,15 @@ fn schedule_and_occurrence_machines_stay_in_canonical_coverage_manifests() {
 }
 
 #[test]
+fn occurrence_lifecycle_schema_stays_on_the_v0_8_14_wire_version() {
+    let schema = occurrence_lifecycle_machine();
+    assert_eq!(
+        schema.version, 9,
+        "0.8.15 delivery-identity work must not change the persisted occurrence schema; any future version bump requires migrate-or-replan support first"
+    );
+}
+
+#[test]
 fn kernel_seam_retains_coverage_metadata() {
     let coverage_names = canonical_composition_coverage_manifests()
         .into_iter()

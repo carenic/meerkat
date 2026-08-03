@@ -2328,6 +2328,20 @@ mod content_block_tests {
     }
 
     #[test]
+    fn tool_name_set_serialization_is_canonical_across_insertion_order() {
+        use super::ToolNameSet;
+
+        let forward: ToolNameSet = ["read_file", "shell", "web_search"].into_iter().collect();
+        let reverse: ToolNameSet = ["web_search", "shell", "read_file"].into_iter().collect();
+
+        let forward_json = serde_json::to_string(&forward).expect("serialize forward set");
+        let reverse_json = serde_json::to_string(&reverse).expect("serialize reverse set");
+
+        assert_eq!(forward_json, r#"["read_file","shell","web_search"]"#);
+        assert_eq!(reverse_json, forward_json);
+    }
+
+    #[test]
     fn tool_provenance_roundtrip_all_kinds() {
         use super::{ToolProvenance, ToolSourceKind};
 

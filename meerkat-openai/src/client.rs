@@ -115,6 +115,21 @@ fn invalid_replay(message: impl Into<String>) -> LlmError {
     }
 }
 
+/// Return only message annotations that prove OpenAI web-search provenance.
+///
+/// The Responses API includes `annotations: []` on ordinary output text and
+/// can also carry annotation kinds unrelated to web search. Presence of the
+/// field is therefore not evidence that a server-side search ran.
+fn web_search_message_annotations(value: &Value) -> Option<Vec<Value>> {
+    let annotations = value.as_array()?;
+    let web_citations = annotations
+        .iter()
+        .filter(|annotation| annotation.get("type").and_then(Value::as_str) == Some("url_citation"))
+        .cloned()
+        .collect::<Vec<_>>();
+    (!web_citations.is_empty()).then_some(web_citations)
+}
+
 fn project_openai_content_blocks(blocks: &[ContentBlock]) -> Vec<ContentBlock> {
     blocks
         .iter()
@@ -2098,7 +2113,10 @@ impl LlmClient for OpenAiClient {
                                                             if let Some(part_type) = part.get("type").and_then(|t| t.as_str()) {
                                                                 match part_type {
                                                                     "output_text" => {
-                                                                        if let Some(annotations) = part.get("annotations") {
+                                                                        if let Some(annotations) = part
+                                                                            .get("annotations")
+                                                                            .and_then(web_search_message_annotations)
+                                                                        {
                                                                             yield LlmEvent::ServerToolContent {
                                                                                 id: item.get("id")
                                                                                     .and_then(|v| v.as_str())
@@ -6006,6 +6024,43 @@ mod tests {
         assert_eq!(
             server_blocks[2].2["annotations"][0]["url"],
             "https://example.com"
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_or_non_web_annotations_do_not_claim_web_search() {
+        let payload = [
+            r#"data: {"type":"response.completed","response":{"status":"completed","output":[{"type":"message","id":"msg_123","content":[{"type":"output_text","text":"ordinary","annotations":[]},{"type":"output_text","text":" file","annotations":[{"type":"file_citation","file_id":"file_123"}]}]}],"usage":{"input_tokens":10,"output_tokens":5}}}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let (base_url, server) = spawn_openai_stub_server(payload).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5-mini",
+            vec![Message::User(UserMessage::text("answer".to_string()))],
+        );
+
+        let mut stream = client.stream(&request);
+        let mut text = String::new();
+        let mut server_blocks = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event.expect("stream event") {
+                LlmEvent::TextDelta { delta, .. } => text.push_str(&delta),
+                LlmEvent::ServerToolContent { kind, content, .. } => {
+                    server_blocks.push((kind, content));
+                }
+                LlmEvent::Done { .. } => break,
+                _ => {}
+            }
+        }
+        server.abort();
+
+        assert_eq!(text, "ordinary file");
+        assert!(
+            server_blocks.is_empty(),
+            "annotation presence alone must not assert server-side web-search provenance: {server_blocks:?}"
         );
     }
 

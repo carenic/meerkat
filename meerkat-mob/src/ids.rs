@@ -398,7 +398,7 @@ impl WorkRef {
         &self.0
     }
 
-    pub(crate) fn for_external_delivery(
+    pub(crate) fn for_delivery(
         mob_id: &MobId,
         member_id: &AgentIdentity,
         idempotency_key: &str,
@@ -408,6 +408,14 @@ impl WorkRef {
             format!("meerkat:mob:{mob_id}:member:{member_id}:delivery:{idempotency_key}")
                 .as_bytes(),
         ))
+    }
+
+    pub(crate) fn for_external_delivery(
+        mob_id: &MobId,
+        member_id: &AgentIdentity,
+        idempotency_key: &str,
+    ) -> Self {
+        Self::for_delivery(mob_id, member_id, idempotency_key)
     }
 }
 

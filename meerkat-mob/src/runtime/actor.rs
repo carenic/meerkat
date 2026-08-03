@@ -1673,9 +1673,9 @@ fn validate_member_turn_carriers(
         return Err(MobError::UnsupportedForMode {
             mode: entry.runtime_mode,
             reason: if autonomous {
-                "stable external input identity is not representable on autonomous inbox delivery"
+                "stable input identity is not representable on autonomous inbox delivery"
             } else {
-                "stable external input identity is not representable on the legacy peer-only lane"
+                "stable input identity is not representable on the legacy peer-only lane"
             }
             .to_string(),
         });
@@ -11527,7 +11527,7 @@ impl MobActor {
                         "revived replacement session '{bridge_session_id}' has no comms runtime"
                     ))
                 })?;
-            let endpoint = super::provisioner::SessionBackend::trusted_peer_spec_from_runtime(
+            let endpoint = super::provisioner::trusted_peer_spec_from_runtime(
                 &peer_name,
                 runtime.as_ref(),
             )?
@@ -14768,12 +14768,10 @@ impl MobActor {
                     .comms_runtime(&replacement_member_ref)
                     .await
                 {
-                    Some(runtime) => {
-                        super::provisioner::SessionBackend::trusted_peer_spec_from_runtime(
-                            &fallback_name,
-                            runtime.as_ref(),
-                        )?
-                    }
+                    Some(runtime) => super::provisioner::trusted_peer_spec_from_runtime(
+                        &fallback_name,
+                        runtime.as_ref(),
+                    )?,
                     None => None,
                 }
             };
@@ -35621,6 +35619,7 @@ impl MobActor {
         // ingress: DetachIngress takes runtime authority that a wedged turn
         // may retain indefinitely. The ordinary archive step repeats this
         // idempotent quiesce before terminal disposal.
+        #[cfg(feature = "runtime-adapter")]
         if let Some(session_id) = entry.member_ref.bridge_session_id() {
             super::provisioner::MemberSessionDisposalArc::cancel_active_runtime_turn_before_retire_with_adapter(
                 self.runtime_adapter.as_ref(),
@@ -45117,15 +45116,12 @@ impl MobActor {
         if let Some(identity) = &external_delivery_identity {
             identity.validate()?;
             let correlation = uuid::Uuid::parse_str(&identity.correlation_id).map_err(|_| {
-                MobError::Internal(
-                    "external-delivery correlation identity is not a UUID".to_string(),
-                )
+                MobError::Internal("delivery correlation identity is not a UUID".to_string())
             })?;
             let correlation = meerkat_core::interaction::InteractionId(correlation);
             if interaction_id.is_some_and(|existing| existing != correlation) {
                 return Err(MobError::Internal(
-                    "external-delivery correlation conflicts with supplied transcript identity"
-                        .to_string(),
+                    "delivery correlation conflicts with supplied transcript identity".to_string(),
                 ));
             }
             interaction_id = Some(correlation);
@@ -45186,8 +45182,7 @@ impl MobActor {
         {
             return Err(MobError::UnsupportedForMode {
                 mode: entry.runtime_mode,
-                reason: "stable external input identity requires a runtime-backed member"
-                    .to_string(),
+                reason: "stable input identity requires a runtime-backed member".to_string(),
             });
         }
 

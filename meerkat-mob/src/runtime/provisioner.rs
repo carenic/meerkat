@@ -1824,6 +1824,47 @@ impl MemberSessionDisposalArc {
     }
 }
 
+/// Project an exact trusted-peer descriptor from a live comms runtime.
+///
+/// This helper is independent of the optional runtime adapter. Resume and
+/// peer-recovery code must remain compilable when that adapter is disabled.
+pub(super) fn trusted_peer_spec_from_runtime(
+    fallback_name: &str,
+    runtime: &dyn CoreCommsRuntime,
+) -> Result<Option<TrustedPeerDescriptor>, MobError> {
+    let Some(peer_id) = runtime.peer_id() else {
+        return Ok(None);
+    };
+    let Some(pubkey) = runtime.public_key_bytes() else {
+        return Ok(None);
+    };
+    TrustedPeerDescriptor::validate_pubkey_for_peer_id(peer_id, &pubkey).map_err(|error| {
+        MobError::WiringError(format!("invalid peer spec for '{fallback_name}': {error}"))
+    })?;
+    let name = runtime
+        .comms_name()
+        .unwrap_or_else(|| fallback_name.to_string());
+    let name = PeerName::new(name).map_err(|error| {
+        MobError::WiringError(format!(
+            "invalid peer spec for '{fallback_name}': invalid peer name: {error}"
+        ))
+    })?;
+    let address = runtime
+        .advertised_address()
+        .unwrap_or_else(|| format!("inproc://{fallback_name}"));
+    let address = PeerAddress::parse(&address).map_err(|error| {
+        MobError::WiringError(format!(
+            "invalid peer spec for '{fallback_name}': invalid peer address: {error}"
+        ))
+    })?;
+    Ok(Some(TrustedPeerDescriptor {
+        peer_id,
+        name,
+        address,
+        pubkey,
+    }))
+}
+
 #[cfg(feature = "runtime-adapter")]
 pub(super) enum FailedResumeRuntimeAuthority<'a> {
     ExactAttachment(&'a Arc<RuntimeSessionState>),
@@ -2166,37 +2207,7 @@ impl SessionBackend {
         fallback_name: &str,
         runtime: &dyn CoreCommsRuntime,
     ) -> Result<Option<TrustedPeerDescriptor>, MobError> {
-        let Some(peer_id) = runtime.peer_id() else {
-            return Ok(None);
-        };
-        let Some(pubkey) = runtime.public_key_bytes() else {
-            return Ok(None);
-        };
-        TrustedPeerDescriptor::validate_pubkey_for_peer_id(peer_id, &pubkey).map_err(|error| {
-            MobError::WiringError(format!("invalid peer spec for '{fallback_name}': {error}"))
-        })?;
-        let name = runtime
-            .comms_name()
-            .unwrap_or_else(|| fallback_name.to_string());
-        let name = PeerName::new(name).map_err(|error| {
-            MobError::WiringError(format!(
-                "invalid peer spec for '{fallback_name}': invalid peer name: {error}"
-            ))
-        })?;
-        let address = runtime
-            .advertised_address()
-            .unwrap_or_else(|| format!("inproc://{fallback_name}"));
-        let address = PeerAddress::parse(&address).map_err(|error| {
-            MobError::WiringError(format!(
-                "invalid peer spec for '{fallback_name}': invalid peer address: {error}"
-            ))
-        })?;
-        Ok(Some(TrustedPeerDescriptor {
-            peer_id,
-            name,
-            address,
-            pubkey,
-        }))
+        trusted_peer_spec_from_runtime(fallback_name, runtime)
     }
 
     async fn runtime_session_state(

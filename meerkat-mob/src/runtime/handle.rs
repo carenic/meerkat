@@ -7195,6 +7195,52 @@ impl MobHandle {
         }
     }
 
+    /// Submit work with one stable caller-owned delivery identity.
+    ///
+    /// The identity is carried through runtime admission for crash-redelivery
+    /// deduplication. The work reference is derived from the same identity so
+    /// callers cannot accidentally provide two competing idempotency keys.
+    pub async fn submit_work_with_mode_and_delivery_identity(
+        &self,
+        runtime_id: AgentRuntimeId,
+        fence_token: FenceToken,
+        spec: WorkSpec,
+        handling_mode: HandlingMode,
+        delivery_identity: crate::store::MobDeliveryIdentity,
+    ) -> Result<WorkDeliveryReceipt, MobError> {
+        delivery_identity.validate()?;
+        let work_ref = WorkRef::for_delivery(
+            &self.definition.id,
+            &runtime_id.identity,
+            &delivery_identity.idempotency_key,
+        );
+        let cmd = Box::new(crate::mob_machine::SubmitWorkCommand {
+            runtime_id: runtime_id.clone(),
+            fence_token,
+            work_ref: work_ref.clone(),
+            spec,
+            handling_mode,
+            external_delivery_identity: Some(delivery_identity),
+            turn_metadata: None,
+            event_tx: None,
+            completion_tx: None,
+            llm_identity_applied_tx: None,
+            ack_mode: crate::mob_machine::SubmitWorkAckMode::IngressAccepted,
+        });
+        match self
+            .execute_machine_command(MobMachineCommand::SubmitWork(cmd))
+            .await?
+        {
+            MobMachineCommandResult::WorkReceipt { work_ref: ref_out } => Ok(WorkDeliveryReceipt {
+                work_ref: ref_out,
+                runtime_id,
+            }),
+            _ => Err(MobError::Internal(
+                "unexpected command result variant".into(),
+            )),
+        }
+    }
+
     /// Cancel a previously submitted unit of work.
     ///
     /// Per-unit cancellation has no backing work-tracking ledger, so this

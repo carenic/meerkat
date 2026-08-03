@@ -1315,9 +1315,18 @@ where
             return Ok(ResumeSessionLoad::Absent);
         };
         let runtime_state = self.persisted_runtime_state(session_id).await?;
-        let archived = session
-            .lifecycle_terminal()
-            .is_some_and(meerkat_core::SessionLifecycleTerminal::is_archived);
+        let store_archived = self
+            .session_archived_by_authority(session_id, &session)
+            .await?;
+        // Current runtimes own lifecycle in RuntimeStore. An imported
+        // pre-runtime document has no such row, so its machine-authored
+        // terminal remains the only lifecycle authority until revival mints
+        // the current runtime representation.
+        let imported_document_archived = runtime_state.is_none()
+            && session
+                .lifecycle_terminal()
+                .is_some_and(meerkat_core::SessionLifecycleTerminal::is_archived);
+        let archived = store_archived || imported_document_archived;
         if !archived {
             // A Retired runtime over a non-archived document stays revivable,
             // preserving the pre-fix behaviour for that shape.
@@ -1332,8 +1341,14 @@ where
             Some(meerkat_runtime::RuntimeState::Retired | meerkat_runtime::RuntimeState::Idle) => {
                 Ok(ResumeSessionLoad::Revivable(Box::new(session)))
             }
-            // Everything else (live/attached/running, or no runtime record at
-            // all) is unproven. Refuse, but say so truthfully.
+            // Pre-runtime-store imports can carry a machine-authored archived
+            // document without any runtime row. Absence of runtime authority
+            // proves there is no attached executor to race; the retained
+            // document is therefore the sole authority and may drive the
+            // existing ReviveArchivedSessionDocument transition.
+            None => Ok(ResumeSessionLoad::Revivable(Box::new(session))),
+            // Live, attached, or running state is not quiescent. Refuse, but
+            // say so truthfully.
             other => Ok(ResumeSessionLoad::ArchivedNotRevivable {
                 runtime_state: other,
             }),
