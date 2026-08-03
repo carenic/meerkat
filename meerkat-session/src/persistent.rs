@@ -2361,14 +2361,15 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         Ok(())
     }
 
-    /// Whether RuntimeStore currently classifies this session as archived.
+    /// Whether RuntimeStore has committed an absorbing archive terminal for
+    /// this session.
     ///
-    /// A current machine lifecycle row is authoritative. Its live states
-    /// override an older archived catalog projection after machine-authorized
-    /// revival, while Retired and Destroyed remain archived. Only an imported
-    /// document with no machine lifecycle row falls back to the catalog fact.
-    /// The caller-supplied Session and the external SessionStore projection
-    /// are never authority.
+    /// There are two bounded RuntimeStore-owned projections of that terminal:
+    /// the catalog entry committed atomically with the physical session
+    /// authority, and the machine lifecycle row. Archive is absorbing, so
+    /// either committed terminal is sufficient during the short interval
+    /// between the document and lifecycle commits. The caller-supplied
+    /// Session and the external SessionStore projection are never authority.
     pub async fn session_archived_by_authority(
         &self,
         id: &SessionId,
@@ -2393,14 +2394,6 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         id: &SessionId,
     ) -> Result<bool, SessionError> {
         let runtime_id = Self::runtime_id_for_session(id);
-        if let Some(runtime_state) =
-            Self::load_runtime_state_for_session(&self.runtime_store, id).await?
-        {
-            return Ok(matches!(
-                runtime_state,
-                RuntimeState::Retired | RuntimeState::Destroyed
-            ));
-        }
         let catalog_archived = self
             .runtime_store
             .load_runtime_session_catalog_entry(&runtime_id)
@@ -2414,7 +2407,13 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 entry.lifecycle_terminal()
                     == Some(meerkat_core::SessionLifecycleTerminal::Archived)
             });
-        Ok(catalog_archived)
+        if catalog_archived {
+            return Ok(true);
+        }
+        Ok(matches!(
+            Self::load_runtime_state_for_session(&self.runtime_store, id).await?,
+            Some(RuntimeState::Retired | RuntimeState::Destroyed)
+        ))
     }
 
     fn runtime_id_for_session(id: &SessionId) -> LogicalRuntimeId {
@@ -8372,6 +8371,57 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 id: session.id().clone(),
             });
         }
+        if archived_resume_allowed
+            && let Some(session) = req
+                .build
+                .as_mut()
+                .and_then(|build| build.resume_session.as_mut())
+            && session.try_lifecycle_terminal().map_err(|error| {
+                SessionError::Agent(AgentError::InternalError(format!(
+                    "archived resume session {} has malformed lifecycle terminal: {error}",
+                    session.id()
+                )))
+            })? == Some(SessionLifecycleTerminal::Archived)
+        {
+            let mut authority = SessionDocumentMachineAuthority::new();
+            let document_key = SessionDocumentKey::new(session.id().to_string());
+            authority
+                .recover_session_lifecycle_terminal(
+                    document_key.clone(),
+                    SessionLifecycleTerminal::Archived.into(),
+                )
+                .map_err(|error| {
+                    SessionError::Agent(AgentError::InternalError(format!(
+                        "generated session document authority rejected archived lifecycle recovery for session {}: {error}",
+                        session.id()
+                    )))
+                })?;
+            let effects = authority
+                .revive_archived_session_document(document_key)
+                .map_err(|error| {
+                    SessionError::Agent(AgentError::InternalError(format!(
+                        "generated session document authority rejected revival for session {}: {error}",
+                        session.id()
+                    )))
+                })?;
+            if !effects
+                .iter()
+                .any(|effect| matches!(effect, SessionDocumentEffect::SessionRevivalResolved))
+            {
+                return Err(SessionError::Agent(AgentError::InternalError(format!(
+                    "generated session document authority emitted no revival verdict for session {}",
+                    session.id()
+                ))));
+            }
+            session
+                .set_lifecycle_terminal(SessionLifecycleTerminal::Active)
+                .map_err(|error| {
+                    SessionError::Agent(AgentError::InternalError(format!(
+                        "failed to realize generated session revival for session {}: {error}",
+                        session.id()
+                    )))
+                })?;
+        }
         let materialization_session_id = runtime_binding_session_id
             .as_ref()
             .or(resume_session_id.as_ref());
@@ -9030,13 +9080,12 @@ impl<B: SessionAgentBuilder + 'static> SessionService for PersistentSessionServi
             })?;
         let mut summaries: Vec<SessionSummary> = catalog
             .into_iter()
-            .filter(|entry| match entry.runtime_state() {
-                Some(RuntimeState::Retired | RuntimeState::Destroyed) => false,
-                Some(_) => true,
-                None => {
-                    entry.lifecycle_terminal()
-                        != Some(meerkat_core::SessionLifecycleTerminal::Archived)
-                }
+            .filter(|entry| {
+                entry.lifecycle_terminal() != Some(meerkat_core::SessionLifecycleTerminal::Archived)
+                    && !matches!(
+                        entry.runtime_state(),
+                        Some(RuntimeState::Retired | RuntimeState::Destroyed)
+                    )
             })
             .map(|entry| SessionSummary {
                 session_id: entry.session_id().clone(),

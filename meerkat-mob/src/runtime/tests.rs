@@ -9684,6 +9684,11 @@ async fn archived_document_without_runtime_record_is_revivable() {
         .await
         .expect("load resumed authority")
         .expect("resumed session remains durable");
+    assert_eq!(
+        resumed.lifecycle_terminal(),
+        Some(meerkat_core::SessionLifecycleTerminal::Active),
+        "the generated revival verdict must be realized in durable document authority"
+    );
     assert!(
         resumed.messages().iter().any(|message| {
             matches!(
