@@ -13480,6 +13480,18 @@ mod tests {
     }
 
     impl meerkat_core::event_injector::SubscribableInjector for NoopSubscribableInjector {
+        fn inject_with_delivery_identity(
+            &self,
+            _input_identity: meerkat_core::service::StartTurnInputIdentity,
+            _objective_id: Option<meerkat_core::interaction::ObjectiveId>,
+            _content: meerkat_core::types::ContentInput,
+            _source: meerkat_core::PlainEventSource,
+            _handling_mode: meerkat_core::types::HandlingMode,
+            _render_metadata: Option<meerkat_core::types::RenderMetadata>,
+        ) -> Result<(), meerkat_core::event_injector::EventInjectorError> {
+            Err(meerkat_core::event_injector::EventInjectorError::Closed)
+        }
+
         fn inject_with_subscription(
             &self,
             _content: meerkat_core::types::ContentInput,

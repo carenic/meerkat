@@ -390,6 +390,7 @@ impl IngressClassificationContext {
                 blocks,
                 render_metadata,
                 objective_id,
+                input_identity,
             } => {
                 let interaction_id = interaction_id.unwrap_or_else(Uuid::new_v4);
                 let facts = PeerIngressPlainEventFacts {
@@ -404,6 +405,7 @@ impl IngressClassificationContext {
                     source.to_string(),
                     classification.class,
                     classification.kind,
+                    input_identity.clone(),
                 );
                 Some(PreparedIngressItem {
                     raw_item_id: InteractionId(interaction_id),
@@ -427,6 +429,7 @@ impl IngressClassificationContext {
                         blocks,
                         render_metadata,
                         objective_id,
+                        input_identity,
                     },
                 })
             }
@@ -1354,6 +1357,7 @@ mod tests {
             handling_mode: meerkat_core::types::HandlingMode::Queue,
             interaction_id: None,
             render_metadata: None,
+            input_identity: None,
         });
         assert!(
             plain_result.is_none(),
@@ -1560,6 +1564,7 @@ mod tests {
             handling_mode: meerkat_core::types::HandlingMode::Queue,
             interaction_id: None,
             render_metadata: None,
+            input_identity: None,
         };
         let result = ctx.prepare(item).expect("should classify");
         assert_eq!(result.class, PeerInputClass::PlainEvent);
@@ -1585,6 +1590,7 @@ mod tests {
                 handling_mode: meerkat_core::types::HandlingMode::Queue,
                 interaction_id: None,
                 render_metadata: None,
+                input_identity: None,
             })
             .expect("machine accepted plain event should prepare");
 
@@ -1614,6 +1620,7 @@ mod tests {
             handling_mode: meerkat_core::types::HandlingMode::Queue,
             interaction_id: None,
             render_metadata: None,
+            input_identity: None,
         });
 
         assert!(
@@ -1634,6 +1641,7 @@ mod tests {
             interaction_id: None,
             blocks: None,
             render_metadata: None,
+            input_identity: None,
         };
         let result = ctx.prepare(item).expect("should classify");
         assert_eq!(result.class, PeerInputClass::PlainEvent);
@@ -1718,6 +1726,7 @@ mod tests {
                 interaction_id: None,
                 blocks: None,
                 render_metadata: None,
+                input_identity: None,
             })
             .expect("plain event should prepare");
 

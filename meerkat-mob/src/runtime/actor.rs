@@ -1669,15 +1669,11 @@ fn validate_member_turn_carriers(
         );
     let autonomous = entry.runtime_mode == crate::MobRuntimeMode::AutonomousHost;
 
-    if has_external_delivery_identity && !remotely_hosted && (autonomous || peer_only) {
+    if has_external_delivery_identity && !remotely_hosted && peer_only {
         return Err(MobError::UnsupportedForMode {
             mode: entry.runtime_mode,
-            reason: if autonomous {
-                "stable input identity is not representable on autonomous inbox delivery"
-            } else {
-                "stable input identity is not representable on the legacy peer-only lane"
-            }
-            .to_string(),
+            reason: "stable input identity is not representable on the legacy peer-only lane"
+                .to_string(),
         });
     }
 
@@ -46515,14 +46511,27 @@ impl MobActor {
                 // runtime transcript identity) carries the SAME id as the
                 // host's live interaction frames instead of minting a fresh
                 // unrelated one.
-                let inject_result = injector.inject_with_turn_identity(
-                    interaction_id,
-                    objective_id,
-                    content,
-                    meerkat_core::PlainEventSource::Rpc,
-                    handling_mode,
-                    render_metadata,
-                );
+                let inject_result = match external_delivery_identity {
+                    Some(identity) => injector.inject_with_delivery_identity(
+                        meerkat_core::service::StartTurnInputIdentity {
+                            idempotency_key: identity.idempotency_key,
+                            correlation_id: identity.correlation_id,
+                        },
+                        objective_id,
+                        content,
+                        meerkat_core::PlainEventSource::Rpc,
+                        handling_mode,
+                        render_metadata,
+                    ),
+                    None => injector.inject_with_turn_identity(
+                        interaction_id,
+                        objective_id,
+                        content,
+                        meerkat_core::PlainEventSource::Rpc,
+                        handling_mode,
+                        render_metadata,
+                    ),
+                };
                 inject_result.map_err(|error| {
                     MobError::Internal(format!(
                         "autonomous dispatch inject failed for '{}': {}",

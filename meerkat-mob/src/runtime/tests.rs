@@ -3045,6 +3045,18 @@ impl EventInjector for CountingInjector {
 }
 
 impl SubscribableInjector for CountingInjector {
+    fn inject_with_delivery_identity(
+        &self,
+        _input_identity: meerkat_core::service::StartTurnInputIdentity,
+        _objective_id: Option<meerkat_core::interaction::ObjectiveId>,
+        _content: meerkat_core::types::ContentInput,
+        _source: PlainEventSource,
+        _handling_mode: meerkat_core::types::HandlingMode,
+        _render_metadata: Option<meerkat_core::types::RenderMetadata>,
+    ) -> Result<(), EventInjectorError> {
+        Err(EventInjectorError::Closed)
+    }
+
     fn inject_with_subscription(
         &self,
         body: meerkat_core::types::ContentInput,
@@ -43443,6 +43455,119 @@ async fn internal_submit_work_carries_stable_delivery_identity_to_runtime_admiss
             .len(),
         baseline + 1,
         "redelivery under the same stable identity must not execute twice"
+    );
+}
+
+#[tokio::test]
+async fn autonomous_internal_submit_work_carries_stable_delivery_identity_to_runtime_admission() {
+    let _serial = lock_real_comms_tests();
+    let (handle, service) =
+        create_test_mob_with_runtime_backed_real_comms(sample_definition()).await;
+    service.set_keep_alive_turns_complete_immediately(true);
+    let member_id = AgentIdentity::from("autonomous-delivery-identity-worker");
+    let session_id = handle
+        .spawn_with_options(
+            ProfileName::from("worker"),
+            member_id.clone(),
+            None,
+            Some(crate::MobRuntimeMode::AutonomousHost),
+            None,
+        )
+        .await
+        .expect("spawn autonomous worker")
+        .bridge_session_id()
+        .expect("runtime-backed member")
+        .clone();
+    handle
+        .wait_for_ready(Some(Duration::from_secs(2)))
+        .await
+        .expect("startup should settle");
+    handle
+        .wait_for_members_kickoff_complete(
+            std::slice::from_ref(&member_id),
+            Some(Duration::from_secs(2)),
+        )
+        .await
+        .expect("autonomous kickoff should settle before stable delivery");
+    let entry = handle
+        .get_member(&member_id)
+        .await
+        .expect("read member")
+        .expect("member exists");
+    let baseline = service
+        .applied_runtime_contributing_input_ids(&session_id)
+        .await
+        .len();
+    let delivery_identity = crate::MobDeliveryIdentity::new(
+        "schedule:autonomous-report:occurrence:2026-08-03T14:00:00Z",
+        "019fdcda-836e-70b4-9d89-78e629a77c31",
+    )
+    .expect("valid delivery identity");
+    let expected_work_ref = WorkRef::for_delivery(
+        handle.mob_id(),
+        &member_id,
+        &delivery_identity.idempotency_key,
+    );
+
+    let receipt = handle
+        .submit_work_with_mode_and_delivery_identity(
+            entry.agent_runtime_id.clone(),
+            entry.fence_token,
+            WorkSpec::new("deliver autonomous scheduled work", WorkOrigin::Internal),
+            HandlingMode::Queue,
+            delivery_identity.clone(),
+        )
+        .await
+        .expect("stable autonomous delivery should be admitted");
+    assert_eq!(receipt.work_ref, expected_work_ref);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while service
+            .applied_runtime_contributing_input_ids(&session_id)
+            .await
+            .len()
+            < baseline + 1
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stable autonomous delivery should reach runtime input admission");
+    let stored = <meerkat_runtime::MeerkatMachine as meerkat_runtime::service_ext::SessionServiceRuntimeExt>::input_state_by_idempotency_key(
+        service.runtime_adapter.as_ref(),
+        &session_id,
+        &delivery_identity.idempotency_key,
+    )
+    .await
+    .expect("runtime identity lookup")
+    .expect("stable autonomous delivery must be indexed at admission");
+    assert_eq!(
+        stored
+            .state
+            .idempotency_key
+            .as_ref()
+            .map(ToString::to_string),
+        Some(delivery_identity.idempotency_key.clone())
+    );
+
+    let duplicate = handle
+        .submit_work_with_mode_and_delivery_identity(
+            entry.agent_runtime_id,
+            entry.fence_token,
+            WorkSpec::new("deliver autonomous scheduled work", WorkOrigin::Internal),
+            HandlingMode::Queue,
+            delivery_identity,
+        )
+        .await
+        .expect("autonomous crash redelivery should deduplicate");
+    assert_eq!(duplicate.work_ref, receipt.work_ref);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        service
+            .applied_runtime_contributing_input_ids(&session_id)
+            .await
+            .len(),
+        baseline + 1,
+        "autonomous redelivery under the same stable identity must not execute twice"
     );
 }
 

@@ -290,6 +290,10 @@ pub enum InboxItem {
         render_metadata: Option<RenderMetadata>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         objective_id: Option<meerkat_core::interaction::ObjectiveId>,
+        /// Caller-stable runtime input identity. When present, classification
+        /// must preserve it into the durable runtime input header.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        input_identity: Option<meerkat_core::service::StartTurnInputIdentity>,
     },
 }
 
@@ -701,6 +705,7 @@ mod tests {
                 interaction_id: Some(Uuid::new_v4()),
                 blocks: None,
                 render_metadata: None,
+                input_identity: None,
             },
         ];
         for item in items {
@@ -995,6 +1000,7 @@ mod tests {
             interaction_id: None,
             blocks: None,
             render_metadata: None,
+            input_identity: None,
         };
 
         // JSON round-trip
@@ -1022,6 +1028,7 @@ mod tests {
                 interaction_id: None,
                 blocks: None,
                 render_metadata: None,
+                input_identity: None,
             },
             InboxItem::PlainEvent {
                 objective_id: None,
@@ -1031,6 +1038,7 @@ mod tests {
                 interaction_id: None,
                 blocks: None,
                 render_metadata: None,
+                input_identity: None,
             },
             InboxItem::PlainEvent {
                 objective_id: None,
@@ -1040,6 +1048,7 @@ mod tests {
                 interaction_id: None,
                 blocks: None,
                 render_metadata: None,
+                input_identity: None,
             },
             InboxItem::PlainEvent {
                 objective_id: None,
@@ -1049,6 +1058,7 @@ mod tests {
                 interaction_id: None,
                 blocks: None,
                 render_metadata: None,
+                input_identity: None,
             },
         ];
         for item in items {
@@ -1095,6 +1105,7 @@ mod tests {
             interaction_id: Some(id),
             blocks: None,
             render_metadata: None,
+            input_identity: None,
         };
 
         let json = serde_json::to_string(&item).unwrap();
@@ -1117,6 +1128,7 @@ mod tests {
             interaction_id: Some(id),
             blocks: None,
             render_metadata: None,
+            input_identity: None,
         };
 
         let mut buf = Vec::new();
@@ -1135,6 +1147,7 @@ mod tests {
             interaction_id: None,
             blocks: None,
             render_metadata: None,
+            input_identity: None,
         };
 
         let json = serde_json::to_string(&item).unwrap();

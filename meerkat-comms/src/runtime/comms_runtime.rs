@@ -3676,6 +3676,7 @@ impl CommsRuntime {
                 blocks,
                 render_metadata: None,
                 objective_id: None,
+                input_identity: None,
             })
         {
             self.abandon_interaction_stream(
@@ -7711,6 +7712,7 @@ mod tests {
                 handling_mode: meerkat_core::types::HandlingMode::Queue,
                 interaction_id: Some(interaction_id),
                 render_metadata: None,
+                input_identity: None,
             })
             .into_result()
             .unwrap();
@@ -7742,6 +7744,7 @@ mod tests {
                 handling_mode: meerkat_core::types::HandlingMode::Steer,
                 interaction_id: None,
                 render_metadata: Some(render_metadata.clone()),
+                input_identity: None,
             })
             .into_result()
             .unwrap();
@@ -7774,6 +7777,7 @@ mod tests {
                 handling_mode: meerkat_core::types::HandlingMode::Queue,
                 interaction_id: None,
                 render_metadata: None,
+                input_identity: None,
             })
             .into_result()
             .unwrap();
@@ -7838,6 +7842,7 @@ mod tests {
                 handling_mode: meerkat_core::types::HandlingMode::Queue,
                 interaction_id: None,
                 render_metadata: None,
+                input_identity: None,
             })
             .into_result()
             .unwrap();
