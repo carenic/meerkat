@@ -33038,6 +33038,57 @@ async fn test_force_cancel_member_mid_provider_call_is_idempotent() {
         .expect("release blocked force-cancel test turn");
 }
 
+/// Retirement must quiesce a provider turn before ingress detach. A provider
+/// future that never returns used to retain runtime authority and wedge the
+/// retire command indefinitely.
+#[tokio::test]
+async fn test_retire_quiesces_mid_provider_call_before_ingress_detach() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let member_id = AgentIdentity::from("retire-wedged");
+    handle
+        .spawn_with_options(
+            ProfileName::from("lead"),
+            member_id.clone(),
+            None,
+            Some(crate::MobRuntimeMode::TurnDriven),
+            None,
+        )
+        .await
+        .expect("spawn retirement target");
+
+    service.set_start_turn_delay_ms(600_000);
+    let baseline_start_turn = service.start_turn_call_count();
+    handle
+        .member(&member_id)
+        .await
+        .expect("member handle")
+        .send("wedge before retire", HandlingMode::Queue)
+        .await
+        .expect("active turn admission");
+    wait_for_start_turn_call_count(
+        service.as_ref(),
+        baseline_start_turn + 1,
+        "retirement target should reach the provider call",
+    )
+    .await;
+
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        handle.retire(AgentIdentity::from(member_id.as_str())),
+    )
+    .await
+    .expect("retirement must not wedge behind ingress detach")
+    .expect("retirement should succeed after hard-cancel escalation");
+    assert!(
+        handle
+            .get_member(&AgentIdentity::from(member_id.as_str()))
+            .await
+            .expect("read roster")
+            .is_none(),
+        "retirement must remove the quiesced member"
+    );
+}
+
 #[tokio::test]
 async fn test_runtime_adapter_cancel_all_work_rejects_unsupported_boundary_cancel() {
     let (handle, service) = create_test_mob(sample_definition()).await;

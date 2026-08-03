@@ -35616,6 +35616,20 @@ impl MobActor {
             .await?;
         }
 
+        // The durable retirement-start event above is the retry anchor. Stop
+        // any active provider turn before publishing Retire and detaching its
+        // ingress: DetachIngress takes runtime authority that a wedged turn
+        // may retain indefinitely. The ordinary archive step repeats this
+        // idempotent quiesce before terminal disposal.
+        if let Some(session_id) = entry.member_ref.bridge_session_id() {
+            super::provisioner::MemberSessionDisposalArc::cancel_active_runtime_turn_before_retire_with_adapter(
+                self.runtime_adapter.as_ref(),
+                session_id,
+            )
+            .await
+            .map_err(MobError::from)?;
+        }
+
         let detach_obligations = if let Some(prepared_retire) = prepared_retire {
             let obligations =
                 crate::generated::protocol_mob_destroying_session_ingress::extract_obligations(
