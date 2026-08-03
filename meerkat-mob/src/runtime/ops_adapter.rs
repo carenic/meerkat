@@ -2127,9 +2127,10 @@ impl MobOpsAdapter {
     /// Complete the ops-lifecycle half of an archive-confirmed retirement.
     ///
     /// A missing binding remains fail-closed for a fresh archive. It is
-    /// idempotent only when the typed disposal authority proves the durable
-    /// archive already held: in that case an absent binding is the exact
-    /// terminal-publication retry state produced after the prior ops
+    /// idempotent only when the typed disposal authority proves either that
+    /// the durable archive already held or that the host-owned runtime release
+    /// already reached its stable terminal classification. In both cases an
+    /// absent binding is the exact retry state produced after the prior ops
     /// retirement succeeded and cleared its binding.
     pub(crate) async fn mark_member_retired_after_disposal(
         &self,
@@ -2137,8 +2138,11 @@ impl MobOpsAdapter {
         disposal: super::provisioner::MemberSessionDisposalVerdict,
     ) -> Result<(), MobError> {
         let member_key = Self::require_member_key(member_ref, "mark retired for")?;
-        if disposal == super::provisioner::MemberSessionDisposalVerdict::AlreadyArchived
-            && self.binding_for_key(&member_key).is_none()
+        if matches!(
+            disposal,
+            super::provisioner::MemberSessionDisposalVerdict::AlreadyArchived
+                | super::provisioner::MemberSessionDisposalVerdict::RuntimeReleasedOnlyHostOwned
+        ) && self.binding_for_key(&member_key).is_none()
         {
             tracing::debug!(
                 member_key = ?member_key,
