@@ -2361,15 +2361,14 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         Ok(())
     }
 
-    /// Whether RuntimeStore has committed an absorbing archive terminal for
-    /// this session.
+    /// Whether RuntimeStore currently classifies this session as archived.
     ///
-    /// There are two bounded RuntimeStore-owned projections of that terminal:
-    /// the catalog entry committed atomically with the physical session
-    /// authority, and the machine lifecycle row. Archive is absorbing, so
-    /// either committed terminal is sufficient during the short interval
-    /// between the document and lifecycle commits. The caller-supplied
-    /// Session and the external SessionStore projection are never authority.
+    /// A current machine lifecycle row is authoritative. Its live states
+    /// override an older archived catalog projection after machine-authorized
+    /// revival, while Retired and Destroyed remain archived. Only an imported
+    /// document with no machine lifecycle row falls back to the catalog fact.
+    /// The caller-supplied Session and the external SessionStore projection
+    /// are never authority.
     pub async fn session_archived_by_authority(
         &self,
         id: &SessionId,
@@ -2394,6 +2393,14 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         id: &SessionId,
     ) -> Result<bool, SessionError> {
         let runtime_id = Self::runtime_id_for_session(id);
+        if let Some(runtime_state) =
+            Self::load_runtime_state_for_session(&self.runtime_store, id).await?
+        {
+            return Ok(matches!(
+                runtime_state,
+                RuntimeState::Retired | RuntimeState::Destroyed
+            ));
+        }
         let catalog_archived = self
             .runtime_store
             .load_runtime_session_catalog_entry(&runtime_id)
@@ -2407,13 +2414,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 entry.lifecycle_terminal()
                     == Some(meerkat_core::SessionLifecycleTerminal::Archived)
             });
-        if catalog_archived {
-            return Ok(true);
-        }
-        Ok(matches!(
-            Self::load_runtime_state_for_session(&self.runtime_store, id).await?,
-            Some(RuntimeState::Retired | RuntimeState::Destroyed)
-        ))
+        Ok(catalog_archived)
     }
 
     fn runtime_id_for_session(id: &SessionId) -> LogicalRuntimeId {
@@ -9029,12 +9030,13 @@ impl<B: SessionAgentBuilder + 'static> SessionService for PersistentSessionServi
             })?;
         let mut summaries: Vec<SessionSummary> = catalog
             .into_iter()
-            .filter(|entry| {
-                entry.lifecycle_terminal() != Some(meerkat_core::SessionLifecycleTerminal::Archived)
-                    && !matches!(
-                        entry.runtime_state(),
-                        Some(RuntimeState::Retired | RuntimeState::Destroyed)
-                    )
+            .filter(|entry| match entry.runtime_state() {
+                Some(RuntimeState::Retired | RuntimeState::Destroyed) => false,
+                Some(_) => true,
+                None => {
+                    entry.lifecycle_terminal()
+                        != Some(meerkat_core::SessionLifecycleTerminal::Archived)
+                }
             })
             .map(|entry| SessionSummary {
                 session_id: entry.session_id().clone(),

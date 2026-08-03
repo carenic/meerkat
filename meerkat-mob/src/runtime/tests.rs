@@ -9567,7 +9567,10 @@ async fn archived_document_without_runtime_record_is_revivable() {
     let blob_store: Arc<dyn meerkat_core::BlobStore> =
         Arc::new(meerkat_store::MemoryBlobStore::new());
     let service = Arc::new(meerkat_session::PersistentSessionService::new(
-        PersistentMockBuilder,
+        OverlayProbeSessionAgentBuilder {
+            provider_visible_tools: Arc::new(Mutex::new(Vec::new())),
+            provider_turn_overlays: Arc::new(Mutex::new(Vec::new())),
+        },
         16,
         session_store,
         runtime_store_dyn,
@@ -9613,6 +9616,88 @@ async fn archived_document_without_runtime_record_is_revivable() {
         Some(meerkat_core::SessionLifecycleTerminal::Archived),
         "classification must preserve the terminal for the machine-owned revive transition"
     );
+
+    let adapter = service
+        .runtime_adapter()
+        .expect("persistent service runtime adapter");
+    let provisioner =
+        super::provisioner::SessionBackend::new(service.clone(), Some(adapter.clone()), None);
+    let receipt = provisioner
+        .provision_member(super::provisioner::ProvisionMemberRequest {
+            session_origin: super::provisioner::ProvisionSessionOrigin::ResumedDurable,
+            create_session: CreateSessionRequest {
+                injected_context: Vec::new(),
+                model: "claude-sonnet-4-5".to_string(),
+                prompt: "resume imported archived document".to_string().into(),
+                system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+                max_tokens: None,
+                event_tx: None,
+                build: Some(meerkat_core::service::SessionBuildOptions {
+                    resume_session: Some(*revivable),
+                    comms_name: Some("test-mob/worker/imported-archive".to_string()),
+                    keep_alive: true,
+                    ..Default::default()
+                }),
+                initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+                deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+                labels: None,
+            },
+            binding: test_external_binding("imported-archive-worker"),
+            peer_name: "imported-archive-worker".to_string(),
+            owner_bridge_session_id: None,
+            ops_registry: None,
+            generated_self_owned_operation_owner: Some(session_id.clone()),
+            runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
+        })
+        .await
+        .expect("materialize imported archived document through the real resume transaction");
+
+    let runtime_state_after_resume =
+        meerkat_runtime::store::load_runtime_state(runtime_store.as_ref(), &runtime_id)
+            .await
+            .expect("inspect revived runtime state");
+    assert!(
+        adapter.contains_session(&session_id).await,
+        "the revived actor must remain registered with the runtime adapter; runtime state: {runtime_state_after_resume:?}"
+    );
+    assert!(
+        service
+            .has_live_session(&session_id)
+            .await
+            .expect("inspect revived actor"),
+        "the product resume path must reconstruct a live actor; runtime state: {runtime_state_after_resume:?}"
+    );
+    SessionService::read(service.as_ref(), &session_id)
+        .await
+        .expect("revived imported session must be publicly readable");
+    let listed = SessionService::list(service.as_ref(), SessionQuery::default())
+        .await
+        .expect("list revived imported session");
+    assert!(
+        listed
+            .iter()
+            .any(|summary| summary.session_id == session_id),
+        "a live runtime must override its imported archived catalog projection"
+    );
+    let resumed = service
+        .load_authoritative_session(&session_id)
+        .await
+        .expect("load resumed authority")
+        .expect("resumed session remains durable");
+    assert!(
+        resumed.messages().iter().any(|message| {
+            matches!(
+                message,
+                Message::User(user) if user.text_content() == "retained pre-runtime transcript"
+            )
+        }),
+        "revival must preserve the imported transcript"
+    );
+
+    provisioner
+        .retire_member(&receipt.member_ref)
+        .await
+        .expect("retire revived imported session");
 }
 
 fn overlay_probe_visible_tools(overlay: Option<&TurnToolOverlay>) -> Vec<meerkat_core::ToolName> {
