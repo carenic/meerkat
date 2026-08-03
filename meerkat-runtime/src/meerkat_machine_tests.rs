@@ -16592,6 +16592,28 @@ async fn stale_exact_boundary_preserves_twenty_five_peer_fan_in_inputs() {
 
 #[tokio::test]
 async fn run_advancing_during_live_boundary_preparation_preserves_successor_claim() {
+    assert!(
+        crate::meerkat_machine::dispatch_ingress::LiveBoundaryInputDisposition::SuccessorClaimed {
+            wake_needed: true,
+        }
+        .suppress_cancel(),
+        "successor ownership must suppress the stale old-run cancel"
+    );
+    assert!(
+        !crate::meerkat_machine::dispatch_ingress::LiveBoundaryInputDisposition::SuccessorClaimed {
+            wake_needed: true,
+        }
+        .suppress_wake(),
+        "retired successor ownership must retain the runtime wake liveness edge"
+    );
+    assert!(
+        crate::meerkat_machine::dispatch_ingress::LiveBoundaryInputDisposition::SuccessorClaimed {
+            wake_needed: false,
+        }
+        .suppress_wake(),
+        "an active successor already owns its executor wake"
+    );
+
     let prepare_release = Arc::new(Notify::new());
     let probe = InterruptYieldingProbe::blocked(
         BoundaryPreparationResult::Stale,
@@ -16649,6 +16671,23 @@ async fn run_advancing_during_live_boundary_preparation_preserves_successor_clai
         "the regression must exercise revalidation after successor-run staging"
     );
 
+    rig.allow_finish.notify_waiters();
+    rig.wait_until_attached_and_empty().await;
+
+    let sentinel = make_progress_input("successor-claim wake sentinel");
+    let sentinel_id = sentinel.id().clone();
+    let sentinel_outcome = rig
+        .adapter
+        .accept_input_without_wake(&rig.session_id, sentinel)
+        .await
+        .expect("sentinel should queue without independently waking the runtime loop");
+    assert!(sentinel_outcome.is_accepted());
+    assert_eq!(
+        rig.apply_calls.load(Ordering::SeqCst),
+        2,
+        "the sentinel must remain queued until successor-claim revalidation retains the wake"
+    );
+
     prepare_release.notify_one();
     let (outcome, completion_handle) = tokio::time::timeout(Duration::from_secs(1), accept)
         .await
@@ -16658,15 +16697,16 @@ async fn run_advancing_during_live_boundary_preparation_preserves_successor_clai
     assert!(outcome.is_accepted());
     assert!(completion_handle.is_some());
 
-    let during_successor_run = rig
+    rig.wait_for_apply_calls(3).await;
+    let during_sentinel_run = rig
         .adapter
         .meerkat_machine_spine_snapshot(&rig.session_id)
         .await
-        .expect("snapshot should exist while queued fallback runs");
+        .expect("snapshot should exist while the retained wake runs the sentinel");
     assert_eq!(
-        during_successor_run.inputs.current_run_contributors,
-        vec![peer_id],
-        "the next run must own the peer input that lost its stale live boundary"
+        during_sentinel_run.inputs.current_run_contributors,
+        vec![sentinel_id],
+        "the retained wake must start exactly the no-wake sentinel"
     );
 
     rig.allow_finish.notify_waiters();
