@@ -179,6 +179,7 @@ retry_lane \
   "workspace integration lane" \
   "$NEXTEST_TIMEOUT_SECS" \
   "$CARGO" nextest run --workspace --tests --profile fast --no-fail-fast \
+    -E 'kind(test)' \
     --show-progress none --status-level none --final-status-level fail
 retry_lane \
   "HeadCanonical process-death lane" \

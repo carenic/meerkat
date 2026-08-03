@@ -24,6 +24,7 @@ if [[ "$args" == *" --test cold_restart_mob_resume "* ]]; then
 elif [[ "$args" == *" --lib "* ]]; then
   lane="unit"
 elif [[ "$args" == *" --tests "* ]]; then
+  [[ "$args" == *" -E kind(test) "* ]] || exit 98
   lane="integration"
 elif [[ "$args" == *" --test e2e_fast_lane "* ]]; then
   lane="e2e-fast"
