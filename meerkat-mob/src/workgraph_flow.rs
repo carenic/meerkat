@@ -1004,7 +1004,7 @@ impl<H: WorkGraphFlowHost + ?Sized> WorkGraphFlowBridge<'_, H> {
                                     .as_deref()
                                     .unwrap_or("Mob Flow run was lost"),
                             )
-                            .await?
+                            .await?;
                         }
                         other => {
                             return Err(WorkGraphFlowBridgeError::InvalidBinding(format!(
@@ -1220,8 +1220,7 @@ impl<H: WorkGraphFlowHost + ?Sized> WorkGraphFlowBridge<'_, H> {
                     Err(WorkGraphFlowBridgeError::LaunchQuarantined {
                         binding_id: binding.binding_id.clone(),
                         detail: format!(
-                            "durable realization fence was crossed before run {} became observable",
-                            run_id
+                            "durable realization fence was crossed before run {run_id} became observable"
                         ),
                     })
                 }
@@ -1270,8 +1269,7 @@ impl<H: WorkGraphFlowHost + ?Sized> WorkGraphFlowBridge<'_, H> {
                 return Err(WorkGraphFlowBridgeError::LaunchQuarantined {
                     binding_id: binding.binding_id.clone(),
                     detail: format!(
-                        "durable realization fence names run {} but exact run {} is absent",
-                        realizing_run_id, run_id
+                        "durable realization fence names run {realizing_run_id} but exact run {run_id} is absent"
                     ),
                 });
             }
