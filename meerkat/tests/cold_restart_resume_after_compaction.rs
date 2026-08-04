@@ -44,13 +44,13 @@ mod tests {
     };
     use meerkat_client::types::LlmStream;
     use meerkat_client::{LlmClient, LlmDoneOutcome, LlmError, LlmEvent, LlmRequest};
-    use meerkat_core::SessionBuildOptions;
     use meerkat_core::session_store::{IncrementalSessionStore as _, SessionStore};
     #[cfg(all(feature = "memory-store-session", feature = "session-compaction"))]
     use meerkat_core::{
         MemoryEnumerationRequest, MemoryIndexBatch, MemoryIndexRequest, MemoryIndexScope,
         MemoryMetadata, MemorySearchScope, MemorySource, MemoryStore, MessageRange, SessionService,
     };
+    use meerkat_core::{Message, SessionBuildOptions};
     use meerkat_runtime::RuntimeStore;
     use meerkat_runtime::completion::CompletionOutcome;
     use meerkat_runtime::{Input, MeerkatMachine, PromptInput};
@@ -2003,11 +2003,11 @@ mod tests {
         );
     }
 
-    /// A failed compaction attempt is itself a durable cadence boundary. A
-    /// process restart must not forget it and immediately hammer the compaction
-    /// path again before `min_turns_between_compactions` has elapsed.
+    /// A failed compaction attempt is durable across restart, but an actively
+    /// oversized history must retry immediately because cadence is only a cost
+    /// guard and cannot veto capacity recovery.
     #[tokio::test]
-    async fn failed_compaction_attempt_cadence_survives_cold_restart() {
+    async fn failed_compaction_attempt_pressure_retry_survives_cold_restart() {
         let temp = tempfile::tempdir().expect("tempdir");
         let first_lifetime_attempts = Arc::new(AtomicUsize::new(0));
 
@@ -2067,8 +2067,8 @@ mod tests {
 
         assert_eq!(
             restarted_attempts.load(Ordering::SeqCst),
-            0,
-            "the first post-restart boundary must be cadence-guarded from immediate retry"
+            1,
+            "the first post-restart boundary must retry while history remains over capacity"
         );
         let persisted = service
             .load_authoritative_session(&session_id)
@@ -2077,8 +2077,8 @@ mod tests {
             .expect("session should still exist");
         let cadence = compaction_cadence(&persisted);
         assert_eq!(cadence.session_boundary_index, 3);
-        assert_eq!(cadence.last_compaction_boundary_index, None);
-        assert_eq!(cadence.last_compaction_attempt_boundary_index, Some(1));
+        assert_eq!(cadence.last_compaction_boundary_index, Some(2));
+        assert_eq!(cadence.last_compaction_attempt_boundary_index, Some(2));
     }
 
     /// Like `run_prompt`, but returns the outcome (or the error text) instead
@@ -2288,10 +2288,21 @@ mod tests {
             texts.iter().any(|t| t.contains("third turn after restart")),
             "the post-restart turn must be recorded: {texts:?}"
         );
-        // Transcript equality across the kill: the pre-kill authority is a
-        // digest-exact prefix of the resumed transcript.
-        let prefix_len = resume_pre_kill_prefix_len(&final_session, &pre_kill_digest);
-        assert!(prefix_len > 0, "pre-kill transcript must be recoverable");
+        // A still-oversized resumed history may compact again immediately, so
+        // the pre-kill authority is either a live prefix or a digest-exact
+        // prefix of a retained rewrite body. In both cases it remains
+        // recoverable across the kill and the subsequent rewrite.
+        let rewrites = inc.load_rewrites(&session_id).await.expect("load_rewrites");
+        let live_prefix_len = digest_prefix_len(final_session.messages(), &pre_kill_digest);
+        let retained_prefix_len = rewrites
+            .iter()
+            .map(|record| digest_prefix_len(&record.parent_body.messages, &pre_kill_digest))
+            .max()
+            .unwrap_or(0);
+        assert!(
+            live_prefix_len > 0 || retained_prefix_len > 0,
+            "pre-kill transcript must be recoverable from the live head or retained rewrite bodies"
+        );
         // The durable representation stays head-canonical after the resumed
         // turn: the head strand covers exactly the live transcript.
         let head = inc
@@ -2307,12 +2318,12 @@ mod tests {
         assert_eq!(slim.messages().len() as u64, head.message_count);
     }
 
-    /// Longest prefix of `session` whose digest equals `pre_kill_digest`
+    /// Longest prefix of `messages` whose digest equals `expected_digest`
     /// (0 when none).
-    fn resume_pre_kill_prefix_len(session: &Session, pre_kill_digest: &str) -> usize {
-        for len in (1..=session.messages().len()).rev() {
-            if meerkat_core::transcript_messages_digest(&session.messages()[..len])
-                .map(|digest| digest == pre_kill_digest)
+    fn digest_prefix_len(messages: &[Message], expected_digest: &str) -> usize {
+        for len in (1..=messages.len()).rev() {
+            if meerkat_core::transcript_messages_digest(&messages[..len])
+                .map(|digest| digest == expected_digest)
                 .unwrap_or(false)
             {
                 return len;
