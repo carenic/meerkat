@@ -534,22 +534,52 @@ pub fn persist_compaction_cadence(
 /// 2. Produce the summary: a configured curator substitutes summary content
 ///    directly (no summarization LLM call, zero summary usage); otherwise
 ///    call the LLM with the compaction prompt
-/// 3. On failure: emit CompactionFailed, return error without mutating session
-///    (a failing curator never falls back to the LLM path)
+/// 3. If the summary request itself exceeds provider capacity, use a
+///    deterministic mechanical handoff so an oversized session always makes
+///    forward progress. Other failures emit CompactionFailed and preserve the
+///    original session (a failing curator never falls back to either path).
 /// 4. Rebuild history via compactor
 /// 5. Return a typed outcome; the caller commits it and emits CompactionCompleted
-pub async fn run_compaction<C>(
+const MECHANICAL_CAPACITY_SUMMARY: &str = "The summarization request exceeded the active provider capacity. Older transcript rows were mechanically compacted so the session can continue. A durable transcript or memory store may retain the discarded detail when configured; re-establish any critical working detail before relying on it.";
+
+fn is_compaction_capacity_error(error: &crate::error::AgentError) -> bool {
+    matches!(
+        error,
+        crate::error::AgentError::Llm {
+            reason: crate::error::LlmFailureReason::ContextExceeded { .. },
+            ..
+        } | crate::error::AgentError::Llm {
+            reason: crate::error::LlmFailureReason::ProviderError(crate::error::LlmProviderError {
+                kind: crate::error::LlmProviderErrorKind::RequestTooLarge,
+                ..
+            }),
+            ..
+        }
+    )
+}
+
+pub(crate) struct CompactionInvocation<'a> {
+    pub(crate) window: CompactionWindow<'a>,
+    pub(crate) request_pressure: Option<crate::ProviderRequestPressure>,
+    pub(crate) parent_revision: String,
+}
+
+pub(crate) async fn run_compaction<C>(
     client: &C,
     compactor: &Arc<dyn Compactor>,
     curator: Option<&Arc<dyn CompactionCurator>>,
-    window: CompactionWindow<'_>,
-    parent_revision: String,
+    invocation: CompactionInvocation<'_>,
     event_tx: &Option<mpsc::Sender<AgentEvent>>,
     event_tap: &crate::event_tap::EventTap,
 ) -> Result<CompactionOutcome, CompactionError>
 where
     C: crate::agent::AgentLlmClient + ?Sized,
 {
+    let CompactionInvocation {
+        window,
+        request_pressure,
+        parent_revision,
+    } = invocation;
     let CompactionWindow {
         messages,
         last_input_tokens,
@@ -650,6 +680,15 @@ where
                 }
                 (summary, result.usage().clone())
             }
+            Err(e) if is_compaction_capacity_error(&e) => {
+                tracing::warn!(
+                    error = %e,
+                    message_count,
+                    estimated_history_tokens = estimated,
+                    "compaction summary request exceeded provider capacity; using mechanical progress fallback"
+                );
+                (MECHANICAL_CAPACITY_SUMMARY.to_string(), Usage::default())
+            }
             Err(e) => {
                 if event_stream_open
                     && !crate::event_tap::tap_emit(
@@ -672,7 +711,8 @@ where
 
     // 4. Rebuild history. Validation below requires every ordinary System row
     // to remain verbatim at its mapped relative position.
-    let result = compactor.rebuild_history(messages, &summary_text);
+    let result =
+        compactor.rebuild_history_under_pressure(messages, &summary_text, request_pressure);
     if let Err(error) = validate_compaction_rebuild(
         messages,
         &result.messages,

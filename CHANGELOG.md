@@ -32,6 +32,12 @@ via cargo-semver-checks against the published baselines).
 
 ### Fixed
 
+- Built-in context compaction now bounds the summarization request and the
+  exact recent-turn tail it retains. A single oversized tool result can no
+  longer make the compactor resend or preserve the same over-context payload;
+  live token or provider-byte pressure bypasses the ordinary cadence guard,
+  and typed provider-capacity failure falls back to a deterministic
+  progress-making rewrite.
 - Imported archived session documents with no competing runtime record are
   now revivable. When a runtime record exists, its lifecycle remains the
   authoritative classification and overrides stale document metadata.

@@ -246,7 +246,9 @@ MCP server connections are **non-blocking across all surfaces**. Servers connect
 When `session-compaction` is enabled:
 
 - **Trigger**: `last_input_tokens >= threshold` OR `estimated_history_tokens >= threshold`
-- **Guards**: Never on first turn. Minimum 3 turns between compactions.
+- **Guards**: Never on first turn. Ordinary compactions wait at least 3 turns;
+  a live history-token or exact provider-byte capacity crossing bypasses that
+  cost guard so an already-oversized request can recover immediately.
 - **Failure**: Non-fatal. `CompactionFailed` event emitted, agent continues with uncompacted history.
 - **Budget**: Compaction LLM call draws from the same token budget as regular turns.
 

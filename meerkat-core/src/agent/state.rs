@@ -2128,12 +2128,15 @@ where
                                     self.client.as_ref(),
                                     &compactor,
                                     self.compaction_curator.as_ref(),
-                                    crate::compact::CompactionWindow {
-                                        messages: self.session.messages(),
-                                        last_input_tokens: self.last_input_tokens,
-                                        session_boundary_index: current_boundary_index,
+                                    crate::agent::compact::CompactionInvocation {
+                                        window: crate::compact::CompactionWindow {
+                                            messages: self.session.messages(),
+                                            last_input_tokens: self.last_input_tokens,
+                                            session_boundary_index: current_boundary_index,
+                                        },
+                                        request_pressure: provider_request_pressure,
+                                        parent_revision,
                                     },
-                                    parent_revision,
                                     event_tx,
                                     &self.event_tap,
                                 )
@@ -6722,12 +6725,27 @@ mod tests {
 
     struct FailingCompactionLlmClient {
         last_user_messages: Mutex<Vec<String>>,
+        compaction_failure: LlmFailureReason,
     }
 
     impl FailingCompactionLlmClient {
         fn new() -> Self {
             Self {
                 last_user_messages: Mutex::new(Vec::new()),
+                compaction_failure: LlmFailureReason::ProviderError(LlmProviderError::retryable(
+                    LlmProviderErrorKind::IncompleteResponse,
+                    serde_json::json!({"message": "stream ended before done"}),
+                )),
+            }
+        }
+
+        fn context_capacity_exceeded() -> Self {
+            Self {
+                last_user_messages: Mutex::new(Vec::new()),
+                compaction_failure: LlmFailureReason::ContextExceeded {
+                    max: 1_000_000,
+                    requested: 1_200_000,
+                },
             }
         }
 
@@ -6763,11 +6781,13 @@ mod tests {
             if last_user == "COMPACT NOW" {
                 return Err(AgentError::Llm {
                     provider: "mock",
-                    reason: LlmFailureReason::ProviderError(LlmProviderError::retryable(
-                        LlmProviderErrorKind::IncompleteResponse,
-                        serde_json::json!({"message": "stream ended before done"}),
-                    )),
-                    message: "stream ended before done".to_string(),
+                    reason: self.compaction_failure.clone(),
+                    message: match &self.compaction_failure {
+                        LlmFailureReason::ContextExceeded { .. } => {
+                            "context length exceeded".to_string()
+                        }
+                        _ => "stream ended before done".to_string(),
+                    },
                 });
             }
 
@@ -9262,6 +9282,52 @@ mod tests {
         assert_eq!(cadence.session_boundary_index, 3);
         assert_eq!(cadence.last_compaction_boundary_index, None);
         assert_eq!(cadence.last_compaction_attempt_boundary_index, Some(1));
+    }
+
+    #[tokio::test]
+    async fn context_capacity_failure_mechanically_compacts_and_continues() {
+        let client = Arc::new(FailingCompactionLlmClient::context_capacity_exceeded());
+        let compactor = Arc::new(DiscardingCompactor::new(1));
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .compactor(compactor)
+            .build_standalone(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        agent.run("first".into()).await.unwrap();
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(128);
+        agent
+            .run_with_events("second".into(), tx)
+            .await
+            .expect("capacity-overflow compaction must make progress and continue the turn");
+
+        let events = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            events
+                .iter()
+                .any(|event| matches!(event, crate::event::AgentEvent::CompactionCompleted { .. })),
+            "mechanical capacity recovery must complete the compaction rewrite"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, crate::event::AgentEvent::CompactionFailed { .. })),
+            "a recovered capacity overflow must not be reported as terminal compaction failure"
+        );
+        assert!(agent.session().messages().iter().any(|message| matches!(
+            message,
+            Message::User(user)
+                if user.transcript_role.is_compaction_summary()
+                    && user.text_content().contains("mechanically compacted")
+        )));
+        assert_eq!(
+            client.seen_last_user_messages(),
+            vec![
+                "first".to_string(),
+                "COMPACT NOW".to_string(),
+                "second".to_string(),
+            ],
+            "the failed summary request must be followed by the rebuilt ordinary turn"
+        );
     }
 
     #[tokio::test]
