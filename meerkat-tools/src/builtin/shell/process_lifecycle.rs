@@ -283,12 +283,8 @@ pub(super) async fn join_reader_bounded(mut handle: JoinHandle<()>, label: &str)
 mod tests {
     use super::*;
     #[cfg(target_os = "macos")]
-    use std::process::Stdio;
-    #[cfg(target_os = "macos")]
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    #[cfg(target_os = "macos")]
-    use tokio::io::AsyncReadExt;
     use tokio::process::Command;
 
     struct FailingControl {
@@ -379,19 +375,36 @@ mod tests {
     }
 
     #[cfg(target_os = "macos")]
+    async fn wait_until_zombie(pid: i32) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let output = Command::new("/bin/ps")
+                    .args(["-o", "state=", "-p"])
+                    .arg(pid.to_string())
+                    .output()
+                    .await
+                    .expect("inspect short-lived child state");
+                if String::from_utf8_lossy(&output.stdout)
+                    .trim()
+                    .starts_with('Z')
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("short-lived child must become an unreaped zombie");
+    }
+
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn terminate_reaps_exited_leader_before_group_probe() {
         let mut child = Command::new("/usr/bin/true")
-            .stdout(Stdio::piped())
             .spawn()
-            .expect("spawn short-lived child with exit signal");
+            .expect("spawn short-lived child");
         let leader_pid = child.id().expect("child pid") as i32;
-        let mut stdout = child.stdout.take().expect("child stdout");
-        let mut output = Vec::new();
-        stdout
-            .read_to_end(&mut output)
-            .await
-            .expect("observe child exit without reaping it");
+        wait_until_zombie(leader_pid).await;
         let control = Arc::new(LeaderReapObservingControl {
             leader_pid,
             observed_absent: AtomicBool::new(false),
