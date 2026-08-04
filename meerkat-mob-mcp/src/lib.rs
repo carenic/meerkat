@@ -1939,8 +1939,7 @@ impl MobMcpState {
             } = &binding.target;
             if bound_mob_id != mob_id.as_str() {
                 return Err(MobError::Internal(format!(
-                    "WorkGraph execution run '{}' belongs to mob '{}' rather than requested mob '{}'",
-                    run_id, bound_mob_id, mob_id
+                    "WorkGraph execution run '{run_id}' belongs to mob '{bound_mob_id}' rather than requested mob '{mob_id}'"
                 )));
             }
         }
