@@ -78,6 +78,12 @@ impl OwnedProcessGroup {
         let Some(pgid) = self.pgid else {
             return Ok(());
         };
+        // Reap an already-exited leader before probing the group. On macOS an
+        // unreaped zombie can make killpg(pgid, 0) report EPERM even when it is
+        // the group's final member. Reaping is not itself containment proof:
+        // live descendants keep the process group observable and still flow
+        // through TERM and KILL below.
+        let _ = child.try_wait()?;
         match self.control.exists(pgid) {
             Ok(false) => {
                 self.disarm();
@@ -276,7 +282,9 @@ pub(super) async fn join_reader_bounded(mut handle: JoinHandle<()>, label: &str)
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::process::Stdio;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use tokio::io::AsyncReadExt;
     use tokio::process::Command;
 
     struct FailingControl {
@@ -288,6 +296,38 @@ mod tests {
 
     struct PermissionDeniedAfterKillFenceControl {
         signals: AtomicUsize,
+    }
+
+    struct LeaderReapObservingControl {
+        leader_pid: i32,
+        observed_absent: AtomicBool,
+        signals: AtomicUsize,
+    }
+
+    impl ProcessGroupControl for LeaderReapObservingControl {
+        fn signal(&self, _pgid: i32, _signal: ProcessGroupSignal) -> std::io::Result<bool> {
+            self.signals.fetch_add(1, Ordering::SeqCst);
+            Err(std::io::Error::other(
+                "an absent single-member group must not be signalled",
+            ))
+        }
+
+        fn exists(&self, _pgid: i32) -> std::io::Result<bool> {
+            use nix::errno::Errno;
+            use nix::sys::signal::kill;
+            use nix::unistd::Pid;
+
+            match kill(Pid::from_raw(self.leader_pid), None) {
+                Err(Errno::ESRCH) => {
+                    self.observed_absent.store(true, Ordering::SeqCst);
+                    Ok(false)
+                }
+                Ok(()) => Err(std::io::Error::other(
+                    "group probe ran before the exited leader was reaped",
+                )),
+                Err(error) => Err(std::io::Error::from_raw_os_error(error as i32)),
+            }
+        }
     }
 
     impl ProcessGroupControl for PermissionDeniedAfterKillFenceControl {
@@ -330,6 +370,41 @@ mod tests {
         Command::new("/usr/bin/true")
             .spawn()
             .expect("spawn short-lived child")
+    }
+
+    #[tokio::test]
+    async fn terminate_reaps_exited_leader_before_group_probe() {
+        let mut child = Command::new("/usr/bin/true")
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn short-lived child with exit signal");
+        let leader_pid = child.id().expect("child pid") as i32;
+        let mut stdout = child.stdout.take().expect("child stdout");
+        let mut output = Vec::new();
+        stdout
+            .read_to_end(&mut output)
+            .await
+            .expect("observe child exit without reaping it");
+        let control = Arc::new(LeaderReapObservingControl {
+            leader_pid,
+            observed_absent: AtomicBool::new(false),
+            signals: AtomicUsize::new(0),
+        });
+        let mut group = OwnedProcessGroup::with_control(
+            &child,
+            control.clone(),
+            Duration::ZERO,
+            Duration::ZERO,
+        );
+
+        group
+            .terminate(&mut child)
+            .await
+            .expect("exited leader must be reaped before group probing");
+
+        assert!(control.observed_absent.load(Ordering::SeqCst));
+        assert_eq!(control.signals.load(Ordering::SeqCst), 0);
+        assert!(group.pgid.is_none());
     }
 
     #[tokio::test]
