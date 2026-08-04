@@ -61,12 +61,24 @@ threads-required = "num-cpus"
 # These process-backed monitor tests are normally sub-second, but a
 # concurrently saturating topology/codegen case can starve their Tokio/process
 # readers until the contract timeout. Reserve the lane; each command still
-# exercises its own stdout or credential-resolution concurrency internally.
-filter = 'test(~explicit_completion_cannot_deadlock_behind_post_complete_stdout_flood) or test(~resolved_monitor_credentials_are_redacted_without_entering_durable_spec_or_output)'
+# exercises its own stdout, framing, or credential-resolution concurrency
+# internally.
+filter = 'test(~explicit_completion_cannot_deadlock_behind_post_complete_stdout_flood) or test(~framed_monitor_notifies_checkpoints_and_continues_until_explicit_completion) or test(~resolved_monitor_credentials_are_redacted_without_entering_durable_spec_or_output)'
 threads-required = "num-cpus"
 
 [[profile.default.overrides]]
-filter = 'test(~explicit_completion_cannot_deadlock_behind_post_complete_stdout_flood) or test(~resolved_monitor_credentials_are_redacted_without_entering_durable_spec_or_output)'
+filter = 'test(~explicit_completion_cannot_deadlock_behind_post_complete_stdout_flood) or test(~framed_monitor_notifies_checkpoints_and_continues_until_explicit_completion) or test(~resolved_monitor_credentials_are_redacted_without_entering_durable_spec_or_output)'
+threads-required = "num-cpus"
+
+[[profile.fast.overrides]]
+# Mob reconstruction mutates a process-global runtime-adapter registration.
+# Keep the tool-wiring resume contract isolated from other runtime tests while
+# preserving all of its internal async work.
+filter = 'test(~test_resume_restores_missing_sessions_with_tool_wiring)'
+threads-required = "num-cpus"
+
+[[profile.default.overrides]]
+filter = 'test(~test_resume_restores_missing_sessions_with_tool_wiring)'
 threads-required = "num-cpus"
 
 [[profile.fast.overrides]]
