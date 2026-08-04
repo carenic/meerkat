@@ -3564,6 +3564,15 @@ struct RuntimeLiveBoundaryAttachmentWitness {
     boundary_handle: Arc<dyn meerkat_core::lifecycle::CoreExecutorBoundaryHandle>,
 }
 
+/// Best-effort actor projection for one already-durable input. This authority
+/// is deliberately separate from admission: the caller may return as soon as
+/// this non-cloneable plan is transferred to process-owned execution.
+struct RuntimeAcceptedLiveBoundaryPlan {
+    witness: RuntimeLiveBoundaryAttachmentWitness,
+    input_id: InputId,
+    publication_handle: Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>>,
+}
+
 struct RuntimeAcceptedBoundaryCancelPlan {
     witness: RuntimeEffectDispatchAttachmentWitness,
     boundary_handle: Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorBoundaryHandle>>,
@@ -4924,51 +4933,119 @@ impl MeerkatMachine {
         Ok(gate_guard)
     }
 
-    /// Own all post-admission boundary work for an accepted ingress request.
-    /// Once the driver and DSL have accepted the input, caller cancellation may
-    /// drop only the acknowledgement: cancel dispatch and wake remain
-    /// process-owned.
-    async fn dispatch_accepted_ingress_boundary_work(
+    /// Transfer every actor-bound post-admission optimization away from the
+    /// durable admission acknowledgement. The input and its completion waiter
+    /// are already committed before this is called; actor slowness can delay
+    /// exact injection but can no longer delay acceptance of this or later
+    /// inputs.
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_accepted_ingress_boundary_work(
+        &self,
+        cleanup_spawner: MachineCleanupTaskSpawner,
+        session_id: &SessionId,
+        held_mutation_gate: crate::tokio::sync::OwnedMutexGuard<()>,
+        live_boundary_plan: Option<RuntimeAcceptedLiveBoundaryPlan>,
+        cancel_plan: Option<RuntimeAcceptedBoundaryCancelPlan>,
+        completions: crate::meerkat_machine::driver::SharedCompletionRegistry,
+        wake_tx: Option<mpsc::Sender<()>>,
+        should_wake: bool,
+        fallback_wake: AcceptedIngressFallbackWakeGuard,
+    ) {
+        let machine = self.clone();
+        let session_id = session_id.clone();
+        let work_session_id = session_id.clone();
+        let work = cleanup_spawner.spawn(async move {
+            if let Err(error) = machine
+                .dispatch_accepted_ingress_boundary_work_owned(
+                    &work_session_id,
+                    held_mutation_gate,
+                    live_boundary_plan,
+                    cancel_plan,
+                    completions,
+                    wake_tx,
+                    should_wake,
+                    fallback_wake,
+                )
+                .await
+            {
+                tracing::error!(
+                    session_id = %work_session_id,
+                    %error,
+                    "asynchronous accepted-input boundary optimization failed"
+                );
+            }
+        });
+        cleanup_spawner.spawn(async move {
+            if let Err(error) = work.await {
+                tracing::error!(
+                    %session_id,
+                    %error,
+                    "asynchronous accepted-input boundary task panicked or was cancelled"
+                );
+            }
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_accepted_ingress_boundary_work_owned(
         &self,
         session_id: &SessionId,
         held_mutation_gate: crate::tokio::sync::OwnedMutexGuard<()>,
+        live_boundary_plan: Option<RuntimeAcceptedLiveBoundaryPlan>,
         cancel_plan: Option<RuntimeAcceptedBoundaryCancelPlan>,
-        _completions: crate::meerkat_machine::driver::SharedCompletionRegistry,
+        completions: crate::meerkat_machine::driver::SharedCompletionRegistry,
         wake_tx: Option<mpsc::Sender<()>>,
         should_wake: bool,
-    ) -> Result<crate::tokio::sync::OwnedMutexGuard<()>, RuntimeDriverError> {
-        let cleanup_spawner = MachineCleanupTaskSpawner::acquire()?;
-        let machine = self.clone();
-        let session_id = session_id.clone();
-        let completion = cleanup_spawner.spawn(async move {
-            let mut gate_guard = held_mutation_gate;
-            if let Some(cancel_plan) = cancel_plan {
-                gate_guard = machine
-                    .dispatch_cancel_after_boundary_runtime_effect_owned(
-                        &session_id,
-                        cancel_plan.witness,
-                        gate_guard,
-                        cancel_plan.boundary_handle,
-                        None,
-                        cancel_plan.pending_dispatch,
-                        Some(&cancel_plan.expected_run_id),
-                        cancel_plan.projected_effect,
-                        cancel_plan.dispatch_generation,
-                        cancel_plan.dispatch_lifecycle_phase,
-                        "AcceptWithCompletion",
-                    )
-                    .await?;
-            }
-            if should_wake && let Some(wake_tx) = wake_tx {
-                let _ = wake_tx.try_send(());
-            }
-            Ok(gate_guard)
-        });
-        completion.await.map_err(|error| {
-            RuntimeDriverError::Internal(format!(
-                "process-owned accepted-ingress boundary transaction ended without a result: {error}"
-            ))
-        })?
+        mut fallback_wake: AcceptedIngressFallbackWakeGuard,
+    ) -> Result<(), RuntimeDriverError> {
+        let mut gate_guard = held_mutation_gate;
+        let live_boundary_disposition = if let Some(live_boundary_plan) = live_boundary_plan {
+            let (returned_gate, disposition) = self
+                .commit_live_boundary_input_if_available(
+                    session_id,
+                    &live_boundary_plan.witness,
+                    gate_guard,
+                    &live_boundary_plan.input_id,
+                    &completions,
+                    live_boundary_plan.publication_handle,
+                    &mut fallback_wake,
+                )
+                .await?;
+            gate_guard = returned_gate;
+            disposition
+        } else {
+            dispatch_ingress::LiveBoundaryInputDisposition::QueuedFallback
+        };
+
+        let cancel_plan = if live_boundary_disposition.suppress_cancel() {
+            None
+        } else {
+            cancel_plan
+        };
+        let should_wake = should_wake && !live_boundary_disposition.suppress_wake();
+        if let Some(cancel_plan) = cancel_plan {
+            gate_guard = self
+                .dispatch_cancel_after_boundary_runtime_effect_owned(
+                    session_id,
+                    cancel_plan.witness,
+                    gate_guard,
+                    cancel_plan.boundary_handle,
+                    None,
+                    cancel_plan.pending_dispatch,
+                    Some(&cancel_plan.expected_run_id),
+                    cancel_plan.projected_effect,
+                    cancel_plan.dispatch_generation,
+                    cancel_plan.dispatch_lifecycle_phase,
+                    "AcceptWithCompletion",
+                )
+                .await?;
+        }
+        if should_wake && let Some(wake_tx) = wake_tx {
+            let _ = wake_tx.try_send(());
+        }
+        fallback_wake.disarm();
+        drop(gate_guard);
+        Ok(())
     }
 
     /// Invoke the executor-owned boundary hook without holding a session

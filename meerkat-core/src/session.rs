@@ -6823,6 +6823,41 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn dropping_pending_transient_boundary_preparation_revokes_exact_request() {
+        let state = TransientTurnContextStateHandle::new();
+        let run_id = RunId::new();
+        let _guard = state
+            .begin_boundary_run(run_id.clone())
+            .expect("open boundary");
+        let prepare_state = state.clone();
+        let prepare_run_id = run_id.clone();
+        let prepare = tokio::spawn(async move {
+            prepare_state
+                .prepare_active_turn_boundary(
+                    &prepare_run_id,
+                    vec![transient_context("cancelled before park")],
+                )
+                .await
+        });
+        wait_for_transient_boundary_request(&state).await;
+
+        prepare.abort();
+        let error = prepare
+            .await
+            .expect_err("aborted preparation task must report cancellation");
+        assert!(error.is_cancelled());
+
+        let contexts = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            state.take_pending_at_exact_boundary(&run_id),
+        )
+        .await
+        .expect("dropping preparation must wake and release the exact boundary")
+        .expect("the still-active boundary remains valid");
+        assert!(contexts.is_empty());
+    }
+
     fn block_assistant_text(message: &BlockAssistantMessage) -> String {
         message
             .blocks

@@ -1482,7 +1482,10 @@ pub trait CoreExecutorBoundaryHandle: Send + Sync {
     /// consumption. The non-clone result owns explicit commit/abort authority.
     ///
     /// This context is never Session state and therefore carries no durable
-    /// session snapshot.
+    /// session snapshot. Implementations must be cancellation-safe: dropping
+    /// this future before it returns must revoke the exact pending request and
+    /// wake any actor parked on it. Durable input admission must not depend on
+    /// this ephemeral optimization completing.
     async fn prepare_transient_turn_context_at_boundary(
         &self,
         _expected_run_id: &RunId,

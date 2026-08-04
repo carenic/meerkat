@@ -414,6 +414,30 @@ impl MeerkatMachine {
     > {
         let live_boundary_plan = {
             let driver = witness.driver.lock().await;
+            let steer_queue = driver.driver_ingress().steer_queue();
+            if steer_queue.iter().any(|candidate| candidate == input_id)
+                && steer_queue.first() != Some(input_id)
+            {
+                drop(driver);
+                self.normalize_live_boundary_queued_fallback(
+                    session_id,
+                    witness,
+                    completions,
+                    publication_handle.clone(),
+                    input_id,
+                    fallback_wake,
+                )
+                .await?;
+                tracing::debug!(
+                    session_id = %session_id,
+                    input_id = %input_id,
+                    "later live-boundary candidate retained durable FIFO behind earlier admission"
+                );
+                return Ok((
+                    held_mutation_gate,
+                    LiveBoundaryInputDisposition::QueuedFallback,
+                ));
+            }
             let Some(run_id) = driver.current_run_id() else {
                 tracing::debug!(
                     session_id = %session_id,
@@ -1085,6 +1109,10 @@ impl MeerkatMachine {
                     .await?;
                 self.require_directed_terminal_publication_capability(&session_id, &input)
                     .await?;
+                // Acquire process-owned execution before mutating either the
+                // driver or generated DSL. Once admission commits, handing
+                // actor-bound work off must be infallible.
+                let cleanup_spawner = MachineCleanupTaskSpawner::acquire()?;
 
                 // This observation selects the generated live-boundary plan;
                 // it is not authority to publish. The exact post-admission
@@ -1357,74 +1385,50 @@ impl MeerkatMachine {
                     (signal, None)
                 };
 
-                let live_boundary_disposition = if signal.should_interrupt_yielding()
+                let live_boundary_plan = if signal.should_interrupt_yielding()
                     && stages_run_boundary
                     && let (Some(input_id), Some(boundary_handle), Some(attachment_id)) = (
                         accepted_input_id.as_ref(),
                         boundary_handle.clone(),
                         attachment_id,
                     ) {
-                    let witness = RuntimeLiveBoundaryAttachmentWitness {
-                        mutation_gate: Arc::clone(&gate),
-                        driver: driver.clone(),
-                        dsl_authority: Arc::clone(&dsl_authority),
-                        attachment_id,
-                        boundary_handle,
-                    };
-                    let held_mutation_gate = gate_guard.take().ok_or_else(|| {
-                        RuntimeDriverError::Internal(
-                            "AcceptWithCompletion lost its held session mutation gate before exact live-boundary preparation"
-                                .to_string(),
-                        )
-                    })?;
-                    let (returned_gate, disposition) = self
-                        .commit_live_boundary_input_if_available(
-                            &session_id,
-                            &witness,
-                            held_mutation_gate,
-                            input_id,
-                            &completions,
-                            publication_handle.clone(),
-                            &mut fallback_wake,
-                        )
-                        .await?;
-                    gate_guard = Some(returned_gate);
-                    disposition
+                    Some(RuntimeAcceptedLiveBoundaryPlan {
+                        witness: RuntimeLiveBoundaryAttachmentWitness {
+                            mutation_gate: Arc::clone(&gate),
+                            driver: driver.clone(),
+                            dsl_authority: Arc::clone(&dsl_authority),
+                            attachment_id,
+                            boundary_handle,
+                        },
+                        input_id: input_id.clone(),
+                        publication_handle: publication_handle.clone(),
+                    })
                 } else {
-                    LiveBoundaryInputDisposition::QueuedFallback
+                    None
                 };
 
-                // Exact injection and successor ownership both supersede the
-                // old-run cancel. Only exact injection also consumes the wake;
-                // a successor claim retains that liveness edge.
-                let cancel_plan = if live_boundary_disposition.suppress_cancel() {
-                    None
-                } else {
-                    cancel_plan
-                };
-                let should_wake =
-                    signal.should_wake() && !live_boundary_disposition.suppress_wake();
-                if cancel_plan.is_some() || should_wake {
+                if accepted_input_id.is_some() {
                     let held_mutation_gate = gate_guard.take().ok_or_else(|| {
                         RuntimeDriverError::Internal(
-                            "AcceptWithCompletion lost its held session mutation gate before process-owned boundary work"
+                            "AcceptWithCompletion lost its held session mutation gate before asynchronous boundary work"
                                 .to_string(),
                         )
                     })?;
-                    gate_guard = Some(
-                        self.dispatch_accepted_ingress_boundary_work(
-                            &session_id,
-                            held_mutation_gate,
-                            cancel_plan,
-                            completions.clone(),
-                            wake_tx,
-                            should_wake,
-                        )
-                        .await?,
+                    self.spawn_accepted_ingress_boundary_work(
+                        cleanup_spawner,
+                        &session_id,
+                        held_mutation_gate,
+                        live_boundary_plan,
+                        cancel_plan,
+                        completions.clone(),
+                        wake_tx,
+                        signal.should_wake(),
+                        fallback_wake,
                     );
+                } else {
+                    fallback_wake.disarm();
+                    drop(gate_guard.take());
                 }
-                fallback_wake.disarm();
-                drop(gate_guard.take());
 
                 Ok(MeerkatMachineCommandResult::AcceptWithCompletion {
                     outcome,
