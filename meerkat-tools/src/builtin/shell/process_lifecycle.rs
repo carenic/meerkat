@@ -282,8 +282,12 @@ pub(super) async fn join_reader_bounded(mut handle: JoinHandle<()>, label: &str)
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    #[cfg(target_os = "macos")]
     use std::process::Stdio;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    #[cfg(target_os = "macos")]
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(target_os = "macos")]
     use tokio::io::AsyncReadExt;
     use tokio::process::Command;
 
@@ -298,12 +302,14 @@ mod tests {
         signals: AtomicUsize,
     }
 
+    #[cfg(target_os = "macos")]
     struct LeaderReapObservingControl {
         leader_pid: i32,
         observed_absent: AtomicBool,
         signals: AtomicUsize,
     }
 
+    #[cfg(target_os = "macos")]
     impl ProcessGroupControl for LeaderReapObservingControl {
         fn signal(&self, _pgid: i32, _signal: ProcessGroupSignal) -> std::io::Result<bool> {
             self.signals.fetch_add(1, Ordering::SeqCst);
@@ -372,6 +378,7 @@ mod tests {
             .expect("spawn short-lived child")
     }
 
+    #[cfg(target_os = "macos")]
     #[tokio::test]
     async fn terminate_reaps_exited_leader_before_group_probe() {
         let mut child = Command::new("/usr/bin/true")
