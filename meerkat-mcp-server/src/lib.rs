@@ -4727,6 +4727,7 @@ async fn handle_meerkat_resume(
             // RuntimeTurnMetadata carries the keep_alive mutation; the
             // session service applies it only after generated turn-admission
             // feedback. The surface may refresh machine-owned peer ingress.
+            #[cfg(feature = "comms")]
             ingress
                 .configure_peer_ingress_exact(&session_id, keep_alive)
                 .await

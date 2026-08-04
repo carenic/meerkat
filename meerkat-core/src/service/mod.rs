@@ -1600,7 +1600,7 @@ impl StartTurnRuntimeSemantics {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StartTurnInputIdentity {
     pub idempotency_key: String,
     pub correlation_id: String,

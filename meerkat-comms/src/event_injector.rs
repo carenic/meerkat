@@ -73,6 +73,7 @@ impl CommsEventInjector {
             blocks,
             render_metadata,
             objective_id: None,
+            input_identity: None,
         }) {
             AdmissionOutcome::Admitted => Ok(()),
             AdmissionOutcome::Dropped { reason } => Err(drop_reason_to_injector_error(reason)),
@@ -101,6 +102,7 @@ impl EventInjector for CommsEventInjector {
             blocks,
             render_metadata,
             objective_id: None,
+            input_identity: None,
         }) {
             AdmissionOutcome::Admitted => Ok(()),
             AdmissionOutcome::Dropped { reason } => Err(drop_reason_to_injector_error(reason)),
@@ -123,6 +125,37 @@ fn drop_reason_to_injector_error(reason: DropReason) -> EventInjectorError {
 }
 
 impl meerkat_core::event_injector::SubscribableInjector for CommsEventInjector {
+    fn inject_with_delivery_identity(
+        &self,
+        input_identity: meerkat_core::service::StartTurnInputIdentity,
+        objective_id: Option<meerkat_core::interaction::ObjectiveId>,
+        content: ContentInput,
+        source: PlainEventSource,
+        handling_mode: HandlingMode,
+        render_metadata: Option<RenderMetadata>,
+    ) -> Result<(), EventInjectorError> {
+        let correlation_id = uuid::Uuid::parse_str(&input_identity.correlation_id)
+            .map_err(|_| EventInjectorError::Closed)?;
+        let body = content.text_content();
+        let blocks = match content {
+            ContentInput::Text(_) => None,
+            ContentInput::Blocks(blocks) => Some(blocks),
+        };
+        match self.sender.send_classified(InboxItem::PlainEvent {
+            body,
+            source,
+            handling_mode,
+            interaction_id: Some(correlation_id),
+            blocks,
+            render_metadata,
+            objective_id,
+            input_identity: Some(input_identity),
+        }) {
+            AdmissionOutcome::Admitted => Ok(()),
+            AdmissionOutcome::Dropped { reason } => Err(drop_reason_to_injector_error(reason)),
+        }
+    }
+
     fn inject_with_turn_identity(
         &self,
         interaction_id: Option<meerkat_core::interaction::InteractionId>,
@@ -145,6 +178,7 @@ impl meerkat_core::event_injector::SubscribableInjector for CommsEventInjector {
             blocks,
             render_metadata,
             objective_id,
+            input_identity: None,
         }) {
             AdmissionOutcome::Admitted => Ok(()),
             AdmissionOutcome::Dropped { reason } => Err(drop_reason_to_injector_error(reason)),
@@ -179,6 +213,7 @@ impl meerkat_core::event_injector::SubscribableInjector for CommsEventInjector {
                 blocks,
                 render_metadata,
                 objective_id: None,
+                input_identity: None,
             })
         {
             // Clean up subscriber on send failure

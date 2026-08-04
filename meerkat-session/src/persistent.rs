@@ -8371,6 +8371,57 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 id: session.id().clone(),
             });
         }
+        if archived_resume_allowed
+            && let Some(session) = req
+                .build
+                .as_mut()
+                .and_then(|build| build.resume_session.as_mut())
+            && session.try_lifecycle_terminal().map_err(|error| {
+                SessionError::Agent(AgentError::InternalError(format!(
+                    "archived resume session {} has malformed lifecycle terminal: {error}",
+                    session.id()
+                )))
+            })? == Some(SessionLifecycleTerminal::Archived)
+        {
+            let mut authority = SessionDocumentMachineAuthority::new();
+            let document_key = SessionDocumentKey::new(session.id().to_string());
+            authority
+                .recover_session_lifecycle_terminal(
+                    document_key.clone(),
+                    SessionLifecycleTerminal::Archived.into(),
+                )
+                .map_err(|error| {
+                    SessionError::Agent(AgentError::InternalError(format!(
+                        "generated session document authority rejected archived lifecycle recovery for session {}: {error}",
+                        session.id()
+                    )))
+                })?;
+            let effects = authority
+                .revive_archived_session_document(document_key)
+                .map_err(|error| {
+                    SessionError::Agent(AgentError::InternalError(format!(
+                        "generated session document authority rejected revival for session {}: {error}",
+                        session.id()
+                    )))
+                })?;
+            if !effects
+                .iter()
+                .any(|effect| matches!(effect, SessionDocumentEffect::SessionRevivalResolved))
+            {
+                return Err(SessionError::Agent(AgentError::InternalError(format!(
+                    "generated session document authority emitted no revival verdict for session {}",
+                    session.id()
+                ))));
+            }
+            session
+                .set_lifecycle_terminal(SessionLifecycleTerminal::Active)
+                .map_err(|error| {
+                    SessionError::Agent(AgentError::InternalError(format!(
+                        "failed to realize generated session revival for session {}: {error}",
+                        session.id()
+                    )))
+                })?;
+        }
         let materialization_session_id = runtime_binding_session_id
             .as_ref()
             .or(resume_session_id.as_ref());
@@ -13429,6 +13480,18 @@ mod tests {
     }
 
     impl meerkat_core::event_injector::SubscribableInjector for NoopSubscribableInjector {
+        fn inject_with_delivery_identity(
+            &self,
+            _input_identity: meerkat_core::service::StartTurnInputIdentity,
+            _objective_id: Option<meerkat_core::interaction::ObjectiveId>,
+            _content: meerkat_core::types::ContentInput,
+            _source: meerkat_core::PlainEventSource,
+            _handling_mode: meerkat_core::types::HandlingMode,
+            _render_metadata: Option<meerkat_core::types::RenderMetadata>,
+        ) -> Result<(), meerkat_core::event_injector::EventInjectorError> {
+            Err(meerkat_core::event_injector::EventInjectorError::Closed)
+        }
+
         fn inject_with_subscription(
             &self,
             _content: meerkat_core::types::ContentInput,

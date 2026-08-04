@@ -3653,7 +3653,7 @@ mod durable_tests {
         let temp = TempDir::new().expect("tempdir");
         let session_id = SessionId::new();
         let (runtime, job_store, config) = durable_fixture(&temp, session_id.clone());
-        let service = DetachedJobService::new(job_store);
+        let service = DetachedJobService::new(job_store.clone());
         let manager = JobManager::new(config)
             .bind_canonical_async_ops(session_id, Arc::new(RuntimeOpsLifecycleRegistry::new()))
             .with_durable_job_runtime(runtime);
@@ -3701,7 +3701,7 @@ mod durable_tests {
         .await
         .expect("first notification");
 
-        let completed = tokio::time::timeout(Duration::from_secs(15), async {
+        let completion = tokio::time::timeout(Duration::from_secs(15), async {
             loop {
                 let snapshot = service.get(&job_id).await.expect("read").expect("job");
                 if snapshot.terminal_result.is_some() {
@@ -3710,8 +3710,30 @@ mod durable_tests {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
-        .await
-        .expect("monitor completion");
+        .await;
+        let completed = match completion {
+            Ok(snapshot) => snapshot,
+            Err(_) => {
+                let snapshot = service
+                    .get(&job_id)
+                    .await
+                    .expect("read timed-out monitor")
+                    .expect("timed-out monitor job");
+                let active = manager
+                    .active_attempts
+                    .lock()
+                    .await
+                    .contains_key(&public_job_id);
+                let stored = job_store
+                    .get(&job_id)
+                    .await
+                    .expect("read timed-out stored monitor")
+                    .expect("timed-out stored monitor job");
+                panic!(
+                    "monitor completion timed out; active={active}; snapshot={snapshot:?}; stored={stored:?}"
+                );
+            }
+        };
         assert_eq!(completed.attempt_count, 1);
         assert_eq!(completed.current_fence.get(), 1);
         assert_eq!(completed.outbox.len(), 3);

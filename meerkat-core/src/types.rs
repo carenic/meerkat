@@ -2854,9 +2854,20 @@ impl PartialEq<ToolName> for &str {
 
 /// Set of canonical tool names.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(transparent)]
 pub struct ToolNameSet(pub std::collections::HashSet<ToolName>);
+
+impl Serialize for ToolNameSet {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let mut names = self.0.iter().collect::<Vec<_>>();
+        names.sort_unstable_by(|left, right| left.as_str().cmp(right.as_str()));
+        names.serialize(serializer)
+    }
+}
 
 impl ToolNameSet {
     pub fn new() -> Self {

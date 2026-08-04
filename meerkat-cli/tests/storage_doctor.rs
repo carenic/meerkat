@@ -202,7 +202,7 @@ fn unledgered_realm_reports_structural_inventory_without_mutating() {
 
     let no_ledger = findings_with_code(&report, "no-schema-ledger");
     assert_eq!(no_ledger.len(), 1, "{report:#}");
-    assert_eq!(no_ledger[0]["severity"], "info");
+    assert_eq!(no_ledger[0]["severity"], "warning");
 
     assert_eq!(no_ledger[0]["realm"], "unledgered-shape");
     let errors: Vec<_> = report["findings"]

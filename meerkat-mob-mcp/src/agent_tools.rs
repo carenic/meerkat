@@ -2945,6 +2945,18 @@ mod tests {
     }
 
     impl SubscribableInjector for TestInjector {
+        fn inject_with_delivery_identity(
+            &self,
+            _input_identity: meerkat_core::service::StartTurnInputIdentity,
+            _objective_id: Option<meerkat_core::interaction::ObjectiveId>,
+            _content: ContentInput,
+            _source: PlainEventSource,
+            _handling_mode: HandlingMode,
+            _render_metadata: Option<RenderMetadata>,
+        ) -> Result<(), EventInjectorError> {
+            Err(EventInjectorError::Closed)
+        }
+
         fn inject_with_subscription(
             &self,
             body: ContentInput,

@@ -424,6 +424,7 @@ pub enum PeerIngressConvention {
     },
     PlainEvent {
         source_name: String,
+        input_identity: Option<crate::service::StartTurnInputIdentity>,
     },
 }
 
@@ -528,6 +529,7 @@ impl PeerIngressFact {
         source_name: impl Into<String>,
         class: PeerInputClass,
         kind: PeerIngressKind,
+        input_identity: Option<crate::service::StartTurnInputIdentity>,
     ) -> Self {
         let source_name = source_name.into();
         Self {
@@ -540,7 +542,10 @@ impl PeerIngressFact {
             route: None,
             declared_reply_endpoint: None,
             auth: None,
-            convention: PeerIngressConvention::PlainEvent { source_name },
+            convention: PeerIngressConvention::PlainEvent {
+                source_name,
+                input_identity,
+            },
         }
     }
 
@@ -572,7 +577,7 @@ impl PeerIngressFact {
 
     pub fn plain_event_source_name(&self) -> Option<&str> {
         match &self.convention {
-            PeerIngressConvention::PlainEvent { source_name } => Some(source_name.as_str()),
+            PeerIngressConvention::PlainEvent { source_name, .. } => Some(source_name.as_str()),
             _ => None,
         }
     }

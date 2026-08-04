@@ -248,19 +248,19 @@ pub enum MobExternalDeliveryTargetKind {
     ForkHelper,
 }
 
-/// Stable caller-owned identity of one external mob delivery.
+/// Stable caller-owned identity of one mob delivery.
 ///
 /// The idempotency key selects durable admission. Correlation is deliberately
 /// separate: it is stamped onto receipts/runtime inputs but never used as a
 /// substitute for target admission identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct MobExternalDeliveryIdentity {
+pub struct MobDeliveryIdentity {
     pub idempotency_key: String,
     pub correlation_id: String,
 }
 
-impl MobExternalDeliveryIdentity {
+impl MobDeliveryIdentity {
     pub fn new(
         idempotency_key: impl Into<String>,
         correlation_id: impl Into<String>,
@@ -284,23 +284,26 @@ impl MobExternalDeliveryIdentity {
                 || value.chars().any(char::is_control)
             {
                 return Err(MobStoreError::Serialization(format!(
-                    "mob external-delivery {field} must be canonical nonempty text no longer than {MOB_EXTERNAL_DELIVERY_KEY_MAX_BYTES} bytes"
+                    "mob delivery {field} must be canonical nonempty text no longer than {MOB_EXTERNAL_DELIVERY_KEY_MAX_BYTES} bytes"
                 )));
             }
         }
         let correlation_id = uuid::Uuid::parse_str(&self.correlation_id).map_err(|_| {
             MobStoreError::Serialization(
-                "mob external-delivery correlation_id must be a canonical UUID".to_string(),
+                "mob delivery correlation_id must be a canonical UUID".to_string(),
             )
         })?;
         if correlation_id.is_nil() || correlation_id.to_string() != self.correlation_id {
             return Err(MobStoreError::Serialization(
-                "mob external-delivery correlation_id must be a canonical non-nil UUID".to_string(),
+                "mob delivery correlation_id must be a canonical non-nil UUID".to_string(),
             ));
         }
         Ok(())
     }
 }
+
+/// Compatibility name for callers using the external-delivery ledger.
+pub type MobExternalDeliveryIdentity = MobDeliveryIdentity;
 
 /// Immutable authority written before a scheduled effect is attempted.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -308,7 +311,7 @@ impl MobExternalDeliveryIdentity {
 pub struct MobExternalDeliveryIntent {
     pub schema_version: u32,
     pub mob_id: MobId,
-    pub identity: MobExternalDeliveryIdentity,
+    pub identity: MobDeliveryIdentity,
     pub target_kind: MobExternalDeliveryTargetKind,
     /// SHA-256 of the schedule target's canonical semantic key.
     pub action_digest: String,
@@ -317,7 +320,7 @@ pub struct MobExternalDeliveryIntent {
 impl MobExternalDeliveryIntent {
     pub fn new(
         mob_id: MobId,
-        identity: MobExternalDeliveryIdentity,
+        identity: MobDeliveryIdentity,
         target_kind: MobExternalDeliveryTargetKind,
         canonical_action: &[u8],
     ) -> Result<Self, MobStoreError> {

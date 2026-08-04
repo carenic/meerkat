@@ -9,6 +9,7 @@
 use crate::tokio;
 use crate::{
     PlainEventSource,
+    service::StartTurnInputIdentity,
     types::{ContentInput, HandlingMode, RenderMetadata},
 };
 
@@ -69,6 +70,20 @@ pub struct InteractionSubscription {
 /// observation APIs instead.
 #[doc(hidden)]
 pub trait SubscribableInjector: EventInjector {
+    /// Inject an event with the exact durable input identity owned by the
+    /// caller. Implementations must preserve both fields into runtime input
+    /// admission; this method is required so an adapter cannot silently
+    /// downgrade a deduplicating delivery to an ordinary inbox event.
+    fn inject_with_delivery_identity(
+        &self,
+        input_identity: StartTurnInputIdentity,
+        objective_id: Option<crate::interaction::ObjectiveId>,
+        content: ContentInput,
+        source: PlainEventSource,
+        handling_mode: HandlingMode,
+        render_metadata: Option<RenderMetadata>,
+    ) -> Result<(), EventInjectorError>;
+
     /// Inject an event and return a subscription for streaming events.
     ///
     /// 1. Generates a unique `InteractionId`

@@ -14,7 +14,7 @@ use meerkat_core::interaction::{
 use meerkat_core::interaction::{PeerIngressIdentity, ResponseStatus};
 use meerkat_core::lifecycle::InputId;
 
-use crate::identifiers::{CorrelationId, LogicalRuntimeId};
+use crate::identifiers::{CorrelationId, IdempotencyKey, LogicalRuntimeId};
 use crate::input::{
     ExternalEventInput, Input, InputDurability, InputHeader, InputOrigin, InputVisibility,
     PeerConvention, PeerInput, ResponseProgressPhase, ResponseTerminalStatus,
@@ -60,6 +60,10 @@ pub fn classified_interaction_to_runtime_input(
             .plain_event_source_name()
             .unwrap_or("unknown");
         let blocks = external_event_blocks(interaction);
+        let input_identity = match &classified.ingress.convention {
+            PeerIngressConvention::PlainEvent { input_identity, .. } => input_identity.as_ref(),
+            _ => None,
+        };
         return Ok(Input::ExternalEvent(ExternalEventInput {
             header: InputHeader {
                 id: InputId::new(),
@@ -72,7 +76,8 @@ pub fn classified_interaction_to_runtime_input(
                     transcript_eligible: true,
                     operator_eligible: true,
                 },
-                idempotency_key: None,
+                idempotency_key: input_identity
+                    .map(|identity| IdempotencyKey::new(identity.idempotency_key.clone())),
                 supersession_key: None,
                 correlation_id: Some(CorrelationId::from_uuid(interaction.id.0)),
             },
@@ -346,6 +351,7 @@ mod tests {
             source_name,
             PeerInputClass::PlainEvent,
             meerkat_core::PeerIngressKind::PlainEvent,
+            None,
         )
     }
 

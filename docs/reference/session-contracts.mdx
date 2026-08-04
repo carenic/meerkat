@@ -89,6 +89,15 @@ Committed create failure must not be silently rewritten to “cancelled” or cl
 - Committed success must not be rewritten to cancellation.
 - Runtime-backed surfaces may hot-swap supported live settings on an existing session where the surface contract says that is allowed.
 
+<Warning>
+The runtime may coalesce multiple queued `Steer` inputs into one agent turn.
+Admission remains durable per input, but there is no promise of one model call
+per input. Applications that require one side effect per admitted input must
+iterate the durable input records deterministically in a tool or host-owned
+worker. Do not rely on the model to notice and act once for every item in a
+batched prompt.
+</Warning>
+
 ### Ordered System messages
 
 `system_prompt` on `StartTurnRequest` appends one ordinary `System` message at
@@ -350,6 +359,14 @@ the exclusive side after in-flight operations drain. Backup artifacts
 written by maintenance use the registered `*.pre-<version>-<timestamp>`
 naming that `rkat storage doctor` inventories and `rkat storage prune`
 owns.
+
+<Warning>
+Recent session-envelope upgrades are one-way once a newer binary writes the
+session. Before upgrading a durable realm, snapshot every durable store and
+keep that snapshot with the prior binary. Rolling the binary back after new
+writes can leave those sessions unreadable to the older release; a code-only
+rollback is not a supported recovery plan.
+</Warning>
 
 Every store slot a realm composes carries a machine-readable durability
 class (`durable` / `rebuildable_cache` / `scratch`) and its resolution.

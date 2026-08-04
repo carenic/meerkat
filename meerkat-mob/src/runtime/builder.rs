@@ -8769,11 +8769,12 @@ impl MobBuilder {
                                     entry.agent_identity.as_str(),
                                 )?;
                                 match provisioner.comms_runtime(&member_ref).await {
-                                    Some(runtime) => super::provisioner::SessionBackend::
-                                        trusted_peer_spec_from_runtime(
+                                    Some(runtime) => {
+                                        super::provisioner::trusted_peer_spec_from_runtime(
                                             &fallback_name,
                                             runtime.as_ref(),
-                                        )?,
+                                        )?
+                                    }
                                     None => None,
                                 }
                             } else {

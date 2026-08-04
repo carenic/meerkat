@@ -1451,6 +1451,7 @@ mod tests {
                 interaction_id: None,
                 blocks: None,
                 render_metadata: None,
+                input_identity: None,
             })
             .into_result()
             .unwrap();
@@ -1537,6 +1538,7 @@ mod tests {
                 interaction_id: None,
                 blocks: None,
                 render_metadata: None,
+                input_identity: None,
             })
             .into_result()
             .unwrap();
@@ -1641,6 +1643,7 @@ mod tests {
                 interaction_id: None,
                 blocks: None,
                 render_metadata: None,
+                input_identity: None,
             })
             .into_result()
             .unwrap();

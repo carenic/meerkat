@@ -3045,6 +3045,18 @@ impl EventInjector for CountingInjector {
 }
 
 impl SubscribableInjector for CountingInjector {
+    fn inject_with_delivery_identity(
+        &self,
+        _input_identity: meerkat_core::service::StartTurnInputIdentity,
+        _objective_id: Option<meerkat_core::interaction::ObjectiveId>,
+        _content: meerkat_core::types::ContentInput,
+        _source: PlainEventSource,
+        _handling_mode: meerkat_core::types::HandlingMode,
+        _render_metadata: Option<meerkat_core::types::RenderMetadata>,
+    ) -> Result<(), EventInjectorError> {
+        Err(EventInjectorError::Closed)
+    }
+
     fn inject_with_subscription(
         &self,
         body: meerkat_core::types::ContentInput,
@@ -9556,6 +9568,153 @@ async fn test_persistent_resume_classifies_lifecycle_only_session_as_absent() {
         matches!(loaded, ResumeSessionLoad::Absent),
         "a never-persisted session body must remain fresh-eligible even when lifecycle authority exists"
     );
+}
+
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test]
+async fn archived_document_without_runtime_record_is_revivable() {
+    let session_store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+    let runtime_store = Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let runtime_store_dyn: Arc<dyn meerkat_runtime::RuntimeStore> = runtime_store.clone();
+    let blob_store: Arc<dyn meerkat_core::BlobStore> =
+        Arc::new(meerkat_store::MemoryBlobStore::new());
+    let service = Arc::new(meerkat_session::PersistentSessionService::new(
+        OverlayProbeSessionAgentBuilder {
+            provider_visible_tools: Arc::new(Mutex::new(Vec::new())),
+            provider_turn_overlays: Arc::new(Mutex::new(Vec::new())),
+        },
+        16,
+        session_store,
+        runtime_store_dyn,
+        blob_store,
+    ));
+    let mut session = Session::new();
+    session.push(Message::User(meerkat_core::UserMessage::text(
+        "retained pre-runtime transcript".to_string(),
+    )));
+    session
+        .set_lifecycle_terminal(meerkat_core::SessionLifecycleTerminal::Archived)
+        .expect("seed archived document authority");
+    let session_id = session.id().clone();
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
+    let session_bytes = serde_json::to_vec(&session).expect("serialize archived document");
+    meerkat_runtime::RuntimeStore::commit_session_snapshot(
+        runtime_store.as_ref(),
+        &runtime_id,
+        meerkat_runtime::SerializedSessionSnapshot {
+            session_snapshot: session_bytes.into(),
+        },
+    )
+    .await
+    .expect("seed imported archived document without runtime state");
+    assert!(
+        meerkat_runtime::store::load_runtime_state(runtime_store.as_ref(), &runtime_id)
+            .await
+            .expect("read absent runtime state")
+            .is_none(),
+        "fixture must model an imported document with no runtime record"
+    );
+
+    let loaded = service
+        .load_session_for_resume(&session_id)
+        .await
+        .expect("classify imported archived document");
+    let ResumeSessionLoad::Revivable(revivable) = loaded else {
+        panic!("archived document with no competing runtime authority must be revivable");
+    };
+    assert_eq!(revivable.messages(), session.messages());
+    assert_eq!(
+        revivable.lifecycle_terminal(),
+        Some(meerkat_core::SessionLifecycleTerminal::Archived),
+        "classification must preserve the terminal for the machine-owned revive transition"
+    );
+
+    let adapter = service
+        .runtime_adapter()
+        .expect("persistent service runtime adapter");
+    let provisioner =
+        super::provisioner::SessionBackend::new(service.clone(), Some(adapter.clone()), None);
+    let receipt = provisioner
+        .provision_member(super::provisioner::ProvisionMemberRequest {
+            session_origin: super::provisioner::ProvisionSessionOrigin::ResumedDurable,
+            create_session: CreateSessionRequest {
+                injected_context: Vec::new(),
+                model: "claude-sonnet-4-5".to_string(),
+                prompt: "resume imported archived document".to_string().into(),
+                system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+                max_tokens: None,
+                event_tx: None,
+                build: Some(meerkat_core::service::SessionBuildOptions {
+                    resume_session: Some(*revivable),
+                    comms_name: Some("test-mob/worker/imported-archive".to_string()),
+                    keep_alive: true,
+                    ..Default::default()
+                }),
+                initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+                deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+                labels: None,
+            },
+            binding: test_external_binding("imported-archive-worker"),
+            peer_name: "imported-archive-worker".to_string(),
+            owner_bridge_session_id: None,
+            ops_registry: None,
+            generated_self_owned_operation_owner: Some(session_id.clone()),
+            runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
+        })
+        .await
+        .expect("materialize imported archived document through the real resume transaction");
+
+    let runtime_state_after_resume =
+        meerkat_runtime::store::load_runtime_state(runtime_store.as_ref(), &runtime_id)
+            .await
+            .expect("inspect revived runtime state");
+    assert!(
+        adapter.contains_session(&session_id).await,
+        "the revived actor must remain registered with the runtime adapter; runtime state: {runtime_state_after_resume:?}"
+    );
+    assert!(
+        service
+            .has_live_session(&session_id)
+            .await
+            .expect("inspect revived actor"),
+        "the product resume path must reconstruct a live actor; runtime state: {runtime_state_after_resume:?}"
+    );
+    SessionService::read(service.as_ref(), &session_id)
+        .await
+        .expect("revived imported session must be publicly readable");
+    let listed = SessionService::list(service.as_ref(), SessionQuery::default())
+        .await
+        .expect("list revived imported session");
+    assert!(
+        listed
+            .iter()
+            .any(|summary| summary.session_id == session_id),
+        "a live runtime must override its imported archived catalog projection"
+    );
+    let resumed = service
+        .load_authoritative_session(&session_id)
+        .await
+        .expect("load resumed authority")
+        .expect("resumed session remains durable");
+    assert_eq!(
+        resumed.lifecycle_terminal(),
+        Some(meerkat_core::SessionLifecycleTerminal::Active),
+        "the generated revival verdict must be realized in durable document authority"
+    );
+    assert!(
+        resumed.messages().iter().any(|message| {
+            matches!(
+                message,
+                Message::User(user) if user.text_content() == "retained pre-runtime transcript"
+            )
+        }),
+        "revival must preserve the imported transcript"
+    );
+
+    provisioner
+        .retire_member(&receipt.member_ref)
+        .await
+        .expect("retire revived imported session");
 }
 
 fn overlay_probe_visible_tools(overlay: Option<&TurnToolOverlay>) -> Vec<meerkat_core::ToolName> {
@@ -43192,6 +43351,224 @@ async fn test_active_internal_submit_work_steer_falls_back_when_exact_boundary_i
         .await
         .expect("stop timeout after internal queued fallback assertion")
         .expect("stop after internal queued fallback assertion");
+}
+
+#[tokio::test]
+async fn internal_submit_work_carries_stable_delivery_identity_to_runtime_admission() {
+    let _serial = lock_real_comms_tests();
+    let (handle, service) =
+        create_test_mob_with_runtime_backed_real_comms(sample_definition()).await;
+    let member_id = AgentIdentity::from("delivery-identity-worker");
+    let session_id = handle
+        .spawn_with_options(
+            ProfileName::from("worker"),
+            member_id.clone(),
+            None,
+            Some(crate::MobRuntimeMode::TurnDriven),
+            None,
+        )
+        .await
+        .expect("spawn turn-driven worker")
+        .bridge_session_id()
+        .expect("runtime-backed member")
+        .clone();
+    handle
+        .wait_for_ready(Some(Duration::from_secs(2)))
+        .await
+        .expect("startup should settle");
+    let entry = handle
+        .get_member(&member_id)
+        .await
+        .expect("read member")
+        .expect("member exists");
+    let baseline = service
+        .applied_runtime_contributing_input_ids(&session_id)
+        .await
+        .len();
+    let delivery_identity = crate::MobDeliveryIdentity::new(
+        "schedule:daily-report:occurrence:2026-08-03T14:00:00Z",
+        "019fdcda-836e-70b4-9d89-78e629a77c30",
+    )
+    .expect("valid delivery identity");
+    let expected_work_ref = WorkRef::for_delivery(
+        handle.mob_id(),
+        &member_id,
+        &delivery_identity.idempotency_key,
+    );
+
+    let receipt = handle
+        .submit_work_with_mode_and_delivery_identity(
+            entry.agent_runtime_id.clone(),
+            entry.fence_token,
+            WorkSpec::new("deliver scheduled work", WorkOrigin::Internal),
+            HandlingMode::Queue,
+            delivery_identity.clone(),
+        )
+        .await
+        .expect("stable internal delivery should be admitted");
+    assert_eq!(receipt.work_ref, expected_work_ref);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while service
+            .applied_runtime_contributing_input_ids(&session_id)
+            .await
+            .len()
+            < baseline + 1
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stable internal delivery should reach the runtime executor");
+    let stored = <meerkat_runtime::MeerkatMachine as meerkat_runtime::service_ext::SessionServiceRuntimeExt>::input_state_by_idempotency_key(
+        service.runtime_adapter.as_ref(),
+        &session_id,
+        &delivery_identity.idempotency_key,
+    )
+    .await
+    .expect("runtime identity lookup")
+    .expect("stable delivery must be indexed at admission");
+    assert_eq!(
+        stored
+            .state
+            .idempotency_key
+            .as_ref()
+            .map(ToString::to_string),
+        Some(delivery_identity.idempotency_key.clone())
+    );
+
+    let duplicate = handle
+        .submit_work_with_mode_and_delivery_identity(
+            entry.agent_runtime_id,
+            entry.fence_token,
+            WorkSpec::new("deliver scheduled work", WorkOrigin::Internal),
+            HandlingMode::Queue,
+            delivery_identity,
+        )
+        .await
+        .expect("crash-redelivered identity should deduplicate");
+    assert_eq!(duplicate.work_ref, receipt.work_ref);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        service
+            .applied_runtime_contributing_input_ids(&session_id)
+            .await
+            .len(),
+        baseline + 1,
+        "redelivery under the same stable identity must not execute twice"
+    );
+}
+
+#[tokio::test]
+async fn autonomous_internal_submit_work_carries_stable_delivery_identity_to_runtime_admission() {
+    let _serial = lock_real_comms_tests();
+    let (handle, service) =
+        create_test_mob_with_runtime_backed_real_comms(sample_definition()).await;
+    service.set_keep_alive_turns_complete_immediately(true);
+    let member_id = AgentIdentity::from("autonomous-delivery-identity-worker");
+    let session_id = handle
+        .spawn_with_options(
+            ProfileName::from("worker"),
+            member_id.clone(),
+            None,
+            Some(crate::MobRuntimeMode::AutonomousHost),
+            None,
+        )
+        .await
+        .expect("spawn autonomous worker")
+        .bridge_session_id()
+        .expect("runtime-backed member")
+        .clone();
+    handle
+        .wait_for_ready(Some(Duration::from_secs(2)))
+        .await
+        .expect("startup should settle");
+    handle
+        .wait_for_members_kickoff_complete(
+            std::slice::from_ref(&member_id),
+            Some(Duration::from_secs(2)),
+        )
+        .await
+        .expect("autonomous kickoff should settle before stable delivery");
+    let entry = handle
+        .get_member(&member_id)
+        .await
+        .expect("read member")
+        .expect("member exists");
+    let baseline = service
+        .applied_runtime_contributing_input_ids(&session_id)
+        .await
+        .len();
+    let delivery_identity = crate::MobDeliveryIdentity::new(
+        "schedule:autonomous-report:occurrence:2026-08-03T14:00:00Z",
+        "019fdcda-836e-70b4-9d89-78e629a77c31",
+    )
+    .expect("valid delivery identity");
+    let expected_work_ref = WorkRef::for_delivery(
+        handle.mob_id(),
+        &member_id,
+        &delivery_identity.idempotency_key,
+    );
+
+    let receipt = handle
+        .submit_work_with_mode_and_delivery_identity(
+            entry.agent_runtime_id.clone(),
+            entry.fence_token,
+            WorkSpec::new("deliver autonomous scheduled work", WorkOrigin::Internal),
+            HandlingMode::Queue,
+            delivery_identity.clone(),
+        )
+        .await
+        .expect("stable autonomous delivery should be admitted");
+    assert_eq!(receipt.work_ref, expected_work_ref);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while service
+            .applied_runtime_contributing_input_ids(&session_id)
+            .await
+            .len()
+            < baseline + 1
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("stable autonomous delivery should reach runtime input admission");
+    let stored = <meerkat_runtime::MeerkatMachine as meerkat_runtime::service_ext::SessionServiceRuntimeExt>::input_state_by_idempotency_key(
+        service.runtime_adapter.as_ref(),
+        &session_id,
+        &delivery_identity.idempotency_key,
+    )
+    .await
+    .expect("runtime identity lookup")
+    .expect("stable autonomous delivery must be indexed at admission");
+    assert_eq!(
+        stored
+            .state
+            .idempotency_key
+            .as_ref()
+            .map(ToString::to_string),
+        Some(delivery_identity.idempotency_key.clone())
+    );
+
+    let duplicate = handle
+        .submit_work_with_mode_and_delivery_identity(
+            entry.agent_runtime_id,
+            entry.fence_token,
+            WorkSpec::new("deliver autonomous scheduled work", WorkOrigin::Internal),
+            HandlingMode::Queue,
+            delivery_identity,
+        )
+        .await
+        .expect("autonomous crash redelivery should deduplicate");
+    assert_eq!(duplicate.work_ref, receipt.work_ref);
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(
+        service
+            .applied_runtime_contributing_input_ids(&session_id)
+            .await
+            .len(),
+        baseline + 1,
+        "autonomous redelivery under the same stable identity must not execute twice"
+    );
 }
 
 #[tokio::test]

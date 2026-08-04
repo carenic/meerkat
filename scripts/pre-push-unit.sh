@@ -12,6 +12,13 @@ GIT_BIN="${GIT_BIN:-git}"
 
 CACHE_VERSION="v6"
 NEXTEST_TIMEOUT_SECS="${MEERKAT_PRE_PUSH_NEXTEST_TIMEOUT_SECS:-300}"
+# The unit lane includes a dense-topology stress test with its own 300-second
+# assertion budget, in addition to workspace test-binary compilation.
+UNIT_NEXTEST_TIMEOUT_SECS="${MEERKAT_PRE_PUSH_UNIT_NEXTEST_TIMEOUT_SECS:-900}"
+# The integration lane includes downstream compile-policy canaries and more
+# than 2,000 tests. Its timeout must cover both exact-tree linking and those
+# nested compiler checks.
+INTEGRATION_NEXTEST_TIMEOUT_SECS="${MEERKAT_PRE_PUSH_INTEGRATION_NEXTEST_TIMEOUT_SECS:-900}"
 LOCK_WAIT_SECS="${MEERKAT_PRE_PUSH_UNIT_LOCK_WAIT_SECS:-180}"
 GIT_DIR_PATH="$("$GIT_BIN" rev-parse --git-common-dir)"
 HOOK_CACHE_ROOT="${GIT_DIR_PATH}/meerkat-hook-cache"
@@ -133,12 +140,13 @@ run_with_timeout() {
 
 retry_lane() {
   local label="$1"
-  shift
+  local timeout_secs="$2"
+  shift 2
   local lane_cmd=("$@")
   local status
 
   echo "Running ${label}..."
-  if run_with_timeout "$NEXTEST_TIMEOUT_SECS" "${lane_cmd[@]}"; then
+  if run_with_timeout "$timeout_secs" "${lane_cmd[@]}"; then
     return 0
   else
     status=$?
@@ -150,7 +158,7 @@ retry_lane() {
 
   echo "${label} timed out; retrying once with a clean process tree..." >&2
   sleep 1
-  run_with_timeout "$NEXTEST_TIMEOUT_SECS" "${lane_cmd[@]}"
+  run_with_timeout "$timeout_secs" "${lane_cmd[@]}"
 }
 
 acquire_lock
@@ -168,20 +176,25 @@ fi
 
 retry_lane \
   "workspace unit lane" \
+  "$UNIT_NEXTEST_TIMEOUT_SECS" \
   "$CARGO" nextest run --workspace --lib --no-fail-fast \
     --show-progress none --status-level none --final-status-level fail
 retry_lane \
   "workspace integration lane" \
+  "$INTEGRATION_NEXTEST_TIMEOUT_SECS" \
   "$CARGO" nextest run --workspace --tests --profile fast --no-fail-fast \
+    -E 'kind(test)' \
     --show-progress none --status-level none --final-status-level fail
 retry_lane \
   "HeadCanonical process-death lane" \
+  "$NEXTEST_TIMEOUT_SECS" \
   "$CARGO" nextest run -p meerkat-mob --test cold_restart_mob_resume \
     --features test-support --profile fast --no-tests=fail \
     --show-progress none --status-level none --final-status-level fail \
     -E 'test(mob_cold_restart_resume_after_kill_between_commit_points)'
 retry_lane \
   "e2e-fast lane" \
+  "$NEXTEST_TIMEOUT_SECS" \
   "$CARGO" nextest run -p meerkat-integration-tests --test e2e_fast_lane \
     --no-fail-fast --show-progress none --status-level none --final-status-level fail
 

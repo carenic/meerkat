@@ -245,7 +245,10 @@ pub struct CompactionConfig {
     pub recent_turn_budget: usize,
     /// Maximum tokens for the compaction summary LLM response.
     pub max_summary_tokens: u32,
-    /// Minimum session-scoped LLM boundaries between consecutive compactions.
+    /// Minimum session-scoped LLM boundaries between ordinary consecutive
+    /// compactions. Built-in compaction bypasses this cost guard when the
+    /// current history or exact provider request has already crossed a live
+    /// capacity threshold; cadence cannot veto recovery.
     pub min_turns_between_compactions: u32,
 }
 
@@ -305,6 +308,21 @@ pub trait Compactor: Send + Sync {
     /// The default implementation returns an unmodified clone.
     fn prepare_for_summarization(&self, messages: &[Message]) -> Vec<Message> {
         messages.to_vec()
+    }
+
+    /// Rebuild history while carrying the exact provider request pressure that
+    /// triggered compaction, when available.
+    ///
+    /// The default preserves the original custom-compactor contract. Built-in
+    /// compaction uses the pressure witness to ensure its exact retained tail
+    /// cannot itself recreate the oversized request it is meant to repair.
+    fn rebuild_history_under_pressure(
+        &self,
+        messages: &[Message],
+        summary: &str,
+        _pressure: Option<ProviderRequestPressure>,
+    ) -> CompactionResult {
+        self.rebuild_history(messages, summary)
     }
 
     /// Rebuild the session history from a summary and current messages.

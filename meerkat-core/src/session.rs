@@ -5331,13 +5331,99 @@ impl Session {
         &self,
         validated: ValidatedTranscriptHistory,
     ) -> Result<Self, TranscriptEditError> {
+        let mut projected = self.clone_persisted_envelope_without_transcript_history();
+        projected.apply_validated_transcript_history_state(validated)?;
+        Ok(projected)
+    }
+
+    /// Clone the persisted envelope at the exact parent of one proved rewrite
+    /// occurrence.
+    ///
+    /// Cross-store reconciliation may observe a durable strand that predates
+    /// ordinary appends included in a later committed rewrite parent. The
+    /// parent must land before the typed rewrite door can adopt that
+    /// occurrence. This projection derives the exact parent body and preceding
+    /// graph prefix from the Session's already-validated graph, without
+    /// inventing timestamps or re-running the rewrite.
+    pub fn with_validated_transcript_rewrite_parent_projection(
+        &self,
+        validated: &ValidatedTranscriptHistory,
+        commit: &TranscriptRewriteCommit,
+    ) -> Result<Self, TranscriptEditError> {
+        let carried = self.validated_transcript_history_state()?.ok_or_else(|| {
+            TranscriptEditError::HistoryStateMalformed(
+                "session carries no transcript graph for parent projection".to_string(),
+            )
+        })?;
+        if !carried.shares_exact_state_with(validated) {
+            return Err(TranscriptEditError::HistoryStateMalformed(
+                "parent projection proof does not belong to this Session".to_string(),
+            ));
+        }
+        let commit_index = commit
+            .rewrite_generation
+            .checked_sub(1)
+            .and_then(|index| usize::try_from(index).ok())
+            .ok_or_else(|| {
+                TranscriptEditError::HistoryStateMalformed(format!(
+                    "rewrite occurrence generation {} cannot address this graph",
+                    commit.rewrite_generation
+                ))
+            })?;
+        let bound = validated.state().commit(commit_index).ok_or_else(|| {
+            TranscriptEditError::HistoryStateMalformed(format!(
+                "rewrite occurrence generation {} is outside the proved graph",
+                commit.rewrite_generation
+            ))
+        })?;
+        if bound != commit {
+            return Err(TranscriptEditError::HistoryStateMalformed(format!(
+                "rewrite occurrence generation {} does not match the proved graph commit",
+                commit.rewrite_generation
+            )));
+        }
+
+        let parent_body = validated.materialize_rewrite_parent(commit)?;
+        let mut projected = self.clone_persisted_envelope_without_transcript_history();
+        if commit_index != 0 {
+            let previous_commit = validated.state().commit(commit_index - 1).ok_or_else(|| {
+                TranscriptEditError::HistoryStateMalformed(
+                    "rewrite parent projection lost its preceding occurrence".to_string(),
+                )
+            })?;
+            projected.apply_validated_transcript_history_state(
+                validated.project_at_rewrite_commit(previous_commit)?,
+            )?;
+        }
+        let realtime_rebase = projected.prepare_realtime_transcript_rebase_after_rewrite(
+            &parent_body.messages,
+            RealtimeTranscriptSnapshotReasonV1::RecoveryRebase,
+        )?;
+        projected
+            .realtime_transcript
+            .apply_prepared_rebase(realtime_rebase);
+        projected.messages.replace(parent_body.messages);
+        projected.mark_content_mutated(parent_body.created_at);
+        let projected_revision = projected
+            .transcript_content_digest()
+            .map_err(|error| TranscriptEditError::HistoryStateMalformed(error.to_string()))?;
+        if projected_revision != commit.parent_revision {
+            return Err(TranscriptEditError::HistoryStateMalformed(format!(
+                "proved parent projection digest {projected_revision} differs from commit parent {}",
+                commit.parent_revision
+            )));
+        }
+        Ok(projected)
+    }
+
+    fn clone_persisted_envelope_without_transcript_history(&self) -> Self {
         let metadata = self
             .metadata
             .iter()
             .filter(|(key, _)| key.as_str() != SESSION_TRANSCRIPT_HISTORY_STATE_KEY)
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        let mut projected = Self {
+        Self {
             version: self.version,
             id: self.id.clone(),
             messages: self.messages.clone(),
@@ -5348,9 +5434,7 @@ impl Session {
             history_caches: Box::default(),
             transcript_history_metadata_validation: TranscriptHistoryMetadataValidation::Validated,
             usage: self.usage.clone(),
-        };
-        projected.apply_validated_transcript_history_state(validated)?;
-        Ok(projected)
+        }
     }
 
     fn apply_proved_transcript_history_state(
@@ -9333,6 +9417,94 @@ mod tests {
             latest_b.commit_count(),
             3,
             "digest-only lookup intentionally selects the latest matching occurrence"
+        );
+    }
+
+    #[test]
+    fn proved_rewrite_parent_projection_preserves_appends_and_prior_graph() {
+        let message_a = Message::User(UserMessage::text("A".to_string()));
+        let message_b = Message::User(UserMessage::text("B".to_string()));
+        let message_c = Message::User(UserMessage::text("C".to_string()));
+        let message_d = Message::User(UserMessage::text("D".to_string()));
+        let message_e = Message::User(UserMessage::text("E".to_string()));
+        let mut session = Session::new();
+        session.push(message_a);
+        session.push(message_b.clone());
+        let first_parent = session.messages().to_vec();
+        let first_parent_revision = session
+            .transcript_revision()
+            .expect("first parent revision");
+        let first = session
+            .commit_transcript_rewrite(
+                TranscriptRewriteSelection::MessageRange { start: 0, end: 1 },
+                vec![message_c.clone()],
+                TranscriptRewriteReason::new("first rewrite"),
+                Some("unit-test".to_string()),
+                Some(first_parent_revision),
+            )
+            .expect("first rewrite should commit");
+
+        session.push(message_d.clone());
+        let second_parent = session.messages().to_vec();
+        let second_parent_revision = session
+            .transcript_revision()
+            .expect("second parent revision");
+        let second = session
+            .commit_transcript_rewrite(
+                TranscriptRewriteSelection::MessageRange { start: 0, end: 1 },
+                vec![message_e],
+                TranscriptRewriteReason::new("second rewrite"),
+                Some("unit-test".to_string()),
+                Some(second_parent_revision),
+            )
+            .expect("second rewrite should commit");
+        let sealed = session
+            .validated_transcript_history_state()
+            .expect("history should validate")
+            .expect("rewritten session should carry history");
+
+        let projected_first_parent = session
+            .with_validated_transcript_rewrite_parent_projection(&sealed, &first)
+            .expect("first parent should project");
+        assert_eq!(projected_first_parent.messages(), first_parent);
+        assert_eq!(
+            projected_first_parent
+                .transcript_rewrite_generation()
+                .expect("first parent generation"),
+            0
+        );
+        assert_eq!(
+            projected_first_parent
+                .transcript_revision()
+                .expect("first projected parent revision"),
+            first.parent_revision
+        );
+
+        let projected_second_parent = session
+            .with_validated_transcript_rewrite_parent_projection(&sealed, &second)
+            .expect("second parent should project");
+        assert_eq!(projected_second_parent.messages(), second_parent);
+        assert_eq!(
+            projected_second_parent
+                .transcript_rewrite_generation()
+                .expect("second parent generation"),
+            1
+        );
+        assert_eq!(
+            projected_second_parent
+                .transcript_revision()
+                .expect("second projected parent revision"),
+            second.parent_revision
+        );
+        let preceding_graph = projected_second_parent
+            .validated_transcript_history_state()
+            .expect("preceding graph should validate")
+            .expect("second parent should retain the first occurrence");
+        assert_eq!(preceding_graph.commit_count(), 1);
+        assert_eq!(preceding_graph.last_commit(), Some(&first));
+        assert_eq!(
+            projected_second_parent.messages(),
+            &[message_c, message_b, message_d]
         );
     }
 

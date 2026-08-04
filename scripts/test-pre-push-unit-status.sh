@@ -24,6 +24,7 @@ if [[ "$args" == *" --test cold_restart_mob_resume "* ]]; then
 elif [[ "$args" == *" --lib "* ]]; then
   lane="unit"
 elif [[ "$args" == *" --tests "* ]]; then
+  [[ "$args" == *" -E kind(test) "* ]] || exit 98
   lane="integration"
 elif [[ "$args" == *" --test e2e_fast_lane "* ]]; then
   lane="e2e-fast"
@@ -39,7 +40,7 @@ if [[ "$lane" == "$timeout_lane" && "$timeout_attempts" -gt 0 ]]; then
   attempt="$(( $(wc -l < "$attempt_file") + 1 ))"
   printf '%s\n' "$attempt" >> "$attempt_file"
   if [[ "$attempt" -le "$timeout_attempts" ]]; then
-    sleep 30
+    exit 124
   fi
 fi
 if [[ "$lane" == "$MEERKAT_PRE_PUSH_TEST_FAIL_LANE" ]]; then
@@ -71,6 +72,8 @@ assert_failure_case() {
       CARGO="$FAKE_CARGO" \
       MEERKAT_SKIP_PRE_PUSH_UNIT_CACHE=1 \
       MEERKAT_PRE_PUSH_NEXTEST_TIMEOUT_SECS=10 \
+      MEERKAT_PRE_PUSH_UNIT_NEXTEST_TIMEOUT_SECS=10 \
+      MEERKAT_PRE_PUSH_INTEGRATION_NEXTEST_TIMEOUT_SECS=10 \
       MEERKAT_PRE_PUSH_TEST_LANE_LOG="$LANE_LOG" \
       MEERKAT_PRE_PUSH_TEST_FAIL_LANE="$fail_lane" \
       MEERKAT_PRE_PUSH_TEST_FAIL_STATUS="$fail_status" \
@@ -117,6 +120,8 @@ assert_timeout_case() {
       CARGO="$FAKE_CARGO" \
       MEERKAT_SKIP_PRE_PUSH_UNIT_CACHE=1 \
       MEERKAT_PRE_PUSH_NEXTEST_TIMEOUT_SECS=1 \
+      MEERKAT_PRE_PUSH_UNIT_NEXTEST_TIMEOUT_SECS=1 \
+      MEERKAT_PRE_PUSH_INTEGRATION_NEXTEST_TIMEOUT_SECS=1 \
       MEERKAT_PRE_PUSH_TEST_LANE_LOG="$LANE_LOG" \
       MEERKAT_PRE_PUSH_TEST_FAIL_LANE="" \
       MEERKAT_PRE_PUSH_TEST_FAIL_STATUS=99 \
@@ -168,6 +173,8 @@ assert_preflight_rejection() {
       CARGO="$FAKE_CARGO" \
       MEERKAT_SKIP_PRE_PUSH_UNIT_CACHE=1 \
       MEERKAT_PRE_PUSH_NEXTEST_TIMEOUT_SECS=10 \
+      MEERKAT_PRE_PUSH_UNIT_NEXTEST_TIMEOUT_SECS=10 \
+      MEERKAT_PRE_PUSH_INTEGRATION_NEXTEST_TIMEOUT_SECS=10 \
       MEERKAT_PRE_PUSH_TEST_LANE_LOG="$LANE_LOG" \
       MEERKAT_PRE_PUSH_TEST_FAIL_LANE="" \
       MEERKAT_PRE_PUSH_TEST_FAIL_STATUS=99 \
@@ -201,6 +208,8 @@ rm -rf "$TEST_ROOT/.git/meerkat-hook-cache"
   ROOT="$REPO_ROOT" \
     CARGO="$FAKE_CARGO" \
     MEERKAT_PRE_PUSH_NEXTEST_TIMEOUT_SECS=10 \
+    MEERKAT_PRE_PUSH_UNIT_NEXTEST_TIMEOUT_SECS=10 \
+    MEERKAT_PRE_PUSH_INTEGRATION_NEXTEST_TIMEOUT_SECS=10 \
     MEERKAT_PRE_PUSH_TEST_LANE_LOG="$LANE_LOG" \
     MEERKAT_PRE_PUSH_TEST_FAIL_LANE="" \
     MEERKAT_PRE_PUSH_TEST_FAIL_STATUS=99 \

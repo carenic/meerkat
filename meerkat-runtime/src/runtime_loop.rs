@@ -9083,6 +9083,7 @@ mod tests {
                     "webhook",
                     PeerInputClass::PlainEvent,
                     meerkat_core::PeerIngressKind::PlainEvent,
+                    None,
                 ),
                 interaction: InboxInteraction {
                     objective_id: None,

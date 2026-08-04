@@ -13,8 +13,31 @@ via cargo-semver-checks against the published baselines).
 
 ## [Unreleased]
 
+## [0.8.15] - 2026-08-03
+
+### Added
+
+- Mob work submission can now carry a store-owned `MobDeliveryIdentity`
+  through `MobHandle::submit_work_with_mode_and_delivery_identity`. The
+  runtime derives a stable work reference and uses the exact identity for
+  durable turn admission in both turn-driven and autonomous-host modes, so a
+  scheduler can redeliver the same occurrence after a crash without executing
+  it twice.
+
+### Changed
+
+- `ToolNameSet` now serializes in canonical sorted order. Equivalent tool
+  policies no longer produce different JSON, hashes, or cache identities due
+  only to hash-set insertion order.
+
 ### Fixed
 
+- Built-in context compaction now bounds the summarization request and the
+  exact recent-turn tail it retains. A single oversized tool result can no
+  longer make the compactor resend or preserve the same over-context payload;
+  live token or provider-byte pressure bypasses the ordinary cadence guard,
+  and typed provider-capacity failure falls back to a deterministic
+  progress-making rewrite.
 - Pre-0.8.10 durable SQLite realms now have one explicit current-binary bridge:
   `rkat ... storage migrate --apply --bridge-pre-0-8-10`. The frozen,
   fail-closed importer authenticates supported pre-floor schemas and rows
@@ -31,6 +54,35 @@ via cargo-semver-checks against the published baselines).
   provider, and tool policy remain in force. Explicit realms, isolated runs,
   resumes, and session commands stay fail-closed, and historical access remains
   available only through the explicit pre-0.8.10 maintenance bridge.
+- Imported archived session documents with no competing runtime record are
+  now revivable. When a runtime record exists, its lifecycle remains the
+  authoritative classification and overrides stale document metadata.
+- OpenAI responses no longer claim that web search ran merely because the
+  response contains an empty or unrelated annotation list. Only a recognized,
+  non-empty URL citation produces web-search provenance.
+- `meerkat-mob` and the RPC, REST, and MCP server crates compile in their
+  supported minimal feature configurations. Runtime-adapter and comms-only
+  calls are no longer left reachable when those features are disabled.
+- The schedule occurrence lifecycle schema remains frozen at wire version 9;
+  durable delivery identity does not alter the persisted occurrence format.
+
+## [0.8.14] - 2026-08-03
+
+### Fixed
+
+- Mob retirement now quiesces an active turn before detaching its actor, so a
+  successful retirement cannot race an in-flight executor.
+- A failed host-owned retirement keeps its retryable actor projection instead
+  of deleting the actor while the durable lifecycle still requires the host
+  to retry cleanup.
+
+## [0.8.13] - 2026-08-03
+
+### Fixed
+
+- Runtime successor wakes are retained across the boundary claim that creates
+  their work, while redundant wakes are suppressed and only genuinely queued
+  successor work can schedule another turn.
 
 ## [0.8.12] - 2026-08-02
 
