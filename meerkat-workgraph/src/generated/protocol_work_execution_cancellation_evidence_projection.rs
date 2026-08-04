@@ -37,7 +37,7 @@ pub fn extract_obligations(
             } => Some(WorkExecutionCancellationEvidenceProjectionObligation {
                 binding_id: binding_id.clone(),
                 run_id: run_id.clone(),
-                kind: kind.clone(),
+                kind: *kind,
             }),
             _ => None,
         })

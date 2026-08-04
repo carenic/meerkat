@@ -40,7 +40,7 @@ pub fn extract_obligations(
                 binding_id: binding_id.clone(),
                 run_id: run_id.clone(),
                 detail: detail.clone(),
-                kind: kind.clone(),
+                kind: *kind,
             }),
             _ => None,
         })
