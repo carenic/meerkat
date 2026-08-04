@@ -218,7 +218,6 @@ BASELINE_HAND_ROLLED: set[tuple[str, str, str]] = {
     ("ts", "mob/flow_run", "params"),
     ("ts", "mob/flow_run", "result"),
     ("ts", "mob/flow_status", "params"),
-    ("ts", "mob/flow_status", "result"),
     ("ts", "mob/flows", "params"),
     ("ts", "mob/flows", "result"),
     ("ts", "mob/force_cancel", "params"),

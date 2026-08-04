@@ -1140,7 +1140,7 @@ mod tests {
             ("session-store", 1, 3),
             ("runtime-store", 1, 2),
             ("schedule-store", 1, 2),
-            ("workgraph", 1, 2),
+            ("workgraph", 1, 3),
             ("jobs", 1, 2),
         ];
         #[cfg(feature = "memory-store-session")]

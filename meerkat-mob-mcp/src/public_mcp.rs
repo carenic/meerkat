@@ -1638,8 +1638,8 @@ mod tests {
         }
         assert_eq!(
             table_names.len(),
-            32,
-            "expected exactly 32 public tools across all surfaces"
+            36,
+            "expected exactly 36 public tools across all surfaces"
         );
     }
 

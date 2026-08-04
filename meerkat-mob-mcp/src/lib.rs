@@ -33,11 +33,6 @@ mod tokio {
     pub use tokio_with_wasm::alias::*;
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-mod tokio {
-    pub use ::tokio::*;
-}
-
 use async_trait::async_trait;
 
 use meerkat_client::LlmClient;

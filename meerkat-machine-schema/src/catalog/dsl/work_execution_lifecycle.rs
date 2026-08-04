@@ -2,20 +2,15 @@ use meerkat_machine_dsl::machine;
 
 use super::OptionValueExt;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WorkExecutionEvidenceKind {
+    #[default]
     Completed,
     Failed,
     Canceled,
     LaunchFailed,
     RunLost,
-}
-
-impl Default for WorkExecutionEvidenceKind {
-    fn default() -> Self {
-        Self::Completed
-    }
 }
 
 machine! {

@@ -11,7 +11,10 @@ pub use meerkat_mob::{
 };
 
 use crate::MobMcpState;
+#[cfg(target_arch = "wasm32")]
 use crate::tokio;
+#[cfg(not(target_arch = "wasm32"))]
+use ::tokio;
 
 impl MobMcpState {
     pub(crate) fn authorize_workgraph_flow_realm(

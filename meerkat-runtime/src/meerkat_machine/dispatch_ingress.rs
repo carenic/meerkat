@@ -414,6 +414,20 @@ impl MeerkatMachine {
     > {
         let live_boundary_plan = {
             let driver = witness.driver.lock().await;
+            let Some(run_id) = driver.current_run_id() else {
+                tracing::debug!(
+                    session_id = %session_id,
+                    input_id = %input_id,
+                    "no active run is available for exact live-boundary context; retaining queued fallback"
+                );
+                return Ok((
+                    held_mutation_gate,
+                    LiveBoundaryInputDisposition::QueuedFallback,
+                ));
+            };
+            // Arbitrate only an actual active-run boundary. Before a run has
+            // acquired queue authority, multiple Steer inputs intentionally
+            // remain eligible for one generated same-boundary batch.
             let steer_queue = driver.driver_ingress().steer_queue();
             if steer_queue.iter().any(|candidate| candidate == input_id)
                 && steer_queue.first() != Some(input_id)
@@ -431,24 +445,13 @@ impl MeerkatMachine {
                 tracing::debug!(
                     session_id = %session_id,
                     input_id = %input_id,
-                    "later live-boundary candidate retained durable FIFO behind earlier admission"
+                    "later live-boundary candidate retained durable FIFO behind earlier active-run admission"
                 );
                 return Ok((
                     held_mutation_gate,
                     LiveBoundaryInputDisposition::QueuedFallback,
                 ));
             }
-            let Some(run_id) = driver.current_run_id() else {
-                tracing::debug!(
-                    session_id = %session_id,
-                    input_id = %input_id,
-                    "no active run is available for exact live-boundary context; retaining queued fallback"
-                );
-                return Ok((
-                    held_mutation_gate,
-                    LiveBoundaryInputDisposition::QueuedFallback,
-                ));
-            };
             let Some(projection) = driver.driver_ingress().primitive_projection(input_id) else {
                 let error = RuntimeDriverError::Internal(format!(
                     "accepted live-boundary input {input_id} has no primitive projection"
