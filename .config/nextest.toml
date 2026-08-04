@@ -82,6 +82,17 @@ filter = 'test(~test_resume_restores_missing_sessions_with_tool_wiring)'
 threads-required = "num-cpus"
 
 [[profile.fast.overrides]]
+# Raw SQLite writes are observed through filesystem notification with a
+# five-second safety sweep. Keep this wall-clock fallback contract away from
+# CPU-saturating topology and nested-codegen tests.
+filter = 'test(~test_sqlite_event_store_subscribe_receives_raw_sqlite_append)'
+threads-required = "num-cpus"
+
+[[profile.default.overrides]]
+filter = 'test(~test_sqlite_event_store_subscribe_receives_raw_sqlite_append)'
+threads-required = "num-cpus"
+
+[[profile.fast.overrides]]
 # Branch-winner mob flow tests drive full in-memory runtimes and wait on
 # scheduler progress, so running them beside codegen canaries or parity audits
 # can consume their terminal-state wait budget without surfacing a product

@@ -8749,10 +8749,13 @@ mod tests {
         .await
         .unwrap();
 
-        let observed = tokio::time::timeout(std::time::Duration::from_secs(2), rx.recv())
-            .await
-            .expect("subscription should receive raw sqlite append")
-            .expect("subscription should stay open");
+        let observed = tokio::time::timeout(
+            std::time::Duration::from_millis(EVENT_WATCH_SAFETY_SWEEP_MS.saturating_mul(2)),
+            rx.recv(),
+        )
+        .await
+        .expect("subscription should receive raw sqlite append")
+        .expect("subscription should stay open");
 
         assert_eq!(observed.cursor, 1);
         assert!(matches!(observed.kind, MobEventKind::MobCompleted));
