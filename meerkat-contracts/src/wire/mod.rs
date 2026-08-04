@@ -173,7 +173,8 @@ pub use mob::{
     WireProjectionProvenance, WireReachability, WireRenderClass, WireRenderMetadata,
     WireRenderSalience, WireRouteInstallObligation, WireRuntimeBinding, WireScopeDeniedDetail,
     WireToolAccessPolicy, WireToolFilter, WireTrustedPeerIdentity, WireTrustedPeerSpec,
-    WireUnreachablePeer, WireWorkOrigin,
+    WireUnreachablePeer, WireWorkExecutionLifecyclePhase, WireWorkGraphFlowExecutionBinding,
+    WireWorkGraphFlowWorkRef, WireWorkOrigin,
 };
 pub use models::{
     CatalogModelEntry, ModelsCatalogResponse, ProviderCatalog, WireModelBetaHeader,

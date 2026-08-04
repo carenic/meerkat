@@ -78,6 +78,11 @@ source of truth for tool names and availability.
 | `meerkat_mob_flows` | List flows defined for a mob (mob feature) |
 | `meerkat_mob_run` | Invoke a mob as a typed callable run (mob feature) |
 | `meerkat_mob_flow_run` | Start a mob flow run (mob feature) |
+| `meerkat_workgraph_flow_launch` | Durably bind a WorkGraph item to an exact Mob Flow attempt before launch (mob feature) |
+| `meerkat_workgraph_flow_reconcile` | Explicitly reconcile a durable WorkGraph Flow binding (mob feature) |
+| `meerkat_workgraph_flow_abandon_uncertain` | CAS-fence an ambiguous Begin-without-run launch, project failure evidence, and make a superseding retry eligible (mob feature) |
+| `meerkat_workgraph_flow_binding_get` | Read one redacted WorkGraph Flow execution binding (mob feature) |
+| `meerkat_workgraph_flow_binding_list` | List bounded redacted WorkGraph Flow execution bindings (mob feature) |
 | `meerkat_mob_flow_status` | Get flow run status (mob feature) |
 | `meerkat_mob_run_result` | Get the typed output envelope for a mob run (mob feature) |
 | `meerkat_mob_flow_cancel` | Cancel a flow run (mob feature) |
@@ -99,6 +104,12 @@ Default `rkat-mcp` builds are driven by the crate feature set. The base/default
 tool surface includes core session/config/history/blob/skills tools and
 schedule and WorkGraph tools. Mob tools appear when the `mob` feature is
 compiled in.
+The WorkGraph Flow tools are advertised only by hosts that also configure a
+WorkGraph service. Their shared Mob runtime bridge owns reconciliation; MCP is
+only the transport adapter.
+Flow status carries a redacted reverse execution-binding reference when the run
+was launched by the bridge. Public binding views omit activation parameters,
+idempotency and correlation values, and execution principals.
 </Note>
 
 <Note>

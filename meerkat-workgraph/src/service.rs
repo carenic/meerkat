@@ -18,13 +18,52 @@ use crate::types::{
     LinkWorkItemsRequest, PolicyEscalateRequest, ProjectedAttentionAuthority, ReadyWorkFilter,
     ReleaseWorkItemRequest, UpdateWorkItemRequest, WorkAttentionBinding, WorkAttentionBindingId,
     WorkAttentionMode, WorkAttentionStatus, WorkCompletionPolicy, WorkEdge, WorkEdgeKind,
-    WorkEvidenceKind, WorkEvidenceRef, WorkGraphEvent, WorkGraphEventKind, WorkGraphSnapshot,
-    WorkGraphSnapshotFilter, WorkItem, WorkItemFilter, WorkItemId, WorkItemRef, WorkNamespace,
-    WorkOwnerKey, WorkStatus,
+    WorkEvidenceKind, WorkEvidenceRef, WorkExecutionBinding, WorkExecutionBindingFilter,
+    WorkExecutionBindingId, WorkExecutionEvidenceKind, WorkExecutionEvidenceProjection,
+    WorkGraphEvent, WorkGraphEventKind, WorkGraphSnapshot, WorkGraphSnapshotFilter, WorkItem,
+    WorkItemFilter, WorkItemId, WorkItemRef, WorkNamespace, WorkOwnerKey, WorkStatus,
 };
-use crate::{WorkGraphError, validate_workgraph_attention_projection_current};
+use crate::{
+    WorkExecutionLifecycleEffect, WorkExecutionMachine, WorkExecutionObservation,
+    WorkExecutionTransition, WorkGraphError, validate_workgraph_attention_projection_current,
+};
+
+fn validate_execution_evidence(
+    binding: &WorkExecutionBinding,
+    kind: WorkExecutionEvidenceKind,
+) -> Result<(), WorkGraphError> {
+    let expected = match WorkExecutionMachine::recover_effect(binding)? {
+        WorkExecutionLifecycleEffect::EvidenceProjectionRequested { kind, .. }
+        | WorkExecutionLifecycleEffect::FlowFailureEvidenceProjectionRequested { kind, .. }
+        | WorkExecutionLifecycleEffect::FlowCancellationEvidenceProjectionRequested {
+            kind, ..
+        }
+        | WorkExecutionLifecycleEffect::LaunchFailureEvidenceProjectionRequested { kind, .. } => {
+            Some(kind)
+        }
+        _ => None,
+    };
+    if expected != Some(kind) {
+        return Err(WorkGraphError::InvalidTransition(format!(
+            "execution evidence class {kind:?} is not admitted for binding {} in its current phase",
+            binding.binding_id
+        )));
+    }
+    Ok(())
+}
+
+const fn execution_evidence_provenance_kind(kind: WorkExecutionEvidenceKind) -> &'static str {
+    match kind {
+        WorkExecutionEvidenceKind::Completed => "mob_flow_run_completed",
+        WorkExecutionEvidenceKind::Failed => "mob_flow_run_failed",
+        WorkExecutionEvidenceKind::Canceled => "mob_flow_run_canceled",
+        WorkExecutionEvidenceKind::LaunchFailed => "mob_flow_launch_failed",
+        WorkExecutionEvidenceKind::RunLost => "mob_flow_run_lost",
+    }
+}
 
 const BEST_EFFORT_REFRESH_ATTEMPTS: usize = 3;
+const EXECUTION_PROJECTION_CAS_ATTEMPTS: usize = 8;
 const MAX_REVIEWER_QUORUM_THRESHOLD: u16 = 64;
 const DEFAULT_COLLECTION_LIMIT: usize = 100;
 const MAX_COLLECTION_LIMIT: usize = 1000;
@@ -49,6 +88,24 @@ pub struct WorkGraphService {
     default_namespace: WorkNamespace,
 }
 
+/// Capability-bearing coordinator for WorkGraph execution observations.
+///
+/// Ordinary WorkGraph consumers can read execution linkage but cannot mint
+/// launch, observation, or evidence transitions. A runtime host must
+/// explicitly obtain and custody this bridge handle at its composition seam.
+#[derive(Clone)]
+pub struct WorkExecutionBridge {
+    service: WorkGraphService,
+}
+
+impl std::ops::Deref for WorkExecutionBridge {
+    type Target = WorkGraphService;
+
+    fn deref(&self) -> &Self::Target {
+        &self.service
+    }
+}
+
 impl WorkGraphService {
     pub fn new(store: Arc<dyn WorkGraphStore>) -> Self {
         Self::with_scope(store, "default", WorkNamespace::default())
@@ -68,6 +125,17 @@ impl WorkGraphService {
 
     pub fn store(&self) -> &Arc<dyn WorkGraphStore> {
         &self.store
+    }
+
+    /// Explicitly enter the trusted execution-coordinator boundary.
+    ///
+    /// Holding an in-process `WorkGraphService` is already realm-backend
+    /// authority. Embedders that distribute untrusted code must retain the
+    /// service behind an admitted surface rather than handing it out.
+    pub fn execution_bridge(&self) -> WorkExecutionBridge {
+        WorkExecutionBridge {
+            service: self.clone(),
+        }
     }
 
     pub fn default_realm_id(&self) -> &str {
@@ -97,7 +165,7 @@ impl WorkGraphService {
                 ));
             }
         }
-        reject_reserved_confirmation_evidence_refs(&request.evidence_refs)?;
+        reject_reserved_evidence_refs(&request.evidence_refs)?;
         let (realm_id, namespace) = self.scope(request.realm_id.clone(), request.namespace.clone());
         let (item, event) = WorkGraphMachine::create_item(request, realm_id, namespace, now)?;
         self.store.insert_item(item, event).await
@@ -568,6 +636,7 @@ impl WorkGraphService {
                     evidence,
                 },
                 true,
+                false,
             )
             .await?;
         Ok(GoalConfirmResult { item, attention })
@@ -1049,14 +1118,325 @@ impl WorkGraphService {
         &self,
         request: AddEvidenceRequest,
     ) -> Result<WorkItem, WorkGraphError> {
-        self.add_evidence_internal(request, false).await
+        self.add_evidence_internal(request, false, false).await
+    }
+
+    /// Add evidence exactly once by evidence id.
+    ///
+    /// An exact replay returns the current item without another revision. A
+    /// same-id/different-content replay fails closed. This is the recovery seam
+    /// used by execution bridges after an ambiguous projection boundary.
+    pub async fn add_evidence_idempotent(
+        &self,
+        request: AddEvidenceRequest,
+    ) -> Result<WorkItem, WorkGraphError> {
+        if request.evidence.execution_binding_id.is_some() {
+            return Err(WorkGraphError::InvalidInput(
+                "reserved WorkGraph execution evidence provenance must be projected by the owning execution bridge"
+                    .to_string(),
+            ));
+        }
+        let item = self
+            .get(
+                request.realm_id.clone(),
+                request.namespace.clone(),
+                request.id.clone(),
+            )
+            .await?;
+        if let Some(existing) = item
+            .evidence_refs
+            .iter()
+            .find(|evidence| evidence.id == request.evidence.id)
+        {
+            return if existing == &request.evidence {
+                Ok(item)
+            } else {
+                Err(WorkGraphError::Conflict(format!(
+                    "work evidence id {} already exists with different content",
+                    request.evidence.id
+                )))
+            };
+        }
+        self.add_evidence(request).await
+    }
+
+    /// Project bridge-owned evidence against the canonical execution binding.
+    ///
+    /// The public evidence mutation cannot stamp typed execution provenance.
+    /// This method validates both lineage and the lifecycle phase,
+    /// then makes the projection idempotent across crash recovery.
+    #[doc(hidden)]
+    pub(crate) async fn project_execution_evidence(
+        &self,
+        realm_id: Option<String>,
+        namespace: Option<WorkNamespace>,
+        binding_id: WorkExecutionBindingId,
+        projection: WorkExecutionEvidenceProjection,
+    ) -> Result<WorkItem, WorkGraphError> {
+        let binding = self
+            .execution_binding(realm_id, namespace, binding_id)
+            .await?;
+        validate_execution_evidence(&binding, projection.kind)?;
+        let evidence = WorkEvidenceRef {
+            kind: execution_evidence_provenance_kind(projection.kind).to_string(),
+            id: binding.evidence_id(),
+            label: projection.label,
+            summary: projection.summary,
+            confirmation_kind: None,
+            confirming_owner_key: None,
+            execution_binding_id: Some(binding.binding_id.clone()),
+        };
+
+        for attempt in 0..EXECUTION_PROJECTION_CAS_ATTEMPTS {
+            let item = self
+                .get(
+                    Some(binding.work_ref.realm_id.clone()),
+                    Some(binding.work_ref.namespace.clone()),
+                    binding.work_ref.item_id.clone(),
+                )
+                .await?;
+            if let Some(existing) = item
+                .evidence_refs
+                .iter()
+                .find(|existing| existing.id == evidence.id)
+            {
+                return if existing == &evidence {
+                    Ok(item)
+                } else {
+                    Err(WorkGraphError::Conflict(format!(
+                        "work execution evidence id {} already exists with different content",
+                        evidence.id
+                    )))
+                };
+            }
+            match self
+                .add_evidence_internal(
+                    AddEvidenceRequest {
+                        id: item.id,
+                        realm_id: Some(item.realm_id),
+                        namespace: Some(item.namespace),
+                        expected_revision: item.revision,
+                        evidence: evidence.clone(),
+                    },
+                    false,
+                    true,
+                )
+                .await
+            {
+                Ok(item) => return Ok(item),
+                Err(WorkGraphError::StaleRevision { .. })
+                    if attempt + 1 < EXECUTION_PROJECTION_CAS_ATTEMPTS =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        Err(WorkGraphError::Conflict(format!(
+            "execution evidence projection for binding {} exceeded the bounded CAS retry budget",
+            binding.binding_id
+        )))
+    }
+
+    /// Return bridge-owned evidence only when it is valid for the binding's
+    /// current projection obligation.
+    #[doc(hidden)]
+    pub async fn execution_evidence(
+        &self,
+        realm_id: Option<String>,
+        namespace: Option<WorkNamespace>,
+        binding_id: WorkExecutionBindingId,
+    ) -> Result<Option<WorkEvidenceRef>, WorkGraphError> {
+        let binding = self
+            .execution_binding(realm_id, namespace, binding_id)
+            .await?;
+        let item = self
+            .get(
+                Some(binding.work_ref.realm_id.clone()),
+                Some(binding.work_ref.namespace.clone()),
+                binding.work_ref.item_id.clone(),
+            )
+            .await?;
+        let evidence = item
+            .evidence_refs
+            .iter()
+            .find(|evidence| {
+                evidence.execution_binding_id.as_ref() == Some(&binding.binding_id)
+                    && evidence.id == binding.evidence_id()
+            })
+            .cloned();
+        Ok(evidence)
+    }
+
+    /// Persist an immutable WorkItem-to-execution association before the
+    /// target runtime is invoked.
+    pub(crate) async fn bind_execution(
+        &self,
+        binding: WorkExecutionBinding,
+        expected_item_revision: u64,
+    ) -> Result<WorkExecutionTransition, WorkGraphError> {
+        let commit = WorkExecutionMachine::prepare_bind(binding)?;
+        let binding = commit.binding().clone();
+        let effect = commit.effect().clone();
+        let now = self.store.get_store_time_utc().await?;
+        let event = WorkGraphEvent::item(
+            binding.work_ref.realm_id.clone(),
+            binding.work_ref.namespace.clone(),
+            binding.work_ref.item_id.clone(),
+            WorkGraphEventKind::ExecutionBound,
+            now,
+            json!({ "execution_binding": binding.clone() }),
+        );
+        let binding = self
+            .store
+            .insert_execution_binding(commit, expected_item_revision, event)
+            .await?;
+        Ok(WorkExecutionTransition { binding, effect })
+    }
+
+    pub(crate) async fn observe_execution(
+        &self,
+        realm_id: Option<String>,
+        namespace: Option<WorkNamespace>,
+        binding_id: WorkExecutionBindingId,
+        expected_revision: u64,
+        observation: WorkExecutionObservation,
+    ) -> Result<WorkExecutionTransition, WorkGraphError> {
+        let binding = self
+            .execution_binding(realm_id, namespace, binding_id)
+            .await?;
+        let commit = WorkExecutionMachine::prepare_observation(
+            binding,
+            expected_revision,
+            observation.clone(),
+        )?;
+        let binding = commit.binding().clone();
+        let effect = commit.effect().clone();
+        let now = self.store.get_store_time_utc().await?;
+        let event = WorkGraphEvent::item(
+            binding.work_ref.realm_id.clone(),
+            binding.work_ref.namespace.clone(),
+            binding.work_ref.item_id.clone(),
+            WorkGraphEventKind::ExecutionTransitioned,
+            now,
+            json!({
+                "execution_binding": binding.clone(),
+                "observation": observation,
+            }),
+        );
+        let binding = self
+            .store
+            .update_execution_binding_cas(commit, expected_revision, event)
+            .await?;
+        Ok(WorkExecutionTransition { binding, effect })
+    }
+
+    pub async fn find_execution_binding(
+        &self,
+        realm_id: Option<String>,
+        namespace: Option<WorkNamespace>,
+        binding_id: WorkExecutionBindingId,
+    ) -> Result<Option<WorkExecutionBinding>, WorkGraphError> {
+        let (realm_id, namespace) = self.scope(realm_id, namespace);
+        let binding = self
+            .store
+            .get_execution_binding(&realm_id, &namespace, &binding_id)
+            .await?;
+        if let Some(binding) = binding.as_ref() {
+            binding.validate()?;
+            WorkExecutionMachine::validate_projection(binding)?;
+        }
+        Ok(binding)
+    }
+
+    pub async fn execution_binding(
+        &self,
+        realm_id: Option<String>,
+        namespace: Option<WorkNamespace>,
+        binding_id: WorkExecutionBindingId,
+    ) -> Result<WorkExecutionBinding, WorkGraphError> {
+        let (realm_id, namespace) = self.scope(realm_id, namespace);
+        let binding = self.store
+            .get_execution_binding(&realm_id, &namespace, &binding_id)
+            .await?
+            .ok_or_else(|| {
+                WorkGraphError::Conflict(format!(
+                    "work execution binding {binding_id} not found in realm '{realm_id}' namespace '{namespace}'"
+                ))
+            })?;
+        binding.validate()?;
+        WorkExecutionMachine::validate_projection(&binding)?;
+        Ok(binding)
+    }
+
+    /// Resolve the current realm's unique execution binding for a target run.
+    /// Flow status surfaces use this for first-class reverse linkage.
+    pub async fn execution_binding_for_target_run(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<WorkExecutionBinding>, WorkGraphError> {
+        let binding = self
+            .store
+            .get_execution_binding_by_target_run(&self.default_realm_id, run_id)
+            .await?;
+        if let Some(binding) = binding.as_ref() {
+            binding.validate()?;
+            WorkExecutionMachine::validate_projection(binding)?;
+        }
+        Ok(binding)
+    }
+
+    pub async fn execution_bindings(
+        &self,
+        mut filter: WorkExecutionBindingFilter,
+    ) -> Result<Vec<WorkExecutionBinding>, WorkGraphError> {
+        if filter.realm_id.is_none() {
+            filter.realm_id = Some(self.default_realm_id.to_string());
+        }
+        if filter.namespace.is_none() {
+            filter.namespace = Some(self.default_namespace.clone());
+        }
+        filter.limit = Some(bounded_collection_limit(filter.limit)?);
+        let bindings = self.store.list_execution_bindings(filter).await?;
+        for binding in &bindings {
+            binding.validate()?;
+            WorkExecutionMachine::validate_projection(binding)?;
+        }
+        Ok(bindings)
+    }
+
+    /// Host-runtime recovery queue. Unlike public listing, this deliberately
+    /// does not truncate active obligations or deserialize terminal history.
+    #[doc(hidden)]
+    pub async fn execution_bindings_for_recovery(
+        &self,
+        realm_id: Option<String>,
+    ) -> Result<Vec<WorkExecutionBinding>, WorkGraphError> {
+        let bindings = self
+            .store
+            .list_execution_bindings_for_recovery(
+                &realm_id.unwrap_or_else(|| self.default_realm_id.to_string()),
+            )
+            .await?;
+        for binding in &bindings {
+            binding.validate()?;
+            WorkExecutionMachine::validate_projection(binding)?;
+        }
+        Ok(bindings)
     }
 
     async fn add_evidence_internal(
         &self,
         request: AddEvidenceRequest,
         allow_reserved_completion_evidence: bool,
+        allow_reserved_execution_evidence: bool,
     ) -> Result<WorkItem, WorkGraphError> {
+        if !allow_reserved_execution_evidence && request.evidence.execution_binding_id.is_some() {
+            return Err(WorkGraphError::InvalidInput(
+                "reserved WorkGraph execution evidence provenance must be projected by the owning execution bridge"
+                    .to_string(),
+            ));
+        }
         if !allow_reserved_completion_evidence
             && request.evidence.confirmation_classification().is_some()
         {
@@ -1090,7 +1470,8 @@ impl WorkGraphService {
         if !filter.all_namespaces && filter.namespace.is_none() {
             filter.namespace = Some(self.default_namespace.clone());
         }
-        self.store.list_events(filter).await
+        filter.limit = Some(bounded_collection_limit(filter.limit)?);
+        self.store.list_public_events(filter).await
     }
 
     fn scope(
@@ -1602,9 +1983,16 @@ fn require_admitted_principal<'a>(
     })
 }
 
-fn reject_reserved_confirmation_evidence_refs(
-    evidence_refs: &[WorkEvidenceRef],
-) -> Result<(), WorkGraphError> {
+fn reject_reserved_evidence_refs(evidence_refs: &[WorkEvidenceRef]) -> Result<(), WorkGraphError> {
+    if evidence_refs
+        .iter()
+        .any(|evidence| evidence.execution_binding_id.is_some())
+    {
+        return Err(WorkGraphError::InvalidInput(
+            "reserved WorkGraph execution evidence provenance must be projected by the owning execution bridge"
+                .to_string(),
+        ));
+    }
     if let Some(evidence) = evidence_refs
         .iter()
         .find(|evidence| evidence.confirmation_classification().is_some())
@@ -1687,6 +2075,49 @@ fn unresolved_blocker_count(
     Ok(unresolved)
 }
 
+impl WorkExecutionBridge {
+    pub async fn bind_execution(
+        &self,
+        binding: WorkExecutionBinding,
+        expected_item_revision: u64,
+    ) -> Result<WorkExecutionTransition, WorkGraphError> {
+        self.service
+            .bind_execution(binding, expected_item_revision)
+            .await
+    }
+
+    pub async fn observe_execution(
+        &self,
+        realm_id: Option<String>,
+        namespace: Option<WorkNamespace>,
+        binding_id: WorkExecutionBindingId,
+        expected_revision: u64,
+        observation: WorkExecutionObservation,
+    ) -> Result<WorkExecutionTransition, WorkGraphError> {
+        self.service
+            .observe_execution(
+                realm_id,
+                namespace,
+                binding_id,
+                expected_revision,
+                observation,
+            )
+            .await
+    }
+
+    pub async fn project_execution_evidence(
+        &self,
+        realm_id: Option<String>,
+        namespace: Option<WorkNamespace>,
+        binding_id: WorkExecutionBindingId,
+        projection: WorkExecutionEvidenceProjection,
+    ) -> Result<WorkItem, WorkGraphError> {
+        self.service
+            .project_execution_evidence(realm_id, namespace, binding_id, projection)
+            .await
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::expect_used, clippy::unwrap_used, clippy::panic)]
 mod tests {
@@ -1705,8 +2136,11 @@ mod tests {
         WorkItem, WorkItemFilter, WorkOwner, WorkOwnerKey,
     };
     use crate::{
-        CreateWorkItemRequest, MemoryWorkGraphStore, UpdateWorkItemRequest, WorkGraphService,
-        WorkGraphStore, WorkGraphStoreKind, WorkItemId, WorkNamespace,
+        AddEvidenceRequest, CreateWorkItemRequest, MemoryWorkGraphStore, UpdateWorkItemRequest,
+        WorkExecutionBinding, WorkExecutionBindingId, WorkExecutionEvidenceKind,
+        WorkExecutionEvidenceProjection, WorkExecutionLifecycleEffect, WorkExecutionMachine,
+        WorkExecutionObservation, WorkExecutionTarget, WorkGraphService, WorkGraphStore,
+        WorkGraphStoreKind, WorkItemId, WorkItemRef, WorkNamespace,
     };
 
     fn create_req(title: &str) -> CreateWorkItemRequest {
@@ -1971,6 +2405,37 @@ mod tests {
             .create(create_req("self-attest"))
             .await
             .expect("self-attest create admitted");
+    }
+
+    #[tokio::test]
+    async fn create_rejects_reserved_execution_evidence_provenance() {
+        let service = WorkGraphService::with_scope(
+            Arc::new(MemoryWorkGraphStore::new()),
+            "realm",
+            WorkNamespace::default(),
+        );
+        let mut request = create_req("reserved execution evidence");
+        request.evidence_refs.push(crate::WorkEvidenceRef {
+            kind: "generic".to_string(),
+            id: "work_execution:caller-supplied".to_string(),
+            label: None,
+            summary: None,
+            confirmation_kind: None,
+            confirming_owner_key: None,
+            execution_binding_id: Some(
+                crate::WorkExecutionBindingId::new("caller-supplied").expect("binding id"),
+            ),
+        });
+
+        let error = service
+            .create(request)
+            .await
+            .expect_err("execution evidence provenance must remain bridge-owned at create");
+        assert!(matches!(
+            error,
+            crate::WorkGraphError::InvalidInput(message)
+                if message.contains("owning execution bridge")
+        ));
     }
 
     #[tokio::test]
@@ -2483,6 +2948,7 @@ mod tests {
             summary: None,
             confirmation_kind: None,
             confirming_owner_key: None,
+            execution_binding_id: None,
         }
     }
 
@@ -2688,5 +3154,222 @@ mod tests {
             .await
             .expect("bounded list");
         assert_eq!(listed.len(), super::DEFAULT_COLLECTION_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn execution_binding_lifecycle_is_machine_owned_and_cas_persisted() {
+        let service = WorkGraphService::with_scope(
+            Arc::new(MemoryWorkGraphStore::new()),
+            "realm",
+            WorkNamespace::default(),
+        );
+        let item = service.create(create_req("execute")).await.expect("item");
+        let binding_id = WorkExecutionBindingId::new("execution_test").expect("binding id");
+        let target = WorkExecutionTarget::mob_flow(
+            "mob-test",
+            "flow-test",
+            format!("sha256:{}", "a".repeat(64)),
+            "8a0737ff-b72d-57cd-91c7-feb396c79e7f",
+            crate::WorkExecutionAuthority::TargetOwner,
+            json!({"input": "value"}),
+        )
+        .expect("target");
+        let (machine_state, bind_effect) =
+            WorkExecutionMachine::bind(&binding_id, target.run_id()).expect("machine bind");
+        assert!(matches!(
+            bind_effect,
+            WorkExecutionLifecycleEffect::FlowLaunchRequested { .. }
+        ));
+        let binding = WorkExecutionBinding {
+            binding_id,
+            work_ref: WorkItemRef {
+                realm_id: item.realm_id.clone(),
+                namespace: item.namespace.clone(),
+                item_id: item.id.clone(),
+            },
+            target,
+            idempotency_key: "attempt-1".to_string(),
+            correlation_id: "74a2790d-a684-5211-98b6-b16e6496ae63".to_string(),
+            supersedes: None,
+            machine_state,
+            created_at: Utc::now(),
+        };
+        let bound = service
+            .bind_execution(binding.clone(), item.revision)
+            .await
+            .expect("bind");
+        assert_eq!(bound.binding.machine_state.revision, 1);
+        let replay = service
+            .bind_execution(binding, item.revision)
+            .await
+            .expect("exact replay");
+        assert_eq!(replay.binding, bound.binding);
+        assert_eq!(
+            service
+                .execution_binding_for_target_run(bound.binding.target.run_id())
+                .await
+                .expect("reverse target-run lookup")
+                .expect("binding by run")
+                .binding_id,
+            bound.binding.binding_id
+        );
+
+        let running = service
+            .observe_execution(
+                Some(item.realm_id.clone()),
+                Some(item.namespace.clone()),
+                bound.binding.binding_id.clone(),
+                1,
+                WorkExecutionObservation::FlowRunning,
+            )
+            .await
+            .expect("running");
+        let completed = service
+            .observe_execution(
+                Some(item.realm_id.clone()),
+                Some(item.namespace.clone()),
+                running.binding.binding_id.clone(),
+                2,
+                WorkExecutionObservation::FlowCompleted,
+            )
+            .await
+            .expect("completed");
+        assert!(matches!(
+            completed.effect,
+            WorkExecutionLifecycleEffect::EvidenceProjectionRequested { .. }
+        ));
+        let public_events = service
+            .events(WorkGraphEventFilter::default())
+            .await
+            .expect("public events");
+        assert!(public_events.iter().all(|event| !matches!(
+            event.kind,
+            WorkGraphEventKind::ExecutionBound | WorkGraphEventKind::ExecutionTransitioned
+        )));
+        let current_item = service
+            .get(
+                Some(item.realm_id.clone()),
+                Some(item.namespace.clone()),
+                item.id.clone(),
+            )
+            .await
+            .expect("current item");
+        let execution_evidence = WorkEvidenceRef {
+            kind: "mob_flow_run_completed".to_string(),
+            id: completed.binding.evidence_id(),
+            label: Some("trusted execution evidence".to_string()),
+            summary: Some("completed".to_string()),
+            confirmation_kind: None,
+            confirming_owner_key: None,
+            execution_binding_id: Some(completed.binding.binding_id.clone()),
+        };
+        let reserved_error = service
+            .add_evidence(AddEvidenceRequest {
+                id: current_item.id.clone(),
+                realm_id: Some(current_item.realm_id.clone()),
+                namespace: Some(current_item.namespace.clone()),
+                expected_revision: current_item.revision,
+                evidence: execution_evidence.clone(),
+            })
+            .await
+            .expect_err("generic mutation must not poison execution evidence ids");
+        assert!(matches!(reserved_error, WorkGraphError::InvalidInput(_)));
+        let projected_item = service
+            .project_execution_evidence(
+                Some(item.realm_id.clone()),
+                Some(item.namespace.clone()),
+                completed.binding.binding_id.clone(),
+                WorkExecutionEvidenceProjection {
+                    kind: WorkExecutionEvidenceKind::Completed,
+                    label: execution_evidence.label.clone(),
+                    summary: execution_evidence.summary.clone(),
+                },
+            )
+            .await
+            .expect("trusted execution evidence projection");
+        let replayed_item = service
+            .project_execution_evidence(
+                Some(item.realm_id.clone()),
+                Some(item.namespace.clone()),
+                completed.binding.binding_id.clone(),
+                WorkExecutionEvidenceProjection {
+                    kind: WorkExecutionEvidenceKind::Completed,
+                    label: execution_evidence.label,
+                    summary: execution_evidence.summary,
+                },
+            )
+            .await
+            .expect("exact projection replay");
+        assert_eq!(replayed_item.revision, projected_item.revision);
+        let public_after_hidden_execution_events = service
+            .events(WorkGraphEventFilter {
+                after_seq: public_events.last().and_then(|event| event.seq),
+                limit: Some(1),
+                ..WorkGraphEventFilter::default()
+            })
+            .await
+            .expect("public page after hidden execution events");
+        assert_eq!(public_after_hidden_execution_events.len(), 1);
+        assert!(!matches!(
+            public_after_hidden_execution_events[0].kind,
+            WorkGraphEventKind::ExecutionBound | WorkGraphEventKind::ExecutionTransitioned
+        ));
+        assert!(
+            service
+                .execution_evidence(
+                    Some(item.realm_id.clone()),
+                    Some(item.namespace.clone()),
+                    completed.binding.binding_id.clone(),
+                )
+                .await
+                .expect("validated execution evidence")
+                .is_some()
+        );
+        let projected = service
+            .observe_execution(
+                Some(item.realm_id.clone()),
+                Some(item.namespace.clone()),
+                completed.binding.binding_id.clone(),
+                3,
+                WorkExecutionObservation::EvidenceProjected,
+            )
+            .await
+            .expect("evidence projected");
+        assert!(matches!(
+            projected.effect,
+            WorkExecutionLifecycleEffect::WorkClosureRequested { .. }
+        ));
+        let refused = service
+            .observe_execution(
+                Some(item.realm_id.clone()),
+                Some(item.namespace.clone()),
+                projected.binding.binding_id,
+                4,
+                WorkExecutionObservation::WorkClosureRefused {
+                    detail: "principal confirmation required".to_string(),
+                },
+            )
+            .await
+            .expect("closure refusal");
+        assert!(matches!(
+            refused.effect,
+            WorkExecutionLifecycleEffect::EvidenceProjected { .. }
+        ));
+        let stored = service
+            .execution_binding(
+                Some(item.realm_id),
+                Some(item.namespace),
+                refused.binding.binding_id.clone(),
+            )
+            .await
+            .expect("stored binding");
+        assert_eq!(stored.machine_state.revision, 5);
+        assert!(
+            service
+                .execution_bindings_for_recovery(Some("realm".to_string()))
+                .await
+                .expect("terminal binding leaves recovery queue")
+                .is_empty()
+        );
     }
 }

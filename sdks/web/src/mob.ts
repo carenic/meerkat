@@ -1100,6 +1100,7 @@ function parseMobFlowStatusResult(raw: unknown): FlowStatus | null {
     ...run,
     run_id: requireStringField(run, 'run_id', `${context}: run missing run_id`),
     status: requireStringField(run, 'status', `${context}: run missing status`),
+    execution_binding: record.execution_binding ?? null,
   };
 }
 

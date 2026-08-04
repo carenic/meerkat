@@ -10,7 +10,7 @@ pub use compositions::{
     adaptive_mob_bundle_composition, auth_lease_bundle_composition,
     job_runtime_delivery_composition, meerkat_mob_seam_composition, schedule_bundle_composition,
     schedule_mob_bundle_composition, schedule_runtime_bundle_composition,
-    workgraph_attention_bundle_composition,
+    workgraph_attention_bundle_composition, workgraph_flow_bundle_composition,
 };
 pub use coverage::{
     CompositionCoverageManifest, CoverageAnchor, CoverageClaims, CoverageSchemaTarget,
@@ -52,6 +52,7 @@ pub fn canonical_machine_schemas() -> Vec<MachineSchema> {
         dsl::dsl_session_turn_admission_machine(),
         dsl::dsl_workgraph_lifecycle_machine(),
         dsl::dsl_work_attention_lifecycle_machine(),
+        dsl::dsl_work_execution_lifecycle_machine(),
     ]
 }
 
@@ -65,6 +66,7 @@ pub fn canonical_composition_schemas() -> Vec<CompositionSchema> {
         adaptive_mob_bundle_composition(),
         auth_lease_bundle_composition(),
         workgraph_attention_bundle_composition(),
+        workgraph_flow_bundle_composition(),
     ]
 }
 
@@ -129,6 +131,11 @@ pub fn canonical_machine_production_owner_relations() -> Vec<MachineProductionOw
             "WorkAttentionLifecycleMachine",
             dsl::WORK_ATTENTION_LIFECYCLE_PRODUCTION_RUST_CRATE,
             dsl::WORK_ATTENTION_LIFECYCLE_PRODUCTION_RUST_MODULE,
+        ),
+        MachineProductionOwnerRelation::new(
+            "WorkExecutionLifecycleMachine",
+            dsl::WORK_EXECUTION_LIFECYCLE_PRODUCTION_RUST_CRATE,
+            dsl::WORK_EXECUTION_LIFECYCLE_PRODUCTION_RUST_MODULE,
         ),
     ]
 }

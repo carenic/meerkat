@@ -1844,6 +1844,57 @@ pub struct WireMobRun {
     pub kernel: serde_json::Map<String, Value>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum WireWorkExecutionLifecyclePhase {
+    Absent,
+    LaunchRequested,
+    LaunchUncertain,
+    LaunchQuarantined,
+    Running,
+    EvidenceProjectionRequested,
+    FailureEvidenceProjectionRequested,
+    CancellationEvidenceProjectionRequested,
+    LaunchFailureEvidenceProjectionRequested,
+    WorkClosureRequested,
+    FlowFailed,
+    FlowCanceled,
+    EvidenceProjected,
+    WorkClosed,
+    LaunchFailed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct WireWorkGraphFlowWorkRef {
+    pub realm_id: String,
+    pub namespace: String,
+    pub item_id: String,
+}
+
+/// Redacted, typed reverse linkage from one canonical Mob Flow run to its
+/// durable WorkGraph execution attempt. Activation parameters and execution
+/// principals are intentionally absent from this public projection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct WireWorkGraphFlowExecutionBinding {
+    pub binding_id: String,
+    pub work_ref: WireWorkGraphFlowWorkRef,
+    pub mob_id: String,
+    pub flow_id: String,
+    pub flow_config_digest: String,
+    pub run_id: String,
+    pub lifecycle_phase: WireWorkExecutionLifecyclePhase,
+    pub binding_revision: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<String>,
+    pub evidence_id: String,
+    pub created_at: String,
+}
+
 /// Response payload for `mob/flow_status`.
 ///
 /// `run` is `None` when the requested run id has no persisted run.
@@ -1852,6 +1903,10 @@ pub struct WireMobRun {
 pub struct MobFlowStatusResult {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<WireMobRun>,
+    /// Redacted durable WorkGraph execution linkage when this run was launched
+    /// through the WorkGraph-Flow bridge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_binding: Option<WireWorkGraphFlowExecutionBinding>,
 }
 
 /// Request payload for `mob/run_result`.

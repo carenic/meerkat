@@ -13,6 +13,8 @@ pub mod tokio {
 pub use ::tokio;
 
 mod error;
+mod execution_machine;
+mod generated;
 mod machine;
 pub(crate) mod machines;
 mod rest_contract;
@@ -24,13 +26,18 @@ mod tools;
 mod types;
 
 pub use error::WorkGraphError;
+pub use execution_machine::{
+    WorkExecutionBindCommit, WorkExecutionLifecycleEffect, WorkExecutionLifecycleState,
+    WorkExecutionMachine, WorkExecutionObservation, WorkExecutionObservationCommit,
+    WorkExecutionTransition,
+};
 pub use machine::{WorkAttentionMachine, WorkGraphMachine, WorkGraphPublicErrorClass};
 pub use rest_contract::{
     WORKGRAPH_REST_PATHS, WorkGraphRestOperationDescriptor, WorkGraphRestPathDescriptor,
     WorkGraphRestRoute, workgraph_rest_path_catalog, workgraph_rest_request_response_schema,
     workgraph_rest_response_schema,
 };
-pub use service::WorkGraphService;
+pub use service::{WorkExecutionBridge, WorkGraphService};
 pub use store::{
     DisabledWorkGraphStore, MemoryWorkGraphStore, WorkGraphEventFilter, WorkGraphStore,
     WorkGraphStoreKind,
@@ -63,10 +70,13 @@ pub use types::{
     PublicGoalRequestCloseRequest, ReadyWorkFilter, ReleaseWorkItemRequest, UpdateWorkItemRequest,
     WorkAttentionBinding, WorkAttentionBindingId, WorkAttentionMachineState, WorkAttentionMode,
     WorkAttentionStatus, WorkAttentionTarget, WorkClaim, WorkCompletionPolicy, WorkEdge,
-    WorkEdgeKind, WorkEvidenceKind, WorkEvidenceRef, WorkGraphEvent, WorkGraphEventKind,
-    WorkGraphEventsResponse, WorkGraphIdParams, WorkGraphItemsResponse, WorkGraphMachineState,
-    WorkGraphSnapshot, WorkGraphSnapshotFilter, WorkItem, WorkItemFilter, WorkItemId, WorkItemRef,
-    WorkNamespace, WorkOwner, WorkOwnerKey, WorkOwnerKind, WorkPriority, WorkStatus,
+    WorkEdgeKind, WorkEvidenceKind, WorkEvidenceRef, WorkExecutionAuthority, WorkExecutionBinding,
+    WorkExecutionBindingFilter, WorkExecutionBindingId, WorkExecutionEvidenceKind,
+    WorkExecutionEvidenceProjection, WorkExecutionMachineState, WorkExecutionTarget,
+    WorkGraphEvent, WorkGraphEventKind, WorkGraphEventsResponse, WorkGraphIdParams,
+    WorkGraphItemsResponse, WorkGraphMachineState, WorkGraphSnapshot, WorkGraphSnapshotFilter,
+    WorkItem, WorkItemFilter, WorkItemId, WorkItemRef, WorkNamespace, WorkOwner, WorkOwnerKey,
+    WorkOwnerKind, WorkPriority, WorkStatus,
 };
 
 pub const WORKGRAPH_CAPABILITY_DISABLED_DESCRIPTION: &str =

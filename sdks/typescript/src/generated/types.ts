@@ -1332,6 +1332,26 @@ export interface WireMobRunResultEnvelope {
   status: WireMobRunStatus;
 }
 
+export interface WireWorkGraphFlowWorkRef {
+  item_id: string;
+  namespace: string;
+  realm_id: string;
+}
+
+export interface WireWorkGraphFlowExecutionBinding {
+  binding_id: string;
+  binding_revision: number;
+  created_at: string;
+  evidence_id: string;
+  flow_config_digest: string;
+  flow_id: string;
+  lifecycle_phase: WireWorkExecutionLifecyclePhase;
+  mob_id: string;
+  run_id: string;
+  supersedes?: string | null;
+  work_ref: WireWorkGraphFlowWorkRef;
+}
+
 export interface WirePeerConnectivitySnapshot {
   reachable_peer_count: number;
   unknown_peer_count: number;
@@ -1507,6 +1527,7 @@ export interface MobFlowStatusParams {
 }
 
 export interface MobFlowStatusResult {
+  execution_binding?: WireWorkGraphFlowExecutionBinding | null;
   run?: WireMobRun | null;
 }
 
@@ -2244,6 +2265,7 @@ export interface WorkEdge {
 export interface WorkEvidenceRef {
   confirmation_kind?: WorkEvidenceKind | null;
   confirming_owner_key?: WorkOwnerKey | null;
+  execution_binding_id?: string | null;
   id: string;
   kind: string;
   label?: string | null;
@@ -2951,6 +2973,8 @@ export type WireNonPortableResourceKind = "rust_bundles" | "per_spawn_external_t
 
 export type WireMobRunStatus = "pending" | "running" | "completed" | "failed" | "canceled";
 
+export type WireWorkExecutionLifecyclePhase = "absent" | "launch_requested" | "launch_uncertain" | "launch_quarantined" | "running" | "evidence_projection_requested" | "failure_evidence_projection_requested" | "cancellation_evidence_projection_requested" | "launch_failure_evidence_projection_requested" | "work_closure_requested" | "flow_failed" | "flow_canceled" | "evidence_projected" | "work_closed" | "launch_failed";
+
 export interface WirePeerConnectivityNotApplicable {
   status: "not_applicable";
 }
@@ -3086,7 +3110,7 @@ export type WorkEdgeKind = "blocks" | "parent" | "related" | "supersedes" | "der
 
 export type WorkEvidenceKind = "host_confirmation" | "principal_confirmation" | "supervisor_confirmation" | "reviewer_confirmation" | "self_attest";
 
-export type WorkGraphEventKind = "created" | "updated" | "claimed" | "released" | "blocked" | "closed" | "linked" | "evidence_added" | "attention_created" | "attention_updated";
+export type WorkGraphEventKind = "created" | "updated" | "claimed" | "released" | "blocked" | "closed" | "linked" | "evidence_added" | "attention_created" | "attention_updated" | "execution_bound" | "execution_transitioned";
 
 export type WorkOwnerKind = "principal" | "agent" | "session" | "mob" | "label";
 
@@ -3098,7 +3122,7 @@ export type WorkGraphStatus = typeof WORK_GRAPH_STATUSES[number];
 export const WORK_GRAPH_PRIORITIES = ["low", "medium", "high"] as const;
 export type WorkGraphPriority = typeof WORK_GRAPH_PRIORITIES[number];
 
-export const WORK_GRAPH_EVENT_KINDS = ["created", "updated", "claimed", "released", "blocked", "closed", "linked", "evidence_added", "attention_created", "attention_updated"] as const;
+export const WORK_GRAPH_EVENT_KINDS = ["created", "updated", "claimed", "released", "blocked", "closed", "linked", "evidence_added", "attention_created", "attention_updated", "execution_bound", "execution_transitioned"] as const;
 
 export type McpLiveOperation = "add" | "remove" | "reload";
 
@@ -5670,6 +5694,7 @@ export function parseWorkEvidenceRef(value: unknown): WorkEvidenceRef {
   return {
     ...(data["confirmation_kind"] === undefined || data["confirmation_kind"] === null ? {} : { confirmation_kind: parseWorkEvidenceKind(data["confirmation_kind"]) }),
     ...(data["confirming_owner_key"] === undefined || data["confirming_owner_key"] === null ? {} : { confirming_owner_key: parseWorkOwnerKey(data["confirming_owner_key"]) }),
+    ...(data["execution_binding_id"] === undefined || data["execution_binding_id"] === null ? {} : { execution_binding_id: expectWireString(data["execution_binding_id"], "WorkEvidenceRef.execution_binding_id") }),
     id: expectWireString(requireWireField(data, "id", "WorkEvidenceRef"), "WorkEvidenceRef.id"),
     kind: expectWireString(requireWireField(data, "kind", "WorkEvidenceRef"), "WorkEvidenceRef.kind"),
     ...(data["label"] === undefined || data["label"] === null ? {} : { label: expectWireString(data["label"], "WorkEvidenceRef.label") }),
@@ -5703,7 +5728,7 @@ export function parseWorkEdgeKind(value: unknown): WorkEdgeKind {
 
 /** Fail-closed wire parser for WorkGraphEventKind (K21): throws MeerkatError(INVALID_RESPONSE). */
 export function parseWorkGraphEventKind(value: unknown): WorkGraphEventKind {
-  return expectWireEnum(value, ["created", "updated", "claimed", "released", "blocked", "closed", "linked", "evidence_added", "attention_created", "attention_updated"], "WorkGraphEventKind") as WorkGraphEventKind;
+  return expectWireEnum(value, ["created", "updated", "claimed", "released", "blocked", "closed", "linked", "evidence_added", "attention_created", "attention_updated", "execution_bound", "execution_transitioned"], "WorkGraphEventKind") as WorkGraphEventKind;
 }
 
 /** Fail-closed wire parser for WorkAttentionBinding (K21): throws MeerkatError(INVALID_RESPONSE). */

@@ -4751,6 +4751,11 @@ pub struct MobRun {
     pub run_id: RunId,
     pub mob_id: MobId,
     pub flow_id: FlowId,
+    /// SHA-256 of the exact canonical FlowSpec used to create this run.
+    /// Legacy rows may omit it; execution bridges fail closed rather than
+    /// asserting definition identity for those rows.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub flow_definition_digest: Option<String>,
     pub status: MobRunStatus,
     pub flow_state: flow_run::State,
     pub activation_params: serde_json::Value,
@@ -5048,6 +5053,7 @@ impl MobRun {
             run_id,
             mob_id,
             flow_id,
+            flow_definition_digest: None,
             status: MobRunStatus::Pending,
             flow_state,
             activation_params,
@@ -6244,6 +6250,18 @@ impl FlowRunConfig {
             orchestrator_role,
         })
     }
+
+    pub fn definition_digest(&self) -> Result<String, MobError> {
+        use sha2::{Digest as _, Sha256};
+
+        let bytes = serde_json::to_vec(self).map_err(|error| {
+            MobError::Internal(format!(
+                "flow '{}' definition digest serialization failed: {error}",
+                self.flow_id
+            ))
+        })?;
+        Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+    }
 }
 
 /// Per-loop iteration output history, ordered by iteration index.
@@ -7135,6 +7153,25 @@ mod tests {
     }
 
     #[test]
+    fn flow_definition_digest_covers_complete_run_config() {
+        let def = sample_definition();
+        let config = FlowRunConfig::from_definition(FlowId::from("flow-a"), &def).unwrap();
+        let baseline = config.definition_digest().unwrap();
+
+        let mut changed = config.clone();
+        changed.limits.as_mut().unwrap().max_step_retries = Some(99);
+        assert_ne!(baseline, changed.definition_digest().unwrap());
+
+        let mut changed = config.clone();
+        changed.topology.as_mut().unwrap().rules[0].allowed = false;
+        assert_ne!(baseline, changed.definition_digest().unwrap());
+
+        let mut changed = config;
+        changed.supervisor.as_mut().unwrap().escalation_threshold = 99;
+        assert_ne!(baseline, changed.definition_digest().unwrap());
+    }
+
+    #[test]
     fn test_flow_run_config_from_definition_missing_flow() {
         let def = sample_definition();
         let error = FlowRunConfig::from_definition(FlowId::from("missing"), &def).unwrap_err();
@@ -7159,6 +7196,7 @@ mod tests {
             run_id: RunId::new(),
             mob_id: MobId::from("mob"),
             flow_id: FlowId::from("flow-a"),
+            flow_definition_digest: None,
             status: MobRunStatus::Running,
             flow_state: MobRun::flow_state_for_steps([StepId::from("step-1")]).unwrap(),
             activation_params: serde_json::json!({"k":"v"}),
@@ -7201,6 +7239,7 @@ mod tests {
             run_id: RunId::new(),
             mob_id: MobId::from("mob"),
             flow_id: FlowId::from("flow-a"),
+            flow_definition_digest: None,
             status: MobRunStatus::Completed,
             flow_state: MobRun::flow_state_for_steps([StepId::from("step-1")]).unwrap(),
             activation_params: serde_json::json!({"k":"v"}),

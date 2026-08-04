@@ -3311,6 +3311,7 @@ impl MobHandle {
                 run_id,
                 flow_id,
                 activation_params,
+                external_delivery_intent,
                 scoped_event_tx,
             } => {
                 let run_id = self
@@ -3318,6 +3319,7 @@ impl MobHandle {
                         run_id,
                         flow_id,
                         activation_params,
+                        external_delivery_intent,
                         scoped_event_tx,
                         reply_tx,
                     })
@@ -5497,6 +5499,144 @@ impl MobHandle {
             .map_err(MobError::from)
     }
 
+    /// Complete a realized Flow delivery after re-observing the exact run
+    /// beyond its pre-realization `Pending` state.
+    pub async fn complete_external_flow_realization(
+        &self,
+        authority: &crate::workgraph_flow::WorkGraphFlowExecutionAuthority,
+        intent: &crate::store::MobExternalDeliveryIntent,
+        run: &crate::MobRun,
+    ) -> Result<crate::store::MobExternalDeliveryCompleteOutcome, MobError> {
+        let expected_run_id = RunId::for_external_delivery(
+            &self.definition.id,
+            authority.flow_id(),
+            &intent.identity.idempotency_key,
+        );
+        if authority.mob_id() != &self.definition.id
+            || authority.run_id() != &expected_run_id
+            || intent.mob_id != self.definition.id
+            || intent.identity.idempotency_key != authority.binding_id().as_str()
+        {
+            return Err(MobError::Internal(
+                "external-delivery realizer completion authority does not select the exact delivery run"
+                    .to_string(),
+            ));
+        }
+        self.complete_external_flow_realization_for_run(intent, run.run_id.clone())
+            .await
+    }
+
+    /// Complete a realized Flow delivery from its exact durable run proof.
+    ///
+    /// This is also the recovery path for schedule-owned Flow deliveries,
+    /// which do not carry WorkGraph execution authority.
+    pub async fn complete_external_flow_realization_for_run(
+        &self,
+        intent: &crate::store::MobExternalDeliveryIntent,
+        run_id: RunId,
+    ) -> Result<crate::store::MobExternalDeliveryCompleteOutcome, MobError> {
+        let run = self
+            .run_store
+            .get_run(&run_id)
+            .await?
+            .ok_or_else(|| MobError::RunNotFound(run_id.clone()))?;
+        let expected_run_id = RunId::for_external_delivery(
+            &self.definition.id,
+            &run.flow_id,
+            &intent.identity.idempotency_key,
+        );
+        if intent.target_kind != crate::store::MobExternalDeliveryTargetKind::Flow
+            || intent.mob_id != self.definition.id
+            || run.mob_id != self.definition.id
+            || run_id != expected_run_id
+            || run.run_id != run_id
+            || run.status == crate::MobRunStatus::Pending
+        {
+            return Err(MobError::Internal(
+                "external-delivery realizer completion lacks an exact non-pending Flow run"
+                    .to_string(),
+            ));
+        }
+        let commit = crate::store::MobExternalDeliveryRealizerCompletionCommit::new(
+            intent.clone(),
+            expected_run_id,
+        )?;
+        self.events
+            .complete_external_delivery_realization(&commit)
+            .await
+            .map_err(MobError::from)
+    }
+
+    /// Abandon only a delivery that has not crossed the realization fence.
+    pub async fn abandon_external_delivery(
+        &self,
+        intent: &crate::store::MobExternalDeliveryIntent,
+        terminal: &crate::store::MobExternalDeliveryTerminal,
+    ) -> Result<crate::store::MobExternalDeliveryAbandonOutcome, MobError> {
+        if intent.mob_id != self.definition.id {
+            return Err(MobError::Internal(format!(
+                "external-delivery abandonment mob '{}' does not match handle mob '{}'",
+                intent.mob_id, self.definition.id
+            )));
+        }
+        self.events
+            .abandon_external_delivery(intent, terminal)
+            .await
+            .map_err(MobError::from)
+    }
+
+    /// Resolve a realization quarantine only after the owning host has fenced
+    /// the former realizer outside this store.
+    pub async fn resolve_external_delivery_after_realizer_fenced(
+        &self,
+        authority: &crate::workgraph_flow::WorkGraphFlowExecutionAuthority,
+        intent: &crate::store::MobExternalDeliveryIntent,
+        terminal: &crate::store::MobExternalDeliveryTerminal,
+    ) -> Result<crate::store::MobExternalDeliveryAbandonOutcome, MobError> {
+        if intent.mob_id != self.definition.id {
+            return Err(MobError::Internal(format!(
+                "external-delivery owner resolution mob '{}' does not match handle mob '{}'",
+                intent.mob_id, self.definition.id
+            )));
+        }
+        let expected_run_id = RunId::for_external_delivery(
+            &self.definition.id,
+            authority.flow_id(),
+            &intent.identity.idempotency_key,
+        );
+        if authority.mob_id() != &self.definition.id
+            || authority.run_id() != &expected_run_id
+            || intent.identity.idempotency_key != authority.binding_id().as_str()
+        {
+            return Err(MobError::Internal(
+                "external-delivery owner resolution authority does not select the exact delivery run"
+                    .to_string(),
+            ));
+        }
+        let commit = crate::store::MobExternalDeliveryFencedResolutionCommit::new(
+            intent.clone(),
+            expected_run_id,
+            terminal.clone(),
+        )?;
+        self.events
+            .resolve_external_delivery_after_realizer_fenced(&commit)
+            .await
+            .map_err(MobError::from)
+    }
+
+    /// Read the exact durable delivery ledger entry without reopening target
+    /// admission. Recovery uses this to distinguish proven absence from an
+    /// already-realizing effect.
+    pub async fn load_external_delivery(
+        &self,
+        idempotency_key: &str,
+    ) -> Result<Option<crate::store::MobExternalDeliveryRecord>, MobError> {
+        self.events
+            .load_external_delivery(&self.definition.id, idempotency_key)
+            .await
+            .map_err(MobError::from)
+    }
+
     /// Advance the durable retry attempt/deadline for a begun delivery.
     ///
     /// Like terminal completion, this is repair mechanics over already
@@ -5540,6 +5680,75 @@ impl MobHandle {
             .await
     }
 
+    /// Prepare the Flow target, then let the Mob actor persist the exact
+    /// deterministic pending run before it crosses the external-delivery
+    /// realization fence. Once `Realizing` is durable, the target run is
+    /// therefore already durable and independently observable.
+    pub async fn run_flow_with_external_delivery(
+        &self,
+        flow_id: FlowId,
+        params: serde_json::Value,
+        intent: &crate::store::MobExternalDeliveryIntent,
+    ) -> Result<crate::store::MobExternalFlowLaunchOutcome, MobError> {
+        self.execute_machine_command(MobMachineCommand::PreviewRunFlowAdmission)
+            .await?;
+        if !self.definition.flows.contains_key(&flow_id) {
+            return Err(MobError::FlowNotFound(flow_id));
+        }
+        if intent.mob_id != self.definition.id {
+            return Err(MobError::Internal(format!(
+                "external-delivery intent mob '{}' does not match handle mob '{}'",
+                intent.mob_id, self.definition.id
+            )));
+        }
+        intent.validate()?;
+        let provisioner = self
+            .flow_target_provisioner
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some(provisioner) = provisioner {
+            provisioner().await?;
+        }
+        self.ensure_flow_targets_provisioned(&flow_id).await?;
+
+        let run_id = RunId::for_external_delivery(
+            &self.definition.id,
+            &flow_id,
+            &intent.identity.idempotency_key,
+        );
+        match self
+            .execute_machine_command(MobMachineCommand::RunFlow {
+                run_id: Some(run_id),
+                flow_id,
+                activation_params: params,
+                external_delivery_intent: Some(intent.clone()),
+                scoped_event_tx: None,
+            })
+            .await
+        {
+            Ok(MobMachineCommandResult::RunId(run_id)) => {
+                Ok(crate::store::MobExternalFlowLaunchOutcome::Started(run_id))
+            }
+            Ok(_) => Ok(crate::store::MobExternalFlowLaunchOutcome::Uncertain {
+                detail: "Mob run command returned an unexpected result after realization"
+                    .to_string(),
+            }),
+            Err(error) => match self
+                .load_external_delivery(&intent.identity.idempotency_key)
+                .await?
+            {
+                Some(crate::store::MobExternalDeliveryRecord {
+                    phase: crate::store::MobExternalDeliveryPhase::Terminal { terminal },
+                    ..
+                }) => Ok(crate::store::MobExternalFlowLaunchOutcome::ExistingTerminal(terminal)),
+                _ => Ok(crate::store::MobExternalFlowLaunchOutcome::Uncertain {
+                    detail: error.to_string(),
+                }),
+            },
+        }
+    }
+
     async fn run_flow_with_stream_and_external_identity(
         &self,
         flow_id: FlowId,
@@ -5580,6 +5789,7 @@ impl MobHandle {
                 run_id,
                 flow_id,
                 activation_params: params,
+                external_delivery_intent: None,
                 scoped_event_tx,
             })
             .await?

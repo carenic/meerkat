@@ -44,6 +44,16 @@ pub(crate) trait ScheduleMobRuntime: Send + Sync {
         terminal: &MobExternalDeliveryTerminal,
     ) -> Result<MobExternalDeliveryCompleteOutcome, MobError>;
 
+    async fn complete_external_flow_realization(
+        &self,
+        _intent: &MobExternalDeliveryIntent,
+        _run_id: RunId,
+    ) -> Result<MobExternalDeliveryCompleteOutcome, MobError> {
+        Err(MobError::Internal(
+            "schedule runtime cannot recover a realizing Flow delivery".to_string(),
+        ))
+    }
+
     async fn schedule_external_delivery_repair(
         &self,
         intent: &MobExternalDeliveryIntent,
@@ -121,6 +131,17 @@ impl ScheduleMobRuntime for MobMcpState {
         terminal: &MobExternalDeliveryTerminal,
     ) -> Result<MobExternalDeliveryCompleteOutcome, MobError> {
         self.mob_complete_external_delivery(intent, terminal).await
+    }
+
+    async fn complete_external_flow_realization(
+        &self,
+        intent: &MobExternalDeliveryIntent,
+        run_id: RunId,
+    ) -> Result<MobExternalDeliveryCompleteOutcome, MobError> {
+        let handle = self.handle_for(&intent.mob_id).await?;
+        handle
+            .complete_external_flow_realization_for_run(intent, run_id)
+            .await
     }
 
     async fn schedule_external_delivery_repair(
@@ -390,6 +411,31 @@ impl SurfaceScheduleMobHost for MobMcpScheduleHost {
                     target_kind,
                     repair,
                 ));
+            }
+            MobExternalDeliveryBeginOutcome::ExistingRealizing { run_id, .. }
+                if target_kind == MobExternalDeliveryTargetKind::Flow =>
+            {
+                self.runtime
+                    .complete_external_flow_realization(&delivery_intent, run_id)
+                    .await
+                    .map_err(|error| ScheduleDomainError::DeliveryRepairDeferred {
+                        detail: format!(
+                            "realizing schedule Flow delivery is not yet recoverably complete: {error}"
+                        ),
+                    })?;
+                return Ok(dispatch_for_external_terminal(
+                    occurrence,
+                    schedule_identity,
+                    MobExternalDeliveryTerminal::Completed,
+                    ScheduleAdmissionOutcome::Deduplicated,
+                ));
+            }
+            MobExternalDeliveryBeginOutcome::ExistingRealizing { .. } => {
+                return Err(ScheduleDomainError::DeliveryRepairDeferred {
+                    detail: format!(
+                        "non-Flow schedule target unexpectedly crossed the realization fence: {target_kind:?}"
+                    ),
+                });
             }
             MobExternalDeliveryBeginOutcome::Begun => {
                 (ScheduleAdmissionOutcome::Accepted, None)
@@ -674,6 +720,12 @@ impl SurfaceScheduleMobHost for MobMcpScheduleHost {
                     MobExternalDeliveryTargetKind::MemberSend,
                     repair,
                 )));
+            }
+            MobExternalDeliveryBeginOutcome::ExistingRealizing { .. } => {
+                return Err(ScheduleDomainError::DeliveryRepairDeferred {
+                    detail: "member schedule target unexpectedly crossed the Flow realization fence"
+                        .to_string(),
+                });
             }
             MobExternalDeliveryBeginOutcome::ExistingTerminal(terminal) => {
                 return Ok(Some(dispatch_for_external_terminal(

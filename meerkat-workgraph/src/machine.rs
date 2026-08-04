@@ -2123,6 +2123,7 @@ mod tests {
                     summary: None,
                     confirmation_kind: Some(WorkEvidenceKind::HostConfirmation),
                     confirming_owner_key: None,
+                    execution_binding_id: None,
                 },
             },
             now,
@@ -2162,6 +2163,7 @@ mod tests {
             confirming_owner_key: Some(
                 WorkOwnerKey::principal(reviewer).expect("reviewer principal"),
             ),
+            execution_binding_id: None,
         };
 
         // One distinct reviewer is short of the quorum: machine refuses close.

@@ -1,6 +1,8 @@
 #![allow(unused_imports)]
 
-use crate::{McpToolError, MobMcpState, decode_public_mob_definition};
+use crate::{
+    McpToolError, MobMcpState, decode_public_mob_definition, workgraph_execution_binding_view,
+};
 use meerkat_contracts::{
     MobCreateParams, MobLifecycleParams, MobLifecycleResult, MobMemberSendParams,
     WireAuthBindingRef, WireContentInput, WireMemberRef, WireMobBackendKind, WireMobRuntimeMode,
@@ -216,6 +218,71 @@ struct MeerkatMobFlowRunInput {
 
 #[derive(Debug, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct MeerkatWorkGraphFlowLaunchInput {
+    work_item_id: String,
+    #[serde(default)]
+    realm_id: Option<String>,
+    #[serde(default)]
+    namespace: Option<String>,
+    expected_item_revision: u64,
+    mob_id: String,
+    flow_id: String,
+    #[serde(default)]
+    params: Value,
+    idempotency_key: String,
+    #[serde(default)]
+    supersedes: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct MeerkatWorkGraphFlowReconcileInput {
+    binding_id: String,
+    #[serde(default)]
+    realm_id: Option<String>,
+    #[serde(default)]
+    namespace: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct MeerkatWorkGraphFlowBindingGetInput {
+    binding_id: String,
+    #[serde(default)]
+    realm_id: Option<String>,
+    #[serde(default)]
+    namespace: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct MeerkatWorkGraphFlowBindingListInput {
+    #[serde(default)]
+    realm_id: Option<String>,
+    #[serde(default)]
+    namespace: Option<String>,
+    #[serde(default)]
+    work_item_id: Option<String>,
+    #[serde(default)]
+    current_only: bool,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct MeerkatWorkGraphFlowAbandonUncertainInput {
+    binding_id: String,
+    #[serde(default)]
+    realm_id: Option<String>,
+    #[serde(default)]
+    namespace: Option<String>,
+    expected_binding_revision: u64,
+    detail: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct MeerkatMobRunInput {
     mob_id: String,
     #[serde(default)]
@@ -407,6 +474,31 @@ static PUBLIC_TOOLS: &[PublicTool] = &[
         schema: typed_schema::<MeerkatMobFlowRunInput>,
     },
     PublicTool {
+        name: "meerkat_workgraph_flow_launch",
+        description: "Durably bind a WorkGraph item to one exact Mob Flow run, then launch and reconcile it.",
+        schema: typed_schema::<MeerkatWorkGraphFlowLaunchInput>,
+    },
+    PublicTool {
+        name: "meerkat_workgraph_flow_reconcile",
+        description: "Resume a durable WorkGraph-to-Flow execution binding and project any authorized terminal effects.",
+        schema: typed_schema::<MeerkatWorkGraphFlowReconcileInput>,
+    },
+    PublicTool {
+        name: "meerkat_workgraph_flow_binding_get",
+        description: "Read one redacted typed WorkGraph-to-Flow execution linkage without exposing activation parameters or execution principals.",
+        schema: typed_schema::<MeerkatWorkGraphFlowBindingGetInput>,
+    },
+    PublicTool {
+        name: "meerkat_workgraph_flow_binding_list",
+        description: "List redacted typed WorkGraph-to-Flow execution linkages, optionally restricted to one work item or the current supersession head.",
+        schema: typed_schema::<MeerkatWorkGraphFlowBindingListInput>,
+    },
+    PublicTool {
+        name: "meerkat_workgraph_flow_abandon_uncertain",
+        description: "Terminalize an ambiguous pre-realization WorkGraph Flow launch after the bridge proves that its deterministic run is absent. Realization quarantines fail closed and cannot be caller-overridden. A retry must use a superseding binding.",
+        schema: typed_schema::<MeerkatWorkGraphFlowAbandonUncertainInput>,
+    },
+    PublicTool {
         name: "meerkat_mob_run",
         description: "Invoke a mob as a typed callable run.",
         schema: typed_schema::<MeerkatMobRunInput>,
@@ -505,6 +597,14 @@ pub fn public_tools_list() -> Vec<Value> {
         .collect()
 }
 
+pub fn public_tools_list_without_workgraph() -> Vec<Value> {
+    PUBLIC_TOOLS
+        .iter()
+        .filter(|entry| !entry.name.starts_with("meerkat_workgraph_flow_"))
+        .map(|entry| tool_json(entry.name, entry.description, (entry.schema)()))
+        .collect()
+}
+
 /// Wrap a structured payload in the MCP text-content envelope.
 ///
 /// Serialization is a TRUE fault: a payload that fails to serialize must surface
@@ -544,6 +644,11 @@ const DISPATCH_TOOL_NAMES: &[&str] = &[
     "meerkat_mob_events",
     "meerkat_mob_flows",
     "meerkat_mob_flow_run",
+    "meerkat_workgraph_flow_launch",
+    "meerkat_workgraph_flow_reconcile",
+    "meerkat_workgraph_flow_binding_get",
+    "meerkat_workgraph_flow_binding_list",
+    "meerkat_workgraph_flow_abandon_uncertain",
     "meerkat_mob_run",
     "meerkat_mob_flow_status",
     "meerkat_mob_run_result",
@@ -566,6 +671,7 @@ pub async fn handle_public_tools_call(
     name: &str,
     arguments: &Value,
 ) -> Result<Value, McpToolError> {
+    state.start_workgraph_flow_reconciler();
     match name {
         "meerkat_mob_create" => {
             let input: MobCreateParams = parse_args(arguments)?;
@@ -870,6 +976,155 @@ pub async fn handle_public_tools_call(
                 .map_err(|err| McpToolError::from_mob(&err))?;
             Ok(json!({ "run_id": run_id }))
         }
+        "meerkat_workgraph_flow_launch" => {
+            let input: MeerkatWorkGraphFlowLaunchInput = parse_args(arguments)?;
+            let namespace = input
+                .namespace
+                .map(meerkat::WorkNamespace::new)
+                .transpose()
+                .map_err(|error| McpToolError::invalid_params(error.to_string()))?;
+            let supersedes = input
+                .supersedes
+                .map(meerkat::WorkExecutionBindingId::new)
+                .transpose()
+                .map_err(|error| McpToolError::invalid_params(error.to_string()))?;
+            let result = state
+                .launch_workgraph_flow(crate::LaunchWorkGraphFlowRequest {
+                    work_item_id: meerkat::WorkItemId::new(input.work_item_id)
+                        .map_err(|error| McpToolError::invalid_params(error.to_string()))?,
+                    realm_id: input.realm_id,
+                    namespace,
+                    expected_item_revision: input.expected_item_revision,
+                    mob_id: parse_mob_id(&input.mob_id)?,
+                    flow_id: meerkat_mob::FlowId::from(input.flow_id.as_str()),
+                    activation_params: input.params,
+                    idempotency_key: input.idempotency_key,
+                    supersedes,
+                })
+                .await
+                .map_err(|error| McpToolError::from_workgraph_flow(&error))?;
+            workgraph_flow_result_payload(
+                result.binding,
+                result.run,
+                result.item,
+                result.evidence_projected,
+                result.work_item_closed,
+            )
+        }
+        "meerkat_workgraph_flow_reconcile" => {
+            let input: MeerkatWorkGraphFlowReconcileInput = parse_args(arguments)?;
+            let namespace = input
+                .namespace
+                .map(meerkat::WorkNamespace::new)
+                .transpose()
+                .map_err(|error| McpToolError::invalid_params(error.to_string()))?;
+            let result = state
+                .reconcile_workgraph_flow(
+                    input.realm_id,
+                    namespace,
+                    meerkat::WorkExecutionBindingId::new(input.binding_id)
+                        .map_err(|error| McpToolError::invalid_params(error.to_string()))?,
+                )
+                .await
+                .map_err(|error| McpToolError::from_workgraph_flow(&error))?;
+            workgraph_flow_result_payload(
+                result.binding,
+                result.run,
+                result.item,
+                result.evidence_projected,
+                result.work_item_closed,
+            )
+        }
+        "meerkat_workgraph_flow_binding_get" => {
+            let input: MeerkatWorkGraphFlowBindingGetInput = parse_args(arguments)?;
+            state
+                .authorize_workgraph_flow_realm(input.realm_id.as_deref())
+                .map_err(|error| McpToolError::from_mob(&error))?;
+            let namespace = input
+                .namespace
+                .map(meerkat::WorkNamespace::new)
+                .transpose()
+                .map_err(|error| McpToolError::invalid_params(error.to_string()))?;
+            let service = state.workgraph_service.as_ref().ok_or_else(|| {
+                McpToolError::capability_unavailable(
+                    "WorkGraph service is not configured for this mob surface".to_string(),
+                )
+            })?;
+            let binding = service
+                .execution_binding(
+                    input.realm_id,
+                    namespace,
+                    meerkat::WorkExecutionBindingId::new(input.binding_id)
+                        .map_err(|error| McpToolError::invalid_params(error.to_string()))?,
+                )
+                .await
+                .map_err(|error| McpToolError::from_workgraph(&error))?;
+            state
+                .authorize_workgraph_flow_binding_read(&binding)
+                .await
+                .map_err(|error| McpToolError::from_mob(&error))?;
+            Ok(json!({ "binding": workgraph_flow_binding_view(&binding)? }))
+        }
+        "meerkat_workgraph_flow_binding_list" => {
+            let input: MeerkatWorkGraphFlowBindingListInput = parse_args(arguments)?;
+            state
+                .authorize_workgraph_flow_binding_list(input.realm_id.as_deref())
+                .map_err(|error| McpToolError::from_mob(&error))?;
+            let namespace = input
+                .namespace
+                .map(meerkat::WorkNamespace::new)
+                .transpose()
+                .map_err(|error| McpToolError::invalid_params(error.to_string()))?;
+            let item_id = input
+                .work_item_id
+                .map(meerkat::WorkItemId::new)
+                .transpose()
+                .map_err(|error| McpToolError::invalid_params(error.to_string()))?;
+            let service = state.workgraph_service.as_ref().ok_or_else(|| {
+                McpToolError::capability_unavailable(
+                    "WorkGraph service is not configured for this mob surface".to_string(),
+                )
+            })?;
+            let bindings = service
+                .execution_bindings(meerkat::WorkExecutionBindingFilter {
+                    realm_id: input.realm_id,
+                    namespace,
+                    item_id,
+                    current_only: input.current_only,
+                    limit: input.limit,
+                })
+                .await
+                .map_err(|error| McpToolError::from_workgraph(&error))?;
+            let bindings = bindings
+                .iter()
+                .map(workgraph_flow_binding_view)
+                .collect::<Result<Vec<_>, _>>()?;
+            Ok(json!({ "bindings": bindings }))
+        }
+        "meerkat_workgraph_flow_abandon_uncertain" => {
+            let input: MeerkatWorkGraphFlowAbandonUncertainInput = parse_args(arguments)?;
+            let namespace = input
+                .namespace
+                .map(meerkat::WorkNamespace::new)
+                .transpose()
+                .map_err(|error| McpToolError::invalid_params(error.to_string()))?;
+            let result = state
+                .abandon_uncertain_workgraph_flow(crate::AbandonUncertainWorkGraphFlowRequest {
+                    binding_id: meerkat::WorkExecutionBindingId::new(input.binding_id)
+                        .map_err(|error| McpToolError::invalid_params(error.to_string()))?,
+                    realm_id: input.realm_id,
+                    namespace,
+                    expected_binding_revision: input.expected_binding_revision,
+                    detail: input.detail,
+                })
+                .await
+                .map_err(|error| McpToolError::from_workgraph_flow(&error))?;
+            Ok(json!({
+                "binding": workgraph_flow_binding_view(&result.binding)?,
+                "item": result.item,
+                "evidence_projected": result.evidence_projected,
+            }))
+        }
         "meerkat_mob_run" => {
             let input: MeerkatMobRunInput = parse_args(arguments)?;
             let mob_id = parse_mob_id(&input.mob_id)?;
@@ -886,13 +1141,24 @@ pub async fn handle_public_tools_call(
             let mob_id = parse_mob_id(&input.mob_id)?;
             let run_id = parse_run_id(&input.run_id)?;
             let run = state
-                .mob_flow_status(&mob_id, run_id)
+                .mob_flow_status(&mob_id, run_id.clone())
                 .await
                 .map_err(|err| McpToolError::from_mob(&err))?;
             let run = meerkat_mob::MobRun::public_flow_status_run_value(run.as_ref())
                 .map_err(|err| McpToolError::from_mob(&err))?;
-            serde_json::to_value(meerkat_contracts::MobFlowStatusResult { run })
-                .map_err(|err| McpToolError::invalid_params(err.to_string()))
+            let execution_binding = state
+                .workgraph_execution_binding_for_flow_run(&mob_id, &run_id)
+                .await
+                .map_err(|error| McpToolError::from_mob(&error))?
+                .as_ref()
+                .map(workgraph_execution_binding_view)
+                .transpose()
+                .map_err(|error| McpToolError::from_mob(&error))?;
+            serde_json::to_value(meerkat_contracts::MobFlowStatusResult {
+                run,
+                execution_binding,
+            })
+            .map_err(|err| McpToolError::invalid_params(err.to_string()))
         }
         "meerkat_mob_run_result" => {
             let input: MeerkatMobRunIdInput = parse_args(arguments)?;
@@ -1061,6 +1327,30 @@ fn tool_json(name: &str, description: &str, input_schema: Value) -> Value {
         "description": description,
         "inputSchema": input_schema
     })
+}
+
+fn workgraph_flow_result_payload(
+    binding: meerkat::WorkExecutionBinding,
+    run: Option<meerkat_mob::MobRun>,
+    item: meerkat::WorkItem,
+    evidence_projected: bool,
+    work_item_closed: bool,
+) -> Result<Value, McpToolError> {
+    let run = meerkat_mob::MobRun::public_flow_status_run_value(run.as_ref())
+        .map_err(|error| McpToolError::from_mob(&error))?;
+    Ok(json!({
+        "binding": workgraph_flow_binding_view(&binding)?,
+        "run": run,
+        "item": item,
+        "evidence_projected": evidence_projected,
+        "work_item_closed": work_item_closed,
+    }))
+}
+
+fn workgraph_flow_binding_view(
+    binding: &meerkat::WorkExecutionBinding,
+) -> Result<meerkat_contracts::WireWorkGraphFlowExecutionBinding, McpToolError> {
+    workgraph_execution_binding_view(binding).map_err(|error| McpToolError::from_mob(&error))
 }
 
 fn parse_args<T: DeserializeOwned>(arguments: &Value) -> Result<T, McpToolError> {
@@ -1348,8 +1638,8 @@ mod tests {
         }
         assert_eq!(
             table_names.len(),
-            31,
-            "expected exactly 31 public tools across all surfaces"
+            32,
+            "expected exactly 32 public tools across all surfaces"
         );
     }
 

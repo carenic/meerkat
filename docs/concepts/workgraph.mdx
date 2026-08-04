@@ -58,6 +58,43 @@ observe that state; they do not reinterpret it.
 | Time-based wakeups and recurrence | Schedule |
 | Recalled knowledge and compacted context | Memory |
 | Live collaboration messages | Comms |
+| Executable multi-agent DAGs | Mob Flow |
+
+## Mob Flow Execution Bindings
+
+A WorkGraph item describes durable truth. A Mob Flow run is one bounded attempt
+to make that truth hold. Meerkat links them through a durable execution binding
+without merging their state machines.
+
+After authority admission, the binding is committed before Flow execution and
+records the exact mob, Flow, effective run-config digest, deterministic run id,
+activation parameters, idempotency key, and retry predecessor.
+`WorkExecutionLifecycleMachine` owns the cross-system handoff phases. Mob
+remains the only owner of run status and outputs. WorkGraph remains the only
+owner of evidence and completion policy.
+
+Launch realization has its own durable ordering. The Mob actor first persists
+the exact deterministic pending run, then advances the external-delivery
+ledger from `begun` to `realizing`, then commits the Mob lifecycle transition
+and starts execution. Consequently, a valid `realizing` record always has an
+independently observable run. A crash before pending-run persistence leaves a
+`begun` delivery whose absence can be adjudicated. A crash afterward recovers
+the same run instead of launching a replacement.
+
+A completed Flow therefore requests an idempotent evidence projection. It does
+not directly complete the item. The bridge then asks WorkGraph to close the
+item, and WorkGraph either admits closure under its policy or leaves the item
+open with the evidence attached. Execution evidence ids are reserved from
+general WorkGraph mutations. Recovery consumes an already committed execution
+evidence record before requiring the Mob run to remain present.
+
+Ambiguous launch is fail-closed. If the durable Mob delivery intent exists but
+the deterministic run is absent, reconciliation records `launch_uncertain` and
+does not blindly execute the Flow again. A `realizing` record without that run
+is a quarantine condition, not retry authority. Resolving it is an explicit
+exact-run recovery obligation. The public bridge has no caller-asserted
+break-glass transition; it remains fail-closed until the deterministic run is
+observed or a future sealed host authority proves a safe resolution.
 
 ## Namespaces
 
@@ -73,6 +110,23 @@ and CLI expose observability so humans and UIs can inspect items, ready work,
 snapshots, events, goal status, and attention bindings. CLI and trusted
 in-process hosts additionally expose narrow session-goal attention controls;
 public REST/RPC remain observational for those controls.
+
+The public Mob MCP surface exposes `meerkat_workgraph_flow_launch`,
+`meerkat_workgraph_flow_reconcile`, and
+`meerkat_workgraph_flow_abandon_uncertain` for managed Flow execution. Typed,
+redacted `meerkat_workgraph_flow_binding_get` and
+`meerkat_workgraph_flow_binding_list` tools expose linkage without activation
+parameters, idempotency material, correlation ids, or execution principals.
+Ordinary Flow status includes the same redacted reverse binding reference when
+the run belongs to a WorkGraph execution. The Mob
+host reconciles on startup and on Mob machine-state changes; explicit
+reconciliation is an observation/recovery trigger, not the liveness owner. A
+slow safety tick retries transient store or runtime failures that do not emit a
+watched state change.
+Remote members
+do not receive a replica of the WorkGraph store. The controlling host owns the
+binding, launches local or remotely placed Flow steps, and projects terminal
+evidence back into that same WorkGraph authority.
 
 ## See Also
 

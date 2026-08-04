@@ -4892,7 +4892,10 @@ async def test_client_mob_lifecycle_and_send_methods_use_explicit_rpc_methods():
         if method == "mob/flow_run":
             return {"run_id": "run-1"}
         if method == "mob/flow_status":
-            return {"run": {"status": "running"}}
+            return {
+                "run": {"status": "running"},
+                "execution_binding": {"binding_id": "binding-1"},
+            }
         if method == "mob/wait_kickoff":
             return {
                 "members": [
@@ -5037,7 +5040,10 @@ async def test_client_mob_lifecycle_and_send_methods_use_explicit_rpc_methods():
     assert await client.list_mob_flows("mob-1") == ["incident"]
     assert await mob_handle.run({"severity": "high"}, prompt="triage") == "run-typed"
     assert await client.run_mob_flow("mob-1", "incident") == "run-1"
-    assert await client.get_mob_flow_status("mob-1", "run-1") == {"status": "running"}
+    assert await client.get_mob_flow_status("mob-1", "run-1") == {
+        "status": "running",
+        "execution_binding": {"binding_id": "binding-1"},
+    }
     await client.cancel_mob_flow("mob-1", "run-1")
 
     assert [method for method, _ in calls] == [

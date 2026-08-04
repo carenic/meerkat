@@ -3795,6 +3795,7 @@ mod tests {
             run_id: RunId::new(),
             mob_id: MobId::from("adaptive-run-1-verify-findings-a1"),
             flow_id: FlowId::from("layer-flow"),
+            flow_definition_digest: None,
             status: MobRunStatus::Completed,
             flow_state: Default::default(),
             activation_params: serde_json::json!({}),

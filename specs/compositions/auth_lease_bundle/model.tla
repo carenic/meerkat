@@ -142,7 +142,7 @@ auth_machine_Acquire(arg_expires_at_ts, arg_credential_published_at_millis) ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> (auth_machine_credential_generation + 1), credential_published_at_millis |-> Some(packet.payload.credential_published_at_millis), expires_at |-> packet.payload.expires_at_ts, new_state |-> "Valid"], effect_id |-> (model_step_count + 1), source_transition |-> "Acquire"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "Acquire", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Valid"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Valid", expires_at |-> packet.payload.expires_at_ts, credential_generation |-> (auth_machine_credential_generation + 1), credential_published_at_millis |-> Some(packet.payload.credential_published_at_millis)]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Valid", expires_at |-> packet.payload.expires_at_ts, credential_generation |-> (auth_machine_credential_generation + 1), credential_published_at_millis |-> Some(packet.payload.credential_published_at_millis)]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -161,7 +161,7 @@ auth_machine_MarkExpiring ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expiring"], effect_id |-> (model_step_count + 1), source_transition |-> "MarkExpiring"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "MarkExpiring", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expiring"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -183,7 +183,7 @@ auth_machine_ObserveCredentialFreshnessValid(arg_now_ts, arg_refresh_window_secs
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Valid"], effect_id |-> (model_step_count + 1), source_transition |-> "ObserveCredentialFreshnessValid"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ObserveCredentialFreshnessValid", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Valid"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -205,7 +205,7 @@ auth_machine_ObserveCredentialFreshnessExpiringFromValid(arg_now_ts, arg_refresh
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expiring"], effect_id |-> (model_step_count + 1), source_transition |-> "ObserveCredentialFreshnessExpiringFromValid"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ObserveCredentialFreshnessExpiringFromValid", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expiring"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -227,7 +227,7 @@ auth_machine_ObserveCredentialFreshnessExpiredFromValid(arg_now_ts, arg_refresh_
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expired"], effect_id |-> (model_step_count + 1), source_transition |-> "ObserveCredentialFreshnessExpiredFromValid"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ObserveCredentialFreshnessExpiredFromValid", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -249,7 +249,7 @@ auth_machine_ObserveCredentialFreshnessExpiring(arg_now_ts, arg_refresh_window_s
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expiring"], effect_id |-> (model_step_count + 1), source_transition |-> "ObserveCredentialFreshnessExpiring"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ObserveCredentialFreshnessExpiring", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expiring"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -271,7 +271,7 @@ auth_machine_ObserveCredentialFreshnessExpiredFromExpiring(arg_now_ts, arg_refre
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expired"], effect_id |-> (model_step_count + 1), source_transition |-> "ObserveCredentialFreshnessExpiredFromExpiring"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ObserveCredentialFreshnessExpiredFromExpiring", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -292,7 +292,7 @@ auth_machine_ObserveCredentialFreshnessExpired(arg_now_ts, arg_refresh_window_se
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expired"], effect_id |-> (model_step_count + 1), source_transition |-> "ObserveCredentialFreshnessExpired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ObserveCredentialFreshnessExpired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -313,7 +313,7 @@ auth_machine_ObserveCredentialFreshnessRefreshing(arg_now_ts, arg_refresh_window
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Refreshing"], effect_id |-> (model_step_count + 1), source_transition |-> "ObserveCredentialFreshnessRefreshing"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ObserveCredentialFreshnessRefreshing", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Refreshing"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -334,7 +334,7 @@ auth_machine_ObserveCredentialFreshnessReauthRequired(arg_now_ts, arg_refresh_wi
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "ObserveCredentialFreshnessReauthRequired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ObserveCredentialFreshnessReauthRequired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -355,7 +355,7 @@ auth_machine_ObserveCredentialFreshnessReleased(arg_now_ts, arg_refresh_window_s
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Released"], effect_id |-> (model_step_count + 1), source_transition |-> "ObserveCredentialFreshnessReleased"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ObserveCredentialFreshnessReleased", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Released"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Released", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Released", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -374,7 +374,7 @@ auth_machine_BeginRefreshFromValid ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Refreshing"], effect_id |-> (model_step_count + 1), source_transition |-> "BeginRefreshFromValid"], [machine |-> "auth_machine", variant |-> "WakeRefreshLoop", payload |-> [tag |-> "unit"], effect_id |-> (model_step_count + 1), source_transition |-> "BeginRefreshFromValid"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "BeginRefreshFromValid", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Refreshing"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -393,7 +393,7 @@ auth_machine_BeginRefreshFromExpiring ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Refreshing"], effect_id |-> (model_step_count + 1), source_transition |-> "BeginRefreshFromExpiring"], [machine |-> "auth_machine", variant |-> "WakeRefreshLoop", payload |-> [tag |-> "unit"], effect_id |-> (model_step_count + 1), source_transition |-> "BeginRefreshFromExpiring"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "BeginRefreshFromExpiring", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Refreshing"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -412,7 +412,7 @@ auth_machine_BeginRefreshFromExpired ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Refreshing"], effect_id |-> (model_step_count + 1), source_transition |-> "BeginRefreshFromExpired"], [machine |-> "auth_machine", variant |-> "WakeRefreshLoop", payload |-> [tag |-> "unit"], effect_id |-> (model_step_count + 1), source_transition |-> "BeginRefreshFromExpired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "BeginRefreshFromExpired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Refreshing"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -441,7 +441,7 @@ auth_machine_CompleteRefresh(arg_new_expires_at, arg_now_ts, arg_credential_publ
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> (auth_machine_credential_generation + 1), credential_published_at_millis |-> Some(packet.payload.credential_published_at_millis), expires_at |-> packet.payload.new_expires_at, new_state |-> "Valid"], effect_id |-> (model_step_count + 1), source_transition |-> "CompleteRefresh"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "CompleteRefresh", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Valid"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Valid", expires_at |-> packet.payload.new_expires_at, credential_generation |-> (auth_machine_credential_generation + 1), credential_published_at_millis |-> Some(packet.payload.credential_published_at_millis)]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Valid", expires_at |-> packet.payload.new_expires_at, credential_generation |-> (auth_machine_credential_generation + 1), credential_published_at_millis |-> Some(packet.payload.credential_published_at_millis)]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -507,7 +507,7 @@ auth_machine_RefreshFailedTransient(arg_disposition) ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expiring"], effect_id |-> (model_step_count + 1), source_transition |-> "RefreshFailedTransient"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RefreshFailedTransient", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expiring"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -529,7 +529,7 @@ auth_machine_RefreshFailedPermanent(arg_disposition) ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "RefreshFailedPermanent"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RefreshFailedPermanent", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -548,7 +548,7 @@ auth_machine_MarkReauthRequiredFromValid ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "MarkReauthRequiredFromValid"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "MarkReauthRequiredFromValid", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -567,7 +567,7 @@ auth_machine_MarkReauthRequiredFromExpiring ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "MarkReauthRequiredFromExpiring"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "MarkReauthRequiredFromExpiring", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -586,7 +586,7 @@ auth_machine_MarkReauthRequiredFromExpired ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "MarkReauthRequiredFromExpired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "MarkReauthRequiredFromExpired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -605,7 +605,7 @@ auth_machine_MarkReauthRequiredFromRefreshing ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "MarkReauthRequiredFromRefreshing"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "MarkReauthRequiredFromRefreshing", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -629,7 +629,7 @@ auth_machine_ClearCredentialLifecycle ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> None, expires_at |-> None, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "ClearCredentialLifecycle"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ClearCredentialLifecycle", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> None, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> None]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> None, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> None]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -654,7 +654,7 @@ auth_machine_ReleaseCredentialLifecycleWithOAuth ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> None, expires_at |-> None, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "ReleaseCredentialLifecycleWithOAuth"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ReleaseCredentialLifecycleWithOAuth", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> None, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> None]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> None, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> None]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -689,7 +689,7 @@ auth_machine_ReleaseCredentialLifecycleWithoutOAuth ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> None, expires_at |-> None, new_state |-> "Released"], effect_id |-> (model_step_count + 1), source_transition |-> "ReleaseCredentialLifecycleWithoutOAuth"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ReleaseCredentialLifecycleWithoutOAuth", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Released"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Released", expires_at |-> None, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> None]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Released", expires_at |-> None, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> None]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -710,7 +710,7 @@ auth_machine_BeginReleaseDrainingOAuthFlowsValid ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "CancelOAuthFlowsForRelease", payload |-> [browser_flow_ids |-> auth_machine_oauth_browser_flow_ids, device_flow_ids |-> auth_machine_oauth_device_flow_ids], effect_id |-> (model_step_count + 1), source_transition |-> "BeginReleaseDrainingOAuthFlowsValid"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "BeginReleaseDrainingOAuthFlowsValid", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Valid"]}
-       /\ obligation_auth_machine_auth_release_oauth_flow_drain' = obligation_auth_machine_auth_release_oauth_flow_drain \cup {[browser_flow_ids |-> auth_machine_oauth_browser_flow_ids, device_flow_ids |-> auth_machine_oauth_device_flow_ids]}
+       /\ obligation_auth_machine_auth_release_oauth_flow_drain' = obligation_auth_machine_auth_release_oauth_flow_drain \cup {[effect_id |-> (model_step_count + 1), browser_flow_ids |-> auth_machine_oauth_browser_flow_ids, device_flow_ids |-> auth_machine_oauth_device_flow_ids]}
        /\ UNCHANGED << obligation_auth_machine_auth_lease_lifecycle_publication >>
        /\ model_step_count' = model_step_count + 1
 
@@ -731,7 +731,7 @@ auth_machine_BeginReleaseDrainingOAuthFlowsExpiring ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "CancelOAuthFlowsForRelease", payload |-> [browser_flow_ids |-> auth_machine_oauth_browser_flow_ids, device_flow_ids |-> auth_machine_oauth_device_flow_ids], effect_id |-> (model_step_count + 1), source_transition |-> "BeginReleaseDrainingOAuthFlowsExpiring"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "BeginReleaseDrainingOAuthFlowsExpiring", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expiring"]}
-       /\ obligation_auth_machine_auth_release_oauth_flow_drain' = obligation_auth_machine_auth_release_oauth_flow_drain \cup {[browser_flow_ids |-> auth_machine_oauth_browser_flow_ids, device_flow_ids |-> auth_machine_oauth_device_flow_ids]}
+       /\ obligation_auth_machine_auth_release_oauth_flow_drain' = obligation_auth_machine_auth_release_oauth_flow_drain \cup {[effect_id |-> (model_step_count + 1), browser_flow_ids |-> auth_machine_oauth_browser_flow_ids, device_flow_ids |-> auth_machine_oauth_device_flow_ids]}
        /\ UNCHANGED << obligation_auth_machine_auth_lease_lifecycle_publication >>
        /\ model_step_count' = model_step_count + 1
 
@@ -752,7 +752,7 @@ auth_machine_BeginReleaseDrainingOAuthFlowsExpired ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "CancelOAuthFlowsForRelease", payload |-> [browser_flow_ids |-> auth_machine_oauth_browser_flow_ids, device_flow_ids |-> auth_machine_oauth_device_flow_ids], effect_id |-> (model_step_count + 1), source_transition |-> "BeginReleaseDrainingOAuthFlowsExpired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "BeginReleaseDrainingOAuthFlowsExpired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expired"]}
-       /\ obligation_auth_machine_auth_release_oauth_flow_drain' = obligation_auth_machine_auth_release_oauth_flow_drain \cup {[browser_flow_ids |-> auth_machine_oauth_browser_flow_ids, device_flow_ids |-> auth_machine_oauth_device_flow_ids]}
+       /\ obligation_auth_machine_auth_release_oauth_flow_drain' = obligation_auth_machine_auth_release_oauth_flow_drain \cup {[effect_id |-> (model_step_count + 1), browser_flow_ids |-> auth_machine_oauth_browser_flow_ids, device_flow_ids |-> auth_machine_oauth_device_flow_ids]}
        /\ UNCHANGED << obligation_auth_machine_auth_lease_lifecycle_publication >>
        /\ model_step_count' = model_step_count + 1
 
@@ -773,7 +773,7 @@ auth_machine_BeginReleaseDrainingOAuthFlowsRefreshing ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "CancelOAuthFlowsForRelease", payload |-> [browser_flow_ids |-> auth_machine_oauth_browser_flow_ids, device_flow_ids |-> auth_machine_oauth_device_flow_ids], effect_id |-> (model_step_count + 1), source_transition |-> "BeginReleaseDrainingOAuthFlowsRefreshing"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "BeginReleaseDrainingOAuthFlowsRefreshing", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Refreshing"]}
-       /\ obligation_auth_machine_auth_release_oauth_flow_drain' = obligation_auth_machine_auth_release_oauth_flow_drain \cup {[browser_flow_ids |-> auth_machine_oauth_browser_flow_ids, device_flow_ids |-> auth_machine_oauth_device_flow_ids]}
+       /\ obligation_auth_machine_auth_release_oauth_flow_drain' = obligation_auth_machine_auth_release_oauth_flow_drain \cup {[effect_id |-> (model_step_count + 1), browser_flow_ids |-> auth_machine_oauth_browser_flow_ids, device_flow_ids |-> auth_machine_oauth_device_flow_ids]}
        /\ UNCHANGED << obligation_auth_machine_auth_lease_lifecycle_publication >>
        /\ model_step_count' = model_step_count + 1
 
@@ -794,7 +794,7 @@ auth_machine_BeginReleaseDrainingOAuthFlowsReauthRequired ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "CancelOAuthFlowsForRelease", payload |-> [browser_flow_ids |-> auth_machine_oauth_browser_flow_ids, device_flow_ids |-> auth_machine_oauth_device_flow_ids], effect_id |-> (model_step_count + 1), source_transition |-> "BeginReleaseDrainingOAuthFlowsReauthRequired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "BeginReleaseDrainingOAuthFlowsReauthRequired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_release_oauth_flow_drain' = obligation_auth_machine_auth_release_oauth_flow_drain \cup {[browser_flow_ids |-> auth_machine_oauth_browser_flow_ids, device_flow_ids |-> auth_machine_oauth_device_flow_ids]}
+       /\ obligation_auth_machine_auth_release_oauth_flow_drain' = obligation_auth_machine_auth_release_oauth_flow_drain \cup {[effect_id |-> (model_step_count + 1), browser_flow_ids |-> auth_machine_oauth_browser_flow_ids, device_flow_ids |-> auth_machine_oauth_device_flow_ids]}
        /\ UNCHANGED << obligation_auth_machine_auth_lease_lifecycle_publication >>
        /\ model_step_count' = model_step_count + 1
 
@@ -947,7 +947,7 @@ auth_machine_Release ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> None, expires_at |-> None, new_state |-> "Released"], effect_id |-> (model_step_count + 1), source_transition |-> "Release"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "Release", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Released"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Released", expires_at |-> None, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> None]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Released", expires_at |-> None, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> None]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -981,7 +981,7 @@ auth_machine_RestoreCredentialLifecycleSnapshotValid(arg_lifecycle_phase, arg_ex
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis, expires_at |-> packet.payload.expires_at, new_state |-> "Valid"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreCredentialLifecycleSnapshotValid"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreCredentialLifecycleSnapshotValid", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Valid"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Valid", expires_at |-> packet.payload.expires_at, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Valid", expires_at |-> packet.payload.expires_at, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1015,7 +1015,7 @@ auth_machine_RestoreCredentialLifecycleSnapshotExpiring(arg_lifecycle_phase, arg
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis, expires_at |-> packet.payload.expires_at, new_state |-> "Expiring"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreCredentialLifecycleSnapshotExpiring"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreCredentialLifecycleSnapshotExpiring", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expiring"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expiring", expires_at |-> packet.payload.expires_at, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expiring", expires_at |-> packet.payload.expires_at, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1049,7 +1049,7 @@ auth_machine_RestoreCredentialLifecycleSnapshotRefreshing(arg_lifecycle_phase, a
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis, expires_at |-> packet.payload.expires_at, new_state |-> "Refreshing"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreCredentialLifecycleSnapshotRefreshing"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreCredentialLifecycleSnapshotRefreshing", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Refreshing"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Refreshing", expires_at |-> packet.payload.expires_at, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Refreshing", expires_at |-> packet.payload.expires_at, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1083,7 +1083,7 @@ auth_machine_RestoreCredentialLifecycleSnapshotExpired(arg_lifecycle_phase, arg_
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis, expires_at |-> packet.payload.expires_at, new_state |-> "Expired"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreCredentialLifecycleSnapshotExpired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreCredentialLifecycleSnapshotExpired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expired", expires_at |-> packet.payload.expires_at, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expired", expires_at |-> packet.payload.expires_at, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1117,7 +1117,7 @@ auth_machine_RestoreCredentialLifecycleSnapshotReauthRequired(arg_lifecycle_phas
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis, expires_at |-> packet.payload.expires_at, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreCredentialLifecycleSnapshotReauthRequired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreCredentialLifecycleSnapshotReauthRequired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> packet.payload.expires_at, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> packet.payload.expires_at, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1152,7 +1152,7 @@ auth_machine_RestoreCredentialLifecycleSnapshotNoCredentialWithOAuth(arg_lifecyc
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> None, expires_at |-> None, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreCredentialLifecycleSnapshotNoCredentialWithOAuth"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreCredentialLifecycleSnapshotNoCredentialWithOAuth", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> None, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> None]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> None, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> None]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1197,7 +1197,7 @@ auth_machine_RestoreCredentialLifecycleSnapshotNoCredentialWithoutOAuth(arg_life
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> None, expires_at |-> None, new_state |-> "Released"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreCredentialLifecycleSnapshotNoCredentialWithoutOAuth"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreCredentialLifecycleSnapshotNoCredentialWithoutOAuth", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Released"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Released", expires_at |-> None, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> None]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Released", expires_at |-> None, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> None]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1230,7 +1230,7 @@ auth_machine_RestoreAuthoritySnapshotValid(arg_lifecycle_phase, arg_expires_at, 
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis, expires_at |-> packet.payload.expires_at, new_state |-> "Valid"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreAuthoritySnapshotValid"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreAuthoritySnapshotValid", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Valid"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Valid", expires_at |-> packet.payload.expires_at, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Valid", expires_at |-> packet.payload.expires_at, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1263,7 +1263,7 @@ auth_machine_RestoreAuthoritySnapshotExpiring(arg_lifecycle_phase, arg_expires_a
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis, expires_at |-> packet.payload.expires_at, new_state |-> "Expiring"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreAuthoritySnapshotExpiring"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreAuthoritySnapshotExpiring", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expiring"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expiring", expires_at |-> packet.payload.expires_at, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expiring", expires_at |-> packet.payload.expires_at, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1296,7 +1296,7 @@ auth_machine_RestoreAuthoritySnapshotRefreshing(arg_lifecycle_phase, arg_expires
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis, expires_at |-> packet.payload.expires_at, new_state |-> "Refreshing"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreAuthoritySnapshotRefreshing"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreAuthoritySnapshotRefreshing", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Refreshing"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Refreshing", expires_at |-> packet.payload.expires_at, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Refreshing", expires_at |-> packet.payload.expires_at, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1329,7 +1329,7 @@ auth_machine_RestoreAuthoritySnapshotExpired(arg_lifecycle_phase, arg_expires_at
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis, expires_at |-> packet.payload.expires_at, new_state |-> "Expired"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreAuthoritySnapshotExpired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreAuthoritySnapshotExpired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expired", expires_at |-> packet.payload.expires_at, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expired", expires_at |-> packet.payload.expires_at, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1362,7 +1362,7 @@ auth_machine_RestoreAuthoritySnapshotReauthRequired(arg_lifecycle_phase, arg_exp
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis, expires_at |-> packet.payload.expires_at, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreAuthoritySnapshotReauthRequired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreAuthoritySnapshotReauthRequired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> packet.payload.expires_at, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> packet.payload.expires_at, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1396,7 +1396,7 @@ auth_machine_RestoreAuthoritySnapshotReleased(arg_lifecycle_phase, arg_expires_a
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis, expires_at |-> packet.payload.expires_at, new_state |-> "Released"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreAuthoritySnapshotReleased"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreAuthoritySnapshotReleased", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Released"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Released", expires_at |-> packet.payload.expires_at, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Released", expires_at |-> packet.payload.expires_at, credential_generation |-> IF (packet.payload.credential_generation > auth_machine_credential_generation) THEN packet.payload.credential_generation ELSE auth_machine_credential_generation, credential_published_at_millis |-> packet.payload.credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1428,7 +1428,7 @@ auth_machine_RestoreOAuthBrowserFlowValid(arg_flow_id, arg_provider, arg_redirec
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Valid"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreOAuthBrowserFlowValid"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreOAuthBrowserFlowValid", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Valid"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1460,7 +1460,7 @@ auth_machine_RestoreOAuthBrowserFlowExpiring(arg_flow_id, arg_provider, arg_redi
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expiring"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreOAuthBrowserFlowExpiring"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreOAuthBrowserFlowExpiring", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expiring"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1492,7 +1492,7 @@ auth_machine_RestoreOAuthBrowserFlowExpired(arg_flow_id, arg_provider, arg_redir
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expired"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreOAuthBrowserFlowExpired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreOAuthBrowserFlowExpired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1524,7 +1524,7 @@ auth_machine_RestoreOAuthBrowserFlowRefreshing(arg_flow_id, arg_provider, arg_re
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Refreshing"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreOAuthBrowserFlowRefreshing"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreOAuthBrowserFlowRefreshing", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Refreshing"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1556,7 +1556,7 @@ auth_machine_RestoreOAuthBrowserFlowReauthRequired(arg_flow_id, arg_provider, ar
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreOAuthBrowserFlowReauthRequired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreOAuthBrowserFlowReauthRequired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1586,7 +1586,7 @@ auth_machine_RestoreOAuthDeviceFlowValid(arg_flow_id, arg_provider, arg_expires_
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Valid"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreOAuthDeviceFlowValid"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreOAuthDeviceFlowValid", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Valid"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1616,7 +1616,7 @@ auth_machine_RestoreOAuthDeviceFlowExpiring(arg_flow_id, arg_provider, arg_expir
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expiring"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreOAuthDeviceFlowExpiring"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreOAuthDeviceFlowExpiring", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expiring"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1646,7 +1646,7 @@ auth_machine_RestoreOAuthDeviceFlowExpired(arg_flow_id, arg_provider, arg_expire
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expired"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreOAuthDeviceFlowExpired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreOAuthDeviceFlowExpired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1676,7 +1676,7 @@ auth_machine_RestoreOAuthDeviceFlowRefreshing(arg_flow_id, arg_provider, arg_exp
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Refreshing"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreOAuthDeviceFlowRefreshing"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreOAuthDeviceFlowRefreshing", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Refreshing"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1706,7 +1706,7 @@ auth_machine_RestoreOAuthDeviceFlowReauthRequired(arg_flow_id, arg_provider, arg
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreOAuthDeviceFlowReauthRequired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreOAuthDeviceFlowReauthRequired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1729,7 +1729,7 @@ auth_machine_RestoreOAuthDevicePollValid(arg_flow_id) ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Valid"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreOAuthDevicePollValid"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreOAuthDevicePollValid", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Valid"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1752,7 +1752,7 @@ auth_machine_RestoreOAuthDevicePollExpiring(arg_flow_id) ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expiring"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreOAuthDevicePollExpiring"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreOAuthDevicePollExpiring", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expiring"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1775,7 +1775,7 @@ auth_machine_RestoreOAuthDevicePollExpired(arg_flow_id) ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expired"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreOAuthDevicePollExpired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreOAuthDevicePollExpired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1798,7 +1798,7 @@ auth_machine_RestoreOAuthDevicePollRefreshing(arg_flow_id) ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Refreshing"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreOAuthDevicePollRefreshing"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreOAuthDevicePollRefreshing", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Refreshing"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1821,7 +1821,7 @@ auth_machine_RestoreOAuthDevicePollReauthRequired(arg_flow_id) ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "RestoreOAuthDevicePollReauthRequired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "RestoreOAuthDevicePollReauthRequired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1855,7 +1855,7 @@ auth_machine_AdmitOAuthBrowserFlowValid(arg_flow_id, arg_provider, arg_redirect_
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Valid"], effect_id |-> (model_step_count + 1), source_transition |-> "AdmitOAuthBrowserFlowValid"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "AdmitOAuthBrowserFlowValid", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Valid"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1889,7 +1889,7 @@ auth_machine_AdmitOAuthBrowserFlowExpiring(arg_flow_id, arg_provider, arg_redire
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expiring"], effect_id |-> (model_step_count + 1), source_transition |-> "AdmitOAuthBrowserFlowExpiring"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "AdmitOAuthBrowserFlowExpiring", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expiring"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1923,7 +1923,7 @@ auth_machine_AdmitOAuthBrowserFlowExpired(arg_flow_id, arg_provider, arg_redirec
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expired"], effect_id |-> (model_step_count + 1), source_transition |-> "AdmitOAuthBrowserFlowExpired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "AdmitOAuthBrowserFlowExpired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1957,7 +1957,7 @@ auth_machine_AdmitOAuthBrowserFlowRefreshing(arg_flow_id, arg_provider, arg_redi
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Refreshing"], effect_id |-> (model_step_count + 1), source_transition |-> "AdmitOAuthBrowserFlowRefreshing"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "AdmitOAuthBrowserFlowRefreshing", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Refreshing"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -1991,7 +1991,7 @@ auth_machine_AdmitOAuthBrowserFlowReauthRequired(arg_flow_id, arg_provider, arg_
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "AdmitOAuthBrowserFlowReauthRequired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "AdmitOAuthBrowserFlowReauthRequired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2025,7 +2025,7 @@ auth_machine_ReopenReleasedForOAuthBrowserFlowAdmission(arg_flow_id, arg_provide
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "ReopenReleasedForOAuthBrowserFlowAdmission"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ReopenReleasedForOAuthBrowserFlowAdmission", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2052,7 +2052,7 @@ auth_machine_VerifyOAuthBrowserFlowValid(arg_flow_id, arg_provider, arg_redirect
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Valid"], effect_id |-> (model_step_count + 1), source_transition |-> "VerifyOAuthBrowserFlowValid"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "VerifyOAuthBrowserFlowValid", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Valid"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2079,7 +2079,7 @@ auth_machine_VerifyOAuthBrowserFlowExpiring(arg_flow_id, arg_provider, arg_redir
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expiring"], effect_id |-> (model_step_count + 1), source_transition |-> "VerifyOAuthBrowserFlowExpiring"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "VerifyOAuthBrowserFlowExpiring", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expiring"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2106,7 +2106,7 @@ auth_machine_VerifyOAuthBrowserFlowExpired(arg_flow_id, arg_provider, arg_redire
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expired"], effect_id |-> (model_step_count + 1), source_transition |-> "VerifyOAuthBrowserFlowExpired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "VerifyOAuthBrowserFlowExpired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2133,7 +2133,7 @@ auth_machine_VerifyOAuthBrowserFlowRefreshing(arg_flow_id, arg_provider, arg_red
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Refreshing"], effect_id |-> (model_step_count + 1), source_transition |-> "VerifyOAuthBrowserFlowRefreshing"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "VerifyOAuthBrowserFlowRefreshing", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Refreshing"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2160,7 +2160,7 @@ auth_machine_VerifyOAuthBrowserFlowReauthRequired(arg_flow_id, arg_provider, arg
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "VerifyOAuthBrowserFlowReauthRequired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "VerifyOAuthBrowserFlowReauthRequired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2192,7 +2192,7 @@ auth_machine_ConsumeOAuthBrowserFlowValid(arg_flow_id, arg_provider, arg_redirec
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Valid"], effect_id |-> (model_step_count + 1), source_transition |-> "ConsumeOAuthBrowserFlowValid"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ConsumeOAuthBrowserFlowValid", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Valid"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2224,7 +2224,7 @@ auth_machine_ConsumeOAuthBrowserFlowExpiring(arg_flow_id, arg_provider, arg_redi
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expiring"], effect_id |-> (model_step_count + 1), source_transition |-> "ConsumeOAuthBrowserFlowExpiring"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ConsumeOAuthBrowserFlowExpiring", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expiring"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2256,7 +2256,7 @@ auth_machine_ConsumeOAuthBrowserFlowExpired(arg_flow_id, arg_provider, arg_redir
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expired"], effect_id |-> (model_step_count + 1), source_transition |-> "ConsumeOAuthBrowserFlowExpired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ConsumeOAuthBrowserFlowExpired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2288,7 +2288,7 @@ auth_machine_ConsumeOAuthBrowserFlowRefreshing(arg_flow_id, arg_provider, arg_re
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Refreshing"], effect_id |-> (model_step_count + 1), source_transition |-> "ConsumeOAuthBrowserFlowRefreshing"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ConsumeOAuthBrowserFlowRefreshing", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Refreshing"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2320,7 +2320,7 @@ auth_machine_ConsumeOAuthBrowserFlowReauthRequired(arg_flow_id, arg_provider, ar
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "ConsumeOAuthBrowserFlowReauthRequired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ConsumeOAuthBrowserFlowReauthRequired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2346,7 +2346,7 @@ auth_machine_ExpireOAuthBrowserFlowValid(arg_flow_id) ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Valid"], effect_id |-> (model_step_count + 1), source_transition |-> "ExpireOAuthBrowserFlowValid"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ExpireOAuthBrowserFlowValid", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Valid"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2372,7 +2372,7 @@ auth_machine_ExpireOAuthBrowserFlowExpiring(arg_flow_id) ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expiring"], effect_id |-> (model_step_count + 1), source_transition |-> "ExpireOAuthBrowserFlowExpiring"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ExpireOAuthBrowserFlowExpiring", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expiring"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2398,7 +2398,7 @@ auth_machine_ExpireOAuthBrowserFlowExpired(arg_flow_id) ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expired"], effect_id |-> (model_step_count + 1), source_transition |-> "ExpireOAuthBrowserFlowExpired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ExpireOAuthBrowserFlowExpired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2424,7 +2424,7 @@ auth_machine_ExpireOAuthBrowserFlowRefreshing(arg_flow_id) ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Refreshing"], effect_id |-> (model_step_count + 1), source_transition |-> "ExpireOAuthBrowserFlowRefreshing"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ExpireOAuthBrowserFlowRefreshing", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Refreshing"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2450,7 +2450,7 @@ auth_machine_ExpireOAuthBrowserFlowReauthRequired(arg_flow_id) ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "ExpireOAuthBrowserFlowReauthRequired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ExpireOAuthBrowserFlowReauthRequired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2602,7 +2602,7 @@ auth_machine_AdmitOAuthDeviceFlowValid(arg_flow_id, arg_provider, arg_expires_at
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Valid"], effect_id |-> (model_step_count + 1), source_transition |-> "AdmitOAuthDeviceFlowValid"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "AdmitOAuthDeviceFlowValid", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Valid"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2635,7 +2635,7 @@ auth_machine_AdmitOAuthDeviceFlowExpiring(arg_flow_id, arg_provider, arg_expires
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expiring"], effect_id |-> (model_step_count + 1), source_transition |-> "AdmitOAuthDeviceFlowExpiring"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "AdmitOAuthDeviceFlowExpiring", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expiring"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2668,7 +2668,7 @@ auth_machine_AdmitOAuthDeviceFlowExpired(arg_flow_id, arg_provider, arg_expires_
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expired"], effect_id |-> (model_step_count + 1), source_transition |-> "AdmitOAuthDeviceFlowExpired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "AdmitOAuthDeviceFlowExpired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2701,7 +2701,7 @@ auth_machine_AdmitOAuthDeviceFlowRefreshing(arg_flow_id, arg_provider, arg_expir
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Refreshing"], effect_id |-> (model_step_count + 1), source_transition |-> "AdmitOAuthDeviceFlowRefreshing"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "AdmitOAuthDeviceFlowRefreshing", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Refreshing"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2734,7 +2734,7 @@ auth_machine_AdmitOAuthDeviceFlowReauthRequired(arg_flow_id, arg_provider, arg_e
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "AdmitOAuthDeviceFlowReauthRequired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "AdmitOAuthDeviceFlowReauthRequired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2767,7 +2767,7 @@ auth_machine_ReopenReleasedForOAuthDeviceFlowAdmission(arg_flow_id, arg_provider
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "ReopenReleasedForOAuthDeviceFlowAdmission"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ReopenReleasedForOAuthDeviceFlowAdmission", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2917,7 +2917,7 @@ auth_machine_VerifyOAuthDeviceFlowValid(arg_flow_id, arg_provider, arg_now_milli
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Valid"], effect_id |-> (model_step_count + 1), source_transition |-> "VerifyOAuthDeviceFlowValid"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "VerifyOAuthDeviceFlowValid", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Valid"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2942,7 +2942,7 @@ auth_machine_VerifyOAuthDeviceFlowExpiring(arg_flow_id, arg_provider, arg_now_mi
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expiring"], effect_id |-> (model_step_count + 1), source_transition |-> "VerifyOAuthDeviceFlowExpiring"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "VerifyOAuthDeviceFlowExpiring", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expiring"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2967,7 +2967,7 @@ auth_machine_VerifyOAuthDeviceFlowExpired(arg_flow_id, arg_provider, arg_now_mil
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expired"], effect_id |-> (model_step_count + 1), source_transition |-> "VerifyOAuthDeviceFlowExpired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "VerifyOAuthDeviceFlowExpired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -2992,7 +2992,7 @@ auth_machine_VerifyOAuthDeviceFlowRefreshing(arg_flow_id, arg_provider, arg_now_
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Refreshing"], effect_id |-> (model_step_count + 1), source_transition |-> "VerifyOAuthDeviceFlowRefreshing"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "VerifyOAuthDeviceFlowRefreshing", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Refreshing"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -3017,7 +3017,7 @@ auth_machine_VerifyOAuthDeviceFlowReauthRequired(arg_flow_id, arg_provider, arg_
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "VerifyOAuthDeviceFlowReauthRequired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "VerifyOAuthDeviceFlowReauthRequired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -3044,7 +3044,7 @@ auth_machine_BeginOAuthDevicePollValid(arg_flow_id, arg_provider, arg_now_millis
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Valid"], effect_id |-> (model_step_count + 1), source_transition |-> "BeginOAuthDevicePollValid"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "BeginOAuthDevicePollValid", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Valid"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -3071,7 +3071,7 @@ auth_machine_BeginOAuthDevicePollExpiring(arg_flow_id, arg_provider, arg_now_mil
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expiring"], effect_id |-> (model_step_count + 1), source_transition |-> "BeginOAuthDevicePollExpiring"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "BeginOAuthDevicePollExpiring", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expiring"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -3098,7 +3098,7 @@ auth_machine_BeginOAuthDevicePollExpired(arg_flow_id, arg_provider, arg_now_mill
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expired"], effect_id |-> (model_step_count + 1), source_transition |-> "BeginOAuthDevicePollExpired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "BeginOAuthDevicePollExpired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -3125,7 +3125,7 @@ auth_machine_BeginOAuthDevicePollRefreshing(arg_flow_id, arg_provider, arg_now_m
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Refreshing"], effect_id |-> (model_step_count + 1), source_transition |-> "BeginOAuthDevicePollRefreshing"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "BeginOAuthDevicePollRefreshing", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Refreshing"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -3152,7 +3152,7 @@ auth_machine_BeginOAuthDevicePollReauthRequired(arg_flow_id, arg_provider, arg_n
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "BeginOAuthDevicePollReauthRequired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "BeginOAuthDevicePollReauthRequired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -3174,7 +3174,7 @@ auth_machine_FinishOAuthDevicePollValid(arg_flow_id) ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Valid"], effect_id |-> (model_step_count + 1), source_transition |-> "FinishOAuthDevicePollValid"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "FinishOAuthDevicePollValid", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Valid"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -3196,7 +3196,7 @@ auth_machine_FinishOAuthDevicePollExpiring(arg_flow_id) ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expiring"], effect_id |-> (model_step_count + 1), source_transition |-> "FinishOAuthDevicePollExpiring"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "FinishOAuthDevicePollExpiring", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expiring"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -3218,7 +3218,7 @@ auth_machine_FinishOAuthDevicePollExpired(arg_flow_id) ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expired"], effect_id |-> (model_step_count + 1), source_transition |-> "FinishOAuthDevicePollExpired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "FinishOAuthDevicePollExpired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -3240,7 +3240,7 @@ auth_machine_FinishOAuthDevicePollRefreshing(arg_flow_id) ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Refreshing"], effect_id |-> (model_step_count + 1), source_transition |-> "FinishOAuthDevicePollRefreshing"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "FinishOAuthDevicePollRefreshing", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Refreshing"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -3262,7 +3262,7 @@ auth_machine_FinishOAuthDevicePollReauthRequired(arg_flow_id) ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "FinishOAuthDevicePollReauthRequired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "FinishOAuthDevicePollReauthRequired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -3411,7 +3411,7 @@ auth_machine_ConsumeOAuthDeviceFlowValid(arg_flow_id, arg_provider, arg_now_mill
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Valid"], effect_id |-> (model_step_count + 1), source_transition |-> "ConsumeOAuthDeviceFlowValid"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ConsumeOAuthDeviceFlowValid", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Valid"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -3441,7 +3441,7 @@ auth_machine_ConsumeOAuthDeviceFlowExpiring(arg_flow_id, arg_provider, arg_now_m
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expiring"], effect_id |-> (model_step_count + 1), source_transition |-> "ConsumeOAuthDeviceFlowExpiring"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ConsumeOAuthDeviceFlowExpiring", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expiring"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -3471,7 +3471,7 @@ auth_machine_ConsumeOAuthDeviceFlowExpired(arg_flow_id, arg_provider, arg_now_mi
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expired"], effect_id |-> (model_step_count + 1), source_transition |-> "ConsumeOAuthDeviceFlowExpired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ConsumeOAuthDeviceFlowExpired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -3501,7 +3501,7 @@ auth_machine_ConsumeOAuthDeviceFlowRefreshing(arg_flow_id, arg_provider, arg_now
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Refreshing"], effect_id |-> (model_step_count + 1), source_transition |-> "ConsumeOAuthDeviceFlowRefreshing"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ConsumeOAuthDeviceFlowRefreshing", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Refreshing"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -3531,7 +3531,7 @@ auth_machine_ConsumeOAuthDeviceFlowReauthRequired(arg_flow_id, arg_provider, arg
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "ConsumeOAuthDeviceFlowReauthRequired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ConsumeOAuthDeviceFlowReauthRequired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -3557,7 +3557,7 @@ auth_machine_ExpireOAuthDeviceFlowValid(arg_flow_id) ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Valid"], effect_id |-> (model_step_count + 1), source_transition |-> "ExpireOAuthDeviceFlowValid"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ExpireOAuthDeviceFlowValid", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Valid"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Valid", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -3583,7 +3583,7 @@ auth_machine_ExpireOAuthDeviceFlowExpiring(arg_flow_id) ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expiring"], effect_id |-> (model_step_count + 1), source_transition |-> "ExpireOAuthDeviceFlowExpiring"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ExpireOAuthDeviceFlowExpiring", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expiring"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expiring", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -3609,7 +3609,7 @@ auth_machine_ExpireOAuthDeviceFlowExpired(arg_flow_id) ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Expired"], effect_id |-> (model_step_count + 1), source_transition |-> "ExpireOAuthDeviceFlowExpired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ExpireOAuthDeviceFlowExpired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Expired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Expired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -3635,7 +3635,7 @@ auth_machine_ExpireOAuthDeviceFlowRefreshing(arg_flow_id) ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "Refreshing"], effect_id |-> (model_step_count + 1), source_transition |-> "ExpireOAuthDeviceFlowRefreshing"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ExpireOAuthDeviceFlowRefreshing", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "Refreshing"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "Refreshing", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -3661,7 +3661,7 @@ auth_machine_ExpireOAuthDeviceFlowReauthRequired(arg_flow_id) ==
        /\ delivered_routes' = delivered_routes
        /\ emitted_effects' = emitted_effects \cup { [machine |-> "auth_machine", variant |-> "EmitLifecycleEvent", payload |-> [credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis, expires_at |-> auth_machine_expires_at, new_state |-> "ReauthRequired"], effect_id |-> (model_step_count + 1), source_transition |-> "ExpireOAuthDeviceFlowReauthRequired"] }
        /\ observed_transitions' = observed_transitions \cup {[machine |-> "auth_machine", transition |-> "ExpireOAuthDeviceFlowReauthRequired", actor |-> "auth_machine_authority", step |-> (model_step_count + 1), from_phase |-> auth_machine_phase, to_phase |-> "ReauthRequired"]}
-       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
+       /\ obligation_auth_machine_auth_lease_lifecycle_publication' = obligation_auth_machine_auth_lease_lifecycle_publication \cup {[effect_id |-> (model_step_count + 1), new_state |-> "ReauthRequired", expires_at |-> auth_machine_expires_at, credential_generation |-> auth_machine_credential_generation, credential_published_at_millis |-> auth_machine_credential_published_at_millis]}
        /\ UNCHANGED << obligation_auth_machine_auth_release_oauth_flow_drain >>
        /\ model_step_count' = model_step_count + 1
 
@@ -4460,6 +4460,19 @@ WitnessSatisfiedStutter_auth_lease_lifecycle_publication_round_trip ==
 WitnessSatisfiedStutter_auth_release_oauth_flow_drain_round_trip ==
     /\ FALSE
 
+\* Liveness: eventual feedback: release_lease discharges the drain by firing a terminal Expire* feedback per drained flow id before committing `Release`; the Release guard `oauth_release_drained` is the machine-side completion witness
+OwnerFeedback_auth_machine_auth_release_oauth_flow_drain_ExpireOAuthBrowserFlow ==
+    /\ obligation_auth_machine_auth_release_oauth_flow_drain /= {}
+    /\ \E token \in obligation_auth_machine_auth_release_oauth_flow_drain :
+        /\ \E owner_ctx_browser_flow_id \in StringValues : (/\ pending_inputs' = Append(pending_inputs, [machine |-> "auth_machine", variant |-> "ExpireOAuthBrowserFlow", source_kind |-> "owner", source_machine |-> "auth_machine", source_effect |-> "CancelOAuthFlowsForRelease", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [flow_id |-> owner_ctx_browser_flow_id]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "auth_machine", variant |-> "ExpireOAuthBrowserFlow", source_kind |-> "owner", source_machine |-> "auth_machine", source_effect |-> "CancelOAuthFlowsForRelease", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [flow_id |-> owner_ctx_browser_flow_id]]} /\ obligation_auth_machine_auth_release_oauth_flow_drain' = obligation_auth_machine_auth_release_oauth_flow_drain \ {token} /\ model_step_count' = model_step_count + 1)
+    /\ UNCHANGED << auth_machine_phase, auth_machine_expires_at, auth_machine_last_refresh, auth_machine_refresh_attempt, auth_machine_credential_present, auth_machine_credential_generation, auth_machine_credential_published_at_millis, auth_machine_oauth_browser_flow_ids, auth_machine_oauth_browser_flow_providers, auth_machine_oauth_browser_flow_redirect_uris, auth_machine_oauth_browser_flow_expires_at_millis, auth_machine_oauth_device_flow_ids, auth_machine_oauth_device_flow_providers, auth_machine_oauth_device_flow_expires_at_millis, auth_machine_oauth_device_poll_ids, auth_machine_oauth_outstanding_flow_count, auth_machine_release_draining, obligation_auth_machine_auth_lease_lifecycle_publication, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+
+OwnerFeedback_auth_machine_auth_release_oauth_flow_drain_ExpireOAuthDeviceFlow ==
+    /\ obligation_auth_machine_auth_release_oauth_flow_drain /= {}
+    /\ \E token \in obligation_auth_machine_auth_release_oauth_flow_drain :
+        /\ \E owner_ctx_device_flow_id \in StringValues : (/\ pending_inputs' = Append(pending_inputs, [machine |-> "auth_machine", variant |-> "ExpireOAuthDeviceFlow", source_kind |-> "owner", source_machine |-> "auth_machine", source_effect |-> "CancelOAuthFlowsForRelease", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [flow_id |-> owner_ctx_device_flow_id]]) /\ observed_inputs' = observed_inputs \cup {[machine |-> "auth_machine", variant |-> "ExpireOAuthDeviceFlow", source_kind |-> "owner", source_machine |-> "auth_machine", source_effect |-> "CancelOAuthFlowsForRelease", source_route |-> "none", effect_id |-> token.effect_id, payload |-> [flow_id |-> owner_ctx_device_flow_id]]} /\ obligation_auth_machine_auth_release_oauth_flow_drain' = obligation_auth_machine_auth_release_oauth_flow_drain \ {token} /\ model_step_count' = model_step_count + 1)
+    /\ UNCHANGED << auth_machine_phase, auth_machine_expires_at, auth_machine_last_refresh, auth_machine_refresh_attempt, auth_machine_credential_present, auth_machine_credential_generation, auth_machine_credential_published_at_millis, auth_machine_oauth_browser_flow_ids, auth_machine_oauth_browser_flow_providers, auth_machine_oauth_browser_flow_redirect_uris, auth_machine_oauth_browser_flow_expires_at_millis, auth_machine_oauth_device_flow_ids, auth_machine_oauth_device_flow_providers, auth_machine_oauth_device_flow_expires_at_millis, auth_machine_oauth_device_poll_ids, auth_machine_oauth_outstanding_flow_count, auth_machine_release_draining, obligation_auth_machine_auth_lease_lifecycle_publication, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+
 CoreNext ==
     \/ \E arg_expires_at_ts \in OptionU64Values : \E arg_credential_published_at_millis \in 0..2 : auth_machine_Acquire(arg_expires_at_ts, arg_credential_published_at_millis)
     \/ auth_machine_MarkExpiring
@@ -4634,6 +4647,8 @@ CoreNext ==
     \/ \E arg_credential_present \in BOOLEAN : \E arg_force_refresh \in BOOLEAN : auth_machine_ResolveOAuthLoginCredentialDispositionRefreshDisallowedNonValidRefreshing(arg_credential_present, arg_force_refresh, FALSE)
     \/ \E arg_credential_present \in BOOLEAN : \E arg_force_refresh \in BOOLEAN : auth_machine_ResolveOAuthLoginCredentialDispositionRefreshDisallowedNonValidReauthRequired(arg_credential_present, arg_force_refresh, FALSE)
     \/ \E arg_credential_present \in BOOLEAN : \E arg_force_refresh \in BOOLEAN : auth_machine_ResolveOAuthLoginCredentialDispositionRefreshDisallowedNonValidReleased(arg_credential_present, arg_force_refresh, FALSE)
+    \/ OwnerFeedback_auth_machine_auth_release_oauth_flow_drain_ExpireOAuthBrowserFlow
+    \/ OwnerFeedback_auth_machine_auth_release_oauth_flow_drain_ExpireOAuthDeviceFlow
     \/ QuiescentStutter
 
 InjectNext ==
@@ -4657,20 +4672,16 @@ auth_release_oauth_flow_drain_protocol_covered == TRUE
 auth_lease_lifecycle_publication_protocol_covered == TRUE
 
 NoOpenObligationsOnTerminal_auth_machine_auth_release_oauth_flow_drain == (auth_machine_phase = "Released") => obligation_auth_machine_auth_release_oauth_flow_drain = {}
-NoFeedbackWithoutObligation_auth_machine_auth_release_oauth_flow_drain == \A input_packet \in observed_inputs : ((((input_packet.machine = "auth_machine" /\ input_packet.variant = "ExpireOAuthBrowserFlow")) => (obligation_auth_machine_auth_release_oauth_flow_drain /= {})) /\ (((input_packet.machine = "auth_machine" /\ input_packet.variant = "ExpireOAuthDeviceFlow")) => (obligation_auth_machine_auth_release_oauth_flow_drain /= {})))
 NoOpenObligationsOnTerminal_auth_machine_auth_lease_lifecycle_publication == (auth_machine_phase = "Released") => obligation_auth_machine_auth_lease_lifecycle_publication = {}
-
-\* Liveness: eventual feedback: release_lease discharges the drain by firing a terminal Expire* feedback per drained flow id before committing `Release`; the Release guard `oauth_release_drained` is the machine-side completion witness
-OwnerFeedback_auth_machine_auth_release_oauth_flow_drain ==
-    /\ obligation_auth_machine_auth_release_oauth_flow_drain /= {}
-    /\ \E token \in obligation_auth_machine_auth_release_oauth_flow_drain :
-        /\ (\E owner_ctx_browser_flow_id \in StringValues : (/\ pending_inputs' = Append(pending_inputs, [machine |-> "auth_machine", variant |-> "ExpireOAuthBrowserFlow", source_kind |-> "owner", source_machine |-> "auth_machine", source_effect |-> "CancelOAuthFlowsForRelease", source_route |-> "none", effect_id |-> token, payload |-> [flow_id |-> owner_ctx_browser_flow_id]]) /\ obligation_auth_machine_auth_release_oauth_flow_drain' = obligation_auth_machine_auth_release_oauth_flow_drain \ {token}) \/ \E owner_ctx_device_flow_id \in StringValues : (/\ pending_inputs' = Append(pending_inputs, [machine |-> "auth_machine", variant |-> "ExpireOAuthDeviceFlow", source_kind |-> "owner", source_machine |-> "auth_machine", source_effect |-> "CancelOAuthFlowsForRelease", source_route |-> "none", effect_id |-> token, payload |-> [flow_id |-> owner_ctx_device_flow_id]]) /\ obligation_auth_machine_auth_release_oauth_flow_drain' = obligation_auth_machine_auth_release_oauth_flow_drain \ {token}))
-    /\ UNCHANGED << auth_machine_phase, auth_machine_expires_at, auth_machine_last_refresh, auth_machine_refresh_attempt, auth_machine_credential_present, auth_machine_credential_generation, auth_machine_credential_published_at_millis, auth_machine_oauth_browser_flow_ids, auth_machine_oauth_browser_flow_providers, auth_machine_oauth_browser_flow_redirect_uris, auth_machine_oauth_browser_flow_expires_at_millis, auth_machine_oauth_device_flow_ids, auth_machine_oauth_device_flow_providers, auth_machine_oauth_device_flow_expires_at_millis, auth_machine_oauth_device_poll_ids, auth_machine_oauth_outstanding_flow_count, auth_machine_release_draining, obligation_auth_machine_auth_lease_lifecycle_publication, model_step_count, observed_inputs, pending_routes, delivered_routes, emitted_effects, observed_transitions, witness_current_script_input, witness_remaining_script_inputs >>
+OwnerFeedbackHasProtocolProvenance ==
+    \A input_packet \in observed_inputs :
+        input_packet.source_kind /= "owner"
+        \/ ((/\ input_packet.machine = "auth_machine" /\ input_packet.variant = "ExpireOAuthBrowserFlow" /\ input_packet.source_machine = "auth_machine" /\ input_packet.source_effect = "CancelOAuthFlowsForRelease" /\ \E effect_packet \in emitted_effects : /\ effect_packet.machine = "auth_machine" /\ effect_packet.variant = "CancelOAuthFlowsForRelease" /\ effect_packet.effect_id = input_packet.effect_id) \/ (/\ input_packet.machine = "auth_machine" /\ input_packet.variant = "ExpireOAuthDeviceFlow" /\ input_packet.source_machine = "auth_machine" /\ input_packet.source_effect = "CancelOAuthFlowsForRelease" /\ \E effect_packet \in emitted_effects : /\ effect_packet.machine = "auth_machine" /\ effect_packet.variant = "CancelOAuthFlowsForRelease" /\ effect_packet.effect_id = input_packet.effect_id))
 
 CoverageInstrumentation == TRUE
 
 CiStateConstraint == /\ model_step_count <= 8 /\ Len(pending_inputs) <= 8 /\ Cardinality(observed_inputs) <= 10 /\ Len(pending_routes) <= 8 /\ Cardinality(delivered_routes) <= 0 /\ Cardinality(emitted_effects) <= 0 /\ Cardinality(observed_transitions) <= 8 /\ Cardinality(auth_machine_oauth_browser_flow_ids) <= 0 /\ Cardinality(DOMAIN auth_machine_oauth_browser_flow_providers) <= 0 /\ Cardinality(DOMAIN auth_machine_oauth_browser_flow_redirect_uris) <= 0 /\ Cardinality(DOMAIN auth_machine_oauth_browser_flow_expires_at_millis) <= 0 /\ Cardinality(auth_machine_oauth_device_flow_ids) <= 0 /\ Cardinality(DOMAIN auth_machine_oauth_device_flow_providers) <= 0 /\ Cardinality(DOMAIN auth_machine_oauth_device_flow_expires_at_millis) <= 0 /\ Cardinality(auth_machine_oauth_device_poll_ids) <= 0
-DeepStateConstraint == /\ model_step_count <= 6 /\ Len(pending_inputs) <= 2 /\ Cardinality(observed_inputs) <= 6 /\ Len(pending_routes) <= 2 /\ Cardinality(delivered_routes) <= 2 /\ Cardinality(emitted_effects) <= 2 /\ Cardinality(observed_transitions) <= 6 /\ Cardinality(auth_machine_oauth_browser_flow_ids) <= 2 /\ Cardinality(DOMAIN auth_machine_oauth_browser_flow_providers) <= 2 /\ Cardinality(DOMAIN auth_machine_oauth_browser_flow_redirect_uris) <= 2 /\ Cardinality(DOMAIN auth_machine_oauth_browser_flow_expires_at_millis) <= 2 /\ Cardinality(auth_machine_oauth_device_flow_ids) <= 2 /\ Cardinality(DOMAIN auth_machine_oauth_device_flow_providers) <= 2 /\ Cardinality(DOMAIN auth_machine_oauth_device_flow_expires_at_millis) <= 2 /\ Cardinality(auth_machine_oauth_device_poll_ids) <= 2
+DeepStateConstraint == /\ model_step_count <= 8 /\ Len(pending_inputs) <= 8 /\ Cardinality(observed_inputs) <= 12 /\ Len(pending_routes) <= 8 /\ Cardinality(delivered_routes) <= 2 /\ Cardinality(emitted_effects) <= 2 /\ Cardinality(observed_transitions) <= 8 /\ Cardinality(auth_machine_oauth_browser_flow_ids) <= 2 /\ Cardinality(DOMAIN auth_machine_oauth_browser_flow_providers) <= 2 /\ Cardinality(DOMAIN auth_machine_oauth_browser_flow_redirect_uris) <= 2 /\ Cardinality(DOMAIN auth_machine_oauth_browser_flow_expires_at_millis) <= 2 /\ Cardinality(auth_machine_oauth_device_flow_ids) <= 2 /\ Cardinality(DOMAIN auth_machine_oauth_device_flow_providers) <= 2 /\ Cardinality(DOMAIN auth_machine_oauth_device_flow_expires_at_millis) <= 2 /\ Cardinality(auth_machine_oauth_device_poll_ids) <= 2
 WitnessStateConstraint_auth_lease_lifecycle_publication_round_trip == /\ model_step_count <= 8 /\ Len(pending_inputs) <= 8 /\ Cardinality(observed_inputs) <= 10 /\ Len(pending_routes) <= 8 /\ Cardinality(delivered_routes) <= 0 /\ Cardinality(emitted_effects) <= 0 /\ Cardinality(observed_transitions) <= 8 /\ Cardinality(auth_machine_oauth_browser_flow_ids) <= 0 /\ Cardinality(DOMAIN auth_machine_oauth_browser_flow_providers) <= 0 /\ Cardinality(DOMAIN auth_machine_oauth_browser_flow_redirect_uris) <= 0 /\ Cardinality(DOMAIN auth_machine_oauth_browser_flow_expires_at_millis) <= 0 /\ Cardinality(auth_machine_oauth_device_flow_ids) <= 0 /\ Cardinality(DOMAIN auth_machine_oauth_device_flow_providers) <= 0 /\ Cardinality(DOMAIN auth_machine_oauth_device_flow_expires_at_millis) <= 0 /\ Cardinality(auth_machine_oauth_device_poll_ids) <= 0
 WitnessStateConstraint_auth_release_oauth_flow_drain_round_trip == /\ model_step_count <= 8 /\ Len(pending_inputs) <= 8 /\ Cardinality(observed_inputs) <= 10 /\ Len(pending_routes) <= 8 /\ Cardinality(delivered_routes) <= 0 /\ Cardinality(emitted_effects) <= 0 /\ Cardinality(observed_transitions) <= 8 /\ Cardinality(auth_machine_oauth_browser_flow_ids) <= 0 /\ Cardinality(DOMAIN auth_machine_oauth_browser_flow_providers) <= 0 /\ Cardinality(DOMAIN auth_machine_oauth_browser_flow_redirect_uris) <= 0 /\ Cardinality(DOMAIN auth_machine_oauth_browser_flow_expires_at_millis) <= 0 /\ Cardinality(auth_machine_oauth_device_flow_ids) <= 0 /\ Cardinality(DOMAIN auth_machine_oauth_device_flow_providers) <= 0 /\ Cardinality(DOMAIN auth_machine_oauth_device_flow_expires_at_millis) <= 0 /\ Cardinality(auth_machine_oauth_device_poll_ids) <= 0
 
@@ -5087,7 +5098,7 @@ THEOREM Spec => []auth_machine_oauth_flow_membership_consistent
 THEOREM Spec => []auth_machine_released_oauth_membership_drained
 THEOREM Spec => []auth_machine_released_not_release_draining
 THEOREM Spec => []NoOpenObligationsOnTerminal_auth_machine_auth_release_oauth_flow_drain
-THEOREM Spec => []NoFeedbackWithoutObligation_auth_machine_auth_release_oauth_flow_drain
 THEOREM Spec => []NoOpenObligationsOnTerminal_auth_machine_auth_lease_lifecycle_publication
+THEOREM Spec => []OwnerFeedbackHasProtocolProvenance
 
 =============================================================================

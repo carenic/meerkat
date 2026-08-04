@@ -3651,8 +3651,12 @@ impl MobSessionService for MockSessionService {
 struct FaultInjectedMobEventStore {
     events: RwLock<Vec<MobEvent>>,
     event_tx: tokio::sync::broadcast::Sender<MobEvent>,
+    external_deliveries: InMemoryMobEventStore,
     fail_on_kind: RwLock<HashSet<&'static str>>,
     fail_after_append_on_kind: RwLock<HashSet<&'static str>>,
+    fail_next_external_delivery_claim: AtomicBool,
+    fail_external_delivery_load_after_claim: AtomicBool,
+    fail_next_external_delivery_load: AtomicBool,
     fail_clear: AtomicBool,
     poll_calls: AtomicU64,
     replay_calls: AtomicU64,
@@ -3745,8 +3749,12 @@ impl FaultInjectedMobEventStore {
         Self {
             events: RwLock::new(Vec::new()),
             event_tx,
+            external_deliveries: InMemoryMobEventStore::new(),
             fail_on_kind: RwLock::new(HashSet::new()),
             fail_after_append_on_kind: RwLock::new(HashSet::new()),
+            fail_next_external_delivery_claim: AtomicBool::new(false),
+            fail_external_delivery_load_after_claim: AtomicBool::new(false),
+            fail_next_external_delivery_load: AtomicBool::new(false),
             fail_clear: AtomicBool::new(false),
             poll_calls: AtomicU64::new(0),
             replay_calls: AtomicU64::new(0),
@@ -3771,6 +3779,17 @@ impl FaultInjectedMobEventStore {
 
     async fn allow_appends_for(&self, kind: &'static str) {
         self.fail_on_kind.write().await.remove(kind);
+    }
+
+    fn fail_next_external_delivery_claim(&self) {
+        self.fail_next_external_delivery_claim
+            .store(true, Ordering::SeqCst);
+    }
+
+    fn fail_next_external_delivery_claim_and_reread(&self) {
+        self.fail_next_external_delivery_claim();
+        self.fail_external_delivery_load_after_claim
+            .store(true, Ordering::SeqCst);
     }
 
     fn replay_calls(&self) -> u64 {
@@ -3870,6 +3889,104 @@ impl private::MobEventStoreSealed for FaultInjectedMobEventStore {}
 
 #[async_trait]
 impl MobEventStore for FaultInjectedMobEventStore {
+    async fn begin_external_delivery(
+        &self,
+        intent: &crate::store::MobExternalDeliveryIntent,
+    ) -> Result<crate::store::MobExternalDeliveryBeginOutcome, MobStoreError> {
+        self.external_deliveries
+            .begin_external_delivery(intent)
+            .await
+    }
+
+    async fn complete_external_delivery(
+        &self,
+        intent: &crate::store::MobExternalDeliveryIntent,
+        terminal: &crate::store::MobExternalDeliveryTerminal,
+    ) -> Result<crate::store::MobExternalDeliveryCompleteOutcome, MobStoreError> {
+        self.external_deliveries
+            .complete_external_delivery(intent, terminal)
+            .await
+    }
+
+    async fn claim_external_delivery_realization(
+        &self,
+        commit: &crate::store::MobExternalDeliveryRealizationCommit,
+    ) -> Result<crate::store::MobExternalDeliveryClaimOutcome, MobStoreError> {
+        if self
+            .fail_next_external_delivery_claim
+            .swap(false, Ordering::SeqCst)
+        {
+            if self
+                .fail_external_delivery_load_after_claim
+                .swap(false, Ordering::SeqCst)
+            {
+                self.fail_next_external_delivery_load
+                    .store(true, Ordering::SeqCst);
+            }
+            return Err(MobStoreError::Internal(
+                "fault-injected external-delivery realization claim failure".to_string(),
+            ));
+        }
+        self.external_deliveries
+            .claim_external_delivery_realization(commit)
+            .await
+    }
+
+    async fn complete_external_delivery_realization(
+        &self,
+        commit: &crate::store::MobExternalDeliveryRealizerCompletionCommit,
+    ) -> Result<crate::store::MobExternalDeliveryCompleteOutcome, MobStoreError> {
+        self.external_deliveries
+            .complete_external_delivery_realization(commit)
+            .await
+    }
+
+    async fn abandon_external_delivery(
+        &self,
+        intent: &crate::store::MobExternalDeliveryIntent,
+        terminal: &crate::store::MobExternalDeliveryTerminal,
+    ) -> Result<crate::store::MobExternalDeliveryAbandonOutcome, MobStoreError> {
+        self.external_deliveries
+            .abandon_external_delivery(intent, terminal)
+            .await
+    }
+
+    async fn resolve_external_delivery_after_realizer_fenced(
+        &self,
+        commit: &crate::store::MobExternalDeliveryFencedResolutionCommit,
+    ) -> Result<crate::store::MobExternalDeliveryAbandonOutcome, MobStoreError> {
+        self.external_deliveries
+            .resolve_external_delivery_after_realizer_fenced(commit)
+            .await
+    }
+
+    async fn schedule_external_delivery_repair(
+        &self,
+        intent: &crate::store::MobExternalDeliveryIntent,
+    ) -> Result<crate::store::MobExternalDeliveryRepairOutcome, MobStoreError> {
+        self.external_deliveries
+            .schedule_external_delivery_repair(intent)
+            .await
+    }
+
+    async fn load_external_delivery(
+        &self,
+        mob_id: &MobId,
+        idempotency_key: &str,
+    ) -> Result<Option<crate::store::MobExternalDeliveryRecord>, MobStoreError> {
+        if self
+            .fail_next_external_delivery_load
+            .swap(false, Ordering::SeqCst)
+        {
+            return Err(MobStoreError::Internal(
+                "fault-injected external-delivery exact reread failure".to_string(),
+            ));
+        }
+        self.external_deliveries
+            .load_external_delivery(mob_id, idempotency_key)
+            .await
+    }
+
     async fn append(&self, event: NewMobEvent) -> Result<MobEvent, MobStoreError> {
         let kind_label = Self::kind_label(&event.kind);
         if self.fail_on_kind.read().await.contains(kind_label) {
@@ -3990,6 +4107,7 @@ impl MobEventStore for FaultInjectedMobEventStore {
             ));
         }
         self.events.write().await.clear();
+        self.external_deliveries.clear().await?;
         Ok(())
     }
 }
@@ -35645,6 +35763,259 @@ async fn test_run_flow_persists_before_reply_and_is_queryable() {
     assert!(
         terminal.failure_ledger.is_empty(),
         "successful flow should not persist failure ledger entries"
+    );
+}
+
+#[tokio::test]
+async fn external_delivery_claim_failure_compensates_pending_run_and_delivery() {
+    let definition = with_unique_mob_id(
+        sample_definition_with_single_step_flow(2_000, 8),
+        "external-delivery-claim-compensation",
+    );
+    let mob_id = definition.id.clone();
+    let events = Arc::new(FaultInjectedMobEventStore::new());
+    let (handle, _service, runs, _specs, _runtime_metadata, _identity, _identity_status) =
+        create_test_mob_with_recoverable_fault_events(definition, events.clone()).await;
+    let identity = crate::store::MobExternalDeliveryIdentity::new(
+        "binding-claim-compensation",
+        Uuid::new_v4().to_string(),
+    )
+    .expect("external delivery identity");
+    let intent = crate::store::MobExternalDeliveryIntent::new(
+        mob_id.clone(),
+        identity.clone(),
+        crate::store::MobExternalDeliveryTargetKind::Flow,
+        b"flow:demo",
+    )
+    .expect("external delivery intent");
+    handle
+        .begin_external_delivery(&intent)
+        .await
+        .expect("begin external delivery");
+    events.fail_next_external_delivery_claim();
+
+    let outcome = handle
+        .run_flow_with_external_delivery(
+            FlowId::from("demo"),
+            serde_json::json!({ "case": "claim-compensation" }),
+            &intent,
+        )
+        .await
+        .expect("claim failure must converge to an observable terminal delivery");
+    assert!(
+        matches!(
+            &outcome,
+            crate::store::MobExternalFlowLaunchOutcome::ExistingTerminal(
+                crate::store::MobExternalDeliveryTerminal::Failed { .. }
+            )
+        ),
+        "claim compensation returned {outcome:?}"
+    );
+
+    let run_id =
+        RunId::for_external_delivery(&mob_id, &FlowId::from("demo"), &identity.idempotency_key);
+    let run = runs
+        .get_run(&run_id)
+        .await
+        .expect("read compensated run")
+        .expect("compensated run must remain durable");
+    assert_eq!(run.status, MobRunStatus::Failed);
+    let record = handle
+        .load_external_delivery(&identity.idempotency_key)
+        .await
+        .expect("read compensated delivery")
+        .expect("delivery must remain durable");
+    assert!(matches!(
+        record.phase,
+        crate::store::MobExternalDeliveryPhase::Terminal {
+            terminal: crate::store::MobExternalDeliveryTerminal::Failed { .. }
+        }
+    ));
+    assert_eq!(
+        handle
+            .debug_flow_tracker_counts()
+            .await
+            .expect("flow tracker counts"),
+        (0, 0),
+        "compensation must not leave an executable Flow tracker"
+    );
+    let replay = events
+        .replay_all()
+        .await
+        .expect("replay compensation events");
+    assert_eq!(
+        replay
+            .iter()
+            .filter(|event| matches!(&event.kind, MobEventKind::FlowFailed { run_id: id, .. } if id == &run_id))
+            .count(),
+        1,
+        "compensation must emit exactly one durable Flow failure"
+    );
+    assert!(
+        !replay.iter().any(|event| matches!(&event.kind, MobEventKind::StepDispatched { run_id: id, .. } if id == &run_id)),
+        "the compensated Flow must never dispatch a step"
+    );
+    handle
+        .status()
+        .await
+        .expect("proven Begun compensation must not fail-stop the actor");
+}
+
+#[tokio::test]
+async fn external_delivery_claim_and_reread_failure_fail_stops_with_pending_run() {
+    let definition = with_unique_mob_id(
+        sample_definition_with_single_step_flow(2_000, 8),
+        "external-delivery-claim-quarantine",
+    );
+    let mob_id = definition.id.clone();
+    let events = Arc::new(FaultInjectedMobEventStore::new());
+    let (handle, _service, runs, _specs, _runtime_metadata, _identity, _identity_status) =
+        create_test_mob_with_recoverable_fault_events(definition, events.clone()).await;
+    let identity = crate::store::MobExternalDeliveryIdentity::new(
+        "binding-claim-quarantine",
+        Uuid::new_v4().to_string(),
+    )
+    .expect("external delivery identity");
+    let intent = crate::store::MobExternalDeliveryIntent::new(
+        mob_id.clone(),
+        identity.clone(),
+        crate::store::MobExternalDeliveryTargetKind::Flow,
+        b"flow:demo",
+    )
+    .expect("external delivery intent");
+    handle
+        .begin_external_delivery(&intent)
+        .await
+        .expect("begin external delivery");
+    events.fail_next_external_delivery_claim_and_reread();
+
+    let outcome = handle
+        .run_flow_with_external_delivery(
+            FlowId::from("demo"),
+            serde_json::json!({ "case": "claim-quarantine" }),
+            &intent,
+        )
+        .await
+        .expect("ambiguous claim must return a typed uncertain launch");
+    assert!(matches!(
+        outcome,
+        crate::store::MobExternalFlowLaunchOutcome::Uncertain { .. }
+    ));
+
+    let run_id =
+        RunId::for_external_delivery(&mob_id, &FlowId::from("demo"), &identity.idempotency_key);
+    let run = runs
+        .get_run(&run_id)
+        .await
+        .expect("read quarantined run")
+        .expect("quarantined pending run must remain durable");
+    assert_eq!(run.status, MobRunStatus::Pending);
+    let record = handle
+        .load_external_delivery(&identity.idempotency_key)
+        .await
+        .expect("reread delivery after one-shot fault")
+        .expect("begun delivery must remain durable");
+    assert!(matches!(
+        record.phase,
+        crate::store::MobExternalDeliveryPhase::Begun { .. }
+    ));
+
+    let actor_stopped = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if handle.status().await.is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        actor_stopped.is_ok(),
+        "unreadable claim outcome must crash-quiesce the actor for cold recovery"
+    );
+}
+
+#[tokio::test]
+async fn external_delivery_post_start_compensation_failure_fail_stops() {
+    let definition = with_unique_mob_id(
+        sample_definition_with_single_step_flow(2_000, 8),
+        "external-delivery-post-start-failure",
+    );
+    let mob_id = definition.id.clone();
+    let events = Arc::new(FaultInjectedMobEventStore::new());
+    let (handle, _service, runs, _specs, _runtime_metadata, _identity, _identity_status) =
+        create_test_mob_with_recoverable_fault_events(definition, events.clone()).await;
+    let identity = crate::store::MobExternalDeliveryIdentity::new(
+        "binding-post-start-failure",
+        Uuid::new_v4().to_string(),
+    )
+    .expect("external delivery identity");
+    let intent = crate::store::MobExternalDeliveryIntent::new(
+        mob_id.clone(),
+        identity.clone(),
+        crate::store::MobExternalDeliveryTargetKind::Flow,
+        b"flow:demo",
+    )
+    .expect("external delivery intent");
+    handle
+        .begin_external_delivery(&intent)
+        .await
+        .expect("begin external delivery");
+    events.fail_appends_for("FlowFailed").await;
+    events.fail_next_external_delivery_claim();
+
+    let outcome = handle
+        .run_flow_with_external_delivery(
+            FlowId::from("demo"),
+            serde_json::json!({ "case": "post-start-failure" }),
+            &intent,
+        )
+        .await
+        .expect("failed compensation must return an uncertain launch");
+    assert!(matches!(
+        outcome,
+        crate::store::MobExternalFlowLaunchOutcome::Uncertain { .. }
+    ));
+
+    let run_id =
+        RunId::for_external_delivery(&mob_id, &FlowId::from("demo"), &identity.idempotency_key);
+    let run = runs
+        .get_run(&run_id)
+        .await
+        .expect("read post-start run")
+        .expect("post-start run must remain durable");
+    assert_eq!(run.status, MobRunStatus::Failed);
+    let replay = events.replay_all().await.expect("replay post-start events");
+    assert!(
+        !replay.iter().any(|event| matches!(&event.kind, MobEventKind::StepDispatched { run_id: id, .. } if id == &run_id)),
+        "post-start compensation failure must never dispatch a step"
+    );
+    assert!(
+        !replay.iter().any(|event| matches!(&event.kind, MobEventKind::FlowFailed { run_id: id, .. } if id == &run_id)),
+        "the injected projection failure must remain observable rather than being fabricated"
+    );
+    let record = handle
+        .load_external_delivery(&identity.idempotency_key)
+        .await
+        .expect("read delivery after failed compensation")
+        .expect("delivery must remain durable");
+    assert!(matches!(
+        record.phase,
+        crate::store::MobExternalDeliveryPhase::Begun { .. }
+    ));
+
+    let actor_stopped = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if handle.status().await.is_err() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        actor_stopped.is_ok(),
+        "post-StartRun compensation failure must crash-quiesce the actor"
     );
 }
 

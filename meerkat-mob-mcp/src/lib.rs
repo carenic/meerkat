@@ -11,20 +11,31 @@ mod public_mcp;
 #[cfg(not(target_arch = "wasm32"))]
 mod schedule_host;
 mod surface;
+mod workgraph_flow;
 pub use agent_tools::{
     AgentMobToolSurface, AgentMobToolSurfaceFactory, archive_session_with_mob_cleanup,
 };
 pub use public_definition::decode_public_mob_definition;
 pub use public_mcp::{
-    handle_public_tools_call, public_tool_names, public_tools_list, wrap_public_tool_payload,
+    handle_public_tools_call, public_tool_names, public_tools_list,
+    public_tools_list_without_workgraph, wrap_public_tool_payload,
 };
 #[cfg(not(target_arch = "wasm32"))]
 pub use schedule_host::MobMcpScheduleHost;
 pub use surface::wire_mob_tools;
+pub use workgraph_flow::{
+    AbandonUncertainWorkGraphFlowRequest, LaunchWorkGraphFlowRequest, WorkGraphFlowAbandonResult,
+    WorkGraphFlowBridgeError, WorkGraphFlowLaunchResult, WorkGraphFlowReconcileResult,
+};
 
 #[cfg(target_arch = "wasm32")]
 mod tokio {
     pub use tokio_with_wasm::alias::*;
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+mod tokio {
+    pub use ::tokio::*;
 }
 
 use async_trait::async_trait;
@@ -306,6 +317,9 @@ pub struct MobMcpState {
     mob_set_epoch: tokio::sync::watch::Sender<u64>,
     /// Per-session locks for single-flight implicit mob creation.
     implicit_mob_locks: Mutex<HashMap<String, Arc<Mutex<()>>>>,
+    workgraph_flow_custodies: Mutex<HashMap<String, std::sync::Weak<Mutex<()>>>>,
+    workgraph_flow_reconcile_epoch: tokio::sync::watch::Sender<u64>,
+    workgraph_flow_reconciler_started: std::sync::atomic::AtomicBool,
     restore_lock: Mutex<bool>,
     /// Shared realm-scoped profile store for cross-mob profile CRUD, together
     /// with its provenance (single source of truth for the persistent-root
@@ -370,6 +384,9 @@ impl MobMcpState {
             mobs: RwLock::new(BTreeMap::new()),
             mob_set_epoch: tokio::sync::watch::Sender::new(0),
             implicit_mob_locks: Mutex::new(HashMap::new()),
+            workgraph_flow_custodies: Mutex::new(HashMap::new()),
+            workgraph_flow_reconcile_epoch: tokio::sync::watch::Sender::new(0),
+            workgraph_flow_reconciler_started: std::sync::atomic::AtomicBool::new(false),
             restore_lock: Mutex::new(false),
             realm_profile_store_selection: RealmProfileStoreSelection::DefaultInMemory(Arc::new(
                 meerkat_mob::InMemoryRealmProfileStore::new(),
@@ -1088,6 +1105,36 @@ impl MobMcpState {
         &self,
         mob_id: &MobId,
     ) -> Result<meerkat_mob::MobDestroyReport, MobMcpDestroyError> {
+        if let Some(workgraph) = self.workgraph_service.as_ref() {
+            let active = workgraph
+                .execution_bindings_for_recovery(None)
+                .await
+                .map_err(|error| MobMcpDestroyError::Mob(MobError::Internal(error.to_string())))?
+                .into_iter()
+                .filter(|binding| {
+                    matches!(
+                        &binding.target,
+                        meerkat::WorkExecutionTarget::MobFlow {
+                            mob_id: bound_mob_id,
+                            ..
+                        } if bound_mob_id == mob_id.as_str()
+                    )
+                })
+                .filter_map(|binding| {
+                    match meerkat::WorkExecutionMachine::retry_eligible(&binding) {
+                        Ok(false) => Some(binding.binding_id.to_string()),
+                        Ok(true) => None,
+                        Err(_) => Some(binding.binding_id.to_string()),
+                    }
+                })
+                .collect::<Vec<_>>();
+            if !active.is_empty() {
+                return Err(MobMcpDestroyError::Mob(MobError::Internal(format!(
+                    "mob {mob_id} has active WorkGraph Flow bindings and cannot be destroyed: {}",
+                    active.join(", ")
+                ))));
+            }
+        }
         let managed = {
             let mobs = self.mobs.read().await;
             mobs.get(mob_id)
@@ -1875,6 +1922,34 @@ impl MobMcpState {
         run_id: RunId,
     ) -> Result<Option<meerkat_mob::MobRun>, MobError> {
         self.handle_for(mob_id).await?.flow_status(run_id).await
+    }
+
+    /// Resolve the redacted WorkGraph linkage for one exact Flow run.
+    pub async fn workgraph_execution_binding_for_flow_run(
+        &self,
+        mob_id: &MobId,
+        run_id: &RunId,
+    ) -> Result<Option<meerkat::WorkExecutionBinding>, MobError> {
+        let Some(workgraph) = self.workgraph_service.as_ref() else {
+            return Ok(None);
+        };
+        let binding = workgraph
+            .execution_binding_for_target_run(&run_id.to_string())
+            .await
+            .map_err(|error| MobError::Internal(error.to_string()))?;
+        if let Some(binding) = binding.as_ref() {
+            let meerkat::WorkExecutionTarget::MobFlow {
+                mob_id: bound_mob_id,
+                ..
+            } = &binding.target;
+            if bound_mob_id != mob_id.as_str() {
+                return Err(MobError::Internal(format!(
+                    "WorkGraph execution run '{}' belongs to mob '{}' rather than requested mob '{}'",
+                    run_id, bound_mob_id, mob_id
+                )));
+            }
+        }
+        Ok(binding)
     }
 
     pub async fn mob_list_runs(
@@ -3953,6 +4028,7 @@ pub struct MobMcpDispatcher {
 
 impl MobMcpDispatcher {
     pub fn new(state: Arc<MobMcpState>) -> Self {
+        state.start_workgraph_flow_reconciler();
         const PRIMER: &str = "A mob is a managed multi-agent team with shared lifecycle/events: \
             create -> spawn members -> wire/unwire trust -> stop/resume -> complete/destroy.";
         const COMMON: &str = "Use real mob tools (no simulation). Keep and reuse the returned \
@@ -4711,18 +4787,31 @@ impl AgentToolDispatcher for MobMcpDispatcher {
                 let args: FlowStatusArgs = call
                     .parse_args()
                     .map_err(|e| ToolError::invalid_arguments(call.name, e.to_string()))?;
+                let mob_id = MobId::from(args.mob_id);
                 let run_id = args.run_id.parse::<RunId>().map_err(|e| {
                     ToolError::invalid_arguments(call.name, format!("invalid run_id: {e}"))
                 })?;
                 let run = self
                     .state
-                    .mob_flow_status(&MobId::from(args.mob_id), run_id)
+                    .mob_flow_status(&mob_id, run_id.clone())
                     .await
                     .map_err(|e| map_mob_err(call, e))?;
                 let run = meerkat_mob::MobRun::public_flow_status_run_value(run.as_ref())
                     .map_err(|e| map_mob_err(call, e))?;
-                let result = serde_json::to_value(meerkat_contracts::MobFlowStatusResult { run })
-                    .map_err(|e| {
+                let execution_binding = self
+                    .state
+                    .workgraph_execution_binding_for_flow_run(&mob_id, &run_id)
+                    .await
+                    .map_err(|e| map_mob_err(call, e))?
+                    .as_ref()
+                    .map(workgraph_execution_binding_view)
+                    .transpose()
+                    .map_err(|e| map_mob_err(call, e))?;
+                let result = serde_json::to_value(meerkat_contracts::MobFlowStatusResult {
+                    run,
+                    execution_binding,
+                })
+                .map_err(|e| {
                     ToolError::invalid_arguments(
                         call.name,
                         format!("failed to encode flow status: {e}"),
@@ -5009,6 +5098,61 @@ impl AgentToolDispatcher for MobMcpDispatcher {
     }
 }
 
+pub fn workgraph_execution_binding_view(
+    binding: &meerkat::WorkExecutionBinding,
+) -> Result<meerkat_contracts::WireWorkGraphFlowExecutionBinding, MobError> {
+    let meerkat::WorkExecutionTarget::MobFlow {
+        mob_id,
+        flow_id,
+        flow_config_digest,
+        run_id,
+        ..
+    } = &binding.target;
+    use meerkat_contracts::WireWorkExecutionLifecyclePhase as Phase;
+    let lifecycle_phase = match binding.machine_state.lifecycle_phase {
+        meerkat::WorkExecutionLifecycleState::Absent => Phase::Absent,
+        meerkat::WorkExecutionLifecycleState::LaunchRequested => Phase::LaunchRequested,
+        meerkat::WorkExecutionLifecycleState::LaunchUncertain => Phase::LaunchUncertain,
+        meerkat::WorkExecutionLifecycleState::LaunchQuarantined => Phase::LaunchQuarantined,
+        meerkat::WorkExecutionLifecycleState::Running => Phase::Running,
+        meerkat::WorkExecutionLifecycleState::EvidenceProjectionRequested => {
+            Phase::EvidenceProjectionRequested
+        }
+        meerkat::WorkExecutionLifecycleState::FailureEvidenceProjectionRequested => {
+            Phase::FailureEvidenceProjectionRequested
+        }
+        meerkat::WorkExecutionLifecycleState::CancellationEvidenceProjectionRequested => {
+            Phase::CancellationEvidenceProjectionRequested
+        }
+        meerkat::WorkExecutionLifecycleState::LaunchFailureEvidenceProjectionRequested => {
+            Phase::LaunchFailureEvidenceProjectionRequested
+        }
+        meerkat::WorkExecutionLifecycleState::WorkClosureRequested => Phase::WorkClosureRequested,
+        meerkat::WorkExecutionLifecycleState::FlowFailed => Phase::FlowFailed,
+        meerkat::WorkExecutionLifecycleState::FlowCanceled => Phase::FlowCanceled,
+        meerkat::WorkExecutionLifecycleState::EvidenceProjected => Phase::EvidenceProjected,
+        meerkat::WorkExecutionLifecycleState::WorkClosed => Phase::WorkClosed,
+        meerkat::WorkExecutionLifecycleState::LaunchFailed => Phase::LaunchFailed,
+    };
+    Ok(meerkat_contracts::WireWorkGraphFlowExecutionBinding {
+        binding_id: binding.binding_id.to_string(),
+        work_ref: meerkat_contracts::WireWorkGraphFlowWorkRef {
+            realm_id: binding.work_ref.realm_id.clone(),
+            namespace: binding.work_ref.namespace.to_string(),
+            item_id: binding.work_ref.item_id.to_string(),
+        },
+        mob_id: mob_id.to_string(),
+        flow_id: flow_id.to_string(),
+        flow_config_digest: flow_config_digest.clone(),
+        run_id: run_id.to_string(),
+        lifecycle_phase,
+        binding_revision: binding.machine_state.revision,
+        supersedes: binding.supersedes.as_ref().map(ToString::to_string),
+        evidence_id: binding.evidence_id(),
+        created_at: binding.created_at.to_rfc3339(),
+    })
+}
+
 #[derive(Debug, Clone)]
 pub struct McpToolError {
     pub code: i32,
@@ -5089,6 +5233,89 @@ impl McpToolError {
                 code: -32602,
                 message: err.to_string(),
                 data: err.structured_data(),
+            },
+        }
+    }
+
+    pub fn from_workgraph(err: &meerkat::WorkGraphError) -> Self {
+        match meerkat::WorkGraphMachine::public_error_class(err) {
+            Ok(
+                meerkat::WorkGraphPublicErrorClass::NotFound
+                | meerkat::WorkGraphPublicErrorClass::Conflict
+                | meerkat::WorkGraphPublicErrorClass::InvalidTransition
+                | meerkat::WorkGraphPublicErrorClass::InvalidArguments,
+            ) => Self::invalid_params(err.to_string()),
+            Ok(meerkat::WorkGraphPublicErrorClass::CapabilityUnavailable) => {
+                Self::capability_unavailable(err.to_string())
+            }
+            Ok(meerkat::WorkGraphPublicErrorClass::StoreError) | Err(_) => {
+                Self::internal(err.to_string())
+            }
+        }
+    }
+
+    pub fn from_workgraph_flow(err: &WorkGraphFlowBridgeError) -> Self {
+        match err {
+            WorkGraphFlowBridgeError::WorkGraphUnavailable => {
+                Self::capability_unavailable(err.to_string())
+            }
+            WorkGraphFlowBridgeError::WorkGraph(inner) => Self::from_workgraph(inner),
+            WorkGraphFlowBridgeError::Mob(inner) => Self::from_mob(inner),
+            WorkGraphFlowBridgeError::InvalidBinding(_) => Self::invalid_params(err.to_string()),
+            WorkGraphFlowBridgeError::AmbiguousLaunch { binding_id, run_id } => Self {
+                code: -32041,
+                message: err.to_string(),
+                data: Some(json!({
+                    "kind": "workgraph_flow_launch_ambiguous",
+                    "binding_id": binding_id,
+                    "run_id": run_id,
+                    "guidance": "reconcile, or explicitly abandon the uncertain launch with its expected binding revision",
+                })),
+            },
+            WorkGraphFlowBridgeError::LaunchFailed { binding_id, detail } => Self {
+                code: -32042,
+                message: err.to_string(),
+                data: Some(json!({
+                    "kind": "workgraph_flow_launch_failed",
+                    "binding_id": binding_id,
+                    "detail": detail,
+                    "guidance": "create a new execution binding that supersedes this terminal attempt",
+                })),
+            },
+            WorkGraphFlowBridgeError::RunMissing { binding_id, run_id } => Self {
+                code: -32043,
+                message: err.to_string(),
+                data: Some(json!({
+                    "kind": "workgraph_flow_run_missing",
+                    "binding_id": binding_id,
+                    "run_id": run_id,
+                    "guidance": "restore the owning Mob runtime or reconcile the binding through the host recovery surface",
+                })),
+            },
+            WorkGraphFlowBridgeError::ConflictingRun {
+                binding_id,
+                expected_run_id,
+                observed_run_id,
+            } => Self {
+                code: -32044,
+                message: err.to_string(),
+                data: Some(json!({
+                    "kind": "workgraph_flow_conflicting_run",
+                    "binding_id": binding_id,
+                    "expected_run_id": expected_run_id,
+                    "observed_run_id": observed_run_id,
+                    "guidance": "the binding is quarantined; inspect the owning Mob runtime before owner adjudication",
+                })),
+            },
+            WorkGraphFlowBridgeError::LaunchQuarantined { binding_id, detail } => Self {
+                code: -32045,
+                message: err.to_string(),
+                data: Some(json!({
+                    "kind": "workgraph_flow_launch_quarantined",
+                    "binding_id": binding_id,
+                    "detail": detail,
+                    "guidance": "inspect and reconcile the exact run; do not retry or supersede this attempt automatically",
+                })),
             },
         }
     }
@@ -5192,6 +5419,7 @@ pub async fn handle_tools_call(
 )]
 mod tests {
     use super::*;
+    use crate::workgraph_flow::{WorkGraphFlowBridge, WorkGraphFlowHost};
     use async_trait::async_trait;
     use meerkat_core::InteractionId;
     use meerkat_core::PlainEventSource;
@@ -7979,6 +8207,507 @@ mod tests {
             matches!(terminal_status.as_deref(), Some("canceled" | "failed")),
             "mob_cancel_flow should converge to canceled, or failed if terminal failure won the race first; got {terminal_status:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn workgraph_flow_bridge_projects_terminal_failure_before_retry_eligibility() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let workgraph =
+            meerkat::WorkGraphService::new(Arc::new(meerkat::MemoryWorkGraphStore::new()));
+        let state = Arc::new(
+            MobMcpState::new(svc, meerkat_mob::MobControlPrincipal::Owner)
+                .with_workgraph_service(Some(workgraph.clone())),
+        );
+        let dispatcher = MobMcpDispatcher::new(state.clone());
+
+        let created = call_tool(
+            &dispatcher,
+            "mob_create",
+            json!({ "definition": flow_enabled_definition() }),
+        )
+        .await;
+        let mob_id = created["mob_id"].as_str().expect("mob id").to_string();
+        call_tool(
+            &dispatcher,
+            "mob_spawn_member",
+            json!({
+                "mob_id": mob_id,
+                "specs": [{"profile": "worker", "agent_identity": "w1"}]
+            }),
+        )
+        .await;
+
+        let item = workgraph
+            .create(meerkat::CreateWorkItemRequest {
+                title: "Prove terminal Flow evidence projection".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("create work item");
+        let launched = state
+            .launch_workgraph_flow(LaunchWorkGraphFlowRequest {
+                work_item_id: item.id.clone(),
+                realm_id: Some(item.realm_id.clone()),
+                namespace: Some(item.namespace.clone()),
+                expected_item_revision: item.revision,
+                mob_id: meerkat_mob::MobId::from(mob_id.as_str()),
+                flow_id: meerkat_mob::FlowId::from("demo"),
+                activation_params: json!({"ticket": "WG-1"}),
+                idempotency_key: "workgraph-flow-failure-evidence".to_string(),
+                supersedes: None,
+            })
+            .await
+            .expect("launch bound Flow");
+
+        let binding_id = launched.binding.binding_id;
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let terminal = loop {
+            let reconciled = state
+                .reconcile_workgraph_flow(
+                    Some(item.realm_id.clone()),
+                    Some(item.namespace.clone()),
+                    binding_id.clone(),
+                )
+                .await
+                .expect("reconcile bound Flow");
+            if reconciled
+                .run
+                .as_ref()
+                .is_some_and(|run| matches!(run.status, meerkat_mob::MobRunStatus::Failed))
+                && reconciled.evidence_projected
+            {
+                break reconciled;
+            }
+            assert!(Instant::now() < deadline, "bound Flow did not terminalize");
+            sleep(Duration::from_millis(25)).await;
+        };
+
+        assert_eq!(terminal.item.status, meerkat::WorkStatus::Open);
+        assert!(terminal.item.evidence_refs.iter().any(|evidence| {
+            evidence.id == terminal.binding.evidence_id() && evidence.kind == "mob_flow_run_failed"
+        }));
+        assert!(matches!(
+            meerkat::WorkExecutionMachine::recover_effect(&terminal.binding)
+                .expect("recover terminal binding"),
+            meerkat::WorkExecutionLifecycleEffect::FlowFailed { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn workgraph_flow_bridge_closes_only_after_evidence_and_replays_exact_launch() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let workgraph =
+            meerkat::WorkGraphService::new(Arc::new(meerkat::MemoryWorkGraphStore::new()));
+        let state = Arc::new(
+            MobMcpState::new(svc, meerkat_mob::MobControlPrincipal::Owner)
+                .with_workgraph_service(Some(workgraph.clone())),
+        );
+        let dispatcher = MobMcpDispatcher::new(state.clone());
+        let mut definition = flow_enabled_definition();
+        definition["flows"]["demo"]["steps"]["start"]["output_format"] = json!("text");
+
+        let created = call_tool(
+            &dispatcher,
+            "mob_create",
+            json!({ "definition": definition }),
+        )
+        .await;
+        let mob_id = created["mob_id"].as_str().expect("mob id").to_string();
+        call_tool(
+            &dispatcher,
+            "mob_spawn_member",
+            json!({
+                "mob_id": mob_id,
+                "specs": [{"profile": "worker", "agent_identity": "w1"}]
+            }),
+        )
+        .await;
+
+        let item = workgraph
+            .create(meerkat::CreateWorkItemRequest {
+                title: "Prove successful Flow evidence adjudication".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("create work item");
+        let request = LaunchWorkGraphFlowRequest {
+            work_item_id: item.id.clone(),
+            realm_id: Some(item.realm_id.clone()),
+            namespace: Some(item.namespace.clone()),
+            expected_item_revision: item.revision,
+            mob_id: meerkat_mob::MobId::from(mob_id.as_str()),
+            flow_id: meerkat_mob::FlowId::from("demo"),
+            activation_params: json!({"ticket": "WG-2"}),
+            idempotency_key: "workgraph-flow-success-evidence".to_string(),
+            supersedes: None,
+        };
+        let launched = state
+            .launch_workgraph_flow(request.clone())
+            .await
+            .expect("launch bound Flow");
+
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let completed = loop {
+            let reconciled = state
+                .reconcile_workgraph_flow(
+                    Some(item.realm_id.clone()),
+                    Some(item.namespace.clone()),
+                    launched.binding.binding_id.clone(),
+                )
+                .await
+                .expect("reconcile bound Flow");
+            if reconciled.work_item_closed {
+                break reconciled;
+            }
+            assert!(Instant::now() < deadline, "bound Flow did not close work");
+            sleep(Duration::from_millis(25)).await;
+        };
+
+        assert!(completed.evidence_projected);
+        assert_eq!(completed.item.status, meerkat::WorkStatus::Completed);
+        assert!(matches!(
+            meerkat::WorkExecutionMachine::recover_effect(&completed.binding)
+                .expect("recover closed binding"),
+            meerkat::WorkExecutionLifecycleEffect::WorkClosed { .. }
+        ));
+
+        let replayed = state
+            .launch_workgraph_flow(request)
+            .await
+            .expect("replay exact launch after work closure");
+        assert_eq!(replayed.binding.binding_id, completed.binding.binding_id);
+        assert_eq!(
+            replayed.run.as_ref().map(|run| &run.run_id),
+            completed.run.as_ref().map(|run| &run.run_id)
+        );
+        assert!(replayed.work_item_closed);
+    }
+
+    #[tokio::test]
+    async fn public_mcp_dispatches_durable_workgraph_flow_launch_and_reconcile() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let workgraph =
+            meerkat::WorkGraphService::new(Arc::new(meerkat::MemoryWorkGraphStore::new()));
+        let state = Arc::new(
+            MobMcpState::new(svc, meerkat_mob::MobControlPrincipal::Owner)
+                .with_workgraph_service(Some(workgraph.clone())),
+        );
+        let dispatcher = MobMcpDispatcher::new(state.clone());
+        let created = call_tool(
+            &dispatcher,
+            "mob_create",
+            json!({ "definition": flow_enabled_definition() }),
+        )
+        .await;
+        let mob_id = created["mob_id"].as_str().expect("mob id").to_string();
+        call_tool(
+            &dispatcher,
+            "mob_spawn_member",
+            json!({
+                "mob_id": mob_id,
+                "specs": [{"profile": "worker", "agent_identity": "w1"}]
+            }),
+        )
+        .await;
+        let item = workgraph
+            .create(meerkat::CreateWorkItemRequest {
+                title: "Public bridge contract".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("work item");
+
+        let launched = crate::public_mcp::handle_public_tools_call(
+            &state,
+            "meerkat_workgraph_flow_launch",
+            &json!({
+                "work_item_id": item.id,
+                "realm_id": item.realm_id,
+                "namespace": item.namespace,
+                "expected_item_revision": item.revision,
+                "mob_id": mob_id,
+                "flow_id": "demo",
+                "params": {"ticket": "PUBLIC-1"},
+                "idempotency_key": "public-workgraph-flow"
+            }),
+        )
+        .await
+        .expect("public launch");
+        let binding_id = launched["binding"]["binding_id"]
+            .as_str()
+            .expect("binding id")
+            .to_string();
+        assert!(launched["run"]["run_id"].is_string());
+        assert!(launched["binding"].get("activation_params").is_none());
+        assert!(launched["binding"].get("idempotency_key").is_none());
+        assert!(launched["binding"].get("correlation_id").is_none());
+        assert!(launched["binding"].get("execution_authority").is_none());
+
+        let binding = crate::public_mcp::handle_public_tools_call(
+            &state,
+            "meerkat_workgraph_flow_binding_get",
+            &json!({
+                "binding_id": binding_id,
+                "realm_id": workgraph.default_realm_id(),
+                "namespace": "default"
+            }),
+        )
+        .await
+        .expect("public binding get");
+        assert_eq!(
+            binding["binding"]["binding_id"],
+            launched["binding"]["binding_id"]
+        );
+        assert!(binding["binding"].get("activation_params").is_none());
+
+        let bindings = crate::public_mcp::handle_public_tools_call(
+            &state,
+            "meerkat_workgraph_flow_binding_list",
+            &json!({
+                "realm_id": workgraph.default_realm_id(),
+                "namespace": "default",
+                "limit": 10
+            }),
+        )
+        .await
+        .expect("public binding list");
+        assert_eq!(
+            bindings["bindings"][0]["binding_id"],
+            binding["binding"]["binding_id"]
+        );
+
+        let status = crate::public_mcp::handle_public_tools_call(
+            &state,
+            "meerkat_mob_flow_status",
+            &json!({
+                "mob_id": mob_id,
+                "run_id": launched["run"]["run_id"]
+            }),
+        )
+        .await
+        .expect("public flow status with reverse binding");
+        assert_eq!(
+            status["execution_binding"]["binding_id"],
+            launched["binding"]["binding_id"]
+        );
+
+        let reconciled = crate::public_mcp::handle_public_tools_call(
+            &state,
+            "meerkat_workgraph_flow_reconcile",
+            &json!({
+                "binding_id": binding_id,
+                "realm_id": workgraph.default_realm_id(),
+                "namespace": "default"
+            }),
+        )
+        .await
+        .expect("public reconcile");
+        assert_eq!(
+            reconciled["binding"]["binding_id"],
+            launched["binding"]["binding_id"]
+        );
+    }
+
+    #[tokio::test]
+    async fn workgraph_flow_bridge_observes_exact_run_without_broad_list_grant() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let owner = Arc::new(MobMcpState::new(
+            svc.clone(),
+            meerkat_mob::MobControlPrincipal::Owner,
+        ));
+        let dispatcher = MobMcpDispatcher::new(owner.clone());
+        let created = call_tool(
+            &dispatcher,
+            "mob_create",
+            json!({ "definition": flow_enabled_definition() }),
+        )
+        .await;
+        let mob_id = meerkat_mob::MobId::from(created["mob_id"].as_str().expect("mob id"));
+        call_tool(
+            &dispatcher,
+            "mob_spawn_member",
+            json!({
+                "mob_id": mob_id,
+                "specs": [{"profile": "worker", "agent_identity": "w1"}]
+            }),
+        )
+        .await;
+        let principal =
+            meerkat_core::auth::PrincipalId::new("workgraph-flow-operator").expect("principal");
+        owner
+            .mob_grant_scopes(
+                &mob_id,
+                principal.clone(),
+                BTreeSet::from([ControlScope::SendCommand]),
+                None,
+            )
+            .await
+            .expect("grant only SendCommand");
+
+        let workgraph =
+            meerkat::WorkGraphService::new(Arc::new(meerkat::MemoryWorkGraphStore::new()));
+        let operator = Arc::new(
+            MobMcpState::new(svc, MobControlPrincipal::External(principal))
+                .with_workgraph_service(Some(workgraph.clone())),
+        );
+        operator
+            .mob_insert_handle(
+                mob_id.clone(),
+                owner.handle_for(&mob_id).await.expect("owner handle"),
+            )
+            .await;
+        let item = workgraph
+            .create(meerkat::CreateWorkItemRequest {
+                title: "Scoped bridge observation".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("item");
+        let launched = operator
+            .launch_workgraph_flow(LaunchWorkGraphFlowRequest {
+                work_item_id: item.id,
+                realm_id: Some(item.realm_id),
+                namespace: Some(item.namespace),
+                expected_item_revision: item.revision,
+                mob_id,
+                flow_id: FlowId::from("demo"),
+                activation_params: json!({"scope": "send-only"}),
+                idempotency_key: "send-only-bridge".to_string(),
+                supersedes: None,
+            })
+            .await
+            .expect("SendCommand-only principal launches and observes exact bound run");
+        assert!(launched.run.is_some());
+    }
+
+    #[tokio::test]
+    async fn revoked_launch_authority_terminalizes_precommitted_binding() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let owner = Arc::new(MobMcpState::new(svc.clone(), MobControlPrincipal::Owner));
+        let dispatcher = MobMcpDispatcher::new(owner.clone());
+        let created = call_tool(
+            &dispatcher,
+            "mob_create",
+            json!({ "definition": flow_enabled_definition() }),
+        )
+        .await;
+        let mob_id = MobId::from(created["mob_id"].as_str().expect("mob id"));
+        let principal =
+            meerkat_core::auth::PrincipalId::new("revoked-flow-operator").expect("principal");
+        owner
+            .mob_grant_scopes(
+                &mob_id,
+                principal.clone(),
+                BTreeSet::from([ControlScope::SendCommand]),
+                None,
+            )
+            .await
+            .expect("grant SendCommand");
+        let workgraph =
+            meerkat::WorkGraphService::new(Arc::new(meerkat::MemoryWorkGraphStore::new()));
+        let operator = Arc::new(
+            MobMcpState::new(svc, MobControlPrincipal::External(principal.clone()))
+                .with_workgraph_service(Some(workgraph.clone())),
+        );
+        operator
+            .mob_insert_handle(
+                mob_id.clone(),
+                owner.handle_for(&mob_id).await.expect("owner handle"),
+            )
+            .await;
+        let config = <MobMcpState as WorkGraphFlowHost>::admit_workgraph_flow(
+            operator.as_ref(),
+            &mob_id,
+            &FlowId::from("demo"),
+        )
+        .await
+        .expect("pre-admit launch authority");
+        let item = workgraph
+            .create(meerkat::CreateWorkItemRequest {
+                title: "Revoked launch recovery".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("item");
+        let binding_id =
+            meerkat::WorkExecutionBindingId::new("execution-revoked-launch").expect("binding id");
+        let target = meerkat::WorkExecutionTarget::mob_flow(
+            mob_id.to_string(),
+            "demo",
+            config.config.definition_digest().expect("config digest"),
+            "369f4dfb-0b67-5ecf-806f-eaf3c0177291",
+            meerkat::WorkExecutionAuthority::principal(principal.clone()),
+            json!({}),
+        )
+        .expect("target");
+        let (machine_state, _) = meerkat::WorkExecutionMachine::bind(&binding_id, target.run_id())
+            .expect("bind machine");
+        let bound = workgraph
+            .execution_bridge()
+            .bind_execution(
+                meerkat::WorkExecutionBinding {
+                    binding_id: binding_id.clone(),
+                    work_ref: meerkat::WorkItemRef {
+                        realm_id: item.realm_id.clone(),
+                        namespace: item.namespace.clone(),
+                        item_id: item.id.clone(),
+                    },
+                    target,
+                    idempotency_key: "revoked-launch".to_string(),
+                    correlation_id: "2d26bcba-10f6-5626-a2a5-4d1897b88d8b".to_string(),
+                    supersedes: None,
+                    machine_state,
+                    created_at: workgraph
+                        .store()
+                        .get_store_time_utc()
+                        .await
+                        .expect("store time"),
+                },
+                item.revision,
+            )
+            .await
+            .expect("commit binding before launch")
+            .binding;
+        owner
+            .mob_revoke_scopes(
+                &mob_id,
+                principal,
+                Some(BTreeSet::from([ControlScope::SendCommand])),
+            )
+            .await
+            .expect("revoke SendCommand");
+
+        let error = WorkGraphFlowBridge::new(operator.as_ref())
+            .reconcile_workgraph_flow(
+                Some(item.realm_id.clone()),
+                Some(item.namespace.clone()),
+                bound.binding_id.clone(),
+            )
+            .await
+            .expect_err("revoked authority becomes terminal launch failure");
+        assert!(matches!(
+            error,
+            WorkGraphFlowBridgeError::LaunchFailed { .. }
+        ));
+        let terminal = workgraph
+            .execution_binding(
+                Some(item.realm_id.clone()),
+                Some(item.namespace.clone()),
+                bound.binding_id,
+            )
+            .await
+            .expect("terminal binding");
+        assert!(matches!(
+            meerkat::WorkExecutionMachine::recover_effect(&terminal).expect("terminal effect"),
+            meerkat::WorkExecutionLifecycleEffect::LaunchFailed { .. }
+        ));
+        let item = workgraph
+            .get(Some(item.realm_id), Some(item.namespace), item.id)
+            .await
+            .expect("item with launch failure evidence");
+        assert!(item.evidence_refs.iter().any(|evidence| {
+            evidence.id == terminal.evidence_id() && evidence.kind == "mob_flow_launch_failed"
+        }));
     }
 
     #[tokio::test]

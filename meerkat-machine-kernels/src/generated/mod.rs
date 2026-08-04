@@ -10,4 +10,5 @@ pub mod schedule_lifecycle;
 pub mod session_document;
 pub mod session_turn_admission;
 pub mod work_attention_lifecycle;
+pub mod work_execution_lifecycle;
 pub mod work_graph_lifecycle;

@@ -47,8 +47,9 @@ use meerkat_machine_schema::{
     DriverRefusalFieldSource, EntryInput, EnumSchema, Expr, FeedbackFieldSource, FeedbackInputRef,
     Guard, HelperSchema, MachineCoverageManifest, MachineSchema, Quantifier, Route,
     RouteBindingSource, RouteDelivery, RouteTarget, RouteTargetKind, SchedulerRule,
-    TransitionSchema, TypePathEnumPayloadAtom, TypePathEnumStructuralVariant, TypePathStructField,
-    TypePathStructFieldAtom, TypeRef, Update, VariantSchema, canonical_machine_schemas,
+    TransitionSchema, TriggerMatch, TypePathEnumPayloadAtom, TypePathEnumStructuralVariant,
+    TypePathStructField, TypePathStructFieldAtom, TypeRef, Update, VariantSchema,
+    canonical_machine_schemas,
 };
 
 /// Fail-closed error for composition/machine TLA model generation.
@@ -1384,6 +1385,7 @@ pub fn render_composition_ci_cfg(schema: &CompositionSchema, deep: bool) -> Stri
     let named_bindings = collect_composition_named_bindings(machine_by_instance.values().copied());
     let operator_suffix = if deep { "Deep" } else { "Ci" };
     let mut instance_invariants = Vec::new();
+    let mut obligation_invariants = Vec::new();
     let uses_u64_max = composition_uses_u64_max(schema, &machine_by_instance);
     let session_id_cardinality = if deep {
         schema
@@ -1417,7 +1419,26 @@ pub fn render_composition_ci_cfg(schema: &CompositionSchema, deep: bool) -> Stri
             ));
         }
     }
-
+    for protocol in &schema.handoff_protocols {
+        let suffix = format!(
+            "{}_{}",
+            tla_ident(&protocol.producer_instance),
+            tla_ident(&protocol.name)
+        );
+        if machine_by_instance
+            .get(protocol.producer_instance.as_str())
+            .is_some_and(|machine| !machine.state.terminal_phases.is_empty())
+        {
+            obligation_invariants.push(format!("NoOpenObligationsOnTerminal_{suffix}"));
+        }
+    }
+    if schema
+        .handoff_protocols
+        .iter()
+        .any(|protocol| !protocol.allowed_feedback_inputs.is_empty())
+    {
+        obligation_invariants.push("OwnerFeedbackHasProtocolProvenance".to_string());
+    }
     pushln!(&mut out, "SPECIFICATION Spec");
     if !domains.is_empty() || uses_u64_max {
         pushln!(&mut out, "CONSTANTS");
@@ -1485,6 +1506,7 @@ pub fn render_composition_ci_cfg(schema: &CompositionSchema, deep: bool) -> Stri
     if !behavioral_invariants.is_empty()
         || !structural_invariants.is_empty()
         || !instance_invariants.is_empty()
+        || !obligation_invariants.is_empty()
         || deep
     {
         pushln!(&mut out, "INVARIANTS");
@@ -1495,6 +1517,9 @@ pub fn render_composition_ci_cfg(schema: &CompositionSchema, deep: bool) -> Stri
             pushln!(&mut out, "  {}", invariant.name);
         }
         for invariant_name in instance_invariants {
+            pushln!(&mut out, "  {}", invariant_name);
+        }
+        for invariant_name in obligation_invariants {
             pushln!(&mut out, "  {}", invariant_name);
         }
         if deep {
@@ -1545,6 +1570,7 @@ pub fn render_composition_witness_cfg(
         .max(max_named_sample_cardinality(&named_samples));
     let operator_suffix = witness_cfg_operator_suffix(witness);
     let mut instance_invariants = Vec::new();
+    let mut obligation_invariants = Vec::new();
     let uses_u64_max = composition_uses_u64_max(schema, &machine_by_instance);
 
     for instance in &schema.machines {
@@ -1561,6 +1587,26 @@ pub fn render_composition_witness_cfg(
                 tla_ident(&invariant.name)
             ));
         }
+    }
+    for protocol in &schema.handoff_protocols {
+        let suffix = format!(
+            "{}_{}",
+            tla_ident(&protocol.producer_instance),
+            tla_ident(&protocol.name)
+        );
+        if machine_by_instance
+            .get(protocol.producer_instance.as_str())
+            .is_some_and(|machine| !machine.state.terminal_phases.is_empty())
+        {
+            obligation_invariants.push(format!("NoOpenObligationsOnTerminal_{suffix}"));
+        }
+    }
+    if schema
+        .handoff_protocols
+        .iter()
+        .any(|protocol| !protocol.allowed_feedback_inputs.is_empty())
+    {
+        obligation_invariants.push("OwnerFeedbackHasProtocolProvenance".to_string());
     }
 
     writeln!(
@@ -1643,6 +1689,7 @@ pub fn render_composition_witness_cfg(
     let explicit_witness = CompositionTlaCompiler::witness_has_explicit_progress(witness);
     if !schema.invariants.is_empty()
         || !instance_invariants.is_empty()
+        || !obligation_invariants.is_empty()
         || (explicit_witness && !witness_properties.is_empty())
     {
         pushln!(&mut out, "INVARIANTS");
@@ -1650,6 +1697,9 @@ pub fn render_composition_witness_cfg(
             pushln!(&mut out, "  {}", invariant.name);
         }
         for invariant_name in instance_invariants {
+            pushln!(&mut out, "  {}", invariant_name);
+        }
+        for invariant_name in obligation_invariants {
             pushln!(&mut out, "  {}", invariant_name);
         }
         pushln!(&mut out, "  CoverageInstrumentation");
@@ -5899,6 +5949,10 @@ impl<'a> CompositionTlaCompiler<'a> {
         self.render_witness_completion_operators(&mut out);
         self.render_witness_action_constraint_operators(&mut out);
         self.render_witness_satisfied_stutter_actions(&mut out);
+        // TLA+ does not permit action references before their definitions.
+        // Owner-feedback actions participate in CoreNext and witness Next, so
+        // render them before either dispatcher is declared.
+        self.render_owner_actor_processes(&mut out)?;
 
         let core_next_branches = self.core_next_branches();
 
@@ -5967,7 +6021,6 @@ impl<'a> CompositionTlaCompiler<'a> {
         }
 
         self.render_obligation_invariants(&mut out, &mut machine_invariant_names)?;
-        self.render_owner_actor_processes(&mut out)?;
 
         self.render_coverage_instrumentation(&mut out);
 
@@ -5989,7 +6042,7 @@ impl<'a> CompositionTlaCompiler<'a> {
             "DeepStateConstraint == {}",
             render_composition_state_constraint(
                 self.schema,
-                &CompositionStateLimits::deep_defaults(),
+                &composition_deep_state_limits(self.schema),
                 self
             )
         )
@@ -6329,53 +6382,6 @@ impl<'a> CompositionTlaCompiler<'a> {
             })
     }
 
-    fn correlation_match_expr(
-        &self,
-        protocol: &meerkat_machine_schema::EffectHandoffProtocol,
-        feedback: &FeedbackInputRef,
-        obligation_var: &str,
-        input_packet_var: &str,
-    ) -> std::result::Result<String, String> {
-        if protocol.correlation_fields.is_empty() {
-            return Ok(format!("{obligation_var} /= {{}}"));
-        }
-
-        let clauses = protocol
-            .correlation_fields
-            .iter()
-            .map(|correlation_field| {
-                let binding = feedback
-                    .field_bindings
-                    .iter()
-                    .find(|binding| {
-                        matches!(
-                            &binding.source,
-                            FeedbackFieldSource::ObligationField(name)
-                                if name == correlation_field
-                        )
-                    })
-                    .ok_or_else(|| {
-                        format!(
-                            "correlation binding for field `{}` not found",
-                            correlation_field
-                        )
-                    })?;
-                Ok::<String, String>(format!(
-                    "record.{} = {}.payload.{}",
-                    tla_ident(correlation_field),
-                    input_packet_var,
-                    tla_ident(&binding.input_field)
-                ))
-            })
-            .collect::<std::result::Result<Vec<_>, _>>()?;
-
-        Ok(format!(
-            "(\\E record \\in {} : ({}))",
-            obligation_var,
-            clauses.join(" /\\ ")
-        ))
-    }
-
     fn feedback_payload_expr(
         &self,
         feedback: &FeedbackInputRef,
@@ -6457,33 +6463,37 @@ impl<'a> CompositionTlaCompiler<'a> {
                 .expect("write to string");
                 invariant_names.push(inv_name);
             }
+        }
 
-            // NoFeedbackWithoutObligation: feedback input observed => matching obligation exists
-            if !protocol.allowed_feedback_inputs.is_empty() {
-                let inv_name = format!("NoFeedbackWithoutObligation_{}", suffix);
-                let obligation_checks: Vec<String> = protocol
-                    .allowed_feedback_inputs
-                    .iter()
-                    .map(|feedback| {
-                        let packet_match = format!(
-                            "(input_packet.machine = {} /\\ input_packet.variant = {})",
-                            tla_string(&feedback.machine_instance),
-                            tla_string(&feedback.input_variant)
-                        );
-                        let obligation_check =
-                            self.correlation_match_expr(protocol, feedback, &var, "input_packet")?;
-                        Ok::<String, String>(format!("(({packet_match}) => ({obligation_check}))"))
-                    })
-                    .collect::<std::result::Result<Vec<_>, _>>()?;
-                writeln!(
-                    out,
-                    "{} == \\A input_packet \\in observed_inputs : ({})",
-                    inv_name,
-                    obligation_checks.join(" /\\ ")
-                )
-                .expect("write to string");
-                invariant_names.push(inv_name);
-            }
+        let owner_feedback_sources = self
+            .schema
+            .handoff_protocols
+            .iter()
+            .flat_map(|protocol| {
+                protocol.allowed_feedback_inputs.iter().map(move |feedback| {
+                    format!(
+                        "(/\\ input_packet.machine = {} /\\ input_packet.variant = {} /\\ input_packet.source_machine = {} /\\ input_packet.source_effect = {} /\\ \\E effect_packet \\in emitted_effects : /\\ effect_packet.machine = {} /\\ effect_packet.variant = {} /\\ effect_packet.effect_id = input_packet.effect_id)",
+                        tla_string(&feedback.machine_instance),
+                        tla_string(&feedback.input_variant),
+                        tla_string(&protocol.producer_instance),
+                        tla_string(&protocol.effect_variant),
+                        tla_string(&protocol.producer_instance),
+                        tla_string(&protocol.effect_variant),
+                    )
+                })
+            })
+            .collect::<Vec<_>>();
+        if !owner_feedback_sources.is_empty() {
+            pushln!(out, "OwnerFeedbackHasProtocolProvenance ==");
+            pushln!(out, "    \\A input_packet \\in observed_inputs :");
+            pushln!(out, "        input_packet.source_kind /= \"owner\"");
+            writeln!(
+                out,
+                "        \\/ ({})",
+                owner_feedback_sources.join(" \\/ ")
+            )
+            .expect("write to string");
+            invariant_names.push("OwnerFeedbackHasProtocolProvenance".to_string());
         }
 
         if !self.schema.handoff_protocols.is_empty() {
@@ -6496,7 +6506,8 @@ impl<'a> CompositionTlaCompiler<'a> {
     /// model the owner choosing to submit protocol-allowed feedback when an
     /// obligation is outstanding.
     ///
-    /// Each protocol generates an `OwnerFeedback_<protocol>` action that:
+    /// Each allowed feedback input generates an
+    /// `OwnerFeedback_<protocol>_<input>` action that:
     /// - Is enabled when the obligation set is non-empty
     /// - Nondeterministically picks one of the allowed feedback inputs
     /// - Removes one obligation token from the set
@@ -6506,7 +6517,6 @@ impl<'a> CompositionTlaCompiler<'a> {
     fn render_owner_actor_processes(&self, out: &mut String) -> std::result::Result<(), String> {
         for protocol in &self.schema.handoff_protocols {
             let var = self.obligation_var(protocol);
-            let action_name = format!("OwnerFeedback_{}", self.obligation_symbol_suffix(protocol));
 
             if protocol.allowed_feedback_inputs.is_empty() {
                 continue;
@@ -6516,63 +6526,53 @@ impl<'a> CompositionTlaCompiler<'a> {
                 writeln!(out, "\\* Liveness: {liveness}").expect("write to string");
             }
 
-            writeln!(out, "{action_name} ==").expect("write to string");
-            writeln!(out, "    /\\ {} /= {{}}", var).expect("write to string");
-            writeln!(out, "    /\\ \\E token \\in {} :", var).expect("write to string");
-            let feedback_branches: Vec<String> = protocol
-                .allowed_feedback_inputs
-                .iter()
-                .map(|feedback| {
-                    let (payload_expr, owner_context_quantifiers) =
-                        self.feedback_payload_expr(feedback, "token")?;
-                    let input_expr = format!(
-                        "[machine |-> {}, variant |-> {}, source_kind |-> \"owner\", source_machine |-> {}, source_effect |-> {}, source_route |-> \"none\", effect_id |-> token, payload |-> {}]",
-                        tla_string(&feedback.machine_instance),
-                        tla_string(&feedback.input_variant),
-                        tla_string(&protocol.producer_instance),
-                        tla_string(&protocol.effect_variant),
-                        payload_expr,
-                    );
-                    let quantifier_prefix = if owner_context_quantifiers.is_empty() {
-                        String::new()
-                    } else {
-                        format!("\\E {} : ", owner_context_quantifiers.join(", "))
-                    };
-                    Ok::<String, String>(format!(
-                        "{}(/\\ pending_inputs' = Append(pending_inputs, {}) /\\ {}' = {} \\ {{token}})",
-                        quantifier_prefix,
-                        input_expr,
-                        var,
-                        var
-                    ))
-                })
-                .collect::<std::result::Result<Vec<_>, _>>()?;
+            for feedback in &protocol.allowed_feedback_inputs {
+                let action_name = self.owner_feedback_action_name(protocol, feedback);
+                let (payload_expr, owner_context_quantifiers) =
+                    self.feedback_payload_expr(feedback, "token")?;
+                let input_expr = format!(
+                    "[machine |-> {}, variant |-> {}, source_kind |-> \"owner\", source_machine |-> {}, source_effect |-> {}, source_route |-> \"none\", effect_id |-> token.effect_id, payload |-> {}]",
+                    tla_string(&feedback.machine_instance),
+                    tla_string(&feedback.input_variant),
+                    tla_string(&protocol.producer_instance),
+                    tla_string(&protocol.effect_variant),
+                    payload_expr,
+                );
 
-            writeln!(out, "        /\\ ({})", feedback_branches.join(" \\/ "))
+                writeln!(out, "{action_name} ==").expect("write to string");
+                writeln!(out, "    /\\ {} /= {{}}", var).expect("write to string");
+                writeln!(out, "    /\\ \\E token \\in {} :", var).expect("write to string");
+                let quantifier_prefix = if owner_context_quantifiers.is_empty() {
+                    String::new()
+                } else {
+                    format!("\\E {} : ", owner_context_quantifiers.join(", "))
+                };
+                writeln!(
+                    out,
+                    "        /\\ {quantifier_prefix}(/\\ pending_inputs' = Append(pending_inputs, {input_expr}) /\\ observed_inputs' = observed_inputs \\cup {{{input_expr}}} /\\ {var}' = {var} \\ {{token}} /\\ model_step_count' = model_step_count + 1)"
+                )
                 .expect("write to string");
 
-            // Frame: all other variables unchanged
-            let unchanged_vars: Vec<String> = self
-                .machine_vars()
-                .into_iter()
-                .chain(self.obligation_vars().into_iter().filter(|v| *v != var))
-                .chain(
-                    [
-                        "model_step_count",
-                        "observed_inputs",
-                        "pending_routes",
-                        "delivered_routes",
-                        "emitted_effects",
-                        "observed_transitions",
-                        "witness_current_script_input",
-                        "witness_remaining_script_inputs",
-                    ]
-                    .iter()
-                    .map(std::string::ToString::to_string),
-                )
-                .collect();
-            self.render_unchanged_vars(out, "    /\\ ", &unchanged_vars);
-            pushln!(out);
+                let unchanged_vars: Vec<String> = self
+                    .machine_vars()
+                    .into_iter()
+                    .chain(self.obligation_vars().into_iter().filter(|v| *v != var))
+                    .chain(
+                        [
+                            "pending_routes",
+                            "delivered_routes",
+                            "emitted_effects",
+                            "observed_transitions",
+                            "witness_current_script_input",
+                            "witness_remaining_script_inputs",
+                        ]
+                        .iter()
+                        .map(std::string::ToString::to_string),
+                    )
+                    .collect();
+                self.render_unchanged_vars(out, "    /\\ ", &unchanged_vars);
+                pushln!(out);
+            }
         }
         Ok(())
     }
@@ -7275,8 +7275,130 @@ impl<'a> CompositionTlaCompiler<'a> {
                     .push(self.machine_transition_call(instance.instance_id.as_str(), transition));
             }
         }
+        branches.extend(self.owner_feedback_branches());
         branches.push("QuiescentStutter".into());
         branches
+    }
+
+    fn owner_feedback_branches(&self) -> Vec<String> {
+        self.schema
+            .handoff_protocols
+            .iter()
+            .flat_map(|protocol| {
+                protocol
+                    .allowed_feedback_inputs
+                    .iter()
+                    .map(move |feedback| self.owner_feedback_action_name(protocol, feedback))
+            })
+            .collect()
+    }
+
+    fn owner_feedback_action_name(
+        &self,
+        protocol: &meerkat_machine_schema::EffectHandoffProtocol,
+        feedback: &FeedbackInputRef,
+    ) -> String {
+        format!(
+            "OwnerFeedback_{}_{}",
+            self.obligation_symbol_suffix(protocol),
+            tla_ident(&feedback.input_variant)
+        )
+    }
+
+    fn witness_owner_feedback_branches(&self, witness: &CompositionWitness) -> Vec<String> {
+        let expected_inputs = witness
+            .expected_transitions
+            .iter()
+            .filter_map(|expected| {
+                let machine = self.machine_by_instance.get(expected.machine.as_str())?;
+                let transition = machine
+                    .transitions
+                    .iter()
+                    .find(|transition| transition.name == expected.transition)?;
+                match &transition.on {
+                    TriggerMatch::Input { variant, .. } => {
+                        Some((expected.machine.clone(), variant.clone()))
+                    }
+                    TriggerMatch::Signal { .. } => None,
+                }
+            })
+            .collect::<BTreeSet<_>>();
+
+        let ordered_predecessor_effects = witness
+            .expected_transition_order
+            .iter()
+            .filter_map(|order| {
+                let predecessor_machine = self
+                    .machine_by_instance
+                    .get(order.earlier.machine.as_str())?;
+                let predecessor = predecessor_machine
+                    .transitions
+                    .iter()
+                    .find(|transition| transition.name == order.earlier.transition)?;
+                Some((
+                    (order.later.machine.clone(), order.later.transition.clone()),
+                    predecessor
+                        .emit
+                        .iter()
+                        .map(|effect| (order.earlier.machine.clone(), effect.variant.clone()))
+                        .collect::<BTreeSet<_>>(),
+                ))
+            })
+            .fold(
+                BTreeMap::<_, BTreeSet<_>>::new(),
+                |mut effects, (transition, predecessor_effects)| {
+                    effects
+                        .entry(transition)
+                        .or_default()
+                        .extend(predecessor_effects);
+                    effects
+                },
+            );
+
+        self.schema
+            .handoff_protocols
+            .iter()
+            .flat_map(|protocol| {
+                protocol
+                    .allowed_feedback_inputs
+                    .iter()
+                    .filter_map(|feedback| {
+                        let input = (
+                            feedback.machine_instance.clone(),
+                            feedback.input_variant.clone(),
+                        );
+                        if !expected_inputs.contains(&input) {
+                            return None;
+                        }
+                        let receiver_machine = self
+                            .machine_by_instance
+                            .get(feedback.machine_instance.as_str())?;
+                        let receiver = receiver_machine.transitions.iter().find(|transition| {
+                            matches!(
+                                &transition.on,
+                                TriggerMatch::Input { variant, .. }
+                                    if variant == &feedback.input_variant
+                            )
+                        })?;
+                        let receiver_key =
+                            (feedback.machine_instance.clone(), receiver.name.clone());
+                        if let Some(predecessor_effects) =
+                            ordered_predecessor_effects.get(&receiver_key)
+                        {
+                            let producer = (
+                                protocol.producer_instance.clone(),
+                                protocol.effect_variant.clone(),
+                            );
+                            if !predecessor_effects.contains(&producer) {
+                                return None;
+                            }
+                        }
+                        Some(self.owner_feedback_action_name(protocol, feedback))
+                    })
+            })
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect()
     }
 
     fn witness_next_branches(
@@ -7304,6 +7426,7 @@ impl<'a> CompositionTlaCompiler<'a> {
         for expected in &witness.expected_transitions {
             branches.push(self.witness_transition_call(witness, expected)?);
         }
+        branches.extend(self.witness_owner_feedback_branches(witness));
         Ok(branches)
     }
 
@@ -8140,7 +8263,8 @@ impl<'a> CompositionTlaCompiler<'a> {
                 {
                     let var = self.obligation_var(protocol);
                     let mut record_fields: Vec<String> =
-                        Vec::with_capacity(protocol.obligation_fields.len());
+                        Vec::with_capacity(protocol.obligation_fields.len() + 1);
+                    record_fields.push("effect_id |-> (model_step_count + 1)".to_string());
                     for field in &protocol.obligation_fields {
                         let tla_field = tla_ident(field);
                         // Fail closed: an obligation field that is absent from
@@ -11803,6 +11927,21 @@ fn effective_composition_state_limits(
         effective.pending_input_limit = effective.pending_input_limit.max(1);
     }
     effective
+}
+
+fn composition_deep_state_limits(schema: &CompositionSchema) -> CompositionStateLimits {
+    let mut deep = CompositionStateLimits::deep_defaults();
+    if let Some(ci) = &schema.ci_limits {
+        deep.step_limit = deep.step_limit.max(ci.step_limit);
+        deep.pending_input_limit = deep.pending_input_limit.max(ci.pending_input_limit);
+        deep.pending_route_limit = deep.pending_route_limit.max(ci.pending_route_limit);
+        deep.delivered_route_limit = deep.delivered_route_limit.max(ci.delivered_route_limit);
+        deep.emitted_effect_limit = deep.emitted_effect_limit.max(ci.emitted_effect_limit);
+        deep.seq_limit = deep.seq_limit.max(ci.seq_limit);
+        deep.set_limit = deep.set_limit.max(ci.set_limit);
+        deep.map_limit = deep.map_limit.max(ci.map_limit);
+    }
+    deep
 }
 
 fn render_machine_state_constraint(schema: &MachineSchema, deep: bool) -> String {
