@@ -15,6 +15,10 @@ NEXTEST_TIMEOUT_SECS="${MEERKAT_PRE_PUSH_NEXTEST_TIMEOUT_SECS:-300}"
 # The unit lane includes a dense-topology stress test with its own 300-second
 # assertion budget, in addition to workspace test-binary compilation.
 UNIT_NEXTEST_TIMEOUT_SECS="${MEERKAT_PRE_PUSH_UNIT_NEXTEST_TIMEOUT_SECS:-900}"
+# The integration lane includes downstream compile-policy canaries and more
+# than 2,000 tests. Its timeout must cover both exact-tree linking and those
+# nested compiler checks.
+INTEGRATION_NEXTEST_TIMEOUT_SECS="${MEERKAT_PRE_PUSH_INTEGRATION_NEXTEST_TIMEOUT_SECS:-900}"
 LOCK_WAIT_SECS="${MEERKAT_PRE_PUSH_UNIT_LOCK_WAIT_SECS:-180}"
 GIT_DIR_PATH="$("$GIT_BIN" rev-parse --git-common-dir)"
 HOOK_CACHE_ROOT="${GIT_DIR_PATH}/meerkat-hook-cache"
@@ -177,7 +181,7 @@ retry_lane \
     --show-progress none --status-level none --final-status-level fail
 retry_lane \
   "workspace integration lane" \
-  "$NEXTEST_TIMEOUT_SECS" \
+  "$INTEGRATION_NEXTEST_TIMEOUT_SECS" \
   "$CARGO" nextest run --workspace --tests --profile fast --no-fail-fast \
     -E 'kind(test)' \
     --show-progress none --status-level none --final-status-level fail
