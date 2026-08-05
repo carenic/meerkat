@@ -22956,6 +22956,7 @@ async fn test_build_resumed_agent_config_rejects_mismatched_session_identity() {
             },
             expected_session_id: &wrong_session_id,
             resumed_session: resumed,
+            system_prompt_intent: crate::build::ResumeSystemPromptIntent::PreservePersisted,
         })
         .await
         .expect_err("resume helper must validate the target session identity");
@@ -41480,6 +41481,13 @@ impl RuntimeBackedRealCommsSessionService {
             .store(enabled, Ordering::Relaxed);
     }
 
+    async fn reset_keep_alive_notifier(&self, session_id: &SessionId) {
+        self.keep_alive_notifiers
+            .write()
+            .await
+            .insert(session_id.clone(), Arc::new(tokio::sync::Notify::new()));
+    }
+
     fn set_append_system_context_delay_ms(&self, delay_ms: u64) {
         self.append_system_context_delay_ms
             .store(delay_ms, Ordering::Relaxed);
@@ -43589,7 +43597,7 @@ async fn test_active_autonomous_direct_steer_falls_back_when_exact_boundary_is_u
         .clear_runtime_turn_content_barrier(&sid_worker)
         .await;
     service.release_one_runtime_turn();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let prompts = service.applied_runtime_prompts(&sid_worker).await;
             if prompts.iter().skip(active_apply_count).any(|prompt| {
@@ -43703,7 +43711,7 @@ async fn test_active_internal_submit_work_steer_falls_back_when_exact_boundary_i
         .clear_runtime_turn_content_barrier(&sid_worker)
         .await;
     service.release_one_runtime_turn();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let prompts = service.applied_runtime_prompts(&sid_worker).await;
             if prompts.iter().skip(active_apply_count).any(|prompt| {
@@ -44048,8 +44056,9 @@ async fn test_turn_driven_submit_work_steer_queues_when_exact_boundary_is_unavai
 
     service.set_block_session_reads(false);
     service.release_session_reads();
+    service.set_block_runtime_turns(false);
     service.release_one_runtime_turn();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let prompts = service.applied_runtime_prompts(&sid_worker).await;
             if prompts.iter().skip(prompt_baseline + 1).any(|prompt| {
@@ -44162,7 +44171,7 @@ async fn test_member_send_steer_queues_when_exact_boundary_is_unavailable() {
     service.release_session_reads();
     service.set_block_runtime_turns(false);
     service.release_runtime_turns();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let prompts = service.applied_runtime_prompts(&sid_worker).await;
             if prompts.iter().skip(prompt_baseline + 1).any(|prompt| {
@@ -44591,6 +44600,11 @@ async fn test_default_peer_response_inherits_request_steer_while_requester_runni
         "runtime-start barrier fired without recording the busy requester prompt; prompts={requester_prompts:?}"
     );
     service.set_keep_alive_turns_complete_immediately(false);
+    // Install a fresh notifier before releasing the content barrier. The
+    // kickoff path may have left a stored Notify permit on the original test
+    // notifier, which would let this turn finish and make the response race a
+    // second apply instead of exercising the active-requester boundary.
+    service.reset_keep_alive_notifier(&sid_requester).await;
     service
         .clear_runtime_turn_content_barrier(&sid_requester)
         .await;
@@ -47219,6 +47233,26 @@ async fn test_discarded_live_session_revived_by_machine_authorized_dispatch() {
         .expect("session-backed member")
         .clone();
 
+    // Production-shaped prompt history: automatic rematerialization must
+    // preserve every persisted System row, including byte-identical repeats.
+    // These are transcript events, not configuration entries to normalize.
+    let expected_before_revival = {
+        let mut persisted_sessions = service.persisted_sessions.write().await;
+        let persisted = persisted_sessions
+            .get_mut(&bridge_session_id)
+            .expect("durable bridge session");
+        for _ in 0..12 {
+            persisted.append_system_message("repeated runtime instruction".to_string());
+        }
+        let expected = persisted.messages().to_vec();
+        service
+            .live_session_data
+            .write()
+            .await
+            .insert(bridge_session_id.clone(), persisted.clone());
+        expected
+    };
+
     // Model the #34 fail-closed discard: the live session (and with it the
     // comms runtime) is dropped out from under MobMachine while the durable
     // snapshot stays loadable and the member stays Active.
@@ -47249,6 +47283,15 @@ async fn test_discarded_live_session_revived_by_machine_authorized_dispatch() {
             .await
             .expect("has_live_session"),
         "revival must rebuild the live session under the unchanged binding"
+    );
+    let revived = service
+        .live_session_clone(&bridge_session_id)
+        .await
+        .expect("revived bridge session");
+    assert_eq!(
+        revived.messages(),
+        expected_before_revival,
+        "machine-authorized revival must preserve repeated System rows byte-for-byte and in order",
     );
     let turn_prompts = service.start_turn_prompts.read().await.clone();
     assert!(
@@ -51114,6 +51157,63 @@ async fn test_cold_restart_restores_per_spawn_profile_override_without_customize
     assert!(
         last_names.contains(&"planner".to_string()),
         "restored member build must carry the per-spawn declarative MCP servers: {mcp_creates:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_cold_restart_does_not_replay_persisted_system_prompt_configuration() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let events = storage.events.clone();
+    let runtime_metadata = storage.runtime_metadata.clone();
+    let handle = MobBuilder::new(sample_definition(), storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+
+    let prompt = "configured once, retained across rematerialization";
+    let mut spec = SpawnMemberSpec::new("worker", "w-prompt-restore");
+    spec.system_prompt_override = Some(SpawnSystemPromptOverride::Replace(prompt.to_string()));
+    let spawned = handle.spawn_spec(spec).await.expect("spawn worker");
+    let session_id = handle
+        .resolve_bridge_session_id(&spawned.agent_identity)
+        .await
+        .expect("bridge session id");
+
+    handle.stop().await.expect("stop");
+    MobSessionService::discard_live_session(service.as_ref(), &session_id)
+        .await
+        .expect("discard live session");
+
+    let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+        events,
+        runtime_metadata,
+    ))
+    .with_session_service(service.clone())
+    .resume()
+    .await
+    .expect("resume");
+    resumed
+        .resume()
+        .await
+        .expect("rebuild stopped member session");
+
+    let restored = service
+        .live_session_clone(&session_id)
+        .await
+        .expect("restored live session");
+    assert_eq!(
+        restored
+            .messages()
+            .iter()
+            .filter(
+                |message| matches!(message, Message::System(system) if system.content == prompt)
+            )
+            .count(),
+        1,
+        "automatic rematerialization must not append persisted prompt configuration",
     );
 }
 

@@ -2527,6 +2527,34 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         Ok(replay.session)
     }
 
+    /// Read one committed session body without leaking the narrow
+    /// HeadCanonical checkpoint-to-boundary commit window to observers.
+    ///
+    /// Ordinary reads remain lock-free. If the physical head moved after the
+    /// RuntimeStore authority was sampled, wait for the runtime-owned outer
+    /// turn boundary and retry exactly once. A mismatch with no completing
+    /// turn behind it is returned unchanged, preserving fail-closed behavior
+    /// for stale or contradictory authority.
+    async fn load_authoritative_session_base_for_observation(
+        &self,
+        id: &SessionId,
+    ) -> Result<Option<Session>, SessionError> {
+        match self.load_authoritative_session_base(id).await {
+            Err(SessionError::Store(error))
+                if error
+                    .downcast_ref::<SessionStoreError>()
+                    .is_some_and(|error| {
+                        matches!(error, SessionStoreError::TranscriptRevisionConflict { .. })
+                    }) =>
+            {
+                let _turn_finalization_guard =
+                    self.acquire_runtime_turn_finalization_guard(id).await;
+                self.load_authoritative_session_base(id).await
+            }
+            result => result,
+        }
+    }
+
     async fn load_authoritative_session_base_with_replay_info(
         &self,
         id: &SessionId,
@@ -9205,7 +9233,7 @@ impl<B: SessionAgentBuilder + 'static> SessionServiceHistoryExt for PersistentSe
         query: SessionHistoryQuery,
     ) -> Result<SessionHistoryPage, SessionError> {
         let session = self
-            .load_authoritative_session_base(id)
+            .load_authoritative_session_base_for_observation(id)
             .await?
             .ok_or_else(|| SessionError::NotFound { id: id.clone() })?;
         Ok(SessionHistoryPage::from_messages(
@@ -9221,7 +9249,7 @@ impl<B: SessionAgentBuilder + 'static> SessionServiceHistoryExt for PersistentSe
         query: SessionTranscriptRevisionQuery,
     ) -> Result<SessionTranscriptRevisionPage, SessionError> {
         let session = self
-            .load_authoritative_session_base(id)
+            .load_authoritative_session_base_for_observation(id)
             .await?
             .ok_or_else(|| SessionError::NotFound { id: id.clone() })?;
         let head_revision = session.transcript_revision().map_err(|err| {
@@ -9305,7 +9333,7 @@ impl<B: SessionAgentBuilder + 'static> SessionServiceHistoryExt for PersistentSe
         query: SessionTranscriptRevisionListQuery,
     ) -> Result<SessionTranscriptRevisionList, SessionError> {
         let session = self
-            .load_authoritative_session_base(id)
+            .load_authoritative_session_base_for_observation(id)
             .await?
             .ok_or_else(|| SessionError::NotFound { id: id.clone() })?;
         let head_revision = session.transcript_revision().map_err(|err| {

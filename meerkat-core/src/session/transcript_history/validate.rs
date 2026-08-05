@@ -535,8 +535,9 @@ pub(super) fn validate_transcript_revision_edge(
     }
     let (base_parent_prefix, appended) = match edge.parent_advance() {
         TranscriptParentAdvance::ExactAppend { appended } => {
-            (expected_base_witness.row_prefix().clone(), appended)
+            (Some(expected_base_witness.row_prefix().clone()), appended)
         }
+        TranscriptParentAdvance::ContentAddressedAppend { appended } => (None, appended),
         TranscriptParentAdvance::ExactSplice {
             at,
             replacement,
@@ -575,7 +576,7 @@ pub(super) fn validate_transcript_revision_edge(
                 .row_prefix()
                 .replace_serialized_range(at, end, &replacement_rows)
                 .map_err(|error| TranscriptEditError::HistoryStateMalformed(error.to_string()))?;
-            (spliced, appended)
+            (Some(spliced), appended)
         }
     };
     let serialized = appended
@@ -583,14 +584,16 @@ pub(super) fn validate_transcript_revision_edge(
         .map(serde_json::to_vec)
         .collect::<Result<Vec<_>, _>>()
         .map_err(|error| TranscriptEditError::HistoryStateMalformed(error.to_string()))?;
-    let expected_parent_prefix = base_parent_prefix
-        .extend_serialized_rows(&serialized)
-        .map_err(|error| TranscriptEditError::HistoryStateMalformed(error.to_string()))?;
-    if &expected_parent_prefix != edge.parent_row_prefix() {
-        return Err(TranscriptEditError::HistoryStateMalformed(format!(
-            "rewrite occurrence {} parent row prefix does not exactly bind its typed advance",
-            edge.rewrite_generation()
-        )));
+    if let Some(base_parent_prefix) = base_parent_prefix {
+        let expected_parent_prefix = base_parent_prefix
+            .extend_serialized_rows(&serialized)
+            .map_err(|error| TranscriptEditError::HistoryStateMalformed(error.to_string()))?;
+        if &expected_parent_prefix != edge.parent_row_prefix() {
+            return Err(TranscriptEditError::HistoryStateMalformed(format!(
+                "rewrite occurrence {} parent row prefix does not exactly bind its typed advance",
+                edge.rewrite_generation()
+            )));
+        }
     }
     let (start, end) = commit.selection.bounds();
     if start != edge.rewrite().at() || start > end || end > commit.messages_before {

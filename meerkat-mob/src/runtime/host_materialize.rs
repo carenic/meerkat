@@ -2396,6 +2396,7 @@ impl HostMemberMaterializer {
                     base,
                     expected_session_id: session_id,
                     resumed_session: session,
+                    system_prompt_intent: crate::build::ResumeSystemPromptIntent::PreservePersisted,
                 })
                 .await?
             }

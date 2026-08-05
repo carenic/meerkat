@@ -2780,12 +2780,6 @@ async fn ensure_session_with_executor_upgrades_registered_session() {
     )
     .await;
 
-    let state = adapter.runtime_state(&sid).await.unwrap();
-    assert_eq!(state, RuntimeState::Attached);
-
-    let active = adapter.list_active_inputs(&sid).await.unwrap();
-    assert!(active.is_empty(), "queued work should drain after upgrade");
-
     let is = wait_for_input_state(
         &adapter,
         &sid,
@@ -2799,6 +2793,12 @@ async fn ensure_session_with_executor_upgrades_registered_session() {
         InputLifecycleState::Consumed,
         "the pre-upgrade queued input should be processed once the loop is attached"
     );
+
+    let state = adapter.runtime_state(&sid).await.unwrap();
+    assert_eq!(state, RuntimeState::Attached);
+
+    let active = adapter.list_active_inputs(&sid).await.unwrap();
+    assert!(active.is_empty(), "queued work should drain after upgrade");
 }
 
 #[tokio::test]
@@ -4253,6 +4253,15 @@ async fn unregister_session_aborts_spawned_drain_and_clears_suppression() {
         > {
             Ok(Vec::new())
         }
+
+        async fn try_recv_classified_inbox_interaction(
+            &self,
+        ) -> Result<
+            Option<meerkat_core::interaction::ClassifiedInboxInteraction>,
+            meerkat_core::agent::CommsCapabilityError,
+        > {
+            Ok(None)
+        }
     }
 
     let adapter = Arc::new(MeerkatMachine::ephemeral());
@@ -4336,6 +4345,15 @@ async fn idle_non_host_sessions_do_not_spawn_background_comms_drains() {
         > {
             Ok(Vec::new())
         }
+
+        async fn try_recv_classified_inbox_interaction(
+            &self,
+        ) -> Result<
+            Option<meerkat_core::interaction::ClassifiedInboxInteraction>,
+            meerkat_core::agent::CommsCapabilityError,
+        > {
+            Ok(None)
+        }
     }
 
     let adapter = Arc::new(MeerkatMachine::ephemeral());
@@ -4405,6 +4423,15 @@ async fn attached_sessions_do_not_spawn_comms_drains_without_keep_alive() {
             meerkat_core::agent::CommsCapabilityError,
         > {
             Ok(Vec::new())
+        }
+
+        async fn try_recv_classified_inbox_interaction(
+            &self,
+        ) -> Result<
+            Option<meerkat_core::interaction::ClassifiedInboxInteraction>,
+            meerkat_core::agent::CommsCapabilityError,
+        > {
+            Ok(None)
         }
     }
 

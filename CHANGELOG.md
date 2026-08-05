@@ -13,6 +13,30 @@ via cargo-semver-checks against the published baselines).
 
 ## [Unreleased]
 
+### Fixed
+
+- Runtime comms drains now admit one classified input at a time, preserving
+  the durable FIFO tail when a drain task is cancelled or replaced.
+- Automatic mob-member rematerialization no longer replays persisted system
+  prompt configuration as a new System message. Explicit resume-time prompt
+  changes still append in transcript order.
+- Audited transcript-history hydration and rewrite now accept a semantically
+  identical live prefix when adapter rematerialization changed only physical
+  row bookkeeping. Exact row lineage remains the fast path; the typed
+  content-addressed append path reanchors current row authority and still
+  rejects divergent semantic prefixes.
+
+### Known limitations
+
+- The stock MobKit console Steer lane can accept an input while stripping its
+  content, and a steer racing member retirement may be lost. Ordinary queued
+  MobHandle, flow, and application-chat delivery lanes are unaffected. This is
+  planned for the next paired release.
+
+Meerkat 0.8.17 should be paired with MobKit 0.8.13. The pair repairs the
+0.8.16 member-input admission regression and prevents configured prompts from
+being duplicated across automatic rematerialization.
+
 ## [0.8.15] - 2026-08-03
 
 ### Added

@@ -949,9 +949,11 @@ fn install_imported_history(
         })?
         .row_prefix()
         .clone();
-    if !session.install_exact_message_row_lineage(endpoint_prefix, exact_live_prefix) {
+    if !session.install_exact_message_row_lineage(endpoint_prefix, exact_live_prefix.clone())
+        && !session.install_exact_message_row_prefix(exact_live_prefix)
+    {
         return Err(Released0810ImportError::TranscriptHistory(
-            "failed to install imported message-row lineage".to_string(),
+            "failed to install imported message-row authority".to_string(),
         ));
     }
     session

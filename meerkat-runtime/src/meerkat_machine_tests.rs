@@ -4210,6 +4210,13 @@ impl CommsRuntime for FakeDrainRuntime {
     {
         Ok(Vec::new())
     }
+
+    async fn try_recv_classified_inbox_interaction(
+        &self,
+    ) -> Result<Option<meerkat_core::interaction::ClassifiedInboxInteraction>, CommsCapabilityError>
+    {
+        Ok(None)
+    }
 }
 
 async fn spawn_test_comms_drain(
