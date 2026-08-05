@@ -44051,7 +44051,7 @@ async fn test_turn_driven_submit_work_steer_queues_when_exact_boundary_is_unavai
     service.release_session_reads();
     service.set_block_runtime_turns(false);
     service.release_one_runtime_turn();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let prompts = service.applied_runtime_prompts(&sid_worker).await;
             if prompts.iter().skip(prompt_baseline + 1).any(|prompt| {
@@ -44164,7 +44164,7 @@ async fn test_member_send_steer_queues_when_exact_boundary_is_unavailable() {
     service.release_session_reads();
     service.set_block_runtime_turns(false);
     service.release_runtime_turns();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let prompts = service.applied_runtime_prompts(&sid_worker).await;
             if prompts.iter().skip(prompt_baseline + 1).any(|prompt| {

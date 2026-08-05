@@ -2780,12 +2780,6 @@ async fn ensure_session_with_executor_upgrades_registered_session() {
     )
     .await;
 
-    let state = adapter.runtime_state(&sid).await.unwrap();
-    assert_eq!(state, RuntimeState::Attached);
-
-    let active = adapter.list_active_inputs(&sid).await.unwrap();
-    assert!(active.is_empty(), "queued work should drain after upgrade");
-
     let is = wait_for_input_state(
         &adapter,
         &sid,
@@ -2799,6 +2793,12 @@ async fn ensure_session_with_executor_upgrades_registered_session() {
         InputLifecycleState::Consumed,
         "the pre-upgrade queued input should be processed once the loop is attached"
     );
+
+    let state = adapter.runtime_state(&sid).await.unwrap();
+    assert_eq!(state, RuntimeState::Attached);
+
+    let active = adapter.list_active_inputs(&sid).await.unwrap();
+    assert!(active.is_empty(), "queued work should drain after upgrade");
 }
 
 #[tokio::test]
