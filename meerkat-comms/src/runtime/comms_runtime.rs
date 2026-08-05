@@ -536,6 +536,184 @@ impl Drop for InteractionStream {
     }
 }
 
+fn classified_entry_to_interaction(
+    entry: crate::inbox::ClassifiedInboxEntry,
+) -> Option<meerkat_core::ClassifiedInboxInteraction> {
+    use crate::agent::types::MessageIntent;
+    use crate::types::MessageKind;
+
+    let ingress = entry.ingress_fact;
+    let lifecycle_peer = entry.lifecycle_peer;
+    let from_peer = entry.from_peer.unwrap_or_else(|| "unknown".to_string());
+    let from_peer_id = ingress.route.as_ref().map(|route| route.peer_id);
+    let rendered_text = entry.text_projection.clone();
+
+    match entry.item {
+        crate::types::InboxItem::External { envelope } => {
+            // Runtime lifecycle dismissal does NOT flow through a peer message
+            // body. A peer-controlled string can never stop the local executor;
+            // dismissal must arrive as a typed lifecycle signal owned by the
+            // runtime authority. Extract handling_mode before consuming the
+            // kind. `send_response` may omit this field, so the sender side
+            // defaults it from the original request mode.
+            let envelope_handling_mode = match &envelope.kind {
+                MessageKind::Message {
+                    handling_mode: Some(mode),
+                    ..
+                }
+                | MessageKind::IncarnationFencedMessage {
+                    handling_mode: Some(mode),
+                    ..
+                }
+                | MessageKind::Request {
+                    handling_mode: Some(mode),
+                    ..
+                }
+                | MessageKind::Response {
+                    handling_mode: Some(mode),
+                    ..
+                } => *mode,
+                MessageKind::Response {
+                    handling_mode: None,
+                    ..
+                }
+                | MessageKind::Message {
+                    handling_mode: None,
+                    ..
+                }
+                | MessageKind::IncarnationFencedMessage {
+                    handling_mode: None,
+                    ..
+                }
+                | MessageKind::Request {
+                    handling_mode: None,
+                    ..
+                }
+                | MessageKind::Lifecycle { .. }
+                | MessageKind::Ack { .. } => meerkat_core::types::HandlingMode::Queue,
+            };
+            // Sender-declared content taint travels with the content facts
+            // (signed-when-present on the envelope); extract it before the kind
+            // is consumed below.
+            let sender_taint = envelope.kind.content_taint();
+            let objective_id = envelope.kind.objective_id();
+            let content = match envelope.kind {
+                MessageKind::Message {
+                    body,
+                    blocks,
+                    content_taint: _,
+                    handling_mode: _,
+                    objective_id: _,
+                } => meerkat_core::InteractionContent::Message { body, blocks },
+                MessageKind::IncarnationFencedMessage {
+                    body,
+                    blocks,
+                    content_taint: _,
+                    handling_mode: _,
+                    objective_id: _,
+                    expected_recipient,
+                } => meerkat_core::InteractionContent::IncarnationFencedMessage {
+                    body,
+                    blocks,
+                    expected_recipient,
+                },
+                MessageKind::Request {
+                    intent,
+                    params,
+                    blocks,
+                    reply_endpoint: _,
+                    content_taint: _,
+                    handling_mode: _,
+                    objective_id: _,
+                } => {
+                    let typed_intent = MessageIntent::from(intent.as_str());
+                    meerkat_core::InteractionContent::Request {
+                        intent: typed_intent.to_string(),
+                        params,
+                        blocks,
+                    }
+                }
+                MessageKind::Lifecycle { kind, params } => {
+                    meerkat_core::InteractionContent::Request {
+                        intent: kind.to_string(),
+                        params,
+                        blocks: None,
+                    }
+                }
+                MessageKind::Response {
+                    in_reply_to,
+                    status,
+                    result,
+                    blocks,
+                    content_taint: _,
+                    handling_mode: _,
+                    objective_id: _,
+                } => {
+                    let core_status = match status {
+                        crate::types::Status::Accepted => meerkat_core::ResponseStatus::Accepted,
+                        crate::types::Status::Completed => meerkat_core::ResponseStatus::Completed,
+                        crate::types::Status::Failed => meerkat_core::ResponseStatus::Failed,
+                    };
+                    meerkat_core::InteractionContent::Response {
+                        in_reply_to: meerkat_core::InteractionId(in_reply_to),
+                        status: core_status,
+                        result,
+                        blocks,
+                    }
+                }
+                MessageKind::Ack { .. } => {
+                    // Acks should never reach classified drain.
+                    return None;
+                }
+            };
+
+            Some(meerkat_core::ClassifiedInboxInteraction {
+                interaction: meerkat_core::InboxInteraction {
+                    id: meerkat_core::InteractionId(envelope.id),
+                    from_route: from_peer_id,
+                    from: from_peer,
+                    content,
+                    rendered_text,
+                    handling_mode: envelope_handling_mode,
+                    render_metadata: None,
+                    sender_taint,
+                    objective_id,
+                },
+                ingress,
+                lifecycle_peer,
+                response_terminality: entry.response_terminality,
+            })
+        }
+        crate::types::InboxItem::PlainEvent {
+            body,
+            source,
+            handling_mode,
+            objective_id,
+            interaction_id,
+            blocks,
+            render_metadata,
+            ..
+        } => Some(meerkat_core::ClassifiedInboxInteraction {
+            interaction: meerkat_core::InboxInteraction {
+                id: meerkat_core::InteractionId(interaction_id.unwrap_or_else(uuid::Uuid::new_v4)),
+                from_route: None,
+                from: format!("event:{source}"),
+                content: meerkat_core::InteractionContent::Message { body, blocks },
+                rendered_text,
+                handling_mode,
+                render_metadata,
+                // Plain events are host-injected, not peer envelopes: no
+                // sender declaration exists.
+                sender_taint: None,
+                objective_id,
+            },
+            ingress,
+            lifecycle_peer,
+            response_terminality: entry.response_terminality,
+        }),
+    }
+}
+
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl CoreCommsRuntime for CommsRuntime {
@@ -1358,202 +1536,23 @@ impl CoreCommsRuntime for CommsRuntime {
         &self,
     ) -> Result<Vec<meerkat_core::ClassifiedInboxInteraction>, meerkat_core::CommsCapabilityError>
     {
-        use crate::agent::types::MessageIntent;
-        use crate::types::MessageKind;
-
         let mut inbox = self.inbox.lock().await;
         let classified_entries = inbox.try_drain_classified();
-
-        if classified_entries.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // Use stored classification metadata — NO trust re-check.
-        // Snapshot semantics: classification was fixed at enqueue time.
         Ok(classified_entries
             .into_iter()
-            .filter_map(|entry| {
-                let ingress = entry.ingress_fact;
-                let lifecycle_peer = entry.lifecycle_peer;
-                let from_peer = entry.from_peer.unwrap_or_else(|| "unknown".to_string());
-                let from_peer_id = ingress.route.as_ref().map(|route| route.peer_id);
-                let rendered_text = entry.text_projection.clone();
-
-                match entry.item {
-                    crate::types::InboxItem::External { envelope } => {
-                        // Runtime lifecycle dismissal does NOT flow through a
-                        // peer message body. A peer-controlled string can never
-                        // stop the local executor; dismissal must arrive as a
-                        // typed lifecycle signal owned by the runtime authority.
-                        // Extract handling_mode before consuming the kind.
-                        // `send_response` may omit this field, so the sender
-                        // side defaults it from the original request mode.
-                        let envelope_handling_mode = match &envelope.kind {
-                            MessageKind::Message {
-                                handling_mode: Some(mode),
-                                ..
-                            }
-                            | MessageKind::IncarnationFencedMessage {
-                                handling_mode: Some(mode),
-                                ..
-                            }
-                            | MessageKind::Request {
-                                handling_mode: Some(mode),
-                                ..
-                            }
-                            | MessageKind::Response {
-                                handling_mode: Some(mode),
-                                ..
-                            } => *mode,
-                            MessageKind::Response {
-                                handling_mode: None,
-                                ..
-                            }
-                            | MessageKind::Message {
-                                handling_mode: None,
-                                ..
-                            }
-                            | MessageKind::IncarnationFencedMessage {
-                                handling_mode: None,
-                                ..
-                            }
-                            | MessageKind::Request {
-                                handling_mode: None,
-                                ..
-                            }
-                            | MessageKind::Lifecycle { .. }
-                            | MessageKind::Ack { .. } => meerkat_core::types::HandlingMode::Queue,
-                        };
-                        // Sender-declared content taint travels with the
-                        // content facts (signed-when-present on the envelope);
-                        // extract it before the kind is consumed below.
-                        let sender_taint = envelope.kind.content_taint();
-                        let objective_id = envelope.kind.objective_id();
-                        let content = match envelope.kind {
-                            MessageKind::Message {
-                                body,
-                                blocks,
-                                content_taint: _,
-                                handling_mode: _,
-                                objective_id: _,
-                            } => meerkat_core::InteractionContent::Message { body, blocks },
-                            MessageKind::IncarnationFencedMessage {
-                                body,
-                                blocks,
-                                content_taint: _,
-                                handling_mode: _,
-                                objective_id: _,
-                                expected_recipient,
-                            } => meerkat_core::InteractionContent::IncarnationFencedMessage {
-                                body,
-                                blocks,
-                                expected_recipient,
-                            },
-                            MessageKind::Request {
-                                intent,
-                                params,
-                                blocks,
-                                reply_endpoint: _,
-                                content_taint: _,
-                                handling_mode: _,
-                                objective_id: _,
-                            } => {
-                                let typed_intent = MessageIntent::from(intent.as_str());
-                                meerkat_core::InteractionContent::Request {
-                                    intent: typed_intent.to_string(),
-                                    params,
-                                    blocks,
-                                }
-                            }
-                            MessageKind::Lifecycle { kind, params } => {
-                                meerkat_core::InteractionContent::Request {
-                                    intent: kind.to_string(),
-                                    params,
-                                    blocks: None,
-                                }
-                            }
-                            MessageKind::Response {
-                                in_reply_to,
-                                status,
-                                result,
-                                blocks,
-                                content_taint: _,
-                                handling_mode: _,
-                                objective_id: _,
-                            } => {
-                                let core_status = match status {
-                                    crate::types::Status::Accepted => {
-                                        meerkat_core::ResponseStatus::Accepted
-                                    }
-                                    crate::types::Status::Completed => {
-                                        meerkat_core::ResponseStatus::Completed
-                                    }
-                                    crate::types::Status::Failed => {
-                                        meerkat_core::ResponseStatus::Failed
-                                    }
-                                };
-                                meerkat_core::InteractionContent::Response {
-                                    in_reply_to: meerkat_core::InteractionId(in_reply_to),
-                                    status: core_status,
-                                    result,
-                                    blocks,
-                                }
-                            }
-                            MessageKind::Ack { .. } => {
-                                // Acks should never reach classified drain
-                                return None;
-                            }
-                        };
-
-                        Some(meerkat_core::ClassifiedInboxInteraction {
-                            interaction: meerkat_core::InboxInteraction {
-                                id: meerkat_core::InteractionId(envelope.id),
-                                from_route: from_peer_id,
-                                from: from_peer,
-                                content,
-                                rendered_text,
-                                handling_mode: envelope_handling_mode,
-                                render_metadata: None,
-                                sender_taint,
-                                objective_id,
-                            },
-                            ingress,
-                            lifecycle_peer,
-                            response_terminality: entry.response_terminality,
-                        })
-                    }
-                    crate::types::InboxItem::PlainEvent {
-                        body,
-                        source,
-                        handling_mode,
-                        objective_id,
-                        interaction_id,
-                        blocks,
-                        render_metadata,
-                        ..
-                    } => Some(meerkat_core::ClassifiedInboxInteraction {
-                        interaction: meerkat_core::InboxInteraction {
-                            id: meerkat_core::InteractionId(
-                                interaction_id.unwrap_or_else(uuid::Uuid::new_v4),
-                            ),
-                            from_route: None,
-                            from: format!("event:{source}"),
-                            content: meerkat_core::InteractionContent::Message { body, blocks },
-                            rendered_text,
-                            handling_mode,
-                            render_metadata,
-                            // Plain events are host-injected, not peer
-                            // envelopes: no sender declaration exists.
-                            sender_taint: None,
-                            objective_id,
-                        },
-                        ingress,
-                        lifecycle_peer,
-                        response_terminality: entry.response_terminality,
-                    }),
-                }
-            })
+            .filter_map(classified_entry_to_interaction)
             .collect())
+    }
+
+    async fn try_recv_classified_inbox_interaction(
+        &self,
+    ) -> Result<Option<meerkat_core::ClassifiedInboxInteraction>, meerkat_core::CommsCapabilityError>
+    {
+        let mut inbox = self.inbox.lock().await;
+        // Use stored classification metadata — NO trust re-check.
+        // Snapshot semantics: classification was fixed at enqueue time.
+        Ok(std::iter::from_fn(|| inbox.try_recv_one_classified())
+            .find_map(classified_entry_to_interaction))
     }
 
     async fn peer_ingress_queue_snapshot(

@@ -157,8 +157,9 @@ pub fn spawn_comms_drain(
             // indistinguishable from an idle inbox and triggering the
             // idle/dismiss lifecycle branch below). Empty-because-error must be
             // distinguishable from empty-because-idle before deciding to idle.
-            let candidates = match comms_runtime.drain_classified_inbox_interactions().await {
-                Ok(candidates) => candidates,
+            let candidates = match comms_runtime.try_recv_classified_inbox_interaction().await {
+                Ok(Some(candidate)) => vec![candidate],
+                Ok(None) => Vec::new(),
                 Err(err) => {
                     // A classified-drain fault is NOT an idle inbox. Fail closed
                     // with the typed `Failed` terminal owned by the drain
@@ -6670,7 +6671,7 @@ mod tests {
     use meerkat_core::interaction::{PeerIngressConvention, PeerIngressIdentity};
     use meerkat_core::types::HandlingMode;
     use serde_json::json;
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{HashMap, HashSet, VecDeque};
     use uuid::Uuid;
 
     struct ExhaustedDirectedTurnObservation;
@@ -7800,6 +7801,14 @@ mod tests {
                 .into_iter()
                 .collect())
         }
+        async fn try_recv_classified_inbox_interaction(
+            &self,
+        ) -> Result<
+            Option<meerkat_core::interaction::ClassifiedInboxInteraction>,
+            meerkat_core::agent::CommsCapabilityError,
+        > {
+            Ok(self.candidate.lock().expect("candidate mutex").take())
+        }
 
         fn mark_interaction_complete(&self, _id: &InteractionId) {
             self.completed_count
@@ -7929,6 +7938,108 @@ mod tests {
         }
     }
 
+    struct PrefixPausingRuntime {
+        notify: Arc<tokio::sync::Notify>,
+        candidates: std::sync::Mutex<VecDeque<PeerInputCandidate>>,
+        received: std::sync::Mutex<Vec<InteractionId>>,
+        receive_calls: std::sync::atomic::AtomicUsize,
+        pause_before_receive: usize,
+        paused: std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    }
+
+    impl PrefixPausingRuntime {
+        fn new(
+            candidates: Vec<PeerInputCandidate>,
+            pause_before_receive: usize,
+            paused: tokio::sync::oneshot::Sender<()>,
+        ) -> Self {
+            Self {
+                notify: Arc::new(tokio::sync::Notify::new()),
+                candidates: std::sync::Mutex::new(candidates.into()),
+                received: std::sync::Mutex::new(Vec::new()),
+                receive_calls: std::sync::atomic::AtomicUsize::new(0),
+                pause_before_receive,
+                paused: std::sync::Mutex::new(Some(paused)),
+            }
+        }
+
+        fn remaining(&self) -> usize {
+            self.candidates.lock().expect("candidate mutex").len()
+        }
+
+        fn received(&self) -> Vec<InteractionId> {
+            self.received.lock().expect("received mutex").clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl CommsRuntime for PrefixPausingRuntime {
+        async fn drain_messages(&self) -> Vec<String> {
+            Vec::new()
+        }
+
+        fn inbox_notify(&self) -> Arc<tokio::sync::Notify> {
+            self.notify.clone()
+        }
+
+        async fn try_recv_classified_inbox_interaction(
+            &self,
+        ) -> Result<
+            Option<meerkat_core::interaction::ClassifiedInboxInteraction>,
+            meerkat_core::agent::CommsCapabilityError,
+        > {
+            let call = self
+                .receive_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            if call == self.pause_before_receive {
+                if let Some(paused) = self.paused.lock().expect("paused mutex").take() {
+                    let _ = paused.send(());
+                }
+                std::future::pending::<()>().await;
+            }
+            let candidate = self.candidates.lock().expect("candidate mutex").pop_front();
+            if let Some(candidate) = candidate.as_ref() {
+                self.received
+                    .lock()
+                    .expect("received mutex")
+                    .push(candidate.interaction.id);
+            }
+            Ok(candidate)
+        }
+    }
+
+    fn actionable_message_candidate(index: usize) -> PeerInputCandidate {
+        let id = InteractionId(Uuid::new_v4());
+        let peer_id = PeerId::new();
+        let sender = format!("fan-in-worker-{index}");
+        PeerInputCandidate {
+            interaction: InboxInteraction {
+                objective_id: None,
+                sender_taint: None,
+                id,
+                from_route: Some(peer_id),
+                from: sender.clone(),
+                content: InteractionContent::Message {
+                    body: format!("DONE {index}"),
+                    blocks: None,
+                },
+                rendered_text: format!("DONE {index}"),
+                handling_mode: HandlingMode::Steer,
+                render_metadata: None,
+            },
+            ingress: PeerIngressFact::peer(
+                id,
+                PeerInputClass::ActionableMessage,
+                meerkat_core::PeerIngressKind::Message,
+                Some(meerkat_core::PeerIngressAuthDecision::Required),
+                PeerIngressIdentity::new(peer_id, sender, PeerIngressConvention::Message),
+            ),
+            lifecycle_peer: None,
+            response_terminality: None,
+        }
+    }
+
     #[async_trait::async_trait]
     impl CommsRuntime for ClassifiedDrainOutcomeRuntime {
         async fn drain_messages(&self) -> Vec<String> {
@@ -7951,6 +8062,21 @@ mod tests {
                 ))
             } else {
                 Ok(Vec::new())
+            }
+        }
+
+        async fn try_recv_classified_inbox_interaction(
+            &self,
+        ) -> Result<
+            Option<meerkat_core::interaction::ClassifiedInboxInteraction>,
+            meerkat_core::agent::CommsCapabilityError,
+        > {
+            if self.fail_classified_drain {
+                Err(meerkat_core::agent::CommsCapabilityError::Unsupported(
+                    "synthetic classification fault".to_string(),
+                ))
+            } else {
+                Ok(None)
             }
         }
     }
@@ -8037,6 +8163,86 @@ mod tests {
                 .await
                 .is_err(),
             "an empty (Ok) inbox must idle, not exit promptly"
+        );
+    }
+
+    #[tokio::test]
+    async fn abort_after_fan_in_prefix_preserves_fifo_tail_for_replacement_drain() {
+        const FAN_IN: usize = 69;
+        const PREFIX: usize = 24;
+
+        let adapter = Arc::new(MeerkatMachine::ephemeral());
+        let session_id = SessionId::new();
+        adapter
+            .register_session(session_id.clone())
+            .await
+            .expect("register session");
+
+        let candidates = (0..FAN_IN)
+            .map(actionable_message_candidate)
+            .collect::<Vec<_>>();
+        let expected_order = candidates
+            .iter()
+            .map(|candidate| candidate.interaction.id)
+            .collect::<Vec<_>>();
+        let (paused_tx, paused_rx) = tokio::sync::oneshot::channel();
+        let runtime = Arc::new(PrefixPausingRuntime::new(candidates, PREFIX + 1, paused_tx));
+        let runtime_dyn: Arc<dyn CommsRuntime> = runtime.clone();
+
+        let first_drain = spawn_authorized_test_comms_drain(
+            adapter.clone(),
+            session_id.clone(),
+            runtime_dyn.clone(),
+            Duration::from_secs(60),
+        )
+        .await;
+        tokio::time::timeout(Duration::from_secs(2), paused_rx)
+            .await
+            .expect("first drain must reach the deterministic replacement seam")
+            .expect("pause sender must remain live");
+
+        first_drain.abort();
+        let cancelled = first_drain
+            .await
+            .expect_err("first drain must be cancelled");
+        assert!(cancelled.is_cancelled());
+        assert_eq!(
+            runtime.remaining(),
+            FAN_IN - PREFIX,
+            "aborting after a prefix must leave the unstarted FIFO tail in the inbox"
+        );
+        assert_eq!(
+            adapter
+                .meerkat_machine_spine_snapshot(&session_id)
+                .await
+                .expect("registered session snapshot")
+                .ledger
+                .input_count,
+            PREFIX,
+            "the first drain must admit exactly the completed prefix"
+        );
+
+        let replacement = spawn_comms_drain(
+            adapter.clone(),
+            session_id.clone(),
+            runtime_dyn,
+            Some(Duration::from_millis(10)),
+        );
+        tokio::time::timeout(Duration::from_secs(2), replacement)
+            .await
+            .expect("replacement drain must consume the retained tail")
+            .expect("replacement drain must not panic");
+
+        let snapshot = adapter
+            .meerkat_machine_spine_snapshot(&session_id)
+            .await
+            .expect("registered session snapshot");
+        assert_eq!(snapshot.ledger.input_count, FAN_IN);
+        assert_eq!(runtime.remaining(), 0);
+        assert_eq!(
+            runtime.received(),
+            expected_order,
+            "replacement must resume at the exact next interaction without loss, duplication, or reordering"
         );
     }
 
@@ -14261,6 +14467,15 @@ mod tests {
                 .take()
                 .into_iter()
                 .collect())
+        }
+
+        async fn try_recv_classified_inbox_interaction(
+            &self,
+        ) -> Result<
+            Option<meerkat_core::interaction::ClassifiedInboxInteraction>,
+            meerkat_core::agent::CommsCapabilityError,
+        > {
+            Ok(self.candidate.lock().expect("candidate mutex").take())
         }
 
         fn mark_interaction_complete(&self, _id: &InteractionId) {

@@ -1702,6 +1702,20 @@ pub trait CommsRuntime: Send + Sync {
         ))
     }
 
+    /// Receive at most one classified inbox interaction.
+    ///
+    /// Session-backed drain loops must use this cancellation-safe dequeue
+    /// surface before awaiting admission. Removing a whole batch and then
+    /// awaiting each admission can strand the unprocessed tail in task-local
+    /// memory if the drain task is aborted or replaced.
+    async fn try_recv_classified_inbox_interaction(
+        &self,
+    ) -> Result<Option<crate::interaction::ClassifiedInboxInteraction>, CommsCapabilityError> {
+        Err(CommsCapabilityError::Unsupported(
+            "try_recv_classified_inbox_interaction".to_string(),
+        ))
+    }
+
     /// Drain canonical peer/event ingress candidates.
     ///
     /// This remains the live runtime drain bridge for call sites that consume

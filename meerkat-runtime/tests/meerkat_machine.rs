@@ -4253,6 +4253,15 @@ async fn unregister_session_aborts_spawned_drain_and_clears_suppression() {
         > {
             Ok(Vec::new())
         }
+
+        async fn try_recv_classified_inbox_interaction(
+            &self,
+        ) -> Result<
+            Option<meerkat_core::interaction::ClassifiedInboxInteraction>,
+            meerkat_core::agent::CommsCapabilityError,
+        > {
+            Ok(None)
+        }
     }
 
     let adapter = Arc::new(MeerkatMachine::ephemeral());
@@ -4336,6 +4345,15 @@ async fn idle_non_host_sessions_do_not_spawn_background_comms_drains() {
         > {
             Ok(Vec::new())
         }
+
+        async fn try_recv_classified_inbox_interaction(
+            &self,
+        ) -> Result<
+            Option<meerkat_core::interaction::ClassifiedInboxInteraction>,
+            meerkat_core::agent::CommsCapabilityError,
+        > {
+            Ok(None)
+        }
     }
 
     let adapter = Arc::new(MeerkatMachine::ephemeral());
@@ -4405,6 +4423,15 @@ async fn attached_sessions_do_not_spawn_comms_drains_without_keep_alive() {
             meerkat_core::agent::CommsCapabilityError,
         > {
             Ok(Vec::new())
+        }
+
+        async fn try_recv_classified_inbox_interaction(
+            &self,
+        ) -> Result<
+            Option<meerkat_core::interaction::ClassifiedInboxInteraction>,
+            meerkat_core::agent::CommsCapabilityError,
+        > {
+            Ok(None)
         }
     }
 
