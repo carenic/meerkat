@@ -4951,7 +4951,18 @@ impl Session {
                 "compact transcript graph has no final endpoint witness".to_string(),
             )
         })?;
-        Ok(self.exact_message_row_lineage_extends(endpoint.row_prefix(), current_count))
+        if self.exact_message_row_lineage_extends(endpoint.row_prefix(), current_count) {
+            return Ok(true);
+        }
+
+        let live_prefix_revision = self
+            .transcript_prefix_digest(endpoint.message_count())
+            .map_err(|error| {
+                TranscriptEditError::HistoryStateMalformed(format!(
+                    "failed to derive live transcript prefix revision: {error}"
+                ))
+            })?;
+        Ok(live_prefix_revision == state.head())
     }
 
     /// Load exact compaction projection intents carried to the runtime's
@@ -6521,11 +6532,53 @@ mod tests {
             .remove(SESSION_TRANSCRIPT_HISTORY_STATE_KEY);
         let mut replay: Session = serde_json::from_value(slim_document)?;
         let live_revision = replay.transcript_content_digest()?;
+        let endpoint = state
+            .final_endpoint_witness()
+            .ok_or_else(|| std::io::Error::other("history endpoint missing"))?;
 
         assert_eq!(state.head(), live_revision);
         assert!(
-            !replay.live_transcript_extends_history_head(&state, "")?,
+            !replay.exact_message_row_lineage_extends(
+                endpoint.row_prefix(),
+                u64::try_from(replay.messages().len())?,
+            ),
             "the replay fixture must lack the exact endpoint row lineage"
+        );
+        replay.install_validated_audited_transcript_history_preserving_live(validated)?;
+
+        Ok(())
+    }
+
+    #[test]
+    fn audited_history_install_accepts_live_append_without_row_lineage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut source = Session::new();
+        source.push(Message::User(UserMessage::text("before".to_string())));
+        source.commit_transcript_rewrite(
+            TranscriptRewriteSelection::MessageRange { start: 0, end: 1 },
+            vec![Message::User(UserMessage::text("after".to_string()))],
+            TranscriptRewriteReason::new("unit-test"),
+            Some("unit-test".to_string()),
+            None,
+        )?;
+
+        let state = source
+            .transcript_history_state()?
+            .ok_or_else(|| std::io::Error::other("source history missing"))?;
+        let validated = ValidatedTranscriptHistory::seal_owned(state.clone())?;
+        let mut slim_document = serde_json::to_value(&source)?;
+        slim_document["metadata"]
+            .as_object_mut()
+            .ok_or_else(|| std::io::Error::other("session metadata is not an object"))?
+            .remove(SESSION_TRANSCRIPT_HISTORY_STATE_KEY);
+        let mut replay: Session = serde_json::from_value(slim_document)?;
+        replay.push(Message::User(UserMessage::text("appended".to_string())));
+        let live_revision = replay.transcript_content_digest()?;
+
+        assert_ne!(state.head(), live_revision);
+        assert!(
+            replay.live_transcript_extends_history_head(&state, &live_revision)?,
+            "the audited endpoint content digest must prove the live transcript prefix"
         );
         replay.install_validated_audited_transcript_history_preserving_live(validated)?;
 
