@@ -4936,8 +4936,11 @@ impl Session {
     pub(crate) fn live_transcript_extends_history_head(
         &self,
         state: &TranscriptHistoryState,
-        _live_revision: &str,
+        live_revision: &str,
     ) -> Result<bool, TranscriptEditError> {
+        if state.head() == live_revision {
+            return Ok(true);
+        }
         let current_count = u64::try_from(self.messages.len()).map_err(|_| {
             TranscriptEditError::HistoryStateMalformed(
                 "live transcript row count exceeds u64".to_string(),
@@ -6493,6 +6496,41 @@ impl PersistedSessionMetadataView {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
+
+    #[test]
+    fn audited_history_install_accepts_exact_live_revision_without_row_lineage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut source = Session::new();
+        source.push(Message::User(UserMessage::text("before".to_string())));
+        source.commit_transcript_rewrite(
+            TranscriptRewriteSelection::MessageRange { start: 0, end: 1 },
+            vec![Message::User(UserMessage::text("after".to_string()))],
+            TranscriptRewriteReason::new("unit-test"),
+            Some("unit-test".to_string()),
+            None,
+        )?;
+
+        let state = source
+            .transcript_history_state()?
+            .ok_or_else(|| std::io::Error::other("source history missing"))?;
+        let validated = ValidatedTranscriptHistory::seal_owned(state.clone())?;
+        let mut slim_document = serde_json::to_value(&source)?;
+        slim_document["metadata"]
+            .as_object_mut()
+            .ok_or_else(|| std::io::Error::other("session metadata is not an object"))?
+            .remove(SESSION_TRANSCRIPT_HISTORY_STATE_KEY);
+        let mut replay: Session = serde_json::from_value(slim_document)?;
+        let live_revision = replay.transcript_content_digest()?;
+
+        assert_eq!(state.head(), live_revision);
+        assert!(
+            !replay.live_transcript_extends_history_head(&state, "")?,
+            "the replay fixture must lack the exact endpoint row lineage"
+        );
+        replay.install_validated_audited_transcript_history_preserving_live(validated)?;
+
+        Ok(())
+    }
 
     /// Ordinary append does not consult or rewrite transcript-history
     /// metadata, regardless of whether the session's parsed-graph cache is

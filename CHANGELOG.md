@@ -20,6 +20,9 @@ via cargo-semver-checks against the published baselines).
 - Automatic mob-member rematerialization no longer replays persisted system
   prompt configuration as a new System message. Explicit resume-time prompt
   changes still append in transcript order.
+- Audited transcript-history hydration now accepts an exact live revision even
+  when a slim HeadCanonical materialization does not carry endpoint row-lineage
+  metadata. Prefix-extension cases remain fail-closed on exact row lineage.
 
 Meerkat 0.8.17 should be paired with MobKit 0.8.13. The pair repairs the
 0.8.16 member-input admission regression and prevents configured prompts from
