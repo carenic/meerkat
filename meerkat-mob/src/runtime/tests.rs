@@ -41481,6 +41481,13 @@ impl RuntimeBackedRealCommsSessionService {
             .store(enabled, Ordering::Relaxed);
     }
 
+    async fn reset_keep_alive_notifier(&self, session_id: &SessionId) {
+        self.keep_alive_notifiers
+            .write()
+            .await
+            .insert(session_id.clone(), Arc::new(tokio::sync::Notify::new()));
+    }
+
     fn set_append_system_context_delay_ms(&self, delay_ms: u64) {
         self.append_system_context_delay_ms
             .store(delay_ms, Ordering::Relaxed);
@@ -44593,6 +44600,11 @@ async fn test_default_peer_response_inherits_request_steer_while_requester_runni
         "runtime-start barrier fired without recording the busy requester prompt; prompts={requester_prompts:?}"
     );
     service.set_keep_alive_turns_complete_immediately(false);
+    // Install a fresh notifier before releasing the content barrier. The
+    // kickoff path may have left a stored Notify permit on the original test
+    // notifier, which would let this turn finish and make the response race a
+    // second apply instead of exercising the active-requester boundary.
+    service.reset_keep_alive_notifier(&sid_requester).await;
     service
         .clear_runtime_turn_content_barrier(&sid_requester)
         .await;
@@ -47221,6 +47233,26 @@ async fn test_discarded_live_session_revived_by_machine_authorized_dispatch() {
         .expect("session-backed member")
         .clone();
 
+    // Production-shaped prompt history: automatic rematerialization must
+    // preserve every persisted System row, including byte-identical repeats.
+    // These are transcript events, not configuration entries to normalize.
+    let expected_before_revival = {
+        let mut persisted_sessions = service.persisted_sessions.write().await;
+        let persisted = persisted_sessions
+            .get_mut(&bridge_session_id)
+            .expect("durable bridge session");
+        for _ in 0..12 {
+            persisted.append_system_message("repeated runtime instruction".to_string());
+        }
+        let expected = persisted.messages().to_vec();
+        service
+            .live_session_data
+            .write()
+            .await
+            .insert(bridge_session_id.clone(), persisted.clone());
+        expected
+    };
+
     // Model the #34 fail-closed discard: the live session (and with it the
     // comms runtime) is dropped out from under MobMachine while the durable
     // snapshot stays loadable and the member stays Active.
@@ -47251,6 +47283,15 @@ async fn test_discarded_live_session_revived_by_machine_authorized_dispatch() {
             .await
             .expect("has_live_session"),
         "revival must rebuild the live session under the unchanged binding"
+    );
+    let revived = service
+        .live_session_clone(&bridge_session_id)
+        .await
+        .expect("revived bridge session");
+    assert_eq!(
+        revived.messages(),
+        expected_before_revival,
+        "machine-authorized revival must preserve repeated System rows byte-for-byte and in order",
     );
     let turn_prompts = service.start_turn_prompts.read().await.clone();
     assert!(
