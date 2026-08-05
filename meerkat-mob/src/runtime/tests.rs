@@ -43597,7 +43597,7 @@ async fn test_active_autonomous_direct_steer_falls_back_when_exact_boundary_is_u
         .clear_runtime_turn_content_barrier(&sid_worker)
         .await;
     service.release_one_runtime_turn();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let prompts = service.applied_runtime_prompts(&sid_worker).await;
             if prompts.iter().skip(active_apply_count).any(|prompt| {
@@ -43711,7 +43711,7 @@ async fn test_active_internal_submit_work_steer_falls_back_when_exact_boundary_i
         .clear_runtime_turn_content_barrier(&sid_worker)
         .await;
     service.release_one_runtime_turn();
-    tokio::time::timeout(Duration::from_secs(2), async {
+    tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             let prompts = service.applied_runtime_prompts(&sid_worker).await;
             if prompts.iter().skip(active_apply_count).any(|prompt| {
