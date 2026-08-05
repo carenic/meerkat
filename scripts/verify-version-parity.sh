@@ -199,9 +199,12 @@ fi
 echo ""
 echo "Bazel CARGO_PKG_VERSION metadata:"
 BAZEL_BUILDS=$(
-    find "$ROOT" -type f -name BUILD.bazel \
-        -not -path "$ROOT/.git/*" \
-        -not -path "$ROOT/target/*" \
+    find "$ROOT" \
+        \( -path "$ROOT/.git" \
+        -o -path "$ROOT/target" \
+        -o -path "$ROOT/.claude/worktrees" \
+        -o -path "$ROOT/.codex/worktrees" \) -prune \
+        -o -type f -name BUILD.bazel \
         -exec grep -l '"CARGO_PKG_VERSION":' {} + |
         sort
 )
