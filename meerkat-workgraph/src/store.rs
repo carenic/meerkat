@@ -13,7 +13,8 @@ use rusqlite::{
 use crate::WorkGraphError;
 use crate::types::{
     AttentionListRequest, AttentionPruneRequest, WorkAttentionBinding, WorkAttentionBindingId,
-    WorkAttentionStatus, WorkEdge, WorkGraphEvent, WorkGraphEventKind, WorkItem, WorkItemFilter,
+    WorkAttentionStatus, WorkEdge, WorkExecutionBinding, WorkExecutionBindingFilter,
+    WorkExecutionBindingId, WorkGraphEvent, WorkGraphEventKind, WorkItem, WorkItemFilter,
     WorkItemId, WorkNamespace,
 };
 use crate::{WorkAttentionMachine, WorkGraphMachine};
@@ -142,6 +143,79 @@ pub trait WorkGraphStore: Send + Sync {
         Err(unsupported(self.kind()))
     }
 
+    /// Insert one immutable execution binding after proving the referenced
+    /// WorkGraph item revision and retry-chain predecessor in the same store
+    /// transaction.
+    async fn insert_execution_binding(
+        &self,
+        _commit: crate::WorkExecutionBindCommit,
+        _expected_item_revision: u64,
+        _event: WorkGraphEvent,
+    ) -> Result<WorkExecutionBinding, WorkGraphError> {
+        Err(unsupported(self.kind()))
+    }
+
+    async fn get_execution_binding(
+        &self,
+        _realm_id: &str,
+        _namespace: &WorkNamespace,
+        _binding_id: &WorkExecutionBindingId,
+    ) -> Result<Option<WorkExecutionBinding>, WorkGraphError> {
+        Err(unsupported(self.kind()))
+    }
+
+    /// Resolve the unique execution binding for one target run in a realm.
+    /// This powers reverse linkage from Flow status without scanning a
+    /// bounded public binding list.
+    async fn get_execution_binding_by_target_run(
+        &self,
+        _realm_id: &str,
+        _run_id: &str,
+    ) -> Result<Option<WorkExecutionBinding>, WorkGraphError> {
+        Err(unsupported(self.kind()))
+    }
+
+    async fn update_execution_binding_cas(
+        &self,
+        _commit: crate::WorkExecutionObservationCommit,
+        _expected_previous_revision: u64,
+        _event: WorkGraphEvent,
+    ) -> Result<WorkExecutionBinding, WorkGraphError> {
+        Err(unsupported(self.kind()))
+    }
+
+    async fn list_execution_bindings(
+        &self,
+        _filter: WorkExecutionBindingFilter,
+    ) -> Result<Vec<WorkExecutionBinding>, WorkGraphError> {
+        Err(unsupported(self.kind()))
+    }
+
+    /// Enumerate only nonterminal execution obligations for host recovery.
+    /// Shipping stores override this with an active-queue projection so the
+    /// hot recovery path never scans historical terminal bindings.
+    async fn list_execution_bindings_for_recovery(
+        &self,
+        realm_id: &str,
+    ) -> Result<Vec<WorkExecutionBinding>, WorkGraphError> {
+        let mut bindings = self
+            .list_execution_bindings(WorkExecutionBindingFilter {
+                realm_id: Some(realm_id.to_string()),
+                namespace: None,
+                item_id: None,
+                current_only: true,
+                limit: None,
+            })
+            .await?;
+        let mut active = Vec::with_capacity(bindings.len());
+        for binding in bindings.drain(..) {
+            if !crate::WorkExecutionMachine::retry_eligible(&binding)? {
+                active.push(binding);
+            }
+        }
+        Ok(active)
+    }
+
     /// Return at most `limit` attention rows. Backends should push this bound
     /// into iteration/query ownership; the default is compatibility-only for
     /// custom stores.
@@ -201,6 +275,28 @@ pub trait WorkGraphStore: Send + Sync {
         &self,
         filter: WorkGraphEventFilter,
     ) -> Result<Vec<WorkGraphEvent>, WorkGraphError>;
+
+    /// Return a bounded public event page while omitting internal execution
+    /// lifecycle events before applying the caller's visible limit.
+    async fn list_public_events(
+        &self,
+        mut filter: WorkGraphEventFilter,
+    ) -> Result<Vec<WorkGraphEvent>, WorkGraphError> {
+        let visible_limit = filter.limit.unwrap_or(usize::MAX);
+        if visible_limit == 0 {
+            return Ok(Vec::new());
+        }
+        // Custom stores get a single bounded read by default. Built-in stores
+        // override this method so visibility is filtered before applying the
+        // caller's limit.
+        filter.limit = Some(visible_limit);
+        Ok(self
+            .list_events(filter)
+            .await?
+            .into_iter()
+            .filter(|event| !is_internal_execution_event(event.kind))
+            .collect())
+    }
 
     /// Highest sequence matching a scope without retaining the event history.
     async fn latest_event_seq(
@@ -350,6 +446,9 @@ pub struct MemoryWorkGraphStore {
 struct MemoryWorkGraphState {
     items: BTreeMap<(String, WorkNamespace, WorkItemId), WorkItem>,
     attention: BTreeMap<(String, WorkNamespace, WorkAttentionBindingId), WorkAttentionBinding>,
+    execution_bindings:
+        BTreeMap<(String, WorkNamespace, WorkExecutionBindingId), WorkExecutionBinding>,
+    execution_recovery: std::collections::BTreeSet<(String, WorkNamespace, WorkExecutionBindingId)>,
     edges: Vec<WorkEdge>,
     events: Vec<WorkGraphEvent>,
     next_event_seq: i64,
@@ -463,6 +562,188 @@ impl WorkGraphStore for MemoryWorkGraphStore {
             .collect::<Vec<_>>();
         items.sort_by(compare);
         Ok(items)
+    }
+
+    async fn insert_execution_binding(
+        &self,
+        commit: crate::WorkExecutionBindCommit,
+        expected_item_revision: u64,
+        event: WorkGraphEvent,
+    ) -> Result<WorkExecutionBinding, WorkGraphError> {
+        let (binding, effect) = commit.into_parts();
+        binding.validate()?;
+        crate::WorkExecutionMachine::validate_projection(&binding)?;
+        let (expected_state, expected_effect) =
+            crate::WorkExecutionMachine::bind(&binding.binding_id, binding.target.run_id())?;
+        if binding.machine_state != expected_state || effect != expected_effect {
+            return Err(WorkGraphError::InvalidInput(format!(
+                "work execution binding {} lacks canonical bind authority",
+                binding.binding_id
+            )));
+        }
+        let mut guard = self.inner.write().await;
+        let key = execution_binding_key(
+            &binding.work_ref.realm_id,
+            &binding.work_ref.namespace,
+            &binding.binding_id,
+        );
+        if let Some(existing) = guard.execution_bindings.get(&key) {
+            return if existing == &binding {
+                Ok(existing.clone())
+            } else {
+                Err(WorkGraphError::Conflict(format!(
+                    "work execution binding {} already exists with different content",
+                    binding.binding_id
+                )))
+            };
+        }
+        validate_execution_binding_insert(
+            &binding,
+            expected_item_revision,
+            guard.items.values(),
+            guard.execution_bindings.values(),
+        )?;
+        if !crate::WorkExecutionMachine::retry_eligible(&binding)? {
+            guard.execution_recovery.insert(key.clone());
+        }
+        guard.execution_bindings.insert(key, binding.clone());
+        guard.append_event(event);
+        Ok(binding)
+    }
+
+    async fn get_execution_binding(
+        &self,
+        realm_id: &str,
+        namespace: &WorkNamespace,
+        binding_id: &WorkExecutionBindingId,
+    ) -> Result<Option<WorkExecutionBinding>, WorkGraphError> {
+        let guard = self.inner.read().await;
+        Ok(guard
+            .execution_bindings
+            .get(&execution_binding_key(realm_id, namespace, binding_id))
+            .cloned())
+    }
+
+    async fn get_execution_binding_by_target_run(
+        &self,
+        realm_id: &str,
+        run_id: &str,
+    ) -> Result<Option<WorkExecutionBinding>, WorkGraphError> {
+        let guard = self.inner.read().await;
+        Ok(guard
+            .execution_bindings
+            .values()
+            .find(|binding| {
+                binding.work_ref.realm_id == realm_id && binding.target.run_id() == run_id
+            })
+            .cloned())
+    }
+
+    async fn update_execution_binding_cas(
+        &self,
+        commit: crate::WorkExecutionObservationCommit,
+        expected_previous_revision: u64,
+        event: WorkGraphEvent,
+    ) -> Result<WorkExecutionBinding, WorkGraphError> {
+        let (previous, observation, binding, effect) = commit.into_parts();
+        crate::WorkExecutionMachine::validate_projection(&binding)?;
+        let mut guard = self.inner.write().await;
+        let key = execution_binding_key(
+            &binding.work_ref.realm_id,
+            &binding.work_ref.namespace,
+            &binding.binding_id,
+        );
+        let current = guard.execution_bindings.get(&key).ok_or_else(|| {
+            WorkGraphError::Conflict(format!(
+                "work execution binding {} does not exist",
+                binding.binding_id
+            ))
+        })?;
+        if current.machine_state.revision != expected_previous_revision {
+            return Err(WorkGraphError::Conflict(format!(
+                "stale work execution revision for {}: expected {}, actual {}",
+                binding.binding_id, expected_previous_revision, current.machine_state.revision
+            )));
+        }
+        if current != &previous {
+            return Err(WorkGraphError::Conflict(format!(
+                "work execution transition authority for {} was minted from a different predecessor",
+                binding.binding_id
+            )));
+        }
+        let (expected_binding, expected_effect) = crate::WorkExecutionMachine::observe(
+            current.clone(),
+            expected_previous_revision,
+            observation,
+        )?;
+        if binding != expected_binding || effect != expected_effect {
+            return Err(WorkGraphError::Conflict(format!(
+                "work execution transition authority for {} does not match the generated machine result",
+                binding.binding_id
+            )));
+        }
+        if !current.has_same_immutable_spec(&binding) {
+            return Err(WorkGraphError::Conflict(format!(
+                "immutable work execution specification changed for {}",
+                binding.binding_id
+            )));
+        }
+        if crate::WorkExecutionMachine::retry_eligible(&binding)? {
+            guard.execution_recovery.remove(&key);
+        } else {
+            guard.execution_recovery.insert(key.clone());
+        }
+        guard.execution_bindings.insert(key, binding.clone());
+        guard.append_event(event);
+        Ok(binding)
+    }
+
+    async fn list_execution_bindings(
+        &self,
+        filter: WorkExecutionBindingFilter,
+    ) -> Result<Vec<WorkExecutionBinding>, WorkGraphError> {
+        let guard = self.inner.read().await;
+        let superseded = guard
+            .execution_bindings
+            .values()
+            .filter_map(|binding| {
+                binding.supersedes.clone().map(|supersedes| {
+                    (
+                        binding.work_ref.realm_id.clone(),
+                        binding.work_ref.namespace.clone(),
+                        supersedes,
+                    )
+                })
+            })
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut bindings = guard
+            .execution_bindings
+            .values()
+            .filter(|binding| execution_binding_matches_filter(binding, &filter, &superseded))
+            .cloned()
+            .collect::<Vec<_>>();
+        bindings.sort_by(|left, right| {
+            left.created_at
+                .cmp(&right.created_at)
+                .then_with(|| left.binding_id.cmp(&right.binding_id))
+        });
+        if let Some(limit) = filter.limit {
+            bindings.truncate(limit);
+        }
+        Ok(bindings)
+    }
+
+    async fn list_execution_bindings_for_recovery(
+        &self,
+        realm_id: &str,
+    ) -> Result<Vec<WorkExecutionBinding>, WorkGraphError> {
+        let guard = self.inner.read().await;
+        Ok(guard
+            .execution_recovery
+            .iter()
+            .filter(|(realm, _, _)| realm == realm_id)
+            .filter_map(|key| guard.execution_bindings.get(key).cloned())
+            .collect())
     }
 
     async fn insert_goal(
@@ -849,6 +1130,25 @@ impl WorkGraphStore for MemoryWorkGraphStore {
         Ok(events)
     }
 
+    async fn list_public_events(
+        &self,
+        filter: WorkGraphEventFilter,
+    ) -> Result<Vec<WorkGraphEvent>, WorkGraphError> {
+        let limit = filter.limit.unwrap_or(usize::MAX);
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let guard = self.inner.read().await;
+        Ok(guard
+            .events
+            .iter()
+            .filter(|event| event_matches_filter(event, &filter))
+            .filter(|event| !is_internal_execution_event(event.kind))
+            .take(limit)
+            .cloned()
+            .collect())
+    }
+
     async fn latest_event_seq(
         &self,
         filter: WorkGraphEventFilter,
@@ -885,6 +1185,141 @@ fn attention_key(
     id: &WorkAttentionBindingId,
 ) -> (String, WorkNamespace, WorkAttentionBindingId) {
     (realm_id.to_string(), namespace.clone(), id.clone())
+}
+
+fn execution_binding_key(
+    realm_id: &str,
+    namespace: &WorkNamespace,
+    id: &WorkExecutionBindingId,
+) -> (String, WorkNamespace, WorkExecutionBindingId) {
+    (realm_id.to_string(), namespace.clone(), id.clone())
+}
+
+fn validate_execution_binding_insert<'a>(
+    binding: &WorkExecutionBinding,
+    expected_item_revision: u64,
+    items: impl Iterator<Item = &'a WorkItem>,
+    bindings: impl Iterator<Item = &'a WorkExecutionBinding>,
+) -> Result<(), WorkGraphError> {
+    let item = items
+        .filter(|item| {
+            item.realm_id == binding.work_ref.realm_id
+                && item.namespace == binding.work_ref.namespace
+                && item.id == binding.work_ref.item_id
+        })
+        .last()
+        .ok_or_else(|| {
+            WorkGraphError::not_found(
+                binding.work_ref.realm_id.clone(),
+                binding.work_ref.namespace.clone(),
+                binding.work_ref.item_id.clone(),
+            )
+        })?;
+    if item.revision != expected_item_revision {
+        return Err(WorkGraphError::StaleRevision {
+            id: item.id.clone(),
+            expected: expected_item_revision,
+            actual: item.revision,
+        });
+    }
+    if WorkGraphMachine::classify_terminality(item)? {
+        return Err(WorkGraphError::InvalidTransition(format!(
+            "terminal work item {} cannot bind a new execution",
+            item.id
+        )));
+    }
+
+    let bindings = bindings.collect::<Vec<_>>();
+    if bindings
+        .iter()
+        .any(|existing| existing.target.run_id() == binding.target.run_id())
+    {
+        return Err(WorkGraphError::Conflict(format!(
+            "work execution binding {} reuses target run id {}",
+            binding.binding_id,
+            binding.target.run_id()
+        )));
+    }
+    let scoped = bindings
+        .into_iter()
+        .filter(|existing| {
+            existing.work_ref.realm_id == binding.work_ref.realm_id
+                && existing.work_ref.namespace == binding.work_ref.namespace
+                && existing.work_ref.item_id == binding.work_ref.item_id
+        })
+        .collect::<Vec<_>>();
+    if scoped.iter().any(|existing| {
+        existing.idempotency_key == binding.idempotency_key
+            || existing.target.run_id() == binding.target.run_id()
+    }) {
+        return Err(WorkGraphError::Conflict(format!(
+            "work execution binding {} reuses an idempotency key or run id",
+            binding.binding_id
+        )));
+    }
+
+    match &binding.supersedes {
+        None if !scoped.is_empty() => Err(WorkGraphError::Conflict(format!(
+            "work item {} already has an execution chain",
+            binding.work_ref.item_id
+        ))),
+        None => Ok(()),
+        Some(predecessor) => {
+            if predecessor == &binding.binding_id {
+                return Err(WorkGraphError::InvalidInput(
+                    "work execution binding cannot supersede itself".to_string(),
+                ));
+            }
+            let Some(predecessor_binding) = scoped
+                .iter()
+                .copied()
+                .find(|existing| &existing.binding_id == predecessor)
+            else {
+                return Err(WorkGraphError::InvalidInput(format!(
+                    "superseded work execution binding {predecessor} is not in the same work item chain"
+                )));
+            };
+            if !crate::WorkExecutionMachine::retry_eligible(predecessor_binding)? {
+                return Err(WorkGraphError::InvalidTransition(format!(
+                    "work execution binding {predecessor} is not terminal and cannot be superseded"
+                )));
+            }
+            if scoped
+                .iter()
+                .any(|existing| existing.supersedes.as_ref() == Some(predecessor))
+            {
+                return Err(WorkGraphError::Conflict(format!(
+                    "work execution binding {predecessor} is already superseded"
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn execution_binding_matches_filter(
+    binding: &WorkExecutionBinding,
+    filter: &WorkExecutionBindingFilter,
+    superseded: &std::collections::BTreeSet<(String, WorkNamespace, WorkExecutionBindingId)>,
+) -> bool {
+    filter
+        .realm_id
+        .as_ref()
+        .is_none_or(|realm_id| &binding.work_ref.realm_id == realm_id)
+        && filter
+            .namespace
+            .as_ref()
+            .is_none_or(|namespace| &binding.work_ref.namespace == namespace)
+        && filter
+            .item_id
+            .as_ref()
+            .is_none_or(|item_id| &binding.work_ref.item_id == item_id)
+        && (!filter.current_only
+            || !superseded.contains(&(
+                binding.work_ref.realm_id.clone(),
+                binding.work_ref.namespace.clone(),
+                binding.binding_id.clone(),
+            )))
 }
 
 fn item_matches_filter(item: &WorkItem, filter: &WorkItemFilter) -> bool {
@@ -983,6 +1418,13 @@ fn event_matches_filter(event: &WorkGraphEvent, filter: &WorkGraphEventFilter) -
     true
 }
 
+fn is_internal_execution_event(kind: WorkGraphEventKind) -> bool {
+    matches!(
+        kind,
+        WorkGraphEventKind::ExecutionBound | WorkGraphEventKind::ExecutionTransitioned
+    )
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 pub struct SqliteWorkGraphStore {
     path: PathBuf,
@@ -1014,6 +1456,8 @@ impl SqliteWorkGraphStore {
             tx.execute("DELETE FROM workgraph_edges", [])
                 .map_err(|err| WorkGraphError::Store(err.to_string()))?;
             tx.execute("DELETE FROM workgraph_attention", [])
+                .map_err(|err| WorkGraphError::Store(err.to_string()))?;
+            tx.execute("DELETE FROM workgraph_execution_bindings", [])
                 .map_err(|err| WorkGraphError::Store(err.to_string()))?;
 
             let events = {
@@ -1136,6 +1580,227 @@ impl WorkGraphStore for SqliteWorkGraphStore {
 
     async fn list_items(&self, filter: WorkItemFilter) -> Result<Vec<WorkItem>, WorkGraphError> {
         self.with_connection(|conn| list_sqlite_items(conn, &filter))
+    }
+
+    async fn insert_execution_binding(
+        &self,
+        commit: crate::WorkExecutionBindCommit,
+        expected_item_revision: u64,
+        event: WorkGraphEvent,
+    ) -> Result<WorkExecutionBinding, WorkGraphError> {
+        let (binding, effect) = commit.into_parts();
+        binding.validate()?;
+        crate::WorkExecutionMachine::validate_projection(&binding)?;
+        let (expected_state, expected_effect) =
+            crate::WorkExecutionMachine::bind(&binding.binding_id, binding.target.run_id())?;
+        if binding.machine_state != expected_state || effect != expected_effect {
+            return Err(WorkGraphError::InvalidInput(format!(
+                "work execution binding {} lacks canonical bind authority",
+                binding.binding_id
+            )));
+        }
+        self.with_connection(|conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|err| WorkGraphError::Store(err.to_string()))?;
+            if let Some(existing) = select_execution_binding(
+                &tx,
+                &binding.work_ref.realm_id,
+                &binding.work_ref.namespace,
+                &binding.binding_id,
+            )? {
+                return if existing == binding {
+                    Ok(existing)
+                } else {
+                    Err(WorkGraphError::Conflict(format!(
+                        "work execution binding {} already exists with different content",
+                        binding.binding_id
+                    )))
+                };
+            }
+            let items = select_item(
+                &tx,
+                &binding.work_ref.realm_id,
+                &binding.work_ref.namespace,
+                &binding.work_ref.item_id,
+            )?
+            .into_iter()
+            .collect::<Vec<_>>();
+            let bindings = list_sqlite_execution_bindings(
+                &tx,
+                &WorkExecutionBindingFilter {
+                    realm_id: Some(binding.work_ref.realm_id.clone()),
+                    namespace: Some(binding.work_ref.namespace.clone()),
+                    item_id: Some(binding.work_ref.item_id.clone()),
+                    current_only: false,
+                    limit: None,
+                },
+            )?;
+            validate_execution_binding_insert(
+                &binding,
+                expected_item_revision,
+                items.iter(),
+                bindings.iter(),
+            )?;
+            insert_execution_binding_tx(&tx, &binding)?;
+            insert_event_tx(&tx, &event)?;
+            tx.commit()
+                .map_err(|err| WorkGraphError::Store(err.to_string()))?;
+            Ok(binding)
+        })
+    }
+
+    async fn get_execution_binding(
+        &self,
+        realm_id: &str,
+        namespace: &WorkNamespace,
+        binding_id: &WorkExecutionBindingId,
+    ) -> Result<Option<WorkExecutionBinding>, WorkGraphError> {
+        self.with_connection(|conn| select_execution_binding(conn, realm_id, namespace, binding_id))
+    }
+
+    async fn get_execution_binding_by_target_run(
+        &self,
+        realm_id: &str,
+        run_id: &str,
+    ) -> Result<Option<WorkExecutionBinding>, WorkGraphError> {
+        self.with_connection(|conn| {
+            conn.query_row(
+                "SELECT binding_json FROM workgraph_execution_bindings
+                 WHERE realm_id = ?1 AND target_run_id = ?2",
+                params![realm_id, run_id],
+                |row| row_json(row, 0),
+            )
+            .optional()
+            .map_err(|error| WorkGraphError::Store(error.to_string()))
+        })
+    }
+
+    async fn update_execution_binding_cas(
+        &self,
+        commit: crate::WorkExecutionObservationCommit,
+        expected_previous_revision: u64,
+        event: WorkGraphEvent,
+    ) -> Result<WorkExecutionBinding, WorkGraphError> {
+        let (previous, observation, binding, effect) = commit.into_parts();
+        crate::WorkExecutionMachine::validate_projection(&binding)?;
+        self.with_connection(|conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(|error| WorkGraphError::Store(error.to_string()))?;
+            let current = select_execution_binding(
+                &tx,
+                &binding.work_ref.realm_id,
+                &binding.work_ref.namespace,
+                &binding.binding_id,
+            )?
+            .ok_or_else(|| {
+                WorkGraphError::Conflict(format!(
+                    "work execution binding {} does not exist",
+                    binding.binding_id
+                ))
+            })?;
+            if current.machine_state.revision != expected_previous_revision {
+                return Err(WorkGraphError::Conflict(format!(
+                    "stale work execution revision for {}: expected {}, actual {}",
+                    binding.binding_id, expected_previous_revision, current.machine_state.revision
+                )));
+            }
+            if current != previous {
+                return Err(WorkGraphError::Conflict(format!(
+                    "work execution transition authority for {} was minted from a different predecessor",
+                    binding.binding_id
+                )));
+            }
+            let (expected_binding, expected_effect) = crate::WorkExecutionMachine::observe(
+                current.clone(),
+                expected_previous_revision,
+                observation,
+            )?;
+            if binding != expected_binding || effect != expected_effect {
+                return Err(WorkGraphError::Conflict(format!(
+                    "work execution transition authority for {} does not match the generated machine result",
+                    binding.binding_id
+                )));
+            }
+            if !current.has_same_immutable_spec(&binding) {
+                return Err(WorkGraphError::Conflict(format!(
+                    "immutable work execution specification changed for {}",
+                    binding.binding_id
+                )));
+            }
+            let json = serde_json::to_string(&binding)
+                .map_err(|error| WorkGraphError::Store(error.to_string()))?;
+            let recovery_pending = execution_recovery_pending(&binding)?;
+            let changed = tx
+                .execute(
+                    "UPDATE workgraph_execution_bindings
+                     SET revision = ?1, recovery_pending = ?2, binding_json = ?3
+                     WHERE realm_id = ?4 AND namespace = ?5 AND binding_id = ?6
+                       AND revision = ?7",
+                    params![
+                        binding.machine_state.revision,
+                        recovery_pending,
+                        json,
+                        binding.work_ref.realm_id,
+                        binding.work_ref.namespace.as_str(),
+                        binding.binding_id.as_str(),
+                        expected_previous_revision,
+                    ],
+                )
+                .map_err(|error| WorkGraphError::Store(error.to_string()))?;
+            if changed == 0 {
+                let current = select_execution_binding(
+                    &tx,
+                    &binding.work_ref.realm_id,
+                    &binding.work_ref.namespace,
+                    &binding.binding_id,
+                )?;
+                return match current {
+                    Some(current) => Err(WorkGraphError::Conflict(format!(
+                        "stale work execution revision for {}: expected {}, actual {}",
+                        binding.binding_id,
+                        expected_previous_revision,
+                        current.machine_state.revision
+                    ))),
+                    None => Err(WorkGraphError::Conflict(format!(
+                        "work execution binding {} does not exist",
+                        binding.binding_id
+                    ))),
+                };
+            }
+            insert_event_tx(&tx, &event)?;
+            tx.commit()
+                .map_err(|error| WorkGraphError::Store(error.to_string()))?;
+            Ok(binding)
+        })
+    }
+
+    async fn list_execution_bindings(
+        &self,
+        filter: WorkExecutionBindingFilter,
+    ) -> Result<Vec<WorkExecutionBinding>, WorkGraphError> {
+        self.with_connection(|conn| list_sqlite_execution_bindings(conn, &filter))
+    }
+
+    async fn list_execution_bindings_for_recovery(
+        &self,
+        realm_id: &str,
+    ) -> Result<Vec<WorkExecutionBinding>, WorkGraphError> {
+        self.with_connection(|conn| {
+            let mut statement = conn
+                .prepare(
+                    "SELECT binding_json FROM workgraph_execution_bindings
+                     WHERE realm_id = ?1 AND recovery_pending = 1
+                     ORDER BY created_at_utc ASC, binding_id ASC",
+                )
+                .map_err(|error| WorkGraphError::Store(error.to_string()))?;
+            let rows = statement
+                .query_map([realm_id], |row| row_json::<WorkExecutionBinding>(row, 0))
+                .map_err(|error| WorkGraphError::Store(error.to_string()))?;
+            rows.map(|row| row.map_err(|error| WorkGraphError::Store(error.to_string())))
+                .collect()
+        })
     }
 
     async fn insert_goal(
@@ -1479,12 +2144,71 @@ impl WorkGraphStore for SqliteWorkGraphStore {
         self.with_connection(|conn| list_sqlite_events(conn, &filter))
     }
 
+    async fn list_public_events(
+        &self,
+        filter: WorkGraphEventFilter,
+    ) -> Result<Vec<WorkGraphEvent>, WorkGraphError> {
+        self.with_connection(|conn| list_sqlite_public_events(conn, &filter))
+    }
+
     async fn latest_event_seq(
         &self,
         filter: WorkGraphEventFilter,
     ) -> Result<Option<i64>, WorkGraphError> {
         self.with_connection(|conn| latest_sqlite_event_seq(conn, &filter))
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn build_released_0_8_15_workgraph_schema(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
+    migration_0001_workgraph_schema(tx)?;
+    migration_0002_attention_query_columns(tx)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+const RELEASED_0_8_15_WORKGRAPH_OBJECTS: &[meerkat_sqlite::SchemaObject] = &[
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "workgraph_items",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "idx_workgraph_items_realm_namespace_updated",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "workgraph_attention",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "idx_workgraph_attention_realm_namespace_updated",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "idx_workgraph_attention_scope_status",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "workgraph_edges",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "workgraph_events",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "idx_workgraph_events_realm_namespace_seq",
+    },
+];
+
+#[cfg(not(target_arch = "wasm32"))]
+fn verify_released_0_8_15_workgraph_schema(conn: &Connection) -> Result<(), String> {
+    meerkat_sqlite::verify_released_schema_fingerprint(
+        conn,
+        &WORKGRAPH_DOMAIN,
+        RELEASED_0_8_15_WORKGRAPH_OBJECTS,
+        build_released_0_8_15_workgraph_schema,
+    )
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1508,10 +2232,18 @@ pub const WORKGRAPH_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::Schem
             name: "attention-query-columns",
             apply: migration_0002_attention_query_columns,
         },
+        meerkat_sqlite::Migration {
+            version: 3,
+            name: "execution-bindings",
+            apply: migration_0003_execution_bindings,
+        },
     ],
     initialize_current: initialize_current_workgraph_schema,
-    allowed_existing_versions: &[2],
-    released_predecessors: &[],
+    allowed_existing_versions: &[2, 3],
+    released_predecessors: &[meerkat_sqlite::SchemaPredecessor {
+        version: 2,
+        verify: verify_released_0_8_15_workgraph_schema,
+    }],
     owned_objects: &[
         meerkat_sqlite::SchemaObject {
             kind: meerkat_sqlite::SchemaObjectKind::Table,
@@ -1539,6 +2271,30 @@ pub const WORKGRAPH_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::Schem
         },
         meerkat_sqlite::SchemaObject {
             kind: meerkat_sqlite::SchemaObjectKind::Table,
+            name: "workgraph_execution_bindings",
+        },
+        meerkat_sqlite::SchemaObject {
+            kind: meerkat_sqlite::SchemaObjectKind::Index,
+            name: "idx_workgraph_execution_bindings_item",
+        },
+        meerkat_sqlite::SchemaObject {
+            kind: meerkat_sqlite::SchemaObjectKind::Index,
+            name: "idx_workgraph_execution_bindings_root",
+        },
+        meerkat_sqlite::SchemaObject {
+            kind: meerkat_sqlite::SchemaObjectKind::Index,
+            name: "idx_workgraph_execution_bindings_supersedes",
+        },
+        meerkat_sqlite::SchemaObject {
+            kind: meerkat_sqlite::SchemaObjectKind::Index,
+            name: "idx_workgraph_execution_bindings_target_run",
+        },
+        meerkat_sqlite::SchemaObject {
+            kind: meerkat_sqlite::SchemaObjectKind::Index,
+            name: "idx_workgraph_execution_bindings_recovery",
+        },
+        meerkat_sqlite::SchemaObject {
+            kind: meerkat_sqlite::SchemaObjectKind::Table,
             name: "workgraph_events",
         },
         meerkat_sqlite::SchemaObject {
@@ -1552,7 +2308,46 @@ pub const WORKGRAPH_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::Schem
 #[cfg(not(target_arch = "wasm32"))]
 fn initialize_current_workgraph_schema(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
     migration_0001_workgraph_schema(tx)?;
-    migration_0002_attention_query_columns(tx)
+    migration_0002_attention_query_columns(tx)?;
+    migration_0003_execution_bindings(tx)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn migration_0003_execution_bindings(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
+    tx.execute_batch(
+        r"
+        CREATE TABLE IF NOT EXISTS workgraph_execution_bindings (
+            realm_id TEXT NOT NULL,
+            namespace TEXT NOT NULL,
+            binding_id TEXT NOT NULL,
+            item_id TEXT NOT NULL,
+            supersedes_binding_id TEXT,
+            idempotency_key TEXT NOT NULL,
+            target_run_id TEXT NOT NULL,
+            revision INTEGER NOT NULL,
+            recovery_pending INTEGER NOT NULL CHECK (recovery_pending IN (0, 1)),
+            created_at_utc TEXT NOT NULL,
+            binding_json TEXT NOT NULL,
+            PRIMARY KEY (realm_id, namespace, binding_id),
+            UNIQUE (realm_id, namespace, item_id, idempotency_key),
+            UNIQUE (realm_id, namespace, target_run_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_workgraph_execution_bindings_item
+            ON workgraph_execution_bindings
+                (realm_id, namespace, item_id, created_at_utc, binding_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_workgraph_execution_bindings_root
+            ON workgraph_execution_bindings (realm_id, namespace, item_id)
+            WHERE supersedes_binding_id IS NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_workgraph_execution_bindings_supersedes
+            ON workgraph_execution_bindings (realm_id, namespace, supersedes_binding_id)
+            WHERE supersedes_binding_id IS NOT NULL;
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_workgraph_execution_bindings_target_run
+            ON workgraph_execution_bindings (target_run_id);
+        CREATE INDEX IF NOT EXISTS idx_workgraph_execution_bindings_recovery
+            ON workgraph_execution_bindings
+                (realm_id, recovery_pending, created_at_utc, binding_id);
+        ",
+    )
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2191,6 +2986,153 @@ fn select_item(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn insert_execution_binding_tx(
+    tx: &Transaction<'_>,
+    binding: &WorkExecutionBinding,
+) -> Result<(), WorkGraphError> {
+    let json =
+        serde_json::to_string(binding).map_err(|err| WorkGraphError::Store(err.to_string()))?;
+    let recovery_pending = execution_recovery_pending(binding)?;
+    tx.execute(
+        "INSERT INTO workgraph_execution_bindings
+            (realm_id, namespace, binding_id, item_id, supersedes_binding_id,
+             idempotency_key, target_run_id, revision, recovery_pending,
+             created_at_utc, binding_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            binding.work_ref.realm_id,
+            binding.work_ref.namespace.as_str(),
+            binding.binding_id.as_str(),
+            binding.work_ref.item_id.as_str(),
+            binding
+                .supersedes
+                .as_ref()
+                .map(WorkExecutionBindingId::as_str),
+            binding.idempotency_key,
+            binding.target.run_id(),
+            binding.machine_state.revision,
+            recovery_pending,
+            binding.created_at.to_rfc3339(),
+            json,
+        ],
+    )
+    .map_err(|error| {
+        if sqlite_constraint_violation(&error) {
+            WorkGraphError::Conflict(format!(
+                "work execution binding {} conflicts with the existing execution chain",
+                binding.binding_id
+            ))
+        } else {
+            WorkGraphError::Store(error.to_string())
+        }
+    })?;
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn upsert_execution_binding_tx(
+    tx: &Transaction<'_>,
+    binding: &WorkExecutionBinding,
+) -> Result<(), WorkGraphError> {
+    let json =
+        serde_json::to_string(binding).map_err(|error| WorkGraphError::Store(error.to_string()))?;
+    let recovery_pending = execution_recovery_pending(binding)?;
+    tx.execute(
+        "INSERT INTO workgraph_execution_bindings
+            (realm_id, namespace, binding_id, item_id, supersedes_binding_id,
+             idempotency_key, target_run_id, revision, recovery_pending,
+             created_at_utc, binding_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+         ON CONFLICT(realm_id, namespace, binding_id) DO UPDATE SET
+            revision = excluded.revision,
+            recovery_pending = excluded.recovery_pending,
+            binding_json = excluded.binding_json",
+        params![
+            binding.work_ref.realm_id,
+            binding.work_ref.namespace.as_str(),
+            binding.binding_id.as_str(),
+            binding.work_ref.item_id.as_str(),
+            binding
+                .supersedes
+                .as_ref()
+                .map(WorkExecutionBindingId::as_str),
+            binding.idempotency_key,
+            binding.target.run_id(),
+            binding.machine_state.revision,
+            recovery_pending,
+            binding.created_at.to_rfc3339(),
+            json,
+        ],
+    )
+    .map_err(|error| WorkGraphError::Store(error.to_string()))?;
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn execution_recovery_pending(binding: &WorkExecutionBinding) -> Result<i64, WorkGraphError> {
+    Ok(i64::from(!crate::WorkExecutionMachine::retry_eligible(
+        binding,
+    )?))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn select_execution_binding(
+    conn: &Connection,
+    realm_id: &str,
+    namespace: &WorkNamespace,
+    binding_id: &WorkExecutionBindingId,
+) -> Result<Option<WorkExecutionBinding>, WorkGraphError> {
+    conn.query_row(
+        "SELECT binding_json FROM workgraph_execution_bindings
+         WHERE realm_id = ?1 AND namespace = ?2 AND binding_id = ?3",
+        params![realm_id, namespace.as_str(), binding_id.as_str()],
+        |row| row_json(row, 0),
+    )
+    .optional()
+    .map_err(|err| WorkGraphError::Store(err.to_string()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn list_sqlite_execution_bindings(
+    conn: &Connection,
+    filter: &WorkExecutionBindingFilter,
+) -> Result<Vec<WorkExecutionBinding>, WorkGraphError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT binding_json FROM workgraph_execution_bindings
+             ORDER BY created_at_utc ASC, binding_id ASC",
+        )
+        .map_err(|err| WorkGraphError::Store(err.to_string()))?;
+    let rows = stmt
+        .query_map([], |row| row_json::<WorkExecutionBinding>(row, 0))
+        .map_err(|err| WorkGraphError::Store(err.to_string()))?;
+    let mut all = Vec::new();
+    for row in rows {
+        all.push(row.map_err(|err| WorkGraphError::Store(err.to_string()))?);
+    }
+    let superseded = all
+        .iter()
+        .filter_map(|binding| {
+            binding.supersedes.clone().map(|supersedes| {
+                (
+                    binding.work_ref.realm_id.clone(),
+                    binding.work_ref.namespace.clone(),
+                    supersedes,
+                )
+            })
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let mut bindings = all
+        .into_iter()
+        .filter(|binding| execution_binding_matches_filter(binding, filter, &superseded))
+        .collect::<Vec<_>>();
+    if let Some(limit) = filter.limit {
+        bindings.truncate(limit);
+    }
+    Ok(bindings)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn list_sqlite_items(
     conn: &Connection,
     filter: &WorkItemFilter,
@@ -2357,6 +3299,56 @@ fn list_sqlite_events(
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+fn list_sqlite_public_events(
+    conn: &Connection,
+    filter: &WorkGraphEventFilter,
+) -> Result<Vec<WorkGraphEvent>, WorkGraphError> {
+    let limit = filter.limit.unwrap_or(usize::MAX);
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+
+    let mut clauses = vec![
+        "event_kind != 'ExecutionBound'".to_string(),
+        "event_kind != 'ExecutionTransitioned'".to_string(),
+    ];
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(realm_id) = &filter.realm_id {
+        params.push(Box::new(realm_id.clone()));
+        clauses.push(format!("realm_id = ?{}", params.len()));
+    }
+    if !filter.all_namespaces
+        && let Some(namespace) = &filter.namespace
+    {
+        params.push(Box::new(namespace.as_str().to_string()));
+        clauses.push(format!("namespace = ?{}", params.len()));
+    }
+    if let Some(after_seq) = filter.after_seq {
+        params.push(Box::new(after_seq));
+        clauses.push(format!("seq > ?{}", params.len()));
+    }
+    params.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
+    let sql = format!(
+        "SELECT seq, event_json FROM workgraph_events WHERE {} ORDER BY seq ASC LIMIT ?{}",
+        clauses.join(" AND "),
+        params.len()
+    );
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|err| WorkGraphError::Store(err.to_string()))?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            let seq = row.get::<_, i64>(0)?;
+            let mut event = row_json::<WorkGraphEvent>(row, 1)?;
+            event.seq = Some(seq);
+            Ok(event)
+        })
+        .map_err(|err| WorkGraphError::Store(err.to_string()))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|err| WorkGraphError::Store(err.to_string()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn latest_sqlite_event_seq(
     conn: &Connection,
     filter: &WorkGraphEventFilter,
@@ -2401,6 +3393,76 @@ fn replay_event_tx(tx: &Transaction<'_>, event: &WorkGraphEvent) -> Result<(), W
             let attention = payload_field::<WorkAttentionBinding>(event, "attention")?;
             upsert_attention_tx(tx, &attention)
         }
+        WorkGraphEventKind::ExecutionBound => {
+            let binding = payload_field::<WorkExecutionBinding>(event, "execution_binding")?;
+            let commit = crate::WorkExecutionMachine::prepare_bind(binding.clone())?;
+            if commit.binding() != &binding {
+                return Err(WorkGraphError::Store(format!(
+                    "execution bind event for {} changed during authority validation",
+                    binding.binding_id
+                )));
+            }
+            validate_execution_event_scope(event, &binding)?;
+            let item = select_item(
+                tx,
+                &binding.work_ref.realm_id,
+                &binding.work_ref.namespace,
+                &binding.work_ref.item_id,
+            )?
+            .ok_or_else(|| {
+                WorkGraphError::Store(format!(
+                    "execution bind for {} references a missing work item",
+                    binding.binding_id
+                ))
+            })?;
+            let bindings = list_sqlite_execution_bindings(
+                tx,
+                &WorkExecutionBindingFilter {
+                    realm_id: Some(binding.work_ref.realm_id.clone()),
+                    namespace: Some(binding.work_ref.namespace.clone()),
+                    item_id: Some(binding.work_ref.item_id.clone()),
+                    current_only: false,
+                    limit: None,
+                },
+            )?;
+            validate_execution_binding_insert(
+                &binding,
+                item.revision,
+                std::iter::once(&item),
+                bindings.iter(),
+            )?;
+            insert_execution_binding_tx(tx, &binding)
+        }
+        WorkGraphEventKind::ExecutionTransitioned => {
+            let binding = payload_field::<WorkExecutionBinding>(event, "execution_binding")?;
+            let observation =
+                payload_field::<crate::WorkExecutionObservation>(event, "observation")?;
+            validate_execution_event_scope(event, &binding)?;
+            let current = select_execution_binding(
+                tx,
+                &binding.work_ref.realm_id,
+                &binding.work_ref.namespace,
+                &binding.binding_id,
+            )?
+            .ok_or_else(|| {
+                WorkGraphError::Store(format!(
+                    "execution transition for {} precedes its bind event",
+                    binding.binding_id
+                ))
+            })?;
+            let commit = crate::WorkExecutionMachine::prepare_observation(
+                current.clone(),
+                current.machine_state.revision,
+                observation,
+            )?;
+            if commit.binding() != &binding {
+                return Err(WorkGraphError::Store(format!(
+                    "execution transition event for {} is not the exact generated machine result",
+                    binding.binding_id
+                )));
+            }
+            upsert_execution_binding_tx(tx, &binding)
+        }
         WorkGraphEventKind::Created
         | WorkGraphEventKind::Updated
         | WorkGraphEventKind::Claimed
@@ -2412,6 +3474,23 @@ fn replay_event_tx(tx: &Transaction<'_>, event: &WorkGraphEvent) -> Result<(), W
             upsert_item_tx(tx, &item)
         }
     }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn validate_execution_event_scope(
+    event: &WorkGraphEvent,
+    binding: &WorkExecutionBinding,
+) -> Result<(), WorkGraphError> {
+    if event.realm_id != binding.work_ref.realm_id
+        || event.namespace != binding.work_ref.namespace
+        || event.item_id.as_ref() != Some(&binding.work_ref.item_id)
+    {
+        return Err(WorkGraphError::Store(format!(
+            "execution event scope does not match binding {}",
+            binding.binding_id
+        )));
+    }
+    Ok(())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -2502,9 +3581,10 @@ mod tests {
         AttentionDelegatedAuthority, AttentionProjectionPolicy, CreateWorkItemRequest,
         GoalAttentionTarget, GoalCreateRequest, GoalRequestCloseRequest, GoalTerminalStatus,
         LinkWorkItemsRequest, MemoryWorkGraphStore, WorkAttentionMode, WorkAttentionStatus,
-        WorkCompletionPolicy, WorkEdgeKind, WorkGraphError, WorkGraphEvent, WorkGraphEventFilter,
-        WorkGraphEventKind, WorkGraphService, WorkGraphStore, WorkItemFilter, WorkItemId,
-        WorkNamespace,
+        WorkCompletionPolicy, WorkEdgeKind, WorkExecutionBinding, WorkExecutionBindingId,
+        WorkExecutionMachine, WorkExecutionObservation, WorkExecutionTarget, WorkGraphError,
+        WorkGraphEvent, WorkGraphEventFilter, WorkGraphEventKind, WorkGraphService, WorkGraphStore,
+        WorkItemFilter, WorkItemId, WorkItemRef, WorkNamespace,
     };
 
     fn test_edge() -> WorkEdge {
@@ -2526,6 +3606,224 @@ mod tests {
             edge.created_at,
             json!({ "edge": edge }),
         )
+    }
+
+    async fn stale_execution_commit_is_refused(store: std::sync::Arc<dyn WorkGraphStore>) {
+        let service =
+            WorkGraphService::with_scope(store.clone(), "realm", WorkNamespace::default());
+        let item = service
+            .create(CreateWorkItemRequest {
+                title: "immutable execution".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("item");
+        let binding_id = WorkExecutionBindingId::new("execution-immutable").expect("binding id");
+        let target = WorkExecutionTarget::mob_flow(
+            "mob",
+            "flow",
+            format!("sha256:{}", "c".repeat(64)),
+            "46371bce-c308-58a4-bf0b-0a262de45c12",
+            crate::WorkExecutionAuthority::TargetOwner,
+            json!({}),
+        )
+        .expect("target");
+        let (machine_state, _) =
+            WorkExecutionMachine::bind(&binding_id, target.run_id()).expect("bind machine");
+        let bound = service
+            .bind_execution(
+                WorkExecutionBinding {
+                    binding_id,
+                    work_ref: WorkItemRef {
+                        realm_id: item.realm_id.clone(),
+                        namespace: item.namespace.clone(),
+                        item_id: item.id.clone(),
+                    },
+                    target,
+                    idempotency_key: "original-key".to_string(),
+                    correlation_id: "f9ae62da-662f-5c50-940e-442c529d8e1d".to_string(),
+                    supersedes: None,
+                    machine_state,
+                    created_at: Utc::now(),
+                },
+                item.revision,
+            )
+            .await
+            .expect("bind execution")
+            .binding;
+        let commit = WorkExecutionMachine::prepare_observation(
+            bound.clone(),
+            bound.machine_state.revision,
+            WorkExecutionObservation::FlowRunning,
+        )
+        .expect("machine-minted next-state authority");
+        service
+            .observe_execution(
+                Some(bound.work_ref.realm_id.clone()),
+                Some(bound.work_ref.namespace.clone()),
+                bound.binding_id.clone(),
+                bound.machine_state.revision,
+                WorkExecutionObservation::FlowRunning,
+            )
+            .await
+            .expect("commit competing transition");
+        let event = WorkGraphEvent::item(
+            item.realm_id,
+            item.namespace,
+            item.id,
+            WorkGraphEventKind::ExecutionTransitioned,
+            Utc::now(),
+            json!({
+                "execution_binding": commit.binding(),
+                "observation": WorkExecutionObservation::FlowRunning,
+            }),
+        );
+        let error = store
+            .update_execution_binding_cas(commit, bound.machine_state.revision, event)
+            .await
+            .expect_err("store must reject a commit minted from a stale predecessor");
+        assert!(matches!(error, WorkGraphError::Conflict(_)));
+    }
+
+    async fn duplicate_execution_run_is_refused(store: std::sync::Arc<dyn WorkGraphStore>) {
+        let service = WorkGraphService::with_scope(store, "realm", WorkNamespace::default());
+        let first_item = service
+            .create(CreateWorkItemRequest {
+                title: "first execution".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("first item");
+        let second_item = service
+            .create(CreateWorkItemRequest {
+                title: "second execution".to_string(),
+                ..Default::default()
+            })
+            .await
+            .expect("second item");
+        let run_id = "24d61f25-09db-5327-99e7-63d7390a1e95";
+
+        for (index, item) in [first_item, second_item].into_iter().enumerate() {
+            let binding_id =
+                WorkExecutionBindingId::new(format!("execution-run-{index}")).expect("binding id");
+            let target = WorkExecutionTarget::mob_flow(
+                "mob",
+                "flow",
+                format!("sha256:{}", "d".repeat(64)),
+                run_id,
+                crate::WorkExecutionAuthority::TargetOwner,
+                json!({}),
+            )
+            .expect("target");
+            let (machine_state, _) =
+                WorkExecutionMachine::bind(&binding_id, target.run_id()).expect("bind machine");
+            let result = service
+                .bind_execution(
+                    WorkExecutionBinding {
+                        binding_id,
+                        work_ref: WorkItemRef {
+                            realm_id: item.realm_id,
+                            namespace: item.namespace,
+                            item_id: item.id,
+                        },
+                        target,
+                        idempotency_key: format!("run-key-{index}"),
+                        correlation_id: if index == 0 {
+                            "e25abdd9-29cf-56e3-9402-e86c78feec27".to_string()
+                        } else {
+                            "e8c85639-aa77-5d9b-ad77-b13e29675a21".to_string()
+                        },
+                        supersedes: None,
+                        machine_state,
+                        created_at: Utc::now(),
+                    },
+                    item.revision,
+                )
+                .await;
+            if index == 0 {
+                result.expect("first run binding");
+            } else {
+                assert!(matches!(result, Err(WorkGraphError::Conflict(_))));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn memory_store_rejects_stale_execution_commit() {
+        stale_execution_commit_is_refused(std::sync::Arc::new(MemoryWorkGraphStore::new())).await;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn sqlite_store_rejects_stale_execution_commit() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        stale_execution_commit_is_refused(std::sync::Arc::new(
+            crate::SqliteWorkGraphStore::open(dir.path().join("workgraph.sqlite3"))
+                .expect("sqlite store"),
+        ))
+        .await;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn sqlite_public_event_limit_is_applied_after_internal_visibility_filter() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = crate::SqliteWorkGraphStore::open(dir.path().join("workgraph.sqlite3"))
+            .expect("sqlite store");
+        let namespace = WorkNamespace::default();
+        let event = |kind| {
+            WorkGraphEvent::graph(
+                "realm".to_string(),
+                namespace.clone(),
+                kind,
+                Utc::now(),
+                json!({}),
+            )
+        };
+        store
+            .with_connection(|conn| {
+                let tx = conn
+                    .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+                    .map_err(|error| WorkGraphError::Store(error.to_string()))?;
+                super::insert_event_tx(&tx, &event(WorkGraphEventKind::Created))?;
+                for _ in 0..300 {
+                    super::insert_event_tx(&tx, &event(WorkGraphEventKind::ExecutionTransitioned))?;
+                }
+                super::insert_event_tx(&tx, &event(WorkGraphEventKind::EvidenceAdded))?;
+                tx.commit()
+                    .map_err(|error| WorkGraphError::Store(error.to_string()))
+            })
+            .expect("insert event history");
+
+        let public = store
+            .list_public_events(WorkGraphEventFilter {
+                realm_id: Some("realm".to_string()),
+                namespace: Some(namespace),
+                after_seq: Some(1),
+                limit: Some(1),
+                ..WorkGraphEventFilter::default()
+            })
+            .await
+            .expect("public event page");
+        assert_eq!(public.len(), 1);
+        assert_eq!(public[0].kind, WorkGraphEventKind::EvidenceAdded);
+        assert_eq!(public[0].seq, Some(302));
+    }
+
+    #[tokio::test]
+    async fn memory_store_rejects_cross_item_run_reuse() {
+        duplicate_execution_run_is_refused(std::sync::Arc::new(MemoryWorkGraphStore::new())).await;
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn sqlite_store_rejects_cross_item_run_reuse() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        duplicate_execution_run_is_refused(std::sync::Arc::new(
+            crate::SqliteWorkGraphStore::open(dir.path().join("workgraph.sqlite3"))
+                .expect("sqlite store"),
+        ))
+        .await;
     }
 
     #[tokio::test]
@@ -2585,6 +3883,128 @@ mod tests {
             .expect("list");
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].title, "default");
+    }
+
+    #[tokio::test]
+    async fn sqlite_rebuild_restores_execution_machine_state_from_events() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = std::sync::Arc::new(
+            crate::SqliteWorkGraphStore::open(temp.path().join("workgraph.db"))
+                .expect("sqlite store"),
+        );
+        let service =
+            WorkGraphService::with_scope(store.clone(), "realm", WorkNamespace::default());
+        let item = service
+            .create(CreateWorkItemRequest {
+                realm_id: None,
+                namespace: None,
+                title: "durable execution".to_string(),
+                description: None,
+                priority: Default::default(),
+                completion_policy: Default::default(),
+                labels: BTreeSet::new(),
+                due_at: None,
+                not_before: None,
+                snoozed_until: None,
+                external_refs: Vec::new(),
+                evidence_refs: Vec::new(),
+                status: None,
+            })
+            .await
+            .expect("item");
+        let binding_id = WorkExecutionBindingId::new("execution-sqlite").expect("binding id");
+        let target = WorkExecutionTarget::mob_flow(
+            "mob",
+            "flow",
+            format!("sha256:{}", "b".repeat(64)),
+            "d8bb76bb-40e8-54f7-b859-d02827f7d296",
+            crate::WorkExecutionAuthority::TargetOwner,
+            json!({}),
+        )
+        .expect("target");
+        let (machine_state, _) =
+            WorkExecutionMachine::bind(&binding_id, target.run_id()).expect("machine bind");
+        let bound = service
+            .bind_execution(
+                WorkExecutionBinding {
+                    binding_id,
+                    work_ref: WorkItemRef {
+                        realm_id: item.realm_id.clone(),
+                        namespace: item.namespace.clone(),
+                        item_id: item.id.clone(),
+                    },
+                    target,
+                    idempotency_key: "sqlite-key".to_string(),
+                    correlation_id: "6084cb0d-f5df-5814-aad9-c8c6c763ef54".to_string(),
+                    supersedes: None,
+                    machine_state,
+                    created_at: Utc::now(),
+                },
+                item.revision,
+            )
+            .await
+            .expect("bind");
+        let running = service
+            .observe_execution(
+                Some(item.realm_id.clone()),
+                Some(item.namespace.clone()),
+                bound.binding.binding_id,
+                1,
+                WorkExecutionObservation::FlowRunning,
+            )
+            .await
+            .expect("running");
+        assert_eq!(running.binding.machine_state.revision, 2);
+
+        store
+            .rebuild_projection_from_events()
+            .expect("rebuild projections");
+        let restored = service
+            .execution_binding(
+                Some(item.realm_id),
+                Some(item.namespace),
+                running.binding.binding_id,
+            )
+            .await
+            .expect("restored binding");
+        assert_eq!(restored.machine_state.revision, 2);
+        assert_eq!(
+            service
+                .execution_bindings_for_recovery(Some("realm".to_string()))
+                .await
+                .expect("active recovery queue")
+                .len(),
+            1
+        );
+        let failed = service
+            .observe_execution(
+                Some(restored.work_ref.realm_id.clone()),
+                Some(restored.work_ref.namespace.clone()),
+                restored.binding_id.clone(),
+                restored.machine_state.revision,
+                WorkExecutionObservation::FlowFailed {
+                    detail: Some("test failure".to_string()),
+                },
+            )
+            .await
+            .expect("observe failure");
+        service
+            .observe_execution(
+                Some(failed.binding.work_ref.realm_id.clone()),
+                Some(failed.binding.work_ref.namespace.clone()),
+                failed.binding.binding_id,
+                failed.binding.machine_state.revision,
+                WorkExecutionObservation::FlowFailureEvidenceProjected,
+            )
+            .await
+            .expect("terminal failure");
+        assert!(
+            service
+                .execution_bindings_for_recovery(Some("realm".to_string()))
+                .await
+                .expect("terminal recovery queue")
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -3085,7 +4505,7 @@ mod legacy_schema_tests {
         )
         .expect("bridge exact v2 catalog");
         assert_eq!(report.from_version, 2);
-        assert_eq!(report.to_version, 2);
+        assert_eq!(report.to_version, 3);
         assert_eq!(report.prepared, 1);
         let projections = conn
             .query_row(
@@ -3097,7 +4517,7 @@ mod legacy_schema_tests {
         assert_eq!(projections, (expected_status, expected_target_key));
         assert_eq!(
             meerkat_sqlite::domain_version(&conn, WORKGRAPH_DOMAIN.name).expect("ledger"),
-            Some(2)
+            Some(3)
         );
 
         let rerun = meerkat_sqlite::bridge_unledgered_domain(
@@ -3108,8 +4528,8 @@ mod legacy_schema_tests {
             Some(prepare_pre_0_8_10_workgraph_attention),
         )
         .expect("idempotent target rerun");
-        assert_eq!(rerun.from_version, 2);
-        assert_eq!(rerun.to_version, 2);
+        assert_eq!(rerun.from_version, 3);
+        assert_eq!(rerun.to_version, 3);
         assert_eq!(rerun.prepared, 0);
     }
 

@@ -7792,7 +7792,10 @@ fn clone_expr_for_type(ty: &TypeRef, rust_name: &str) -> String {
 }
 
 fn is_known_copy_named_type(name: &str) -> bool {
-    matches!(name, "TurnNumber" | "SurfaceDeltaOperation")
+    matches!(
+        name,
+        "TurnNumber" | "SurfaceDeltaOperation" | "WorkExecutionEvidenceKind"
+    )
 }
 
 /// Generate a standalone terminal surface mapping module for MeerkatMachine.

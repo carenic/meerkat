@@ -1,6 +1,6 @@
 [package]
 name = "meerkat-mob-mcp"
-description = "MCP tool surface for Meerkat Mob"
+description = "Shared Mob host integration with MCP surface adapters"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

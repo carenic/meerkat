@@ -92,6 +92,7 @@ import {
   type LiveWebrtcAnswerParams,
   type LiveWebrtcAnswerResult,
   type MobFlowRunResult,
+  type MobFlowStatusResult,
   type MobRunParams,
   type MobRunResult,
   type MobRunResultParams,
@@ -3223,10 +3224,16 @@ export class MeerkatClient {
   }
 
   async getMobFlowStatus(mobId: string, runId: string): Promise<MobFlowStatus | null> {
-    const result = await this.request("mob/flow_status", { mob_id: mobId, run_id: runId });
+    const result = (await this.request("mob/flow_status", {
+      mob_id: mobId,
+      run_id: runId,
+    })) as MobFlowStatusResult;
     return result.run == null
       ? null
-      : { run: result.run as unknown as Record<string, unknown> };
+      : {
+          run: result.run as unknown as Record<string, unknown>,
+          execution_binding: result.execution_binding ?? null,
+        };
   }
 
   async getMobRunResult(mobId: string, runId: string): Promise<PublicMobRunResult | null> {

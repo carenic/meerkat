@@ -15972,6 +15972,7 @@ struct InterruptYieldingProbe {
     prepare_calls: Arc<AtomicUsize>,
     prepared_texts: Arc<std::sync::Mutex<Vec<String>>>,
     prepare_release: Option<Arc<Notify>>,
+    never_resolve_call: Option<usize>,
     result: BoundaryPreparationResult,
 }
 
@@ -15981,6 +15982,7 @@ impl InterruptYieldingProbe {
             prepare_calls: Arc::new(AtomicUsize::new(0)),
             prepared_texts: Arc::new(std::sync::Mutex::new(Vec::new())),
             prepare_release: None,
+            never_resolve_call: None,
             result,
         }
     }
@@ -15990,6 +15992,17 @@ impl InterruptYieldingProbe {
             prepare_calls: Arc::new(AtomicUsize::new(0)),
             prepared_texts: Arc::new(std::sync::Mutex::new(Vec::new())),
             prepare_release: Some(prepare_release),
+            never_resolve_call: None,
+            result,
+        }
+    }
+
+    fn never_resolve_on_call(result: BoundaryPreparationResult, call: usize) -> Self {
+        Self {
+            prepare_calls: Arc::new(AtomicUsize::new(0)),
+            prepared_texts: Arc::new(std::sync::Mutex::new(Vec::new())),
+            prepare_release: None,
+            never_resolve_call: Some(call),
             result,
         }
     }
@@ -15999,6 +16012,16 @@ impl InterruptYieldingProbe {
             .lock()
             .expect("prepared text mutex poisoned")
             .clone()
+    }
+
+    async fn wait_for_prepare_calls(&self, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while self.prepare_calls.load(Ordering::SeqCst) < expected {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("expected at least {expected} boundary preparation calls"));
     }
 }
 
@@ -16024,7 +16047,7 @@ impl CoreExecutorBoundaryHandle for InterruptYieldingBoundaryHandle {
         meerkat_core::lifecycle::CoreBoundaryStageOutput,
         meerkat_core::lifecycle::CoreBoundaryStageError,
     > {
-        self.probe.prepare_calls.fetch_add(1, Ordering::SeqCst);
+        let call = self.probe.prepare_calls.fetch_add(1, Ordering::SeqCst) + 1;
         self.probe
             .prepared_texts
             .lock()
@@ -16036,6 +16059,9 @@ impl CoreExecutorBoundaryHandle for InterruptYieldingBoundaryHandle {
             );
         if let Some(prepare_release) = self.probe.prepare_release.as_ref() {
             prepare_release.notified().await;
+        }
+        if self.probe.never_resolve_call == Some(call) {
+            std::future::pending::<()>().await;
         }
         match self.probe.result {
             BoundaryPreparationResult::Unavailable => Err(
@@ -16210,6 +16236,24 @@ impl InterruptYieldingTestRig {
         })
         .await
         .unwrap_or_else(|_| panic!("expected at least {expected} apply calls"));
+    }
+
+    async fn wait_for_queue_len(&self, expected: usize) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let snapshot = self
+                    .adapter
+                    .meerkat_machine_spine_snapshot(&self.session_id)
+                    .await
+                    .expect("snapshot should exist while queued admission converges");
+                if snapshot.inputs.queue.len() == expected {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap_or_else(|_| panic!("expected queue length {expected}"));
     }
 
     async fn wait_until_attached_and_empty(&self) {
@@ -16458,6 +16502,8 @@ async fn unavailable_exact_boundary_uses_queued_fallback() {
         .expect("typed unavailable should preserve queued admission");
     assert!(outcome.is_accepted());
     assert!(completion_handle.is_some());
+    probe.wait_for_prepare_calls(1).await;
+    rig.wait_for_queue_len(1).await;
     assert_eq!(probe.prepare_calls.load(Ordering::SeqCst), 1);
     assert!(probe.prepared_texts()[0].contains("unavailable exact boundary remains queued"));
 
@@ -16510,6 +16556,8 @@ async fn stale_exact_boundary_uses_queued_fallback() {
         .expect("typed stale should preserve queued admission");
     assert!(outcome.is_accepted());
     assert!(completion_handle.is_some());
+    probe.wait_for_prepare_calls(1).await;
+    rig.wait_for_queue_len(1).await;
     assert_eq!(probe.prepare_calls.load(Ordering::SeqCst), 1);
 
     let during_busy = rig
@@ -16569,7 +16617,12 @@ async fn stale_exact_boundary_preserves_twenty_five_peer_fan_in_inputs() {
         assert!(completion_handle.is_some());
     }
 
-    assert_eq!(probe.prepare_calls.load(Ordering::SeqCst), FAN_IN);
+    rig.wait_for_queue_len(FAN_IN).await;
+    let prepare_calls = probe.prepare_calls.load(Ordering::SeqCst);
+    assert!(
+        (1..=FAN_IN).contains(&prepare_calls),
+        "FIFO arbitration may normalize later peers without probing the actor, but at least the earliest durable candidate must probe it"
+    );
     let during_busy = rig
         .adapter
         .meerkat_machine_spine_snapshot(&rig.session_id)
@@ -16588,6 +16641,131 @@ async fn stale_exact_boundary_preserves_twenty_five_peer_fan_in_inputs() {
     rig.wait_for_apply_calls(2).await;
     rig.allow_finish.notify_waiters();
     rig.wait_until_attached_and_empty().await;
+}
+
+#[tokio::test]
+async fn stalled_boundary_optimization_does_not_block_sixty_nine_durable_admissions() {
+    const FAN_IN: usize = 69;
+    const STALLED_CALL: usize = 31;
+
+    let probe = InterruptYieldingProbe::never_resolve_on_call(
+        BoundaryPreparationResult::Unavailable,
+        STALLED_CALL,
+    );
+    let rig = InterruptYieldingTestRig::new_with_probe(Some(probe.clone()), None).await;
+    let first_input = Input::Prompt(crate::input::PromptInput::new(
+        "first turn keeps the runtime busy",
+        Some(
+            meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
+                handling_mode: Some(meerkat_core::types::HandlingMode::Steer),
+                ..Default::default()
+            },
+        ),
+    ));
+    let (outcome, _completion_handle) = rig
+        .adapter
+        .accept_input_with_completion(&rig.session_id, first_input)
+        .await
+        .expect("initial steer prompt should be accepted");
+    assert!(outcome.is_accepted());
+    while rig.apply_calls.load(Ordering::SeqCst) == 0 {
+        tokio::task::yield_now().await;
+    }
+
+    let adapter = Arc::clone(&rig.adapter);
+    let session_id = rig.session_id.clone();
+    let accepts = tokio::spawn(async move {
+        let mut accepted_ids = Vec::with_capacity(FAN_IN);
+        for index in 0..FAN_IN {
+            let (peer_input, input_id) = interrupt_yielding_peer_input(
+                &format!("serial peer report {index}"),
+                Some(meerkat_core::types::HandlingMode::Steer),
+            );
+            let (outcome, completion_handle) = adapter
+                .accept_input_with_completion(&session_id, peer_input)
+                .await
+                .expect("a stalled live boundary must preserve every peer admission");
+            assert!(outcome.is_accepted());
+            assert!(completion_handle.is_some());
+            accepted_ids.push(input_id);
+        }
+        accepted_ids
+    });
+
+    let accepted_ids = tokio::time::timeout(Duration::from_secs(5), accepts)
+        .await
+        .expect("ephemeral boundary optimization must not delay durable admissions")
+        .expect("serial fan-in acceptance task should not panic");
+
+    assert_eq!(accepted_ids.len(), FAN_IN);
+    assert_eq!(
+        accepted_ids
+            .iter()
+            .map(ToString::to_string)
+            .collect::<BTreeSet<_>>()
+            .len(),
+        FAN_IN,
+        "every peer input must retain one unique accepted identity"
+    );
+    let during_busy = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let snapshot = rig
+                .adapter
+                .meerkat_machine_spine_snapshot(&rig.session_id)
+                .await
+                .expect("snapshot should expose every durable peer admission");
+            if probe.prepare_calls.load(Ordering::SeqCst) == STALLED_CALL
+                && snapshot.inputs.queue.len() == FAN_IN - 1
+                && snapshot.inputs.steer_queue.len() == 1
+            {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("asynchronous boundary optimizations should converge behind the stalled claim");
+    let prepared_texts = probe.prepared_texts();
+    assert_eq!(prepared_texts.len(), STALLED_CALL);
+    let stalled_index = prepared_texts
+        .last()
+        .and_then(|text| {
+            text.lines()
+                .find_map(|line| line.strip_prefix("serial peer report "))
+        })
+        .and_then(|index| index.parse::<usize>().ok())
+        .unwrap_or_else(|| {
+            panic!(
+                "the pending probe must identify its exact durable peer input: {:?}",
+                prepared_texts.last()
+            )
+        });
+    assert_eq!(during_busy.inputs.admission_order.len(), FAN_IN + 1);
+    assert_eq!(
+        during_busy
+            .inputs
+            .admission_order
+            .iter()
+            .skip(1)
+            .map(|admission| admission.input_id.clone())
+            .collect::<Vec<_>>(),
+        accepted_ids,
+        "durable admission must preserve exact FIFO order independently of actor progress"
+    );
+    assert_eq!(
+        during_busy.inputs.steer_queue,
+        vec![accepted_ids[stalled_index].clone()],
+        "only the exact actor-bound optimization may remain pending"
+    );
+    for (index, input_id) in accepted_ids.iter().enumerate() {
+        if index == stalled_index {
+            continue;
+        }
+        assert!(
+            during_busy.inputs.queue.contains(input_id),
+            "every non-claimed durable input must remain visible in ordinary FIFO"
+        );
+    }
 }
 
 #[tokio::test]
@@ -16723,16 +16901,34 @@ async fn assert_faulted_boundary_terminalizes_exact_input() {
         "failed exact boundary must not fall back",
         Some(meerkat_core::types::HandlingMode::Steer),
     );
-    let error = tokio::time::timeout(
+    let (outcome, completion_handle) = tokio::time::timeout(
         Duration::from_secs(1),
         rig.adapter
             .accept_input_with_completion(&rig.session_id, peer_input),
     )
     .await
-    .expect("failure terminalization must not await publication while the active turn owns B")
-    .expect_err("stale/fault boundary preparation must fail closed");
-    assert!(error.to_string().contains("preparation failed"), "{error}");
-    assert_eq!(probe.prepare_calls.load(Ordering::SeqCst), 1);
+    .expect("durable admission must not await actor-bound failure terminalization")
+    .expect("durable admission should succeed before actor-bound optimization");
+    assert!(outcome.is_accepted());
+    let completion = tokio::time::timeout(
+        Duration::from_secs(5),
+        completion_handle
+            .expect("accepted input should expose its completion waiter")
+            .wait_authorized(),
+    )
+    .await
+    .expect("actor-bound fault should resolve the accepted input asynchronously");
+    match completion {
+        CompletionOutcome::RuntimeTerminated { reason, error } => {
+            assert!(reason.contains("preparation failed"), "{reason}");
+            assert_eq!(
+                error.kind,
+                meerkat_core::TurnTerminalCauseKind::FatalFailure
+            );
+        }
+        other => panic!("faulted boundary should terminalize exact input, got {other:?}"),
+    }
+    probe.wait_for_prepare_calls(1).await;
 
     let during_busy = rig
         .adapter

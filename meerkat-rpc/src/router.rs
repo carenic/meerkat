@@ -183,7 +183,9 @@ pub fn compose_rpc_mob_state(
     if let Some(acceptor) = controlling_acceptor {
         state = state.with_controlling_acceptor(acceptor);
     }
-    Arc::new(state)
+    let state = Arc::new(state);
+    state.start_workgraph_flow_reconciler();
+    state
 }
 
 #[cfg(feature = "comms")]

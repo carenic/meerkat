@@ -1034,6 +1034,471 @@ pub fn workgraph_attention_bundle_composition() -> CompositionSchema {
     }
 }
 
+pub fn workgraph_flow_bundle_composition() -> CompositionSchema {
+    let feedback = |input: &str, fields: Vec<FeedbackFieldBinding>| FeedbackInputRef {
+        machine_instance: mi_id("work_execution"),
+        input_variant: iv_id(input),
+        field_bindings: fields,
+    };
+    let owner_detail = |context: &str| FeedbackFieldBinding {
+        input_field: fld_id("detail"),
+        source: FeedbackFieldSource::OwnerContext(context.into()),
+    };
+    let protocol = |name: &str,
+                    effect: &str,
+                    fields: &[&str],
+                    allowed_feedback_inputs: Vec<FeedbackInputRef>| {
+        let mut required_imports = vec![
+            "use crate::machines::work_execution_lifecycle::{WorkExecutionLifecycleEffect, WorkExecutionLifecycleInput, WorkExecutionLifecycleMachineAuthority, WorkExecutionLifecycleMachineMutator, WorkExecutionLifecycleMachineTransition, WorkExecutionLifecycleMachineTransitionError};".into(),
+        ];
+        if fields.contains(&"kind") {
+            required_imports.push("use crate::WorkExecutionEvidenceKind;".into());
+        }
+        EffectHandoffProtocol {
+        name: protocol_id(name),
+        producer_instance: mi_id("work_execution"),
+        effect_variant: ev_id(effect),
+        realizing_actor: act_id("workgraph_flow_bridge_owner"),
+        correlation_fields: vec![],
+        obligation_fields: fields.iter().map(|field| fld_id(field)).collect(),
+        allowed_feedback_inputs,
+        closure_policy: ClosurePolicy::AckRequired,
+        liveness_annotation: None,
+        comms_trust_authority: None,
+        durable_marker: None,
+        teardown: None,
+        rust: ProtocolRustBinding {
+            module_path: format!(
+                "meerkat-workgraph/src/generated/protocol_{name}.rs"
+            )
+            .into(),
+            generation_mode: ProtocolGenerationMode::EffectExtractor,
+            required_imports,
+            authority_type_path: Some(
+                "crate::machines::work_execution_lifecycle::WorkExecutionLifecycleMachineAuthority"
+                    .into(),
+            ),
+            mutator_trait_path: Some(
+                "crate::machines::work_execution_lifecycle::WorkExecutionLifecycleMachineMutator"
+                    .into(),
+            ),
+            input_enum_path: Some(
+                "crate::machines::work_execution_lifecycle::WorkExecutionLifecycleInput".into(),
+            ),
+            effect_enum_path: Some(
+                "crate::machines::work_execution_lifecycle::WorkExecutionLifecycleEffect".into(),
+            ),
+            transition_type_path: Some(
+                "crate::machines::work_execution_lifecycle::WorkExecutionLifecycleMachineTransition"
+                    .into(),
+            ),
+            error_type_path: Some(
+                "crate::machines::work_execution_lifecycle::WorkExecutionLifecycleMachineTransitionError"
+                    .into(),
+            ),
+            executor_trigger_input_variant: None,
+            bridge_source_type_path: None,
+            helper_return_shape: ProtocolHelperReturnShape::Obligations,
+            handle_trait_path: None,
+            handle_feedback_bindings: vec![],
+            input_payload_module_path: None,
+            additional_modes: vec![],
+        },
+    }
+    };
+
+    CompositionSchema {
+        name: comp_id("workgraph_flow_bundle"),
+        machines: vec![MachineInstance {
+            instance_id: mi_id("work_execution"),
+            machine_name: mach_id("WorkExecutionLifecycleMachine"),
+            actor: act_id("work_execution_authority"),
+        }],
+        actors: vec![
+            machine_actor("work_execution_authority"),
+            owner_actor("workgraph_flow_bridge_owner"),
+        ],
+        handoff_protocols: vec![
+            protocol(
+                "work_execution_flow_launch",
+                "FlowLaunchRequested",
+                &["binding_id", "run_id"],
+                vec![
+                    feedback("ConfirmFlowStarted", vec![]),
+                    feedback("ObserveFlowRunning", vec![]),
+                    feedback("ObserveFlowCompleted", vec![]),
+                    feedback(
+                        "ObserveFlowFailed",
+                        vec![owner_detail("observed_failure_detail")],
+                    ),
+                    feedback(
+                        "ObserveFlowCanceled",
+                        vec![owner_detail("observed_cancellation_detail")],
+                    ),
+                    feedback(
+                        "MarkLaunchUncertain",
+                        vec![owner_detail("launch_uncertainty_detail")],
+                    ),
+                    feedback(
+                        "QuarantineLaunch",
+                        vec![owner_detail("launch_quarantine_detail")],
+                    ),
+                    feedback(
+                        "ResolveLaunchFailed",
+                        vec![owner_detail("launch_failure_detail")],
+                    ),
+                ],
+            ),
+            protocol(
+                "work_execution_flow_observation",
+                "FlowLaunchAccepted",
+                &["binding_id", "run_id"],
+                vec![
+                    feedback("ObserveFlowRunning", vec![]),
+                    feedback("ObserveFlowCompleted", vec![]),
+                    feedback(
+                        "ObserveFlowFailed",
+                        vec![owner_detail("observed_failure_detail")],
+                    ),
+                    feedback(
+                        "ObserveFlowCanceled",
+                        vec![owner_detail("observed_cancellation_detail")],
+                    ),
+                    feedback("ObserveRunLost", vec![owner_detail("lost_run_detail")]),
+                ],
+            ),
+            protocol(
+                "work_execution_uncertain_launch_resolution",
+                "FlowLaunchUncertain",
+                &["binding_id", "run_id", "detail"],
+                vec![
+                    feedback("ConfirmFlowStarted", vec![]),
+                    feedback("ObserveFlowRunning", vec![]),
+                    feedback("ObserveFlowCompleted", vec![]),
+                    feedback(
+                        "ObserveFlowFailed",
+                        vec![owner_detail("observed_failure_detail")],
+                    ),
+                    feedback(
+                        "ObserveFlowCanceled",
+                        vec![owner_detail("observed_cancellation_detail")],
+                    ),
+                    feedback(
+                        "ResolveLaunchFailed",
+                        vec![owner_detail("launch_failure_detail")],
+                    ),
+                    feedback(
+                        "QuarantineLaunch",
+                        vec![owner_detail("launch_quarantine_detail")],
+                    ),
+                ],
+            ),
+            protocol(
+                "work_execution_quarantined_launch_resolution",
+                "FlowLaunchQuarantined",
+                &["binding_id", "run_id", "detail"],
+                vec![
+                    feedback("ConfirmFlowStarted", vec![]),
+                    feedback("ObserveFlowRunning", vec![]),
+                    feedback("ObserveFlowCompleted", vec![]),
+                    feedback(
+                        "ObserveFlowFailed",
+                        vec![owner_detail("observed_failure_detail")],
+                    ),
+                    feedback(
+                        "ObserveFlowCanceled",
+                        vec![owner_detail("observed_cancellation_detail")],
+                    ),
+                ],
+            ),
+            protocol(
+                "work_execution_success_evidence_projection",
+                "EvidenceProjectionRequested",
+                &["binding_id", "run_id", "kind"],
+                vec![
+                    feedback("ConfirmEvidenceProjected", vec![]),
+                    feedback("ObserveRunLost", vec![owner_detail("lost_run_detail")]),
+                ],
+            ),
+            protocol(
+                "work_execution_failure_evidence_projection",
+                "FlowFailureEvidenceProjectionRequested",
+                &["binding_id", "run_id", "kind"],
+                vec![feedback("ConfirmFlowFailureEvidenceProjected", vec![])],
+            ),
+            protocol(
+                "work_execution_cancellation_evidence_projection",
+                "FlowCancellationEvidenceProjectionRequested",
+                &["binding_id", "run_id", "kind"],
+                vec![feedback("ConfirmFlowCancellationEvidenceProjected", vec![])],
+            ),
+            protocol(
+                "work_execution_launch_failure_evidence_projection",
+                "LaunchFailureEvidenceProjectionRequested",
+                &["binding_id", "run_id", "detail", "kind"],
+                vec![feedback("ConfirmLaunchFailureEvidenceProjected", vec![])],
+            ),
+            protocol(
+                "work_execution_work_closure",
+                "WorkClosureRequested",
+                &["binding_id"],
+                vec![
+                    feedback("ConfirmWorkClosed", vec![]),
+                    feedback(
+                        "RefuseWorkClosure",
+                        vec![owner_detail("work_closure_refusal_detail")],
+                    ),
+                ],
+            ),
+        ],
+        entry_inputs: vec![EntryInput {
+            name: entry_input_id("bind_execution"),
+            machine: mi_id("work_execution"),
+            input_variant: iv_id("Bind"),
+        }],
+        routes: vec![],
+        route_target_selectors: vec![],
+        driver: None,
+        transaction_plans: vec![],
+        actor_priorities: vec![],
+        scheduler_rules: vec![],
+        invariants: [
+            (
+                "flow_launch_handoff",
+                "FlowLaunchRequested",
+                "work_execution_flow_launch",
+            ),
+            (
+                "flow_observation_handoff",
+                "FlowLaunchAccepted",
+                "work_execution_flow_observation",
+            ),
+            (
+                "uncertain_launch_handoff",
+                "FlowLaunchUncertain",
+                "work_execution_uncertain_launch_resolution",
+            ),
+            (
+                "quarantined_launch_handoff",
+                "FlowLaunchQuarantined",
+                "work_execution_quarantined_launch_resolution",
+            ),
+            (
+                "success_evidence_handoff",
+                "EvidenceProjectionRequested",
+                "work_execution_success_evidence_projection",
+            ),
+            (
+                "failure_evidence_handoff",
+                "FlowFailureEvidenceProjectionRequested",
+                "work_execution_failure_evidence_projection",
+            ),
+            (
+                "cancellation_evidence_handoff",
+                "FlowCancellationEvidenceProjectionRequested",
+                "work_execution_cancellation_evidence_projection",
+            ),
+            (
+                "launch_failure_evidence_handoff",
+                "LaunchFailureEvidenceProjectionRequested",
+                "work_execution_launch_failure_evidence_projection",
+            ),
+            (
+                "work_closure_handoff",
+                "WorkClosureRequested",
+                "work_execution_work_closure",
+            ),
+        ]
+        .into_iter()
+        .map(|(name, effect, protocol)| CompositionInvariant {
+            name: name.into(),
+            kind: CompositionInvariantKind::HandoffProtocolCovered {
+                producer_instance: mi_id("work_execution"),
+                effect_variant: ev_id(effect),
+                protocol_name: protocol_id(protocol),
+            },
+            statement: format!(
+                "WorkExecution effect {effect} is realized only through its typed owner handoff"
+            ),
+            references_machines: vec![mi_id("work_execution")],
+            references_actors: vec![
+                act_id("work_execution_authority"),
+                act_id("workgraph_flow_bridge_owner"),
+            ],
+        })
+        .collect(),
+        witnesses: vec![
+            workgraph_flow_success_witness(),
+            workgraph_flow_failure_witness(),
+            workgraph_flow_cancellation_witness(),
+            workgraph_flow_uncertain_abandonment_witness(),
+            workgraph_flow_quarantine_witness(),
+        ],
+        deep_domain_cardinality: 3,
+        deep_domain_overrides: BTreeMap::new(),
+        witness_domain_cardinality: 2,
+        ci_limits: Some(workgraph_flow_witness_limits()),
+        closed_world: true,
+    }
+}
+
+fn workgraph_flow_witness_limits() -> CompositionStateLimits {
+    CompositionStateLimits {
+        step_limit: 12,
+        pending_input_limit: 8,
+        pending_route_limit: 0,
+        delivered_route_limit: 0,
+        emitted_effect_limit: 8,
+        seq_limit: 0,
+        set_limit: 0,
+        map_limit: 0,
+    }
+}
+
+fn workgraph_flow_bind_input() -> CompositionWitnessInput {
+    witness_input(
+        "work_execution",
+        "Bind",
+        vec![
+            witness_field("binding_id", Expr::String("binding_1".into())),
+            witness_field("run_id", Expr::String("run_1".into())),
+        ],
+    )
+}
+
+fn workgraph_flow_success_witness() -> CompositionWitness {
+    CompositionWitness {
+        name: witness_id("workgraph_flow_success_closure"),
+        preload_inputs: vec![workgraph_flow_bind_input()],
+        expected_routes: vec![],
+        expected_scheduler_rules: vec![],
+        expected_states: vec![],
+        expected_transitions: vec![
+            witness_transition("work_execution", "BindExecution"),
+            witness_transition("work_execution", "ObserveCompletedFlow"),
+            witness_transition("work_execution", "CommitEvidenceProjection"),
+            witness_transition("work_execution", "CommitWorkClosure"),
+        ],
+        expected_transition_order: vec![],
+        state_limits: workgraph_flow_witness_limits(),
+    }
+}
+
+fn workgraph_flow_failure_witness() -> CompositionWitness {
+    CompositionWitness {
+        name: witness_id("workgraph_flow_failure_evidence"),
+        preload_inputs: vec![workgraph_flow_bind_input()],
+        expected_routes: vec![],
+        expected_scheduler_rules: vec![],
+        expected_states: vec![],
+        expected_transitions: vec![
+            witness_transition("work_execution", "BindExecution"),
+            witness_transition("work_execution", "ObserveFailedFlow"),
+            witness_transition("work_execution", "CommitFlowFailureEvidenceProjection"),
+        ],
+        expected_transition_order: vec![],
+        state_limits: workgraph_flow_witness_limits(),
+    }
+}
+
+fn workgraph_flow_cancellation_witness() -> CompositionWitness {
+    CompositionWitness {
+        name: witness_id("workgraph_flow_cancellation_evidence"),
+        preload_inputs: vec![workgraph_flow_bind_input()],
+        expected_routes: vec![],
+        expected_scheduler_rules: vec![],
+        expected_states: vec![],
+        expected_transitions: vec![
+            witness_transition("work_execution", "BindExecution"),
+            witness_transition("work_execution", "ObserveCanceledFlow"),
+            witness_transition("work_execution", "CommitFlowCancellationEvidenceProjection"),
+        ],
+        expected_transition_order: vec![],
+        state_limits: workgraph_flow_witness_limits(),
+    }
+}
+
+fn workgraph_flow_uncertain_abandonment_witness() -> CompositionWitness {
+    CompositionWitness {
+        name: witness_id("workgraph_flow_uncertain_abandonment"),
+        preload_inputs: vec![workgraph_flow_bind_input()],
+        expected_routes: vec![],
+        expected_scheduler_rules: vec![],
+        expected_states: vec![],
+        expected_transitions: vec![
+            witness_transition("work_execution", "BindExecution"),
+            witness_transition("work_execution", "RecordUncertainLaunch"),
+            witness_transition("work_execution", "FailLaunch"),
+            witness_transition("work_execution", "CommitLaunchFailureEvidenceProjection"),
+        ],
+        expected_transition_order: vec![
+            witness_transition_order(
+                "work_execution",
+                "BindExecution",
+                "work_execution",
+                "RecordUncertainLaunch",
+            ),
+            witness_transition_order(
+                "work_execution",
+                "RecordUncertainLaunch",
+                "work_execution",
+                "FailLaunch",
+            ),
+            witness_transition_order(
+                "work_execution",
+                "FailLaunch",
+                "work_execution",
+                "CommitLaunchFailureEvidenceProjection",
+            ),
+        ],
+        state_limits: workgraph_flow_witness_limits(),
+    }
+}
+
+fn workgraph_flow_quarantine_witness() -> CompositionWitness {
+    CompositionWitness {
+        name: witness_id("workgraph_flow_launch_quarantine"),
+        preload_inputs: vec![workgraph_flow_bind_input()],
+        expected_routes: vec![],
+        expected_scheduler_rules: vec![],
+        expected_states: vec![],
+        expected_transitions: vec![
+            witness_transition("work_execution", "BindExecution"),
+            witness_transition("work_execution", "QuarantineLaunch"),
+            witness_transition("work_execution", "ObserveCompletedFlow"),
+            witness_transition("work_execution", "CommitEvidenceProjection"),
+            witness_transition("work_execution", "CommitWorkClosure"),
+        ],
+        expected_transition_order: vec![
+            witness_transition_order(
+                "work_execution",
+                "BindExecution",
+                "work_execution",
+                "QuarantineLaunch",
+            ),
+            witness_transition_order(
+                "work_execution",
+                "QuarantineLaunch",
+                "work_execution",
+                "ObserveCompletedFlow",
+            ),
+            witness_transition_order(
+                "work_execution",
+                "ObserveCompletedFlow",
+                "work_execution",
+                "CommitEvidenceProjection",
+            ),
+            witness_transition_order(
+                "work_execution",
+                "CommitEvidenceProjection",
+                "work_execution",
+                "CommitWorkClosure",
+            ),
+        ],
+        state_limits: workgraph_flow_witness_limits(),
+    }
+}
+
 pub fn adaptive_mob_bundle_composition() -> CompositionSchema {
     let mut protocol_templates = comms_trust_bundle_composition()
         .handoff_protocols
@@ -1310,6 +1775,18 @@ fn witness_transition(machine: &str, transition: &str) -> CompositionWitnessTran
     CompositionWitnessTransition {
         machine: mi_id(machine),
         transition: transition_id(transition),
+    }
+}
+
+fn witness_transition_order(
+    earlier_machine: &str,
+    earlier_transition: &str,
+    later_machine: &str,
+    later_transition: &str,
+) -> CompositionWitnessTransitionOrder {
+    CompositionWitnessTransitionOrder {
+        earlier: witness_transition(earlier_machine, earlier_transition),
+        later: witness_transition(later_machine, later_transition),
     }
 }
 

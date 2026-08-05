@@ -19072,7 +19072,9 @@
           "linked",
           "evidence_added",
           "attention_created",
-          "attention_updated"
+          "attention_updated",
+          "execution_bound",
+          "execution_transitioned"
         ],
         "type": "string"
       },
@@ -19398,6 +19400,12 @@
                     {
                       "type": "null"
                     }
+                  ]
+                },
+                "execution_binding_id": {
+                  "type": [
+                    "string",
+                    "null"
                   ]
                 },
                 "id": {

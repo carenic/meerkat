@@ -99,6 +99,75 @@ approved transitions.
 
 Evidence refs are pointers. WorkGraph does not own the artifact content.
 
+## Flow Execution Bindings
+
+`WorkExecutionBinding` durably associates one item with one exact Mob Flow
+attempt.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `binding_id` | `WorkExecutionBindingId` | Stable binding identity |
+| `work_ref` | `WorkItemRef` | Realm, namespace, and item identity |
+| `target` | `mob_flow` target | Mob id, Flow id and digest, run id, and opaque activation parameters |
+| `idempotency_key` | `string` | Caller-stable launch identity |
+| `correlation_id` | UUID | Stable delivery correlation |
+| `supersedes` | binding id? | Previous terminal attempt in the retry chain |
+| `machine_state` | object | Generated execution-handoff lifecycle authority |
+| `created_at` | RFC3339 timestamp | Store-owned creation time |
+
+The lifecycle phases distinguish launch request, uncertain launch, running,
+evidence projection, closure request, terminal Flow failure or cancellation,
+policy-refused closure, and successful WorkGraph closure. A retry may
+supersede only a terminal binding. The store enforces a single append-only
+retry chain with CAS machine revisions. A machine-derived, indexed recovery
+projection contains only nonterminal obligations, so host reconciliation does
+not scan or deserialize historical terminal bindings.
+
+The crash-safe launch sequence is binding commit, external-delivery begin,
+deterministic pending-run persistence, delivery realization claim, and Mob run
+start. `realizing` therefore implies that the exact run was already persisted.
+`begun` without a run is an abandonable uncertain launch. `realizing` without
+a run is quarantined as an invariant breach or legacy-corruption case. The
+WorkGraph bridge has no caller-asserted break-glass transition out of that
+state. It fails closed until the exact run is observed or a future sealed host
+authority is introduced.
+
+Every terminal Flow outcome creates evidence kind `mob_flow_run_completed`,
+`mob_flow_run_failed`, or `mob_flow_run_canceled` with the deterministic id
+`work_execution:<binding_id>`. Only completed-run evidence proceeds to a
+WorkGraph closure request. Exact evidence replay is a no-op; different content
+under the same evidence id fails closed. The typed `execution_binding_id`
+provenance is reserved to the execution bridge; the display id is never read
+as authority. If a completed run disappears before its evidence commits, the
+execution machine converts the attempt to a run-lost failure rather than
+closing the WorkGraph item without proof.
+
+### Public MCP
+
+| Tool | Purpose |
+|------|---------|
+| `meerkat_workgraph_flow_launch` | Commit a binding before launch, start its exact Mob Flow run, and reconcile visible results |
+| `meerkat_workgraph_flow_reconcile` | Resume the machine-owned handoff from its first incomplete durable boundary |
+| `meerkat_workgraph_flow_abandon_uncertain` | Under binding-revision CAS and host custody, resolve an ambiguous launch only after its deterministic run is absent, then require a superseding retry |
+| `meerkat_workgraph_flow_binding_get` | Read one redacted execution linkage |
+| `meerkat_workgraph_flow_binding_list` | List bounded redacted execution linkages |
+
+`meerkat_mob_flow_status` includes the corresponding redacted execution
+binding when the run was created by this bridge. Activation parameters,
+idempotency keys, correlation ids, and execution principals remain internal to
+the trusted realm host.
+
+The durable store journal retains full execution events for deterministic
+rebuild, but the general `workgraph_events` projection omits those event kinds.
+Public consumers observe execution through the redacted binding and Flow-status
+projections, so activation parameters and execution principals never cross the
+coarse WorkGraph event-read boundary.
+
+`expected_item_revision` is required when creating a new binding. An exact
+idempotent replay selects the existing binding even if later evidence changed
+the item revision. A changed effective Flow run configuration cannot be
+launched under an older binding digest.
+
 ## Agent Tools
 
 | Tool | Purpose |

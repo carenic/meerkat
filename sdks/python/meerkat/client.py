@@ -3762,7 +3762,13 @@ class MeerkatClient:
         result = await self._request(
             "mob/flow_status", {"mob_id": mob_id, "run_id": run_id}
         )
-        return result.get("run")
+        run = result.get("run")
+        if not isinstance(run, dict):
+            return None
+        execution_binding = result.get("execution_binding")
+        if execution_binding is None:
+            return run
+        return {**run, "execution_binding": execution_binding}
 
     async def get_mob_run_result(
         self, mob_id: str, run_id: str

@@ -72,6 +72,30 @@ Flows are declarative work graphs. They support one-to-one, fan-out, fan-in,
 branching, and frame/loop nodes. Flow status is persisted, so a host can check
 live state first and fall back to the terminal snapshot.
 
+### WorkGraph Bridge
+
+WorkGraph commitments and Flow runs remain separate authorities. A durable
+`WorkExecutionBinding` records the exact effective Flow run configuration and
+deterministic run identity before execution. The generated execution lifecycle requests the
+launch, observes Mob-owned terminal state, requests evidence projection, and
+feeds the WorkGraph closure result back into the binding lifecycle.
+
+The external-delivery ledger is not a second run machine. Its `realizing`
+phase is a custody fence, crossed by the Mob actor only after the deterministic
+pending `MobRun` is durable. Mob remains the sole owner of run lifecycle. The
+ledger prevents blind target reinvocation across an unobserved reply boundary.
+
+Flow success is evidence, not completion authority. WorkGraph's completion
+policy remains the only path that can terminalize the commitment. Failed and
+canceled runs remain terminal execution attempts and may be superseded by a
+new binding while the WorkGraph item stays open.
+
+For multi-host mobs, the binding and WorkGraph store remain on the controlling
+host. Remotely placed members execute Flow steps through normal Mob routing;
+they do not independently claim or mutate the controlling WorkGraph. Terminal
+run observation and evidence projection return to the controlling host, so
+distributed execution does not create replicated WorkGraph authority.
+
 ## Persistence
 
 Persistent mob state is SQLite/WAL-backed through `SqliteMobStores`.

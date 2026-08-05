@@ -254,6 +254,17 @@ agent-internal `mob_*` tool dispatcher:
 | MCP | `meerkat_mob_*` tools from `meerkat-mob-mcp::public_tools_list()`, including lifecycle, membership, wiring, batch wiring, member interaction, events, flows, `meerkat_mob_wait_kickoff`, `meerkat_mob_wait_ready`, and profile CRUD (`meerkat_mob_profile_create|get|list|update|delete`) |
 | REST | Helper and observation endpoints (`/mob/{id}/events`, `/mob/{id}/wire-members-batch`, helper spawn/fork, member status/cancel/respawn, wait kickoff); full typed lifecycle remains RPC/SDK |
 
+The WorkGraph-to-Flow composition is currently a deliberate MCP host contract:
+`meerkat_workgraph_flow_launch`, `meerkat_workgraph_flow_reconcile`, and
+`meerkat_workgraph_flow_abandon_uncertain`, with redacted linkage reads through
+`meerkat_workgraph_flow_binding_get` and
+`meerkat_workgraph_flow_binding_list`. Its semantic owner is the shared
+`meerkat-mob::WorkGraphFlowBridge`; MCP only adapts that owner to a public
+surface. Hosts start an autonomous reconciler at bootstrap, so durable bindings
+recover without another caller request. REST and generated JSON-RPC clients do
+not yet claim this composition contract; their ordinary Mob and WorkGraph
+surfaces remain independent.
+
 For cross-surface behavior and examples (CLI/RPC/REST/MCP/Python/TypeScript), see [Mobs](/guides/mobs).
 
 ## SDK entry points

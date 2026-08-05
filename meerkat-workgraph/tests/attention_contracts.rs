@@ -654,6 +654,7 @@ async fn goal_confirmation_and_close_are_policy_gated() {
                 summary: Some("Host accepted the result".to_string()),
                 confirmation_kind: None,
                 confirming_owner_key: None,
+                execution_binding_id: None,
             },
             principal: None,
             trusted_principal: None,
@@ -734,6 +735,7 @@ async fn goal_confirm_and_request_close_reject_stale_item_revision() {
                 summary: None,
                 confirmation_kind: None,
                 confirming_owner_key: None,
+                execution_binding_id: None,
             },
             principal: None,
             trusted_principal: None,
@@ -876,6 +878,7 @@ async fn raw_evidence_cannot_satisfy_reserved_completion_policy() {
                 summary: None,
                 confirmation_kind: None,
                 confirming_owner_key: None,
+                execution_binding_id: None,
             },
         })
         .await
@@ -923,6 +926,7 @@ async fn public_self_attest_confirm_rejects_reserved_completion_evidence() {
                 summary: None,
                 confirmation_kind: None,
                 confirming_owner_key: None,
+                execution_binding_id: None,
             },
         })
         .await
@@ -950,6 +954,7 @@ async fn create_rejects_reserved_completion_evidence() {
                 summary: None,
                 confirmation_kind: None,
                 confirming_owner_key: None,
+                execution_binding_id: None,
             }],
             ..CreateWorkItemRequest::default()
         })
@@ -1002,6 +1007,7 @@ async fn add_evidence_rejects_forged_typed_confirmation_kind() {
                 // Forged typed confirmation the machine would otherwise honor.
                 confirmation_kind: Some(meerkat_workgraph::WorkEvidenceKind::HostConfirmation),
                 confirming_owner_key: None,
+                execution_binding_id: None,
             },
         })
         .await
@@ -1029,6 +1035,7 @@ async fn create_rejects_forged_typed_confirmation_kind() {
                 summary: None,
                 confirmation_kind: Some(meerkat_workgraph::WorkEvidenceKind::HostConfirmation),
                 confirming_owner_key: None,
+                execution_binding_id: None,
             }],
             ..CreateWorkItemRequest::default()
         })
@@ -1077,6 +1084,7 @@ async fn public_self_attest_confirm_rejects_forged_typed_confirmation_kind() {
                 summary: None,
                 confirmation_kind: Some(meerkat_workgraph::WorkEvidenceKind::HostConfirmation),
                 confirming_owner_key: None,
+                execution_binding_id: None,
             },
         })
         .await
@@ -1360,6 +1368,7 @@ async fn supervisor_goal_confirmation_requires_named_supervisor() {
                 summary: None,
                 confirmation_kind: None,
                 confirming_owner_key: None,
+                execution_binding_id: None,
             },
             principal: Some(WorkOwnerKey::principal("other").expect("principal")),
             trusted_principal: Some(WorkOwnerKey::principal("other").expect("principal")),
@@ -1384,6 +1393,7 @@ async fn supervisor_goal_confirmation_requires_named_supervisor() {
                 summary: None,
                 confirmation_kind: None,
                 confirming_owner_key: None,
+                execution_binding_id: None,
             },
             principal: Some(supervisor.clone()),
             trusted_principal: Some(supervisor.clone()),
@@ -2314,6 +2324,7 @@ fn narrow_goal_and_attention_control_contracts_round_trip() {
             summary: None,
             confirmation_kind: None,
             confirming_owner_key: None,
+            execution_binding_id: None,
         },
         principal: Some(WorkOwnerKey::principal("user").expect("principal")),
         trusted_principal: Some(WorkOwnerKey::principal("user").expect("principal")),

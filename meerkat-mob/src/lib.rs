@@ -65,6 +65,11 @@ pub mod tokio {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod tokio {
+    pub use ::tokio::*;
+}
+
 #[doc(hidden)]
 pub mod adaptive;
 pub mod backend;
@@ -94,6 +99,7 @@ pub mod storage;
 pub mod store;
 pub mod validate;
 pub mod workgraph_attention;
+pub mod workgraph_flow;
 
 // Re-exports for convenience
 pub use backend::{MobBackendKind, RuntimeBinding};
@@ -148,6 +154,12 @@ pub use mob_machine::{
 };
 pub use workgraph_attention::{
     lower_agent_identity_attention_target, lower_agent_identity_owner_key,
+};
+pub use workgraph_flow::{
+    AbandonUncertainWorkGraphFlowRequest, LaunchWorkGraphFlowRequest, WorkGraphFlowAbandonResult,
+    WorkGraphFlowAdmission, WorkGraphFlowBridge, WorkGraphFlowBridgeError,
+    WorkGraphFlowCustodyGuard, WorkGraphFlowExecutionAuthority, WorkGraphFlowHost,
+    WorkGraphFlowLaunchResult, WorkGraphFlowObservationAuthority, WorkGraphFlowReconcileResult,
 };
 
 #[doc(hidden)]
@@ -243,13 +255,14 @@ pub use store::{
     ExternalBindingOverlayRecord, ExternalBindingOverlayStatus, InMemoryMobEventStore,
     InMemoryMobIdentityStatusStore, InMemoryMobIdentityStore, InMemoryMobRunStore,
     InMemoryMobRuntimeMetadataStore, InMemoryMobSpecStore, InMemoryRealmProfileStore,
-    MobDeliveryIdentity, MobEventReceiver, MobEventStore, MobExternalDeliveryBeginOutcome,
+    MobDeliveryIdentity, MobEventReceiver, MobEventStore, MobExternalDeliveryAbandonOutcome,
+    MobExternalDeliveryBeginOutcome, MobExternalDeliveryClaimOutcome,
     MobExternalDeliveryCompleteOutcome, MobExternalDeliveryIdentity, MobExternalDeliveryIntent,
     MobExternalDeliveryPhase, MobExternalDeliveryRecord, MobExternalDeliveryRepairOutcome,
     MobExternalDeliveryRepairState, MobExternalDeliveryTargetKind, MobExternalDeliveryTerminal,
-    MobHostAuthorityDeletionAuthority, MobHostAuthorityPersistenceAuthority,
-    MobHostAuthorityRecord, MobHostBindPhaseRecord, MobHostCapabilityRecord,
-    MobIdentityStatusStore, MobIdentityStore, MobIdentityStoreClock,
+    MobExternalFlowLaunchOutcome, MobHostAuthorityDeletionAuthority,
+    MobHostAuthorityPersistenceAuthority, MobHostAuthorityRecord, MobHostBindPhaseRecord,
+    MobHostCapabilityRecord, MobIdentityStatusStore, MobIdentityStore, MobIdentityStoreClock,
     MobOperatorGrantDeletionAuthority, MobOperatorGrantPersistenceAuthority,
     MobOperatorGrantRecord, MobRunStore, MobRuntimeMetadataStore, MobSpecStore, MobStoreError,
     RealmProfileStore, StoredRealmProfile, SupervisorAuthorityRecord, SystemMobIdentityStoreClock,

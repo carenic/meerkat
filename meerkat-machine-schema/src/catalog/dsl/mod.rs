@@ -45,6 +45,7 @@ pub mod session_document;
 pub mod session_persistence_version_authority;
 pub mod session_turn_admission;
 pub mod work_attention_lifecycle;
+pub mod work_execution_lifecycle;
 pub mod workgraph_lifecycle;
 
 use crate::identity::{EffectVariantId, InputVariantId, SignalVariantId, TransitionId};
@@ -127,6 +128,8 @@ pub const WORKGRAPH_LIFECYCLE_PRODUCTION_RUST_MODULE: &str = "machines::workgrap
 pub const WORK_ATTENTION_LIFECYCLE_PRODUCTION_RUST_CRATE: &str = "meerkat-workgraph";
 pub const WORK_ATTENTION_LIFECYCLE_PRODUCTION_RUST_MODULE: &str =
     "machines::work_attention_lifecycle";
+pub const WORK_EXECUTION_LIFECYCLE_PRODUCTION_RUST_CRATE: &str = "meerkat-workgraph";
+pub const WORK_EXECUTION_LIFECYCLE_PRODUCTION_RUST_MODULE: &str = "execution_machine";
 pub const MOB_HOST_BINDING_AUTHORITY_PRODUCTION_RUST_CRATE: &str = "meerkat-mob";
 pub const MOB_HOST_BINDING_AUTHORITY_PRODUCTION_RUST_MODULE: &str =
     "machines::mob_host_binding_authority";
@@ -4111,6 +4114,11 @@ pub fn dsl_work_attention_lifecycle_machine() -> MachineSchema {
         .attach_to(work_attention_lifecycle::WorkAttentionLifecycleMachineState::schema())
 }
 
+pub fn dsl_work_execution_lifecycle_machine() -> MachineSchema {
+    work_execution_lifecycle_schema_metadata()
+        .attach_to(work_execution_lifecycle::WorkExecutionLifecycleMachineState::schema())
+}
+
 pub fn dsl_work_attention_lifecycle_machine_production_schema() -> MachineSchema {
     with_production_rust_binding(
         dsl_work_attention_lifecycle_machine(),
@@ -4160,6 +4168,16 @@ pub fn work_attention_lifecycle_schema_metadata() -> MachineSchemaMetadata {
                 ],
             ),
         ],
+        vec![],
+    )
+}
+
+pub fn work_execution_lifecycle_schema_metadata() -> MachineSchemaMetadata {
+    machine_schema_metadata(
+        vec![NamedTypeBinding::string_enum(
+            "WorkExecutionEvidenceKind",
+            &["Completed", "Failed", "Canceled", "LaunchFailed", "RunLost"],
+        )],
         vec![],
     )
 }

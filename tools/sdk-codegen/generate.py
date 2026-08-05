@@ -111,6 +111,8 @@ MOB_RPC_CONTRACT_TYPES = [
     "WireMobRun",
     "WireMobRunResultEnvelope",
     "WireMobRunStatus",
+    "WireWorkGraphFlowWorkRef",
+    "WireWorkGraphFlowExecutionBinding",
     "WirePeerConnectivity",
     "WirePeerConnectivitySnapshot",
     "WireUnreachablePeer",
@@ -481,6 +483,7 @@ MOB_RPC_CONTRACT_ALIAS_TYPES = [
     "WireReachability",
     "WireNonPortableResourceKind",
     "WireMobRunStatus",
+    "WireWorkExecutionLifecyclePhase",
     "WirePeerConnectivity",
     "WireHostBindingDescriptorKind",
     "BridgeLiveControlVerb",
@@ -5981,6 +5984,9 @@ def generate_web_mob_types(schemas: dict, output_dir: Path) -> None:
     append_interface("MobEventsResult")
     append_alias("WireHandlingMode")
     append_interface("MobMemberSendResult")
+    append_alias("WireWorkExecutionLifecyclePhase")
+    append_interface("WireWorkGraphFlowWorkRef")
+    append_interface("WireWorkGraphFlowExecutionBinding")
     append_interface("MobFlowStatusResult")
     append_interface("MobRunResult")
     append_interface("MobHelperResult")

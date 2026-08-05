@@ -18,6 +18,7 @@ fn minimal_run_with_schema_v2() -> MobRun {
         run_id: RunId::new(),
         mob_id: meerkat_mob::MobId::from("test-mob"),
         flow_id: meerkat_mob::FlowId::from("test-flow"),
+        flow_definition_digest: None,
         status: MobRunStatus::Running,
         flow_state,
         activation_params: serde_json::json!({}),

@@ -590,6 +590,7 @@ pub(super) enum MobCommand {
         run_id: Option<RunId>,
         flow_id: FlowId,
         activation_params: serde_json::Value,
+        external_delivery_intent: Option<crate::store::MobExternalDeliveryIntent>,
         scoped_event_tx: Option<tokio::sync::mpsc::Sender<meerkat_core::ScopedAgentEvent>>,
         reply_tx: oneshot::Sender<Result<RunId, MobError>>,
     },

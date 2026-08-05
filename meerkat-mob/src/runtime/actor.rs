@@ -19931,11 +19931,18 @@ impl MobActor {
                     run_id,
                     flow_id,
                     activation_params,
+                    external_delivery_intent,
                     scoped_event_tx,
                     reply_tx,
                 } => {
                     let result = self
-                        .handle_run_flow(run_id, flow_id, activation_params, scoped_event_tx)
+                        .handle_run_flow(
+                            run_id,
+                            flow_id,
+                            activation_params,
+                            external_delivery_intent,
+                            scoped_event_tx,
+                        )
                         .await;
                     let _ = reply_tx.send(result);
                 }
@@ -47141,6 +47148,7 @@ impl MobActor {
         requested_run_id: Option<RunId>,
         flow_id: FlowId,
         activation_params: serde_json::Value,
+        external_delivery_intent: Option<crate::store::MobExternalDeliveryIntent>,
         scoped_event_tx: Option<mpsc::Sender<meerkat_core::ScopedAgentEvent>>,
     ) -> Result<RunId, MobError> {
         self.ensure_pending_spawn_alignment("handle_run_flow preflight")?;
@@ -47158,18 +47166,128 @@ impl MobActor {
             }
             let terminal =
                 crate::run::mob_machine_run_status_is_terminal(&existing.run_id, &existing.status)?;
+            if let Some(intent) = external_delivery_intent.as_ref() {
+                let record = self
+                    .events
+                    .load_external_delivery(&intent.mob_id, &intent.identity.idempotency_key)
+                    .await?;
+                if let Some(crate::store::MobExternalDeliveryRecord {
+                    intent: observed_intent,
+                    phase: crate::store::MobExternalDeliveryPhase::Begun { .. },
+                }) = record
+                {
+                    if observed_intent != *intent {
+                        return Err(MobError::Internal(format!(
+                            "external delivery '{}' does not match its durable admission",
+                            intent.identity.idempotency_key
+                        )));
+                    }
+                    let realization = crate::store::MobExternalDeliveryRealizationCommit::new(
+                        intent.clone(),
+                        run_id.clone(),
+                    )?;
+                    match self
+                        .events
+                        .claim_external_delivery_realization(&realization)
+                        .await?
+                    {
+                        crate::store::MobExternalDeliveryClaimOutcome::Claimed => {}
+                        crate::store::MobExternalDeliveryClaimOutcome::ExistingRealizing {
+                            run_id: ref realizing_run_id,
+                            ..
+                        } if realizing_run_id == &run_id => {}
+                        crate::store::MobExternalDeliveryClaimOutcome::ExistingRealizing {
+                            run_id: realizing_run_id,
+                            ..
+                        } => {
+                            return Err(MobError::Internal(format!(
+                                "external delivery '{}' is realizing run '{}' instead of exact run '{}'",
+                                intent.identity.idempotency_key, realizing_run_id, run_id
+                            )));
+                        }
+                        crate::store::MobExternalDeliveryClaimOutcome::ExistingTerminal(
+                            terminal,
+                        ) => {
+                            return Err(MobError::Internal(format!(
+                                "external delivery '{}' became terminal before exact run recovery: {terminal:?}",
+                                intent.identity.idempotency_key
+                            )));
+                        }
+                    }
+                    if existing.status == MobRunStatus::Pending
+                        && !self.run_tasks.contains_key(&run_id)
+                        && !self.run_cancel_tokens.contains_key(&run_id)
+                    {
+                        return self
+                            .fail_pending_external_flow_before_realization(
+                                run_id,
+                                flow_id,
+                                intent,
+                                "delivery realization was not durably claimed",
+                            )
+                            .await;
+                    }
+                    if existing.status != MobRunStatus::Pending {
+                        let commit =
+                            crate::store::MobExternalDeliveryRealizerCompletionCommit::new(
+                                intent.clone(),
+                                run_id.clone(),
+                            )?;
+                        self.events
+                            .complete_external_delivery_realization(&commit)
+                            .await?;
+                    }
+                }
+            }
             if !terminal
                 && !self.run_tasks.contains_key(&run_id)
                 && !self.run_cancel_tokens.contains_key(&run_id)
             {
+                self.durable_uncertainty_fail_stop = true;
                 return Err(MobError::Internal(format!(
-                    "stable external flow run '{run_id}' is durable but has no live execution tracker; it is held for recovery instead of being reported as resumable"
+                    "stable external flow run '{run_id}' is durable but has no live execution tracker; the actor is fail-stopping for cold recovery"
                 )));
             }
             return Ok(run_id);
         }
+        if let Some(intent) = external_delivery_intent.as_ref() {
+            let record = self
+                .events
+                .load_external_delivery(&intent.mob_id, &intent.identity.idempotency_key)
+                .await?
+                .ok_or_else(|| {
+                    MobError::Internal(format!(
+                        "external delivery '{}' was not begun before Flow realization",
+                        intent.identity.idempotency_key
+                    ))
+                })?;
+            if record.intent != *intent {
+                return Err(MobError::Internal(format!(
+                    "external delivery '{}' does not match its durable admission",
+                    intent.identity.idempotency_key
+                )));
+            }
+            match record.phase {
+                crate::store::MobExternalDeliveryPhase::Begun { .. } => {}
+                crate::store::MobExternalDeliveryPhase::Realizing {
+                    run_id: realizing_run_id,
+                    ..
+                } => {
+                    return Err(MobError::Internal(format!(
+                        "external delivery '{}' is already realizing run '{}' while exact run '{}' is absent",
+                        intent.identity.idempotency_key, realizing_run_id, run_id
+                    )));
+                }
+                crate::store::MobExternalDeliveryPhase::Terminal { terminal } => {
+                    return Err(MobError::Internal(format!(
+                        "external delivery '{}' became terminal before Flow realization: {terminal:?}",
+                        intent.identity.idempotency_key
+                    )));
+                }
+            }
+        }
         self.preview_run_flow_command_admission(&run_id)?;
-        let config = FlowRunConfig::from_definition(flow_id, &self.definition)?;
+        let config = FlowRunConfig::from_definition(flow_id.clone(), &self.definition)?;
         let run_flow = MobRun::run_flow_input(&run_id, &config)?;
         debug_assert!(matches!(run_flow, mob_dsl::MobMachineInput::RunFlow { .. }));
         let prepared_run_flow = self
@@ -47191,6 +47309,107 @@ impl MobActor {
                 "flow admission run-store create failed before committing MobMachine RunFlow"
             );
         })?;
+        if let Some(intent) = external_delivery_intent.as_ref() {
+            let realization = crate::store::MobExternalDeliveryRealizationCommit::new(
+                intent.clone(),
+                run_id.clone(),
+            )?;
+            match self
+                .events
+                .claim_external_delivery_realization(&realization)
+                .await
+            {
+                Ok(crate::store::MobExternalDeliveryClaimOutcome::Claimed) => {}
+                Ok(crate::store::MobExternalDeliveryClaimOutcome::ExistingRealizing {
+                    run_id: realizing_run_id,
+                    ..
+                }) if realizing_run_id == run_id => {}
+                Ok(crate::store::MobExternalDeliveryClaimOutcome::ExistingRealizing {
+                    run_id: realizing_run_id,
+                    ..
+                }) => {
+                    return Err(MobError::Internal(format!(
+                        "external delivery '{}' is realizing run '{}' instead of exact run '{}'",
+                        intent.identity.idempotency_key, realizing_run_id, run_id
+                    )));
+                }
+                Ok(crate::store::MobExternalDeliveryClaimOutcome::ExistingTerminal(terminal)) => {
+                    self.commit_prepared_dsl_input(prepared_run_flow)?;
+                    if let Err(start_error) = self
+                        .start_external_flow_compensation_after_run_flow(
+                            &run_id,
+                            "external_delivery_terminal_start_run",
+                            "external_delivery_terminal_start_run_state",
+                        )
+                        .await
+                    {
+                        self.durable_uncertainty_fail_stop = true;
+                        return Err(start_error);
+                    }
+                    let detail = format!(
+                        "external delivery became terminal before Flow realization: {terminal:?}"
+                    );
+                    if let Err(compensation_error) = self
+                        .terminalize_external_flow_admission_failure_after_start(
+                            &run_id,
+                            config.flow_id.clone(),
+                            &detail,
+                            "external_delivery_terminal_pending_run",
+                            "external_delivery_terminal_complete_flow",
+                        )
+                        .await
+                    {
+                        self.durable_uncertainty_fail_stop = true;
+                        return Err(compensation_error);
+                    }
+                    return Err(MobError::Internal(detail));
+                }
+                Err(claim_error) => {
+                    let record = match self
+                        .events
+                        .load_external_delivery(&intent.mob_id, &intent.identity.idempotency_key)
+                        .await
+                    {
+                        Ok(record) => record,
+                        Err(read_error) => {
+                            self.durable_uncertainty_fail_stop = true;
+                            return Err(MobError::Internal(format!(
+                                "delivery realization claim failed ({claim_error}) and exact reread failed ({read_error}); run {run_id} remains quarantined"
+                            )));
+                        }
+                    };
+                    match record {
+                        Some(crate::store::MobExternalDeliveryRecord {
+                            intent: observed_intent,
+                            phase:
+                                crate::store::MobExternalDeliveryPhase::Realizing {
+                                    run_id: realizing_run_id,
+                                    ..
+                                },
+                        }) if observed_intent == *intent && realizing_run_id == run_id => {}
+                        Some(crate::store::MobExternalDeliveryRecord {
+                            intent: observed_intent,
+                            phase: crate::store::MobExternalDeliveryPhase::Begun { .. },
+                        }) if observed_intent == *intent => {
+                            return self
+                                .fail_pending_external_flow_before_realization(
+                                    run_id,
+                                    flow_id,
+                                    intent,
+                                    "delivery realization claim was not committed",
+                                )
+                                .await;
+                        }
+                        _ => {
+                            self.durable_uncertainty_fail_stop = true;
+                            return Err(MobError::Internal(format!(
+                                "delivery realization claim failed ({claim_error}) without proving Realizing for exact run {run_id}; the pending run remains quarantined"
+                            )));
+                        }
+                    }
+                }
+            }
+        }
         self.commit_prepared_dsl_input(prepared_run_flow)?;
         if let Err(error) = self.apply_dsl_signal(mob_dsl::MobMachineSignal::StartRun, "start_run")
         {
@@ -47208,6 +47427,11 @@ impl MobActor {
                     "lifecycle StartRun transition failed during flow admission: {error}"
                 ),
             };
+            if let Err(cancel_error) = self.cancel_unfinished_steps_in_actor(&run_id).await {
+                details.push(format!(
+                    "canceling unfinished steps after StartRun failure failed: {cancel_error}"
+                ));
+            }
             if let Err(terminalize_error) = self
                 .terminalize_failed_in_actor(
                     run_id.clone(),
@@ -47224,6 +47448,7 @@ impl MobActor {
             let detail_suffix = if details.is_empty() {
                 String::new()
             } else {
+                self.durable_uncertainty_fail_stop = true;
                 format!("; {}", details.join("; "))
             };
             return Err(MobError::Internal(format!(
@@ -47327,8 +47552,139 @@ impl MobActor {
         self.run_tasks.insert(run_id.clone(), handle);
         self.ensure_flow_tracker_alignment("handle_run_flow completion")
             .await?;
+        if let Some(intent) = external_delivery_intent {
+            let completion = crate::store::MobExternalDeliveryRealizerCompletionCommit::new(
+                intent,
+                run_id.clone(),
+            )?;
+            self.events
+                .complete_external_delivery_realization(&completion)
+                .await?;
+        }
 
         Ok(run_id)
+    }
+
+    async fn fail_pending_external_flow_before_realization(
+        &mut self,
+        run_id: RunId,
+        flow_id: FlowId,
+        intent: &crate::store::MobExternalDeliveryIntent,
+        detail: &str,
+    ) -> Result<RunId, MobError> {
+        let failure = MobError::Internal(detail.to_string());
+        let config = FlowRunConfig::from_definition(flow_id.clone(), &self.definition)?;
+        let run_flow = MobRun::run_flow_input(&run_id, &config)?;
+        let prepared = self.prepare_dsl_input(run_flow, "external_delivery_recovery_run_flow")?;
+        self.commit_prepared_dsl_input(prepared)?;
+        if let Err(start_error) = self
+            .start_external_flow_compensation_after_run_flow(
+                &run_id,
+                "external_delivery_recovery_start_run",
+                "external_delivery_recovery_start_run_state",
+            )
+            .await
+        {
+            self.durable_uncertainty_fail_stop = true;
+            return Err(start_error);
+        }
+        if let Err(compensation_error) = self
+            .terminalize_external_flow_admission_failure_after_start(
+                &run_id,
+                flow_id,
+                detail,
+                "external_delivery_pre_realization_failure",
+                "external_delivery_recovery_complete_flow",
+            )
+            .await
+        {
+            self.durable_uncertainty_fail_stop = true;
+            return Err(compensation_error);
+        }
+        let ledger_result: Result<(), MobError> = async {
+            let record = self
+                .events
+                .load_external_delivery(&intent.mob_id, &intent.identity.idempotency_key)
+                .await?;
+            match record.map(|record| record.phase) {
+                Some(crate::store::MobExternalDeliveryPhase::Realizing {
+                    run_id: realizing_run_id,
+                    ..
+                }) if realizing_run_id == run_id => {
+                    let completion =
+                        crate::store::MobExternalDeliveryRealizerCompletionCommit::new(
+                            intent.clone(),
+                            run_id,
+                        )?;
+                    self.events
+                        .complete_external_delivery_realization(&completion)
+                        .await?;
+                }
+                Some(crate::store::MobExternalDeliveryPhase::Begun { .. }) => {
+                    self.events
+                        .complete_external_delivery(
+                            intent,
+                            &crate::store::MobExternalDeliveryTerminal::failed(&failure),
+                        )
+                        .await?;
+                }
+                phase => {
+                    return Err(MobError::Internal(format!(
+                        "pending Flow failure observed incompatible delivery phase {phase:?}"
+                    )));
+                }
+            }
+            Ok(())
+        }
+        .await;
+        if let Err(ledger_error) = ledger_result {
+            self.durable_uncertainty_fail_stop = true;
+            return Err(ledger_error);
+        }
+        Err(failure)
+    }
+
+    async fn start_external_flow_compensation_after_run_flow(
+        &mut self,
+        run_id: &RunId,
+        signal_context: &'static str,
+        state_context: &'static str,
+    ) -> Result<(), MobError> {
+        self.apply_dsl_signal(mob_dsl::MobMachineSignal::StartRun, signal_context)?;
+        self.commit_flow_run_command_in_actor(
+            run_id,
+            MobMachineFlowRunCommand::StartRun(flow_run::inputs::StartRun {}),
+            state_context,
+        )
+        .await?
+        .ok_or_else(|| {
+            MobError::Internal(
+                "external delivery recovery did not commit the Flow StartRun reducer".to_string(),
+            )
+        })?;
+        Ok(())
+    }
+
+    async fn terminalize_external_flow_admission_failure_after_start(
+        &mut self,
+        run_id: &RunId,
+        flow_id: FlowId,
+        detail: &str,
+        terminalization_context: &'static str,
+        completion_context: &'static str,
+    ) -> Result<(), MobError> {
+        self.cancel_unfinished_steps_in_actor(run_id).await?;
+        self.terminalize_failed_in_actor(
+            run_id.clone(),
+            flow_id,
+            FlowFailureCause::AdmissionFailed {
+                detail: detail.to_string(),
+            },
+            terminalization_context,
+        )
+        .await?;
+        self.apply_dsl_signal(mob_dsl::MobMachineSignal::CompleteFlow, completion_context)?;
+        Ok(())
     }
 
     async fn create_pending_run(
@@ -47348,6 +47704,7 @@ impl MobActor {
             flow_state,
             activation_params,
         );
+        run.flow_definition_digest = Some(config.definition_digest()?);
         run.append_flow_authority_inputs(authority_inputs)?;
         self.run_store.create_run(run).await?;
         Ok(run_id)

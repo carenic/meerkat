@@ -68,7 +68,7 @@ mod app {
             "tools/list" => json!({
                 "jsonrpc": "2.0",
                 "id": id,
-                "result": { "tools": meerkat_mob_mcp::public_tools_list() }
+                "result": { "tools": meerkat_mob_mcp::public_tools_list_without_workgraph() }
             }),
             "tools/call" => {
                 let params = request.get("params").cloned().unwrap_or_else(|| json!({}));

@@ -276,6 +276,7 @@ impl JobTerminalEvidenceProjector {
             ),
             confirmation_kind: None,
             confirming_owner_key: None,
+            execution_binding_id: None,
         };
 
         loop {

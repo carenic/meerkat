@@ -1727,6 +1727,32 @@ class WireMobRunResultEnvelope:
 
 
 @dataclass
+class WireWorkGraphFlowWorkRef:
+    """Wire payload for WireWorkGraphFlowWorkRef."""
+    item_id: str
+    namespace: str
+    realm_id: str
+
+
+@dataclass
+class WireWorkGraphFlowExecutionBinding:
+    """Redacted, typed reverse linkage from one canonical Mob Flow run to its
+durable WorkGraph execution attempt. Activation parameters and execution
+principals are intentionally absent from this public projection."""
+    binding_id: str
+    binding_revision: int
+    created_at: str
+    evidence_id: str
+    flow_config_digest: str
+    flow_id: str
+    lifecycle_phase: WireWorkExecutionLifecyclePhase
+    mob_id: str
+    run_id: str
+    work_ref: WireWorkGraphFlowWorkRef
+    supersedes: Optional[str] = None
+
+
+@dataclass
 class WirePeerConnectivitySnapshot:
     """Live connectivity summary for a member's currently wired peers. Mirrors
 `meerkat_mob::MobPeerConnectivitySnapshot`."""
@@ -1982,6 +2008,7 @@ class MobFlowStatusResult:
     """Response payload for `mob/flow_status`.
 
 `run` is `None` when the requested run id has no persisted run."""
+    execution_binding: Optional[WireWorkGraphFlowExecutionBinding] = None
     run: Optional[WireMobRun] = None
 
 
@@ -3147,6 +3174,7 @@ class WorkEvidenceRef:
     kind: str
     confirmation_kind: Optional[WorkEvidenceKind] = None
     confirming_owner_key: Optional[WorkOwnerKey] = None
+    execution_binding_id: Optional[str] = None
     label: Optional[str] = None
     summary: Optional[str] = None
 
@@ -3159,6 +3187,7 @@ class WorkEvidenceRef:
         return cls(
             confirmation_kind=(parse_work_evidence_kind(data['confirmation_kind']) if data.get('confirmation_kind') is not None else None),
             confirming_owner_key=(WorkOwnerKey.from_wire(data['confirming_owner_key']) if data.get('confirming_owner_key') is not None else None),
+            execution_binding_id=(_expect_wire_str(data['execution_binding_id'], 'WorkEvidenceRef.execution_binding_id') if data.get('execution_binding_id') is not None else None),
             id=_expect_wire_str(_require_wire_field(data, 'id', 'WorkEvidenceRef'), 'WorkEvidenceRef.id'),
             kind=_expect_wire_str(_require_wire_field(data, 'kind', 'WorkEvidenceRef'), 'WorkEvidenceRef.kind'),
             label=(_expect_wire_str(data['label'], 'WorkEvidenceRef.label') if data.get('label') is not None else None),
@@ -5472,6 +5501,9 @@ WireNonPortableResourceKind = Literal['rust_bundles', 'per_spawn_external_tools'
 # re-deriving meaning from a free-form status string.
 WireMobRunStatus = Literal['pending', 'running', 'completed', 'failed', 'canceled']
 
+# Mob RPC helper wire type for WireWorkExecutionLifecyclePhase.
+WireWorkExecutionLifecyclePhase = Literal['absent', 'launch_requested', 'launch_uncertain', 'launch_quarantined', 'running', 'evidence_projection_requested', 'failure_evidence_projection_requested', 'cancellation_evidence_projection_requested', 'launch_failure_evidence_projection_requested', 'work_closure_requested', 'flow_failed', 'flow_canceled', 'evidence_projected', 'work_closed', 'launch_failed']
+
 # Tri-state peer-connectivity projection for `mob/member_status`.
 #
 # Distinguishes "connectivity is not applicable to this member" (no bridge
@@ -5611,7 +5643,7 @@ WorkEdgeKind = Literal['blocks', 'parent', 'related', 'supersedes', 'derived_fro
 WorkEvidenceKind = Literal['host_confirmation', 'principal_confirmation', 'supervisor_confirmation', 'reviewer_confirmation'] | Literal['self_attest']
 
 # WorkGraph RPC helper wire type for WorkGraphEventKind.
-WorkGraphEventKind = Literal['created', 'updated', 'claimed', 'released', 'blocked', 'closed', 'linked', 'evidence_added', 'attention_created', 'attention_updated']
+WorkGraphEventKind = Literal['created', 'updated', 'claimed', 'released', 'blocked', 'closed', 'linked', 'evidence_added', 'attention_created', 'attention_updated', 'execution_bound', 'execution_transitioned']
 
 # WorkGraph RPC helper wire type for WorkOwnerKind.
 WorkOwnerKind = Literal['principal', 'agent', 'session', 'mob', 'label']
@@ -7169,7 +7201,7 @@ def parse_work_edge_kind(value: Any) -> "WorkEdgeKind":
 
 def parse_work_graph_event_kind(value: Any) -> "WorkGraphEventKind":
     """Fail-closed wire parser for WorkGraphEventKind (K21)."""
-    return _expect_wire_enum(value, ('created', 'updated', 'claimed', 'released', 'blocked', 'closed', 'linked', 'evidence_added', 'attention_created', 'attention_updated',), 'WorkGraphEventKind')
+    return _expect_wire_enum(value, ('created', 'updated', 'claimed', 'released', 'blocked', 'closed', 'linked', 'evidence_added', 'attention_created', 'attention_updated', 'execution_bound', 'execution_transitioned',), 'WorkGraphEventKind')
 
 
 def parse_work_evidence_kind(value: Any) -> "WorkEvidenceKind":

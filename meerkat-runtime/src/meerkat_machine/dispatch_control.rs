@@ -348,6 +348,11 @@ impl MeerkatMachine {
                         },
                     );
                 }
+                // Acquire process-owned execution before the first durable
+                // mutation. A committed admission must never be reported as
+                // failed because cleanup-runtime initialization came later.
+                let cleanup_spawner = MachineCleanupTaskSpawner::acquire()
+                    .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
                 self.apply_session_dsl_input_with_dispatch_failure(
                     &session_id,
                     ingest_input,
@@ -530,76 +535,50 @@ impl MeerkatMachine {
                     )
                 };
 
-                let live_boundary_disposition = if signal.should_interrupt_yielding()
+                let live_boundary_plan = if signal.should_interrupt_yielding()
                     && stages_run_boundary
                     && let (Some(input_id), Some(boundary_handle), Some(attachment_id)) = (
                         accepted_input_id.as_ref(),
                         boundary_handle.clone(),
                         attachment_id,
                     ) {
-                    let witness = RuntimeLiveBoundaryAttachmentWitness {
-                        mutation_gate: Arc::clone(&mutation_gate),
-                        driver: driver.clone(),
-                        dsl_authority: Arc::clone(&dsl_authority),
-                        attachment_id,
-                        boundary_handle,
-                    };
-                    let held_mutation_gate = gate_guard.take().ok_or_else(|| {
-                        RuntimeControlPlaneError::Internal(
-                            "AcceptWithCompletion(Ingest) lost its held session mutation gate before exact live-boundary preparation"
-                                .to_string(),
-                        )
-                    })?;
-                    let (returned_gate, disposition) = self
-                        .commit_live_boundary_input_if_available(
-                            &session_id,
-                            &witness,
-                            held_mutation_gate,
-                            input_id,
-                            &completions,
-                            publication_handle.clone(),
-                            &mut fallback_wake,
-                        )
-                        .await
-                        .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
-                    gate_guard = Some(returned_gate);
-                    disposition
+                    Some(RuntimeAcceptedLiveBoundaryPlan {
+                        witness: RuntimeLiveBoundaryAttachmentWitness {
+                            mutation_gate: Arc::clone(&mutation_gate),
+                            driver: driver.clone(),
+                            dsl_authority: Arc::clone(&dsl_authority),
+                            attachment_id,
+                            boundary_handle,
+                        },
+                        input_id: input_id.clone(),
+                        publication_handle: publication_handle.clone(),
+                    })
                 } else {
-                    super::dispatch_ingress::LiveBoundaryInputDisposition::QueuedFallback
+                    None
                 };
 
-                // Exact injection and successor ownership both supersede the
-                // old-run cancel. Only exact injection also consumes the wake;
-                // a successor claim retains that liveness edge.
-                let cancel_plan = if live_boundary_disposition.suppress_cancel() {
-                    None
-                } else {
-                    cancel_plan
-                };
-                let should_wake =
-                    signal.should_wake() && !live_boundary_disposition.suppress_wake();
-                if cancel_plan.is_some() || should_wake {
+                if accepted_input_id.is_some() {
                     let held_mutation_gate = gate_guard.take().ok_or_else(|| {
                         RuntimeControlPlaneError::Internal(
-                            "AcceptWithCompletion(Ingest) lost its held session mutation gate"
+                            "AcceptWithCompletion(Ingest) lost its held session mutation gate before asynchronous boundary work"
                                 .to_string(),
                         )
                     })?;
-                    gate_guard = Some(
-                        self.dispatch_accepted_ingress_boundary_work(
-                            &session_id,
-                            held_mutation_gate,
-                            cancel_plan,
-                            completions,
-                            wake_tx,
-                            should_wake,
-                        )
-                        .await
-                        .map_err(|err| RuntimeControlPlaneError::Internal(err.to_string()))?,
+                    self.spawn_accepted_ingress_boundary_work(
+                        cleanup_spawner,
+                        &session_id,
+                        held_mutation_gate,
+                        live_boundary_plan,
+                        cancel_plan,
+                        completions,
+                        wake_tx,
+                        signal.should_wake(),
+                        fallback_wake,
                     );
+                } else {
+                    fallback_wake.disarm();
+                    drop(gate_guard.take());
                 }
-                fallback_wake.disarm();
-                drop(gate_guard.take());
 
                 Ok(MeerkatMachineCommandResult::AcceptOutcome(outcome))
             }

@@ -1,0 +1,212 @@
+# WorkExecutionLifecycleMachine Mapping Note
+
+<!-- GENERATED_COVERAGE_START -->
+## Generated Coverage
+This section is generated from the Rust machine catalog. Do not edit it by hand.
+
+### Machine
+- `WorkExecutionLifecycleMachine`
+
+### Code Anchors
+- `work_execution_lifecycle` (machine `WorkExecutionLifecycleMachine`): `meerkat-workgraph/src/execution_machine.rs` — WorkExecutionMachine owns the durable bind, launch uncertainty, Flow observation, evidence projection, and WorkGraph closure handoff lifecycle
+
+### Scenarios
+- `work_execution_recovery_and_completion` — A binding commits before launch, ambiguous launch remains fail-closed, Flow success requests idempotent evidence, and closure feedback records either WorkClosed or EvidenceProjected
+
+### Transitions
+- `BindExecution`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: `work_execution_recovery_and_completion`
+- `RecoverLaunchRequest`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `RecoverUncertainLaunch`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `RecoverQuarantinedLaunch`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverRunning`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `RecoverEvidenceProjection`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `RecoverWorkClosure`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `RecoverFlowFailureEvidenceProjection`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `RecoverFlowCancellationEvidenceProjection`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `RecoverLaunchFailureEvidenceProjection`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverFlowFailure`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `RecoverFlowCancellation`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `RecoverEvidenceProjected`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `RecoverClosedWork`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `RecoverLaunchFailure`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `AcceptFlowLaunch`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `ObserveRunningFlow`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `ObserveCompletedFlow`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: `work_execution_recovery_and_completion`
+- `ObserveFailedFlow`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `ObserveCanceledFlow`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `ObserveLostRun`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ObserveLostCompletedRunBeforeEvidence`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecordUncertainLaunch`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: `work_execution_recovery_and_completion`
+- `QuarantineLaunch`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `FailLaunch`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `CommitLaunchFailureEvidenceProjection`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `CommitEvidenceProjection`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: `work_execution_recovery_and_completion`
+- `CommitFlowFailureEvidenceProjection`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `CommitFlowCancellationEvidenceProjection`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `CommitWorkClosure`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: `work_execution_recovery_and_completion`
+- `RecordWorkClosureRefusal`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: `work_execution_recovery_and_completion`
+- `ClassifyRetryEligibilityTerminalFlowFailed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRetryEligibilityTerminalFlowCanceled`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRetryEligibilityTerminalEvidenceProjected`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRetryEligibilityTerminalWorkClosed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRetryEligibilityTerminalLaunchFailed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRetryEligibilityLiveAbsent`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRetryEligibilityLiveLaunchRequested`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRetryEligibilityLiveLaunchUncertain`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRetryEligibilityLiveLaunchQuarantined`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRetryEligibilityLiveRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRetryEligibilityLiveEvidenceProjectionRequested`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRetryEligibilityLiveFailureEvidenceProjectionRequested`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRetryEligibilityLiveCancellationEvidenceProjectionRequested`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRetryEligibilityLiveLaunchFailureEvidenceProjectionRequested`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyRetryEligibilityLiveWorkClosureRequested`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+
+### Effects
+- `FlowLaunchRequested`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: `work_execution_recovery_and_completion`
+- `FlowLaunchAccepted`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `FlowLaunchUncertain`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: `work_execution_recovery_and_completion`
+- `FlowLaunchQuarantined`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `EvidenceProjectionRequested`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: `work_execution_recovery_and_completion`
+- `FlowFailureEvidenceProjectionRequested`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `FlowCancellationEvidenceProjectionRequested`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `LaunchFailureEvidenceProjectionRequested`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `WorkClosureRequested`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: `work_execution_recovery_and_completion`
+- `FlowFailed`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `FlowCanceled`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `LaunchFailed`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `EvidenceProjected`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: `work_execution_recovery_and_completion`
+- `WorkClosed`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: `work_execution_recovery_and_completion`
+- `RetryEligibilityClassified`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+
+### Invariants
+- `identified_after_bind`
+  - anchors: `work_execution_lifecycle`
+  - scenarios: (unclaimed)
+- `evidence_projection_is_typed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+
+
+<!-- GENERATED_COVERAGE_END -->

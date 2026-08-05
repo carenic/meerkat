@@ -8258,6 +8258,7 @@ async fn handle_workgraph_command(
                         summary,
                         confirmation_kind: None,
                         confirming_owner_key: None,
+                        execution_binding_id: None,
                     },
                     principal: None,
                     trusted_principal: None,
@@ -8606,6 +8607,8 @@ fn work_event_kind_label(kind: meerkat::WorkGraphEventKind) -> &'static str {
         meerkat::WorkGraphEventKind::EvidenceAdded => "evidence_added",
         meerkat::WorkGraphEventKind::AttentionCreated => "attention_created",
         meerkat::WorkGraphEventKind::AttentionUpdated => "attention_updated",
+        meerkat::WorkGraphEventKind::ExecutionBound => "execution_bound",
+        meerkat::WorkGraphEventKind::ExecutionTransitioned => "execution_transitioned",
     }
 }
 
@@ -14260,6 +14263,7 @@ async fn hydrate_mob_state(
             .mob_insert_handle(meerkat_mob::MobId::from(mob_id.clone()), handle.clone())
             .await;
     }
+    state.start_workgraph_flow_reconciler();
     Ok(state)
 }
 
@@ -26301,6 +26305,7 @@ supports_reasoning = true
             run_id: RunId::new(),
             mob_id: meerkat_mob::MobId::from("flow-mob"),
             flow_id: FlowId::from("demo"),
+            flow_definition_digest: None,
             status: meerkat_mob::MobRunStatus::Running,
             activation_params: serde_json::json!({"ticket":"REQ-019"}),
             created_at: chrono::Utc::now(),

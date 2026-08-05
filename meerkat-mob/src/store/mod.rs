@@ -428,6 +428,14 @@ fn validate_external_delivery_record(
     }
     match &record.phase {
         MobExternalDeliveryPhase::Begun { repair } => repair.validate()?,
+        MobExternalDeliveryPhase::Realizing { run_id, repair } => {
+            if run_id.to_string().is_empty() {
+                return Err(MobStoreError::Serialization(
+                    "mob external-delivery realizing run id must be nonempty".to_string(),
+                ));
+            }
+            repair.validate()?;
+        }
         MobExternalDeliveryPhase::Terminal { terminal } => {
             validate_external_delivery_terminal(terminal)?;
         }
@@ -495,6 +503,14 @@ pub enum MobExternalDeliveryPhase {
         #[serde(default)]
         repair: MobExternalDeliveryRepairState,
     },
+    /// A target realizer durably claimed the delivery after the exact target
+    /// run was persisted and before its execution was started.
+    Realizing {
+        /// Exact target run that was durable before this fence was crossed.
+        run_id: crate::RunId,
+        #[serde(default)]
+        repair: MobExternalDeliveryRepairState,
+    },
     Terminal {
         terminal: MobExternalDeliveryTerminal,
     },
@@ -513,7 +529,148 @@ pub enum MobExternalDeliveryBeginOutcome {
     ExistingBegun {
         repair: MobExternalDeliveryRepairState,
     },
+    ExistingRealizing {
+        run_id: crate::RunId,
+        repair: MobExternalDeliveryRepairState,
+    },
     ExistingTerminal(MobExternalDeliveryTerminal),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MobExternalDeliveryClaimOutcome {
+    Claimed,
+    ExistingRealizing {
+        run_id: crate::RunId,
+        repair: MobExternalDeliveryRepairState,
+    },
+    ExistingTerminal(MobExternalDeliveryTerminal),
+}
+
+#[derive(Debug)]
+pub enum MobExternalFlowLaunchOutcome {
+    Started(crate::RunId),
+    Uncertain { detail: String },
+    ExistingTerminal(MobExternalDeliveryTerminal),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MobExternalDeliveryAbandonOutcome {
+    Abandoned,
+    ExistingRealizing {
+        run_id: crate::RunId,
+        repair: MobExternalDeliveryRepairState,
+    },
+    ExistingTerminal(MobExternalDeliveryTerminal),
+}
+
+/// Opaque actor-minted proof that the exact deterministic pending run was
+/// persisted before the delivery realization fence is crossed.
+pub struct MobExternalDeliveryRealizationCommit {
+    intent: MobExternalDeliveryIntent,
+    run_id: crate::RunId,
+}
+
+/// Opaque proof that the exact realized Flow run is now durably executable.
+///
+/// The Mob actor mints this only after it has committed `StartRun` and
+/// installed the live execution trackers. Recovery may mint the same proof
+/// through the authority-bearing handle after observing the exact run beyond
+/// `Pending`. Stores require this proof for `Realizing -> Terminal`.
+pub struct MobExternalDeliveryRealizerCompletionCommit {
+    intent: MobExternalDeliveryIntent,
+    run_id: crate::RunId,
+}
+
+impl MobExternalDeliveryRealizerCompletionCommit {
+    pub(crate) fn new(
+        intent: MobExternalDeliveryIntent,
+        run_id: crate::RunId,
+    ) -> Result<Self, MobStoreError> {
+        intent.validate()?;
+        if intent.target_kind != MobExternalDeliveryTargetKind::Flow {
+            return Err(MobStoreError::Serialization(
+                "external-delivery realizer completion is reserved for Flow targets".to_string(),
+            ));
+        }
+        Ok(Self { intent, run_id })
+    }
+
+    pub(crate) fn intent(&self) -> &MobExternalDeliveryIntent {
+        &self.intent
+    }
+
+    pub(crate) fn run_id(&self) -> &crate::RunId {
+        &self.run_id
+    }
+}
+
+impl MobExternalDeliveryRealizationCommit {
+    pub(crate) fn new(
+        intent: MobExternalDeliveryIntent,
+        run_id: crate::RunId,
+    ) -> Result<Self, MobStoreError> {
+        intent.validate()?;
+        if intent.target_kind != MobExternalDeliveryTargetKind::Flow {
+            return Err(MobStoreError::Serialization(
+                "external-delivery realization commits are reserved for Flow targets".to_string(),
+            ));
+        }
+        Ok(Self { intent, run_id })
+    }
+
+    pub(crate) fn intent(&self) -> &MobExternalDeliveryIntent {
+        &self.intent
+    }
+
+    pub(crate) fn run_id(&self) -> &crate::RunId {
+        &self.run_id
+    }
+}
+
+/// Opaque owner-adjudication commit for resolving a delivery already behind
+/// the durable realization fence.
+///
+/// Only the WorkGraph Flow bridge path can mint this value after re-admitting
+/// the exact binding authority. Stores consume the commit rather than raw
+/// intent and terminal values so direct store callers cannot bypass that
+/// authority boundary.
+pub struct MobExternalDeliveryFencedResolutionCommit {
+    intent: MobExternalDeliveryIntent,
+    run_id: crate::RunId,
+    terminal: MobExternalDeliveryTerminal,
+}
+
+impl MobExternalDeliveryFencedResolutionCommit {
+    pub(crate) fn new(
+        intent: MobExternalDeliveryIntent,
+        run_id: crate::RunId,
+        terminal: MobExternalDeliveryTerminal,
+    ) -> Result<Self, MobStoreError> {
+        intent.validate()?;
+        validate_external_delivery_terminal(&terminal)?;
+        if !matches!(terminal, MobExternalDeliveryTerminal::Failed { .. }) {
+            return Err(MobStoreError::Serialization(
+                "owner-fenced delivery resolution must record a failed terminal".to_string(),
+            ));
+        }
+        Ok(Self {
+            intent,
+            run_id,
+            terminal,
+        })
+    }
+
+    pub(crate) fn intent(&self) -> &MobExternalDeliveryIntent {
+        &self.intent
+    }
+
+    pub(crate) fn terminal(&self) -> &MobExternalDeliveryTerminal {
+        &self.terminal
+    }
+
+    pub(crate) fn run_id(&self) -> &crate::RunId {
+        &self.run_id
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3446,12 +3603,55 @@ pub trait MobEventStore: private::MobEventStoreSealed + Send + Sync {
         Err(MobStoreError::ExternalDeliveryPersistenceUnavailable)
     }
 
-    /// Commit the exact terminal for a previously begun delivery.
+    /// Commit the exact terminal for a delivery that has not crossed the
+    /// realization fence.
+    ///
+    /// `Realizing -> Terminal` requires either
+    /// [`MobExternalDeliveryRealizerCompletionCommit`] or
+    /// [`MobExternalDeliveryFencedResolutionCommit`].
     async fn complete_external_delivery(
         &self,
         _intent: &MobExternalDeliveryIntent,
         _terminal: &MobExternalDeliveryTerminal,
     ) -> Result<MobExternalDeliveryCompleteOutcome, MobStoreError> {
+        Err(MobStoreError::ExternalDeliveryPersistenceUnavailable)
+    }
+
+    /// Atomically fence one begun delivery as being realized under an opaque
+    /// actor commit proving the exact target run was persisted first.
+    async fn claim_external_delivery_realization(
+        &self,
+        _commit: &MobExternalDeliveryRealizationCommit,
+    ) -> Result<MobExternalDeliveryClaimOutcome, MobStoreError> {
+        Err(MobStoreError::ExternalDeliveryPersistenceUnavailable)
+    }
+
+    /// Complete the exact realized Flow launch under an opaque run-bound
+    /// realizer proof.
+    async fn complete_external_delivery_realization(
+        &self,
+        _commit: &MobExternalDeliveryRealizerCompletionCommit,
+    ) -> Result<MobExternalDeliveryCompleteOutcome, MobStoreError> {
+        Err(MobStoreError::ExternalDeliveryPersistenceUnavailable)
+    }
+
+    /// Atomically abandon only a delivery that has never crossed the durable
+    /// realization fence.
+    async fn abandon_external_delivery(
+        &self,
+        _intent: &MobExternalDeliveryIntent,
+        _terminal: &MobExternalDeliveryTerminal,
+    ) -> Result<MobExternalDeliveryAbandonOutcome, MobStoreError> {
+        Err(MobStoreError::ExternalDeliveryPersistenceUnavailable)
+    }
+
+    /// Commit an owner-adjudicated terminal after the owner has externally
+    /// fenced the former realizer. This is the only legal escape from a
+    /// persisted `Realizing` phase without observing the exact target run.
+    async fn resolve_external_delivery_after_realizer_fenced(
+        &self,
+        _commit: &MobExternalDeliveryFencedResolutionCommit,
+    ) -> Result<MobExternalDeliveryAbandonOutcome, MobStoreError> {
         Err(MobStoreError::ExternalDeliveryPersistenceUnavailable)
     }
 

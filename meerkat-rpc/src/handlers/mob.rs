@@ -1366,9 +1366,31 @@ pub async fn handle_flow_status(
         Ok(run_id) => run_id,
         Err(err) => return invalid_params(id, format!("Invalid run_id: {err}")),
     };
-    match state.mob_flow_status(&mob_id, run_id).await {
+    match state.mob_flow_status(&mob_id, run_id.clone()).await {
         Ok(run) => match meerkat_mob::MobRun::public_flow_status_run_value(run.as_ref()) {
-            Ok(run) => RpcResponse::success(id, meerkat_contracts::MobFlowStatusResult { run }),
+            Ok(run) => {
+                let execution_binding = match state
+                    .workgraph_execution_binding_for_flow_run(&mob_id, &run_id)
+                    .await
+                {
+                    Ok(binding) => match binding
+                        .as_ref()
+                        .map(meerkat_mob_mcp::workgraph_execution_binding_view)
+                        .transpose()
+                    {
+                        Ok(binding) => binding,
+                        Err(error) => return mob_call_error(id, &error),
+                    },
+                    Err(error) => return mob_call_error(id, &error),
+                };
+                RpcResponse::success(
+                    id,
+                    meerkat_contracts::MobFlowStatusResult {
+                        run,
+                        execution_binding,
+                    },
+                )
+            }
             Err(err) => mob_call_error(id, &err),
         },
         Err(err) => mob_call_error(id, &err),

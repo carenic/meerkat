@@ -681,6 +681,7 @@ impl AppState {
                     state = state.with_controlling_acceptor(acceptor);
                 }
                 let state = Arc::new(state);
+                state.start_workgraph_flow_reconciler();
                 *mob_tools_slot
                     .write()
                     .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::new(

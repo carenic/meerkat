@@ -28,12 +28,17 @@ The canonical registry is `canonical_machine_schemas()` in
 | `OccurrenceLifecycleMachine` | `meerkat-schedule` | Claimed occurrence delivery and terminal outcomes. |
 | `WorkGraphLifecycleMachine` | `meerkat-workgraph` | Work item lifecycle, readiness, dependency eligibility, claim leases, terminal state, and evidence revision handling. |
 | `WorkAttentionLifecycleMachine` | `meerkat-workgraph` | Goal attention binding lifecycle, pause/resume/supersession/stop state, and binding revision handling. |
+| `WorkExecutionLifecycleMachine` | `meerkat-workgraph` | Durable WorkGraph-to-executor binding lifecycle, launch uncertainty, terminal evidence projection, closure feedback, and retry eligibility. |
 
 `MeerkatMachine` and `MobMachine` are the two runtime kernels. Auth,
 scheduling, durable jobs, and runtime delivery are auxiliary authority machines that protect
 specific perimeter state. WorkGraph is an optional subsystem authority for
 durable agent commitments, dependency-aware claim state, and goal attention
-bindings.
+bindings. `WorkExecutionLifecycleMachine` owns the cross-system obligation for
+one execution attempt without absorbing either WorkGraph item truth or Mob Flow
+run truth. Its effects are realized mechanically by the Mob composition facade,
+and every launch, evidence, or closure outcome returns through a typed machine
+input before the binding advances.
 
 One scoped authority sits outside the canonical registry:
 `MobHostBindingAuthority` (catalog DSL source
@@ -170,6 +175,7 @@ The canonical registry is `canonical_composition_schemas()` in
 | `schedule_mob_bundle` | Occurrence delivery into mob runs. |
 | `adaptive_mob_bundle` | Adaptive control/layer mob composition, including generated layer-terminal feedback into the control kernel. |
 | `workgraph_attention_bundle` | WorkGraph lifecycle and attention binding coordination. |
+| `workgraph_flow_bundle` | Work execution launch, run observation, terminal evidence, uncertain-launch resolution, and WorkGraph closure handoffs through the shared Mob runtime bridge. |
 
 These compositions are not marketing concepts or public APIs. They are
 contributor-facing guardrails for the runtime implementation.

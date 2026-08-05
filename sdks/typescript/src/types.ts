@@ -629,6 +629,7 @@ export type MobMemberRef = string;
 
 export interface MobFlowStatus {
   readonly run?: Record<string, unknown> | null;
+  readonly execution_binding?: Generated.WireWorkGraphFlowExecutionBinding | null;
 }
 
 export interface MobRunResult {

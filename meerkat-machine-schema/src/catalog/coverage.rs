@@ -17,13 +17,14 @@ use super::{
         job_runtime_delivery_composition, meerkat_mob_seam_composition,
         schedule_bundle_composition, schedule_mob_bundle_composition,
         schedule_runtime_bundle_composition, workgraph_attention_bundle_composition,
+        workgraph_flow_bundle_composition,
     },
     dsl::{
         dsl_approval_lifecycle_machine, dsl_auth_machine, dsl_detached_job_machine,
         dsl_meerkat_machine, dsl_mob_machine, dsl_occurrence_lifecycle_machine,
         dsl_runtime_delivery_machine, dsl_schedule_lifecycle_machine, dsl_session_document_machine,
         dsl_session_turn_admission_machine, dsl_work_attention_lifecycle_machine,
-        dsl_workgraph_lifecycle_machine,
+        dsl_work_execution_lifecycle_machine, dsl_workgraph_lifecycle_machine,
     },
 };
 
@@ -2120,6 +2121,79 @@ pub fn canonical_machine_coverage_manifests() -> Vec<MachineCoverageManifest> {
                     ]),
             )],
         ),
+        machine_manifest_from_schema(
+            &dsl_work_execution_lifecycle_machine(),
+            &[machine_anchor(
+                "work_execution_lifecycle",
+                "WorkExecutionLifecycleMachine",
+                "meerkat-workgraph/src/execution_machine.rs",
+                "WorkExecutionMachine owns the durable bind, launch uncertainty, Flow observation, evidence projection, and WorkGraph closure handoff lifecycle",
+                CoverageClaims::none()
+                    .transitions(&[
+                        "BindExecution",
+                        "RecoverLaunchRequest",
+                        "RecoverUncertainLaunch",
+                        "RecoverRunning",
+                        "RecoverEvidenceProjection",
+                        "RecoverWorkClosure",
+                        "RecoverFlowFailureEvidenceProjection",
+                        "RecoverFlowCancellationEvidenceProjection",
+                        "RecoverFlowFailure",
+                        "RecoverFlowCancellation",
+                        "RecoverEvidenceProjected",
+                        "RecoverClosedWork",
+                        "RecoverLaunchFailure",
+                        "AcceptFlowLaunch",
+                        "ObserveRunningFlow",
+                        "ObserveCompletedFlow",
+                        "ObserveFailedFlow",
+                        "ObserveCanceledFlow",
+                        "RecordUncertainLaunch",
+                        "FailLaunch",
+                        "CommitEvidenceProjection",
+                        "CommitFlowFailureEvidenceProjection",
+                        "CommitFlowCancellationEvidenceProjection",
+                        "CommitWorkClosure",
+                        "RecordWorkClosureRefusal",
+                    ])
+                    .effects(&[
+                        "FlowLaunchRequested",
+                        "FlowLaunchAccepted",
+                        "FlowLaunchUncertain",
+                        "EvidenceProjectionRequested",
+                        "FlowFailureEvidenceProjectionRequested",
+                        "FlowCancellationEvidenceProjectionRequested",
+                        "WorkClosureRequested",
+                        "FlowFailed",
+                        "FlowCanceled",
+                        "LaunchFailed",
+                        "EvidenceProjected",
+                        "WorkClosed",
+                    ])
+                    .invariants(&["identified_after_bind"]),
+            )],
+            &[scenario(
+                "work_execution_recovery_and_completion",
+                "A binding commits before launch, ambiguous launch remains fail-closed, Flow success requests idempotent evidence, and closure feedback records either WorkClosed or EvidenceProjected",
+                CoverageClaims::none()
+                    .transitions(&[
+                        "BindExecution",
+                        "RecordUncertainLaunch",
+                        "ObserveCompletedFlow",
+                        "CommitEvidenceProjection",
+                        "CommitWorkClosure",
+                        "RecordWorkClosureRefusal",
+                    ])
+                    .effects(&[
+                        "FlowLaunchRequested",
+                        "FlowLaunchUncertain",
+                        "EvidenceProjectionRequested",
+                        "WorkClosureRequested",
+                        "EvidenceProjected",
+                        "WorkClosed",
+                    ]),
+            )],
+        ),
     ]
 }
 
@@ -2425,6 +2499,42 @@ pub fn canonical_composition_coverage_manifests() -> Vec<CompositionCoverageMani
                 "terminal WorkGraph item closure routes to WorkAttention Stop so live goal attention bindings cannot survive their target item",
                 CoverageClaims::none().routes(&["work_item_close_stops_attention"]),
             )],
+        ),
+        composition_manifest_from_schema(
+            &workgraph_flow_bundle_composition(),
+            &[
+                machine_anchor(
+                    "workgraph_flow_bridge_owner",
+                    "WorkExecutionLifecycleMachine",
+                    "meerkat-mob/src/workgraph_flow.rs",
+                    "mechanical Mob composition facade realizes generated WorkExecution launch, evidence, and closure obligations and returns typed feedback",
+                    CoverageClaims::none(),
+                ),
+                machine_anchor(
+                    "workgraph_flow_bundle_schema",
+                    "WorkExecutionLifecycleMachine",
+                    "meerkat-machine-schema/src/catalog/compositions.rs",
+                    "formal WorkExecution lifecycle handoff composition for Mob Flow attempts",
+                    CoverageClaims::none(),
+                ),
+            ],
+            &[
+                scenario(
+                    "flow-launch-feedback",
+                    "a durable WorkExecution launch obligation is realized by Mob and closed only by typed started, observed, uncertain, or failed feedback",
+                    CoverageClaims::none(),
+                ),
+                scenario(
+                    "flow-terminal-evidence-feedback",
+                    "successful, failed, and canceled Flow outcomes project idempotent evidence before their corresponding typed feedback advances WorkExecution",
+                    CoverageClaims::none(),
+                ),
+                scenario(
+                    "work-closure-feedback",
+                    "successful evidence requests WorkGraph closure and records either typed closure confirmation or policy refusal",
+                    CoverageClaims::none(),
+                ),
+            ],
         ),
     ]
 }

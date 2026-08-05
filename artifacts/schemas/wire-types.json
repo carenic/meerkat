@@ -5464,6 +5464,13 @@
             ],
             "description": "Typed identity of the confirming owner for supervisor/reviewer\nconfirmations. Set by the trusted producer; the machine records distinct\nowners per confirmation kind."
           },
+          "execution_binding_id": {
+            "description": "Typed execution provenance stamped only by the execution bridge. The\nopaque `id` remains a display/dedup projection and is never interpreted\nas mutation authority.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "id": {
             "type": "string"
           },
@@ -6412,6 +6419,13 @@
             ],
             "description": "Typed identity of the confirming owner for supervisor/reviewer\nconfirmations. Set by the trusted producer; the machine records distinct\nowners per confirmation kind."
           },
+          "execution_binding_id": {
+            "description": "Typed execution provenance stamped only by the execution bridge. The\nopaque `id` remains a display/dedup projection and is never interpreted\nas mutation authority.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "id": {
             "type": "string"
           },
@@ -6774,6 +6788,13 @@
               }
             ],
             "description": "Typed identity of the confirming owner for supervisor/reviewer\nconfirmations. Set by the trusted producer; the machine records distinct\nowners per confirmation kind."
+          },
+          "execution_binding_id": {
+            "description": "Typed execution provenance stamped only by the execution bridge. The\nopaque `id` remains a display/dedup projection and is never interpreted\nas mutation authority.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "id": {
             "type": "string"
@@ -64603,6 +64624,13 @@
             ],
             "description": "Typed identity of the confirming owner for supervisor/reviewer\nconfirmations. Set by the trusted producer; the machine records distinct\nowners per confirmation kind."
           },
+          "execution_binding_id": {
+            "description": "Typed execution provenance stamped only by the execution bridge. The\nopaque `id` remains a display/dedup projection and is never interpreted\nas mutation authority.",
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "id": {
             "type": "string"
           },
@@ -65152,6 +65180,12 @@
                     {
                       "type": "null"
                     }
+                  ]
+                },
+                "execution_binding_id": {
+                  "type": [
+                    "string",
+                    "null"
                   ]
                 },
                 "id": {
@@ -66095,6 +66129,12 @@
                     }
                   ]
                 },
+                "execution_binding_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "id": {
                   "type": "string"
                 },
@@ -66848,6 +66888,12 @@
                     }
                   ]
                 },
+                "execution_binding_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "id": {
                   "type": "string"
                 },
@@ -67579,6 +67625,12 @@
                     {
                       "type": "null"
                     }
+                  ]
+                },
+                "execution_binding_id": {
+                  "type": [
+                    "string",
+                    "null"
                   ]
                 },
                 "id": {
@@ -78104,11 +78156,119 @@
           "canceled"
         ],
         "type": "string"
+      },
+      "WireWorkExecutionLifecyclePhase": {
+        "enum": [
+          "absent",
+          "launch_requested",
+          "launch_uncertain",
+          "launch_quarantined",
+          "running",
+          "evidence_projection_requested",
+          "failure_evidence_projection_requested",
+          "cancellation_evidence_projection_requested",
+          "launch_failure_evidence_projection_requested",
+          "work_closure_requested",
+          "flow_failed",
+          "flow_canceled",
+          "evidence_projected",
+          "work_closed",
+          "launch_failed"
+        ],
+        "type": "string"
+      },
+      "WireWorkGraphFlowExecutionBinding": {
+        "additionalProperties": false,
+        "description": "Redacted, typed reverse linkage from one canonical Mob Flow run to its\ndurable WorkGraph execution attempt. Activation parameters and execution\nprincipals are intentionally absent from this public projection.",
+        "properties": {
+          "binding_id": {
+            "type": "string"
+          },
+          "binding_revision": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "evidence_id": {
+            "type": "string"
+          },
+          "flow_config_digest": {
+            "type": "string"
+          },
+          "flow_id": {
+            "type": "string"
+          },
+          "lifecycle_phase": {
+            "$ref": "#/$defs/WireWorkExecutionLifecyclePhase"
+          },
+          "mob_id": {
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "supersedes": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "work_ref": {
+            "$ref": "#/$defs/WireWorkGraphFlowWorkRef"
+          }
+        },
+        "required": [
+          "binding_id",
+          "work_ref",
+          "mob_id",
+          "flow_id",
+          "flow_config_digest",
+          "run_id",
+          "lifecycle_phase",
+          "binding_revision",
+          "evidence_id",
+          "created_at"
+        ],
+        "type": "object"
+      },
+      "WireWorkGraphFlowWorkRef": {
+        "additionalProperties": false,
+        "properties": {
+          "item_id": {
+            "type": "string"
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "realm_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "realm_id",
+          "namespace",
+          "item_id"
+        ],
+        "type": "object"
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "description": "Response payload for `mob/flow_status`.\n\n`run` is `None` when the requested run id has no persisted run.",
     "properties": {
+      "execution_binding": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/WireWorkGraphFlowExecutionBinding"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "Redacted durable WorkGraph execution linkage when this run was launched\nthrough the WorkGraph-Flow bridge."
+      },
       "run": {
         "anyOf": [
           {
@@ -86945,6 +87105,13 @@
               }
             ],
             "description": "Typed identity of the confirming owner for supervisor/reviewer\nconfirmations. Set by the trusted producer; the machine records distinct\nowners per confirmation kind."
+          },
+          "execution_binding_id": {
+            "description": "Typed execution provenance stamped only by the execution bridge. The\nopaque `id` remains a display/dedup projection and is never interpreted\nas mutation authority.",
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "id": {
             "type": "string"
@@ -129424,6 +129591,151 @@
     "title": "WireUsage",
     "type": "object"
   },
+  "WireWorkExecutionLifecyclePhase": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "enum": [
+      "absent",
+      "launch_requested",
+      "launch_uncertain",
+      "launch_quarantined",
+      "running",
+      "evidence_projection_requested",
+      "failure_evidence_projection_requested",
+      "cancellation_evidence_projection_requested",
+      "launch_failure_evidence_projection_requested",
+      "work_closure_requested",
+      "flow_failed",
+      "flow_canceled",
+      "evidence_projected",
+      "work_closed",
+      "launch_failed"
+    ],
+    "title": "WireWorkExecutionLifecyclePhase",
+    "type": "string"
+  },
+  "WireWorkGraphFlowExecutionBinding": {
+    "$defs": {
+      "WireWorkExecutionLifecyclePhase": {
+        "enum": [
+          "absent",
+          "launch_requested",
+          "launch_uncertain",
+          "launch_quarantined",
+          "running",
+          "evidence_projection_requested",
+          "failure_evidence_projection_requested",
+          "cancellation_evidence_projection_requested",
+          "launch_failure_evidence_projection_requested",
+          "work_closure_requested",
+          "flow_failed",
+          "flow_canceled",
+          "evidence_projected",
+          "work_closed",
+          "launch_failed"
+        ],
+        "type": "string"
+      },
+      "WireWorkGraphFlowWorkRef": {
+        "additionalProperties": false,
+        "properties": {
+          "item_id": {
+            "type": "string"
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "realm_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "realm_id",
+          "namespace",
+          "item_id"
+        ],
+        "type": "object"
+      }
+    },
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "description": "Redacted, typed reverse linkage from one canonical Mob Flow run to its\ndurable WorkGraph execution attempt. Activation parameters and execution\nprincipals are intentionally absent from this public projection.",
+    "properties": {
+      "binding_id": {
+        "type": "string"
+      },
+      "binding_revision": {
+        "format": "uint64",
+        "minimum": 0,
+        "type": "integer"
+      },
+      "created_at": {
+        "type": "string"
+      },
+      "evidence_id": {
+        "type": "string"
+      },
+      "flow_config_digest": {
+        "type": "string"
+      },
+      "flow_id": {
+        "type": "string"
+      },
+      "lifecycle_phase": {
+        "$ref": "#/$defs/WireWorkExecutionLifecyclePhase"
+      },
+      "mob_id": {
+        "type": "string"
+      },
+      "run_id": {
+        "type": "string"
+      },
+      "supersedes": {
+        "type": [
+          "string",
+          "null"
+        ]
+      },
+      "work_ref": {
+        "$ref": "#/$defs/WireWorkGraphFlowWorkRef"
+      }
+    },
+    "required": [
+      "binding_id",
+      "work_ref",
+      "mob_id",
+      "flow_id",
+      "flow_config_digest",
+      "run_id",
+      "lifecycle_phase",
+      "binding_revision",
+      "evidence_id",
+      "created_at"
+    ],
+    "title": "WireWorkGraphFlowExecutionBinding",
+    "type": "object"
+  },
+  "WireWorkGraphFlowWorkRef": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "additionalProperties": false,
+    "properties": {
+      "item_id": {
+        "type": "string"
+      },
+      "namespace": {
+        "type": "string"
+      },
+      "realm_id": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "realm_id",
+      "namespace",
+      "item_id"
+    ],
+    "title": "WireWorkGraphFlowWorkRef",
+    "type": "object"
+  },
   "WorkAttentionBinding": {
     "$defs": {
       "AttentionDelegatedAuthority": {
@@ -130021,7 +130333,9 @@
           "linked",
           "evidence_added",
           "attention_created",
-          "attention_updated"
+          "attention_updated",
+          "execution_bound",
+          "execution_transitioned"
         ],
         "type": "string"
       }
@@ -130273,6 +130587,12 @@
                     {
                       "type": "null"
                     }
+                  ]
+                },
+                "execution_binding_id": {
+                  "type": [
+                    "string",
+                    "null"
                   ]
                 },
                 "id": {
@@ -130980,6 +131300,12 @@
                     }
                   ]
                 },
+                "execution_binding_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "id": {
                   "type": "string"
                 },
@@ -131500,6 +131826,12 @@
                 {
                   "type": "null"
                 }
+              ]
+            },
+            "execution_binding_id": {
+              "type": [
+                "string",
+                "null"
               ]
             },
             "id": {

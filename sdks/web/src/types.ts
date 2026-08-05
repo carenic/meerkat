@@ -7,6 +7,7 @@ import type {
   WireMobMemberStatus,
   WireNonPortableResourceKind,
   WireReachability,
+  WireWorkGraphFlowExecutionBinding,
 } from './generated/mob.js';
 
 // This type appears in the public `MobMemberSnapshot` shape, so consumers
@@ -616,5 +617,6 @@ export type ToolCallback = (args: string) => Promise<ToolCallbackResult>;
 export interface FlowStatus {
   run_id: string;
   status: string;
+  execution_binding?: WireWorkGraphFlowExecutionBinding | null;
   [key: string]: unknown;
 }

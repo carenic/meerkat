@@ -124,7 +124,30 @@ export interface MobMemberSendResult {
   mob_id: string;
 }
 
+export type WireWorkExecutionLifecyclePhase = "absent" | "launch_requested" | "launch_uncertain" | "launch_quarantined" | "running" | "evidence_projection_requested" | "failure_evidence_projection_requested" | "cancellation_evidence_projection_requested" | "launch_failure_evidence_projection_requested" | "work_closure_requested" | "flow_failed" | "flow_canceled" | "evidence_projected" | "work_closed" | "launch_failed";
+
+export interface WireWorkGraphFlowWorkRef {
+  item_id: string;
+  namespace: string;
+  realm_id: string;
+}
+
+export interface WireWorkGraphFlowExecutionBinding {
+  binding_id: string;
+  binding_revision: number;
+  created_at: string;
+  evidence_id: string;
+  flow_config_digest: string;
+  flow_id: string;
+  lifecycle_phase: WireWorkExecutionLifecyclePhase;
+  mob_id: string;
+  run_id: string;
+  supersedes?: string | null;
+  work_ref: WireWorkGraphFlowWorkRef;
+}
+
 export interface MobFlowStatusResult {
+  execution_binding?: WireWorkGraphFlowExecutionBinding | null;
   run?: Record<string, unknown> | null;
 }
 

@@ -5,14 +5,17 @@ use super::{
     BeginPlacedSpawnResult, CommitPlacedSpawnResult, DeletePlacedSpawnResult,
     ExternalBindingOverlayRecord, IdentityMemberEventCommitOutcome,
     IdentityMemberTargetObservation, IdentityWiringEventCommitOutcome,
-    IdentityWiringTargetObservation, MobEventStore, MobExternalDeliveryBeginOutcome,
-    MobExternalDeliveryCompleteOutcome, MobExternalDeliveryIntent, MobExternalDeliveryPhase,
-    MobExternalDeliveryRecord, MobExternalDeliveryRepairOutcome, MobExternalDeliveryRepairState,
-    MobExternalDeliveryTerminal, MobHostAuthorityDeletionAuthority,
-    MobHostAuthorityPersistenceAuthority, MobHostAuthorityRecord, MobIdentityMemberStore,
-    MobIdentityStatusStore, MobIdentityStore, MobIdentityStoreClock, MobMemberEventCursorRecord,
-    MobMemberLiveCleanupRecord, MobMemberOperatorPruneAuthority, MobMemberOperatorRequestBegin,
-    MobMemberOperatorRequestKey, MobMemberOperatorRequestRecord, MobOperatorGrantDeletionAuthority,
+    IdentityWiringTargetObservation, MobEventStore, MobExternalDeliveryAbandonOutcome,
+    MobExternalDeliveryBeginOutcome, MobExternalDeliveryClaimOutcome,
+    MobExternalDeliveryCompleteOutcome, MobExternalDeliveryFencedResolutionCommit,
+    MobExternalDeliveryIntent, MobExternalDeliveryPhase, MobExternalDeliveryRealizationCommit,
+    MobExternalDeliveryRealizerCompletionCommit, MobExternalDeliveryRecord,
+    MobExternalDeliveryRepairOutcome, MobExternalDeliveryRepairState, MobExternalDeliveryTerminal,
+    MobHostAuthorityDeletionAuthority, MobHostAuthorityPersistenceAuthority,
+    MobHostAuthorityRecord, MobIdentityMemberStore, MobIdentityStatusStore, MobIdentityStore,
+    MobIdentityStoreClock, MobMemberEventCursorRecord, MobMemberLiveCleanupRecord,
+    MobMemberOperatorPruneAuthority, MobMemberOperatorRequestBegin, MobMemberOperatorRequestKey,
+    MobMemberOperatorRequestRecord, MobOperatorGrantDeletionAuthority,
     MobOperatorGrantPersistenceAuthority, MobOperatorGrantRecord,
     MobPlacedSpawnBindingPromotionAuthority, MobPlacedSpawnCarrierRecord,
     MobPlacedSpawnCleanupAuthority, MobPlacedSpawnCommitPersistenceAuthority,
@@ -2141,6 +2144,12 @@ impl MobEventStore for InMemoryMobEventStore {
                 MobExternalDeliveryPhase::Begun { repair } => {
                     MobExternalDeliveryBeginOutcome::ExistingBegun { repair: *repair }
                 }
+                MobExternalDeliveryPhase::Realizing { run_id, repair } => {
+                    MobExternalDeliveryBeginOutcome::ExistingRealizing {
+                        run_id: run_id.clone(),
+                        repair: *repair,
+                    }
+                }
                 MobExternalDeliveryPhase::Terminal { terminal } => {
                     MobExternalDeliveryBeginOutcome::ExistingTerminal(terminal.clone())
                 }
@@ -2190,6 +2199,14 @@ impl MobEventStore for InMemoryMobEventStore {
                 };
                 Ok(MobExternalDeliveryCompleteOutcome::Completed)
             }
+            MobExternalDeliveryPhase::Realizing { .. } => {
+                Err(MobStoreError::ExternalDeliveryConflict {
+                    mob_id: intent.mob_id.clone(),
+                    idempotency_key: intent.identity.idempotency_key.clone(),
+                    detail: "realizing delivery requires run-bound completion authority"
+                        .to_string(),
+                })
+            }
             MobExternalDeliveryPhase::Terminal { terminal: existing } if existing == terminal => {
                 Ok(MobExternalDeliveryCompleteOutcome::AlreadyCompleted)
             }
@@ -2200,6 +2217,216 @@ impl MobEventStore for InMemoryMobEventStore {
                     detail: "a different terminal is already committed".to_string(),
                 })
             }
+        }
+    }
+
+    async fn claim_external_delivery_realization(
+        &self,
+        commit: &MobExternalDeliveryRealizationCommit,
+    ) -> Result<MobExternalDeliveryClaimOutcome, MobStoreError> {
+        let intent = commit.intent();
+        intent.validate()?;
+        let key = (
+            intent.mob_id.clone(),
+            intent.identity.idempotency_key.clone(),
+        );
+        let mut aggregate = self.aggregate.write().await;
+        let record = aggregate.external_deliveries.get_mut(&key).ok_or_else(|| {
+            MobStoreError::NotFound(format!(
+                "mob external delivery '{}'",
+                intent.identity.idempotency_key
+            ))
+        })?;
+        if record.intent != *intent {
+            return Err(MobStoreError::ExternalDeliveryConflict {
+                mob_id: intent.mob_id.clone(),
+                idempotency_key: intent.identity.idempotency_key.clone(),
+                detail: "realization authority does not match stored admission".to_string(),
+            });
+        }
+        match &record.phase {
+            MobExternalDeliveryPhase::Begun { repair } => {
+                let repair = *repair;
+                record.phase = MobExternalDeliveryPhase::Realizing {
+                    run_id: commit.run_id().clone(),
+                    repair,
+                };
+                Ok(MobExternalDeliveryClaimOutcome::Claimed)
+            }
+            MobExternalDeliveryPhase::Realizing { run_id, repair } => {
+                if run_id != commit.run_id() {
+                    return Err(MobStoreError::ExternalDeliveryConflict {
+                        mob_id: intent.mob_id.clone(),
+                        idempotency_key: intent.identity.idempotency_key.clone(),
+                        detail: "external-delivery realization selected a different target run"
+                            .to_string(),
+                    });
+                }
+                Ok(MobExternalDeliveryClaimOutcome::ExistingRealizing {
+                    run_id: run_id.clone(),
+                    repair: *repair,
+                })
+            }
+            MobExternalDeliveryPhase::Terminal { terminal } => Ok(
+                MobExternalDeliveryClaimOutcome::ExistingTerminal(terminal.clone()),
+            ),
+        }
+    }
+
+    async fn complete_external_delivery_realization(
+        &self,
+        commit: &MobExternalDeliveryRealizerCompletionCommit,
+    ) -> Result<MobExternalDeliveryCompleteOutcome, MobStoreError> {
+        let intent = commit.intent();
+        intent.validate()?;
+        let key = (
+            intent.mob_id.clone(),
+            intent.identity.idempotency_key.clone(),
+        );
+        let mut aggregate = self.aggregate.write().await;
+        let record = aggregate.external_deliveries.get_mut(&key).ok_or_else(|| {
+            MobStoreError::NotFound(format!(
+                "mob external delivery '{}'",
+                intent.identity.idempotency_key
+            ))
+        })?;
+        if record.intent != *intent {
+            return Err(MobStoreError::ExternalDeliveryConflict {
+                mob_id: intent.mob_id.clone(),
+                idempotency_key: intent.identity.idempotency_key.clone(),
+                detail: "realizer completion authority does not match stored admission".to_string(),
+            });
+        }
+        match &record.phase {
+            MobExternalDeliveryPhase::Realizing { run_id, .. } if run_id == commit.run_id() => {
+                record.phase = MobExternalDeliveryPhase::Terminal {
+                    terminal: MobExternalDeliveryTerminal::Completed,
+                };
+                Ok(MobExternalDeliveryCompleteOutcome::Completed)
+            }
+            MobExternalDeliveryPhase::Realizing { .. } => {
+                Err(MobStoreError::ExternalDeliveryConflict {
+                    mob_id: intent.mob_id.clone(),
+                    idempotency_key: intent.identity.idempotency_key.clone(),
+                    detail: "realizer completion selected a different target run".to_string(),
+                })
+            }
+            MobExternalDeliveryPhase::Terminal {
+                terminal: MobExternalDeliveryTerminal::Completed,
+            } => Ok(MobExternalDeliveryCompleteOutcome::AlreadyCompleted),
+            MobExternalDeliveryPhase::Begun { .. } => {
+                Err(MobStoreError::ExternalDeliveryConflict {
+                    mob_id: intent.mob_id.clone(),
+                    idempotency_key: intent.identity.idempotency_key.clone(),
+                    detail: "delivery has not crossed the realization fence".to_string(),
+                })
+            }
+            MobExternalDeliveryPhase::Terminal { .. } => {
+                Err(MobStoreError::ExternalDeliveryConflict {
+                    mob_id: intent.mob_id.clone(),
+                    idempotency_key: intent.identity.idempotency_key.clone(),
+                    detail: "a different terminal is already committed".to_string(),
+                })
+            }
+        }
+    }
+
+    async fn abandon_external_delivery(
+        &self,
+        intent: &MobExternalDeliveryIntent,
+        terminal: &MobExternalDeliveryTerminal,
+    ) -> Result<MobExternalDeliveryAbandonOutcome, MobStoreError> {
+        intent.validate()?;
+        validate_external_delivery_terminal(terminal)?;
+        let key = (
+            intent.mob_id.clone(),
+            intent.identity.idempotency_key.clone(),
+        );
+        let mut aggregate = self.aggregate.write().await;
+        let record = aggregate.external_deliveries.get_mut(&key).ok_or_else(|| {
+            MobStoreError::NotFound(format!(
+                "mob external delivery '{}'",
+                intent.identity.idempotency_key
+            ))
+        })?;
+        if record.intent != *intent {
+            return Err(MobStoreError::ExternalDeliveryConflict {
+                mob_id: intent.mob_id.clone(),
+                idempotency_key: intent.identity.idempotency_key.clone(),
+                detail: "abandonment authority does not match stored admission".to_string(),
+            });
+        }
+        match &record.phase {
+            MobExternalDeliveryPhase::Begun { .. } => {
+                record.phase = MobExternalDeliveryPhase::Terminal {
+                    terminal: terminal.clone(),
+                };
+                Ok(MobExternalDeliveryAbandonOutcome::Abandoned)
+            }
+            MobExternalDeliveryPhase::Realizing { run_id, repair } => {
+                Ok(MobExternalDeliveryAbandonOutcome::ExistingRealizing {
+                    run_id: run_id.clone(),
+                    repair: *repair,
+                })
+            }
+            MobExternalDeliveryPhase::Terminal { terminal } => Ok(
+                MobExternalDeliveryAbandonOutcome::ExistingTerminal(terminal.clone()),
+            ),
+        }
+    }
+
+    async fn resolve_external_delivery_after_realizer_fenced(
+        &self,
+        commit: &MobExternalDeliveryFencedResolutionCommit,
+    ) -> Result<MobExternalDeliveryAbandonOutcome, MobStoreError> {
+        let intent = commit.intent();
+        let terminal = commit.terminal();
+        intent.validate()?;
+        validate_external_delivery_terminal(terminal)?;
+        let key = (
+            intent.mob_id.clone(),
+            intent.identity.idempotency_key.clone(),
+        );
+        let mut aggregate = self.aggregate.write().await;
+        let record = aggregate.external_deliveries.get_mut(&key).ok_or_else(|| {
+            MobStoreError::NotFound(format!(
+                "mob external delivery '{}'",
+                intent.identity.idempotency_key
+            ))
+        })?;
+        if record.intent != *intent {
+            return Err(MobStoreError::ExternalDeliveryConflict {
+                mob_id: intent.mob_id.clone(),
+                idempotency_key: intent.identity.idempotency_key.clone(),
+                detail: "owner-fenced resolution authority does not match stored admission"
+                    .to_string(),
+            });
+        }
+        match &record.phase {
+            MobExternalDeliveryPhase::Begun { .. } => {
+                Err(MobStoreError::ExternalDeliveryConflict {
+                    mob_id: intent.mob_id.clone(),
+                    idempotency_key: intent.identity.idempotency_key.clone(),
+                    detail: "owner-fenced resolution requires a realizing delivery".to_string(),
+                })
+            }
+            MobExternalDeliveryPhase::Realizing { run_id, .. } => {
+                if run_id != commit.run_id() {
+                    return Err(MobStoreError::ExternalDeliveryConflict {
+                        mob_id: intent.mob_id.clone(),
+                        idempotency_key: intent.identity.idempotency_key.clone(),
+                        detail: "owner-fenced resolution selected a different target run"
+                            .to_string(),
+                    });
+                }
+                record.phase = MobExternalDeliveryPhase::Terminal {
+                    terminal: terminal.clone(),
+                };
+                Ok(MobExternalDeliveryAbandonOutcome::Abandoned)
+            }
+            MobExternalDeliveryPhase::Terminal { terminal } => Ok(
+                MobExternalDeliveryAbandonOutcome::ExistingTerminal(terminal.clone()),
+            ),
         }
     }
 
@@ -2228,6 +2455,13 @@ impl MobEventStore for InMemoryMobEventStore {
         }
         match &mut record.phase {
             MobExternalDeliveryPhase::Begun { repair } => {
+                *repair = next_external_delivery_repair_state(
+                    *repair,
+                    external_delivery_repair_now_ms()?,
+                );
+                Ok(MobExternalDeliveryRepairOutcome::Scheduled(*repair))
+            }
+            MobExternalDeliveryPhase::Realizing { repair, .. } => {
                 *repair = next_external_delivery_repair_state(
                     *repair,
                     external_delivery_repair_now_ms()?,
@@ -3440,6 +3674,74 @@ mod tests {
         let conflict = external_delivery_intent("schedule:one", "action-b");
         assert!(matches!(
             store.begin_external_delivery(&conflict).await,
+            Err(MobStoreError::ExternalDeliveryConflict { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn external_delivery_realization_is_monotonic_and_requires_sealed_owner_resolution() {
+        let store = InMemoryMobEventStore::default();
+        let mut intent = external_delivery_intent("schedule:realizing", "flow-a");
+        intent.target_kind = MobExternalDeliveryTargetKind::Flow;
+        let terminal = MobExternalDeliveryTerminal::failed(&crate::MobError::Internal(
+            "owner fenced stale realizer".to_string(),
+        ));
+        store.begin_external_delivery(&intent).await.unwrap();
+        let realization =
+            MobExternalDeliveryRealizationCommit::new(intent.clone(), crate::RunId::new()).unwrap();
+        assert_eq!(
+            store
+                .claim_external_delivery_realization(&realization)
+                .await
+                .unwrap(),
+            MobExternalDeliveryClaimOutcome::Claimed
+        );
+        assert!(matches!(
+            store
+                .claim_external_delivery_realization(&realization)
+                .await
+                .unwrap(),
+            MobExternalDeliveryClaimOutcome::ExistingRealizing { .. }
+        ));
+        assert!(matches!(
+            store
+                .abandon_external_delivery(&intent, &terminal)
+                .await
+                .unwrap(),
+            MobExternalDeliveryAbandonOutcome::ExistingRealizing { .. }
+        ));
+        let commit = MobExternalDeliveryFencedResolutionCommit::new(
+            intent.clone(),
+            realization.run_id().clone(),
+            terminal.clone(),
+        )
+        .unwrap();
+        assert_eq!(
+            store
+                .resolve_external_delivery_after_realizer_fenced(&commit)
+                .await
+                .unwrap(),
+            MobExternalDeliveryAbandonOutcome::Abandoned
+        );
+        assert_eq!(
+            store.begin_external_delivery(&intent).await.unwrap(),
+            MobExternalDeliveryBeginOutcome::ExistingTerminal(terminal)
+        );
+
+        let begun = external_delivery_intent("schedule:begun", "flow-b");
+        store.begin_external_delivery(&begun).await.unwrap();
+        let begun_commit = MobExternalDeliveryFencedResolutionCommit::new(
+            begun,
+            crate::RunId::new(),
+            MobExternalDeliveryTerminal::failed(&crate::MobError::Internal(
+                "not realizing".to_string(),
+            )),
+        )
+        .unwrap();
+        assert!(matches!(
+            store
+                .resolve_external_delivery_after_realizer_fenced(&begun_commit)
+                .await,
             Err(MobStoreError::ExternalDeliveryConflict { .. })
         ));
     }

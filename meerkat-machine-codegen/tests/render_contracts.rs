@@ -282,8 +282,10 @@ fn adaptive_bundle_scopes_obligations_by_producer_instance() {
         "obligation_layer_mob_mob_destroying_session_ingress",
         "NoOpenObligationsOnTerminal_control_mob_mob_destroying_session_ingress ==",
         "NoOpenObligationsOnTerminal_layer_mob_mob_destroying_session_ingress ==",
-        "OwnerFeedback_control_mob_mob_destroying_session_ingress ==",
-        "OwnerFeedback_layer_mob_mob_destroying_session_ingress ==",
+        "OwnerFeedback_control_mob_mob_destroying_session_ingress_SessionIngressDetachedForMobDestroy ==",
+        "OwnerFeedback_control_mob_mob_destroying_session_ingress_SessionIngressDetachFailedForMobDestroy ==",
+        "OwnerFeedback_layer_mob_mob_destroying_session_ingress_SessionIngressDetachedForMobDestroy ==",
+        "OwnerFeedback_layer_mob_mob_destroying_session_ingress_SessionIngressDetachFailedForMobDestroy ==",
     ] {
         assert!(
             rendered.contains(symbol),
@@ -294,7 +296,7 @@ fn adaptive_bundle_scopes_obligations_by_producer_instance() {
     for stale_symbol in [
         "obligation_mob_destroying_session_ingress",
         "NoOpenObligationsOnTerminal_mob_destroying_session_ingress ==",
-        "OwnerFeedback_mob_destroying_session_ingress ==",
+        "OwnerFeedback_mob_destroying_session_ingress_",
     ] {
         assert!(
             !rendered.contains(stale_symbol),

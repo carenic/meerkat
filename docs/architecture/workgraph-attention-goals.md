@@ -219,6 +219,12 @@ MeerkatMachine
 
 MobMachine
   Owns AgentIdentity membership and runtime binding resolution.
+
+WorkExecutionLifecycleMachine
+  Owns the durable handoff from one WorkGraph item to one exact Mob Flow
+  attempt: launch request, uncertainty, terminal observation, evidence
+  projection request, and closure feedback. It does not own the Flow run or
+  the WorkGraph item's lifecycle.
 ```
 
 Attention is WorkGraph-owned commitment metadata. Runtime wake is runtime-owned
@@ -397,6 +403,44 @@ resolver is not part of this branch.
 Mob docs should avoid saying the persisted mob owns "work" in the WorkGraph
 sense. Mob owns roster, wiring, member lifecycle, flows, and routing. WorkGraph
 owns shared durable work.
+
+### Flow Execution Seam
+
+Flow execution uses an explicit durable association rather than a prompt-level
+WorkGraph id. The controlling host commits `WorkExecutionBinding` before
+launching the Flow. The binding fixes the Mob and Flow identities, effective run-config
+digest, deterministic run id, activation parameters, idempotency key, and
+retry predecessor.
+
+`WorkExecutionLifecycleMachine` emits the next cross-system obligation. The
+composition shell realizes that obligation and feeds the typed outcome back:
+
+```text
+FlowLaunchRequested
+  -> Mob external-delivery admission
+  -> deterministic pending MobRun persistence
+  -> durable realization claim
+  -> Flow running, completed, failed, canceled, or launch uncertain
+
+EvidenceProjectionRequested
+  -> idempotent WorkGraph evidence write
+
+WorkClosureRequested
+  -> WorkGraphLifecycleMachine closure admission
+  -> WorkClosed or EvidenceProjected
+```
+
+No Flow status is copied into WorkGraph as a second authority. Reconciliation
+reads the canonical Mob run and advances only through generated execution
+transitions. A completed Flow never bypasses WorkGraph completion policy.
+
+The pending run precedes the realization claim. This ordering makes the
+cross-store crash boundary recoverable without pretending to have a distributed
+transaction: before pending-run persistence, `begun` proves target absence;
+after it, the exact run is the durable target fact. A `realizing` record with no
+run fails closed as quarantine. The public bridge cannot resolve that state
+from caller testimony. Recovery requires the deterministic run to become
+observable or a future sealed host authority to prove a safe resolution.
 
 ## Tool Authority
 

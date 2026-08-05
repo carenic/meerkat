@@ -27,10 +27,22 @@ impl RunId {
         flow_id: &FlowId,
         idempotency_key: &str,
     ) -> Self {
-        Self(Uuid::new_v5(
-            &Uuid::NAMESPACE_URL,
-            format!("meerkat:mob:{mob_id}:flow:{flow_id}:delivery:{idempotency_key}").as_bytes(),
-        ))
+        let mut name = b"meerkat.mob.external-delivery.v1".to_vec();
+        for component in [mob_id.as_str(), flow_id.as_str(), idempotency_key] {
+            let bytes = component.as_bytes();
+            name.extend_from_slice(&(bytes.len() as u64).to_be_bytes());
+            name.extend_from_slice(bytes);
+        }
+        Self(Uuid::new_v5(&Uuid::NAMESPACE_URL, &name))
+    }
+
+    /// Deterministic Flow run identity for a caller-stable external delivery.
+    ///
+    /// Public composition layers use this to persist the exact run identity
+    /// before invoking Mob. `run_flow_with_external_identity` derives the same
+    /// value and verifies that a replay cannot select another run.
+    pub fn for_work_execution(mob_id: &MobId, flow_id: &FlowId, idempotency_key: &str) -> Self {
+        Self::for_external_delivery(mob_id, flow_id, idempotency_key)
     }
 }
 
@@ -650,6 +662,13 @@ mod tests {
             first,
             RunId::for_external_delivery(&mob_id, &FlowId::from("beta"), key)
         );
+    }
+
+    #[test]
+    fn external_delivery_run_id_uses_an_unambiguous_typed_tuple() {
+        let first = RunId::for_work_execution(&MobId::from("a"), &FlowId::from("b:flow:c"), "key");
+        let second = RunId::for_work_execution(&MobId::from("a:flow:b"), &FlowId::from("c"), "key");
+        assert_ne!(first, second);
     }
 
     #[test]

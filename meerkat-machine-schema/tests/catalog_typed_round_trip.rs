@@ -83,6 +83,7 @@ fn canonical_machine_slug_snapshot() {
             "SessionDocumentMachine".to_string(),
             "SessionTurnAdmissionMachine".to_string(),
             "WorkAttentionLifecycleMachine".to_string(),
+            "WorkExecutionLifecycleMachine".to_string(),
             "WorkGraphLifecycleMachine".to_string(),
         ],
         "canonical machine slug set — bump when intentionally adding/removing a kernel"
@@ -108,6 +109,7 @@ fn canonical_composition_slug_snapshot() {
             "schedule_mob_bundle".to_string(),
             "schedule_runtime_bundle".to_string(),
             "workgraph_attention_bundle".to_string(),
+            "workgraph_flow_bundle".to_string(),
         ],
         "canonical composition slug set — bump when intentionally adding/removing a bundle"
     );

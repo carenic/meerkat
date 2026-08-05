@@ -4,12 +4,15 @@ use std::str::FromStr;
 
 use chrono::{DateTime, Utc};
 use meerkat_core::SessionId;
+use meerkat_core::auth::PrincipalId;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use uuid::Uuid;
 
 use crate::WorkGraphError;
 pub use crate::machines::work_attention_lifecycle::WorkAttentionLifecycleMachineState as WorkAttentionMachineState;
+pub use crate::machines::work_execution_lifecycle::WorkExecutionEvidenceKind;
+pub use crate::machines::work_execution_lifecycle::WorkExecutionLifecycleMachineState as WorkExecutionMachineState;
 use crate::machines::workgraph_lifecycle as wg_dsl;
 pub use crate::machines::workgraph_lifecycle::WorkGraphLifecycleMachineState as WorkGraphMachineState;
 
@@ -58,6 +61,44 @@ impl fmt::Display for WorkAttentionBindingId {
 }
 
 impl FromStr for WorkAttentionBindingId {
+    type Err = WorkGraphError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Self::new(value)
+    }
+}
+
+/// Stable identity for one WorkGraph-to-execution association.
+///
+/// Binding identity and target specification are immutable once inserted. The
+/// generated execution-handoff machine state advances by CAS while the target
+/// runtime remains the sole owner of run state and outputs.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(transparent)]
+pub struct WorkExecutionBindingId(String);
+
+impl WorkExecutionBindingId {
+    pub fn new(value: impl Into<String>) -> Result<Self, WorkGraphError> {
+        validate_token("work execution binding id", value.into()).map(Self)
+    }
+
+    pub fn generated() -> Self {
+        Self(format!("execution_{}", Uuid::now_v7()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for WorkExecutionBindingId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl FromStr for WorkExecutionBindingId {
     type Err = WorkGraphError;
 
     fn from_str(value: &str) -> Result<Self, Self::Err> {
@@ -459,6 +500,12 @@ pub struct WorkEvidenceRef {
     /// owners per confirmation kind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confirming_owner_key: Option<WorkOwnerKey>,
+    /// Typed execution provenance stamped only by the execution bridge. The
+    /// opaque `id` remains a display/dedup projection and is never interpreted
+    /// as mutation authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schema", schemars(with = "Option<String>"))]
+    pub execution_binding_id: Option<WorkExecutionBindingId>,
 }
 
 impl WorkEvidenceRef {
@@ -485,6 +532,218 @@ pub struct WorkItemRef {
     pub realm_id: String,
     pub namespace: WorkNamespace,
     pub item_id: WorkItemId,
+}
+
+/// Durable target-runtime principal under which one execution attempt was
+/// admitted. Recovery must re-present this exact authority rather than inherit
+/// the ambient principal of whichever host happens to reconcile the binding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkExecutionAuthority {
+    TargetOwner,
+    Principal { principal_id: PrincipalId },
+}
+
+impl WorkExecutionAuthority {
+    pub fn principal(principal_id: PrincipalId) -> Self {
+        Self::Principal { principal_id }
+    }
+
+    fn validate(&self) -> Result<(), WorkGraphError> {
+        match self {
+            Self::TargetOwner => Ok(()),
+            Self::Principal { .. } => Ok(()),
+        }
+    }
+}
+
+/// Exact execution identity bound to a durable WorkGraph commitment.
+///
+/// This enum intentionally carries stable domain identifiers and canonical
+/// input bytes, never process-local handles. The target runtime remains the
+/// sole owner of execution status and outputs.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum WorkExecutionTarget {
+    MobFlow {
+        mob_id: String,
+        flow_id: String,
+        flow_config_digest: String,
+        run_id: String,
+        execution_authority: WorkExecutionAuthority,
+        activation_params: Value,
+    },
+}
+
+impl WorkExecutionTarget {
+    const MAX_ACTIVATION_PARAMS_BYTES: usize = 64 * 1024;
+
+    pub fn mob_flow(
+        mob_id: impl Into<String>,
+        flow_id: impl Into<String>,
+        flow_config_digest: impl Into<String>,
+        run_id: impl Into<String>,
+        execution_authority: WorkExecutionAuthority,
+        activation_params: Value,
+    ) -> Result<Self, WorkGraphError> {
+        let mob_id = validate_token("mob id", mob_id.into())?;
+        let flow_id = validate_token("flow id", flow_id.into())?;
+        let flow_config_digest =
+            validate_sha256_digest("Flow run config digest", flow_config_digest.into())?;
+        let run_id = validate_token("flow run id", run_id.into())?;
+        execution_authority.validate()?;
+        Self::validate_activation_params(&activation_params)?;
+        Ok(Self::MobFlow {
+            mob_id,
+            flow_id,
+            flow_config_digest,
+            run_id,
+            execution_authority,
+            activation_params,
+        })
+    }
+
+    pub fn run_id(&self) -> &str {
+        match self {
+            Self::MobFlow { run_id, .. } => run_id,
+        }
+    }
+
+    fn validate_activation_params(value: &Value) -> Result<(), WorkGraphError> {
+        let bytes = serde_json::to_vec(value).map_err(|error| {
+            WorkGraphError::InvalidInput(format!(
+                "Flow activation parameters are not serializable: {error}"
+            ))
+        })?;
+        if bytes.len() > Self::MAX_ACTIVATION_PARAMS_BYTES {
+            return Err(WorkGraphError::InvalidInput(format!(
+                "Flow activation parameters exceed the {} byte durable binding limit",
+                Self::MAX_ACTIVATION_PARAMS_BYTES
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Durable association between one WorkGraph item and one execution attempt.
+///
+/// Retries form a single append-only chain through `supersedes`. The binding
+/// specification is immutable. Only `machine_state` advances, by
+/// CAS through `WorkExecutionLifecycleMachine`. There is no copied execution
+/// status here: reconciliation always reads the target runtime's canonical run
+/// state. Evidence projection is deduplicated by [`Self::evidence_id`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(deny_unknown_fields)]
+pub struct WorkExecutionBinding {
+    pub binding_id: WorkExecutionBindingId,
+    pub work_ref: WorkItemRef,
+    pub target: WorkExecutionTarget,
+    pub idempotency_key: String,
+    pub correlation_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supersedes: Option<WorkExecutionBindingId>,
+    #[cfg_attr(feature = "schema", schemars(with = "WorkExecutionMachineStateSchema"))]
+    pub machine_state: WorkExecutionMachineState,
+    pub created_at: DateTime<Utc>,
+}
+
+#[cfg(feature = "schema")]
+#[derive(schemars::JsonSchema)]
+#[allow(dead_code)]
+struct WorkExecutionMachineStateSchema {
+    lifecycle_phase: String,
+    binding_id: String,
+    run_id: String,
+    revision: u64,
+    last_failure_detail: Option<String>,
+    evidence_kind: Option<String>,
+}
+
+impl WorkExecutionBinding {
+    const MAX_IDEMPOTENCY_KEY_BYTES: usize = 256;
+
+    pub fn evidence_id(&self) -> String {
+        format!("work_execution:{}", self.binding_id)
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), WorkGraphError> {
+        validate_token(
+            "work execution idempotency key",
+            self.idempotency_key.clone(),
+        )?;
+        if self.idempotency_key.len() > Self::MAX_IDEMPOTENCY_KEY_BYTES {
+            return Err(WorkGraphError::InvalidInput(format!(
+                "work execution idempotency key exceeds {} bytes",
+                Self::MAX_IDEMPOTENCY_KEY_BYTES
+            )));
+        }
+        let correlation = Uuid::parse_str(&self.correlation_id).map_err(|_| {
+            WorkGraphError::InvalidInput(
+                "work execution correlation id must be a canonical UUID".to_string(),
+            )
+        })?;
+        if correlation.is_nil() || correlation.to_string() != self.correlation_id {
+            return Err(WorkGraphError::InvalidInput(
+                "work execution correlation id must be a canonical non-nil UUID".to_string(),
+            ));
+        }
+        match &self.target {
+            WorkExecutionTarget::MobFlow {
+                mob_id,
+                flow_id,
+                flow_config_digest,
+                run_id,
+                execution_authority,
+                activation_params,
+            } => {
+                validate_token("mob id", mob_id.clone())?;
+                validate_token("flow id", flow_id.clone())?;
+                validate_sha256_digest("Flow run config digest", flow_config_digest.clone())?;
+                validate_token("flow run id", run_id.clone())?;
+                execution_authority.validate()?;
+                WorkExecutionTarget::validate_activation_params(activation_params)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether two projections describe the same immutable execution attempt.
+    ///
+    /// Stores call this independently of the service so a direct trait caller
+    /// cannot rewrite authority-bearing identity while advancing machine state.
+    pub(crate) fn has_same_immutable_spec(&self, other: &Self) -> bool {
+        self.binding_id == other.binding_id
+            && self.work_ref == other.work_ref
+            && self.target == other.target
+            && self.idempotency_key == other.idempotency_key
+            && self.correlation_id == other.correlation_id
+            && self.supersedes == other.supersedes
+            && self.created_at == other.created_at
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkExecutionEvidenceProjection {
+    pub kind: WorkExecutionEvidenceKind,
+    pub label: Option<String>,
+    pub summary: Option<String>,
+}
+
+fn validate_sha256_digest(name: &str, value: String) -> Result<String, WorkGraphError> {
+    let valid = value.len() == "sha256:".len() + 64
+        && value.strip_prefix("sha256:").is_some_and(|hex| {
+            hex.bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+    if !valid {
+        return Err(WorkGraphError::InvalidInput(format!(
+            "{name} must be a canonical lowercase SHA-256 digest"
+        )));
+    }
+    Ok(value)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -983,6 +1242,9 @@ impl schemars::JsonSchema for WorkItem {
                                     },
                                     { "type": "null" }
                                 ]
+                            },
+                            "execution_binding_id": {
+                                "type": ["string", "null"]
                             }
                         }
                     }
@@ -1056,6 +1318,8 @@ pub enum WorkGraphEventKind {
     EvidenceAdded,
     AttentionCreated,
     AttentionUpdated,
+    ExecutionBound,
+    ExecutionTransitioned,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -1660,6 +1924,21 @@ pub struct WorkItemFilter {
     pub labels: Vec<String>,
     #[serde(default)]
     pub include_terminal: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+pub struct WorkExecutionBindingFilter {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub realm_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<WorkNamespace>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<WorkItemId>,
+    #[serde(default)]
+    pub current_only: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<usize>,
 }
