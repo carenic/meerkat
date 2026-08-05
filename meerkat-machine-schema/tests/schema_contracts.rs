@@ -78,6 +78,8 @@ fn canonical_machine_registry_contains_kernel_and_perimeter_entries() {
             "WorkGraphLifecycleMachine",
             // Work attention owns goal/attention queue lifecycle.
             "WorkAttentionLifecycleMachine",
+            // Work execution owns durable Mob Flow realization lifecycle.
+            "WorkExecutionLifecycleMachine",
         ]
     );
 
@@ -490,6 +492,7 @@ fn canonical_composition_registry_contains_kernel_seam_and_schedule_perimeter_en
             "adaptive_mob_bundle",
             "auth_lease_bundle",
             "workgraph_attention_bundle",
+            "workgraph_flow_bundle",
         ]
     );
 }
@@ -754,6 +757,7 @@ fn kernel_seam_retains_coverage_metadata() {
             "adaptive_mob_bundle",
             "auth_lease_bundle",
             "workgraph_attention_bundle",
+            "workgraph_flow_bundle",
         ]
     );
 }
