@@ -77,6 +77,15 @@ threads-required = "num-cpus"
 filter = 'test(~test_resume_restores_missing_sessions_with_tool_wiring)'
 threads-required = "num-cpus"
 
+[[profile.fast.overrides]]
+# These queued-fallback regressions deliberately hold one runtime apply at a
+# boundary while proving that a second durable admission progresses after the
+# release. Running them beside the full mob shard can starve the Tokio workers
+# long enough to consume the assertion budget without exercising a product
+# failure. Reserve the lane while preserving each test's internal concurrency.
+filter = 'test(~test_turn_driven_submit_work_steer_queues_when_exact_boundary_is_unavailable) or test(~test_member_send_steer_queues_when_exact_boundary_is_unavailable)'
+threads-required = "num-cpus"
+
 [[profile.default.overrides]]
 filter = 'test(~test_resume_restores_missing_sessions_with_tool_wiring)'
 threads-required = "num-cpus"
