@@ -772,8 +772,7 @@ impl DriverEntry {
                 reason: "terminal completion recipient batch has invalid size".to_string(),
             });
         }
-        let mut completion_input_ids = input_ids.to_vec();
-        completion_input_ids.sort_by_key(|input_id| input_id.0);
+        let completion_input_ids = canonical_completion_input_ids(input_ids);
         if completion_input_ids
             .iter()
             .collect::<std::collections::HashSet<_>>()
@@ -4298,7 +4297,7 @@ fn authorized_directed_terminal_outboxes(
         return Ok(Vec::new());
     }
 
-    let completion_input_ids = authority.consumed_input_ids().to_vec();
+    let completion_input_ids = canonical_completion_input_ids(authority.consumed_input_ids());
     if completion_input_ids.is_empty() || completion_input_ids.len() > 256 {
         return Err(RuntimeDriverError::ValidationFailed {
             reason: "runtime completion recipient batch has invalid size".to_string(),
@@ -4446,7 +4445,7 @@ fn authorized_staged_directed_terminal_outboxes(
             reason: "staged completion recipient batch contains duplicate inputs".to_string(),
         });
     }
-    let completion_input_ids = input_ids.to_vec();
+    let completion_input_ids = canonical_completion_input_ids(input_ids);
     let completion_input_ids_digest = interaction_terminal_payload_digest(&completion_input_ids)
         .map_err(RuntimeDriverError::Internal)?;
     directed.sort_by_key(|(input_id, _)| input_id.0);
@@ -4522,6 +4521,12 @@ fn authorized_staged_directed_terminal_outboxes(
 
 /// Shared completion registry (accessed by adapter for registration and loop for resolution).
 pub(crate) type SharedCompletionRegistry = Arc<Mutex<crate::completion::CompletionRegistry>>;
+
+fn canonical_completion_input_ids(input_ids: &[InputId]) -> Vec<InputId> {
+    let mut canonical = input_ids.to_vec();
+    canonical.sort_by_key(|input_id| input_id.0);
+    canonical
+}
 
 pub(crate) fn machine_begin_run(
     driver: &mut DriverEntry,
@@ -6638,6 +6643,18 @@ mod tests {
             .expect("generated runtime-loop batch authority")
             .input_ids()
             .to_vec()
+    }
+
+    #[test]
+    fn completion_recipient_ids_are_canonicalized_before_digest() {
+        let low = InputId::from_uuid(uuid::Uuid::from_u128(1));
+        let middle = InputId::from_uuid(uuid::Uuid::from_u128(2));
+        let high = InputId::from_uuid(uuid::Uuid::from_u128(3));
+
+        assert_eq!(
+            canonical_completion_input_ids(&[high.clone(), low.clone(), middle.clone()]),
+            vec![low, middle, high]
+        );
     }
 
     #[test]
