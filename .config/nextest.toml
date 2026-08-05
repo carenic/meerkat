@@ -90,6 +90,10 @@ threads-required = "num-cpus"
 filter = 'test(~test_resume_restores_missing_sessions_with_tool_wiring)'
 threads-required = "num-cpus"
 
+[[profile.default.overrides]]
+filter = 'test(~test_turn_driven_submit_work_steer_queues_when_exact_boundary_is_unavailable) or test(~test_member_send_steer_queues_when_exact_boundary_is_unavailable)'
+threads-required = "num-cpus"
+
 [[profile.fast.overrides]]
 # Raw SQLite writes are observed through filesystem notification with a
 # five-second safety sweep. Keep this wall-clock fallback contract away from
