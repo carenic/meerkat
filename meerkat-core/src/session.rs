@@ -1133,9 +1133,12 @@ impl<'de> Deserialize<'de> for Session {
                 })?
                 .row_prefix()
                 .clone();
-            if !session.install_exact_message_row_lineage(endpoint_prefix, exact_live_prefix) {
+            if !session
+                .install_exact_message_row_lineage(endpoint_prefix, exact_live_prefix.clone())
+                && !session.install_exact_message_row_prefix(exact_live_prefix)
+            {
                 return Err(<D::Error as serde::de::Error>::custom(
-                    "failed to install exact live message-row authority",
+                    "failed to install live message-row authority",
                 ));
             }
             session.transcript_history_metadata_validation =
@@ -1430,9 +1433,11 @@ impl Session {
             })?
             .row_prefix()
             .clone();
-        if !self.install_exact_message_row_lineage(endpoint_prefix, exact_live_prefix) {
+        if !self.install_exact_message_row_lineage(endpoint_prefix, exact_live_prefix.clone())
+            && !self.install_exact_message_row_prefix(exact_live_prefix)
+        {
             return Err(TranscriptEditError::HistoryStateMalformed(
-                "failed to install exact live message-row authority".to_string(),
+                "failed to install live message-row authority".to_string(),
             ));
         }
         self.transcript_history_metadata_validation =
@@ -5746,6 +5751,14 @@ impl Session {
                     })?;
                 let parent_advance = if exact_append_prefix == parent_row_prefix {
                     TranscriptParentAdvance::ExactAppend { appended }
+                } else if self
+                    .transcript_prefix_digest(endpoint.message_count())
+                    .map_err(|error| {
+                        TranscriptEditError::HistoryStateMalformed(error.to_string())
+                    })?
+                    == state.head()
+                {
+                    TranscriptParentAdvance::ContentAddressedAppend { appended }
                 } else {
                     return Err(TranscriptEditError::HistoryStateMalformed(
                         "live rewrite parent is not an exact audited append".to_string(),
@@ -6571,9 +6584,14 @@ mod tests {
             .as_object_mut()
             .ok_or_else(|| std::io::Error::other("session metadata is not an object"))?
             .remove(SESSION_TRANSCRIPT_HISTORY_STATE_KEY);
+        slim_document["messages"][0]["created_at"] =
+            serde_json::Value::String("2020-01-01T00:00:00Z".to_string());
         let mut replay: Session = serde_json::from_value(slim_document)?;
         replay.push(Message::User(UserMessage::text("appended".to_string())));
         let live_revision = replay.transcript_content_digest()?;
+        let current_row_prefix =
+            crate::SessionMessageRowPrefixAccumulator::from_messages(replay.messages())?;
+        assert!(replay.install_exact_message_row_prefix(current_row_prefix));
 
         assert_ne!(state.head(), live_revision);
         assert!(
@@ -6581,6 +6599,26 @@ mod tests {
             "the audited endpoint content digest must prove the live transcript prefix"
         );
         replay.install_validated_audited_transcript_history_preserving_live(validated)?;
+        replay.commit_transcript_rewrite(
+            TranscriptRewriteSelection::MessageRange { start: 1, end: 2 },
+            vec![Message::User(UserMessage::text("repaired".to_string()))],
+            TranscriptRewriteReason::new("unit-test"),
+            Some("unit-test".to_string()),
+            Some(live_revision),
+        )?;
+        let repaired = replay
+            .transcript_history_state()?
+            .ok_or_else(|| std::io::Error::other("repaired history missing"))?;
+        assert_eq!(
+            repaired.parent_transition(1),
+            Some(TranscriptRewriteParentTransition::ContentAddressedAppend),
+            "adapter-rematerialized rows must reanchor lineage explicitly"
+        );
+        let restored: Session = serde_json::from_slice(&serde_json::to_vec(&replay)?)?;
+        assert_eq!(
+            restored.transcript_content_digest()?,
+            replay.transcript_content_digest()?
+        );
 
         Ok(())
     }

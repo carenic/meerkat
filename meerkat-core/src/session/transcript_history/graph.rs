@@ -61,19 +61,23 @@ pub struct TranscriptRewriteCommit {
     pub committed_at: SystemTime,
 }
 
-/// Exact-byte relationship from one audited rewrite endpoint to the next
-/// commit's parent.
+/// Relationship from one audited rewrite endpoint to the next commit's
+/// parent.
 ///
 /// This evidence is aligned one-for-one with [`TranscriptHistoryState::commits`]
 /// and is validated against the retained bodies before a
 /// [`ValidatedTranscriptHistory`] may expose it. Current writers emit only
-/// `ExactAppend`; `ExactSplice` preserves a frozen same-cardinality
-/// relationship decoded by the explicit 0.8.10 importer.
+/// `ExactAppend` is the ordinary byte-lineage path. `ContentAddressedAppend`
+/// is the typed adapter-rematerialization path: semantic prefix identity proves
+/// the append while the current durable row prefix becomes the new structural
+/// baseline. `ExactSplice` preserves a frozen same-cardinality relationship
+/// decoded by the explicit 0.8.10 importer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(rename_all = "snake_case")]
 pub enum TranscriptRewriteParentTransition {
     ExactAppend,
+    ContentAddressedAppend,
     ExactSplice,
 }
 
@@ -644,15 +648,22 @@ impl TranscriptRevisionAnchor {
 
 /// Exact delta from the preceding audited child to the next rewrite parent.
 ///
-/// Current writers construct only [`Self::ExactAppend`]. [`Self::ExactSplice`]
-/// preserves an already-imported released 0.8.10 edge so historical audit
-/// materialization remains exact without assigning semantic privilege to any
-/// message role or transcript position.
+/// Current writers prefer [`Self::ExactAppend`].
+/// [`Self::ContentAddressedAppend`] explicitly reanchors physical row lineage
+/// after a proved adapter rematerialization whose semantic prefix is unchanged.
+/// [`Self::ExactSplice`] preserves an already-imported released 0.8.10 edge so
+/// historical audit materialization remains exact without assigning semantic
+/// privilege to any message role or transcript position.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum TranscriptParentAdvance {
     ExactAppend {
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        #[cfg_attr(feature = "schema", schemars(with = "Vec<serde_json::Value>"))]
+        appended: Vec<Message>,
+    },
+    ContentAddressedAppend {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         #[cfg_attr(feature = "schema", schemars(with = "Vec<serde_json::Value>"))]
         appended: Vec<Message>,
@@ -671,14 +682,16 @@ impl TranscriptParentAdvance {
     #[must_use]
     pub fn appended(&self) -> &[Message] {
         match self {
-            Self::ExactAppend { appended } | Self::ExactSplice { appended, .. } => appended,
+            Self::ExactAppend { appended }
+            | Self::ContentAddressedAppend { appended }
+            | Self::ExactSplice { appended, .. } => appended,
         }
     }
 
     #[must_use]
     pub fn exact_splice(&self) -> Option<(usize, &[Message])> {
         match self {
-            Self::ExactAppend { .. } => None,
+            Self::ExactAppend { .. } | Self::ContentAddressedAppend { .. } => None,
             Self::ExactSplice {
                 at, replacement, ..
             } => Some((*at, replacement)),
@@ -689,6 +702,9 @@ impl TranscriptParentAdvance {
     pub fn transition(&self) -> TranscriptRewriteParentTransition {
         match self {
             Self::ExactAppend { .. } => TranscriptRewriteParentTransition::ExactAppend,
+            Self::ContentAddressedAppend { .. } => {
+                TranscriptRewriteParentTransition::ContentAddressedAppend
+            }
             Self::ExactSplice { .. } => TranscriptRewriteParentTransition::ExactSplice,
         }
     }
@@ -2220,14 +2236,21 @@ impl TranscriptHistoryState {
         if live.len() < endpoint.messages.len() {
             return Ok(None);
         }
-        let advance = if live[..endpoint.messages.len()] == endpoint.messages {
-            TranscriptParentAdvance::ExactAppend {
+        if live[..endpoint.messages.len()] == endpoint.messages {
+            let advance = TranscriptParentAdvance::ExactAppend {
                 appended: live[endpoint.messages.len()..].to_vec(),
-            }
-        } else {
+            };
+            return row_prefix_after_parent_advance(endpoint_witness.row_prefix(), &advance)
+                .map(Some);
+        }
+        let live_prefix_revision = transcript_messages_digest(&live[..endpoint.messages.len()])
+            .map_err(|error| TranscriptEditError::HistoryStateMalformed(error.to_string()))?;
+        if live_prefix_revision != self.head() {
             return Ok(None);
-        };
-        row_prefix_after_parent_advance(endpoint_witness.row_prefix(), &advance).map(Some)
+        }
+        SessionMessageRowPrefixAccumulator::from_messages(live)
+            .map(Some)
+            .map_err(|error| TranscriptEditError::HistoryStateMalformed(error.to_string()))
     }
 
     #[must_use]
@@ -2481,6 +2504,13 @@ fn parent_advance_from_materialized(
             appended: parent.messages[base.messages.len()..].to_vec(),
         });
     }
+    let semantic_prefix = transcript_messages_digest(&parent.messages[..base.messages.len()])
+        .map_err(|error| TranscriptEditError::HistoryStateMalformed(error.to_string()))?;
+    if source == MaterializedParentAdvanceSource::CurrentAudit && semantic_prefix == base.revision {
+        return Ok(TranscriptParentAdvance::ContentAddressedAppend {
+            appended: parent.messages[base.messages.len()..].to_vec(),
+        });
+    }
     if source == MaterializedParentAdvanceSource::CurrentAudit {
         return Err(TranscriptEditError::HistoryStateMalformed(format!(
             "current rewrite occurrence {rewrite_generation} parent is not an exact append"
@@ -2518,6 +2548,12 @@ fn row_prefix_after_parent_advance(
 ) -> Result<SessionMessageRowPrefixAccumulator, TranscriptEditError> {
     let advanced = match advance {
         TranscriptParentAdvance::ExactAppend { .. } => base.clone(),
+        TranscriptParentAdvance::ContentAddressedAppend { .. } => {
+            return Err(TranscriptEditError::HistoryStateMalformed(
+                "content-addressed append requires an explicit current row-lineage baseline"
+                    .to_string(),
+            ));
+        }
         TranscriptParentAdvance::ExactSplice {
             at, replacement, ..
         } => {
@@ -2567,8 +2603,13 @@ fn edge_from_materialized_bodies(
 ) -> Result<TranscriptRevisionEdge, TranscriptEditError> {
     let parent_advance =
         parent_advance_from_materialized(base, parent, commit.rewrite_generation, source)?;
-    let parent_row_prefix =
-        row_prefix_after_parent_advance(base_witness.row_prefix(), &parent_advance)?;
+    let parent_row_prefix = match &parent_advance {
+        TranscriptParentAdvance::ContentAddressedAppend { .. } => {
+            SessionMessageRowPrefixAccumulator::from_messages(&parent.messages)
+                .map_err(|error| TranscriptEditError::HistoryStateMalformed(error.to_string()))?
+        }
+        _ => row_prefix_after_parent_advance(base_witness.row_prefix(), &parent_advance)?,
+    };
     let (at, end) = commit.selection.bounds();
     let removed_len = end.checked_sub(at).ok_or_else(|| {
         TranscriptEditError::HistoryStateMalformed("rewrite selection is inverted".to_string())
@@ -2623,7 +2664,10 @@ fn apply_parent_advance(
     advance: &TranscriptParentAdvance,
 ) -> Result<(), TranscriptEditError> {
     match advance {
-        TranscriptParentAdvance::ExactAppend { appended } => messages.extend_from_slice(appended),
+        TranscriptParentAdvance::ExactAppend { appended }
+        | TranscriptParentAdvance::ContentAddressedAppend { appended } => {
+            messages.extend_from_slice(appended);
+        }
         TranscriptParentAdvance::ExactSplice {
             at,
             replacement,
