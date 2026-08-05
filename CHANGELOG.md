@@ -13,6 +13,18 @@ via cargo-semver-checks against the published baselines).
 
 ## [Unreleased]
 
+### Fixed
+
+- Runtime comms drains now admit one classified input at a time, preserving
+  the durable FIFO tail when a drain task is cancelled or replaced.
+- Automatic mob-member rematerialization no longer replays persisted system
+  prompt configuration as a new System message. Explicit resume-time prompt
+  changes still append in transcript order.
+
+Meerkat 0.8.17 should be paired with MobKit 0.8.13. The pair repairs the
+0.8.16 member-input admission regression and prevents configured prompts from
+being duplicated across automatic rematerialization.
+
 ## [0.8.15] - 2026-08-03
 
 ### Added

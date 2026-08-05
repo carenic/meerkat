@@ -133,6 +133,20 @@ pub struct BuildResumedAgentConfigParams<'a> {
     pub base: BuildAgentConfigParams<'a>,
     pub(crate) expected_session_id: &'a SessionId,
     pub resumed_session: Session,
+    pub(crate) system_prompt_intent: ResumeSystemPromptIntent,
+}
+
+/// Whether a resume operation authors a new System message or only
+/// rematerializes the existing durable transcript.
+///
+/// Persisted member configuration may still be needed to rebuild the live
+/// executor, but replaying that configuration is not new transcript intent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ResumeSystemPromptIntent {
+    /// Preserve the System messages already present in the durable session.
+    PreservePersisted,
+    /// Append an explicitly supplied prompt as new ordered transcript input.
+    AppendExplicit,
 }
 
 /// Build an [`AgentBuildConfig`] from a mob profile.
@@ -362,9 +376,13 @@ pub async fn build_resumed_agent_config(
         base,
         expected_session_id,
         resumed_session,
+        system_prompt_intent,
     } = params;
     let inherited_tool_filter = base.inherited_tool_filter.clone();
-    let explicit_resume_system_prompt = base.system_prompt_override.is_some();
+    let explicit_resume_system_prompt = matches!(
+        system_prompt_intent,
+        ResumeSystemPromptIntent::AppendExplicit
+    ) && base.system_prompt_override.is_some();
     if resumed_session.id() != expected_session_id {
         return Err(MobError::Internal(format!(
             "resume session id mismatch: expected '{}', got '{}'",
@@ -1628,6 +1646,7 @@ mod tests {
             },
             expected_session_id: &session_id,
             resumed_session,
+            system_prompt_intent: ResumeSystemPromptIntent::PreservePersisted,
         })
         .await
         .expect("build_resumed_agent_config");
@@ -1692,6 +1711,7 @@ mod tests {
             },
             expected_session_id: &session_id,
             resumed_session,
+            system_prompt_intent: ResumeSystemPromptIntent::AppendExplicit,
         })
         .await
         .expect("build_resumed_agent_config");
@@ -1718,6 +1738,66 @@ mod tests {
         assert!(
             config.resume_session.is_some(),
             "the durable session remains the sole transcript authority",
+        );
+    }
+
+    #[tokio::test]
+    async fn test_build_resumed_agent_config_does_not_replay_persisted_prompt_configuration() {
+        let def = sample_definition();
+        let lead = def.profiles[&ProfileName::from("lead")]
+            .as_inline()
+            .unwrap();
+        let session_id = SessionId::new();
+        let current_prompt = "current MobKit-assembled system prompt";
+        let mut resumed_session = resumed_session_with_metadata(session_id.clone());
+        resumed_session.append_system_message(current_prompt.to_string());
+
+        let config = build_resumed_agent_config(BuildResumedAgentConfigParams {
+            base: BuildAgentConfigParams {
+                mob_id: &def.id,
+                profile_name: &ProfileName::from("lead"),
+                agent_identity: &AgentIdentity::from("lead-1"),
+                profile: lead,
+                definition: &def,
+                external_tools: None,
+                context: None,
+                labels: None,
+                additional_instructions: Some(vec!["persisted section".to_string()]),
+                shell_env: None,
+                mob_tool_authority_context: None,
+                tool_access_policy: None,
+                inherited_tool_filter: None,
+                system_prompt_override: Some(crate::runtime::SpawnSystemPromptOverride::Replace(
+                    current_prompt.to_string(),
+                )),
+            },
+            expected_session_id: &session_id,
+            resumed_session,
+            system_prompt_intent: ResumeSystemPromptIntent::PreservePersisted,
+        })
+        .await
+        .expect("build_resumed_agent_config");
+
+        assert_eq!(
+            config.system_prompt,
+            SystemPromptOverride::Inherit,
+            "automatic rematerialization must not append persisted member configuration",
+        );
+        assert!(
+            config.additional_instructions.is_none(),
+            "automatic rematerialization must not replay persisted prompt sections",
+        );
+        assert_eq!(
+            config
+                .resume_session
+                .as_ref()
+                .expect("resumed session")
+                .messages()
+                .iter()
+                .filter(|message| matches!(message, meerkat_core::Message::System(system) if system.content == current_prompt))
+                .count(),
+            1,
+            "the durable transcript remains the sole prompt authority",
         );
     }
 
@@ -1753,6 +1833,7 @@ mod tests {
             },
             expected_session_id: &session_id,
             resumed_session,
+            system_prompt_intent: ResumeSystemPromptIntent::PreservePersisted,
         })
         .await
         .expect("build_resumed_agent_config");
@@ -1843,6 +1924,7 @@ mod tests {
             },
             expected_session_id: &session_id,
             resumed_session,
+            system_prompt_intent: ResumeSystemPromptIntent::PreservePersisted,
         })
         .await
         .expect("build_resumed_agent_config");
@@ -1942,6 +2024,7 @@ mod tests {
             },
             expected_session_id: &session_id,
             resumed_session,
+            system_prompt_intent: ResumeSystemPromptIntent::PreservePersisted,
         })
         .await
         .expect_err("malformed canonical visibility must fail closed");
@@ -2398,6 +2481,7 @@ mod tests {
             },
             expected_session_id: &session_id,
             resumed_session,
+            system_prompt_intent: ResumeSystemPromptIntent::PreservePersisted,
         })
         .await
         .expect("build_resumed_agent_config");

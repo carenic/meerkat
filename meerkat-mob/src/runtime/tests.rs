@@ -22956,6 +22956,7 @@ async fn test_build_resumed_agent_config_rejects_mismatched_session_identity() {
             },
             expected_session_id: &wrong_session_id,
             resumed_session: resumed,
+            system_prompt_intent: crate::build::ResumeSystemPromptIntent::PreservePersisted,
         })
         .await
         .expect_err("resume helper must validate the target session identity");
@@ -51114,6 +51115,63 @@ async fn test_cold_restart_restores_per_spawn_profile_override_without_customize
     assert!(
         last_names.contains(&"planner".to_string()),
         "restored member build must carry the per-spawn declarative MCP servers: {mcp_creates:?}"
+    );
+}
+
+#[tokio::test]
+async fn test_cold_restart_does_not_replay_persisted_system_prompt_configuration() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let events = storage.events.clone();
+    let runtime_metadata = storage.runtime_metadata.clone();
+    let handle = MobBuilder::new(sample_definition(), storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+
+    let prompt = "configured once, retained across rematerialization";
+    let mut spec = SpawnMemberSpec::new("worker", "w-prompt-restore");
+    spec.system_prompt_override = Some(SpawnSystemPromptOverride::Replace(prompt.to_string()));
+    let spawned = handle.spawn_spec(spec).await.expect("spawn worker");
+    let session_id = handle
+        .resolve_bridge_session_id(&spawned.agent_identity)
+        .await
+        .expect("bridge session id");
+
+    handle.stop().await.expect("stop");
+    MobSessionService::discard_live_session(service.as_ref(), &session_id)
+        .await
+        .expect("discard live session");
+
+    let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+        events,
+        runtime_metadata,
+    ))
+    .with_session_service(service.clone())
+    .resume()
+    .await
+    .expect("resume");
+    resumed
+        .resume()
+        .await
+        .expect("rebuild stopped member session");
+
+    let restored = service
+        .live_session_clone(&session_id)
+        .await
+        .expect("restored live session");
+    assert_eq!(
+        restored
+            .messages()
+            .iter()
+            .filter(
+                |message| matches!(message, Message::System(system) if system.content == prompt)
+            )
+            .count(),
+        1,
+        "automatic rematerialization must not append persisted prompt configuration",
     );
 }
 

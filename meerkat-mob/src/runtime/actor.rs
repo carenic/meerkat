@@ -3611,6 +3611,7 @@ impl DeferredResumeProvision {
             },
             expected_session_id: &resume_id,
             resumed_session: stored_session,
+            system_prompt_intent: build::ResumeSystemPromptIntent::AppendExplicit,
         })
         .await?;
         config.keep_alive = keep_alive;
@@ -11393,6 +11394,7 @@ impl MobActor {
             },
             expected_session_id: bridge_session_id,
             resumed_session: stored_session,
+            system_prompt_intent: build::ResumeSystemPromptIntent::PreservePersisted,
         })
         .await?;
         config.keep_alive = entry.runtime_mode == crate::MobRuntimeMode::AutonomousHost;
@@ -23381,6 +23383,8 @@ impl MobActor {
                             },
                             expected_session_id: &resume_id,
                             resumed_session: stored_session,
+                            system_prompt_intent:
+                                build::ResumeSystemPromptIntent::AppendExplicit,
                         },
                     )
                     .await?;
