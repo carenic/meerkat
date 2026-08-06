@@ -178,7 +178,7 @@ fi
 retry_lane \
   "workspace unit build" \
   "$BUILD_TIMEOUT_SECS" \
-  "$CARGO" nextest run --workspace --lib --no-fail-fast --no-run
+  "$CARGO" nextest run --workspace --lib --no-run
 retry_lane \
   "workspace unit lane" \
   "$UNIT_NEXTEST_TIMEOUT_SECS" \
@@ -187,7 +187,7 @@ retry_lane \
 retry_lane \
   "workspace integration build" \
   "$BUILD_TIMEOUT_SECS" \
-  "$CARGO" nextest run --workspace --tests --profile fast --no-fail-fast \
+  "$CARGO" nextest run --workspace --tests --profile fast \
     --no-run -E 'kind(test)'
 retry_lane \
   "workspace integration lane" \
@@ -212,7 +212,7 @@ retry_lane \
   "e2e-fast build" \
   "$BUILD_TIMEOUT_SECS" \
   "$CARGO" nextest run -p meerkat-integration-tests --test e2e_fast_lane \
-    --no-fail-fast --no-run
+    --no-run
 retry_lane \
   "e2e-fast lane" \
   "$NEXTEST_TIMEOUT_SECS" \
