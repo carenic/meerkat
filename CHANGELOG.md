@@ -13,8 +13,20 @@ via cargo-semver-checks against the published baselines).
 
 ## [Unreleased]
 
+### Breaking
+
+- Removed `EphemeralRuntimeDriver::queue` and
+  `EphemeralRuntimeDriver::steer_queue`. Runtime lane membership and ordering
+  are now exposed only through the machine-owned `queue_lane` and
+  `steer_lane` views.
+
 ### Fixed
 
+- Runtime input execution no longer maintains mutable physical queue copies
+  beside the generated `input_lane` authority. Authorized batches validate the
+  exact machine-owned prefix and hydrate payloads from the ledger; staging is
+  the sole lane-removal transition, so rollback, recovery, and task loss cannot
+  strand work in a diverged shell queue.
 - Runtime comms drains now admit one classified input at a time, preserving
   the durable FIFO tail when a drain task is cancelled or replaced.
 - Mob-member rematerialization never replays system-prompt configuration as a

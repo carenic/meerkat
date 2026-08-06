@@ -5169,7 +5169,7 @@ async fn process_queue(
                 >,
                 batch: crate::meerkat_machine::driver::AuthorizedRuntimeLoopBatch,
             },
-            ProjectionMismatch {
+            AuthorityMismatch {
                 input_ids: Vec<InputId>,
                 reason: String,
             },
@@ -5213,19 +5213,19 @@ async fn process_queue(
             let fresh_steer_batch = prebound_run_id.is_none()
                 && batch.source() == crate::meerkat_machine::driver::RuntimeLoopBatchSource::Steer;
 
-            // Dequeue the batch members from the physical queues. The physical
-            // projection must exactly match the machine-selected batch; partial
-            // shrinkage would turn projection drift into different semantic work.
-            let staged_inputs = match d.dequeue_batch_exact(&batch) {
+            // Validate the machine-selected lane prefix and hydrate its payloads
+            // from the ledger. Staging below is the only operation that removes
+            // machine-owned lane membership.
+            let staged_inputs = match d.hydrate_authorized_batch(&batch) {
                 Ok(staged_inputs) => staged_inputs,
                 Err(error) => {
                     let reason =
-                        format!("runtime loop batch projection conformance failed: {error}");
+                        format!("runtime loop batch authority conformance failed: {error}");
                     tracing::error!(
                         error = %error,
-                        "runtime loop batch projection conformance failed"
+                        "runtime loop batch authority conformance failed"
                     );
-                    break 'dequeue RuntimeLoopDequeueOutcome::ProjectionMismatch {
+                    break 'dequeue RuntimeLoopDequeueOutcome::AuthorityMismatch {
                         input_ids: batch.input_ids().to_vec(),
                         reason,
                     };
@@ -6303,7 +6303,7 @@ async fn process_queue(
                     }
                 }
             }
-            RuntimeLoopDequeueOutcome::ProjectionMismatch { input_ids, reason } => {
+            RuntimeLoopDequeueOutcome::AuthorityMismatch { input_ids, reason } => {
                 if let Some(completions) = completions.as_ref() {
                     let mut completions = completions.lock().await;
                     fail_completion_waiters(&mut completions, &input_ids, reason.clone());
@@ -9368,7 +9368,7 @@ mod tests {
             panic!("test uses an ephemeral driver");
         };
         let (_input_id, input) = ephemeral
-            .dequeue_next()
+            .peek_next_queued_input_for_test()
             .expect("continuation should be queued inline");
         match input {
             Input::Continuation(continuation) => {
@@ -9420,7 +9420,7 @@ mod tests {
                 panic!("test uses an ephemeral driver");
             };
             ephemeral
-                .dequeue_next()
+                .peek_next_queued_input_for_test()
                 .expect("first continuation should be accepted");
         }
         let second_driver = make_shared_ephemeral_driver("feed-one-shot-second-wake");
@@ -9753,7 +9753,7 @@ mod tests {
             panic!("test uses an ephemeral driver");
         };
         let (_input_id, input) = ephemeral
-            .dequeue_next()
+            .peek_next_queued_input_for_test()
             .expect("held completion must inject a continuation once the hold clears");
         match input {
             Input::Continuation(continuation) => {

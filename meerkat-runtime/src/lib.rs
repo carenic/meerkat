@@ -87,7 +87,6 @@ pub mod protocol_supervisor_trust_publish;
 #[allow(unused_imports)]
 #[path = "generated/protocol_supervisor_trust_revoke.rs"]
 pub mod protocol_supervisor_trust_revoke;
-pub(crate) mod queue;
 pub mod recovery;
 pub mod runtime_event;
 pub(crate) mod runtime_loop;

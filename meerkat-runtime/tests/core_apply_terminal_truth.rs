@@ -182,20 +182,21 @@ fn core_apply_terminal_truth_has_one_authority() -> Result<(), String> {
     );
     assert!(
         runtime_loop.contains("machine_authorize_runtime_loop_batch(&d)")
-            && runtime_loop.contains("dequeue_batch_exact(&batch)")
+            && runtime_loop.contains("hydrate_authorized_batch(&batch)")
             && runtime_loop.contains("prepare_runtime_loop_batch_start(")
             && !runtime_loop.contains("filter_map(|id| d.dequeue_by_id(id))"),
-        "runtime loop batch execution must use authorized batch tokens and fail closed on projection mismatch"
+        "runtime loop batch execution must use authorized batch tokens and fail closed on lane-authority mismatch"
     );
-    let exact_dequeue =
-        extract_braced_item(&ephemeral_driver, "pub(crate) fn dequeue_batch_exact")?;
+    let batch_hydration =
+        extract_braced_item(&ephemeral_driver, "pub(crate) fn hydrate_authorized_batch")?;
     assert!(
-        exact_dequeue.contains("match batch.source()")
-            && exact_dequeue.contains("RuntimeLoopBatchSource::Queue")
-            && exact_dequeue.contains("RuntimeLoopBatchSource::Steer")
-            && exact_dequeue.contains("dequeue_exact_prefix(batch.input_ids())")
-            && !exact_dequeue.contains("dequeue_by_id"),
-        "runtime batch dequeue must enforce exact source/prefix conformance instead of draining by id from either queue"
+        batch_hydration.contains("match batch.source()")
+            && batch_hydration.contains("RuntimeLoopBatchSource::Queue")
+            && batch_hydration.contains("RuntimeLoopBatchSource::Steer")
+            && batch_hydration.contains("hydrate_lane_prefix")
+            && !batch_hydration.contains("dequeue")
+            && !batch_hydration.contains("remove"),
+        "runtime batch hydration must enforce exact machine-owned source/prefix conformance without mutating a second queue"
     );
     assert!(
         runtime_driver.contains("input_runtime_boundary")

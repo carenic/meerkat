@@ -6,7 +6,7 @@
 //!   DSL authority (`input_phases` + associated transitions); `InputState`
 //!   carries only shell-mirror metadata (history, timestamps, cached terminal
 //!   outcome, compatibility retry counter)
-//! - InputQueue FIFO management
+//! - Machine-owned FIFO lanes with payload hydration from the input ledger
 //! - S24 ephemeral recovery
 //! - S25 retire/reset/destroy lifecycle operations
 
@@ -36,7 +36,6 @@ use crate::input_state::{
 };
 use crate::meerkat_machine::dsl as mm_dsl;
 use crate::policy::PolicyDecision;
-use crate::queue::InputQueue;
 use crate::runtime_event::{
     InputLifecycleEvent, RuntimeEvent, RuntimeEventEnvelope, RuntimeStateChangeEvent,
 };
@@ -124,8 +123,6 @@ pub(crate) struct EphemeralDriverRollbackSnapshot {
     control_projection: RuntimeControlProjection,
     dsl_snapshot: mm_dsl::MeerkatMachineAuthoritySnapshot,
     ledger: InputLedger,
-    queue: InputQueue,
-    steer_queue: InputQueue,
     events: Vec<RuntimeEventEnvelope>,
     post_admission_signal: PostAdmissionSignal,
     handling_mode: HashMap<InputId, HandlingMode>,
@@ -149,8 +146,6 @@ pub struct EphemeralRuntimeDriver {
     /// semantic owner of the lifecycle tuple.
     control: Arc<StdRwLock<RuntimeControlProjection>>,
     ledger: InputLedger,
-    queue: InputQueue,
-    steer_queue: InputQueue,
     events: Vec<RuntimeEventEnvelope>,
     /// Typed post-admission signal replacing boolean wake/process flags.
     ///
@@ -267,8 +262,6 @@ impl EphemeralRuntimeDriver {
             runtime_id,
             control,
             ledger: InputLedger::new(),
-            queue: InputQueue::new(),
-            steer_queue: InputQueue::new(),
             events: Vec::new(),
             post_admission_signal: PostAdmissionSignal::None,
             dsl: DslAuthority(dsl),
@@ -289,8 +282,6 @@ impl EphemeralRuntimeDriver {
             control_projection: self.read_control_projection().clone(),
             dsl_snapshot: self.dsl.lock().snapshot(),
             ledger: self.ledger.clone(),
-            queue: self.queue.clone(),
-            steer_queue: self.steer_queue.clone(),
             events: self.events.clone(),
             post_admission_signal: self.post_admission_signal,
             handling_mode: self.handling_mode.clone(),
@@ -326,8 +317,6 @@ impl EphemeralRuntimeDriver {
             authority.restore_snapshot(snapshot.dsl_snapshot);
         }
         self.ledger = snapshot.ledger;
-        self.queue = snapshot.queue;
-        self.steer_queue = snapshot.steer_queue;
         self.events = snapshot.events;
         self.post_admission_signal = snapshot.post_admission_signal;
         self.handling_mode = snapshot.handling_mode;
@@ -1198,77 +1187,53 @@ impl EphemeralRuntimeDriver {
         })
     }
 
-    fn build_projection_queue(&self, ids: &[InputId], lane: &str) -> InputQueue {
-        let mut queue = InputQueue::new();
-        for input_id in ids {
-            match self
-                .ledger
-                .get(input_id)
-                .and_then(|state| state.persisted_input.clone())
-            {
-                Some(input) => queue.enqueue(input_id.clone(), input),
-                None => {
-                    tracing::error!(
-                        input_id = ?input_id,
-                        lane,
-                        "ingress queue references input without persisted payload"
-                    );
-                    debug_assert!(
-                        false,
-                        "ingress queue projection missing persisted payload for {input_id:?} in {lane}"
-                    );
+    pub(crate) fn validate_queue_payloads(&self, context: &str) -> Result<(), RuntimeDriverError> {
+        for (lane, input_ids) in [
+            ("queue", self.dsl_queue_lane()),
+            ("steer", self.dsl_steer_lane()),
+        ] {
+            for input_id in input_ids {
+                if self
+                    .ledger
+                    .get(&input_id)
+                    .and_then(|state| state.persisted_input.as_ref())
+                    .is_none()
+                {
+                    return Err(RuntimeDriverError::Internal(format!(
+                        "{context}: machine-owned {lane} lane references input {input_id} without a persisted payload"
+                    )));
                 }
             }
         }
-        queue
-    }
-
-    fn rebuild_queue_projections(&mut self) {
-        let queue_ids = self.dsl_queue_lane();
-        let steer_ids = self.dsl_steer_lane();
-        self.queue = self.build_projection_queue(&queue_ids, "queue");
-        self.steer_queue = self.build_projection_queue(&steer_ids, "steer_queue");
-    }
-
-    pub(crate) fn rebuild_queue_projections_after_recovery(&mut self) {
-        self.rebuild_queue_projections();
-        self.debug_assert_queue_projection_alignment();
-    }
-
-    pub(crate) fn validate_queue_projection_alignment(
-        &self,
-        context: &str,
-    ) -> Result<(), RuntimeDriverError> {
-        let physical_queue = self.queue.input_ids();
-        let machine_queue = self.dsl_queue_lane();
-        if physical_queue != machine_queue {
-            return Err(RuntimeDriverError::Internal(format!(
-                "{context}: physical queue projection diverged from machine queue lane: physical={physical_queue:?} machine={machine_queue:?}"
-            )));
-        }
-
-        let physical_steer_queue = self.steer_queue.input_ids();
-        let machine_steer_queue = self.dsl_steer_lane();
-        if physical_steer_queue != machine_steer_queue {
-            return Err(RuntimeDriverError::Internal(format!(
-                "{context}: physical steer queue projection diverged from machine steer lane: physical={physical_steer_queue:?} machine={machine_steer_queue:?}"
-            )));
-        }
-
         Ok(())
     }
 
-    fn debug_assert_queue_projection_alignment(&self) {
-        debug_assert_eq!(
-            self.queue.input_ids(),
-            self.dsl_queue_lane().as_slice(),
-            "physical queue must match DSL queue lane"
-        );
-        debug_assert_eq!(
-            self.steer_queue.input_ids(),
-            self.dsl_steer_lane().as_slice(),
-            "physical steer queue must match DSL steer lane"
-        );
+    fn hydrate_lane_prefix(
+        &self,
+        lane: &str,
+        lane_ids: &[InputId],
+        expected_prefix: &[InputId],
+    ) -> Result<Vec<(InputId, Input)>, RuntimeDriverError> {
+        if !lane_ids.starts_with(expected_prefix) {
+            return Err(RuntimeDriverError::Internal(format!(
+                "authorized runtime batch from {lane} did not match the machine-owned lane prefix exactly: expected {expected_prefix:?}, lane={lane_ids:?}"
+            )));
+        }
+        expected_prefix
+            .iter()
+            .map(|input_id| {
+                let input = self
+                    .ledger
+                    .get(input_id)
+                    .and_then(|state| state.persisted_input.clone())
+                    .ok_or_else(|| {
+                        RuntimeDriverError::Internal(format!(
+                            "machine-owned {lane} lane references input {input_id} without a persisted payload"
+                        ))
+                    })?;
+                Ok((input_id.clone(), input))
+            })
+            .collect()
     }
 
     /// Admit a store-recovered input into the driver's ingress tracking.
@@ -1670,10 +1635,9 @@ impl EphemeralRuntimeDriver {
         self.dsl_apply(admission_input, admission_label)?;
 
         // 2. Handle supersession / coalescing of an existing queued input.
-        //    The new input goes into the queue after generated authority has
-        //    accepted every side effect; the existing one
-        //    transitions to its terminal state here. The DSL transitions
-        //    own lane removal.
+        //    The new input is already present in the machine-owned lane. The
+        //    existing one transitions to its terminal state here, and the DSL
+        //    transition owns its lane removal.
         if let Some(action) = existing_action {
             match action {
                 ExistingQueuedAdmissionAction::Coalesce { existing_id } => {
@@ -1693,8 +1657,6 @@ impl EphemeralRuntimeDriver {
                         InputLifecycleState::Coalesced,
                         "Coalesce",
                     )?;
-                    let _ = self.queue.remove(existing_id);
-                    let _ = self.steer_queue.remove(existing_id);
                 }
                 ExistingQueuedAdmissionAction::Supersede { existing_id } => {
                     let existing_key = Self::dsl_key(existing_id);
@@ -1714,8 +1676,6 @@ impl EphemeralRuntimeDriver {
                         InputLifecycleState::Superseded,
                         "Supersede",
                     )?;
-                    let _ = self.queue.remove(existing_id);
-                    let _ = self.steer_queue.remove(existing_id);
                 }
             }
         }
@@ -1724,7 +1684,7 @@ impl EphemeralRuntimeDriver {
         //    queue_action's target differs from the admission lane (e.g.
         //    priority reroute), the shell emits a `ChangeLane` transition
         //    rather than writing `input_lane` directly.
-        match queue_action.clone() {
+        match queue_action {
             AdmissionQueueAction::None => {}
             AdmissionQueueAction::EnqueueTo { target } => {
                 let target_lane = mm_dsl::InputLane::from(target);
@@ -1786,25 +1746,6 @@ impl EphemeralRuntimeDriver {
             None,
             None,
         );
-
-        match queue_action {
-            AdmissionQueueAction::None => {}
-            AdmissionQueueAction::EnqueueTo { target } => match target {
-                HandlingMode::Queue => self.queue.enqueue(input_id.clone(), input.clone()),
-                HandlingMode::Steer => {
-                    self.steer_queue.enqueue(input_id.clone(), input.clone());
-                }
-            },
-            AdmissionQueueAction::EnqueueFront { target } => match target {
-                HandlingMode::Queue => {
-                    self.queue.enqueue_front(input_id.clone(), input.clone());
-                }
-                HandlingMode::Steer => {
-                    self.steer_queue
-                        .enqueue_front(input_id.clone(), input.clone());
-                }
-            },
-        }
 
         self.emit_event(RuntimeEvent::InputLifecycle(
             InputLifecycleEvent::Accepted {
@@ -2012,23 +1953,6 @@ impl EphemeralRuntimeDriver {
     pub fn drain_events(&mut self) -> Vec<RuntimeEventEnvelope> {
         std::mem::take(&mut self.events)
     }
-    pub fn queue(&self) -> &InputQueue {
-        &self.queue
-    }
-    pub fn steer_queue(&self) -> &InputQueue {
-        &self.steer_queue
-    }
-
-    #[cfg(test)]
-    pub fn queue_mut(&mut self) -> &mut InputQueue {
-        &mut self.queue
-    }
-
-    #[cfg(test)]
-    pub fn steer_queue_mut(&mut self) -> &mut InputQueue {
-        &mut self.steer_queue
-    }
-
     #[cfg(test)]
     pub(crate) fn increment_attempt_count_for_test(
         &mut self,
@@ -2077,8 +2001,6 @@ impl EphemeralRuntimeDriver {
                 "DeferInputBehindBacklog",
             )?;
         }
-        self.rebuild_queue_projections();
-        self.debug_assert_queue_projection_alignment();
         Ok(())
     }
 
@@ -2474,7 +2396,7 @@ impl EphemeralRuntimeDriver {
         }
 
         self.ledger.recover(bundle.state);
-        self.rebuild_queue_projections_after_recovery();
+        self.validate_queue_payloads("after stored input recovery")?;
         self.authorized_stored_input_state(&input_id)?
             .ok_or_else(|| {
                 RuntimeDriverError::Internal(format!(
@@ -2482,49 +2404,38 @@ impl EphemeralRuntimeDriver {
                 ))
             })
     }
-    /// Clear the physical queue projections without touching canonical ingress
-    /// truth. Used by recovery contract tests to simulate projection loss.
-    pub fn clear_queue_projections(&mut self) {
-        self.queue = InputQueue::new();
-        self.steer_queue = InputQueue::new();
-    }
-    pub(crate) fn dequeue_next(&mut self) -> Option<(InputId, Input)> {
-        let queued = self
-            .steer_queue
-            .dequeue()
-            .or_else(|| self.queue.dequeue())?;
-        Some((queued.input_id, queued.input))
+    #[cfg(any(test, debug_assertions, feature = "test-support"))]
+    pub(crate) fn peek_next_queued_input_for_test(&self) -> Option<(InputId, Input)> {
+        let input_id = self
+            .dsl_steer_lane()
+            .into_iter()
+            .next()
+            .or_else(|| self.dsl_queue_lane().into_iter().next())?;
+        let input = self.ledger.get(&input_id)?.persisted_input.clone()?;
+        Some((input_id, input))
     }
 
-    /// Contract helper for recovery/queue-projection tests. Production runtime
-    /// execution must use generated batch authority via `dequeue_batch_exact`.
+    /// Contract helper for recovery tests. Production runtime execution must
+    /// hydrate payloads through generated batch authority.
     #[cfg(any(test, debug_assertions, feature = "test-support"))]
     #[doc(hidden)]
-    pub fn contract_dequeue_next_for_recovery_tests(&mut self) -> Option<(InputId, Input)> {
-        self.dequeue_next()
+    pub fn contract_peek_next_for_recovery_tests(&self) -> Option<(InputId, Input)> {
+        self.peek_next_queued_input_for_test()
     }
 
-    pub(crate) fn dequeue_batch_exact(
-        &mut self,
+    pub(crate) fn hydrate_authorized_batch(
+        &self,
         batch: &crate::meerkat_machine::driver::AuthorizedRuntimeLoopBatch,
     ) -> Result<Vec<(InputId, Input)>, RuntimeDriverError> {
-        self.validate_queue_projection_alignment("before authorized runtime-loop dequeue")?;
-        let (source_name, source_queue) = match batch.source() {
+        let (source_name, lane_ids) = match batch.source() {
             crate::meerkat_machine::driver::RuntimeLoopBatchSource::Queue => {
-                ("queue", &mut self.queue)
+                ("queue", self.dsl_queue_lane())
             }
             crate::meerkat_machine::driver::RuntimeLoopBatchSource::Steer => {
-                ("steer", &mut self.steer_queue)
+                ("steer", self.dsl_steer_lane())
             }
         };
-        source_queue
-            .dequeue_exact_prefix(batch.input_ids())
-            .ok_or_else(|| {
-                RuntimeDriverError::Internal(format!(
-                    "authorized runtime batch from {source_name} did not match the physical queue prefix exactly: expected {:?}",
-                    batch.input_ids()
-                ))
-            })
+        self.hydrate_lane_prefix(source_name, &lane_ids, batch.input_ids())
     }
 
     /// Machine-owned realization for a validated staged contributor batch.
@@ -2562,10 +2473,6 @@ impl EphemeralRuntimeDriver {
                 run_id: run_id.clone(),
             }));
         }
-        self.rebuild_queue_projections();
-        self.validate_queue_projection_alignment("after authorized StageForRun")?;
-        self.debug_assert_queue_projection_alignment();
-
         Ok(())
     }
 
@@ -2754,8 +2661,6 @@ impl EphemeralRuntimeDriver {
             )));
         };
         state.runtime_semantics = Some(normalized_semantics);
-        self.rebuild_queue_projections();
-        self.debug_assert_queue_projection_alignment();
         Ok(())
     }
 
@@ -2901,8 +2806,6 @@ impl EphemeralRuntimeDriver {
             }
         }
 
-        self.rebuild_queue_projections();
-        self.debug_assert_queue_projection_alignment();
         Ok(())
     }
 
@@ -2920,11 +2823,7 @@ impl EphemeralRuntimeDriver {
 
     pub(crate) fn reset_cleanup(&mut self) -> Result<ResetReport, RuntimeDriverError> {
         let abandoned = self.abandon_all_non_terminal(InputAbandonReason::Reset)?;
-        self.queue.drain();
-        self.steer_queue.drain();
         self.post_admission_signal = PostAdmissionSignal::None;
-        self.rebuild_queue_projections();
-        self.debug_assert_queue_projection_alignment();
         Ok(ResetReport {
             inputs_abandoned: abandoned,
         })
@@ -2932,18 +2831,12 @@ impl EphemeralRuntimeDriver {
 
     pub(crate) fn destroy_cleanup(&mut self) -> Result<usize, RuntimeDriverError> {
         let abandoned = self.abandon_all_non_terminal(InputAbandonReason::Destroyed)?;
-        self.queue.drain();
-        self.steer_queue.drain();
         self.post_admission_signal = PostAdmissionSignal::None;
-        self.rebuild_queue_projections();
-        self.debug_assert_queue_projection_alignment();
         Ok(abandoned)
     }
 
     pub(crate) fn stop_runtime_cleanup(&mut self) -> Result<(), RuntimeDriverError> {
         self.abandon_all_non_terminal(InputAbandonReason::Stopped)?;
-        self.queue.drain();
-        self.steer_queue.drain();
         Ok(())
     }
 
@@ -2985,8 +2878,6 @@ impl EphemeralRuntimeDriver {
         self.policy_snapshot = preserved_policy_snapshot;
 
         self.recover_ephemeral()?;
-        self.rebuild_queue_projections();
-        self.debug_assert_queue_projection_alignment();
 
         Ok(transferred)
     }
@@ -3812,9 +3703,6 @@ impl EphemeralRuntimeDriver {
                 }
             }
         }
-        self.rebuild_queue_projections();
-        self.debug_assert_queue_projection_alignment();
-
         let final_bundle = self.stored_input_state(&input_id).ok_or_else(|| {
             RuntimeDriverError::Internal(format!(
                 "accepted input {input_id} missing generated lifecycle seed"
@@ -4063,8 +3951,6 @@ impl EphemeralRuntimeDriver {
                 )));
         }
 
-        self.rebuild_queue_projections();
-        self.debug_assert_queue_projection_alignment();
         Ok(count)
     }
 
@@ -4103,8 +3989,6 @@ impl EphemeralRuntimeDriver {
                     reason,
                 },
             )));
-        self.rebuild_queue_projections();
-        self.debug_assert_queue_projection_alignment();
         Ok(true)
     }
 
@@ -4113,11 +3997,7 @@ impl EphemeralRuntimeDriver {
         reason: InputAbandonReason,
     ) -> Result<usize, RuntimeDriverError> {
         let abandoned = self.abandon_all_non_terminal(reason)?;
-        self.queue.drain();
-        self.steer_queue.drain();
         self.post_admission_signal = PostAdmissionSignal::None;
-        self.rebuild_queue_projections();
-        self.debug_assert_queue_projection_alignment();
         Ok(abandoned)
     }
 
@@ -4626,7 +4506,6 @@ mod tests {
                 "PrioritizeInput(test)",
             )
             .unwrap();
-        driver.rebuild_queue_projections();
 
         assert_eq!(
             driver.dsl_queue_lane(),
@@ -4690,8 +4569,8 @@ mod tests {
         );
         assert!(driver.dsl_steer_lane().is_empty());
         assert_eq!(driver.dsl_queue_lane(), vec![input_id.clone()]);
-        assert!(driver.steer_queue().is_empty());
-        assert_eq!(driver.queue().input_ids(), std::slice::from_ref(&input_id));
+        assert!(driver.steer_lane().is_empty());
+        assert_eq!(driver.queue_lane(), std::slice::from_ref(&input_id));
         assert_eq!(
             driver.input_recovery_lane(&input_id),
             Some(meerkat_core::types::HandlingMode::Queue)
@@ -4713,8 +4592,8 @@ mod tests {
             Some(meerkat_core::types::HandlingMode::Queue)
         );
         driver
-            .validate_queue_projection_alignment("post unavailable normalization")
-            .expect("generated and physical queue projections remain aligned");
+            .validate_queue_payloads("post unavailable normalization")
+            .expect("machine-owned queue payload remains available");
     }
 
     #[tokio::test]
@@ -4873,11 +4752,11 @@ mod tests {
         let untracked = InputId::new();
         driver
             .defer_queued_inputs_behind_backlog(std::slice::from_ref(&untracked))
-            .expect_err("an untracked input in the defer sweep is projection corruption");
+            .expect_err("an untracked input in the defer sweep is authority corruption");
     }
 
     #[tokio::test]
-    async fn authorized_batch_dequeue_requires_exact_source() {
+    async fn authorized_batch_hydration_requires_exact_source() {
         let mut driver = EphemeralRuntimeDriver::new(LogicalRuntimeId::new("batch-source"));
         let input = prompt_input("queued");
         let input_id = input.id().clone();
@@ -4889,8 +4768,8 @@ mod tests {
         );
 
         let err = driver
-            .dequeue_batch_exact(&batch)
-            .expect_err("queue input must not be drained through steer authority");
+            .hydrate_authorized_batch(&batch)
+            .expect_err("queue input must not be hydrated through steer authority");
 
         assert!(
             err.to_string()
@@ -4898,14 +4777,14 @@ mod tests {
             "unexpected error: {err}"
         );
         assert_eq!(
-            driver.queue().input_ids(),
+            driver.queue_lane(),
             vec![input_id],
-            "failed source conformance must leave the physical queue intact"
+            "failed source conformance must leave machine-owned lane truth intact"
         );
     }
 
     #[tokio::test]
-    async fn authorized_batch_dequeue_requires_exact_prefix() {
+    async fn authorized_batch_hydration_requires_exact_prefix() {
         let mut driver = EphemeralRuntimeDriver::new(LogicalRuntimeId::new("batch-prefix"));
         let first = prompt_input("first");
         let first_id = first.id().clone();
@@ -4918,8 +4797,8 @@ mod tests {
             crate::meerkat_machine::driver::test_authorized_runtime_loop_batch(vec![second_id]);
 
         let err = driver
-            .dequeue_batch_exact(&batch)
-            .expect_err("later queue member must not be drained past an older prefix");
+            .hydrate_authorized_batch(&batch)
+            .expect_err("later queue member must not skip an older prefix");
 
         assert!(
             err.to_string()
@@ -4927,9 +4806,9 @@ mod tests {
             "unexpected error: {err}"
         );
         assert_eq!(
-            driver.queue().input_ids(),
+            driver.queue_lane(),
             vec![first_id, batch.input_ids()[0].clone()],
-            "failed prefix conformance must leave the physical queue intact"
+            "failed prefix conformance must leave machine-owned lane truth intact"
         );
     }
 
@@ -5317,8 +5196,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stage_input_keeps_queue_projection_aligned() {
-        let mut driver = EphemeralRuntimeDriver::new(LogicalRuntimeId::new("stage-projection"));
+    async fn stage_input_removes_machine_owned_queue_membership() {
+        let mut driver = EphemeralRuntimeDriver::new(LogicalRuntimeId::new("stage-authority"));
         let input = prompt_input("stage me");
         let input_id = input.id().clone();
         driver.accept_input(input).await.unwrap();
@@ -5329,57 +5208,52 @@ mod tests {
             .machine_realize_stage_batch(std::slice::from_ref(&input_id), &run_id)
             .unwrap();
 
-        assert!(driver.queue().is_empty());
-        driver
-            .validate_queue_projection_alignment("test post-stage")
-            .unwrap();
+        assert!(driver.dsl_queue_lane().is_empty());
+        assert!(driver.queue_lane().is_empty());
     }
 
     #[tokio::test]
-    async fn authorized_dequeue_rejects_physical_queue_projection_drift() {
-        let mut driver = EphemeralRuntimeDriver::new(LogicalRuntimeId::new(
-            "queue-projection-drift-before-dequeue",
-        ));
-        let input = prompt_input("authorized");
-        let input_id = input.id().clone();
-        driver.accept_input(input).await.unwrap();
-
-        let drift = prompt_input("drift");
-        let drift_id = drift.id().clone();
-        driver.queue_mut().enqueue_front(drift_id, drift);
+    async fn authorized_hydration_rejects_non_prefix_batch() {
+        let mut driver =
+            EphemeralRuntimeDriver::new(LogicalRuntimeId::new("queue-authority-prefix"));
+        let first = prompt_input("first");
+        driver.accept_input(first).await.unwrap();
+        let second = prompt_input("second");
+        let second_id = second.id().clone();
+        driver.accept_input(second).await.unwrap();
         let batch =
-            crate::meerkat_machine::driver::test_authorized_runtime_loop_batch(vec![input_id]);
+            crate::meerkat_machine::driver::test_authorized_runtime_loop_batch(vec![second_id]);
 
         let err = driver
-            .dequeue_batch_exact(&batch)
-            .expect_err("physical queue drift must fail closed before dequeue");
+            .hydrate_authorized_batch(&batch)
+            .expect_err("a non-prefix batch must fail closed");
         assert!(
-            matches!(&err, RuntimeDriverError::Internal(message) if message.contains("physical queue projection diverged")),
-            "unexpected queue projection error: {err:?}"
+            matches!(&err, RuntimeDriverError::Internal(message) if message.contains("machine-owned lane prefix")),
+            "unexpected queue authority error: {err:?}"
         );
     }
 
     #[tokio::test]
-    async fn authorized_dequeue_rejects_physical_steer_projection_drift() {
-        let mut driver = EphemeralRuntimeDriver::new(LogicalRuntimeId::new(
-            "steer-projection-drift-before-dequeue",
-        ));
+    async fn authorized_hydration_rejects_missing_ledger_payload() {
+        let mut driver =
+            EphemeralRuntimeDriver::new(LogicalRuntimeId::new("queue-authority-payload"));
         let input = prompt_input("authorized");
         let input_id = input.id().clone();
         driver.accept_input(input).await.unwrap();
-
-        let drift = prompt_input("steer drift");
-        let drift_id = drift.id().clone();
-        driver.steer_queue_mut().enqueue(drift_id, drift);
+        driver
+            .ledger
+            .get_mut(&input_id)
+            .expect("accepted ledger state")
+            .persisted_input = None;
         let batch =
             crate::meerkat_machine::driver::test_authorized_runtime_loop_batch(vec![input_id]);
 
         let err = driver
-            .dequeue_batch_exact(&batch)
-            .expect_err("physical steer queue drift must fail closed before dequeue");
+            .hydrate_authorized_batch(&batch)
+            .expect_err("a missing authoritative payload must fail closed");
         assert!(
-            matches!(&err, RuntimeDriverError::Internal(message) if message.contains("physical steer queue projection diverged")),
-            "unexpected steer projection error: {err:?}"
+            matches!(&err, RuntimeDriverError::Internal(message) if message.contains("without a persisted payload")),
+            "unexpected queue payload error: {err:?}"
         );
     }
 
@@ -5404,9 +5278,7 @@ mod tests {
             driver.input_phase(&input_id),
             Some(InputLifecycleState::AppliedPendingConsumption)
         );
-        driver
-            .validate_queue_projection_alignment("test recovery")
-            .unwrap();
+        driver.validate_queue_payloads("test recovery").unwrap();
     }
 
     #[tokio::test]

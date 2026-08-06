@@ -678,7 +678,7 @@ async fn recover_discards_machine_classified_ephemeral_inputs() {
         .expect("registration-authorized recovery must discard ephemeral input work");
 
     // Generated recovery durability authority discards ephemeral rows before
-    // the ledger or queue projections can recover them.
+    // the ledger or machine-owned lanes can recover them.
     assert!(
         adapter
             .input_state(&session_id, &input_id)
@@ -771,7 +771,7 @@ async fn durable_accept_failure_restores_canonical_ingress_state() {
         "failed durable admission must not leave canonical input state behind"
     );
     assert!(
-        driver.contract_dequeue_next_for_recovery_tests().is_none(),
+        driver.contract_peek_next_for_recovery_tests().is_none(),
         "failed durable admission must not leave a queued phantom input"
     );
     assert!(
@@ -872,8 +872,8 @@ async fn persistence_record_rejects_unstamped_recovered_row_before_store_write()
         "failed persistence-record recovery must not retain the rejected row",
     );
     assert!(
-        driver.contract_dequeue_next_for_recovery_tests().is_none(),
-        "failed persistence-record recovery must not leave recovered queue projection",
+        driver.contract_peek_next_for_recovery_tests().is_none(),
+        "failed persistence-record recovery must not leave machine-owned queue membership",
     );
     assert!(
         store

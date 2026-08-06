@@ -2500,34 +2500,6 @@ fn state_cells() -> Vec<StateCellEntry> {
             "completion registry is crate-private waiter plumbing; runtime surfaces expose only completion handles/outcomes and do not branch on waiter presence/count",
         ),
         state_entry!(
-            "meerkat-runtime/src/driver/ephemeral.rs",
-            "EphemeralRuntimeDriver.queue",
-            Subsystem::Runtime,
-            StateClass::DerivedProjection,
-            "MeerkatMachine admission queue lane",
-            Some(contract(
-                "MeerkatMachine admission queue entries",
-                "any ingress queue mutation or rollback/recovery rebuild",
-                StalenessPolicy::Forbidden,
-            )),
-            EntryStatus::Closed,
-            "physical queue is rebuilt from canonical ingress queue entries after every queue mutation, and persistent recovery now fails closed instead of shell-repairing projection drift",
-        ),
-        state_entry!(
-            "meerkat-runtime/src/driver/ephemeral.rs",
-            "EphemeralRuntimeDriver.steer_queue",
-            Subsystem::Runtime,
-            StateClass::DerivedProjection,
-            "MeerkatMachine admission steer lane",
-            Some(contract(
-                "MeerkatMachine admission steer entries",
-                "any ingress steer mutation or rollback/recovery rebuild",
-                StalenessPolicy::Forbidden,
-            )),
-            EntryStatus::Closed,
-            "physical steer queue is rebuilt from canonical ingress steer entries after every queue mutation, and persistent recovery now fails closed instead of shell-repairing projection drift",
-        ),
-        state_entry!(
             "meerkat-mcp/src/router.rs",
             "McpRouter.servers",
             Subsystem::Mcp,
@@ -3085,14 +3057,10 @@ fn semantic_operations() -> Vec<SemanticOperationEntry> {
             "ingest",
             BoundaryKind::TraitImpl,
             "MeerkatMachine",
-            &[
-                "RuntimeSessionEntry.driver",
-                "EphemeralRuntimeDriver.queue",
-                "EphemeralRuntimeDriver.steer_queue"
-            ],
+            &["RuntimeSessionEntry.driver"],
             "MeerkatMachine admission + input-lifecycle regions",
             &["accepted work is reflected in canonical ingress/input lifecycle truth"],
-            &["driver queues are projections of ingress truth"],
+            &["generated input lanes are the singular membership and ordering authority"],
             EntryStatus::Closed,
         ),
         semantic_operation_entry!(
@@ -4014,19 +3982,6 @@ fn coupling_invariants() -> Vec<CouplingInvariantEntry> {
             "live attachment publication is aligned with driver attachment/control transitions on stop/ensure paths",
             "MeerkatMachine attachment publication contract + RuntimeControlPlane transitions",
             "driver attachment semantics + ownership-ledger",
-            EntryStatus::Closed,
-        ),
-        invariant(
-            "runtime_queue_projection_alignment",
-            Subsystem::Runtime,
-            &[
-                "MeerkatMachine.admission.queue",
-                "EphemeralRuntimeDriver.queue",
-                "EphemeralRuntimeDriver.steer_queue",
-            ],
-            "physical driver queues are projections of canonical ingress lanes and ordering metadata",
-            "MeerkatMachine admission region",
-            "runtime ingress authority + driver boundary rebuild + ownership-ledger",
             EntryStatus::Closed,
         ),
         invariant(
