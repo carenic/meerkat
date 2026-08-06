@@ -1904,6 +1904,100 @@ fn unresolved_kickoff_member_ids(
         .collect()
 }
 
+fn normalize_submit_work_handling_mode_during_kickoff(
+    state: &mob_dsl::MobMachineState,
+    agent_identity: &AgentIdentity,
+    runtime_mode: crate::MobRuntimeMode,
+    requested: meerkat_core::types::HandlingMode,
+) -> meerkat_core::types::HandlingMode {
+    if runtime_mode != crate::MobRuntimeMode::AutonomousHost
+        || requested != meerkat_core::types::HandlingMode::Steer
+    {
+        return requested;
+    }
+
+    let identity = mob_dsl::AgentIdentity::from_domain(agent_identity);
+    if state.member_kickoff_pending.contains(&identity)
+        || state.member_kickoff_starting.contains(&identity)
+    {
+        // A machine-owned kickoff is startup work, not a caller turn that can
+        // safely consume transient Steer context. Preserve the caller input as
+        // the next durable conversation turn instead of attaching it to a
+        // kickoff that may already be inside its only model request.
+        meerkat_core::types::HandlingMode::Queue
+    } else {
+        requested
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn unresolved_autonomous_kickoff_queues_steer_without_affecting_other_modes() {
+    let identity = AgentIdentity::from("review:singleton");
+    let dsl_identity = mob_dsl::AgentIdentity::from_domain(&identity);
+    let mut state = mob_dsl::MobMachineState::default();
+
+    let normalized = |state: &mob_dsl::MobMachineState,
+                      runtime_mode: crate::MobRuntimeMode,
+                      requested: meerkat_core::types::HandlingMode| {
+        normalize_submit_work_handling_mode_during_kickoff(
+            state,
+            &identity,
+            runtime_mode,
+            requested,
+        )
+    };
+
+    state.member_kickoff_pending.insert(dsl_identity.clone());
+    assert_eq!(
+        normalized(
+            &state,
+            crate::MobRuntimeMode::AutonomousHost,
+            meerkat_core::types::HandlingMode::Steer
+        ),
+        meerkat_core::types::HandlingMode::Queue,
+    );
+    assert_eq!(
+        normalized(
+            &state,
+            crate::MobRuntimeMode::TurnDriven,
+            meerkat_core::types::HandlingMode::Steer
+        ),
+        meerkat_core::types::HandlingMode::Steer,
+    );
+    assert_eq!(
+        normalized(
+            &state,
+            crate::MobRuntimeMode::AutonomousHost,
+            meerkat_core::types::HandlingMode::Queue
+        ),
+        meerkat_core::types::HandlingMode::Queue,
+    );
+
+    state.member_kickoff_pending.remove(&dsl_identity);
+    state.member_kickoff_starting.insert(dsl_identity.clone());
+    assert_eq!(
+        normalized(
+            &state,
+            crate::MobRuntimeMode::AutonomousHost,
+            meerkat_core::types::HandlingMode::Steer
+        ),
+        meerkat_core::types::HandlingMode::Queue,
+    );
+
+    state.member_kickoff_starting.remove(&dsl_identity);
+    state.member_kickoff_callback_pending.insert(dsl_identity);
+    assert_eq!(
+        normalized(
+            &state,
+            crate::MobRuntimeMode::AutonomousHost,
+            meerkat_core::types::HandlingMode::Steer
+        ),
+        meerkat_core::types::HandlingMode::Steer,
+        "callback-pending is already a terminal kickoff boundary",
+    );
+}
+
 #[derive(Debug, Clone)]
 enum SubmitWorkIngressAuthority {
     Runtime {
@@ -44986,7 +45080,7 @@ impl MobActor {
             injected_context,
             mut interaction_id,
             objective_id,
-            handling_mode,
+            mut handling_mode,
             external_delivery_identity,
             turn_metadata,
             event_tx,
@@ -45119,6 +45213,23 @@ impl MobActor {
         } else {
             entry.fence_token
         };
+
+        let requested_handling_mode = handling_mode;
+        handling_mode = normalize_submit_work_handling_mode_during_kickoff(
+            self.dsl_authority.state(),
+            &domain_identity,
+            entry.runtime_mode,
+            handling_mode,
+        );
+        if handling_mode != requested_handling_mode {
+            tracing::debug!(
+                agent_identity = %agent_identity,
+                runtime_id = %entry.agent_runtime_id,
+                requested_handling_mode = ?requested_handling_mode,
+                execution_handling_mode = ?handling_mode,
+                "queued Steer behind unresolved machine-owned kickoff"
+            );
+        }
 
         if let Some(identity) = &external_delivery_identity {
             identity.validate()?;
