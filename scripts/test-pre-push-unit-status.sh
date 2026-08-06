@@ -20,14 +20,30 @@ set -euo pipefail
 
 args=" $* "
 if [[ "$args" == *" --test cold_restart_mob_resume "* ]]; then
-  lane="headcanonical-process-death"
+  if [[ "$args" == *" --no-run "* ]]; then
+    lane="headcanonical-build"
+  else
+    lane="headcanonical-process-death"
+  fi
 elif [[ "$args" == *" --lib "* ]]; then
-  lane="unit"
+  if [[ "$args" == *" --no-run "* ]]; then
+    lane="unit-build"
+  else
+    lane="unit"
+  fi
 elif [[ "$args" == *" --tests "* ]]; then
   [[ "$args" == *" -E kind(test) "* ]] || exit 98
-  lane="integration"
+  if [[ "$args" == *" --no-run "* ]]; then
+    lane="integration-build"
+  else
+    lane="integration"
+  fi
 elif [[ "$args" == *" --test e2e_fast_lane "* ]]; then
-  lane="e2e-fast"
+  if [[ "$args" == *" --no-run "* ]]; then
+    lane="e2e-fast-build"
+  else
+    lane="e2e-fast"
+  fi
 else
   exit 99
 fi
@@ -74,6 +90,7 @@ assert_failure_case() {
       MEERKAT_PRE_PUSH_NEXTEST_TIMEOUT_SECS=10 \
       MEERKAT_PRE_PUSH_UNIT_NEXTEST_TIMEOUT_SECS=10 \
       MEERKAT_PRE_PUSH_INTEGRATION_NEXTEST_TIMEOUT_SECS=10 \
+      MEERKAT_PRE_PUSH_BUILD_TIMEOUT_SECS=10 \
       MEERKAT_PRE_PUSH_TEST_LANE_LOG="$LANE_LOG" \
       MEERKAT_PRE_PUSH_TEST_FAIL_LANE="$fail_lane" \
       MEERKAT_PRE_PUSH_TEST_FAIL_STATUS="$fail_status" \
@@ -97,10 +114,12 @@ assert_failure_case() {
   fi
 }
 
-assert_failure_case unit 37 "unit"
-assert_failure_case integration 38 "unit integration"
-assert_failure_case headcanonical-process-death 39 "unit integration headcanonical-process-death"
-assert_failure_case e2e-fast 40 "unit integration headcanonical-process-death e2e-fast"
+assert_failure_case unit 37 "unit-build unit"
+assert_failure_case integration 38 "unit-build unit integration-build integration"
+assert_failure_case headcanonical-process-death 39 \
+  "unit-build unit integration-build integration headcanonical-build headcanonical-process-death"
+assert_failure_case e2e-fast 40 \
+  "unit-build unit integration-build integration headcanonical-build headcanonical-process-death e2e-fast-build e2e-fast"
 
 assert_timeout_case() {
   local timeout_lane="$1"
@@ -122,6 +141,7 @@ assert_timeout_case() {
       MEERKAT_PRE_PUSH_NEXTEST_TIMEOUT_SECS=1 \
       MEERKAT_PRE_PUSH_UNIT_NEXTEST_TIMEOUT_SECS=1 \
       MEERKAT_PRE_PUSH_INTEGRATION_NEXTEST_TIMEOUT_SECS=1 \
+      MEERKAT_PRE_PUSH_BUILD_TIMEOUT_SECS=1 \
       MEERKAT_PRE_PUSH_TEST_LANE_LOG="$LANE_LOG" \
       MEERKAT_PRE_PUSH_TEST_FAIL_LANE="" \
       MEERKAT_PRE_PUSH_TEST_FAIL_STATUS=99 \
@@ -153,12 +173,24 @@ assert_timeout_case() {
   fi
 }
 
-assert_timeout_case unit 1 0 "unit unit integration headcanonical-process-death e2e-fast" 1
-assert_timeout_case unit 2 124 "unit unit" 0
+assert_timeout_case unit 1 0 \
+  "unit-build unit unit integration-build integration headcanonical-build headcanonical-process-death e2e-fast-build e2e-fast" 1
+assert_timeout_case unit 2 124 "unit-build unit unit" 0
+assert_timeout_case unit-build 1 0 \
+  "unit-build unit-build unit integration-build integration headcanonical-build headcanonical-process-death e2e-fast-build e2e-fast" 1
+assert_timeout_case unit-build 2 124 "unit-build unit-build" 0
+assert_timeout_case integration-build 1 0 \
+  "unit-build unit integration-build integration-build integration headcanonical-build headcanonical-process-death e2e-fast-build e2e-fast" 1
+assert_timeout_case integration-build 2 124 \
+  "unit-build unit integration-build integration-build" 0
 assert_timeout_case headcanonical-process-death 1 0 \
-  "unit integration headcanonical-process-death headcanonical-process-death e2e-fast" 1
+  "unit-build unit integration-build integration headcanonical-build headcanonical-process-death headcanonical-process-death e2e-fast-build e2e-fast" 1
 assert_timeout_case headcanonical-process-death 2 124 \
-  "unit integration headcanonical-process-death headcanonical-process-death" 0
+  "unit-build unit integration-build integration headcanonical-build headcanonical-process-death headcanonical-process-death" 0
+assert_timeout_case headcanonical-build 1 0 \
+  "unit-build unit integration-build integration headcanonical-build headcanonical-build headcanonical-process-death e2e-fast-build e2e-fast" 1
+assert_timeout_case headcanonical-build 2 124 \
+  "unit-build unit integration-build integration headcanonical-build headcanonical-build" 0
 
 assert_preflight_rejection() {
   local label="$1"
@@ -175,6 +207,7 @@ assert_preflight_rejection() {
       MEERKAT_PRE_PUSH_NEXTEST_TIMEOUT_SECS=10 \
       MEERKAT_PRE_PUSH_UNIT_NEXTEST_TIMEOUT_SECS=10 \
       MEERKAT_PRE_PUSH_INTEGRATION_NEXTEST_TIMEOUT_SECS=10 \
+      MEERKAT_PRE_PUSH_BUILD_TIMEOUT_SECS=10 \
       MEERKAT_PRE_PUSH_TEST_LANE_LOG="$LANE_LOG" \
       MEERKAT_PRE_PUSH_TEST_FAIL_LANE="" \
       MEERKAT_PRE_PUSH_TEST_FAIL_STATUS=99 \
@@ -210,13 +243,15 @@ rm -rf "$TEST_ROOT/.git/meerkat-hook-cache"
     MEERKAT_PRE_PUSH_NEXTEST_TIMEOUT_SECS=10 \
     MEERKAT_PRE_PUSH_UNIT_NEXTEST_TIMEOUT_SECS=10 \
     MEERKAT_PRE_PUSH_INTEGRATION_NEXTEST_TIMEOUT_SECS=10 \
+    MEERKAT_PRE_PUSH_BUILD_TIMEOUT_SECS=10 \
     MEERKAT_PRE_PUSH_TEST_LANE_LOG="$LANE_LOG" \
     MEERKAT_PRE_PUSH_TEST_FAIL_LANE="" \
     MEERKAT_PRE_PUSH_TEST_FAIL_STATUS=99 \
     PRE_COMMIT_TO_REF="$test_head" \
     "$REPO_ROOT/scripts/pre-push-unit.sh"
 )
-if [[ "$(paste -sd ' ' "$LANE_LOG")" != "unit integration headcanonical-process-death e2e-fast" ]]; then
+if [[ "$(paste -sd ' ' "$LANE_LOG")" != \
+  "unit-build unit integration-build integration headcanonical-build headcanonical-process-death e2e-fast-build e2e-fast" ]]; then
   echo "successful pre-push lane order was '$(paste -sd ' ' "$LANE_LOG")'" >&2
   exit 1
 fi

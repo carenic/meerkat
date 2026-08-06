@@ -4,7 +4,8 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TEST_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/meerkat-pre-push-dispatch.XXXXXX")"
 HARNESS_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/meerkat-pre-push-dispatch-harness.XXXXXX")"
-trap 'rm -rf "$TEST_ROOT" "$HARNESS_ROOT"' EXIT
+CACHE_REPO="${TEST_ROOT}-cache"
+trap 'rm -rf "$TEST_ROOT" "$HARNESS_ROOT" "$CACHE_REPO"' EXIT
 
 git -C "$TEST_ROOT" init -q
 git -C "$TEST_ROOT" -c user.name=Meerkat -c user.email=meerkat@example.invalid \
@@ -49,6 +50,7 @@ run_dispatch() {
       GIT_WORK_TREE="$TEST_ROOT" \
       MEERKAT_DISPATCH_INVOCATION_LOG="$INVOCATION_LOG" \
       MEERKAT_DISPATCH_NESTED_INIT_ROOT="$NESTED_INIT_ROOT" \
+      MEERKAT_SKIP_PRE_PUSH_TREE_CACHE=1 \
       RUST_LANE_ID="" \
       "$REPO_ROOT/scripts/pre-push-dispatch.sh" origin example.invalid \
       <<<"$stdin_payload"
@@ -101,6 +103,46 @@ tag_object="$(git -C "$TEST_ROOT" -c user.name=Meerkat -c user.email=meerkat@exa
 run_dispatch "refs/tags/dispatch-test ${tag_object} refs/tags/dispatch-test 0000000000000000000000000000000000000000"
 assert_log_line "head=${head_sha}"
 assert_log_line "to=${head_sha}"
+
+# A successful exact-tree gate is reusable across ref names. This is the tag
+# release path: the hook still validates the pushed object and checked-out
+# HEAD, but does not recompute an identical tree after its branch push passed.
+mkdir -p "$CACHE_REPO"
+git -C "$CACHE_REPO" init -q
+git -C "$CACHE_REPO" -c user.name=Meerkat -c user.email=meerkat@example.invalid \
+  commit --allow-empty -qm "cache base"
+cache_base_sha="$(git -C "$CACHE_REPO" rev-parse HEAD)"
+git -C "$CACHE_REPO" -c user.name=Meerkat -c user.email=meerkat@example.invalid \
+  commit --allow-empty -qm "cache candidate"
+cache_head_sha="$(git -C "$CACHE_REPO" rev-parse HEAD)"
+cache_tag_object="$(git -C "$CACHE_REPO" -c user.name=Meerkat -c user.email=meerkat@example.invalid \
+  tag -a dispatch-cache-test -m dispatch-cache-test && git -C "$CACHE_REPO" rev-parse dispatch-cache-test)"
+
+run_cached_dispatch() {
+  local stdin_payload="$1"
+  (
+    cd "$CACHE_REPO"
+    PATH="${HARNESS_ROOT}:$PATH" \
+      GIT_DIR="${CACHE_REPO}/.git" \
+      GIT_WORK_TREE="$CACHE_REPO" \
+      MEERKAT_DISPATCH_INVOCATION_LOG="$INVOCATION_LOG" \
+      MEERKAT_DISPATCH_NESTED_INIT_ROOT="$NESTED_INIT_ROOT" \
+      RUST_LANE_ID="" \
+      "$REPO_ROOT/scripts/pre-push-dispatch.sh" origin example.invalid \
+      <<<"$stdin_payload"
+  )
+}
+
+: > "$INVOCATION_LOG"
+run_cached_dispatch "refs/heads/main ${cache_head_sha} refs/heads/main ${cache_base_sha}"
+assert_log_line "head=${cache_head_sha}"
+: > "$INVOCATION_LOG"
+run_cached_dispatch \
+  "refs/tags/dispatch-cache-test ${cache_tag_object} refs/tags/dispatch-cache-test 0000000000000000000000000000000000000000"
+if [[ -s "$INVOCATION_LOG" ]]; then
+  echo "dispatcher recomputed a previously validated exact tree for a tag push" >&2
+  exit 1
+fi
 
 assert_rejected_without_invocation() {
   local label="$1"

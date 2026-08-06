@@ -23,6 +23,8 @@ name: Cargo CI
 #   wasm-check      — wasm32 cargo check (every code change)
 #   wasm-contract   — wasm-pack browser contract test in headless Chrome;
 #                     only when wasm contract surfaces changed
+#   sdk-host        — Python + TypeScript SDK suites; only when SDK-relevant
+#                     paths changed
 #   sdk-web         — full Web SDK suite (wasm-pack + wasm-opt + node tests);
 #                     only when SDK-relevant paths changed
 #   audit           — cargo-deny security/license audit
@@ -551,6 +553,9 @@ jobs:
       - name: Verify SDK wrapper freshness
         run: make verify-sdk-wrapper-freshness
 
+      - name: Verify Rust release configuration
+        run: make check-rust-release-config
+
       - name: Verify generated machine kernels are not stale
         id: machine_drift
         shell: bash
@@ -757,6 +762,47 @@ jobs:
       - name: Web SDK build and tests
         run: make test-sdk-web
 
+  sdk-host:
+    name: Python + TypeScript SDK suites
+    needs: changes
+    if: ${{ needs.changes.outputs.sdk_changed == 'true' }}
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: sccache
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup Rust
+        uses: ./.github/actions/setup-rust-ci
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Setup Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: "22"
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.11
+
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ci-sdk-host
+
+      - name: Build RPC binary for SDK smoke tests
+        run: ./scripts/repo-cargo build -p meerkat-rpc
+
+      - name: Python + TypeScript SDK tests
+        run: make -j2 test-sdk-python test-sdk-typescript
+
   audit:
     name: Security audit
     needs: changes
@@ -792,6 +838,7 @@ jobs:
       - machine-verify
       - wasm-check
       - wasm-contract
+      - sdk-host
       - sdk-web
       - audit
     runs-on: ubuntu-latest
@@ -811,6 +858,7 @@ jobs:
             ${{ needs.machine-verify.result }}
             ${{ needs.wasm-check.result }}
             ${{ needs.wasm-contract.result }}
+            ${{ needs.sdk-host.result }}
             ${{ needs.sdk-web.result }}
             ${{ needs.audit.result }}
         run: |

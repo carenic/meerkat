@@ -113,6 +113,7 @@ fn cargo_workflow_covers_the_full_per_push_gate_set() {
             "int-rest",
             "machine-verify",
             "ratchets",
+            "sdk-host",
             "sdk-web",
             "unit",
             "wasm-check",

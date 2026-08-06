@@ -22956,7 +22956,6 @@ async fn test_build_resumed_agent_config_rejects_mismatched_session_identity() {
             },
             expected_session_id: &wrong_session_id,
             resumed_session: resumed,
-            system_prompt_intent: crate::build::ResumeSystemPromptIntent::PreservePersisted,
         })
         .await
         .expect_err("resume helper must validate the target session identity");

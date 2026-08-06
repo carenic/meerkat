@@ -10,14 +10,15 @@ ROOT="${ROOT:-$(cd "$(dirname "$0")/.." && pwd)}"
 CARGO="${CARGO:-$ROOT/scripts/repo-cargo}"
 GIT_BIN="${GIT_BIN:-git}"
 
-CACHE_VERSION="v6"
+CACHE_VERSION="v8"
 NEXTEST_TIMEOUT_SECS="${MEERKAT_PRE_PUSH_NEXTEST_TIMEOUT_SECS:-300}"
+BUILD_TIMEOUT_SECS="${MEERKAT_PRE_PUSH_BUILD_TIMEOUT_SECS:-${MEERKAT_PRE_PUSH_NARROW_BUILD_TIMEOUT_SECS:-900}}"
 # The unit lane includes a dense-topology stress test with its own 300-second
-# assertion budget, in addition to workspace test-binary compilation.
+# assertion budget. Compilation is a separate lane so linker time cannot spend
+# the test-runtime budget.
 UNIT_NEXTEST_TIMEOUT_SECS="${MEERKAT_PRE_PUSH_UNIT_NEXTEST_TIMEOUT_SECS:-900}"
 # The integration lane includes downstream compile-policy canaries and more
-# than 2,000 tests. Its timeout must cover both exact-tree linking and those
-# nested compiler checks.
+# than 2,000 tests. Exact-tree linking is likewise budgeted separately.
 INTEGRATION_NEXTEST_TIMEOUT_SECS="${MEERKAT_PRE_PUSH_INTEGRATION_NEXTEST_TIMEOUT_SECS:-900}"
 LOCK_WAIT_SECS="${MEERKAT_PRE_PUSH_UNIT_LOCK_WAIT_SECS:-180}"
 GIT_DIR_PATH="$("$GIT_BIN" rev-parse --git-common-dir)"
@@ -175,10 +176,19 @@ if [[ "${MEERKAT_SKIP_PRE_PUSH_UNIT_CACHE:-0}" != "1" && -f "$stamp_path" ]]; th
 fi
 
 retry_lane \
+  "workspace unit build" \
+  "$BUILD_TIMEOUT_SECS" \
+  "$CARGO" nextest run --workspace --lib --no-fail-fast --no-run
+retry_lane \
   "workspace unit lane" \
   "$UNIT_NEXTEST_TIMEOUT_SECS" \
   "$CARGO" nextest run --workspace --lib --no-fail-fast \
     --show-progress none --status-level none --final-status-level fail
+retry_lane \
+  "workspace integration build" \
+  "$BUILD_TIMEOUT_SECS" \
+  "$CARGO" nextest run --workspace --tests --profile fast --no-fail-fast \
+    --no-run -E 'kind(test)'
 retry_lane \
   "workspace integration lane" \
   "$INTEGRATION_NEXTEST_TIMEOUT_SECS" \
@@ -186,12 +196,23 @@ retry_lane \
     -E 'kind(test)' \
     --show-progress none --status-level none --final-status-level fail
 retry_lane \
+  "HeadCanonical process-death build" \
+  "$BUILD_TIMEOUT_SECS" \
+  "$CARGO" nextest run -p meerkat-mob --test cold_restart_mob_resume \
+    --features test-support --profile fast --no-tests=fail --no-run \
+    -E 'test(mob_cold_restart_resume_after_kill_between_commit_points)'
+retry_lane \
   "HeadCanonical process-death lane" \
   "$NEXTEST_TIMEOUT_SECS" \
   "$CARGO" nextest run -p meerkat-mob --test cold_restart_mob_resume \
     --features test-support --profile fast --no-tests=fail \
     --show-progress none --status-level none --final-status-level fail \
     -E 'test(mob_cold_restart_resume_after_kill_between_commit_points)'
+retry_lane \
+  "e2e-fast build" \
+  "$BUILD_TIMEOUT_SECS" \
+  "$CARGO" nextest run -p meerkat-integration-tests --test e2e_fast_lane \
+    --no-fail-fast --no-run
 retry_lane \
   "e2e-fast lane" \
   "$NEXTEST_TIMEOUT_SECS" \

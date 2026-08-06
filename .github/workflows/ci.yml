@@ -62,3 +62,51 @@ jobs:
             echo "::error::CI did not complete successfully."
             exit 1
           fi
+
+      - name: Checkout attested source tree
+        uses: actions/checkout@v6
+
+      - name: Build exact-tree CI attestation
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        id: attestation
+        shell: bash
+        env:
+          CARGO_RESULT: ${{ needs.cargo.result }}
+        run: |
+          set -euo pipefail
+          destination="${RUNNER_TEMP}/meerkat-ci-attestation"
+          mkdir -p "${destination}"
+          tree_sha="$(git rev-parse 'HEAD^{tree}')"
+          jq -n \
+            --arg repository "${GITHUB_REPOSITORY}" \
+            --arg commit_sha "${GITHUB_SHA}" \
+            --arg tree_sha "${tree_sha}" \
+            --arg workflow "${GITHUB_WORKFLOW}" \
+            --arg workflow_run_id "${GITHUB_RUN_ID}" \
+            --arg workflow_run_attempt "${GITHUB_RUN_ATTEMPT}" \
+            --arg event "${GITHUB_EVENT_NAME}" \
+            --arg ref "${GITHUB_REF}" \
+            --arg cargo_result "${CARGO_RESULT}" \
+            '{
+              schema_version: 1,
+              repository: $repository,
+              commit_sha: $commit_sha,
+              tree_sha: $tree_sha,
+              workflow: $workflow,
+              workflow_run_id: $workflow_run_id,
+              workflow_run_attempt: $workflow_run_attempt,
+              event: $event,
+              ref: $ref,
+              cargo_result: $cargo_result
+            }' > "${destination}/attestation.json"
+          echo "tree_sha=${tree_sha}"
+          echo "path=${destination}" >> "${GITHUB_OUTPUT}"
+
+      - name: Upload exact-tree CI attestation
+        if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+        uses: actions/upload-artifact@v7
+        with:
+          name: meerkat-ci-attestation-${{ github.sha }}-${{ github.run_attempt }}
+          path: ${{ steps.attestation.outputs.path }}/attestation.json
+          if-no-files-found: error
+          retention-days: 14
