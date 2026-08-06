@@ -22956,7 +22956,6 @@ async fn test_build_resumed_agent_config_rejects_mismatched_session_identity() {
             },
             expected_session_id: &wrong_session_id,
             resumed_session: resumed,
-            system_prompt_intent: crate::build::ResumeSystemPromptIntent::PreservePersisted,
         })
         .await
         .expect_err("resume helper must validate the target session identity");
@@ -23012,17 +23011,25 @@ async fn test_attach_existing_session_restores_persisted_inactive_session() {
         .await
         .expect("create mob");
 
-    let member_ref = handle
-        .attach_existing_session_as_member(
-            ProfileName::from("worker"),
-            AgentIdentity::from("w-resume"),
-            session_id.clone(),
-        )
+    let resume_prompt = "new build configuration, not durable resume input";
+    let mut resume_spec = SpawnMemberSpec::new("worker", "w-resume")
+        .with_resume_bridge_session_id(session_id.clone());
+    resume_spec.system_prompt_override = Some(SpawnSystemPromptOverride::Replace(
+        resume_prompt.to_string(),
+    ));
+    resume_spec.additional_instructions = Some(vec![
+        "process-local resume configuration must not be replayed".to_string(),
+    ]);
+    let spawned = handle
+        .spawn_spec(resume_spec)
         .await
         .expect("attach should restore persisted session");
 
     assert_eq!(
-        member_ref.bridge_session_id(),
+        handle
+            .resolve_bridge_session_id(&spawned.agent_identity)
+            .await
+            .as_ref(),
         Some(&session_id),
         "explicit member resume should preserve the requested session id"
     );
@@ -23038,6 +23045,21 @@ async fn test_attach_existing_session_restores_persisted_inactive_session() {
             .as_indexable_text()
             .contains("Persist this resume target.")),
         "explicit member resume should restore persisted history"
+    );
+    assert_eq!(
+        history
+            .messages
+            .iter()
+            .filter(|message| matches!(message, Message::System(system) if system.content == "Persisted resume prompt"))
+            .count(),
+        1,
+        "the persisted System row must remain the sole resume prompt authority",
+    );
+    assert!(
+        history.messages.iter().all(
+            |message| !matches!(message, Message::System(system) if system.content == resume_prompt)
+        ),
+        "resume build configuration must not append a new System row",
     );
 }
 

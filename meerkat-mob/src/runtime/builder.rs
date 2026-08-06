@@ -8874,7 +8874,6 @@ impl MobBuilder {
                         },
                         expected_session_id: &bridge_session_id,
                         resumed_session: stored_session,
-                        system_prompt_intent: build::ResumeSystemPromptIntent::PreservePersisted,
                     })
                     .await;
                 let mut resumed_config = match resumed_config {

@@ -131,13 +131,23 @@ embedding a separate runtime implementation.
 
 ## Release Workflow
 
-1. Validate the release candidate.
-2. Build platform binaries.
-3. Create the GitHub release and upload binary assets.
-4. Update the Homebrew tap formula.
-5. Publish Rust crates.
-6. Publish Python, TypeScript, and Web SDK packages.
-7. Run install smoke checks for at least one platform.
+1. Complete CI on the exact release commit and emit its tree-bound
+   attestation.
+2. Push the tag for that same commit; the tag gate consumes the attestation
+   instead of recomputing CI.
+3. Build platform binaries.
+4. Create the GitHub release and upload binary assets.
+5. Update the Homebrew tap formula.
+6. Publish Rust crates.
+7. Publish Python, TypeScript, and Web SDK packages.
+8. Run install smoke checks for at least one platform.
+
+The attestation binds the repository, commit SHA, Git tree SHA, CI workflow run
+and attempt, branch, event, and aggregate Cargo result. The release gate
+downloads it from the successful exact-main workflow run and verifies every
+field before any publish job starts. Manual recovery dispatches run the
+release-validation lane directly so releases older than the attestation
+retention window remain repairable.
 
 Manual release dispatch supports dry-run registry validation. Locally, use:
 

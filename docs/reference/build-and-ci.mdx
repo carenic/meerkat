@@ -80,15 +80,28 @@ runtime authority invariants.
 
 ## CI Shape
 
-GitHub Actions selects one backend for a run:
+GitHub Actions runs the Cargo lane for normal contributor and main-branch CI:
 
-- default Cargo lanes for normal contributors
-- owner-gated GCP BuildBuddy lanes when the secret-backed runner pool is
-  available
+- path-classified Cargo jobs cover formatting, lint, deterministic tests,
+  generated artifacts, SDK suites, and release configuration
+- the final gate emits a small attestation that binds the successful result to
+  the exact commit SHA, Git tree SHA, workflow run, and workflow attempt
+- attestations are emitted only for successful pushes to `main`
 
-The BuildBuddy workflow starts the control plane, scales executors up, submits
-the selected lanes, then scales executors down. The final CI gate checks the
-selected backend result.
+The tag release workflow consumes that exact-tree attestation instead of
+re-running the same validation suite. It still builds and publishes the
+platform-specific release artifacts from the attested source. Manual recovery
+dispatches retain the explicit release-validation lanes because old release
+commits may predate attestation artifacts.
+
+The repository pre-push dispatcher follows the same identity rule. A complete
+successful hook run writes a local Git-tree-keyed evidence stamp. A later push
+of the identical tree, including its release tag, validates the pushed object
+and checked-out `HEAD` identity and then reuses the complete gate result.
+
+BuildBuddy remains an opt-in developer and release-recovery backend. Its
+control-plane workflow starts the executor pool, submits the selected lanes,
+and scales the pool down when the work completes.
 
 ## Doctor
 

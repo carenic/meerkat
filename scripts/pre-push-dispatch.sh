@@ -13,6 +13,7 @@ REMOTE_NAME="$1"
 REMOTE_URL="$2"
 SOURCE_ROOT="$(git rev-parse --show-toplevel)"
 ZERO_SHA="0000000000000000000000000000000000000000"
+CACHE_VERSION="v1"
 
 # Git exports repository-local variables to hooks. They must not cross into the
 # detached validation worktree: nested git commands would otherwise continue
@@ -59,6 +60,20 @@ if [[ "$pushed_commit" != "$checked_out_commit" ]]; then
   exit 1
 fi
 
+pushed_tree="$(git -C "$SOURCE_ROOT" rev-parse "${pushed_commit}^{tree}")"
+git_common_dir="$(git -C "$SOURCE_ROOT" rev-parse --git-common-dir)"
+if [[ "$git_common_dir" != /* ]]; then
+  git_common_dir="${SOURCE_ROOT}/${git_common_dir}"
+fi
+hook_cache_dir="${git_common_dir}/meerkat-hook-cache/exact-tree"
+hook_stamp="${hook_cache_dir}/${CACHE_VERSION}-${pushed_tree}.ok"
+mkdir -p "$hook_cache_dir"
+
+if [[ "${MEERKAT_SKIP_PRE_PUSH_TREE_CACHE:-0}" != "1" && -f "$hook_stamp" ]]; then
+  echo "complete pre-push gate already validated for tree ${pushed_tree}; reusing exact-tree evidence."
+  exit 0
+fi
+
 validation_root="$(mktemp -d "${TMPDIR:-/tmp}/meerkat-pre-push-exact.XXXXXX")"
 validation_tree="${validation_root}/tree"
 cleanup() {
@@ -87,7 +102,11 @@ export RUST_LANE_ID="${RUST_LANE_ID:-pre-push}"
 cd "$validation_tree"
 if [[ "$remote_sha" == "$ZERO_SHA" ]]; then
   pre-commit run --config .pre-commit-config.yaml --hook-stage pre-push --all-files
-  exit $?
+else
+  pre-commit run --config .pre-commit-config.yaml --hook-stage pre-push \
+    --from-ref "$remote_sha" --to-ref "$pushed_commit"
 fi
-pre-commit run --config .pre-commit-config.yaml --hook-stage pre-push \
-  --from-ref "$remote_sha" --to-ref "$pushed_commit"
+
+stamp_tmp="${hook_stamp}.tmp.$$"
+printf 'tree=%s\ncommit=%s\n' "$pushed_tree" "$pushed_commit" > "$stamp_tmp"
+mv "$stamp_tmp" "$hook_stamp"
