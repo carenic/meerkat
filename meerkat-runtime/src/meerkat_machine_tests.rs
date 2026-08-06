@@ -3816,6 +3816,13 @@ async fn idle_explicit_steer_peer_request_runs_through_runtime_loop() {
                 Some(meerkat_core::types::HandlingMode::Queue),
                 "idle steer is an admission lane; fresh turn execution must be normalized for the session-service path"
             );
+            assert!(
+                primitive
+                    .model_projection_content_input()
+                    .text_content()
+                    .contains("Inspect this host and respond"),
+                "idle Steer normalization must retain its exact durable content in the model projection"
+            );
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(CoreApplyOutput::with_run_result(
                 RunBoundaryReceiptDraft {

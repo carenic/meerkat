@@ -418,7 +418,7 @@ impl MeerkatMachine {
                 tracing::debug!(
                     session_id = %session_id,
                     input_id = %input_id,
-                    "no active run is available for exact live-boundary context; retaining queued fallback"
+                    "no active run is available for exact live-boundary context; retaining same-boundary Steer batching for the fresh runtime turn"
                 );
                 return Ok((
                     held_mutation_gate,

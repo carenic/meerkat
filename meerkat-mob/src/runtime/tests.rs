@@ -43733,6 +43733,78 @@ async fn test_active_internal_submit_work_steer_falls_back_when_exact_boundary_i
 }
 
 #[tokio::test]
+async fn test_idle_internal_submit_work_steer_preserves_exact_content() {
+    let _serial = lock_real_comms_tests();
+    let (handle, service) =
+        create_test_mob_with_runtime_backed_real_comms(sample_definition()).await;
+    service.set_keep_alive_turns_complete_immediately(true);
+
+    let member_id = AgentIdentity::from("w-idle-internal-steer");
+    let session_id = handle
+        .spawn(ProfileName::from("lead"), member_id.clone(), None)
+        .await
+        .expect("spawn worker")
+        .bridge_session_id()
+        .expect("session-backed")
+        .clone();
+
+    handle
+        .wait_for_ready(Some(Duration::from_secs(2)))
+        .await
+        .expect("startup should settle");
+    handle
+        .wait_for_members_kickoff_complete(
+            std::slice::from_ref(&member_id),
+            Some(Duration::from_secs(2)),
+        )
+        .await
+        .expect("kickoff should resolve before idle steer");
+
+    let prompt_baseline = service.applied_runtime_prompts(&session_id).await.len();
+    let entry = handle
+        .get_member(&member_id)
+        .await
+        .expect("read member")
+        .expect("member exists");
+    let marker = "idle identity bridge steer must preserve this exact content";
+    handle
+        .submit_work_with_mode(
+            entry.agent_runtime_id,
+            entry.fence_token,
+            WorkRef::new(),
+            WorkSpec::new(marker, WorkOrigin::Internal),
+            HandlingMode::Steer,
+        )
+        .await
+        .expect("idle internal steer should be admitted");
+
+    let delivery = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let prompts = service.applied_runtime_prompts(&session_id).await;
+            if prompts
+                .iter()
+                .skip(prompt_baseline)
+                .any(|prompt| prompt.text_content().starts_with(marker))
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    assert!(
+        delivery.is_ok(),
+        "idle internal steer must reach the model with exact content; applied prompts: {:?}",
+        service.applied_runtime_prompts(&session_id).await
+    );
+
+    tokio::time::timeout(Duration::from_secs(2), handle.stop())
+        .await
+        .expect("stop timeout after idle internal steer assertion")
+        .expect("stop after idle internal steer assertion");
+}
+
+#[tokio::test]
 async fn internal_submit_work_carries_stable_delivery_identity_to_runtime_admission() {
     let _serial = lock_real_comms_tests();
     let (handle, service) =
