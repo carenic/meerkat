@@ -2687,8 +2687,9 @@ impl SpawnSource {
 /// Typed system-prompt composition override for a single spawn.
 ///
 /// `Replace` replaces the prompt sources used to compose this spawn's message;
-/// on resume that composed message is appended at the current transcript
-/// boundary and does not replace any earlier System message.
+/// resume rematerialization ignores this build-time field because the durable
+/// transcript is already authoritative. Use the typed System-context admission
+/// API when new ordered System input is intended after resume.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
