@@ -5210,6 +5210,8 @@ async fn process_queue(
             else {
                 return false;
             };
+            let fresh_steer_batch = prebound_run_id.is_none()
+                && batch.source() == crate::meerkat_machine::driver::RuntimeLoopBatchSource::Steer;
 
             // Dequeue the batch members from the physical queues. The physical
             // projection must exactly match the machine-selected batch; partial
@@ -5242,7 +5244,24 @@ async fn process_queue(
                 .map(|(staged_input_id, _)| staged_input_id.clone())
                 .collect::<Vec<_>>();
             let semantics =
-                crate::meerkat_machine::machine_batch_runtime_semantics(&d, &staged_ids);
+                crate::meerkat_machine::machine_batch_runtime_semantics(&d, &staged_ids).map(
+                    |mut semantics| {
+                        if fresh_steer_batch {
+                            // Steer is an admission lane, not the execution mode of
+                            // a fresh turn. Normalize the already authorized whole
+                            // same-boundary batch only for its run primitive. This
+                            // preserves batching and makes every durable input a
+                            // conversation append; an active prebound run still
+                            // projects Steer as transient request context.
+                            for semantics in &mut semantics {
+                                semantics.execution_handling_mode =
+                                    Some(meerkat_core::types::HandlingMode::Queue);
+                                semantics.live_interrupt_required = false;
+                            }
+                        }
+                        semantics
+                    },
+                );
             let projections =
                 crate::meerkat_machine::machine_batch_primitive_projections(&d, &staged_inputs);
             let primitive = match (semantics, projections) {
