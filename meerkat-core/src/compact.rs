@@ -76,6 +76,10 @@ pub struct CompactionContext {
 pub struct ProviderRequestPressure {
     pub encoded_bytes: u64,
     pub max_bytes: Option<u64>,
+    /// Exact provider-issued input-token count for this fully lowered request,
+    /// when the provider exposes a synchronous counting API before dispatch.
+    /// Byte measurement alone must never populate this field.
+    pub provider_issued_input_tokens: Option<u64>,
 }
 
 impl ProviderRequestPressure {
@@ -83,7 +87,14 @@ impl ProviderRequestPressure {
         Self {
             encoded_bytes,
             max_bytes,
+            provider_issued_input_tokens: None,
         }
+    }
+
+    /// Attach an exact provider-issued input-token count.
+    pub fn with_provider_issued_input_tokens(mut self, input_tokens: u64) -> Self {
+        self.provider_issued_input_tokens = Some(input_tokens);
+        self
     }
 
     /// Effective request-body cap after combining provider and host policy.
@@ -482,5 +493,14 @@ mod tests {
             ProviderRequestPressure::new(1, Some(8_000_000)).effective_cap(None),
             Some(8_000_000)
         );
+    }
+
+    #[test]
+    fn byte_only_constructor_does_not_claim_provider_token_truth() {
+        let byte_only = ProviderRequestPressure::new(2_400, None);
+        assert_eq!(byte_only.provider_issued_input_tokens, None);
+
+        let counted = byte_only.with_provider_issued_input_tokens(731);
+        assert_eq!(counted.provider_issued_input_tokens, Some(731));
     }
 }

@@ -469,18 +469,21 @@ fn apply_resumed_session_metadata(
     config.provider_params = effective_identity.provider_params;
     config.auth_binding = effective_identity.auth_binding;
     config.max_tokens = Some(metadata.max_tokens);
-    config.override_builtins = metadata.tooling.builtins;
-    config.override_shell = metadata.tooling.shell;
-    config.override_memory = metadata.tooling.memory;
-    config.override_schedule = metadata.tooling.schedule;
-    config.override_workgraph = metadata.tooling.workgraph;
-    config.override_image_generation = metadata.tooling.image_generation;
-    if matches!(
-        config.override_mob,
-        meerkat_core::ToolCategoryOverride::Inherit
-    ) {
-        config.override_mob = metadata.tooling.mob;
-    }
+    config.override_builtins =
+        merge_resumed_tool_category(config.override_builtins, metadata.tooling.builtins);
+    config.override_shell =
+        merge_resumed_tool_category(config.override_shell, metadata.tooling.shell);
+    config.override_memory =
+        merge_resumed_tool_category(config.override_memory, metadata.tooling.memory);
+    config.override_schedule =
+        merge_resumed_tool_category(config.override_schedule, metadata.tooling.schedule);
+    config.override_workgraph =
+        merge_resumed_tool_category(config.override_workgraph, metadata.tooling.workgraph);
+    config.override_image_generation = merge_resumed_tool_category(
+        config.override_image_generation,
+        metadata.tooling.image_generation,
+    );
+    config.override_mob = merge_resumed_tool_category(config.override_mob, metadata.tooling.mob);
     config.preload_skills = metadata.tooling.active_skills.clone();
     // keep_alive is NOT restored from metadata — mob runtime owns it
     // (determined by runtime_mode == AutonomousHost). §1: one owner.
@@ -491,6 +494,17 @@ fn apply_resumed_session_metadata(
         config.peer_meta = Some(stamp_standard_mob_member_labels(peer_meta, &binding));
     }
     Ok(())
+}
+
+fn merge_resumed_tool_category(
+    current: meerkat_core::ToolCategoryOverride,
+    durable: meerkat_core::ToolCategoryOverride,
+) -> meerkat_core::ToolCategoryOverride {
+    if matches!(current, meerkat_core::ToolCategoryOverride::Inherit) {
+        durable
+    } else {
+        current
+    }
 }
 
 /// Resolve the exact LLM identity a mob resume will hand to AgentFactory.
@@ -1780,8 +1794,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_build_resumed_agent_config_preserves_persisted_schedule_and_workgraph_overrides()
-    {
+    async fn test_build_resumed_agent_config_prefers_explicit_current_schedule_and_workgraph() {
         let def = sample_definition();
         let mut lead = def.profiles[&ProfileName::from("lead")]
             .as_inline()
@@ -1817,13 +1830,13 @@ mod tests {
 
         assert_eq!(
             config.override_schedule,
-            meerkat_core::ToolCategoryOverride::Enable,
-            "resumed mob members must keep durable schedule exposure intent from metadata"
+            meerkat_core::ToolCategoryOverride::Disable,
+            "an explicit current schedule setting must override creation-time metadata"
         );
         assert_eq!(
             config.override_workgraph,
-            meerkat_core::ToolCategoryOverride::Enable,
-            "resumed mob members must keep durable WorkGraph exposure intent from metadata"
+            meerkat_core::ToolCategoryOverride::Disable,
+            "an explicit current WorkGraph setting must override creation-time metadata"
         );
     }
 
@@ -2867,6 +2880,13 @@ mod tests {
         config.provider_params = Some(fresh_params);
         config.resume_override_mask.model = true;
         config.resume_override_mask.provider = true;
+        config.override_builtins = meerkat_core::ToolCategoryOverride::Enable;
+        config.override_shell = meerkat_core::ToolCategoryOverride::Disable;
+        config.override_memory = meerkat_core::ToolCategoryOverride::Enable;
+        config.override_schedule = meerkat_core::ToolCategoryOverride::Enable;
+        config.override_workgraph = meerkat_core::ToolCategoryOverride::Enable;
+        config.override_image_generation = meerkat_core::ToolCategoryOverride::Enable;
+        config.override_mob = meerkat_core::ToolCategoryOverride::Enable;
 
         let durable_auth_binding = meerkat_core::AuthBindingRef {
             realm: meerkat_core::RealmId::parse("durable").unwrap(),
@@ -2874,7 +2894,7 @@ mod tests {
             profile: None,
             origin: meerkat_core::BindingOrigin::Configured,
         };
-        let metadata = SessionMetadata {
+        let mut metadata = SessionMetadata {
             schema_version: meerkat_core::SESSION_METADATA_SCHEMA_VERSION,
             model: "gpt-5.4".to_string(),
             max_tokens: 4096,
@@ -2893,6 +2913,13 @@ mod tests {
             auth_binding: Some(durable_auth_binding.clone()),
             mob_member_binding: None,
         };
+        metadata.tooling.builtins = meerkat_core::ToolCategoryOverride::Disable;
+        metadata.tooling.shell = meerkat_core::ToolCategoryOverride::Enable;
+        metadata.tooling.memory = meerkat_core::ToolCategoryOverride::Disable;
+        metadata.tooling.schedule = meerkat_core::ToolCategoryOverride::Disable;
+        metadata.tooling.workgraph = meerkat_core::ToolCategoryOverride::Disable;
+        metadata.tooling.image_generation = meerkat_core::ToolCategoryOverride::Disable;
+        metadata.tooling.mob = meerkat_core::ToolCategoryOverride::Disable;
 
         apply_resumed_session_metadata(&mut config, &metadata).expect("metadata applies");
 
@@ -2915,6 +2942,27 @@ mod tests {
             Some(&durable_auth_binding),
             "an omitted current binding restores the durable configured binding"
         );
+        assert_eq!(
+            (
+                config.override_builtins,
+                config.override_shell,
+                config.override_memory,
+                config.override_schedule,
+                config.override_workgraph,
+                config.override_image_generation,
+                config.override_mob,
+            ),
+            (
+                meerkat_core::ToolCategoryOverride::Enable,
+                meerkat_core::ToolCategoryOverride::Disable,
+                meerkat_core::ToolCategoryOverride::Enable,
+                meerkat_core::ToolCategoryOverride::Enable,
+                meerkat_core::ToolCategoryOverride::Enable,
+                meerkat_core::ToolCategoryOverride::Enable,
+                meerkat_core::ToolCategoryOverride::Enable,
+            ),
+            "explicit current tooling must win over creation-time metadata"
+        );
 
         // Without the mask, durable metadata wins (existing behavior pinned).
         let mut config = AgentBuildConfig::new("claude-opus-4-8");
@@ -2922,6 +2970,27 @@ mod tests {
         apply_resumed_session_metadata(&mut config, &metadata).expect("metadata applies");
         assert_eq!(config.model, "gpt-5.4");
         assert_eq!(config.provider, Some(meerkat_core::Provider::OpenAI));
+        assert_eq!(
+            (
+                config.override_builtins,
+                config.override_shell,
+                config.override_memory,
+                config.override_schedule,
+                config.override_workgraph,
+                config.override_image_generation,
+                config.override_mob,
+            ),
+            (
+                meerkat_core::ToolCategoryOverride::Disable,
+                meerkat_core::ToolCategoryOverride::Enable,
+                meerkat_core::ToolCategoryOverride::Disable,
+                meerkat_core::ToolCategoryOverride::Disable,
+                meerkat_core::ToolCategoryOverride::Disable,
+                meerkat_core::ToolCategoryOverride::Disable,
+                meerkat_core::ToolCategoryOverride::Disable,
+            ),
+            "creation-time metadata must fill inherited current tooling"
+        );
 
         let explicit_auth_binding = meerkat_core::AuthBindingRef {
             realm: meerkat_core::RealmId::parse("updated").unwrap(),

@@ -698,6 +698,15 @@ impl meerkat_core::service::SessionServiceHistoryExt for FailingOnceSessionServi
 
 #[async_trait::async_trait]
 impl meerkat_mob::MobSessionService for FailingOnceSessionService {
+    async fn observe_session_resume_authority(
+        &self,
+        session_id: &meerkat_core::SessionId,
+    ) -> Result<meerkat_mob::SessionResumeAuthority, meerkat_core::service::SessionError> {
+        self.inner
+            .observe_session_resume_authority(session_id)
+            .await
+    }
+
     async fn prepare_session_for_resume(
         &self,
         session_id: &meerkat_core::SessionId,

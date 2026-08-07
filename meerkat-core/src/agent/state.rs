@@ -91,6 +91,14 @@ struct LlmRetryRequest<'a> {
     durable_visibility_parent: &'a mut Option<crate::SessionToolVisibilityState>,
 }
 
+enum LlmRetryOutcome {
+    Completed(LlmStreamResult),
+    /// A fallback target tightened request limits and the ordinary compaction
+    /// path committed a rewrite. The caller must rebuild every request-owned
+    /// projection from the new canonical session before dispatch.
+    RepollAfterCompaction,
+}
+
 type AppliedModelFallbackSwitch = (
     Arc<[Arc<ToolDef>]>,
     Option<ProviderParamsOverride>,
@@ -1358,7 +1366,7 @@ where
     async fn call_llm_with_retry(
         &mut self,
         request: LlmRetryRequest<'_>,
-    ) -> Result<LlmStreamResult, AgentError> {
+    ) -> Result<LlmRetryOutcome, AgentError> {
         let LlmRetryRequest {
             run_id,
             turn_count,
@@ -1401,24 +1409,64 @@ where
 
             if fallback_request_pressure_recheck {
                 fallback_request_pressure_recheck = false;
-                if let Some(pressure) = self.client.request_pressure(
+                let request_pressure = self.client.request_pressure(
                     &current_messages,
                     &current_tools,
                     current_max_tokens,
                     temperature,
                     current_provider_params.as_ref(),
-                )? {
+                )?;
+                let request_byte_error = request_pressure.and_then(|pressure| {
                     let effective_cap = self
                         .compactor
                         .as_ref()
                         .and_then(|compactor| compactor.request_byte_cap(pressure))
                         .or(pressure.max_bytes);
                     if effective_cap.is_some_and(|max_bytes| pressure.encoded_bytes > max_bytes) {
-                        return Err(self.request_too_large_preflight_error(
+                        Some(self.request_too_large_preflight_error(
                             "request exceeds the newly activated fallback provider cap",
                             pressure.encoded_bytes,
                             effective_cap,
-                        ));
+                        ))
+                    } else {
+                        None
+                    }
+                });
+                let context_budget_error = self.context_budget_preflight_error(
+                    &current_messages,
+                    &current_tools,
+                    current_max_tokens,
+                    request_pressure,
+                )?;
+                let preflight_error = request_byte_error.or(context_budget_error);
+                if preflight_error.is_some() {
+                    // RetryRequested parked one ordinary machine-authorized
+                    // CheckCompaction boundary. Give that exact boundary the
+                    // newly activated fallback pressure once. If a configured
+                    // compactor commits a rewrite, the outer CallingLlm
+                    // boundary rebuilds all request projections from canonical
+                    // session state. A non-triggering or ineffective compactor
+                    // cannot loop: this flag is consumed before the attempt.
+                    if self.compactor.is_some() && self.pending_compaction_boundary_index.is_some()
+                    {
+                        let prior_completed_boundary =
+                            self.compaction_cadence.last_compaction_boundary_index;
+                        self.pending_compaction_request_pressure = request_pressure;
+                        let transition = TurnExecutionTransition {
+                            prev_phase: TurnPhase::CallingLlm,
+                            next_phase: TurnPhase::CallingLlm,
+                            effects: vec![TurnExecutionEffect::CheckCompaction],
+                        };
+                        self.execute_turn_effects(&transition, turn_count, event_tx)
+                            .await?;
+                        if self.compaction_cadence.last_compaction_boundary_index
+                            != prior_completed_boundary
+                        {
+                            return Ok(LlmRetryOutcome::RepollAfterCompaction);
+                        }
+                    }
+                    if let Some(error) = preflight_error {
+                        return Err(error);
                     }
                 }
             }
@@ -1560,7 +1608,7 @@ where
                         result.blocks(),
                     ) {
                         if allow_empty_success {
-                            return Ok(result);
+                            return Ok(LlmRetryOutcome::Completed(result));
                         }
                         let error = AgentError::llm_empty_response(self.client.provider().as_str());
                         // P0 Dogma Invariant 1: MeerkatMachine — not the shell —
@@ -1665,7 +1713,7 @@ where
                         }
                         return Err(error);
                     }
-                    return Ok(result);
+                    return Ok(LlmRetryOutcome::Completed(result));
                 }
                 Err(e) => {
                     // P0 Dogma Invariant 1: MeerkatMachine — not the shell —
@@ -4432,6 +4480,18 @@ where
                 .await?;
             return Err(error);
         }
+        // Give the machine-authorized compaction path the first opportunity to
+        // produce a fitting rewrite. Only the fully rebuilt request that would
+        // otherwise cross the provider boundary is classified against the
+        // active model's context authority.
+        if let Some(error) = self.context_budget_preflight_error(
+            &request_messages,
+            call_tool_defs,
+            prepared.effective_max_tokens,
+            request_pressure,
+        )? {
+            return self.complete_calling_llm_failure(ctx, &error).await;
+        }
         let result = match self
             .call_llm_with_retry(LlmRetryRequest {
                 run_id: ctx.run_id,
@@ -4452,11 +4512,28 @@ where
             })
             .await
         {
-            Ok(r) => r,
+            Ok(LlmRetryOutcome::Completed(result)) => result,
+            Ok(LlmRetryOutcome::RepollAfterCompaction) => {
+                return Ok(CallingLlmGate::Repoll);
+            }
             Err(e) => {
                 if e.requires_session_teardown() {
                     return Err(e);
                 }
+                if let Some(exceeded) = BudgetExceeded::from_agent_error(&e) {
+                    emit_phase_event!(self, ctx, budget_warning_event(exceeded));
+                    self.apply_turn_input(TurnExecutionInput::BudgetLimitExceeded {
+                        run_id: ctx.run_id.clone(),
+                        exceeded,
+                    })?;
+                    return Ok(CallingLlmGate::Done(
+                        self.build_result(ctx.turn_count, ctx.tool_call_count).await,
+                    ));
+                }
+                // Extraction runs after the main run has already completed.
+                // Its provider and validation failures belong to the typed
+                // ExtractionFailed result and must not retroactively replace
+                // the completed run terminal with RunFailed.
                 if prepared.in_extraction {
                     return Ok(CallingLlmGate::Done(
                         self.complete_extraction_failed(
@@ -4469,45 +4546,8 @@ where
                         .await,
                     ));
                 }
-                if let Some(exceeded) = BudgetExceeded::from_agent_error(&e) {
-                    emit_phase_event!(self, ctx, budget_warning_event(exceeded));
-                    self.apply_turn_input(TurnExecutionInput::BudgetLimitExceeded {
-                        run_id: ctx.run_id.clone(),
-                        exceeded,
-                    })?;
-                    return Ok(CallingLlmGate::Done(
-                        self.build_result(ctx.turn_count, ctx.tool_call_count).await,
-                    ));
-                }
                 if matches!(&e, AgentError::Llm { .. }) {
-                    // Recoverable LLM failures reaching this point have
-                    // exhausted retry authority; non-recoverable LLM
-                    // failures keep their typed LLM cause.
-                    let retry_failure = crate::retry::LlmRetryFailure::from_agent_error(&e);
-                    let failure = if retry_failure.is_some() {
-                        TurnFailureSource::llm_retry_exhausted(&e)
-                    } else {
-                        TurnFailureSource::from_agent_error(&e)
-                    };
-                    self.terminal_error_detail = Some(e.to_string());
-                    // Diagnostic fidelity is safe to retain only
-                    // when the generated cause remains LlmFailure.
-                    // Retry exhaustion is a different generated
-                    // cause and is intentionally reconstructed
-                    // from terminal truth by the runtime witness.
-                    if retry_failure.is_none() {
-                        self.terminal_error_metadata =
-                            crate::TurnErrorMetadata::from_agent_error(&e);
-                    }
-                    let transition = self.apply_turn_input(TurnExecutionInput::FatalFailure {
-                        run_id: ctx.run_id.clone(),
-                        failure,
-                    })?;
-                    self.execute_turn_effects(&transition, ctx.turn_count, ctx.event_tx)
-                        .await?;
-                    return Ok(CallingLlmGate::Done(
-                        self.build_result(ctx.turn_count, ctx.tool_call_count).await,
-                    ));
+                    return self.complete_calling_llm_failure(ctx, &e).await;
                 }
                 self.terminalize_fatal_error(ctx.run_id, ctx.turn_count, ctx.event_tx, &e)
                     .await?;
@@ -4515,6 +4555,124 @@ where
             }
         };
         Ok(CallingLlmGate::Continue(result))
+    }
+
+    /// Commit one typed LLM failure through the generated fatal transition and
+    /// return the machine-owned terminal result.
+    ///
+    /// Pre-dispatch refusals and post-dispatch retry exhaustion share this
+    /// path so a committed terminal can never escape as the raw LLM error that
+    /// preceded it.
+    async fn complete_calling_llm_failure(
+        &mut self,
+        ctx: &CallingLlmTurnCtx<'_>,
+        error: &AgentError,
+    ) -> Result<CallingLlmGate<LlmStreamResult>, AgentError> {
+        // Recoverable LLM failures reaching this point have exhausted retry
+        // authority; non-recoverable LLM failures keep their typed LLM cause.
+        let retry_failure = crate::retry::LlmRetryFailure::from_agent_error(error);
+        let failure = if retry_failure.is_some() {
+            TurnFailureSource::llm_retry_exhausted(error)
+        } else {
+            TurnFailureSource::from_agent_error(error)
+        };
+        self.terminal_error_detail = Some(error.to_string());
+        // Diagnostic fidelity is safe to retain only when the generated cause
+        // remains LlmFailure. Retry exhaustion is a different generated cause
+        // and is intentionally reconstructed from terminal truth.
+        if retry_failure.is_none() {
+            self.terminal_error_metadata = crate::TurnErrorMetadata::from_agent_error(error);
+        }
+        let transition = self.apply_turn_input(TurnExecutionInput::FatalFailure {
+            run_id: ctx.run_id.clone(),
+            failure,
+        })?;
+        self.execute_turn_effects(&transition, ctx.turn_count, ctx.event_tx)
+            .await?;
+        Ok(CallingLlmGate::Done(
+            self.build_result(ctx.turn_count, ctx.tool_call_count).await,
+        ))
+    }
+
+    /// Classify the fully hydrated request against the active model profile
+    /// before any provider dispatch.
+    ///
+    /// The effective model registry owns the context-window limit. Exact
+    /// provider-lowered bytes remain observational. Only an exact
+    /// provider-issued token count may authorize a typed pre-dispatch
+    /// `ContextExceeded` terminal; otherwise provider rejection remains the
+    /// authoritative typed failure.
+    fn context_budget_preflight_error(
+        &self,
+        messages: &[Message],
+        tools: &[Arc<ToolDef>],
+        max_output_tokens: u32,
+        provider_request_pressure: Option<crate::ProviderRequestPressure>,
+    ) -> Result<Option<AgentError>, AgentError> {
+        let Some(fact) = self.context_budget_fact_for_request(
+            messages,
+            tools,
+            max_output_tokens,
+            provider_request_pressure,
+        )?
+        else {
+            return Ok(None);
+        };
+        if !fact.requires_dispatch_refusal() {
+            return Ok(None);
+        }
+
+        let requested = u32::try_from(fact.estimated_total_tokens).unwrap_or(u32::MAX);
+        Ok(Some(AgentError::llm(
+            self.client.provider().as_str(),
+            LlmFailureReason::ContextExceeded {
+                max: fact.context_window_tokens,
+                requested,
+            },
+            format!(
+                "request requires {requested} provider-counted tokens but active model '{}' has a {}-token context window; provider dispatch was refused",
+                self.client.model(),
+                fact.context_window_tokens,
+            ),
+        )))
+    }
+
+    fn context_budget_fact_for_request(
+        &self,
+        messages: &[Message],
+        tools: &[Arc<ToolDef>],
+        max_output_tokens: u32,
+        provider_request_pressure: Option<crate::ProviderRequestPressure>,
+    ) -> Result<Option<crate::ContextBudgetFact>, AgentError> {
+        let Some(active_model_profile) = self.active_model_profile.as_ref() else {
+            return Ok(None);
+        };
+        let fact_result = match provider_request_pressure {
+            Some(pressure) => crate::context_budget_fact_for_provider_request(
+                messages,
+                tools,
+                max_output_tokens,
+                active_model_profile,
+                pressure,
+            ),
+            None => crate::context_budget_fact_for_messages(
+                messages,
+                tools,
+                max_output_tokens,
+                active_model_profile,
+            ),
+        };
+        match fact_result {
+            Ok(fact) => Ok(Some(fact)),
+            // Custom/self-hosted models may intentionally omit a declared
+            // window. The public fact API preserves this as a typed degraded
+            // observation for hosts; the runtime cannot invent a ceiling, so
+            // it leaves provider dispatch policy unchanged.
+            Err(crate::ContextBudgetFactError::ContextWindowUnavailable) => Ok(None),
+            Err(error) => Err(AgentError::InternalError(format!(
+                "failed to classify the active model request before dispatch: {error}"
+            ))),
+        }
     }
 
     fn request_too_large_preflight_error(
@@ -6067,6 +6225,8 @@ mod tests {
     struct HotSwapLimitRecordingClient {
         model: String,
         seen_max_tokens: Mutex<Vec<u32>>,
+        request_pressure_bytes: Option<u64>,
+        provider_issued_input_tokens: Option<u64>,
     }
 
     impl HotSwapLimitRecordingClient {
@@ -6074,6 +6234,26 @@ mod tests {
             Self {
                 model: model.to_string(),
                 seen_max_tokens: Mutex::new(Vec::new()),
+                request_pressure_bytes: None,
+                provider_issued_input_tokens: None,
+            }
+        }
+
+        fn with_request_pressure(model: &str, encoded_bytes: u64) -> Self {
+            Self {
+                model: model.to_string(),
+                seen_max_tokens: Mutex::new(Vec::new()),
+                request_pressure_bytes: Some(encoded_bytes),
+                provider_issued_input_tokens: None,
+            }
+        }
+
+        fn with_provider_issued_input_tokens(model: &str, input_tokens: u64) -> Self {
+            Self {
+                model: model.to_string(),
+                seen_max_tokens: Mutex::new(Vec::new()),
+                request_pressure_bytes: Some(1_024),
+                provider_issued_input_tokens: Some(input_tokens),
             }
         }
 
@@ -6386,6 +6566,23 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl AgentLlmClient for HotSwapLimitRecordingClient {
+        fn request_pressure(
+            &self,
+            _messages: &[Message],
+            _tools: &[Arc<ToolDef>],
+            _max_tokens: u32,
+            _temperature: Option<f32>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
+        ) -> Result<Option<crate::ProviderRequestPressure>, AgentError> {
+            Ok(self.request_pressure_bytes.map(|bytes| {
+                let pressure = crate::ProviderRequestPressure::new(bytes, None);
+                self.provider_issued_input_tokens
+                    .map_or(pressure, |tokens| {
+                        pressure.with_provider_issued_input_tokens(tokens)
+                    })
+            }))
+        }
+
         async fn stream_response(
             &self,
             _messages: &[Message],
@@ -15471,6 +15668,79 @@ mod tests {
             crate::ModelRegistry::from_config(&config, empty_catalog)
                 .expect("fallback activation test registry"),
         )
+    }
+
+    #[tokio::test]
+    async fn context_budget_preflight_terminalizes_before_provider_dispatch() {
+        let registry = fallback_activation_test_registry();
+        let client = Arc::new(
+            HotSwapLimitRecordingClient::with_provider_issued_input_tokens("primary", 130_000),
+        );
+        let mut agent = with_test_turn_state_handle_for_session(
+            AgentBuilder::new()
+                .model("primary")
+                .max_tokens_per_turn(8_192)
+                .with_effective_model_registry(Arc::clone(&registry)),
+            explicit_hot_swap_session("primary"),
+        )
+        .with_tool_visibility_owner(explicit_test_visibility_owner())
+        .build_standalone(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
+        .await;
+        agent.config.max_turns = Some(1);
+
+        let error = agent
+            .run("tiny".into())
+            .await
+            .expect_err("an over-capacity request must fail before provider dispatch");
+
+        assert!(
+            client.seen_max_tokens().is_empty(),
+            "the provider client must not observe an over-capacity request"
+        );
+        assert!(
+            matches!(error, AgentError::TerminalFailure { .. }),
+            "the generated turn authority should expose a committed terminal, got {error:?}"
+        );
+        let metadata = agent
+            .terminal_error_metadata
+            .as_ref()
+            .expect("typed context refusal must survive in terminal metadata");
+        assert!(matches!(
+            &metadata.reason,
+            Some(crate::event::AgentErrorReason::LlmContextExceeded {
+                max: 128_000,
+                requested,
+            }) if *requested > 128_000
+        ));
+    }
+
+    #[tokio::test]
+    async fn provider_lowered_forecast_does_not_refuse_dispatch() {
+        let registry = fallback_activation_test_registry();
+        // A large exact lowered-byte witness remains observational only. It
+        // cannot authorize refusal without an exact provider token count.
+        let client = Arc::new(HotSwapLimitRecordingClient::with_request_pressure(
+            "primary", 307_200,
+        ));
+        let mut agent = with_test_turn_state_handle_for_session(
+            AgentBuilder::new()
+                .model("primary")
+                .max_tokens_per_turn(8_192)
+                .with_effective_model_registry(Arc::clone(&registry)),
+            explicit_hot_swap_session("primary"),
+        )
+        .with_tool_visibility_owner(explicit_test_visibility_owner())
+        .build_standalone(client.clone(), Arc::new(NoTools), Arc::new(NoopStore))
+        .await;
+        agent.config.max_turns = Some(1);
+
+        let result = agent
+            .run("tiny".into())
+            .await
+            .expect("provider-body bytes alone must not refuse a healthy dispatch");
+
+        assert_eq!(result.text, "ok");
+        assert_eq!(client.seen_max_tokens(), vec![8_192]);
     }
 
     impl FallbackActivatingClient {

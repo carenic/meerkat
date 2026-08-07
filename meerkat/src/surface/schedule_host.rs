@@ -2216,7 +2216,10 @@ mod tests {
             async fn commit_schedule_write(
                 &self,
                 _write: meerkat_schedule::AuthorizedScheduleWrite,
-            ) -> Result<(), meerkat_schedule::ScheduleStoreError> {
+            ) -> Result<
+                meerkat_schedule::ScheduleTransitionCommit,
+                meerkat_schedule::ScheduleStoreError,
+            > {
                 Err(meerkat_schedule::ScheduleStoreError::Internal(
                     "synthetic store outage".to_string(),
                 ))
@@ -2247,7 +2250,10 @@ mod tests {
             async fn commit_occurrence_write(
                 &self,
                 _write: meerkat_schedule::AuthorizedOccurrenceWrite,
-            ) -> Result<(), meerkat_schedule::ScheduleStoreError> {
+            ) -> Result<
+                meerkat_schedule::OccurrenceTransitionCommit,
+                meerkat_schedule::ScheduleStoreError,
+            > {
                 Err(meerkat_schedule::ScheduleStoreError::Internal(
                     "synthetic store outage".to_string(),
                 ))
@@ -2256,7 +2262,10 @@ mod tests {
             async fn commit_occurrence_writes(
                 &self,
                 _writes: Vec<meerkat_schedule::AuthorizedOccurrenceWrite>,
-            ) -> Result<(), meerkat_schedule::ScheduleStoreError> {
+            ) -> Result<
+                Vec<meerkat_schedule::OccurrenceTransitionCommit>,
+                meerkat_schedule::ScheduleStoreError,
+            > {
                 Err(meerkat_schedule::ScheduleStoreError::Internal(
                     "synthetic store outage".to_string(),
                 ))
@@ -2266,8 +2275,10 @@ mod tests {
                 &self,
                 _schedule: meerkat_schedule::AuthorizedScheduleWrite,
                 _occurrences: Vec<meerkat_schedule::AuthorizedOccurrenceWrite>,
-            ) -> Result<meerkat_schedule::Schedule, meerkat_schedule::ScheduleStoreError>
-            {
+            ) -> Result<
+                meerkat_schedule::ScheduleMutationCommit,
+                meerkat_schedule::ScheduleStoreError,
+            > {
                 Err(meerkat_schedule::ScheduleStoreError::Internal(
                     "synthetic store outage".to_string(),
                 ))
@@ -2278,8 +2289,10 @@ mod tests {
                 _schedule: meerkat_schedule::AuthorizedScheduleWrite,
                 _occurrences: Vec<meerkat_schedule::AuthorizedOccurrenceWrite>,
                 _next_refill_at_utc: Option<chrono::DateTime<chrono::Utc>>,
-            ) -> Result<meerkat_schedule::Schedule, meerkat_schedule::ScheduleStoreError>
-            {
+            ) -> Result<
+                meerkat_schedule::ScheduleMutationCommit,
+                meerkat_schedule::ScheduleStoreError,
+            > {
                 Err(meerkat_schedule::ScheduleStoreError::Internal(
                     "synthetic store outage".to_string(),
                 ))
@@ -2310,15 +2323,6 @@ mod tests {
                 &self,
                 _filter: meerkat_schedule::OccurrenceFilter,
             ) -> Result<Vec<Occurrence>, meerkat_schedule::ScheduleStoreError> {
-                Err(meerkat_schedule::ScheduleStoreError::Internal(
-                    "synthetic store outage".to_string(),
-                ))
-            }
-
-            async fn append_receipt(
-                &self,
-                _receipt: meerkat_schedule::DeliveryReceipt,
-            ) -> Result<(), meerkat_schedule::ScheduleStoreError> {
                 Err(meerkat_schedule::ScheduleStoreError::Internal(
                     "synthetic store outage".to_string(),
                 ))
@@ -2363,7 +2367,7 @@ mod tests {
                 _expected_claim_token: Option<Uuid>,
                 _transition: meerkat_schedule::OccurrenceLifecycleInput,
             ) -> Result<
-                Option<(Occurrence, Vec<meerkat_schedule::OccurrenceLifecycleEffect>)>,
+                Option<meerkat_schedule::OccurrenceTransitionCommit>,
                 meerkat_schedule::ScheduleStoreError,
             > {
                 Err(meerkat_schedule::ScheduleStoreError::Internal(
@@ -2378,7 +2382,10 @@ mod tests {
                 _expected_claim_token: Option<Uuid>,
                 _transition: meerkat_schedule::OccurrenceLifecycleInput,
                 _runtime_outcome: Option<meerkat_schedule::RuntimeDeliveryOutcome>,
-            ) -> Result<Option<Occurrence>, meerkat_schedule::ScheduleStoreError> {
+            ) -> Result<
+                Option<meerkat_schedule::OccurrenceTransitionCommit>,
+                meerkat_schedule::ScheduleStoreError,
+            > {
                 Err(meerkat_schedule::ScheduleStoreError::Internal(
                     "synthetic store outage".to_string(),
                 ))

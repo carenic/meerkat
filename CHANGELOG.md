@@ -15,6 +15,18 @@ via cargo-semver-checks against the published baselines).
 
 ### Breaking
 
+- `IncrementalSessionStore` implementations must now implement
+  `cross_head_canonical_authority` and return the typed authority-crossing
+  result before HeadCanonical v1 data is used through the v2 write path.
+- `RuntimeSessionAuthorityOps` implementations must now provide one atomic
+  `load_session_resume_observation` over session authority, catalog state, and
+  the machine-lifecycle row.
+- Schedule stores now return trusted-backend transition commits from schedule
+  and occurrence mutations. Raw lifecycle-mutator destructors and
+  `ScheduleStore::append_receipt` have been removed, and claim, renewal,
+  mutation, and terminalization callers must consume the returned effects.
+- Removed the body-only Mob resume compatibility projection. Resume consumers
+  must retain and revalidate the owner-issued `SessionResumeVerdict` authority.
 - Removed `EphemeralRuntimeDriver::queue` and
   `EphemeralRuntimeDriver::steer_queue`. Runtime lane membership and ordering
   are now exposed only through the machine-owned `queue_lane` and
@@ -22,6 +34,24 @@ via cargo-semver-checks against the published baselines).
 
 ### Fixed
 
+- Mob restore, revival, host materialization, and reconciliation now consume
+  one authority-bracketed resume verdict. A body, catalog row, lifecycle row,
+  or runtime generation cannot be independently reclassified or swapped
+  between configuration and actor creation.
+- Schedule lifecycle outputs are retained through the durable store commit and
+  validated by services and drivers. Missing lease, dispatch, terminal,
+  supersession, and revision effects now fail closed instead of degrading to a
+  unit result or precommit projection.
+- SQLite session stores provide a transactional HeadCanonical v1-to-v2
+  crossing with exact source CAS verification, physical replay verification,
+  retry classification, rollback, and schema-v4 migration.
+- Context-budget forecasts are provenance-labeled observations whose ceiling
+  comes only from `ModelProfileWitness`; they do not control dispatch or invent
+  a universal token constant. Provider context rejection still terminalizes as
+  typed `ContextExceeded`, so admitted input cannot disappear silently.
+- JSONL index failures after a canonical save or delete no longer turn a
+  committed durable write into an apparent failure. The projection is marked
+  degraded, reads warn, and the doctor reports restart-visible divergence.
 - Runtime input execution no longer maintains mutable physical queue copies
   beside the generated `input_lane` authority. Authorized batches validate the
   exact machine-owned prefix and hydrate payloads from the ledger; staging is
@@ -41,14 +71,18 @@ via cargo-semver-checks against the published baselines).
 
 ### Known limitations
 
-- The stock MobKit console Steer lane can accept an input while stripping its
-  content, and a steer racing member retirement may be lost. Ordinary queued
-  MobHandle, flow, and application-chat delivery lanes are unaffected. This is
-  planned for the next paired release.
+- Peer-send `HandedOff` remains a volatile wake acknowledgement, not durable
+  delivery authority. Applications with consequential multi-hop routing must
+  retain the work decision in durable graph or application state and use peer
+  delivery only to reduce wake latency.
+- Exact predispatch context refusal requires an adapter-supplied exact token
+  count. Bundled adapters currently expose lowered-body evidence for
+  observation and rely on the provider's typed context rejection when no exact
+  synchronous count exists.
 
-Meerkat 0.8.19 should be paired with the matching MobKit release. The pair
-prevents configured prompts from being duplicated across automatic
-rematerialization and carries the cross-boot regression proof.
+Meerkat 0.8.21 should be paired with MobKit 0.8.15. The pair consumes the
+store-issued schedule and resume carriers directly and removes downstream
+reclassification of Meerkat lifecycle authority.
 
 ## [0.8.15] - 2026-08-03
 

@@ -145,9 +145,9 @@ fn healthy_sqlite_realm_is_clean_and_exits_zero() {
     assert!(
         domains
             .iter()
-            .any(|pair| pair[0] == "session-store" && pair[1] == 3),
-        "session-store domain must be ledger-stamped at v3 (v3 adds the first \
-         published authenticated head sidecars): {domains:?}"
+            .any(|pair| pair[0] == "session-store" && pair[1] == 4),
+        "session-store domain must be ledger-stamped at v4 (v4 completes the \
+         supported HeadCanonical v1-to-v2 authority crossing): {domains:?}"
     );
     let errors: Vec<_> = report["findings"]
         .as_array()

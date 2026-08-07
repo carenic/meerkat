@@ -353,6 +353,11 @@ fn defer_turn_events_until_machine_completion(
 
 pub struct ProvisionMemberRequest {
     pub create_session: CreateSessionRequest,
+    /// Exact owner-issued resume body and authority used to derive this
+    /// request's body-dependent configuration. Resume callers carry this
+    /// receipt into provisioning so the provisioner never pairs a newly read
+    /// transcript with metadata derived from an earlier snapshot.
+    pub(crate) authorized_resume: Option<super::session_service::AuthorizedSessionResume>,
     /// Whether provisioning created a new durable session or is temporarily
     /// attaching an existing one. Cancellation only quiesces the exact live
     /// incarnation; durable session lifecycle changes require an explicit
@@ -383,6 +388,210 @@ pub enum ProvisionSessionOrigin {
     Fresh,
     ResumedDurable,
     RevivedRetired,
+}
+
+/// Typed cold-boot intent recovered from the provision request before any
+/// actor or runtime attachment is prepared.
+///
+/// `ProvisionSessionOrigin` also appears on the eventual receipt, where
+/// `RevivedRetired` is an outcome. Keeping this private request-side type
+/// prevents that outcome from being accepted as a new materialization input
+/// and retains the durable document's archived fact until the runtime machine
+/// can authorize the exact revival route.
+#[cfg(feature = "runtime-adapter")]
+#[derive(Debug, Clone, PartialEq)]
+enum RequestedSessionMaterialization {
+    Fresh,
+    Resume {
+        materialization: super::session_service::SessionResumeMaterialization,
+        authority: super::session_service::SessionResumeAuthority,
+    },
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl RequestedSessionMaterialization {
+    fn actor_route(&self) -> super::session_service::SessionActorMaterializationRoute {
+        match self {
+            Self::Fresh => super::session_service::SessionActorMaterializationRoute::Fresh,
+            Self::Resume { .. } => super::session_service::SessionActorMaterializationRoute::Resume,
+        }
+    }
+
+    fn requires_machine_revival(&self) -> bool {
+        matches!(
+            self,
+            Self::Resume {
+                materialization: super::session_service::SessionResumeMaterialization::Revivable,
+                ..
+            }
+        )
+    }
+
+    fn authorize_revival(
+        &self,
+        authorization: meerkat_runtime::ArchivedSessionActorMaterializationAuthorization,
+    ) -> Result<super::session_service::SessionActorMaterializationRoute, MobError> {
+        match self {
+            Self::Resume {
+                materialization: super::session_service::SessionResumeMaterialization::Revivable,
+                ..
+            } => Ok(
+                super::session_service::SessionActorMaterializationRoute::Revivable {
+                    authorization,
+                },
+            ),
+            Self::Resume {
+                materialization: super::session_service::SessionResumeMaterialization::Active,
+                ..
+            } => Err(MobError::Internal(
+                "runtime machine issued archived-resume authority for an active resume".to_string(),
+            )),
+            Self::Fresh => Err(MobError::Internal(
+                "runtime machine issued archived-resume authority for a fresh session".to_string(),
+            )),
+        }
+    }
+
+    fn is_resume(&self) -> bool {
+        matches!(self, Self::Resume { .. })
+    }
+
+    async fn revalidate_authority(
+        &self,
+        session_service: &Arc<dyn MobSessionService>,
+        session_id: &SessionId,
+    ) -> Result<(), MobError> {
+        let Self::Resume { authority, .. } = self else {
+            return Ok(());
+        };
+        session_service
+            .revalidate_session_resume_authority(session_id, authority)
+            .await
+            .map_err(MobError::SessionError)?
+            .map_err(super::session_service::SessionResumeRejection::into_mob_error)
+    }
+
+    async fn revalidate_authority_after_machine_prepare(
+        &self,
+        session_service: &Arc<dyn MobSessionService>,
+        session_id: &SessionId,
+        prepared: &PreparedSessionMaterialization,
+    ) -> Result<(), MobError> {
+        let Self::Resume { authority, .. } = self else {
+            return Ok(());
+        };
+        let current = session_service
+            .observe_session_resume_authority(session_id)
+            .await
+            .map_err(MobError::SessionError)?;
+        if &current == authority
+            || authorized_machine_prepare_lifecycle_transition(authority, &current, prepared).await
+        {
+            return Ok(());
+        }
+        let super::session_service::SessionResumeVerdict::Rejected(rejection) =
+            super::session_service::SessionResumeVerdict::authority_changed_during_materialization(
+                session_id, current,
+            )
+        else {
+            unreachable!("authority-change constructor always rejects")
+        };
+        Err(rejection.into_mob_error())
+    }
+}
+
+#[cfg(feature = "runtime-adapter")]
+fn same_physical_session_catalog(
+    expected: &meerkat_runtime::store::RuntimeSessionCatalogEntry,
+    current: &meerkat_runtime::store::RuntimeSessionCatalogEntry,
+) -> bool {
+    expected.session_id() == current.session_id()
+        && expected.persistence_profile() == current.persistence_profile()
+        && expected.created_at() == current.created_at()
+        && expected.updated_at() == current.updated_at()
+        && expected.message_count() == current.message_count()
+        && expected.total_tokens() == current.total_tokens()
+        && expected.labels() == current.labels()
+        && expected.lifecycle_terminal() == current.lifecycle_terminal()
+}
+
+#[cfg(feature = "runtime-adapter")]
+async fn authorized_machine_prepare_lifecycle_transition(
+    expected: &super::session_service::SessionResumeAuthority,
+    current: &super::session_service::SessionResumeAuthority,
+    prepared: &PreparedSessionMaterialization,
+) -> bool {
+    let (Some(expected), Some(current)) =
+        (expected.observation.as_ref(), current.observation.as_ref())
+    else {
+        return false;
+    };
+    let prepared_epoch = prepared.bindings().epoch_id().to_string();
+    let expected_supervisor = match expected.lifecycle() {
+        meerkat_runtime::store::MachineLifecycleObservation::Missing => None,
+        meerkat_runtime::store::MachineLifecycleObservation::Decoded { record, .. }
+            if record.runtime_state() == Some(meerkat_runtime::RuntimeState::Retired) =>
+        {
+            if record.binding().agent_runtime_id().is_some()
+                || record.binding().fence_token().is_some()
+                || record.binding().runtime_generation().is_some()
+                || record
+                    .binding()
+                    .runtime_epoch_id()
+                    .is_some_and(|runtime_epoch_id| runtime_epoch_id != prepared_epoch)
+                || record.run().current_run_id().is_some()
+                || record.run().pre_run_phase().is_some()
+                || record.unregister_progress().is_some()
+            {
+                return false;
+            }
+            Some(record.supervisor_authority())
+        }
+        _ => return false,
+    };
+    let expected_runtime_state = expected_supervisor
+        .as_ref()
+        .map(|_| meerkat_runtime::RuntimeState::Retired);
+    if expected.session_authority() != current.session_authority() {
+        return false;
+    }
+    let (Some(expected_catalog), Some(current_catalog)) =
+        (expected.catalog_entry(), current.catalog_entry())
+    else {
+        return false;
+    };
+    if expected_catalog.runtime_state() != expected_runtime_state
+        || current_catalog.runtime_state() != Some(meerkat_runtime::RuntimeState::Idle)
+        || !same_physical_session_catalog(expected_catalog, current_catalog)
+    {
+        return false;
+    }
+    let meerkat_runtime::store::MachineLifecycleObservation::Decoded { record, .. } =
+        current.lifecycle()
+    else {
+        return false;
+    };
+    let binding_matches_prepared = record.binding().agent_runtime_id().is_none()
+        && record.binding().fence_token().is_none()
+        && record.binding().runtime_generation().is_none()
+        && record
+            .binding()
+            .runtime_epoch_id()
+            .is_none_or(|runtime_epoch_id| runtime_epoch_id == prepared_epoch)
+        && record.run().current_run_id().is_none()
+        && record.run().pre_run_phase().is_none()
+        && record.unregister_progress().is_none();
+    let supervisor_matches_source = match expected_supervisor {
+        Some(expected_supervisor) => record.supervisor_authority() == expected_supervisor,
+        None => matches!(
+            record.supervisor_authority(),
+            meerkat_runtime::store::SupervisorAuthoritySnapshot::UnboundNoReceipt
+        ),
+    };
+    record.runtime_state() == Some(meerkat_runtime::RuntimeState::Idle)
+        && binding_matches_prepared
+        && supervisor_matches_source
+        && prepared.owns_current_materialization_claim().await
 }
 
 /// ADJ-3: the `MaterializeMember` bridge budget. Member builds include
@@ -2131,18 +2340,18 @@ impl SessionBackend {
         if restore_retired {
             let restored = self
                 .session_service
-                .load_revivable_retired_session(session_id)
-                .await?
-                .ok_or_else(|| {
-                    MobError::Internal(format!(
-                        "revived session rollback did not restore retired session '{session_id}'"
-                    ))
-                })?;
-            if restored.lifecycle_terminal()
-                != Some(meerkat_core::session::SessionLifecycleTerminal::Archived)
-            {
+                .observe_session_resume_authority(session_id)
+                .await
+                .map_err(MobError::SessionError)?;
+            if !matches!(
+                restored.lifecycle(),
+                super::session_service::SessionResumeLifecycle::Archived {
+                    runtime_state: Some(meerkat_runtime::RuntimeState::Retired),
+                    ..
+                }
+            ) {
                 return Err(MobError::Internal(format!(
-                    "revived session rollback did not restore archived document '{session_id}'"
+                    "revived session rollback did not restore exact Archived+Retired authority for '{session_id}'"
                 )));
             }
 
@@ -3412,9 +3621,11 @@ async fn create_attached_session_actor_recovery_owned(
     let (result_tx, result_rx) = oneshot::channel();
     cleanup_spawner.spawn_detached(async move {
         let _boundary = boundary;
-        let create_result = session_service
-            .create_session_with_actor_witness_under_runtime_turn_boundary(
+        let create_result =
+            super::session_service::execute_session_actor_materialization_under_runtime_turn_boundary(
+                session_service.as_ref(),
                 req,
+                super::session_service::SessionActorMaterializationRoute::AttachedActorRecovery,
                 &actor_witness_slot,
             )
             .await;
@@ -3631,35 +3842,33 @@ impl PreparedServiceActorTransaction {
     /// caller disappears, the owned task finishes every possibly detached
     /// durable write before exact volatile cleanup. A completed durable create
     /// remains discoverable and may be explicitly resumed.
-    pub(super) async fn create_owned(
+    pub(super) async fn create_owned_with_route(
         self,
         req: meerkat_core::service::CreateSessionRequest,
-        archived_resume_authorization: Option<
-            meerkat_runtime::ArchivedSessionActorMaterializationAuthorization,
-        >,
+        route: super::session_service::SessionActorMaterializationRoute,
     ) -> Result<(meerkat_core::RunResult, Self), MobError> {
         let cleanup_spawner = self.cleanup_spawner.clone();
         let session_id = self.session_id.clone();
         let wait_session_id = session_id.clone();
         let (result_tx, result_rx) = oneshot::channel();
         cleanup_spawner.spawn_detached(async move {
-            let transaction = self;
-            let create_result = match archived_resume_authorization {
-                Some(authorization) => transaction
-                    .session_service
-                    .create_session_with_machine_archived_resume_authority_and_actor_witness_under_runtime_turn_boundary(
-                        req,
-                        authorization,
-                        transaction.actor_witness_slot(),
-                    )
-                    .await,
-                None => transaction
-                    .session_service
-                    .create_session_with_actor_witness_under_runtime_turn_boundary(
-                        req,
-                        transaction.actor_witness_slot(),
-                    )
-                    .await,
+            let mut transaction = self;
+            let revivable = route.is_revivable();
+            let create_result =
+                super::session_service::execute_session_actor_materialization_under_runtime_turn_boundary(
+                    transaction.session_service.as_ref(),
+                    req,
+                    route,
+                    transaction.actor_witness_slot(),
+                )
+                .await
+                .map_err(MobError::SessionError);
+            let create_result = match create_result {
+                Ok(result) if revivable => transaction
+                    .commit_revivable_session_lifecycle()
+                    .await
+                    .map(|()| result),
+                result => result,
             };
             match create_result {
                 Ok(result) => {
@@ -3680,13 +3889,17 @@ impl PreparedServiceActorTransaction {
                         }
                     }
                 }
-                Err(create_error) => {
+                Err(materialization_error) => {
+                    // This branch also covers a lifecycle-commit failure
+                    // after actor creation succeeded. Do not return that
+                    // failure until the exact witnessed actor and Prepared+B
+                    // materialization have been cleaned up.
                     let cleanup = transaction.abort().await;
                     let error = match cleanup {
                         // Preserve the service's typed build failure once
                         // exact volatile cleanup is proven. Callers can then
                         // project the class without parsing display text.
-                        Ok(()) => MobError::SessionError(create_error),
+                        Ok(()) => materialization_error,
                         Err(cleanup_error) => {
                             // Build diagnostics may contain host-local command
                             // stderr or backend detail. Keep both diagnostics
@@ -3694,12 +3907,12 @@ impl PreparedServiceActorTransaction {
                             // sanitized uncertainty message.
                             tracing::error!(
                                 %session_id,
-                                build_detail = %create_error,
+                                materialization_detail = %materialization_error,
                                 cleanup_detail = %cleanup_error,
-                                "actor create and exact materialization cleanup both failed"
+                                "actor materialization and exact cleanup both failed"
                             );
                             MobError::Internal(
-                                "agent build failed and exact actor/materialization cleanup also failed; inspect host logs"
+                                "actor materialization failed and exact actor/materialization cleanup also failed; inspect host logs"
                                     .to_string(),
                             )
                         }
@@ -3713,6 +3926,44 @@ impl PreparedServiceActorTransaction {
                 "owned actor create for '{wait_session_id}' ended without a result: {error}"
             ))
         })?
+    }
+
+    /// Commit the lifecycle half of a typed Revivable materialization while
+    /// this transaction still owns Prepared+B. Actor creation alone is not a
+    /// completed restore: the session owner must certify the exact shared
+    /// RuntimeStore authority and the runtime must cross Retired -> Idle
+    /// before generic attachment publication can proceed.
+    async fn commit_revivable_session_lifecycle(&mut self) -> Result<(), MobError> {
+        let commit_lease = self
+            .prepared_mut()?
+            .acquire_archived_resume_commit_lease()
+            .await
+            .map_err(|error| {
+                MobError::Internal(format!(
+                    "failed to acquire exact archived-resume commit lease for '{}': {error}",
+                    self.session_id
+                ))
+            })?;
+        let mut authorized_lease = self
+            .session_service
+            .authorize_revivable_retired_session(&self.session_id, commit_lease)
+            .await
+            .map_err(|error| {
+                MobError::Internal(format!(
+                    "failed to authorize revived durable session '{}' against the shared RuntimeStore: {error}",
+                    self.session_id
+                ))
+            })?;
+        authorized_lease
+            .reset_retired_runtime()
+            .await
+            .map(|_| ())
+            .map_err(|error| {
+                MobError::Internal(format!(
+                    "failed to reset revived durable session '{}' to idle: {error}",
+                    self.session_id
+                ))
+            })
     }
 
     /// Run the complete local prepare -> attach -> operation publication in a
@@ -6520,21 +6771,72 @@ impl MobProvisioner for SessionBackend {
         // rollback capability to the owning PendingProvision.
         let backend = self;
         let mut session_origin = req.session_origin;
-        let archived_document_resume = session_origin == ProvisionSessionOrigin::ResumedDurable
-            && req
-                .create_session
-                .build
-                .as_ref()
-                .and_then(|build| build.resume_session.as_ref())
-                .map(|session| session.try_lifecycle_terminal())
-                .transpose()
-                .map_err(|error| {
-                    MobError::Internal(format!(
-                        "resumed durable session carries malformed lifecycle authority: {error}"
-                    ))
-                })?
-                .flatten()
-                .is_some_and(|terminal| terminal.is_archived());
+        let requested_materialization = match session_origin {
+            ProvisionSessionOrigin::Fresh => {
+                if req.authorized_resume.is_some() {
+                    return Err(MobError::Internal(
+                        "fresh provision carried durable resume authority".to_string(),
+                    ));
+                }
+                RequestedSessionMaterialization::Fresh
+            }
+            ProvisionSessionOrigin::RevivedRetired => {
+                return Err(MobError::Internal(
+                    "RevivedRetired is a provision outcome and cannot be supplied as a cold-boot materialization intent"
+                        .to_string(),
+                ));
+            }
+            ProvisionSessionOrigin::ResumedDurable => {
+                let resume_id = req
+                    .create_session
+                    .build
+                    .as_ref()
+                    .and_then(|build| build.resume_session.as_ref())
+                    .map(|session| session.id().clone())
+                    .ok_or_else(|| {
+                        MobError::Internal(
+                            "resumed durable provision omitted its resume session identity"
+                                .to_string(),
+                        )
+                    })?;
+                let authorized = match req.authorized_resume.take() {
+                    Some(authorized) => authorized,
+                    None => backend
+                        .session_service
+                        .materialize_session_resume_verdict(&resume_id)
+                        .await
+                        .map_err(MobError::SessionError)?
+                        .into_authorized()
+                        .map_err(super::session_service::SessionResumeRejection::into_mob_error)?,
+                };
+                if authorized.session.id() != &resume_id {
+                    return Err(MobError::Internal(format!(
+                        "resume authority for '{resume_id}' returned body for '{}'",
+                        authorized.session.id()
+                    )));
+                }
+                let super::session_service::AuthorizedSessionResume {
+                    authority,
+                    materialization,
+                    session,
+                    ..
+                } = authorized;
+                req.create_session
+                    .build
+                    .as_mut()
+                    .ok_or_else(|| {
+                        MobError::Internal(
+                            "resumed durable provision lost its build configuration".to_string(),
+                        )
+                    })?
+                    .resume_session = Some(*session);
+                RequestedSessionMaterialization::Resume {
+                    materialization,
+                    authority,
+                }
+            }
+        };
+        let mut actor_materialization_route = requested_materialization.actor_route();
         let missing_live_revival =
             req.runtime_revival_intent == RuntimeRevivalIntent::MissingLiveMaterialization;
         let local_materialization_mode = if missing_live_revival {
@@ -6564,8 +6866,6 @@ impl MobProvisioner for SessionBackend {
             Arc<RuntimeSessionState>,
         )> = None;
         let mut recovered_attached_state: Option<Arc<RuntimeSessionState>> = None;
-        let mut archived_resume_authorization = None;
-        let mut reviving_retired_session = false;
         let mut materialization_turn_boundary: Option<RuntimeTurnFinalizationBoundaryLease> = None;
         let actor_witness_slot = meerkat_session::LiveSessionActorWitnessSlot::default();
         let pre_registered_bridge_session_id = if let Some(adapter) = &backend.runtime_adapter {
@@ -6707,22 +7007,15 @@ impl MobProvisioner for SessionBackend {
                 );
                 let bindings = prepared.bindings_clone();
                 let ops_registry = Arc::clone(bindings.ops_lifecycle());
-                if session_origin == ProvisionSessionOrigin::ResumedDurable
-                    && (archived_document_resume
-                        || adapter
-                            .meerkat_machine_archive_snapshot(&member_bridge_session_id)
-                            .await
-                            .is_some_and(|snapshot| {
-                                snapshot.control.phase == meerkat_runtime::RuntimeState::Retired
-                            }))
-                {
-                    reviving_retired_session = true;
-                    archived_resume_authorization =
-                        Some(prepared.archived_resume_authorization().map_err(|error| {
+                if requested_materialization.requires_machine_revival() {
+                    let authorization =
+                        prepared.archived_resume_authorization().map_err(|error| {
                             MobError::Internal(format!(
                                 "prepare exact archived-resume authorization failed: {error}"
                             ))
-                        })?);
+                        })?;
+                    actor_materialization_route =
+                        requested_materialization.authorize_revival(authorization)?;
                 }
                 if let Some(ref mut build) = req.create_session.build {
                     build.runtime_build_mode =
@@ -6772,24 +7065,31 @@ impl MobProvisioner for SessionBackend {
             None
         };
         tracing::debug!("SessionBackend::provision_member creating bridge session");
-        let create_authorization = if reviving_retired_session {
-            Some(archived_resume_authorization.take().ok_or_else(|| {
-                MobError::Internal(
-                    "retired durable session revival lost its exact prepared authorization".into(),
-                )
-            })?)
-        } else {
-            None
-        };
+        if let Some(session_id) = admitted_bridge_session_id.as_ref() {
+            if let Some(transaction) = actor_transaction.as_ref() {
+                requested_materialization
+                    .revalidate_authority_after_machine_prepare(
+                        &backend.session_service,
+                        session_id,
+                        transaction.prepared()?,
+                    )
+                    .await?;
+            } else {
+                requested_materialization
+                    .revalidate_authority(&backend.session_service, session_id)
+                    .await?;
+            }
+        }
+        let reviving_retired_session = actor_materialization_route.is_revivable();
         let create_result: Result<meerkat_core::RunResult, MobError> = if let Some((
             prepared,
             state,
         )) =
             attached_actor_recovery.take()
         {
-            if create_authorization.is_some() {
+            if !requested_materialization.is_resume() {
                 Err(MobError::Internal(format!(
-                    "actor-only recovery for '{}' unexpectedly carried archived-resume authority",
+                    "actor-only recovery for '{}' was requested by a fresh materialization",
                     prepared.witness().session_id()
                 )))
             } else {
@@ -6814,7 +7114,7 @@ impl MobProvisioner for SessionBackend {
             }
         } else if let Some(transaction) = actor_transaction.take() {
             match transaction
-                .create_owned(req.create_session, create_authorization)
+                .create_owned_with_route(req.create_session, actor_materialization_route)
                 .await
             {
                 Ok((created, transaction)) => {
@@ -6823,7 +7123,7 @@ impl MobProvisioner for SessionBackend {
                 }
                 Err(error) => Err(error),
             }
-        } else if create_authorization.is_some() {
+        } else if reviving_retired_session {
             Err(MobError::Internal(
                 "retired durable session revival lost its actor transaction".into(),
             ))
@@ -6855,59 +7155,15 @@ impl MobProvisioner for SessionBackend {
             )));
         }
         let finalize_result = async {
-        // If no admission id was supplied, clean up stale local pre-registration
-        // defensively. Normal mob spawn paths now admit a concrete session id
-        // before provisioning starts.
-        if let (Some(adapter), Some(pre_id)) =
-            (&backend.runtime_adapter, &pre_registered_bridge_session_id)
-        {
+        // Runtime-backed paths retain the exact prepared materialization for
+        // the subsequent attachment transaction.
+        if pre_registered_bridge_session_id.is_some() {
             if reviving_retired_session {
-                // Explicit revival owns the only path across both absorbing
-                // lifecycle boundaries. Prove and promote the archived
-                // document while the runtime is still durably Retired, then
-                // reset Retired -> Idle before generic executor attachment.
-                // Retired must remain non-registrable on every ordinary
-                // ensure-session path.
-                let prepared = actor_transaction
-                    .as_ref()
-                    .ok_or_else(|| {
-                        MobError::Internal(format!(
-                            "revived session '{created_bridge_session_id}' lost its actor transaction before RuntimeStore authorization"
-                        ))
-                    })?
-                    .prepared()
-                    .map_err(|error| {
-                    MobError::Internal(format!(
-                        "revived session '{created_bridge_session_id}' lost its exact prepared materialization before RuntimeStore authorization: {error}"
-                    ))
-                })?;
-                let commit_lease = prepared
-                    .acquire_archived_resume_commit_lease()
-                    .await
-                    .map_err(|error| {
-                        MobError::Internal(format!(
-                            "failed to acquire exact archived-resume commit lease for '{created_bridge_session_id}': {error}"
-                        ))
-                    })?;
-                let mut authorized_lease = backend.session_service
-                    .authorize_revivable_retired_session(
-                        &created_bridge_session_id,
-                        commit_lease,
-                    )
-                    .await
-                    .map_err(|error| {
-                        MobError::Internal(format!(
-                            "failed to authorize revived durable session '{created_bridge_session_id}' against the shared RuntimeStore: {error}"
-                        ))
-                    })?;
-                authorized_lease
-                    .reset_retired_runtime()
-                    .await
-                    .map_err(|error| {
-                        MobError::Internal(format!(
-                            "failed to reset revived durable session '{created_bridge_session_id}' to idle: {error}"
-                        ))
-                    })?;
+                // The typed actor transaction has already crossed both
+                // machine-owned lifecycle boundaries while it retained
+                // Prepared+B. This assignment records that completed outcome
+                // for the provision receipt; it does not perform a second
+                // lifecycle mutation.
                 session_origin = ProvisionSessionOrigin::RevivedRetired;
             }
             tracing::debug!(
@@ -8625,6 +8881,7 @@ impl MobProvisioner for MultiBackendProvisioner {
                 self.session
                     .provision_member(ProvisionMemberRequest {
                         create_session: req.create_session,
+                        authorized_resume: None,
                         session_origin: req.session_origin,
                         binding: RuntimeBinding::Session,
                         peer_name: req.peer_name,

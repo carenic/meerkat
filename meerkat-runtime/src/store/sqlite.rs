@@ -32,15 +32,15 @@ mod inner {
         PreparedWholeBlobSnapshotCas, RecoveryCommitStatus, RecoveryInputSetRevision,
         RecoveryInputStateMutation, RuntimeDeliveryAuthorityCasOutcome,
         RuntimeDeliveryAuthorityRecord, RuntimeDeliveryStoreRecord, RuntimeSessionAuthority,
-        RuntimeSessionAuthorityReadCost, RuntimeSessionPersistenceProfile, RuntimeStore,
-        RuntimeStoreError, RuntimeStoreWriteFence, RuntimeStoreWriteFenceOutcome,
-        SerializedSessionSnapshot, WholeBlobProvisionalTailAuthority, WholeBlobSnapshotCasOutcome,
-        WholeBlobStoreAuthority, classify_machine_lifecycle_record,
-        complete_compaction_projection_intent, decoded_prepared_machine_lifecycle_replacement,
-        execute_runtime_store_write_fence, parsed_whole_blob_snapshot,
-        prepare_input_state_batch_cas, prepare_machine_lifecycle_replacement,
-        prepare_recovery_input_state_mutations, validate_input_state_batch_read_ids,
-        validate_machine_lifecycle_replacement,
+        RuntimeSessionAuthorityReadCost, RuntimeSessionPersistenceProfile,
+        RuntimeSessionResumeObservation, RuntimeStore, RuntimeStoreError, RuntimeStoreWriteFence,
+        RuntimeStoreWriteFenceOutcome, SerializedSessionSnapshot,
+        WholeBlobProvisionalTailAuthority, WholeBlobSnapshotCasOutcome, WholeBlobStoreAuthority,
+        classify_machine_lifecycle_record, complete_compaction_projection_intent,
+        decoded_prepared_machine_lifecycle_replacement, execute_runtime_store_write_fence,
+        parsed_whole_blob_snapshot, prepare_input_state_batch_cas,
+        prepare_machine_lifecycle_replacement, prepare_recovery_input_state_mutations,
+        validate_input_state_batch_read_ids, validate_machine_lifecycle_replacement,
     };
 
     const CREATE_RUNTIME_SCHEMA_SQL: &str = r"
@@ -11886,6 +11886,54 @@ ORDER BY runtime_id";
             .map_err(|error| RuntimeStoreError::Internal(format!("Task join failed: {error}")))?
         }
 
+        async fn load_session_resume_observation(
+            &self,
+            runtime_id: &LogicalRuntimeId,
+        ) -> Result<RuntimeSessionResumeObservation, RuntimeStoreError> {
+            let path = self.path.clone();
+            let runtime_id = runtime_id.clone();
+            let profile = self.session_persistence_profile;
+            tokio::task::spawn_blocking(move || {
+                let mut conn = open_runtime_connection(&path)?;
+                let tx = conn
+                    .transaction()
+                    .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+                let session_authority = match profile {
+                    RuntimeSessionPersistenceProfile::WholeBlobV1 => {
+                        load_whole_blob_store_authority(&tx, &runtime_id)?
+                            .map(RuntimeSessionAuthority::WholeBlob)
+                    }
+                    RuntimeSessionPersistenceProfile::HeadCanonicalV1 => {
+                        load_head_canonical_authority(&tx, &runtime_id)?
+                    }
+                };
+                let catalog_entry = load_runtime_session_catalog_entry_in_txn(&tx, &runtime_id)?;
+                let raw_lifecycle = tx
+                    .query_row(
+                        "SELECT runtime_state_json FROM runtime_states WHERE runtime_id = ?1",
+                        params![runtime_id_text(&runtime_id)],
+                        |row| Ok(row.get::<_, JsonColumnBytes>(0)?.into_bytes()),
+                    )
+                    .optional()
+                    .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+                let lifecycle = raw_lifecycle.as_deref().map_or(
+                    MachineLifecycleObservation::Missing,
+                    classify_machine_lifecycle_record,
+                );
+                let observation = RuntimeSessionResumeObservation::new(
+                    runtime_id,
+                    session_authority,
+                    catalog_entry,
+                    lifecycle,
+                );
+                tx.commit()
+                    .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+                Ok(observation)
+            })
+            .await
+            .map_err(|error| RuntimeStoreError::Internal(format!("Task join failed: {error}")))?
+        }
+
         async fn load_durable_tail_recovery_source(
             &self,
             runtime_id: &LogicalRuntimeId,
@@ -16051,6 +16099,59 @@ ORDER BY runtime_id";
             let mut session = Session::new();
             session.push(Message::User(UserMessage::text(content.to_string())));
             session
+        }
+
+        #[tokio::test]
+        async fn session_resume_observation_loads_all_fields_and_forwards() {
+            let (_dir, store) = temp_store();
+            let session = session_with_user("resume observation");
+            let runtime_id = LogicalRuntimeId::for_session(session.id());
+
+            let absent = RuntimeStore::load_session_resume_observation(&store, &runtime_id)
+                .await
+                .unwrap();
+            assert_eq!(absent.runtime_id(), &runtime_id);
+            assert!(absent.session_authority().is_none());
+            assert!(absent.catalog_entry().is_none());
+            assert_eq!(absent.lifecycle(), &MachineLifecycleObservation::Missing);
+
+            store
+                .commit_session_snapshot(
+                    &runtime_id,
+                    SerializedSessionSnapshot {
+                        session_snapshot: serde_json::to_vec(&session).unwrap().into(),
+                    },
+                )
+                .await
+                .unwrap();
+            store
+                .compare_and_swap_machine_lifecycle(
+                    &runtime_id,
+                    MachineLifecycleExpectedVersion::Missing,
+                    lifecycle_commit(&runtime_id, RuntimeState::Idle, 9, 7),
+                )
+                .await
+                .unwrap();
+
+            let forwarded = RuntimeStore::load_session_resume_observation(&store, &runtime_id)
+                .await
+                .unwrap();
+            let backend =
+                crate::store::RuntimeSessionAuthorityOps::load_session_resume_observation(
+                    &store,
+                    &runtime_id,
+                )
+                .await
+                .unwrap();
+            assert_eq!(forwarded, backend);
+            assert_eq!(forwarded.session_store_revision(), Some(1));
+            assert_eq!(
+                forwarded.catalog_entry().map(|entry| entry.session_id()),
+                Some(session.id())
+            );
+            assert!(forwarded.lifecycle_row_version().is_some());
+            assert_eq!(forwarded.runtime_generation(), Some(7));
+            assert_eq!(forwarded.runtime_epoch_id(), Some("epoch-7"));
         }
 
         fn input_state_with_idempotency_key(input_id: InputId, key: &str) -> StoredInputState {

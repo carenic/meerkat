@@ -1075,6 +1075,28 @@ impl meerkat_mob::MobSessionService for RpcMobSessionService {
         .await
     }
 
+    async fn observe_session_resume_authority(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_mob::SessionResumeAuthority, SessionError> {
+        <PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::observe_session_resume_authority(
+            &self.service,
+            session_id,
+        )
+        .await
+    }
+
+    async fn materialize_session_resume_verdict(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_mob::SessionResumeVerdict, SessionError> {
+        <PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::materialize_session_resume_verdict(
+            &self.service,
+            session_id,
+        )
+        .await
+    }
+
     async fn create_session_under_runtime_turn_boundary(
         &self,
         req: meerkat_core::service::CreateSessionRequest,

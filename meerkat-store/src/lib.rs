@@ -54,6 +54,9 @@ pub use migrate::{
 // Re-export the canonical trait, filter, and error from meerkat-core.
 // Custom storage backends depend only on meerkat-core; existing consumers
 // of meerkat-store see no change.
+pub use meerkat_core::session_store::{
+    HeadCanonicalAuthorityCrossing, VerifiedHeadCanonicalAuthority,
+};
 pub use meerkat_core::{
     IncrementalSessionStore, SessionFilter, SessionHead, SessionHeadCas, SessionStore,
     SessionStoreError, TranscriptStrandId, head_canonical_plain_save_guard, session_head_cas_token,

@@ -62,7 +62,8 @@ use meerkat_core::storage_diagnostics::{
 };
 use meerkat_core::{
     BlobId, ContentBlock, Message, REALM_MANIFEST_FILE_NAME, SESSION_TRANSCRIPT_HISTORY_STATE_KEY,
-    SystemNoticeBlock, sanitize_realm_id, validate_current_persisted_transcript_history_slice,
+    Session, SessionMeta, SystemNoticeBlock, sanitize_realm_id,
+    validate_current_persisted_transcript_history_slice,
 };
 use meerkat_sqlite::JsonColumnBytes;
 use rusqlite::{Connection, OptionalExtension};
@@ -158,6 +159,9 @@ pub const FINDING_HEAD_METADATA_SIDECAR: &str = "head-metadata-sidecar";
 /// footprint findings exclude them, so the report says *unknown* instead of
 /// implying the unmeasured bytes are healthy.
 pub const FINDING_STORAGE_CENSUS_UNMEASURED: &str = "storage-census-unmeasured";
+/// An existing JSONL session-index projection does not match the canonical
+/// per-session JSONL files from which it is rebuildable.
+pub const FINDING_JSONL_SESSION_INDEX_DIVERGED: &str = "jsonl-session-index-diverged";
 
 /// Cap on individually reported dangling blob references per database; the
 /// remainder is summarized in one finding so doctor stays usable on huge
@@ -811,7 +815,147 @@ fn diagnose_realm_dir(
         }
     }
 
+    diagnose_jsonl_session_index_projection(realm_dir, realm, backend, diagnosis);
+
     sweep_artifacts(realm_dir, realm, diagnosis);
+}
+
+/// Compare an existing JSONL metadata index with its canonical session files.
+///
+/// This is warning-only and read-only. An absent index is a normal lazy state:
+/// the first store open builds it, so there is no projection to diagnose yet.
+fn diagnose_jsonl_session_index_projection(
+    realm_dir: &Path,
+    realm: &str,
+    backend: Option<&str>,
+    diagnosis: &mut StorageDiagnosis,
+) {
+    if backend != Some("jsonl") {
+        return;
+    }
+    let jsonl_dir = realm_dir.join("sessions_jsonl");
+    let index_path = jsonl_dir.join("session_index.sqlite3");
+    if !index_path.is_file() {
+        return;
+    }
+
+    let mut authority_ids = HashSet::new();
+    let mut authority_meta = HashMap::new();
+    let mut authority_unreadable = 0usize;
+    match std::fs::read_dir(&jsonl_dir) {
+        Ok(entries) => {
+            for entry in entries {
+                let Ok(entry) = entry else {
+                    authority_unreadable = authority_unreadable.saturating_add(1);
+                    continue;
+                };
+                let path = entry.path();
+                if path.extension().and_then(|ext| ext.to_str()) != Some("jsonl") {
+                    continue;
+                }
+                let Some(id) = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .map(str::to_owned)
+                else {
+                    authority_unreadable = authority_unreadable.saturating_add(1);
+                    continue;
+                };
+                authority_ids.insert(id.clone());
+                let meta = std::fs::read(&path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Session>(&bytes).ok())
+                    .map(|session| SessionMeta::from(&session))
+                    .and_then(|meta| serde_json::to_value(meta).ok());
+                match meta {
+                    Some(meta) => {
+                        authority_meta.insert(id, meta);
+                    }
+                    None => authority_unreadable = authority_unreadable.saturating_add(1),
+                }
+            }
+        }
+        Err(_) => authority_unreadable = authority_unreadable.saturating_add(1),
+    }
+
+    let conn = match meerkat_sqlite::open(&index_path, meerkat_sqlite::ConnectionProfile::ReadOnly)
+    {
+        Ok(conn) => conn,
+        // `inspect_database` already reports the typed unreadable-database
+        // finding. Do not duplicate or upgrade it here.
+        Err(_) => return,
+    };
+    if let Ok(Some(version)) = meerkat_sqlite::domain_version(&conn, "jsonl-index")
+        && supported_domain_version("jsonl-index").is_some_and(|supported| version > supported)
+    {
+        // The schema-from-the-future finding owns this condition. An older
+        // doctor must not interpret a newer projection layout.
+        return;
+    }
+    if !matches!(table_exists(&conn, "session_index"), Ok(true)) {
+        return;
+    }
+
+    let rows = match crate::index::SqliteSessionIndex::read_all_meta_rows(&conn) {
+        Ok(rows) => rows,
+        Err(_) => return,
+    };
+    let projection_rows = rows.len();
+    let mut projection_ids = HashSet::new();
+    let mut projection_meta = HashMap::new();
+    let mut projection_unreadable = 0usize;
+    for (id, bytes) in rows {
+        projection_ids.insert(id.clone());
+        let meta = serde_json::from_slice::<SessionMeta>(&bytes)
+            .ok()
+            .and_then(|meta| serde_json::to_value(meta).ok());
+        match meta {
+            Some(meta) => {
+                projection_meta.insert(id, meta);
+            }
+            None => projection_unreadable = projection_unreadable.saturating_add(1),
+        }
+    }
+
+    let missing = authority_ids
+        .iter()
+        .filter(|id| !projection_ids.contains(*id))
+        .count();
+    let extra = projection_ids
+        .iter()
+        .filter(|id| !authority_ids.contains(*id))
+        .count();
+    let mismatched = authority_meta
+        .iter()
+        .filter(|(id, meta)| projection_meta.get(*id).is_some_and(|other| other != *meta))
+        .count();
+    if missing == 0
+        && extra == 0
+        && mismatched == 0
+        && authority_unreadable == 0
+        && projection_unreadable == 0
+    {
+        return;
+    }
+
+    diagnosis.findings.push(
+        StorageFinding::new(
+            FindingSeverity::Warning,
+            FINDING_JSONL_SESSION_INDEX_DIVERGED,
+            format!(
+                "JSONL session index projection differs from canonical session files: \
+                 authority=jsonl-session-file projection=jsonl-session-index lag=diverged \
+                 rebuildable=true authority_rows={} projection_rows={projection_rows} \
+                 missing={missing} extra={extra} mismatched={mismatched} \
+                 authority_unreadable={authority_unreadable} \
+                 projection_unreadable={projection_unreadable}; listing may serve stale metadata \
+                 until the index is rebuilt",
+                authority_ids.len(),
+            ),
+        )
+        .with_path(index_path)
+        .with_realm(realm),
+    );
 }
 
 fn table_exists(conn: &Connection, table: &str) -> Result<bool, rusqlite::Error> {
@@ -2683,7 +2827,7 @@ fn sweep_artifacts(realm_dir: &Path, realm: &str, diagnosis: &mut StorageDiagnos
 mod tests {
     use super::*;
     use meerkat_core::{
-        ImageData, Session, TranscriptRewriteReason, TranscriptRewriteSelection, UserMessage,
+        ImageData, TranscriptRewriteReason, TranscriptRewriteSelection, UserMessage,
     };
 
     fn write_manifest(realms_root: &Path, realm_id: &str, backend: &str) -> PathBuf {
@@ -2845,6 +2989,59 @@ mod tests {
 
     fn finding<'a>(diagnosis: &'a StorageDiagnosis, code: &str) -> Option<&'a StorageFinding> {
         diagnosis.findings.iter().find(|f| f.code == code)
+    }
+
+    #[cfg(feature = "jsonl")]
+    #[tokio::test]
+    async fn jsonl_projection_divergence_is_one_aggregate_warning() {
+        use crate::{JsonlStore, SessionStore};
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("realms");
+        let realm_dir = write_manifest(&root, "jsonl-diverged", "jsonl");
+        let jsonl_dir = realm_dir.join("sessions_jsonl");
+        let store = JsonlStore::new(jsonl_dir.clone());
+
+        let mut mismatched = Session::new();
+        let mismatched_id = mismatched.id().clone();
+        store.save(&mismatched).await.unwrap();
+        let extra = Session::new();
+        let extra_id = extra.id().clone();
+        store.save(&extra).await.unwrap();
+
+        let healthy = diagnose_disk_roots(&scope(&[&root])).await;
+        assert!(
+            finding(&healthy, FINDING_JSONL_SESSION_INDEX_DIVERGED).is_none(),
+            "matching authority and projection must not warn: {healthy:?}"
+        );
+
+        mismatched.push(Message::User(UserMessage::text("new canonical state")));
+        std::fs::write(
+            jsonl_dir.join(format!("{}.jsonl", mismatched_id.0)),
+            serde_json::to_vec(&mismatched).unwrap(),
+        )
+        .unwrap();
+        let missing = Session::new();
+        std::fs::write(
+            jsonl_dir.join(format!("{}.jsonl", missing.id().0)),
+            serde_json::to_vec(&missing).unwrap(),
+        )
+        .unwrap();
+        std::fs::remove_file(jsonl_dir.join(format!("{}.jsonl", extra_id.0))).unwrap();
+
+        let diagnosis = diagnose_disk_roots(&scope(&[&root])).await;
+        let findings: Vec<_> = diagnosis
+            .findings
+            .iter()
+            .filter(|item| item.code == FINDING_JSONL_SESSION_INDEX_DIVERGED)
+            .collect();
+        assert_eq!(findings.len(), 1, "{diagnosis:?}");
+        let projection = findings[0];
+        assert_eq!(projection.severity, FindingSeverity::Warning);
+        assert!(projection.message.contains("missing=1"));
+        assert!(projection.message.contains("extra=1"));
+        assert!(projection.message.contains("mismatched=1"));
+        assert!(projection.message.contains("rebuildable=true"));
     }
 
     #[tokio::test]

@@ -19,7 +19,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use meerkat_core::session_store::IncrementalSessionStore;
+use meerkat_core::session_store::{HeadCanonicalAuthorityCrossing, IncrementalSessionStore};
 use meerkat_core::{
     Message, Session, SessionFilter, SessionHead, SessionHeadCas, SessionId, SessionMeta,
     SessionStore, SessionStoreError, TranscriptRewriteCommit, TranscriptRewriteRecord,
@@ -304,6 +304,13 @@ impl SessionStore for DefaultRangeVerbIncrementalStore {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl IncrementalSessionStore for DefaultRangeVerbIncrementalStore {
+    async fn cross_head_canonical_authority(
+        &self,
+        id: &SessionId,
+    ) -> Result<HeadCanonicalAuthorityCrossing, SessionStoreError> {
+        self.inner_inc.cross_head_canonical_authority(id).await
+    }
+
     async fn append_messages(
         &self,
         id: &SessionId,

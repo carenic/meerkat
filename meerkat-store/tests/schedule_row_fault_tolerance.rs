@@ -21,8 +21,9 @@ use meerkat_core::{ContentInput, SessionId};
 use meerkat_schedule::{
     ClaimDueRequest, CreateScheduleRequest, IntervalTriggerSpec, MisfirePolicy,
     MissingTargetPolicy, Occurrence, OccurrenceOrdinal, OverlapPolicy, Schedule, ScheduleFilter,
-    ScheduleLifecycleInput, ScheduleService, ScheduleStore, ScheduleStoreRowFaultKind,
-    ScheduledSessionAction, SessionTargetBinding, TargetBinding, TriggerSpec,
+    ScheduleLifecycleInput, SchedulePhase, ScheduleService, ScheduleStore,
+    ScheduleStoreRowFaultKind, ScheduledSessionAction, SessionTargetBinding, TargetBinding,
+    TriggerSpec,
 };
 use meerkat_store::SqliteScheduleStore;
 use rusqlite::{Connection, params};
@@ -64,8 +65,8 @@ async fn commit_schedule(store: &SqliteScheduleStore, name: &str) -> Schedule {
         ScheduleLifecycleInput::Create(sample_schedule_request(name)),
     )
     .expect("schedule creation should pass generated authority");
-    let schedule = mutator.schedule.clone();
-    store
+    let schedule = mutator.schedule().clone();
+    let _commit = store
         .commit_schedule_write(mutator.into_authorized_write())
         .await
         .expect("commit schedule");
@@ -91,11 +92,14 @@ async fn commit_occurrence_at(
     let write = Occurrence::planned_write_from_schedule(schedule, ordinal, due_at_utc)
         .expect("occurrence planning should pass generated authority");
     let occurrence = write.occurrence().clone();
-    store
+    let commit = store
         .commit_occurrence_write(write)
         .await
         .expect("commit occurrence");
-    occurrence
+    assert_eq!(commit.successor(), &occurrence);
+    assert!(commit.effects().is_empty());
+    assert!(commit.supersession_acks().is_empty());
+    commit.successor().clone()
 }
 
 fn poison_row(path: &std::path::Path, table: &str, id_column: &str, json_column: &str, id: &str) {
@@ -133,7 +137,7 @@ async fn zero_limit_claim_is_a_true_noop() {
         })
         .await
         .expect("zero-limit claim");
-    assert!(result.claimed.is_empty());
+    assert!(result.transitions.is_empty());
     assert!(result.row_faults.is_empty());
     let unchanged = store
         .get_occurrence(&occurrence.occurrence_id)
@@ -147,8 +151,11 @@ async fn zero_limit_claim_is_a_true_noop() {
         .claim_due_occurrences(claim_request())
         .await
         .expect("later non-zero claim");
-    assert_eq!(claimed.claimed.len(), 1);
-    assert_eq!(claimed.claimed[0].occurrence_id, occurrence.occurrence_id);
+    assert_eq!(claimed.transitions.len(), 1);
+    assert_eq!(
+        claimed.transitions[0].occurrence_id,
+        occurrence.occurrence_id
+    );
 }
 
 #[tokio::test]
@@ -200,7 +207,7 @@ async fn poisoned_front_page_cannot_permanently_starve_later_due_work() {
         .claim_due_occurrences(request.clone())
         .await
         .expect("first bounded scan");
-    assert!(first.claimed.is_empty());
+    assert!(first.transitions.is_empty());
     assert_eq!(first.row_faults.len(), 64);
 
     let second = store
@@ -210,7 +217,7 @@ async fn poisoned_front_page_cannot_permanently_starve_later_due_work() {
     let healthy = healthy.expect("healthy tail occurrence");
     assert_eq!(
         second
-            .claimed
+            .transitions
             .iter()
             .map(|occurrence| occurrence.occurrence_id.clone())
             .collect::<Vec<_>>(),
@@ -243,7 +250,7 @@ async fn claim_scan_skips_poisoned_occurrence_row_and_claims_healthy_neighbor() 
         .expect("claim must not fail wholesale on a poisoned row");
     assert_eq!(
         result
-            .claimed
+            .transitions
             .iter()
             .map(|occurrence| occurrence.occurrence_id.clone())
             .collect::<Vec<_>>(),
@@ -387,7 +394,7 @@ async fn claim_scan_skips_occurrences_of_a_poisoned_schedule_row() {
         .expect("claim must not fail wholesale on a poisoned schedule row");
     assert_eq!(
         result
-            .claimed
+            .transitions
             .iter()
             .map(|occurrence| occurrence.occurrence_id.clone())
             .collect::<Vec<_>>(),
@@ -431,7 +438,7 @@ async fn claim_scan_never_deserializes_terminal_rows() {
         .expect("claim over terminal poison must succeed");
     assert_eq!(
         result
-            .claimed
+            .transitions
             .iter()
             .map(|occurrence| occurrence.occurrence_id.clone())
             .collect::<Vec<_>>(),
@@ -481,7 +488,7 @@ async fn claim_scan_never_deserializes_rows_of_non_active_schedules() {
         .expect("claim over a non-active poisoned schedule row must succeed");
     assert_eq!(
         result
-            .claimed
+            .transitions
             .iter()
             .map(|occurrence| occurrence.occurrence_id.clone())
             .collect::<Vec<_>>(),
@@ -513,10 +520,13 @@ async fn claim_misfire_store_write_failure_aborts_the_whole_claim() {
     )
     .expect("occurrence planning should pass generated authority");
     let misfired = write.occurrence().clone();
-    store
+    let commit = store
         .commit_occurrence_write(write)
         .await
         .expect("commit occurrence");
+    assert_eq!(commit.successor(), &misfired);
+    assert!(commit.effects().is_empty());
+    assert!(commit.supersession_acks().is_empty());
 
     {
         // Deterministic write-failure injection: receipts INSERTs abort.
@@ -619,11 +629,15 @@ async fn legacy_deleted_tombstone_with_planning_cursor_heals_on_read() {
         ScheduleLifecycleInput::Delete { at_utc: Utc::now() },
     )
     .expect("delete should pass generated authority");
-    let tombstone = deleted.schedule.clone();
-    store
+    let tombstone = deleted.schedule().clone();
+    let commit = store
         .commit_schedule_mutation(deleted.into_authorized_write(), Vec::new())
         .await
         .expect("commit tombstone");
+    let (schedule_commit, occurrence_commits) = commit.into_parts();
+    assert_eq!(schedule_commit.successor(), &tombstone);
+    assert_eq!(schedule_commit.successor().phase, SchedulePhase::Deleted);
+    assert!(occurrence_commits.is_empty());
 
     // Re-shape the persisted row into the legacy form: planning cursor
     // retained on BOTH the machine state and the projection.

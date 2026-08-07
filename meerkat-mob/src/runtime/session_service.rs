@@ -40,50 +40,510 @@ pub enum ResumeSessionLoad {
     Absent,
 }
 
-impl ResumeSessionLoad {
-    /// Why this read could not yield a resumable session, or `None` when it
-    /// did. Callers that own their own control flow (the restore/replacement
-    /// path) use this for a truthful message without changing behaviour.
+/// Owner-issued lifecycle fact carried by the operational resume pipeline.
+///
+/// `NoCurrentDurableAuthority` is intentionally weaker than `NeverPersisted`: the current
+/// session-store API proves only that no authoritative body is present at this
+/// read. Claiming historical non-existence requires a separate durable
+/// provenance fact that this boundary does not expose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SessionResumeLifecycle {
+    NoCurrentDurableAuthority,
+    ContradictoryDurableAuthority {
+        runtime_state: Option<meerkat_runtime::RuntimeState>,
+        occurrence_generation: Option<u64>,
+        head_revision: Option<u64>,
+    },
+    Archived {
+        revivable: bool,
+        runtime_state: Option<meerkat_runtime::RuntimeState>,
+        head_revision: Option<u64>,
+    },
+    Active {
+        /// `None` means the exact runtime lifecycle observation contains no
+        /// bound generation; it is never normalized to generation 0.
+        occurrence_generation: Option<u64>,
+        head_revision: Option<u64>,
+    },
+}
+
+/// Actor materialization selected by the owner-issued resume verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SessionResumeMaterialization {
+    Active,
+    Revivable,
+}
+
+/// Typed reason an operational resume could not produce a session body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResumeRejectionKind {
+    Absent,
+    ArchivedNotRevivable,
+    CommittedBoundaryUnprovable,
+    AuthorityChangedDuringMaterialization,
+    ContradictoryDurableAuthority,
+}
+
+/// Whether repeating the same durable observation can change the verdict.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ResumeVerdictTerminality {
+    StableParkable,
+    TransientRetryable,
+}
+
+/// Typed rejection issued by the session owner rather than reconstructed by
+/// downstream callers from store probes or display text.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SessionResumeRejection {
+    pub session_id: SessionId,
+    pub lifecycle: SessionResumeLifecycle,
+    pub authority: Box<SessionResumeAuthority>,
+    pub kind: ResumeRejectionKind,
+    pub detail: String,
+    pub runtime_state: Option<meerkat_runtime::RuntimeState>,
+    pub terminality: ResumeVerdictTerminality,
+}
+
+impl SessionResumeRejection {
     #[must_use]
-    pub fn unavailable_reason(&self, session_id: &SessionId) -> Option<String> {
+    pub fn into_mob_error(self) -> MobError {
+        let reason = match self.kind {
+            ResumeRejectionKind::Absent => crate::error::SessionResumeUnavailableReason::Absent,
+            ResumeRejectionKind::ArchivedNotRevivable => {
+                crate::error::SessionResumeUnavailableReason::ArchivedNotRevivable
+            }
+            ResumeRejectionKind::CommittedBoundaryUnprovable => {
+                crate::error::SessionResumeUnavailableReason::CommittedBoundaryUnprovable
+            }
+            ResumeRejectionKind::AuthorityChangedDuringMaterialization => {
+                crate::error::SessionResumeUnavailableReason::AuthorityChangedDuringMaterialization
+            }
+            ResumeRejectionKind::ContradictoryDurableAuthority => {
+                crate::error::SessionResumeUnavailableReason::ContradictoryDurableAuthority
+            }
+        };
+        MobError::SessionUnavailableForResume {
+            session_id: self.session_id.clone(),
+            reason,
+            runtime_state: self.runtime_state.map(|state| state.to_string()),
+            verdict: Some(Box::new(self)),
+        }
+    }
+}
+
+/// One backend-atomic store-issued observation captured for a resume verdict.
+/// Session authority, catalog lifecycle, and the raw machine-lifecycle row
+/// come from the same backend snapshot. Session body materialization remains
+/// separate and is accepted only when equal observations bracket the load.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SessionResumeAuthority {
+    pub observation: Option<meerkat_runtime::store::RuntimeSessionResumeObservation>,
+}
+
+impl SessionResumeAuthority {
+    #[must_use]
+    pub fn session_store_authority(
+        &self,
+    ) -> Option<crate::identity::IdentitySessionStoreAuthority> {
+        self.observation
+            .as_ref()?
+            .session_authority()
+            .cloned()
+            .map(crate::identity::IdentitySessionStoreAuthority::from_runtime_authority)
+    }
+
+    #[must_use]
+    pub fn runtime_state(&self) -> Option<meerkat_runtime::RuntimeState> {
+        match self.observation.as_ref()?.lifecycle() {
+            meerkat_runtime::store::MachineLifecycleObservation::Decoded { record, .. } => {
+                record.runtime_state()
+            }
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn occurrence_generation(&self) -> Option<u64> {
+        self.observation.as_ref()?.runtime_generation()
+    }
+
+    #[must_use]
+    pub fn head_revision(&self) -> Option<u64> {
+        self.observation.as_ref()?.session_store_revision()
+    }
+
+    /// Read-only lifecycle classification from the one backend-atomic resume
+    /// observation. This does not materialize a Session body or run recovery.
+    #[must_use]
+    pub fn lifecycle(&self) -> SessionResumeLifecycle {
+        SessionResumeVerdict::lifecycle_from_authority(self)
+    }
+}
+
+/// Operational resume decision after durable-tail convergence.
+///
+/// This carrier deliberately contains only facts the current owner can prove:
+/// lifecycle classification, the store-issued revision for an active body,
+/// materialization eligibility, and a typed rejection. Store and
+/// runtime lifecycle authority remain owner-issued exact observations; this
+/// layer does not synthesize a sequence from independent scalar fields. The
+/// body is separately loaded and accepted only between equal atomic authority
+/// observations.
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum SessionResumeVerdict {
+    ResumeAuthorized {
+        lifecycle: SessionResumeLifecycle,
+        authority: SessionResumeAuthority,
+        materialization: SessionResumeMaterialization,
+        session: Box<Session>,
+    },
+    Rejected(SessionResumeRejection),
+}
+
+#[derive(Debug, Clone)]
+pub struct AuthorizedSessionResume {
+    pub lifecycle: SessionResumeLifecycle,
+    pub authority: SessionResumeAuthority,
+    pub materialization: SessionResumeMaterialization,
+    pub session: Box<Session>,
+}
+
+impl SessionResumeVerdict {
+    pub fn into_authorized(self) -> Result<AuthorizedSessionResume, SessionResumeRejection> {
         match self {
-            Self::Active(_) | Self::Revivable(_) => None,
-            Self::ArchivedNotRevivable { runtime_state } => {
+            Self::ResumeAuthorized {
+                lifecycle,
+                authority,
+                materialization,
+                session,
+            } => Ok(AuthorizedSessionResume {
+                lifecycle,
+                authority,
+                materialization,
+                session,
+            }),
+            Self::Rejected(rejection) => Err(rejection),
+        }
+    }
+
+    fn from_authoritative_load_with_authority(
+        session_id: &SessionId,
+        load: ResumeSessionLoad,
+        authority: SessionResumeAuthority,
+    ) -> Result<Self, SessionError> {
+        let runtime_state = authority.runtime_state();
+        let occurrence_generation = authority.occurrence_generation();
+        let head_revision = authority.head_revision();
+        let authority_lifecycle = Self::lifecycle_from_authority(&authority);
+        if matches!(
+            &load,
+            ResumeSessionLoad::Active(_) | ResumeSessionLoad::Revivable(_)
+        ) && authority
+            .observation
+            .as_ref()
+            .is_some_and(|observation| observation.session_authority().is_none())
+        {
+            return Ok(Self::Rejected(SessionResumeRejection {
+                session_id: session_id.clone(),
+                lifecycle: Self::lifecycle_from_authority(&authority),
+                runtime_state,
+                authority: Box::new(authority),
+                kind: ResumeRejectionKind::ContradictoryDurableAuthority,
+                detail: format!(
+                    "session '{session_id}' materialized a body without store-issued session authority"
+                ),
+                terminality: ResumeVerdictTerminality::StableParkable,
+            }));
+        }
+        match load {
+            ResumeSessionLoad::Active(session) => {
+                let lifecycle = match authority_lifecycle {
+                    lifecycle @ SessionResumeLifecycle::Active { .. } => lifecycle,
+                    SessionResumeLifecycle::NoCurrentDurableAuthority
+                        if authority.observation.is_none() =>
+                    {
+                        // Ephemeral services have no durable backend
+                        // observation. Their body is the only available
+                        // operational input, but it does not claim durable
+                        // store authority.
+                        SessionResumeLifecycle::Active {
+                            occurrence_generation,
+                            head_revision,
+                        }
+                    }
+                    lifecycle => {
+                        return Ok(Self::contradictory_durable_authority(
+                            session_id,
+                            authority,
+                            lifecycle,
+                            "active resume load disagrees with atomic durable lifecycle",
+                        ));
+                    }
+                };
+                Ok(Self::ResumeAuthorized {
+                    lifecycle,
+                    authority,
+                    materialization: SessionResumeMaterialization::Active,
+                    session,
+                })
+            }
+            ResumeSessionLoad::Revivable(session) => {
+                // The atomic owner observation decides whether this is an
+                // archived document or a non-archived document paired with a
+                // Retired runtime. The portable Session projection is not
+                // lifecycle authority.
+                let lifecycle = match authority_lifecycle {
+                    lifecycle @ SessionResumeLifecycle::Archived { .. } => lifecycle,
+                    lifecycle @ SessionResumeLifecycle::Active { .. }
+                        if runtime_state == Some(meerkat_runtime::RuntimeState::Retired) =>
+                    {
+                        lifecycle
+                    }
+                    lifecycle => {
+                        return Ok(Self::contradictory_durable_authority(
+                            session_id,
+                            authority,
+                            lifecycle,
+                            "revivable resume load lacks matching atomic durable lifecycle",
+                        ));
+                    }
+                };
+                Ok(Self::ResumeAuthorized {
+                    lifecycle,
+                    authority,
+                    materialization: SessionResumeMaterialization::Revivable,
+                    session,
+                })
+            }
+            ResumeSessionLoad::ArchivedNotRevivable {
+                runtime_state: load_runtime_state,
+            } => {
+                let lifecycle = match authority_lifecycle {
+                    lifecycle @ SessionResumeLifecycle::Archived {
+                        revivable: false, ..
+                    } => lifecycle,
+                    lifecycle => {
+                        return Ok(Self::contradictory_durable_authority(
+                            session_id,
+                            authority,
+                            lifecycle,
+                            "archived refusal disagrees with atomic durable lifecycle",
+                        ));
+                    }
+                };
+                if load_runtime_state != runtime_state {
+                    return Ok(Self::contradictory_durable_authority(
+                        session_id,
+                        authority,
+                        lifecycle,
+                        "archived refusal runtime state disagrees with atomic durable authority",
+                    ));
+                }
                 let state = runtime_state.map_or_else(
                     || "<no runtime record>".to_string(),
                     |state| state.to_string(),
                 );
-                Some(format!(
-                    "durable session '{session_id}' is archived and not revivable from runtime \
-                     state {state}; the transcript is intact and preserved"
-                ))
+                Ok(Self::Rejected(SessionResumeRejection {
+                    session_id: session_id.clone(),
+                    lifecycle,
+                    authority: Box::new(authority),
+                    kind: ResumeRejectionKind::ArchivedNotRevivable,
+                    detail: format!(
+                        "durable session '{session_id}' is archived and not revivable from runtime state {state}; the transcript is intact and preserved"
+                    ),
+                    runtime_state,
+                    terminality: if runtime_state == Some(meerkat_runtime::RuntimeState::Destroyed)
+                    {
+                        ResumeVerdictTerminality::StableParkable
+                    } else {
+                        ResumeVerdictTerminality::TransientRetryable
+                    },
+                }))
             }
-            Self::Absent => Some(format!(
-                "missing durable session snapshot for '{session_id}'"
-            )),
+            ResumeSessionLoad::Absent => {
+                let positive_authority =
+                    authority.observation.as_ref().is_some_and(|observation| {
+                        observation.session_authority().is_some()
+                            || observation.catalog_entry().is_some()
+                            || !matches!(
+                                observation.lifecycle(),
+                                meerkat_runtime::store::MachineLifecycleObservation::Missing
+                            )
+                    });
+                if positive_authority {
+                    Ok(Self::Rejected(SessionResumeRejection {
+                        session_id: session_id.clone(),
+                        lifecycle: Self::lifecycle_from_authority(&authority),
+                        runtime_state: authority.runtime_state(),
+                        authority: Box::new(authority),
+                        kind: ResumeRejectionKind::ContradictoryDurableAuthority,
+                        detail: format!(
+                            "session '{session_id}' has durable authority or lifecycle rows but no materializable body"
+                        ),
+                        terminality: ResumeVerdictTerminality::StableParkable,
+                    }))
+                } else {
+                    Ok(Self::Rejected(SessionResumeRejection {
+                        session_id: session_id.clone(),
+                        lifecycle: SessionResumeLifecycle::NoCurrentDurableAuthority,
+                        authority: Box::new(authority),
+                        kind: ResumeRejectionKind::Absent,
+                        detail: format!("missing durable session snapshot for '{session_id}'"),
+                        runtime_state: None,
+                        terminality: ResumeVerdictTerminality::StableParkable,
+                    }))
+                }
+            }
         }
     }
 
-    /// The single place resume failures are typed. Keeps "archived" from
-    /// being reported as "missing" across the resume call sites, and keeps
-    /// both out of `MobError::Internal` so `failure_class()` and surface
-    /// renderings see the distinction instead of prose.
-    pub fn into_session_or_error(self, resume_id: &SessionId) -> Result<Session, MobError> {
-        match self {
-            Self::Active(session) | Self::Revivable(session) => Ok(*session),
-            Self::ArchivedNotRevivable { runtime_state } => {
-                Err(MobError::SessionUnavailableForResume {
-                    session_id: resume_id.clone(),
-                    reason: crate::error::SessionResumeUnavailableReason::ArchivedNotRevivable,
-                    runtime_state: runtime_state.map(|state| state.to_string()),
-                })
+    fn contradictory_durable_authority(
+        session_id: &SessionId,
+        authority: SessionResumeAuthority,
+        lifecycle: SessionResumeLifecycle,
+        detail: &str,
+    ) -> Self {
+        let runtime_state = authority.runtime_state();
+        Self::Rejected(SessionResumeRejection {
+            session_id: session_id.clone(),
+            lifecycle,
+            authority: Box::new(authority),
+            kind: ResumeRejectionKind::ContradictoryDurableAuthority,
+            detail: format!("session '{session_id}' {detail}"),
+            runtime_state,
+            terminality: ResumeVerdictTerminality::StableParkable,
+        })
+    }
+
+    fn lifecycle_from_authority(authority: &SessionResumeAuthority) -> SessionResumeLifecycle {
+        let runtime_state = authority.runtime_state();
+        let head_revision = authority.head_revision();
+        match authority.observation.as_ref() {
+            None => SessionResumeLifecycle::NoCurrentDurableAuthority,
+            Some(observation)
+                if observation
+                    .catalog_entry()
+                    .and_then(|entry| entry.lifecycle_terminal())
+                    .is_some_and(meerkat_core::SessionLifecycleTerminal::is_archived) =>
+            {
+                SessionResumeLifecycle::Archived {
+                    revivable: matches!(
+                        runtime_state,
+                        None | Some(
+                            meerkat_runtime::RuntimeState::Idle
+                                | meerkat_runtime::RuntimeState::Retired
+                        )
+                    ),
+                    runtime_state,
+                    head_revision,
+                }
             }
-            Self::Absent => Err(MobError::SessionUnavailableForResume {
-                session_id: resume_id.clone(),
-                reason: crate::error::SessionResumeUnavailableReason::Absent,
-                runtime_state: None,
-            }),
+            Some(observation) if observation.session_authority().is_some() => {
+                SessionResumeLifecycle::Active {
+                    occurrence_generation: authority.occurrence_generation(),
+                    head_revision,
+                }
+            }
+            Some(observation)
+                if observation.catalog_entry().is_some()
+                    || !matches!(
+                        observation.lifecycle(),
+                        meerkat_runtime::store::MachineLifecycleObservation::Missing
+                    ) =>
+            {
+                SessionResumeLifecycle::ContradictoryDurableAuthority {
+                    runtime_state,
+                    occurrence_generation: authority.occurrence_generation(),
+                    head_revision,
+                }
+            }
+            Some(_) => SessionResumeLifecycle::NoCurrentDurableAuthority,
         }
+    }
+
+    fn committed_boundary_unprovable(
+        session_id: &SessionId,
+        load: ResumeSessionLoad,
+        authority: SessionResumeAuthority,
+        detail: String,
+    ) -> Result<Self, SessionError> {
+        let classified = Self::from_authoritative_load_with_authority(session_id, load, authority)?;
+        let (lifecycle, authority) = classified.into_lifecycle_authority();
+        let runtime_state = authority.runtime_state();
+        Ok(Self::Rejected(SessionResumeRejection {
+            session_id: session_id.clone(),
+            lifecycle,
+            authority: Box::new(authority),
+            kind: ResumeRejectionKind::CommittedBoundaryUnprovable,
+            detail,
+            runtime_state,
+            terminality: ResumeVerdictTerminality::StableParkable,
+        }))
+    }
+
+    pub(crate) fn authority_changed_during_materialization(
+        session_id: &SessionId,
+        authority: SessionResumeAuthority,
+    ) -> Self {
+        let runtime_state = authority.runtime_state();
+        let lifecycle = Self::lifecycle_from_authority(&authority);
+        Self::Rejected(SessionResumeRejection {
+            session_id: session_id.clone(),
+            lifecycle,
+            authority: Box::new(authority),
+            kind: ResumeRejectionKind::AuthorityChangedDuringMaterialization,
+            detail: format!(
+                "durable authority for session '{session_id}' changed while its resume body was materialized"
+            ),
+            runtime_state,
+            terminality: ResumeVerdictTerminality::TransientRetryable,
+        })
+    }
+
+    fn into_lifecycle_authority(self) -> (SessionResumeLifecycle, SessionResumeAuthority) {
+        match self {
+            Self::ResumeAuthorized {
+                lifecycle,
+                authority,
+                ..
+            } => (lifecycle, authority),
+            Self::Rejected(rejection) => (rejection.lifecycle, *rejection.authority),
+        }
+    }
+}
+
+/// Typed actor-materialization route selected by the mob provisioner after
+/// the durable resume decision and the runtime machine preparation agree.
+///
+/// This is deliberately not an `Option<Archived...Authorization>`: absence
+/// previously meant both "fresh or ordinary resume" and "revivable resume
+/// whose authorization was accidentally dropped". Keeping the route typed
+/// makes every cold-boot actor creation pass through one execution seam while
+/// preserving the exact authority required by each path.
+#[cfg(feature = "runtime-adapter")]
+pub(crate) enum SessionActorMaterializationRoute {
+    /// Create a newly admitted session actor.
+    Fresh,
+    /// Recreate an actor from an active durable session body.
+    Resume,
+    /// Recreate an actor from a machine-authorized revivable session body.
+    Revivable {
+        authorization: meerkat_runtime::ArchivedSessionActorMaterializationAuthorization,
+    },
+    /// Recreate only the actor for an already-serving exact attachment.
+    AttachedActorRecovery,
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl SessionActorMaterializationRoute {
+    #[must_use]
+    pub(crate) fn is_revivable(&self) -> bool {
+        matches!(self, Self::Revivable { .. })
     }
 }
 
@@ -504,8 +964,8 @@ pub trait MobSessionService:
     /// REQUIRED, deliberately without a default: a persistent wrapper that
     /// forgets this transition would compile while recreating an actor from
     /// stale committed authority whenever the physical head is ahead after a
-    /// power cut. Observation paths must continue to use
-    /// [`Self::load_session_for_resume`] directly and remain read-only.
+    /// power cut. Classification and status paths use
+    /// [`Self::observe_session_resume_authority`] and remain read-only.
     async fn prepare_session_for_resume(&self, session_id: &SessionId) -> Result<(), SessionError>;
 
     /// Typed resume-seam read: never collapses "archived", "absent", and
@@ -524,14 +984,61 @@ pub trait MobSessionService:
         session_id: &SessionId,
     ) -> Result<ResumeSessionLoad, SessionError>;
 
-    /// Operational resume composition: first converge durable-tail authority,
-    /// then load the exact resulting committed body.
-    async fn materialize_session_for_resume(
+    /// Capture the exact session authority, catalog entry, and runtime
+    /// lifecycle row used by an operational resume verdict in one backend
+    /// snapshot. The Session body is deliberately not part of that store
+    /// snapshot, so operational materialization brackets its body load with
+    /// equal observations. Ephemeral services truthfully return an empty
+    /// bundle.
+    async fn observe_session_resume_authority(
         &self,
         session_id: &SessionId,
-    ) -> Result<ResumeSessionLoad, SessionError> {
+    ) -> Result<SessionResumeAuthority, SessionError>;
+
+    /// Re-observe the store-owned resume authority immediately before an
+    /// already-authorized body is handed to actor creation. The caller must
+    /// retain its Prepared runtime claim while performing this check, so a
+    /// body authorized before preparation cannot be consumed under a later
+    /// lifecycle or store revision.
+    async fn revalidate_session_resume_authority(
+        &self,
+        session_id: &SessionId,
+        expected: &SessionResumeAuthority,
+    ) -> Result<Result<(), SessionResumeRejection>, SessionError> {
+        let current = self.observe_session_resume_authority(session_id).await?;
+        if &current == expected {
+            Ok(Ok(()))
+        } else {
+            let SessionResumeVerdict::Rejected(rejection) =
+                SessionResumeVerdict::authority_changed_during_materialization(session_id, current)
+            else {
+                unreachable!("authority-change constructor always rejects")
+            };
+            Ok(Err(rejection))
+        }
+    }
+
+    /// Operational resume composition: first converge durable-tail authority,
+    /// then issue one typed decision over the resulting committed body and
+    /// retain the exact observations available from each authority owner.
+    /// Downstream heal/resume consumers must use this owner-issued verdict
+    /// rather than probing session and runtime stores independently.
+    async fn materialize_session_resume_verdict(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionResumeVerdict, SessionError> {
         self.prepare_session_for_resume(session_id).await?;
-        self.load_session_for_resume(session_id).await
+        let before = self.observe_session_resume_authority(session_id).await?;
+        let load = self.load_session_for_resume(session_id).await?;
+        let authority = self.observe_session_resume_authority(session_id).await?;
+        if before != authority {
+            return Ok(
+                SessionResumeVerdict::authority_changed_during_materialization(
+                    session_id, authority,
+                ),
+            );
+        }
+        SessionResumeVerdict::from_authoritative_load_with_authority(session_id, load, authority)
     }
 
     /// Load the persisted session METADATA view when available.
@@ -748,6 +1255,44 @@ pub trait MobSessionService:
     async fn rearm_all_checkpointers(&self) {}
 }
 
+/// Execute the one typed actor-materialization pipeline while the caller owns
+/// the stable runtime-turn boundary.
+///
+/// The provisioner decides the route only after durable resume preparation
+/// and machine preparation. This function is the sole lowering owner from
+/// that decision into the service's exact create primitive, so a revivable
+/// session cannot silently fall through to ordinary create and actor-only
+/// recovery cannot accidentally consume archived-resume authority.
+#[cfg(feature = "runtime-adapter")]
+pub(crate) async fn execute_session_actor_materialization_under_runtime_turn_boundary(
+    session_service: &dyn MobSessionService,
+    req: meerkat_core::service::CreateSessionRequest,
+    route: SessionActorMaterializationRoute,
+    actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
+) -> Result<meerkat_core::RunResult, SessionError> {
+    match route {
+        SessionActorMaterializationRoute::Fresh
+        | SessionActorMaterializationRoute::Resume
+        | SessionActorMaterializationRoute::AttachedActorRecovery => {
+            session_service
+                .create_session_with_actor_witness_under_runtime_turn_boundary(
+                    req,
+                    actor_witness_slot,
+                )
+                .await
+        }
+        SessionActorMaterializationRoute::Revivable { authorization } => {
+            session_service
+                .create_session_with_machine_archived_resume_authority_and_actor_witness_under_runtime_turn_boundary(
+                    req,
+                    authorization,
+                    actor_witness_slot,
+                )
+                .await
+        }
+    }
+}
+
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 impl<B> MobSessionService for meerkat_session::EphemeralSessionService<B>
@@ -766,6 +1311,13 @@ where
         _session_id: &SessionId,
     ) -> Result<(), SessionError> {
         Ok(())
+    }
+
+    async fn observe_session_resume_authority(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<SessionResumeAuthority, SessionError> {
+        Ok(SessionResumeAuthority::default())
     }
 
     /// In-memory service: nothing durable survives archive, so the two-read
@@ -1127,6 +1679,44 @@ where
         }
     }
 
+    async fn materialize_session_resume_verdict(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionResumeVerdict, SessionError> {
+        let unprovable = match self.recover_committed_boundary(session_id).await {
+            Ok(
+                meerkat_session::CommittedBoundaryRecovery::AlreadyCommitted
+                | meerkat_session::CommittedBoundaryRecovery::Recovered { .. },
+            ) => {
+                // Preserve the rewrite-audit replay/finalization performed by
+                // the ordinary preparation seam after A/H convergence.
+                let _ = self.load_authoritative_session(session_id).await?;
+                None
+            }
+            Err(SessionError::NotFound { .. }) => None,
+            Ok(meerkat_session::CommittedBoundaryRecovery::Unprovable { reason }) => Some(reason),
+            Err(error) => return Err(error),
+        };
+        let before = self.observe_session_resume_authority(session_id).await?;
+        let load = self.load_session_for_resume(session_id).await?;
+        let authority = self.observe_session_resume_authority(session_id).await?;
+        if before != authority {
+            return Ok(
+                SessionResumeVerdict::authority_changed_during_materialization(
+                    session_id, authority,
+                ),
+            );
+        }
+        match unprovable {
+            Some(reason) => SessionResumeVerdict::committed_boundary_unprovable(
+                session_id, load, authority, reason,
+            ),
+            None => SessionResumeVerdict::from_authoritative_load_with_authority(
+                session_id, load, authority,
+            ),
+        }
+    }
+
     async fn create_session_with_actor_witness_under_runtime_turn_boundary(
         &self,
         req: meerkat_core::service::CreateSessionRequest,
@@ -1222,6 +1812,25 @@ where
             )
             .await?;
         Ok(authority.map(crate::identity::IdentitySessionStoreAuthority::from_runtime_authority))
+    }
+
+    async fn observe_session_resume_authority(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionResumeAuthority, SessionError> {
+        let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(session_id);
+        let observation = self
+            .runtime_store()
+            .load_session_resume_observation(&runtime_id)
+            .await
+            .map_err(|error| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
+                    "failed to atomically observe resume authority for session '{session_id}': {error}"
+                )))
+            })?;
+        Ok(SessionResumeAuthority {
+            observation: Some(observation),
+        })
     }
 
     async fn live_session_actor_registered(

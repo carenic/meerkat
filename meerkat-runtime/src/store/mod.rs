@@ -1644,6 +1644,145 @@ impl RuntimeSessionAuthority {
             Self::HeadCanonical(authority) => Some(authority),
         }
     }
+
+    /// Exact revision issued by the physical store that owns this authority.
+    #[must_use]
+    pub const fn store_revision(&self) -> u64 {
+        match self {
+            Self::WholeBlob(authority) => authority.store_revision(),
+            Self::HeadCanonical(authority) => authority.store_revision(),
+        }
+    }
+}
+
+/// Body-free atomic observation used to authorize one session resume attempt.
+///
+/// The session authority, catalog projection, and raw machine-lifecycle row
+/// are observed from one backend snapshot. The carrier deliberately preserves
+/// absence and malformed or unsupported lifecycle rows instead of deriving a
+/// lifecycle verdict in the store. Session materialization remains a separate
+/// operation; callers that need a race-free body bracket that load with equal
+/// before and after observations.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RuntimeSessionResumeObservation {
+    runtime_id: LogicalRuntimeId,
+    session_authority: Option<RuntimeSessionAuthority>,
+    catalog_entry: Option<RuntimeSessionCatalogEntry>,
+    lifecycle: MachineLifecycleObservation,
+}
+
+impl RuntimeSessionResumeObservation {
+    /// Construct the exact body-free observation captured by a custom store
+    /// while it holds one backend snapshot or lock.
+    ///
+    /// This constructor does not combine independent reads or mint authority.
+    /// The caller must already own the atomic backend observation represented
+    /// by these values. Session and catalog identities are checked here so a
+    /// custom backend cannot accidentally pair rows from different sessions.
+    pub fn from_store_snapshot(
+        runtime_id: LogicalRuntimeId,
+        session_authority: Option<RuntimeSessionAuthority>,
+        catalog_entry: Option<RuntimeSessionCatalogEntry>,
+        lifecycle: MachineLifecycleObservation,
+    ) -> Result<Self, RuntimeStoreError> {
+        let expected_session_id = runtime_id.session_id();
+        if let Some(authority) = session_authority.as_ref()
+            && Some(authority.session_id()) != expected_session_id.as_ref()
+        {
+            return Err(RuntimeStoreError::SessionPersistenceAuthorityConflict {
+                runtime_id: runtime_id.to_string(),
+                detail: "resume observation paired session authority from another runtime"
+                    .to_string(),
+            });
+        }
+        if let Some(entry) = catalog_entry.as_ref()
+            && Some(entry.session_id()) != expected_session_id.as_ref()
+        {
+            return Err(RuntimeStoreError::SessionPersistenceAuthorityConflict {
+                runtime_id: runtime_id.to_string(),
+                detail: "resume observation paired catalog entry from another runtime".to_string(),
+            });
+        }
+        Ok(Self {
+            runtime_id,
+            session_authority,
+            catalog_entry,
+            lifecycle,
+        })
+    }
+
+    pub(crate) fn new(
+        runtime_id: LogicalRuntimeId,
+        session_authority: Option<RuntimeSessionAuthority>,
+        catalog_entry: Option<RuntimeSessionCatalogEntry>,
+        lifecycle: MachineLifecycleObservation,
+    ) -> Self {
+        Self {
+            runtime_id,
+            session_authority,
+            catalog_entry,
+            lifecycle,
+        }
+    }
+
+    #[must_use]
+    pub fn runtime_id(&self) -> &LogicalRuntimeId {
+        &self.runtime_id
+    }
+
+    #[must_use]
+    pub fn session_authority(&self) -> Option<&RuntimeSessionAuthority> {
+        self.session_authority.as_ref()
+    }
+
+    #[must_use]
+    pub fn session_store_revision(&self) -> Option<u64> {
+        self.session_authority
+            .as_ref()
+            .map(RuntimeSessionAuthority::store_revision)
+    }
+
+    #[must_use]
+    pub fn catalog_entry(&self) -> Option<&RuntimeSessionCatalogEntry> {
+        self.catalog_entry.as_ref()
+    }
+
+    #[must_use]
+    pub fn lifecycle(&self) -> &MachineLifecycleObservation {
+        &self.lifecycle
+    }
+
+    /// Exact content version of the physical lifecycle row, when present.
+    #[must_use]
+    pub fn lifecycle_row_version(&self) -> Option<&MachineLifecycleObservationVersion> {
+        self.lifecycle.version()
+    }
+
+    /// Machine-owned runtime generation, only when the lifecycle row decodes.
+    #[must_use]
+    pub fn runtime_generation(&self) -> Option<u64> {
+        match &self.lifecycle {
+            MachineLifecycleObservation::Decoded { record, .. } => {
+                record.binding().runtime_generation()
+            }
+            MachineLifecycleObservation::Missing
+            | MachineLifecycleObservation::Unsupported { .. }
+            | MachineLifecycleObservation::Malformed { .. } => None,
+        }
+    }
+
+    /// Machine-owned runtime epoch, only when the lifecycle row decodes.
+    #[must_use]
+    pub fn runtime_epoch_id(&self) -> Option<&str> {
+        match &self.lifecycle {
+            MachineLifecycleObservation::Decoded { record, .. } => {
+                record.binding().runtime_epoch_id()
+            }
+            MachineLifecycleObservation::Missing
+            | MachineLifecycleObservation::Unsupported { .. }
+            | MachineLifecycleObservation::Malformed { .. } => None,
+        }
+    }
 }
 
 /// Store-owned source for one durable-tail recovery pass.
@@ -7154,6 +7293,11 @@ pub trait RuntimeSessionAuthorityOps: Send + Sync {
         runtime_id: &LogicalRuntimeId,
     ) -> Result<Option<RuntimeSessionAuthority>, RuntimeStoreError>;
 
+    async fn load_session_resume_observation(
+        &self,
+        runtime_id: &LogicalRuntimeId,
+    ) -> Result<RuntimeSessionResumeObservation, RuntimeStoreError>;
+
     async fn load_whole_blob_store_authority(
         &self,
         runtime_id: &LogicalRuntimeId,
@@ -7302,6 +7446,21 @@ pub trait RuntimeStore: Send + Sync {
     ) -> Result<Option<RuntimeSessionAuthority>, RuntimeStoreError> {
         self.session_authority_ops()
             .load_session_boundary_authority(runtime_id)
+            .await
+    }
+
+    /// Atomically observe the body-free authority and lifecycle facts needed
+    /// to authorize a session resume attempt.
+    ///
+    /// Backends must read the session authority, catalog projection, and raw
+    /// lifecycle row under one snapshot. This method never materializes the
+    /// accumulated Session body.
+    async fn load_session_resume_observation(
+        &self,
+        runtime_id: &LogicalRuntimeId,
+    ) -> Result<RuntimeSessionResumeObservation, RuntimeStoreError> {
+        self.session_authority_ops()
+            .load_session_resume_observation(runtime_id)
             .await
     }
 

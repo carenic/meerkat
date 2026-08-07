@@ -2239,7 +2239,7 @@ pub(super) static IDENTITY_RECONCILE_COMPLETION_REQUEUES: std::sync::atomic::Ato
 pub(super) static IDENTITY_RECONCILE_REPLY_DELIVERY_FAILURES: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 #[cfg(test)]
-pub(super) static IDENTITY_RECONCILE_SESSION_DOCUMENT_LOADS: std::sync::atomic::AtomicU64 =
+pub(super) static IDENTITY_RECONCILE_SESSION_AUTHORITY_OBSERVATIONS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 #[cfg(test)]
 static FAIL_SESSION_INGRESS_DETACH_FOR_SESSION: std::sync::Mutex<Option<SessionId>> =
@@ -3680,11 +3680,13 @@ impl DeferredResumeProvision {
             generated_self_owned_operation_owner,
         } = *self;
 
-        let stored_session = session_service
-            .materialize_session_for_resume(&resume_id)
+        let authorized_resume = session_service
+            .materialize_session_resume_verdict(&resume_id)
             .await
             .map_err(MobError::from)?
-            .into_session_or_error(&resume_id)?;
+            .into_authorized()
+            .map_err(super::session_service::SessionResumeRejection::into_mob_error)?;
+        let stored_session = *authorized_resume.session.clone();
 
         let mut config = build::build_resumed_agent_config(build::BuildResumedAgentConfigParams {
             base: build::BuildAgentConfigParams {
@@ -3715,6 +3717,7 @@ impl DeferredResumeProvision {
         let create_session = build::to_create_session_request(&config, prompt);
         let mut request = ProvisionMemberRequest {
             create_session: with_spawn_budget_limits(create_session, budget_limits),
+            authorized_resume: Some(authorized_resume),
             session_origin: super::provisioner::ProvisionSessionOrigin::ResumedDurable,
             binding,
             peer_name,
@@ -10247,9 +10250,13 @@ impl MobActor {
                         // local details.
                         let genuinely_absent = matches!(
                             self.session_service
-                                .load_session_for_resume(bridge_session_id)
+                                .observe_session_resume_authority(bridge_session_id)
                                 .await,
-                            Ok(super::session_service::ResumeSessionLoad::Absent)
+                            Ok(authority)
+                                if matches!(
+                                    authority.lifecycle(),
+                                    super::session_service::SessionResumeLifecycle::NoCurrentDurableAuthority
+                                )
                         );
                         if genuinely_absent {
                             let _ = self
@@ -10578,10 +10585,11 @@ impl MobActor {
         let stored_session_present = if self.session_service.supports_persistent_sessions() {
             !matches!(
                 self.session_service
-                    .load_session_for_resume(bridge_session_id)
+                    .observe_session_resume_authority(bridge_session_id)
                     .await
-                    .map_err(MobError::SessionError)?,
-                super::session_service::ResumeSessionLoad::Absent
+                    .map_err(MobError::SessionError)?
+                    .lifecycle(),
+                super::session_service::SessionResumeLifecycle::NoCurrentDurableAuthority
             )
         } else {
             false
@@ -10661,34 +10669,27 @@ impl MobActor {
                 // left dangling.
                 let materialization = match self
                     .session_service
-                    .materialize_session_for_resume(bridge_session_id)
+                    .materialize_session_resume_verdict(bridge_session_id)
                     .await
                 {
                     Ok(
-                        ResumeSessionLoad::Active(stored_session)
-                        | ResumeSessionLoad::Revivable(stored_session),
+                        verdict @ super::session_service::SessionResumeVerdict::ResumeAuthorized {
+                            ..
+                        },
                     ) => {
+                        let authorized = verdict.into_authorized().expect("authorized verdict");
                         self.materialize_revived_member_session(
                             entry,
                             member_ref,
                             bridge_session_id,
-                            *stored_session,
+                            authorized,
                             recovered_binding_without_endpoint,
                             restore_topology_immediately,
                         )
                         .await
                     }
-                    Ok(ResumeSessionLoad::Absent) => Err(MobError::Internal(format!(
-                        "durable snapshot for bridge session '{bridge_session_id}' vanished \
-                         between the metadata presence probe and revival materialization"
-                    ))),
-                    Ok(ResumeSessionLoad::ArchivedNotRevivable { runtime_state }) => {
-                        Err(MobError::SessionUnavailableForResume {
-                            session_id: bridge_session_id.clone(),
-                            reason:
-                                crate::error::SessionResumeUnavailableReason::ArchivedNotRevivable,
-                            runtime_state: runtime_state.map(|state| state.to_string()),
-                        })
+                    Ok(super::session_service::SessionResumeVerdict::Rejected(rejection)) => {
+                        Err(rejection.into_mob_error())
                     }
                     Err(error) => Err(MobError::SessionError(error)),
                 };
@@ -11431,7 +11432,7 @@ impl MobActor {
         entry: &RosterEntry,
         member_ref: &MemberRef,
         bridge_session_id: &SessionId,
-        stored_session: meerkat_core::session::Session,
+        authorized_resume: super::session_service::AuthorizedSessionResume,
         recovered_binding_without_endpoint: bool,
         restore_topology_immediately: bool,
     ) -> Result<(), MobError> {
@@ -11466,6 +11467,7 @@ impl MobActor {
             .get(&agent_identity)
             .cloned();
         let external_tools = self.external_tools_for_profile(&profile, per_spawn_overlay)?;
+        let stored_session = *authorized_resume.session.clone();
         let mut config = build::build_resumed_agent_config(build::BuildResumedAgentConfigParams {
             base: build::BuildAgentConfigParams {
                 mob_id: &self.definition.id,
@@ -11574,6 +11576,7 @@ impl MobActor {
             .provisioner
             .provision_member(ProvisionMemberRequest {
                 create_session: req,
+                authorized_resume: Some(authorized_resume),
                 session_origin: super::provisioner::ProvisionSessionOrigin::ResumedDurable,
                 binding: crate::RuntimeBinding::Session,
                 peer_name: peer_name.clone(),
@@ -17687,57 +17690,57 @@ impl MobActor {
         desired: &crate::identity::DesiredSessionTarget,
     ) -> Result<crate::identity::IdentitySessionObservation, MobError> {
         #[cfg(test)]
-        IDENTITY_RECONCILE_SESSION_DOCUMENT_LOADS
+        IDENTITY_RECONCILE_SESSION_AUTHORITY_OBSERVATIONS
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let authority_before = self
-            .observe_bounded_persisted_session_authority(desired)
-            .await?;
         // Typed resume-seam read: `load_persisted_session` deliberately
         // hides archived documents, and mapping that hidden state to
         // authoritative Missing let identity reconciliation mark an intact
         // Archived+Idle member Broken before explicit resume could revive
         // it. Archived-but-not-revivable observes as UNAVAILABLE (a holding
         // state), never as absence.
-        let loaded = match self
+        let authority = self
             .session_service
-            .load_session_for_resume(&desired.session_id)
+            .observe_session_resume_authority(&desired.session_id)
             .await
-        {
-            Ok(
-                super::session_service::ResumeSessionLoad::Active(session)
-                | super::session_service::ResumeSessionLoad::Revivable(session),
-            ) => Ok(Some(*session)),
-            Ok(super::session_service::ResumeSessionLoad::Absent) => Ok(None),
-            Ok(super::session_service::ResumeSessionLoad::ArchivedNotRevivable {
-                runtime_state,
-            }) => {
-                let state = runtime_state.map_or_else(
-                    || "<no runtime record>".to_string(),
-                    |state| state.to_string(),
-                );
-                return Ok(crate::identity::IdentitySessionObservation::unavailable(
-                    format!(
-                        "session '{}' is archived and not revivable from runtime state {state}; \
-                     the transcript is intact and preserved — refusing to observe it as missing",
-                        desired.session_id
-                    ),
-                ));
+            .map_err(MobError::SessionError)?;
+        match authority.lifecycle() {
+            super::session_service::SessionResumeLifecycle::NoCurrentDurableAuthority => {
+                crate::identity::IdentitySessionObservation::missing(format!(
+                    "session-absent:{}",
+                    desired.session_id
+                ))
+                .map_err(|error| MobError::Internal(error.to_string()))
             }
-            Err(error) => Err(error),
-        };
-        let authority_after = self
-            .observe_bounded_persisted_session_authority(desired)
-            .await?;
-        if authority_after != authority_before {
-            return Err(MobError::Internal(format!(
-                "persisted authority changed while observing session {}",
-                desired.session_id
-            )));
-        }
-        match identity_session_observation_from_persisted_load(desired, loaded, authority_before) {
-            Ok(observation) => Ok(observation),
-            Err(error) => Ok(crate::identity::IdentitySessionObservation::unavailable(
-                format!("persisted session observation construction failed: {error}"),
+            super::session_service::SessionResumeLifecycle::Active { .. }
+            | super::session_service::SessionResumeLifecycle::Archived {
+                revivable: true, ..
+            } => {
+                let Some(store_authority) = authority.session_store_authority() else {
+                    return Ok(crate::identity::IdentitySessionObservation::unavailable(
+                        "atomic resume observation classified the session present without store-issued session authority",
+                    ));
+                };
+                crate::identity::IdentitySessionObservation::matching_authority(
+                    desired,
+                    store_authority,
+                )
+                .map_err(|error| MobError::Internal(error.to_string()))
+            }
+            super::session_service::SessionResumeLifecycle::Archived {
+                revivable: false, ..
+            } => Ok(crate::identity::IdentitySessionObservation::unavailable(
+                format!(
+                    "session '{}' is archived and not currently revivable",
+                    desired.session_id
+                ),
+            )),
+            super::session_service::SessionResumeLifecycle::ContradictoryDurableAuthority {
+                ..
+            } => Ok(crate::identity::IdentitySessionObservation::unavailable(
+                format!(
+                    "session '{}' has contradictory durable resume authority",
+                    desired.session_id
+                ),
             )),
         }
     }
@@ -23444,12 +23447,14 @@ impl MobActor {
                     // preparation order. Their provision opens a machine-owned
                     // recipient-trust obligation, whose cancellation semantics
                     // are deliberately not widened by the session optimization.
-                    let stored_session = self
+                    let authorized_resume = self
                         .session_service
-                        .materialize_session_for_resume(&resume_id)
+                        .materialize_session_resume_verdict(&resume_id)
                         .await
                         .map_err(MobError::from)?
-                        .into_session_or_error(&resume_id)?;
+                        .into_authorized()
+                        .map_err(super::session_service::SessionResumeRejection::into_mob_error)?;
+                    let stored_session = *authorized_resume.session.clone();
 
                     let external_tools = self.external_tools_for_profile(
                         &profile,
@@ -23488,6 +23493,7 @@ impl MobActor {
                     let req = with_spawn_budget_limits(req, budget_limits.clone());
                     let provision_request = ProvisionMemberRequest {
                         create_session: req,
+                        authorized_resume: Some(authorized_resume),
                         session_origin:
                             super::provisioner::ProvisionSessionOrigin::ResumedDurable,
                         binding: selected_binding,
@@ -23613,6 +23619,7 @@ impl MobActor {
             )?;
             let provision_request = ProvisionMemberRequest {
                 create_session: req,
+                authorized_resume: None,
                 session_origin: super::provisioner::ProvisionSessionOrigin::Fresh,
                 binding: selected_binding,
                 peer_name,
@@ -26288,6 +26295,7 @@ impl MobActor {
         )?;
         let mut provision_request = ProvisionMemberRequest {
             create_session: req,
+            authorized_resume: None,
             session_origin: super::provisioner::ProvisionSessionOrigin::Fresh,
             binding: selected_binding,
             peer_name,
@@ -36637,6 +36645,7 @@ impl MobActor {
         )?;
         let mut provision_request = ProvisionMemberRequest {
             create_session: req,
+            authorized_resume: None,
             session_origin: super::provisioner::ProvisionSessionOrigin::Fresh,
             binding: snapshot.binding.clone(),
             peer_name,

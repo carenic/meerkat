@@ -8,9 +8,10 @@ use crate::{SessionFilter, SessionStore, SessionStoreError, StoreError};
 use async_trait::async_trait;
 use fs4::fs_std::FileExt;
 use meerkat_core::{Session, SessionId, SessionMeta};
+use std::collections::HashMap;
 use std::io::{Seek, SeekFrom, Write};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::fs;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -22,6 +23,55 @@ const SESSION_WRITE_LOCK_POLL: Duration = Duration::from_millis(10);
 
 struct SessionWriteLock {
     file: std::fs::File,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IndexProjectionDegradationReason {
+    PostCommitIndexUpdateFailed,
+    PostCommitIndexDeleteFailed,
+    StartupReconciliationDiverged,
+}
+
+impl IndexProjectionDegradationReason {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::PostCommitIndexUpdateFailed => "post_commit_index_update_failed",
+            Self::PostCommitIndexDeleteFailed => "post_commit_index_delete_failed",
+            Self::StartupReconciliationDiverged => "startup_reconciliation_diverged",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IndexProjectionWarning {
+    epoch: u64,
+    reason: IndexProjectionDegradationReason,
+}
+
+#[derive(Debug, Default)]
+struct IndexProjectionHealth {
+    epoch: u64,
+    degraded: Option<IndexProjectionDegradationReason>,
+    warned_epoch: Option<u64>,
+}
+
+impl IndexProjectionHealth {
+    fn mark_degraded(&mut self, reason: IndexProjectionDegradationReason) {
+        self.epoch = self.epoch.saturating_add(1);
+        self.degraded = Some(reason);
+    }
+
+    fn take_warning(&mut self) -> Option<IndexProjectionWarning> {
+        let reason = self.degraded?;
+        if self.warned_epoch == Some(self.epoch) {
+            return None;
+        }
+        self.warned_epoch = Some(self.epoch);
+        Some(IndexProjectionWarning {
+            epoch: self.epoch,
+            reason,
+        })
+    }
 }
 
 impl Drop for SessionWriteLock {
@@ -36,6 +86,12 @@ pub struct JsonlStore {
     /// Whether to use pretty-printed JSON (default: true for readability)
     pretty_print: bool,
     index: RwLock<Option<Arc<SqliteSessionIndex>>>,
+    /// Process-local evidence that canonical JSONL state committed but the
+    /// cached index projection did not. The current instance never clears the
+    /// latch: an unrelated successful row update cannot prove that an earlier
+    /// missed row healed. Reopening starts a fresh evidence epoch after the
+    /// normal startup reconciliation.
+    index_projection_health: Mutex<IndexProjectionHealth>,
     /// `Some(<realm_dir>/realm)` when `dir` sits inside a realm directory:
     /// write operations take the shared realm write-admission guard on it,
     /// so the realm maintenance fence quiesces this store's canonical
@@ -75,6 +131,7 @@ impl JsonlStoreBuilder {
             dir: self.dir,
             pretty_print: self.pretty_print,
             index: RwLock::new(None),
+            index_projection_health: Mutex::new(IndexProjectionHealth::default()),
         }
     }
 }
@@ -87,6 +144,7 @@ impl JsonlStore {
             dir,
             pretty_print: true,
             index: RwLock::new(None),
+            index_projection_health: Mutex::new(IndexProjectionHealth::default()),
         }
     }
 
@@ -103,6 +161,61 @@ impl JsonlStore {
 
     fn index_path(&self) -> PathBuf {
         self.dir.join("session_index.sqlite3")
+    }
+
+    fn with_index_projection_health<T>(
+        &self,
+        inspect: impl FnOnce(&mut IndexProjectionHealth) -> T,
+    ) -> T {
+        let mut health = self
+            .index_projection_health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        inspect(&mut health)
+    }
+
+    fn mark_index_projection_degraded(&self, reason: IndexProjectionDegradationReason) {
+        self.with_index_projection_health(|health| health.mark_degraded(reason));
+    }
+
+    fn record_post_commit_index_failure(
+        &self,
+        reason: IndexProjectionDegradationReason,
+        error: &dyn std::fmt::Display,
+    ) {
+        self.mark_index_projection_degraded(reason);
+        tracing::warn!(
+            event = "projection_degraded",
+            code = "jsonl-session-index-mutation-failed",
+            authority = "jsonl-session-file",
+            representation = "jsonl-session-index",
+            canonical_committed = true,
+            rebuildable = true,
+            reason = reason.as_str(),
+            error = %error,
+            "canonical JSONL commit succeeded but its index projection update failed"
+        );
+    }
+
+    fn warn_if_serving_known_degraded_index(&self) {
+        let warning = self.with_index_projection_health(IndexProjectionHealth::take_warning);
+        let Some(warning) = warning else {
+            return;
+        };
+        tracing::warn!(
+            event = "projection_read",
+            code = "demoted-projection-read",
+            authority = "jsonl-session-file",
+            representation = "jsonl-session-index",
+            operation = "session.list",
+            served = true,
+            health = "known_degraded",
+            lag = "unknown",
+            rebuildable = true,
+            degraded_epoch = warning.epoch,
+            reason = warning.reason.as_str(),
+            "session listing served from a known-degraded JSONL index projection"
+        );
     }
 
     /// Derive `SessionMeta` for every durable session file.
@@ -196,6 +309,7 @@ impl JsonlStore {
         // rename but before the index insert — the durable truth is intact and
         // the projection is rematerialized from it.
         let metas = self.read_all_session_metas().await?;
+        let canonical_metas = metas.clone();
         let session_count = metas.len();
 
         let index_count = {
@@ -228,6 +342,27 @@ impl JsonlStore {
                 Ok(Err(err)) => return Err(err),
                 Err(err) => return Err(StoreError::Join(err)),
             }
+        }
+
+        // Upsert reconciliation repairs missing and stale metadata but cannot
+        // remove an orphan left by a canonical delete whose index removal
+        // failed. Compare the reconciled index with the exact canonical
+        // snapshot before exposing it to `list`. A concurrent canonical write
+        // may conservatively arm this warning; serving silently is worse than
+        // a false-positive WARN during that narrow race.
+        let projected_metas = {
+            let index = Arc::clone(&index);
+            spawn_blocking(move || index.list_meta(SessionFilter::default())).await
+        };
+        let projected_metas = match projected_metas {
+            Ok(Ok(metas)) => metas,
+            Ok(Err(err)) => return Err(err),
+            Err(err) => return Err(StoreError::Join(err)),
+        };
+        if session_meta_sets_diverge(&canonical_metas, &projected_metas) {
+            self.mark_index_projection_degraded(
+                IndexProjectionDegradationReason::StartupReconciliationDiverged,
+            );
         }
 
         Ok(index)
@@ -305,6 +440,26 @@ impl JsonlStore {
     }
 }
 
+fn session_meta_sets_diverge(canonical: &[SessionMeta], projected: &[SessionMeta]) -> bool {
+    if canonical.len() != projected.len() {
+        return true;
+    }
+    let projected_by_id: HashMap<SessionId, &SessionMeta> = projected
+        .iter()
+        .map(|meta| (meta.id.clone(), meta))
+        .collect();
+    canonical.iter().any(|expected| {
+        let Some(actual) = projected_by_id.get(&expected.id) else {
+            return true;
+        };
+        actual.created_at != expected.created_at
+            || actual.updated_at != expected.updated_at
+            || actual.message_count != expected.message_count
+            || actual.total_tokens != expected.total_tokens
+            || actual.metadata != expected.metadata
+    })
+}
+
 // Private methods return StoreError (preserves internal ? chains).
 // Trait methods convert at the boundary via into_session_store_error().
 impl JsonlStore {
@@ -356,12 +511,31 @@ impl JsonlStore {
         // this insert self-heals: `open_index` reconciles the projection from
         // the session files.
         let meta = SessionMeta::from(session);
-        let index = self.index().await?;
+        let index = match self.index().await {
+            Ok(index) => index,
+            Err(error) => {
+                self.record_post_commit_index_failure(
+                    IndexProjectionDegradationReason::PostCommitIndexUpdateFailed,
+                    &error,
+                );
+                return Ok(());
+            }
+        };
         let result = spawn_blocking(move || index.insert_meta(meta)).await;
         match result {
             Ok(Ok(())) => {}
-            Ok(Err(err)) => return Err(err),
-            Err(err) => return Err(StoreError::Join(err)),
+            Ok(Err(err)) => {
+                self.record_post_commit_index_failure(
+                    IndexProjectionDegradationReason::PostCommitIndexUpdateFailed,
+                    &err,
+                );
+            }
+            Err(err) => {
+                self.record_post_commit_index_failure(
+                    IndexProjectionDegradationReason::PostCommitIndexUpdateFailed,
+                    &err,
+                );
+            }
         }
 
         Ok(())
@@ -395,16 +569,19 @@ impl JsonlStore {
     /// method) always reconciles the index by re-deriving `SessionMeta` from
     /// the session files, so a crash that lands the session rename but not the
     /// index insert self-heals on next open: the canonical truth is intact and
-    /// the projection is rematerialized from it. There is no second durable
-    /// metadata artifact that this listing could diverge toward.
+    /// the projection is rematerialized from it. A live post-commit index
+    /// failure instead latches the projection as known-degraded, and the first
+    /// successful listing in each degradation epoch emits a structured warning.
     async fn list_impl(&self, filter: SessionFilter) -> Result<Vec<SessionMeta>, StoreError> {
         let index = self.index().await?;
         let result = spawn_blocking(move || index.list_meta(filter)).await;
-        match result {
-            Ok(Ok(sessions)) => Ok(sessions),
-            Ok(Err(err)) => Err(err),
-            Err(err) => Err(StoreError::Join(err)),
-        }
+        let sessions = match result {
+            Ok(Ok(sessions)) => sessions,
+            Ok(Err(err)) => return Err(err),
+            Err(err) => return Err(StoreError::Join(err)),
+        };
+        self.warn_if_serving_known_degraded_index();
+        Ok(sessions)
     }
 
     /// Callers (the trait methods) hold the realm write-admission guard
@@ -419,13 +596,32 @@ impl JsonlStore {
             return Err(e.into());
         }
 
-        let index = self.index().await?;
+        let index = match self.index().await {
+            Ok(index) => index,
+            Err(error) => {
+                self.record_post_commit_index_failure(
+                    IndexProjectionDegradationReason::PostCommitIndexDeleteFailed,
+                    &error,
+                );
+                return Ok(());
+            }
+        };
         let id = id.clone();
         let result = spawn_blocking(move || index.remove(&id)).await;
         match result {
             Ok(Ok(())) => {}
-            Ok(Err(err)) => return Err(err),
-            Err(err) => return Err(StoreError::Join(err)),
+            Ok(Err(err)) => {
+                self.record_post_commit_index_failure(
+                    IndexProjectionDegradationReason::PostCommitIndexDeleteFailed,
+                    &err,
+                );
+            }
+            Err(err) => {
+                self.record_post_commit_index_failure(
+                    IndexProjectionDegradationReason::PostCommitIndexDeleteFailed,
+                    &err,
+                );
+            }
         }
 
         Ok(())
@@ -576,6 +772,154 @@ mod tests {
         AssistantBlock, BlockAssistantMessage, Message, StopReason, TranscriptRewriteReason,
         TranscriptRewriteSelection, UserMessage,
     };
+
+    #[test]
+    fn degraded_index_warning_is_once_per_epoch() {
+        let mut health = IndexProjectionHealth::default();
+        health.mark_degraded(IndexProjectionDegradationReason::PostCommitIndexUpdateFailed);
+        assert_eq!(
+            health.take_warning(),
+            Some(IndexProjectionWarning {
+                epoch: 1,
+                reason: IndexProjectionDegradationReason::PostCommitIndexUpdateFailed,
+            })
+        );
+        assert_eq!(health.take_warning(), None);
+
+        health.mark_degraded(IndexProjectionDegradationReason::PostCommitIndexDeleteFailed);
+        assert_eq!(
+            health.take_warning(),
+            Some(IndexProjectionWarning {
+                epoch: 2,
+                reason: IndexProjectionDegradationReason::PostCommitIndexDeleteFailed,
+            })
+        );
+        assert_eq!(health.take_warning(), None);
+    }
+
+    fn obstruct_cached_index(store: &JsonlStore) -> PathBuf {
+        let index_path = store.index_path();
+        let backup_path = index_path.with_extension("sqlite3.test-backup");
+        std::fs::rename(&index_path, &backup_path).unwrap();
+        std::fs::create_dir(&index_path).unwrap();
+        backup_path
+    }
+
+    fn restore_cached_index(store: &JsonlStore, backup_path: &std::path::Path) {
+        let index_path = store.index_path();
+        std::fs::remove_dir(&index_path).unwrap();
+        std::fs::rename(backup_path, index_path).unwrap();
+    }
+
+    fn assert_warning_consumed(store: &JsonlStore, reason: IndexProjectionDegradationReason) {
+        let health = store
+            .index_projection_health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(health.degraded, Some(reason));
+        assert_eq!(health.warned_epoch, Some(health.epoch));
+    }
+
+    #[tokio::test]
+    async fn save_succeeds_after_canonical_commit_when_cached_index_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = JsonlStore::new(temp_dir.path().to_path_buf());
+        let mut session = Session::new();
+        store.save(&session).await?;
+        let backup_path = obstruct_cached_index(&store);
+
+        session.push(Message::User(UserMessage::text("canonical update")));
+        store
+            .save(&session)
+            .await
+            .expect("post-commit index failure must not invalidate canonical save");
+        let loaded = store
+            .load(session.id())
+            .await?
+            .expect("canonical JSONL session must remain readable");
+        assert_eq!(loaded.messages().len(), 1);
+
+        restore_cached_index(&store, &backup_path);
+        let listed = store.list(SessionFilter::default()).await?;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].message_count, 0,
+            "index remains a stale projection"
+        );
+        assert_warning_consumed(
+            &store,
+            IndexProjectionDegradationReason::PostCommitIndexUpdateFailed,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn delete_succeeds_after_canonical_commit_when_cached_index_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let store = JsonlStore::new(temp_dir.path().to_path_buf());
+        let session = Session::new();
+        let id = session.id().clone();
+        store.save(&session).await?;
+        let backup_path = obstruct_cached_index(&store);
+
+        store
+            .delete(&id)
+            .await
+            .expect("post-commit index failure must not invalidate canonical delete");
+        assert!(store.load(&id).await?.is_none());
+
+        restore_cached_index(&store, &backup_path);
+        let listed = store.list(SessionFilter::default()).await?;
+        assert_eq!(
+            listed.len(),
+            1,
+            "WARN-first leaves stale projection for repair"
+        );
+        assert_warning_consumed(
+            &store,
+            IndexProjectionDegradationReason::PostCommitIndexDeleteFailed,
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_with_canonical_empty_and_stale_index_arms_warning()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let store_path = temp_dir.path().to_path_buf();
+        let store = JsonlStore::new(store_path.clone());
+        let session = Session::new();
+        let id = session.id().clone();
+        store.save(&session).await?;
+
+        // Model a canonical delete that committed before its index removal.
+        fs::remove_file(store.session_path(&id)).await?;
+        drop(store);
+
+        let reopened = JsonlStore::new(store_path);
+        let listed = reopened.list(SessionFilter::default()).await?;
+        assert_eq!(
+            listed.len(),
+            1,
+            "WARN-first does not silently repair the index"
+        );
+        let health = reopened
+            .index_projection_health
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            health.degraded,
+            Some(IndexProjectionDegradationReason::StartupReconciliationDiverged)
+        );
+        assert_eq!(
+            health.warned_epoch,
+            Some(health.epoch),
+            "the successful restart listing must consume the armed warning epoch"
+        );
+        Ok(())
+    }
 
     /// Test that load() returns None for non-existent sessions without blocking
     /// This verifies we use async file operations, not sync Path::exists()

@@ -3801,6 +3801,14 @@ impl MobSessionService for LocalSessionService {
         Ok(())
     }
 
+    async fn observe_session_resume_authority(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<meerkat_mob::SessionResumeAuthority, SessionError> {
+        // This service owns process-local maps, not durable RuntimeStore rows.
+        Ok(meerkat_mob::SessionResumeAuthority::default())
+    }
+
     async fn create_session_under_runtime_turn_boundary(
         &self,
         req: CreateSessionRequest,
@@ -6871,6 +6879,14 @@ mod tests {
             _session_id: &SessionId,
         ) -> Result<(), SessionError> {
             Ok(())
+        }
+
+        async fn observe_session_resume_authority(
+            &self,
+            _session_id: &SessionId,
+        ) -> Result<meerkat_mob::SessionResumeAuthority, SessionError> {
+            // This process-local test map has no RuntimeStore authority.
+            Ok(meerkat_mob::SessionResumeAuthority::default())
         }
 
         async fn acknowledge_committed_runtime_session_boundary_under_turn_finalization_boundary(

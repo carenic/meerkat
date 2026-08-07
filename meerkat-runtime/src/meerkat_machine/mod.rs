@@ -3124,7 +3124,7 @@ impl PreparedSessionMaterialization {
     /// authorization and committed the exact claim into
     /// `ActorMaterializedPendingCommit`.
     pub async fn acquire_archived_resume_commit_lease(
-        &self,
+        &mut self,
     ) -> Result<PreparedArchivedResumeCommitLease, RuntimeDriverError> {
         if !self.armed || !self.archived_resume_authorization_issued {
             return Err(RuntimeDriverError::StaleAuthority {

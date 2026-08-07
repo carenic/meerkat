@@ -3509,6 +3509,13 @@ mod tests {
             Ok(())
         }
 
+        async fn observe_session_resume_authority(
+            &self,
+            _session_id: &meerkat_core::SessionId,
+        ) -> Result<crate::SessionResumeAuthority, meerkat_core::service::SessionError> {
+            Ok(crate::SessionResumeAuthority::default())
+        }
+
         async fn acknowledge_committed_runtime_session_boundary_under_turn_finalization_boundary(
             &self,
             _session_id: &SessionId,

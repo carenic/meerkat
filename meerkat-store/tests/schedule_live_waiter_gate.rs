@@ -12,10 +12,10 @@ use chrono::{Duration, Utc};
 use meerkat_core::{ContentInput, SessionId};
 use meerkat_schedule::{
     ClaimDueRequest, CreateScheduleRequest, DeliveryReceiptStage, MisfirePolicy,
-    MissingTargetPolicy, Occurrence, OccurrenceLifecycleInput, OccurrenceOrdinal, OccurrencePhase,
-    OverlapPolicy, RenewOccurrenceLeaseOutcome, RenewOccurrenceLeaseRequest, Schedule,
-    ScheduleLifecycleInput, ScheduleStore, ScheduledSessionAction, SessionTargetBinding,
-    TargetBinding, TriggerSpec,
+    MissingTargetPolicy, Occurrence, OccurrenceLifecycleEffect, OccurrenceLifecycleInput,
+    OccurrenceOrdinal, OccurrencePhase, OverlapPolicy, RenewOccurrenceLeaseOutcome,
+    RenewOccurrenceLeaseRequest, Schedule, ScheduleLifecycleInput, ScheduleStore,
+    ScheduledSessionAction, SessionTargetBinding, TargetBinding, TriggerSpec,
 };
 use meerkat_store::SqliteScheduleStore;
 use std::collections::BTreeMap;
@@ -52,8 +52,8 @@ async fn commit_schedule(store: &SqliteScheduleStore, name: &str) -> Schedule {
         ScheduleLifecycleInput::Create(sample_schedule_request(name)),
     )
     .expect("schedule creation should pass generated authority");
-    let schedule = mutator.schedule.clone();
-    store
+    let schedule = mutator.schedule().clone();
+    let _commit = store
         .commit_schedule_write(mutator.into_authorized_write())
         .await
         .expect("commit schedule");
@@ -68,11 +68,14 @@ async fn commit_occurrence_due_at(
     let write = Occurrence::planned_write_from_schedule(schedule, OccurrenceOrdinal(0), due_at_utc)
         .expect("occurrence planning should pass generated authority");
     let occurrence = write.occurrence().clone();
-    store
+    let commit = store
         .commit_occurrence_write(write)
         .await
         .expect("commit occurrence");
-    occurrence
+    assert_eq!(commit.successor(), &occurrence);
+    assert!(commit.effects().is_empty());
+    assert!(commit.supersession_acks().is_empty());
+    commit.successor().clone()
 }
 
 fn claim_request(owner_id: &str, lease_duration: Duration) -> ClaimDueRequest {
@@ -92,33 +95,50 @@ async fn claim_and_dispatch(
         .claim_due_occurrences(claim_request(owner_id, lease))
         .await
         .expect("claim due occurrences");
-    let occurrence = claimed
-        .claimed
+    let claim_commit = claimed
+        .transitions
         .into_iter()
         .next()
         .expect("a due occurrence should be claimed");
+    assert_eq!(
+        claim_commit.effects(),
+        &[OccurrenceLifecycleEffect::Claimed]
+    );
+    let occurrence = claim_commit.successor().clone();
     let dispatch_mutator = occurrence
         .apply(OccurrenceLifecycleInput::DispatchStarted {
             correlation_id: Some(format!("{owner_id}-dispatch")),
             at_utc: claimed.store_now_utc,
         })
         .expect("dispatch should pass generated authority");
-    let dispatching = dispatch_mutator.occurrence.clone();
-    store
+    let dispatching = dispatch_mutator.occurrence().clone();
+    let dispatch_commit = store
         .commit_occurrence_write(dispatch_mutator.into_authorized_write())
         .await
         .expect("commit dispatch");
-    let await_mutator = dispatching
+    assert_eq!(dispatch_commit.successor(), &dispatching);
+    assert_eq!(
+        dispatch_commit.effects(),
+        &[OccurrenceLifecycleEffect::DispatchStarted]
+    );
+    let await_mutator = dispatch_commit
+        .successor()
+        .clone()
         .apply(OccurrenceLifecycleInput::AwaitCompletion {
             at_utc: claimed.store_now_utc,
         })
         .expect("await should pass generated authority");
-    let awaiting = await_mutator.occurrence.clone();
-    store
+    let awaiting = await_mutator.occurrence().clone();
+    let await_commit = store
         .commit_occurrence_write(await_mutator.into_authorized_write())
         .await
         .expect("commit await");
-    awaiting
+    assert_eq!(await_commit.successor(), &awaiting);
+    assert_eq!(
+        await_commit.effects(),
+        &[OccurrenceLifecycleEffect::AwaitingCompletion]
+    );
+    await_commit.successor().clone()
 }
 
 #[tokio::test]
@@ -175,7 +195,7 @@ async fn sqlite_lease_renewal_is_multi_host_and_exact_claim_authoritative() {
         .await
         .expect("host B renews exact host A claim");
     let renewed = match renewed.outcome {
-        RenewOccurrenceLeaseOutcome::Renewed(renewed) => Some(renewed),
+        RenewOccurrenceLeaseOutcome::Renewed(commit) => Some(commit.successor().clone()),
         RenewOccurrenceLeaseOutcome::StaleClaim => None,
     };
     assert!(
@@ -197,7 +217,7 @@ async fn sqlite_lease_renewal_is_multi_host_and_exact_claim_authoritative() {
         .await
         .expect("claim scan before renewed expiry");
     assert!(
-        before_renewed_expiry.claimed.is_empty(),
+        before_renewed_expiry.transitions.is_empty(),
         "durable cross-host renewal must prevent premature reclaim"
     );
     let still_awaiting = host_a
@@ -219,9 +239,9 @@ async fn sqlite_lease_renewal_is_multi_host_and_exact_claim_authoritative() {
         .claim_due_occurrences(claim_request("host-b", Duration::seconds(2)))
         .await
         .expect("claim after renewed lease expiry");
-    assert_eq!(reclaimed.claimed.len(), 1);
-    assert_eq!(reclaimed.claimed[0].attempt_count, 2);
-    let attempt_two_expiry = reclaimed.claimed[0].lease_expires_at_utc;
+    assert_eq!(reclaimed.transitions.len(), 1);
+    assert_eq!(reclaimed.transitions[0].attempt_count, 2);
+    let attempt_two_expiry = reclaimed.transitions[0].lease_expires_at_utc;
 
     let stale = host_a
         .renew_occurrence_lease_if_current(renewal_request)

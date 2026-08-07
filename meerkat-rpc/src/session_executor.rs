@@ -1085,6 +1085,14 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
     impl MobSessionService for BoundaryCancelSessionService {
+        async fn observe_session_resume_authority(
+            &self,
+            _session_id: &SessionId,
+        ) -> Result<meerkat_mob::SessionResumeAuthority, SessionError> {
+            // This process-local test double has no RuntimeStore authority rows.
+            Ok(meerkat_mob::SessionResumeAuthority::default())
+        }
+
         async fn prepare_session_for_resume(
             &self,
             _session_id: &SessionId,

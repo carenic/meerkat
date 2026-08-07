@@ -49,7 +49,7 @@ use crate::runtime::provisioner::{
     MemberSessionDisposalVerdict, PreparedServiceActorTransaction, RuntimeSessionState,
     RuntimeTurnFinalizationBoundaryLease,
 };
-use crate::runtime::session_service::{MobSessionService, ResumeSessionLoad};
+use crate::runtime::session_service::MobSessionService;
 
 // ---------------------------------------------------------------------------
 // Tier-2 preflight probe (DEC-P3H-8) — widens the tier-1 presence probe
@@ -154,6 +154,8 @@ pub enum MaterializeServeError {
         "recorded session '{session_id}' is terminal {state} and cannot be revived at the same tuple; the controller must advance the member generation"
     )]
     ResumeSessionNonRecoverable { session_id: String, state: String },
+    #[error("resume rejected: {}", .0.detail)]
+    ResumeRejected(crate::runtime::SessionResumeRejection),
     #[error("resume session id '{session_id}' is not a valid session id: {detail}")]
     ResumeSessionIdInvalid { session_id: String, detail: String },
     #[error("member build compile failed: {0}")]
@@ -213,7 +215,9 @@ impl MaterializeServeError {
         use meerkat_contracts::wire::supervisor_bridge::BridgeRejectionCause as Cause;
         match self {
             Self::Decompile(err) => (Cause::Unsupported, err.to_string()),
-            Self::ResumeSessionNotFound { .. } | Self::ResumeSessionNonRecoverable { .. } => {
+            Self::ResumeSessionNotFound { .. }
+            | Self::ResumeSessionNonRecoverable { .. }
+            | Self::ResumeRejected(_) => {
                 (Cause::ResumeSessionNotFound, self.to_string())
             }
             Self::ResumeSessionIdInvalid { .. } => (Cause::Unsupported, self.to_string()),
@@ -1528,6 +1532,8 @@ impl HostMemberMaterializer {
         let (
             session_id,
             resumed_session,
+            resume_materialization,
+            resume_authority,
             launch_outcome,
             generation_start_seq,
             residency_update,
@@ -1543,6 +1549,8 @@ impl HostMemberMaterializer {
                     .await;
                 (
                     id,
+                    None,
+                    None,
                     None,
                     MaterializeLaunchOutcome::Fresh,
                     1,
@@ -1601,31 +1609,26 @@ impl HostMemberMaterializer {
                 match self
                     .substrate
                     .session_service
-                    .materialize_session_for_resume(&id)
+                    .materialize_session_resume_verdict(&id)
                     .await?
                 {
-                    ResumeSessionLoad::Active(session) | ResumeSessionLoad::Revivable(session) => (
+                    crate::runtime::SessionResumeVerdict::ResumeAuthorized {
+                        authority,
+                        materialization,
+                        session,
+                        ..
+                    } => (
                         id,
                         Some(*session),
+                        Some(materialization),
+                        Some(authority),
                         MaterializeLaunchOutcome::ResumedFromSnapshot,
                         generation_start_seq,
                         residency_update,
                         Some(boundary),
                     ),
-                    // Never a silent Fresh (§19.F row 1).
-                    ResumeSessionLoad::Absent => {
-                        return Err(MaterializeServeError::ResumeSessionNotFound {
-                            session_id: session_id.clone(),
-                        });
-                    }
-                    ResumeSessionLoad::ArchivedNotRevivable { runtime_state } => {
-                        return Err(MaterializeServeError::ResumeSessionNonRecoverable {
-                            session_id: session_id.clone(),
-                            state: runtime_state.map_or_else(
-                                || "<no runtime record>".to_string(),
-                                |state| state.to_string(),
-                            ),
-                        });
+                    crate::runtime::SessionResumeVerdict::Rejected(rejection) => {
+                        return Err(MaterializeServeError::ResumeRejected(rejection));
                     }
                 }
             }
@@ -1756,6 +1759,24 @@ impl HostMemberMaterializer {
                 ),
             }
         })?;
+        let route = match resume_materialization {
+            None => crate::runtime::session_service::SessionActorMaterializationRoute::Fresh,
+            Some(crate::runtime::SessionResumeMaterialization::Active) => {
+                crate::runtime::session_service::SessionActorMaterializationRoute::Resume
+            }
+            Some(crate::runtime::SessionResumeMaterialization::Revivable) => {
+                let authorization = prepared.archived_resume_authorization().map_err(|error| {
+                    MaterializeServeError::Bindings {
+                        detail: format!(
+                            "failed to mint archived-resume authority for '{session_id}': {error}"
+                        ),
+                    }
+                })?;
+                crate::runtime::session_service::SessionActorMaterializationRoute::Revivable {
+                    authorization,
+                }
+            }
+        };
         let actor_transaction = PreparedServiceActorTransaction::new(
             session_id.clone(),
             Arc::clone(&self.substrate.session_service),
@@ -1764,8 +1785,16 @@ impl HostMemberMaterializer {
             actor_witness_slot,
         )
         .map_err(MaterializeServeError::Build)?;
+        if let Some(expected) = resume_authority.as_ref() {
+            self.substrate
+                .session_service
+                .revalidate_session_resume_authority(&session_id, expected)
+                .await
+                .map_err(MaterializeServeError::SessionService)?
+                .map_err(MaterializeServeError::ResumeRejected)?;
+        }
         let (created, actor_transaction) = actor_transaction
-            .create_owned(req, None)
+            .create_owned_with_route(req, route)
             .await
             .map_err(|error| classify_materialize_create_error(error, spec))?;
         if created.session_id != session_id {
@@ -2036,14 +2065,23 @@ impl HostMemberMaterializer {
         // quiescent and B excludes same-SessionId actor replacement. Reading
         // earlier can capture a snapshot while the old actor is still
         // committing its final turn, then recreate from stale durable state.
-        let loaded = self
+        let authorized = self
             .substrate
             .session_service
-            .materialize_session_for_resume(&session_id)
-            .await?;
-        let session = match loaded {
-            ResumeSessionLoad::Active(session) => *session,
-            ResumeSessionLoad::Revivable(session) => {
+            .materialize_session_resume_verdict(&session_id)
+            .await?
+            .into_authorized()
+            .map_err(MaterializeServeError::ResumeRejected)?;
+        let crate::runtime::AuthorizedSessionResume {
+            authority: resume_authority,
+            materialization: resume_materialization,
+            session,
+            ..
+        } = authorized;
+        let session = match resume_materialization {
+            crate::runtime::SessionResumeMaterialization::Active => *session,
+            crate::runtime::SessionResumeMaterialization::Revivable => {
+                let session = *session;
                 if !session
                     .lifecycle_terminal()
                     .is_some_and(meerkat_core::SessionLifecycleTerminal::is_archived)
@@ -2059,34 +2097,7 @@ impl HostMemberMaterializer {
                         state: meerkat_runtime::RuntimeState::Retired.to_string(),
                     });
                 }
-                *session
-            }
-            ResumeSessionLoad::ArchivedNotRevivable { runtime_state } => {
-                return Err(MaterializeServeError::ResumeSessionNonRecoverable {
-                    session_id: recorded_session_id.to_string(),
-                    state: runtime_state.map_or_else(
-                        || "<no runtime record>".to_string(),
-                        |state| state.to_string(),
-                    ),
-                });
-            }
-            ResumeSessionLoad::Absent => {
-                if self
-                    .substrate
-                    .session_service
-                    .session_known_to_archive_authority(&session_id)
-                    .await?
-                {
-                    // Preserve the absorbing contract when archive authority
-                    // knows a terminal row whose committed body is absent.
-                    return Err(MaterializeServeError::ResumeSessionNonRecoverable {
-                        session_id: recorded_session_id.to_string(),
-                        state: "Archived/Retired".to_string(),
-                    });
-                }
-                return Err(MaterializeServeError::ResumeSessionNotFound {
-                    session_id: recorded_session_id.to_string(),
-                });
+                session
             }
         };
 
@@ -2248,6 +2259,23 @@ impl HostMemberMaterializer {
                 ),
             }
         })?;
+        let route = match resume_materialization {
+            crate::runtime::SessionResumeMaterialization::Active => {
+                crate::runtime::session_service::SessionActorMaterializationRoute::Resume
+            }
+            crate::runtime::SessionResumeMaterialization::Revivable => {
+                let authorization = prepared.archived_resume_authorization().map_err(|error| {
+                    MaterializeServeError::Bindings {
+                        detail: format!(
+                            "failed to mint archived-resume authority for '{session_id}': {error}"
+                        ),
+                    }
+                })?;
+                crate::runtime::session_service::SessionActorMaterializationRoute::Revivable {
+                    authorization,
+                }
+            }
+        };
         let actor_transaction = PreparedServiceActorTransaction::new(
             session_id.clone(),
             Arc::clone(&self.substrate.session_service),
@@ -2256,8 +2284,14 @@ impl HostMemberMaterializer {
             actor_witness_slot,
         )
         .map_err(MaterializeServeError::Build)?;
+        self.substrate
+            .session_service
+            .revalidate_session_resume_authority(&session_id, &resume_authority)
+            .await
+            .map_err(MaterializeServeError::SessionService)?
+            .map_err(MaterializeServeError::ResumeRejected)?;
         let (created, actor_transaction) = actor_transaction
-            .create_owned(req, None)
+            .create_owned_with_route(req, route)
             .await
             .map_err(|error| classify_materialize_create_error(error, spec))?;
         if created.session_id != session_id {
