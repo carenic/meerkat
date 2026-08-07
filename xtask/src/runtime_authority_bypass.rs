@@ -145,22 +145,13 @@ impl RuntimeAuthorityBypassVisitor<'_> {
         }
         let method = node.method.to_string();
         match method.as_str() {
-            "enqueue" | "enqueue_front"
-                if is_queue_projection_receiver(&node.receiver)
-                    && !matches!(
-                        self.current_fn(),
-                        "apply_persist_and_queue" | "rebuild_queue_projections"
-                    ) =>
-            {
+            "enqueue" | "enqueue_front" if is_queue_projection_receiver(&node.receiver) => {
                 self.push_finding("raw accepted-input enqueue", &method);
             }
-            "dequeue"
-                if is_queue_projection_receiver(&node.receiver)
-                    && self.current_fn() != "dequeue_next" =>
-            {
+            "dequeue" if is_queue_projection_receiver(&node.receiver) => {
                 self.push_finding("raw dequeue", &method);
             }
-            "dequeue_exact_prefix" if self.current_fn() != "dequeue_batch_exact" => {
+            "dequeue_exact_prefix" => {
                 self.push_finding("raw exact dequeue", &method);
             }
             "machine_realize_stage_batch"

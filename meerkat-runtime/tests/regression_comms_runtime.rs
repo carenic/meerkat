@@ -433,7 +433,7 @@ async fn response_with_passthrough_message_both_queued() {
     let outcome2 = driver.accept_input(input2).await.unwrap();
 
     // Both should be queued
-    assert_eq!(driver.queue().len(), 2);
+    assert_eq!(driver.queue_lane().len(), 2);
     assert!(outcome1.is_accepted());
     assert!(outcome2.is_accepted());
     assert_eq!(
@@ -510,7 +510,7 @@ async fn peer_lifecycle_net_out_both_accepted() {
 
     assert!(o1.is_accepted());
     assert!(o2.is_accepted());
-    assert_eq!(driver.queue().len(), 2); // Both queued individually
+    assert_eq!(driver.queue_lane().len(), 2); // Both queued individually
 }
 
 // ---------------------------------------------------------------------------
@@ -578,7 +578,7 @@ async fn message_triggers_wake() {
         driver.take_post_admission_signal(),
         PostAdmissionSignal::WakeLoop
     );
-    assert_eq!(driver.queue().len(), 1);
+    assert_eq!(driver.queue_lane().len(), 1);
 }
 
 // ---------------------------------------------------------------------------
@@ -649,7 +649,7 @@ async fn message_blocks_survive_bridge() {
 async fn no_input_no_wake() {
     let driver = EphemeralRuntimeDriver::new(rid());
     // No accept_input called — queue empty, no wake
-    assert!(driver.queue().is_empty());
+    assert!(driver.queue_lane().is_empty());
     assert_eq!(driver.runtime_state(), RuntimeState::Idle);
 }
 
@@ -807,13 +807,13 @@ async fn drain_terminal_response_produces_exactly_one_peer_input() {
 
     // Exactly 1 input in the queue — zero Continuations.
     assert_eq!(
-        driver.queue().len(),
+        driver.queue_lane().len(),
         1,
         "terminal response must produce exactly 1 queued input"
     );
 
     // Verify the queued input is a Peer with ResponseTerminal convention.
-    let queued_ids = driver.queue().input_ids();
+    let queued_ids = driver.queue_lane();
     let queued_state = driver.input_state(&queued_ids[0]).unwrap();
     if let Some(Input::Peer(peer)) = &queued_state.persisted_input {
         assert!(

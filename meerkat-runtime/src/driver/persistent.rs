@@ -1579,19 +1579,19 @@ impl PersistentRuntimeDriver {
         self.inner.take_process_requested()
     }
 
-    /// Contract helper for recovery/queue-projection tests. Production runtime
-    /// execution must use generated batch authority via `dequeue_batch_exact`.
+    /// Contract helper for recovery tests. Production runtime execution must
+    /// hydrate payloads through generated batch authority.
     #[cfg(any(test, debug_assertions, feature = "test-support"))]
     #[doc(hidden)]
-    pub fn contract_dequeue_next_for_recovery_tests(&mut self) -> Option<(InputId, Input)> {
-        self.inner.contract_dequeue_next_for_recovery_tests()
+    pub fn contract_peek_next_for_recovery_tests(&self) -> Option<(InputId, Input)> {
+        self.inner.contract_peek_next_for_recovery_tests()
     }
 
-    pub(crate) fn dequeue_batch_exact(
-        &mut self,
+    pub(crate) fn hydrate_authorized_batch(
+        &self,
         batch: &crate::meerkat_machine::driver::AuthorizedRuntimeLoopBatch,
     ) -> Result<Vec<(InputId, Input)>, RuntimeDriverError> {
-        self.inner.dequeue_batch_exact(batch)
+        self.inner.hydrate_authorized_batch(batch)
     }
 
     pub fn has_queued_input_outside(&self, excluded: &[InputId]) -> bool {

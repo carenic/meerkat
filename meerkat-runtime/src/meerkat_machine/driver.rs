@@ -3611,13 +3611,13 @@ impl DriverEntry {
         }
     }
 
-    pub(crate) fn dequeue_batch_exact(
+    pub(crate) fn hydrate_authorized_batch(
         &mut self,
         batch: &AuthorizedRuntimeLoopBatch,
     ) -> Result<Vec<(InputId, crate::input::Input)>, RuntimeDriverError> {
         match self {
-            DriverEntry::Ephemeral(d) => d.dequeue_batch_exact(batch),
-            DriverEntry::Persistent(d) => d.dequeue_batch_exact(batch),
+            DriverEntry::Ephemeral(d) => d.hydrate_authorized_batch(batch),
+            DriverEntry::Persistent(d) => d.hydrate_authorized_batch(batch),
         }
     }
 
@@ -6131,7 +6131,7 @@ pub(crate) fn machine_recover_ephemeral_driver(
         }
     }
 
-    driver.rebuild_queue_projections_after_recovery();
+    driver.validate_queue_payloads("after ephemeral recovery")?;
 
     Ok(RecoveryReport {
         inputs_recovered: recovered,
@@ -6562,7 +6562,7 @@ pub(crate) async fn machine_recover_persistent_inputs_from_observed(
             driver.input_phase(&input_id) == Some(crate::input_state::InputLifecycleState::Queued);
         if should_requeue && !driver.has_queued_input(&input_id) {
             return Err(RuntimeDriverError::Internal(format!(
-                "persistent recover left queued input '{input_id}' out of the runtime queue projection"
+                "persistent recover left queued input '{input_id}' out of the machine-owned runtime lane"
             )));
         }
     }
@@ -6845,7 +6845,9 @@ mod tests {
                 None,
             )
             .expect("recover queued prompt input");
-        driver.rebuild_queue_projections_after_recovery();
+        driver
+            .validate_queue_payloads("after queued prompt recovery")
+            .expect("machine-owned queue payloads");
 
         let entry = DriverEntry::Ephemeral(driver);
         let selected = authorized_batch_input_ids(&entry);
@@ -6911,7 +6913,9 @@ mod tests {
                 None,
             )
             .expect("recover queued prompt input");
-        driver.rebuild_queue_projections_after_recovery();
+        driver
+            .validate_queue_payloads("after queued prompt recovery")
+            .expect("machine-owned queue payloads");
         driver.clear_admitted_runtime_semantics_for_test(&prefix_id);
 
         let entry = DriverEntry::Ephemeral(driver);
@@ -7001,7 +7005,9 @@ mod tests {
                 None,
             )
             .expect("recover queued prompt input");
-        driver.rebuild_queue_projections_after_recovery();
+        driver
+            .validate_queue_payloads("after queued prompt recovery")
+            .expect("machine-owned queue payloads");
 
         let entry = DriverEntry::Ephemeral(driver);
         let selected = authorized_batch_input_ids(&entry);
@@ -7044,7 +7050,9 @@ mod tests {
                 None,
             )
             .expect("recover queued prompt input");
-        driver.rebuild_queue_projections_after_recovery();
+        driver
+            .validate_queue_payloads("after queued prompt recovery")
+            .expect("machine-owned queue payloads");
         driver.clear_admitted_runtime_semantics_for_test(&input_id);
 
         let selected = authorized_batch_input_ids(&DriverEntry::Ephemeral(driver));
@@ -7089,7 +7097,9 @@ mod tests {
                 None,
             )
             .expect("recover steered continuation input");
-        driver.rebuild_queue_projections_after_recovery();
+        driver
+            .validate_queue_payloads("after steered continuation recovery")
+            .expect("machine-owned steer payloads");
         driver.clear_admitted_runtime_semantics_for_test(&input_id);
 
         let selected = authorized_batch_input_ids(&DriverEntry::Ephemeral(driver));
@@ -10281,7 +10291,7 @@ mod recovery_tests {
         assert_eq!(
             driver.queue_lane(),
             vec![first_id.clone(), second_id.clone()],
-            "queue projection must follow the machine-owned recovered admission sequence, not store iteration order"
+            "queue order must follow the machine-owned recovered admission sequence, not store iteration order"
         );
         assert_eq!(
             driver.admission_order(),

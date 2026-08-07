@@ -132,14 +132,6 @@ fn make_continuation() -> Input {
     Input::Continuation(ContinuationInput::detached_background_op_completed())
 }
 
-fn assert_queue_projection_alignment(driver: &EphemeralRuntimeDriver) {
-    assert_eq!(driver.queue().input_ids(), driver.queue_lane().as_slice());
-    assert_eq!(
-        driver.steer_queue().input_ids(),
-        driver.steer_lane().as_slice()
-    );
-}
-
 fn bind_running(driver: &mut EphemeralRuntimeDriver, run_id: RunId, pre_run_phase: RuntimeState) {
     assert_eq!(driver.runtime_state(), pre_run_phase);
     driver.contract_begin_run_authority(run_id).unwrap();
@@ -182,8 +174,7 @@ async fn accept_prompt_idle_queues_and_wakes() {
         driver.take_post_admission_signal(),
         PostAdmissionSignal::WakeLoop
     );
-    assert_eq!(driver.queue().len(), 1);
-    assert_queue_projection_alignment(&driver);
+    assert_eq!(driver.queue_lane().len(), 1);
 }
 
 #[tokio::test]
@@ -259,8 +250,7 @@ async fn accept_continuation_idle_wakes_and_requests_processing() {
         PostAdmissionSignal::RequestImmediateProcessing
     );
     // Continuations route to steer queue (RoutingDisposition::Steer)
-    assert_eq!(driver.steer_queue().len(), 1);
-    assert_queue_projection_alignment(&driver);
+    assert_eq!(driver.steer_lane().len(), 1);
 }
 
 #[tokio::test]
@@ -332,7 +322,7 @@ async fn retire_without_attached_loop_abandons_queued_work() {
 }
 
 #[tokio::test]
-async fn reset_abandons_and_drains() {
+async fn reset_abandons_and_clears_machine_lane() {
     let (machine, session_id, _runtime_id) = registered_machine().await;
     accept_on_machine(&machine, &session_id, make_prompt_input("a")).await;
 
@@ -398,7 +388,7 @@ async fn reset_after_retire_returns_runtime_to_idle() {
 }
 
 #[tokio::test]
-async fn recovery_counts_queued_as_recovered() -> Result<(), RuntimeDriverError> {
+async fn recovery_preserves_machine_owned_queue_membership() -> Result<(), RuntimeDriverError> {
     let mut driver = EphemeralRuntimeDriver::new(LogicalRuntimeId::new("test"));
 
     // Accept an input — policy transitions it to Queued
@@ -413,16 +403,12 @@ async fn recovery_counts_queued_as_recovered() -> Result<(), RuntimeDriverError>
         Some(InputLifecycleState::Queued)
     );
 
-    // Drain the queue (simulating crash losing queue state)
-    driver.clear_queue_projections();
-
     // Recover
     let report = driver.recover_ephemeral()?;
     // Queued inputs are counted as recovered (already in correct state)
     assert_eq!(report.inputs_recovered, 1);
     assert_eq!(report.inputs_requeued, 0); // Already Queued, no transition needed
-    assert_eq!(driver.queue().input_ids(), vec![input_id]);
-    assert_queue_projection_alignment(&driver);
+    assert_eq!(driver.queue_lane(), vec![input_id]);
     Ok(())
 }
 

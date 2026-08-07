@@ -17584,8 +17584,7 @@ macro_rules! meerkat_catalog_machine_dsl {
         }
 
         // PrioritizeInput: assign a machine-owned front-of-backlog order token.
-        // The shell may only observe the generated order when rebuilding its
-        // queue projection.
+        // The shell reads the generated order directly when hydrating payloads.
         transition PrioritizeInput {
             per_phase [Idle, Attached, Running, Retired, Stopped]
             on input PrioritizeInput { input_id }
@@ -17639,9 +17638,8 @@ macro_rules! meerkat_catalog_machine_dsl {
         }
 
         // StageForRun: stage a queued input for a run. Removes the input
-        // from its work lane — staged inputs are no longer "currently
-        // queuable". The shell's queue projections are derived from
-        // `input_lane` membership and must not include staged inputs.
+        // from its work lane - staged inputs are no longer "currently
+        // queuable". `input_lane` is the singular ordered-membership authority.
         transition StageForRun {
             per_phase [Idle, Attached, Running, Retired, Stopped]
             on input StageForRun { input_id, run_id }
