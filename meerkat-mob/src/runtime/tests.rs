@@ -33727,6 +33727,86 @@ async fn test_provision_member_uses_local_bindings_before_routed_runtime_bound()
 }
 
 #[cfg(feature = "runtime-adapter")]
+#[tokio::test]
+async fn test_multi_backend_session_provision_forwards_injected_authorized_resume() {
+    let service = Arc::new(MockSessionService::new());
+    let adapter = Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
+    service.set_runtime_adapter(adapter.clone());
+    let definition = sample_definition();
+    let supervisor_bridge = Arc::new(
+        crate::runtime::MobSupervisorBridge::new(
+            &definition.id,
+            default_supervisor_authority_record(),
+            None,
+        )
+        .await
+        .expect("build test supervisor bridge"),
+    );
+    let provisioner = super::provisioner::MultiBackendProvisioner::new(
+        service.clone(),
+        Some(adapter),
+        None,
+        None,
+        supervisor_bridge,
+    );
+    let session = Session::new();
+    let session_id = session.id().clone();
+    service.replace_live_session(session.clone()).await;
+    let authorized_resume = service
+        .materialize_session_resume_verdict(&session_id)
+        .await
+        .expect("materialize one owner-issued resume verdict")
+        .into_authorized()
+        .expect("persisted test session is resumable");
+    assert_eq!(
+        service.resume_prepare_calls.load(Ordering::Relaxed),
+        1,
+        "the caller should materialize exactly one resume verdict"
+    );
+
+    let receipt = provisioner
+        .provision_member(super::provisioner::ProvisionMemberRequest {
+            authorized_resume: Some(authorized_resume),
+            session_origin: super::provisioner::ProvisionSessionOrigin::ResumedDurable,
+            create_session: CreateSessionRequest {
+                injected_context: Vec::new(),
+                model: "claude-sonnet-4-5".to_string(),
+                prompt: "forward injected resume authority".to_string().into(),
+                system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+                max_tokens: None,
+                event_tx: None,
+                build: Some(meerkat_core::service::SessionBuildOptions {
+                    resume_session: Some(session),
+                    comms_name: Some("test-mob/worker/forward-authorized-resume".to_string()),
+                    keep_alive: true,
+                    ..Default::default()
+                }),
+                initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+                deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+                labels: None,
+            },
+            binding: crate::RuntimeBinding::Session,
+            peer_name: "forward-authorized-resume".to_string(),
+            owner_bridge_session_id: None,
+            ops_registry: None,
+            generated_self_owned_operation_owner: Some(session_id),
+            runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
+        })
+        .await
+        .expect("session arm should consume the injected resume authorization");
+
+    assert_eq!(
+        service.resume_prepare_calls.load(Ordering::Relaxed),
+        1,
+        "MultiBackendProvisioner must forward the injected verdict instead of materializing it again"
+    );
+    provisioner
+        .retire_member(&receipt.member_ref)
+        .await
+        .expect("retire forwarded-resume fixture");
+}
+
+#[cfg(feature = "runtime-adapter")]
 struct FencedRetirementSessionStore {
     inner: Arc<MemoryStore>,
     presented_fence: AtomicU64,

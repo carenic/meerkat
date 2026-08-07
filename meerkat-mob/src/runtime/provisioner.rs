@@ -8854,7 +8854,7 @@ impl MobProvisioner for MultiBackendProvisioner {
                 self.session
                     .provision_member(ProvisionMemberRequest {
                         create_session: req.create_session,
-                        authorized_resume: None,
+                        authorized_resume: req.authorized_resume,
                         session_origin: req.session_origin,
                         binding: RuntimeBinding::Session,
                         peer_name: req.peer_name,
