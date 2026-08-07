@@ -1714,15 +1714,24 @@ impl HostMemberMaterializer {
             meerkat_core::runtime_epoch::RuntimeBuildMode::SessionOwned(bindings);
 
         if let Some(expected) = resume_authority.as_ref() {
-            revalidate_session_resume_authority_after_machine_prepare(
-                &self.substrate.session_service,
-                &session_id,
-                expected,
-                &prepared,
-            )
-            .await
-            .map_err(MaterializeServeError::SessionService)?
-            .map_err(MaterializeServeError::ResumeRejected)?;
+            let revalidation_error =
+                match revalidate_session_resume_authority_after_machine_prepare(
+                    &self.substrate.session_service,
+                    &session_id,
+                    expected,
+                    &prepared,
+                )
+                .await
+                {
+                    Ok(Ok(())) => None,
+                    Ok(Err(rejection)) => Some(MaterializeServeError::ResumeRejected(rejection)),
+                    Err(error) => Some(MaterializeServeError::SessionService(error)),
+                };
+            if let Some(original) = revalidation_error {
+                return Err(self
+                    .rollback_prepared_session_after_failure(&mut prepared, original)
+                    .await);
+            }
         }
 
         // Step 4 — host-seeded supervisor authority (DEC-P3H-4): the SAME
@@ -2219,15 +2228,30 @@ impl HostMemberMaterializer {
         config.runtime_build_mode =
             meerkat_core::runtime_epoch::RuntimeBuildMode::SessionOwned(bindings);
 
-        revalidate_session_resume_authority_after_machine_prepare(
+        let revalidation_error = match revalidate_session_resume_authority_after_machine_prepare(
             &self.substrate.session_service,
             &session_id,
             &resume_authority,
             &prepared,
         )
         .await
-        .map_err(MaterializeServeError::SessionService)?
-        .map_err(MaterializeServeError::ResumeRejected)?;
+        {
+            Ok(Ok(())) => None,
+            Ok(Err(rejection)) => Some(MaterializeServeError::ResumeRejected(rejection)),
+            Err(error) => Some(MaterializeServeError::SessionService(error)),
+        };
+        if let Some(original) = revalidation_error {
+            drop(config);
+            drop(member_runtime);
+            drop(live);
+            let original = self
+                .rollback_prepared_session_after_failure(&mut prepared, original)
+                .await;
+            drop(materialization_boundary.take());
+            return Err(self
+                .preserve_snapshot_after_revival_failure(&session_id, original)
+                .await);
+        }
 
         if let Err(error) = meerkat_runtime::comms_drain::bind_supervisor_for_materialized_session(
             self.substrate.runtime_adapter.as_ref(),
