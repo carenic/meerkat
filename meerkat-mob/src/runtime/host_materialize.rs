@@ -216,11 +216,17 @@ impl MaterializeServeError {
         use meerkat_contracts::wire::supervisor_bridge::BridgeRejectionCause as Cause;
         match self {
             Self::Decompile(err) => (Cause::Unsupported, err.to_string()),
-            Self::ResumeSessionNotFound { .. }
-            | Self::ResumeSessionNonRecoverable { .. }
-            | Self::ResumeRejected(_) => {
+            Self::ResumeSessionNotFound { .. } | Self::ResumeSessionNonRecoverable { .. } => {
                 (Cause::ResumeSessionNotFound, self.to_string())
             }
+            Self::ResumeRejected(rejection) => match rejection.terminality {
+                crate::runtime::ResumeVerdictTerminality::StableParkable => {
+                    (Cause::ResumeSessionNotFound, self.to_string())
+                }
+                crate::runtime::ResumeVerdictTerminality::TransientRetryable => {
+                    (Cause::Unavailable, self.to_string())
+                }
+            },
             Self::ResumeSessionIdInvalid { .. } => (Cause::Unsupported, self.to_string()),
             Self::AuthBindingUnresolvable { realm, binding, .. } => (
                 Cause::AuthBindingUnresolvable {
@@ -2911,6 +2917,29 @@ mod tests {
         assert!(reason.contains("interactive_login_required"));
         assert!(reason.contains("global/anthropic"));
         assert!(!reason.contains("credential"));
+    }
+
+    #[test]
+    fn resume_rejection_wire_cause_preserves_verdict_terminality() {
+        use meerkat_contracts::wire::supervisor_bridge::BridgeRejectionCause;
+
+        let session_id = SessionId::new();
+        let crate::runtime::SessionResumeVerdict::Rejected(transient) =
+            crate::runtime::SessionResumeVerdict::authority_changed_during_materialization(
+                &session_id,
+                crate::runtime::SessionResumeAuthority::default(),
+            )
+        else {
+            panic!("authority change must produce a typed rejection");
+        };
+
+        let (cause, _) = MaterializeServeError::ResumeRejected(transient.clone()).wire_cause();
+        assert_eq!(cause, BridgeRejectionCause::Unavailable);
+
+        let mut stable = transient;
+        stable.terminality = crate::runtime::ResumeVerdictTerminality::StableParkable;
+        let (cause, _) = MaterializeServeError::ResumeRejected(stable).wire_cause();
+        assert_eq!(cause, BridgeRejectionCause::ResumeSessionNotFound);
     }
 
     // T21 — decompile totality over the contracts fixture: every carried
