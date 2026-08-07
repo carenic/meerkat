@@ -13230,11 +13230,8 @@ async fn test_destroy_autonomous_archive_failure_retry_reaches_archive_after_run
         "archive failure must retain the member roster anchor for retry"
     );
     assert!(
-        service
-            .has_live_session(&bridge_session_id)
-            .await
-            .expect("check worker session after archive failure"),
-        "failed archive must leave the bridge session available for retry"
+        !service.test_is_session_archived(&bridge_session_id).await,
+        "failed archive must leave durable session authority available for retry"
     );
 
     service
