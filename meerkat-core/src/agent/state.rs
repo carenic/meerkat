@@ -2465,10 +2465,14 @@ where
                                 }
                             }
                             if let Some(projection) = self.in_flight_compaction_stage.as_ref() {
-                                return Err(AgentError::InternalError(format!(
-                                    "compaction stage {} remains pending cleanup",
-                                    projection.revision()
-                                )));
+                                return Err(
+                                    AgentError::session_durable_projection_authority_unknown(
+                                        format!(
+                                            "compaction stage {} remains pending cleanup",
+                                            projection.revision()
+                                        ),
+                                    ),
+                                );
                             }
                             if rewrite_committed {
                                 self.last_input_tokens = 0;
@@ -4379,17 +4383,39 @@ where
         // context pending across fallible/async request hydration.
         // Only the final synchronous consume below records that the
         // model request has crossed its consumption seam.
-        let boundary_contexts = self
+        let boundary_contexts = match self
             .take_transient_turn_context_at_boundary(ctx.run_id)
             .await
-            .map_err(|e| AgentError::InternalError(e.to_string()))?;
+            .map_err(|e| AgentError::InternalError(e.to_string()))
+        {
+            Ok(contexts) => contexts,
+            Err(error) => {
+                return self
+                    .complete_calling_llm_request_failure(ctx, prepared.in_extraction, error)
+                    .await;
+            }
+        };
         let base_context_count = self.active_turn_request_contexts.len();
         self.active_turn_request_contexts.extend(boundary_contexts);
         let request_messages = self.llm_messages_for_boundary(!prepared.in_extraction);
         self.active_turn_request_contexts
             .truncate(base_context_count);
-        let request_messages = request_messages?;
-        let request_messages = self.hydrate_llm_request_messages(request_messages).await?;
+        let request_messages = match request_messages {
+            Ok(messages) => messages,
+            Err(error) => {
+                return self
+                    .complete_calling_llm_request_failure(ctx, prepared.in_extraction, error)
+                    .await;
+            }
+        };
+        let request_messages = match self.hydrate_llm_request_messages(request_messages).await {
+            Ok(messages) => messages,
+            Err(error) => {
+                return self
+                    .complete_calling_llm_request_failure(ctx, prepared.in_extraction, error)
+                    .await;
+            }
+        };
         let request_pressure = match self.client.request_pressure(
             &request_messages,
             call_tool_defs,
@@ -4399,9 +4425,9 @@ where
         ) {
             Ok(pressure) => pressure,
             Err(error) => {
-                self.terminalize_fatal_error(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
-                    .await?;
-                return Err(error);
+                return self
+                    .complete_calling_llm_request_failure(ctx, prepared.in_extraction, error)
+                    .await;
             }
         };
 
@@ -4412,9 +4438,9 @@ where
                     before.encoded_bytes,
                     before.max_bytes,
                 );
-                self.terminalize_fatal_error(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
-                    .await?;
-                return Err(error);
+                return self
+                    .complete_calling_llm_request_failure(ctx, prepared.in_extraction, error)
+                    .await;
             };
             let effective_cap = self
                 .compactor
@@ -4433,9 +4459,9 @@ where
                     after.encoded_bytes,
                     effective_cap,
                 );
-                self.terminalize_fatal_error(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
-                    .await?;
-                return Err(error);
+                return self
+                    .complete_calling_llm_request_failure(ctx, prepared.in_extraction, error)
+                    .await;
             }
         }
 
@@ -4447,8 +4473,14 @@ where
                 next_phase: TurnPhase::CallingLlm,
                 effects: vec![TurnExecutionEffect::CheckCompaction],
             };
-            self.execute_turn_effects(&transition, ctx.turn_count, ctx.event_tx)
-                .await?;
+            if let Err(error) = self
+                .execute_turn_effects(&transition, ctx.turn_count, ctx.event_tx)
+                .await
+            {
+                return self
+                    .complete_calling_llm_request_failure(ctx, prepared.in_extraction, error)
+                    .await;
+            }
             if self.compaction_cadence.last_compaction_boundary_index != prior_completed_boundary {
                 // The request composed above belongs to the old transcript.
                 // Re-enter the boundary so system overlays, blobs,
@@ -4476,21 +4508,31 @@ where
                 pressure.encoded_bytes,
                 effective_cap,
             );
-            self.terminalize_fatal_error(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
-                .await?;
-            return Err(error);
+            return self
+                .complete_calling_llm_request_failure(ctx, prepared.in_extraction, error)
+                .await;
         }
         // Give the machine-authorized compaction path the first opportunity to
         // produce a fitting rewrite. Only the fully rebuilt request that would
         // otherwise cross the provider boundary is classified against the
         // active model's context authority.
-        if let Some(error) = self.context_budget_preflight_error(
+        let context_budget_error = match self.context_budget_preflight_error(
             &request_messages,
             call_tool_defs,
             prepared.effective_max_tokens,
             request_pressure,
-        )? {
-            return self.complete_calling_llm_failure(ctx, &error).await;
+        ) {
+            Ok(error) => error,
+            Err(error) => {
+                return self
+                    .complete_calling_llm_request_failure(ctx, prepared.in_extraction, error)
+                    .await;
+            }
+        };
+        if let Some(error) = context_budget_error {
+            return self
+                .complete_calling_llm_request_failure(ctx, prepared.in_extraction, error)
+                .await;
         }
         let result = match self
             .call_llm_with_retry(LlmRetryRequest {
@@ -4516,45 +4558,63 @@ where
             Ok(LlmRetryOutcome::RepollAfterCompaction) => {
                 return Ok(CallingLlmGate::Repoll);
             }
-            Err(e) => {
-                if e.requires_session_teardown() {
-                    return Err(e);
-                }
-                if let Some(exceeded) = BudgetExceeded::from_agent_error(&e) {
-                    emit_phase_event!(self, ctx, budget_warning_event(exceeded));
-                    self.apply_turn_input(TurnExecutionInput::BudgetLimitExceeded {
-                        run_id: ctx.run_id.clone(),
-                        exceeded,
-                    })?;
-                    return Ok(CallingLlmGate::Done(
-                        self.build_result(ctx.turn_count, ctx.tool_call_count).await,
-                    ));
-                }
-                // Extraction runs after the main run has already completed.
-                // Its provider and validation failures belong to the typed
-                // ExtractionFailed result and must not retroactively replace
-                // the completed run terminal with RunFailed.
-                if prepared.in_extraction {
-                    return Ok(CallingLlmGate::Done(
-                        self.complete_extraction_failed(
-                            ctx.run_id,
-                            ctx.turn_count,
-                            ctx.tool_call_count,
-                            e.to_string(),
-                            ctx.event_tx,
-                        )
-                        .await,
-                    ));
-                }
-                if matches!(&e, AgentError::Llm { .. }) {
-                    return self.complete_calling_llm_failure(ctx, &e).await;
-                }
-                self.terminalize_fatal_error(ctx.run_id, ctx.turn_count, ctx.event_tx, &e)
-                    .await?;
-                return Err(e);
+            Err(error) => {
+                return self
+                    .complete_calling_llm_request_failure(ctx, prepared.in_extraction, error)
+                    .await;
             }
         };
         Ok(CallingLlmGate::Continue(result))
+    }
+
+    /// Terminalize one failed request preparation or LLM attempt through the
+    /// owner of the active main-run or extraction phase.
+    async fn complete_calling_llm_request_failure(
+        &mut self,
+        ctx: &mut CallingLlmTurnCtx<'_>,
+        in_extraction: bool,
+        error: AgentError,
+    ) -> Result<CallingLlmGate<LlmStreamResult>, AgentError> {
+        if error.requires_session_teardown() {
+            return Err(error);
+        }
+        // Extraction runs after the main run has already completed. Every
+        // non-teardown failure from request preparation through retry belongs
+        // to ExtractionFailed and must not replace that completed terminal.
+        if in_extraction {
+            let reason = if let Some(exceeded) = BudgetExceeded::from_agent_error(&error) {
+                emit_phase_event!(self, ctx, budget_warning_event(exceeded));
+                format!("extraction budget exceeded: {exceeded:?}")
+            } else {
+                error.to_string()
+            };
+            return Ok(CallingLlmGate::Done(
+                self.complete_extraction_failed(
+                    ctx.run_id,
+                    ctx.turn_count,
+                    ctx.tool_call_count,
+                    reason,
+                    ctx.event_tx,
+                )
+                .await,
+            ));
+        }
+        if let Some(exceeded) = BudgetExceeded::from_agent_error(&error) {
+            emit_phase_event!(self, ctx, budget_warning_event(exceeded));
+            self.apply_turn_input(TurnExecutionInput::BudgetLimitExceeded {
+                run_id: ctx.run_id.clone(),
+                exceeded,
+            })?;
+            return Ok(CallingLlmGate::Done(
+                self.build_result(ctx.turn_count, ctx.tool_call_count).await,
+            ));
+        }
+        if matches!(&error, AgentError::Llm { .. }) {
+            return self.complete_calling_llm_failure(ctx, &error).await;
+        }
+        self.terminalize_fatal_error(ctx.run_id, ctx.turn_count, ctx.event_tx, &error)
+            .await?;
+        Err(error)
     }
 
     /// Commit one typed LLM failure through the generated fatal transition and
@@ -17693,6 +17753,86 @@ mod tests {
         }
     }
 
+    struct BudgetFailingExtractionClient {
+        call_count: Mutex<u32>,
+    }
+
+    #[async_trait]
+    impl AgentLlmClient for BudgetFailingExtractionClient {
+        async fn stream_response(
+            &self,
+            _messages: &[Message],
+            _tools: &[Arc<ToolDef>],
+            _max_tokens: u32,
+            _temperature: Option<f32>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
+        ) -> Result<super::LlmStreamResult, AgentError> {
+            let mut call_count = self.call_count.lock().unwrap();
+            *call_count += 1;
+            if *call_count == 1 {
+                Ok(text_response("main answer"))
+            } else {
+                Err(AgentError::TokenBudgetExceeded {
+                    used: 101,
+                    limit: 100,
+                })
+            }
+        }
+
+        fn provider(&self) -> crate::provider::Provider {
+            crate::provider::Provider::Other
+        }
+
+        fn model(&self) -> &'static str {
+            "mock-model"
+        }
+    }
+
+    struct PressureFailingExtractionClient {
+        pressure_calls: Mutex<u32>,
+    }
+
+    #[async_trait]
+    impl AgentLlmClient for PressureFailingExtractionClient {
+        fn request_pressure(
+            &self,
+            _messages: &[Message],
+            _tools: &[Arc<ToolDef>],
+            _max_tokens: u32,
+            _temperature: Option<f32>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
+        ) -> Result<Option<crate::ProviderRequestPressure>, AgentError> {
+            let mut pressure_calls = self.pressure_calls.lock().unwrap();
+            *pressure_calls += 1;
+            if *pressure_calls == 1 {
+                Ok(None)
+            } else {
+                Err(AgentError::InternalError(
+                    "extraction pressure failed".to_string(),
+                ))
+            }
+        }
+
+        async fn stream_response(
+            &self,
+            _messages: &[Message],
+            _tools: &[Arc<ToolDef>],
+            _max_tokens: u32,
+            _temperature: Option<f32>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
+        ) -> Result<super::LlmStreamResult, AgentError> {
+            Ok(text_response("main answer"))
+        }
+
+        fn provider(&self) -> crate::provider::Provider {
+            crate::provider::Provider::Other
+        }
+
+        fn model(&self) -> &'static str {
+            "mock-model"
+        }
+    }
+
     /// Row #194: a client that completes the main agentic turn normally but
     /// whose `compile_schema` fails, so structured-output extraction setup
     /// cannot proceed.
@@ -18788,6 +18928,138 @@ mod tests {
         assert!(
             !saw_run_failed,
             "extraction failure must not re-fail the run"
+        );
+    }
+
+    #[tokio::test]
+    async fn extraction_retry_budget_failure_preserves_completed_main_run() {
+        let schema = crate::types::OutputSchema::new(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "answer": { "type": "string" }
+            },
+            "required": ["answer"]
+        }))
+        .unwrap();
+
+        let client = Arc::new(BudgetFailingExtractionClient {
+            call_count: Mutex::new(0),
+        });
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .output_schema(schema)
+            .build_standalone(client, Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(32);
+        let result = agent
+            .run_with_events("prompt".to_string().into(), tx)
+            .await
+            .expect("extraction budget failure should not fail the completed main run");
+
+        assert_eq!(result.text, "main answer");
+        assert_eq!(result.terminal_cause_kind, None);
+        let extraction_error = result
+            .extraction_error
+            .expect("extraction budget failure should be returned");
+        assert!(
+            extraction_error
+                .reason
+                .contains("extraction budget exceeded"),
+            "reason should retain the extraction-specific budget classification: {}",
+            extraction_error.reason
+        );
+
+        let mut saw_run_completed = false;
+        let mut saw_run_failed = false;
+        let mut saw_extraction_failed = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                crate::event::AgentEvent::RunCompleted {
+                    extraction_required,
+                    ..
+                } => {
+                    assert!(extraction_required);
+                    saw_run_completed = true;
+                }
+                crate::event::AgentEvent::RunFailed { .. } => saw_run_failed = true,
+                crate::event::AgentEvent::ExtractionFailed { reason, .. } => {
+                    assert!(reason.contains("extraction budget exceeded"));
+                    saw_extraction_failed = true;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_run_completed);
+        assert!(saw_extraction_failed);
+        assert!(
+            !saw_run_failed,
+            "extraction budget failure must not re-fail the completed run"
+        );
+    }
+
+    #[tokio::test]
+    async fn extraction_request_pressure_failure_preserves_completed_main_run() {
+        let schema = crate::types::OutputSchema::new(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "answer": { "type": "string" }
+            },
+            "required": ["answer"]
+        }))
+        .unwrap();
+
+        let client = Arc::new(PressureFailingExtractionClient {
+            pressure_calls: Mutex::new(0),
+        });
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .output_schema(schema)
+            .build_standalone(client, Arc::new(NoTools), Arc::new(NoopStore))
+            .await;
+
+        let (tx, mut rx) = mpsc::channel::<crate::event::AgentEvent>(32);
+        let result = agent
+            .run_with_events("prompt".to_string().into(), tx)
+            .await
+            .expect("extraction request failure should not fail the completed main run");
+
+        assert_eq!(result.text, "main answer");
+        assert_eq!(result.terminal_cause_kind, None);
+        let extraction_error = result
+            .extraction_error
+            .expect("extraction request failure should be returned");
+        assert!(
+            extraction_error
+                .reason
+                .contains("extraction pressure failed")
+        );
+
+        let mut saw_run_completed = false;
+        let mut saw_run_failed = false;
+        let mut saw_extraction_failed = false;
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                crate::event::AgentEvent::RunCompleted {
+                    extraction_required,
+                    ..
+                } => {
+                    assert!(extraction_required);
+                    saw_run_completed = true;
+                }
+                crate::event::AgentEvent::RunFailed { .. } => saw_run_failed = true,
+                crate::event::AgentEvent::ExtractionFailed { reason, .. } => {
+                    assert!(reason.contains("extraction pressure failed"));
+                    saw_extraction_failed = true;
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_run_completed);
+        assert!(saw_extraction_failed);
+        assert!(
+            !saw_run_failed,
+            "extraction request failure must not re-fail the completed run"
         );
     }
 
