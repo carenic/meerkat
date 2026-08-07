@@ -480,24 +480,47 @@ impl RequestedSessionMaterialization {
         let Self::Resume { authority, .. } = self else {
             return Ok(());
         };
-        let current = session_service
-            .observe_session_resume_authority(session_id)
-            .await
-            .map_err(MobError::SessionError)?;
-        if &current == authority
-            || authorized_machine_prepare_lifecycle_transition(authority, &current, prepared).await
-        {
-            return Ok(());
-        }
-        let super::session_service::SessionResumeVerdict::Rejected(rejection) =
-            super::session_service::SessionResumeVerdict::authority_changed_during_materialization(
-                session_id, current,
-            )
-        else {
-            unreachable!("authority-change constructor always rejects")
-        };
-        Err(rejection.into_mob_error())
+        revalidate_session_resume_authority_after_machine_prepare(
+            session_service,
+            session_id,
+            authority,
+            prepared,
+        )
+        .await
+        .map_err(MobError::SessionError)?
+        .map_err(super::session_service::SessionResumeRejection::into_mob_error)
     }
+}
+
+/// Revalidate one owner-issued resume authority after the runtime owner has
+/// prepared the same session for actor creation.
+///
+/// Exact equality remains the ordinary path. The only accepted difference is
+/// the lifecycle transition proven by the non-cloneable machine preparation
+/// lease itself; shell callers do not reproduce that transition table.
+#[cfg(feature = "runtime-adapter")]
+pub(crate) async fn revalidate_session_resume_authority_after_machine_prepare(
+    session_service: &Arc<dyn MobSessionService>,
+    session_id: &SessionId,
+    expected: &super::session_service::SessionResumeAuthority,
+    prepared: &PreparedSessionMaterialization,
+) -> Result<Result<(), super::session_service::SessionResumeRejection>, SessionError> {
+    let current = session_service
+        .observe_session_resume_authority(session_id)
+        .await?;
+    if &current == expected
+        || authorized_machine_prepare_lifecycle_transition(expected, &current, prepared).await
+    {
+        return Ok(Ok(()));
+    }
+    let super::session_service::SessionResumeVerdict::Rejected(rejection) =
+        super::session_service::SessionResumeVerdict::authority_changed_during_materialization(
+            session_id, current,
+        )
+    else {
+        unreachable!("authority-change constructor always rejects")
+    };
+    Ok(Err(rejection))
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -526,32 +549,6 @@ async fn authorized_machine_prepare_lifecycle_transition(
     else {
         return false;
     };
-    let prepared_epoch = prepared.bindings().epoch_id().to_string();
-    let expected_supervisor = match expected.lifecycle() {
-        meerkat_runtime::store::MachineLifecycleObservation::Missing => None,
-        meerkat_runtime::store::MachineLifecycleObservation::Decoded { record, .. }
-            if record.runtime_state() == Some(meerkat_runtime::RuntimeState::Retired) =>
-        {
-            if record.binding().agent_runtime_id().is_some()
-                || record.binding().fence_token().is_some()
-                || record.binding().runtime_generation().is_some()
-                || record
-                    .binding()
-                    .runtime_epoch_id()
-                    .is_some_and(|runtime_epoch_id| runtime_epoch_id != prepared_epoch)
-                || record.run().current_run_id().is_some()
-                || record.run().pre_run_phase().is_some()
-                || record.unregister_progress().is_some()
-            {
-                return false;
-            }
-            Some(record.supervisor_authority())
-        }
-        _ => return false,
-    };
-    let expected_runtime_state = expected_supervisor
-        .as_ref()
-        .map(|_| meerkat_runtime::RuntimeState::Retired);
     if expected.session_authority() != current.session_authority() {
         return false;
     }
@@ -560,38 +557,14 @@ async fn authorized_machine_prepare_lifecycle_transition(
     else {
         return false;
     };
-    if expected_catalog.runtime_state() != expected_runtime_state
-        || current_catalog.runtime_state() != Some(meerkat_runtime::RuntimeState::Idle)
+    if current_catalog.runtime_state() != Some(meerkat_runtime::RuntimeState::Idle)
         || !same_physical_session_catalog(expected_catalog, current_catalog)
     {
         return false;
     }
-    let meerkat_runtime::store::MachineLifecycleObservation::Decoded { record, .. } =
-        current.lifecycle()
-    else {
-        return false;
-    };
-    let binding_matches_prepared = record.binding().agent_runtime_id().is_none()
-        && record.binding().fence_token().is_none()
-        && record.binding().runtime_generation().is_none()
-        && record
-            .binding()
-            .runtime_epoch_id()
-            .is_none_or(|runtime_epoch_id| runtime_epoch_id == prepared_epoch)
-        && record.run().current_run_id().is_none()
-        && record.run().pre_run_phase().is_none()
-        && record.unregister_progress().is_none();
-    let supervisor_matches_source = match expected_supervisor {
-        Some(expected_supervisor) => record.supervisor_authority() == expected_supervisor,
-        None => matches!(
-            record.supervisor_authority(),
-            meerkat_runtime::store::SupervisorAuthoritySnapshot::UnboundNoReceipt
-        ),
-    };
-    record.runtime_state() == Some(meerkat_runtime::RuntimeState::Idle)
-        && binding_matches_prepared
-        && supervisor_matches_source
-        && prepared.owns_current_materialization_claim().await
+    prepared
+        .owns_resume_lifecycle_transition(expected, current)
+        .await
 }
 
 /// ADJ-3: the `MaterializeMember` bridge budget. Member builds include

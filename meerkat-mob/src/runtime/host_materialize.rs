@@ -48,6 +48,7 @@ use crate::runtime::provisioner::{
     CommittedRuntimeSessionPublicationLease, MemberSessionDisposalArc,
     MemberSessionDisposalVerdict, PreparedServiceActorTransaction, RuntimeSessionState,
     RuntimeTurnFinalizationBoundaryLease,
+    revalidate_session_resume_authority_after_machine_prepare,
 };
 use crate::runtime::session_service::MobSessionService;
 
@@ -1706,6 +1707,18 @@ impl HostMemberMaterializer {
         config.runtime_build_mode =
             meerkat_core::runtime_epoch::RuntimeBuildMode::SessionOwned(bindings);
 
+        if let Some(expected) = resume_authority.as_ref() {
+            revalidate_session_resume_authority_after_machine_prepare(
+                &self.substrate.session_service,
+                &session_id,
+                expected,
+                &prepared,
+            )
+            .await
+            .map_err(MaterializeServeError::SessionService)?
+            .map_err(MaterializeServeError::ResumeRejected)?;
+        }
+
         // Step 4 — host-seeded supervisor authority (DEC-P3H-4): the SAME
         // staged machine seams the member drain's BindMember arm uses, with
         // the host-authority-adjudicated payload facts. No BindMember round
@@ -1785,14 +1798,6 @@ impl HostMemberMaterializer {
             actor_witness_slot,
         )
         .map_err(MaterializeServeError::Build)?;
-        if let Some(expected) = resume_authority.as_ref() {
-            self.substrate
-                .session_service
-                .revalidate_session_resume_authority(&session_id, expected)
-                .await
-                .map_err(MaterializeServeError::SessionService)?
-                .map_err(MaterializeServeError::ResumeRejected)?;
-        }
         let (created, actor_transaction) = actor_transaction
             .create_owned_with_route(req, route)
             .await
@@ -2208,6 +2213,16 @@ impl HostMemberMaterializer {
         config.runtime_build_mode =
             meerkat_core::runtime_epoch::RuntimeBuildMode::SessionOwned(bindings);
 
+        revalidate_session_resume_authority_after_machine_prepare(
+            &self.substrate.session_service,
+            &session_id,
+            &resume_authority,
+            &prepared,
+        )
+        .await
+        .map_err(MaterializeServeError::SessionService)?
+        .map_err(MaterializeServeError::ResumeRejected)?;
+
         if let Err(error) = meerkat_runtime::comms_drain::bind_supervisor_for_materialized_session(
             self.substrate.runtime_adapter.as_ref(),
             &session_id,
@@ -2284,12 +2299,6 @@ impl HostMemberMaterializer {
             actor_witness_slot,
         )
         .map_err(MaterializeServeError::Build)?;
-        self.substrate
-            .session_service
-            .revalidate_session_resume_authority(&session_id, &resume_authority)
-            .await
-            .map_err(MaterializeServeError::SessionService)?
-            .map_err(MaterializeServeError::ResumeRejected)?;
         let (created, actor_transaction) = actor_transaction
             .create_owned_with_route(req, route)
             .await

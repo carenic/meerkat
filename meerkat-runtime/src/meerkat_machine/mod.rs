@@ -3062,6 +3062,122 @@ impl PreparedSessionMaterialization {
         })
     }
 
+    /// Prove that one atomic resume observation is the current durable
+    /// lifecycle realization owned by this exact Prepared claim.
+    ///
+    /// Session/document authority remains the caller's concern. The runtime
+    /// owns lifecycle normalization, so callers must not duplicate its state
+    /// transition table in shell code. This check retains the machine mutation
+    /// gate from the exact in-process claim proof through the store read.
+    #[must_use]
+    pub async fn owns_resume_lifecycle_transition(
+        &self,
+        expected: &crate::store::RuntimeSessionResumeObservation,
+        current: &crate::store::RuntimeSessionResumeObservation,
+    ) -> bool {
+        if !self.armed
+            || expected.runtime_id() != current.runtime_id()
+            || current.runtime_id()
+                != &crate::identifiers::LogicalRuntimeId::for_session(self.session_id())
+        {
+            return false;
+        }
+        let expected_supervisor = match expected.lifecycle() {
+            crate::store::MachineLifecycleObservation::Missing => {
+                &crate::store::SupervisorAuthoritySnapshot::UnboundNoReceipt
+            }
+            crate::store::MachineLifecycleObservation::Decoded { record, .. }
+                if matches!(
+                    record.runtime_state(),
+                    Some(
+                        RuntimeState::Idle
+                            | RuntimeState::Attached
+                            | RuntimeState::Running
+                            | RuntimeState::Stopped
+                            | RuntimeState::Retired
+                    )
+                ) =>
+            {
+                record.supervisor_authority()
+            }
+            crate::store::MachineLifecycleObservation::Decoded { .. }
+            | crate::store::MachineLifecycleObservation::Unsupported { .. }
+            | crate::store::MachineLifecycleObservation::Malformed { .. } => return false,
+        };
+        let crate::store::MachineLifecycleObservation::Decoded { record, .. } = current.lifecycle()
+        else {
+            return false;
+        };
+        let prepared_epoch = self.bindings.epoch_id().to_string();
+        if record.runtime_state() != Some(RuntimeState::Idle)
+            || record.binding().agent_runtime_id().is_some()
+            || record.binding().fence_token().is_some()
+            || record.binding().runtime_generation().is_some()
+            || record
+                .binding()
+                .runtime_epoch_id()
+                .is_some_and(|epoch| epoch != prepared_epoch)
+            || record.run().current_run_id().is_some()
+            || record.run().pre_run_phase().is_some()
+            || record.unregister_progress().is_some()
+            || record.supervisor_authority() != expected_supervisor
+        {
+            return false;
+        }
+        let Some(_mutation_guard) = self
+            .machine
+            .lock_current_durability_ready_session_mutation_gate(self.session_id())
+            .await
+            .ok()
+        else {
+            return false;
+        };
+        let Ok(authority) = crate::validated_session_runtime_bindings_authority(&self.bindings)
+        else {
+            return false;
+        };
+        let claim_is_current = {
+            let sessions = self.machine.sessions.read().await;
+            sessions.get(self.session_id()).is_some_and(|entry| {
+                entry.epoch_id == *self.bindings.epoch_id()
+                    && Arc::ptr_eq(&entry.materialization_claim_state, &self.claim_state)
+                    && Arc::ptr_eq(&entry.dsl_authority, &authority.dsl_authority)
+                    && Arc::ptr_eq(&entry.handle_teardown_gate, &authority.teardown_gate)
+                    && !entry.physical_attachment_is_live()
+                    && crate::meerkat_machine::dsl_authority::runtime_phase_from_authority(
+                        &entry
+                            .dsl_authority
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner),
+                    ) == RuntimeState::Idle
+                    && self
+                        .claim_state
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .exact_claim_is(
+                            self.claim_id,
+                            &[
+                                crate::RuntimeActorMaterializationClaimPhase::Prepared,
+                                crate::RuntimeActorMaterializationClaimPhase::Staged,
+                                crate::RuntimeActorMaterializationClaimPhase::ActorCreating,
+                                crate::RuntimeActorMaterializationClaimPhase::ActorMaterializedPendingCommit,
+                                crate::RuntimeActorMaterializationClaimPhase::Aborting,
+                            ],
+                        )
+            })
+        };
+        if !claim_is_current {
+            return false;
+        }
+        let Some(store) = self.machine.store.as_ref() else {
+            return false;
+        };
+        store
+            .load_session_resume_observation(current.runtime_id())
+            .await
+            .is_ok_and(|observed| &observed == current)
+    }
+
     /// Mint the non-cloneable authorization for actor construction at an
     /// exact Archived+Retired revival midpoint.
     ///
