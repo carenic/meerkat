@@ -27,9 +27,10 @@ use super::{
     PreparedWholeBlobSnapshot, PreparedWholeBlobSnapshotCas, RecoveryInputSetRevision,
     RecoveryInputStateMutation, RuntimeDeliveryAuthorityCasOutcome, RuntimeDeliveryAuthorityRecord,
     RuntimeDeliveryStoreRecord, RuntimeSessionAuthority, RuntimeSessionAuthorityReadCost,
-    RuntimeSessionPersistenceProfile, RuntimeStore, RuntimeStoreError, RuntimeStoreWriteFence,
-    RuntimeStoreWriteFenceOutcome, SerializedSessionSnapshot, WholeBlobProvisionalTailAuthority,
-    WholeBlobSnapshotCasOutcome, WholeBlobStoreAuthority, classify_machine_lifecycle_record,
+    RuntimeSessionPersistenceProfile, RuntimeSessionResumeObservation, RuntimeStore,
+    RuntimeStoreError, RuntimeStoreWriteFence, RuntimeStoreWriteFenceOutcome,
+    SerializedSessionSnapshot, WholeBlobProvisionalTailAuthority, WholeBlobSnapshotCasOutcome,
+    WholeBlobStoreAuthority, classify_machine_lifecycle_record,
     complete_compaction_projection_intent, decoded_prepared_machine_lifecycle_replacement,
     execute_runtime_store_write_fence, parsed_whole_blob_snapshot, prepare_input_state_batch_cas,
     prepare_machine_lifecycle_replacement, prepare_recovery_input_state_mutations,
@@ -1823,6 +1824,31 @@ impl super::RuntimeSessionAuthorityOps for InMemoryRuntimeStore {
             .map(|authority| authority.map(RuntimeSessionAuthority::WholeBlob))
     }
 
+    async fn load_session_resume_observation(
+        &self,
+        runtime_id: &LogicalRuntimeId,
+    ) -> Result<RuntimeSessionResumeObservation, RuntimeStoreError> {
+        let inner = self.inner.lock().await;
+        let session_authority = inner
+            .session_authorities
+            .get(&runtime_id.0)
+            .cloned()
+            .map(RuntimeSessionAuthority::WholeBlob);
+        let catalog_entry = inner.session_catalog.get(&runtime_id.0).cloned();
+        let lifecycle = inner
+            .runtime_lifecycle
+            .get(&runtime_id.0)
+            .map_or(MachineLifecycleObservation::Missing, |bytes| {
+                classify_machine_lifecycle_record(bytes)
+            });
+        Ok(RuntimeSessionResumeObservation::new(
+            runtime_id.clone(),
+            session_authority,
+            catalog_entry,
+            lifecycle,
+        ))
+    }
+
     async fn delete_runtime_session_catalog_entry(
         &self,
         runtime_id: &LogicalRuntimeId,
@@ -3427,6 +3453,53 @@ mod tests {
             meerkat_core::types::UserMessage::text(content.to_string()),
         ));
         session
+    }
+
+    #[tokio::test]
+    async fn session_resume_observation_is_body_free_and_single_lock_owned() {
+        let store = InMemoryRuntimeStore::new();
+        let session = session_with_user("resume observation");
+        let runtime_id = LogicalRuntimeId::for_session(session.id());
+
+        let absent = store
+            .load_session_resume_observation(&runtime_id)
+            .await
+            .unwrap();
+        assert_eq!(absent.runtime_id(), &runtime_id);
+        assert!(absent.session_authority().is_none());
+        assert!(absent.catalog_entry().is_none());
+        assert_eq!(absent.lifecycle(), &MachineLifecycleObservation::Missing);
+
+        store
+            .commit_session_snapshot(
+                &runtime_id,
+                SerializedSessionSnapshot {
+                    session_snapshot: serde_json::to_vec(&session).unwrap().into(),
+                },
+            )
+            .await
+            .unwrap();
+        store
+            .compare_and_swap_machine_lifecycle(
+                &runtime_id,
+                MachineLifecycleExpectedVersion::Missing,
+                lifecycle_commit(&runtime_id, RuntimeState::Idle, 9, 7),
+            )
+            .await
+            .unwrap();
+
+        let observed = store
+            .load_session_resume_observation(&runtime_id)
+            .await
+            .unwrap();
+        assert_eq!(observed.session_store_revision(), Some(1));
+        assert_eq!(
+            observed.catalog_entry().map(|entry| entry.session_id()),
+            Some(session.id())
+        );
+        assert!(observed.lifecycle_row_version().is_some());
+        assert_eq!(observed.runtime_generation(), Some(7));
+        assert_eq!(observed.runtime_epoch_id(), Some("epoch-7"));
     }
 
     fn encode_as_released_0810_compaction_fixture(

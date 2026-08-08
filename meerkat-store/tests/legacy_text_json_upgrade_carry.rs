@@ -14,9 +14,9 @@ use meerkat_core::{
 };
 use meerkat_schedule::{
     ClaimDueRequest, CreateScheduleRequest, IntervalTriggerSpec, MisfirePolicy,
-    MissingTargetPolicy, Occurrence, OccurrenceLifecycleInput, OccurrenceOrdinal, OverlapPolicy,
-    Schedule, ScheduleLifecycleInput, ScheduleStore, ScheduledSessionAction, SessionTargetBinding,
-    TargetBinding, TriggerSpec,
+    MissingTargetPolicy, Occurrence, OccurrenceLifecycleEffect, OccurrenceLifecycleInput,
+    OccurrenceOrdinal, OccurrencePhase, OverlapPolicy, Schedule, ScheduleLifecycleInput,
+    ScheduleStore, ScheduledSessionAction, SessionTargetBinding, TargetBinding, TriggerSpec,
 };
 use meerkat_store::{SqliteScheduleStore, SqliteSessionStore, index::SqliteSessionIndex};
 use rusqlite::Connection;
@@ -57,8 +57,8 @@ async fn commit_sample_schedule(store: &SqliteScheduleStore) -> Schedule {
         ScheduleLifecycleInput::Create(sample_schedule_request()),
     )
     .expect("sample schedule creation should pass generated authority");
-    let schedule = mutator.schedule.clone();
-    store
+    let schedule = mutator.schedule().clone();
+    let _commit = store
         .commit_schedule_write(mutator.into_authorized_write())
         .await
         .expect("commit schedule");
@@ -103,10 +103,13 @@ async fn schedule_store_reads_legacy_text_rows() {
     )
     .expect("plan occurrence");
     let occurrence = occurrence_write.occurrence().clone();
-    store
+    let planned_commit = store
         .commit_occurrence_write(occurrence_write)
         .await
         .expect("commit occurrence");
+    assert_eq!(planned_commit.successor(), &occurrence);
+    assert!(planned_commit.effects().is_empty());
+    assert!(planned_commit.supersession_acks().is_empty());
 
     // Drive one occurrence to a terminal receipt so schedule_receipts has a row.
     let claim = store
@@ -118,13 +121,13 @@ async fn schedule_store_reads_legacy_text_rows() {
         .await
         .expect("claim due occurrences");
     assert_eq!(
-        claim.claimed.len(),
+        claim.transitions.len(),
         1,
         "expected the due occurrence claimed"
     );
-    let claimed = claim.claimed[0].clone();
+    let claimed = claim.transitions[0].successor().clone();
     let claim_token = claimed.claim_token();
-    let dispatching = store
+    let dispatch_commit = store
         .transition_occurrence_if_current(
             &claimed.occurrence_id,
             claimed.attempt_count,
@@ -136,9 +139,17 @@ async fn schedule_store_reads_legacy_text_rows() {
         )
         .await
         .expect("dispatch transition")
-        .expect("occurrence should still be current")
-        .0;
-    store
+        .expect("occurrence should still be current");
+    assert_eq!(
+        dispatch_commit.effects(),
+        &[OccurrenceLifecycleEffect::DispatchStarted]
+    );
+    assert_eq!(
+        dispatch_commit.successor().phase,
+        OccurrencePhase::Dispatching
+    );
+    let dispatching = dispatch_commit.successor().clone();
+    let completion_commit = store
         .transition_occurrence_with_receipt_if_current(
             &dispatching.occurrence_id,
             dispatching.attempt_count,
@@ -149,6 +160,14 @@ async fn schedule_store_reads_legacy_text_rows() {
         .await
         .expect("complete transition")
         .expect("occurrence should still be current");
+    assert_eq!(
+        completion_commit.effects(),
+        &[OccurrenceLifecycleEffect::Completed]
+    );
+    assert_eq!(
+        completion_commit.successor().phase,
+        OccurrencePhase::Completed
+    );
 
     let schedules_before = store
         .list_schedules(Default::default())
@@ -215,10 +234,13 @@ async fn schedule_store_claims_and_writes_over_legacy_text_rows() {
         Utc::now() - Duration::seconds(1),
     )
     .expect("plan occurrence");
-    store
+    let planned_commit = store
         .commit_occurrence_write(occurrence_write)
         .await
         .expect("commit occurrence");
+    assert_eq!(planned_commit.successor().phase, OccurrencePhase::Pending);
+    assert!(planned_commit.effects().is_empty());
+    assert!(planned_commit.supersession_acks().is_empty());
 
     degrade_json_column_to_text(&path, "schedule_schedules", "schedule_json");
     degrade_json_column_to_text(&path, "schedule_occurrences", "occurrence_json");
@@ -235,7 +257,7 @@ async fn schedule_store_claims_and_writes_over_legacy_text_rows() {
         .await
         .expect("claim_due_occurrences over TEXT rows");
     assert_eq!(
-        claim.claimed.len(),
+        claim.transitions.len(),
         1,
         "expected the due occurrence claimed"
     );
@@ -245,7 +267,7 @@ async fn schedule_store_claims_and_writes_over_legacy_text_rows() {
     let claimed_type: String = conn
         .query_row(
             "SELECT typeof(occurrence_json) FROM schedule_occurrences WHERE occurrence_id = ?1",
-            [claim.claimed[0].occurrence_id.to_string()],
+            [claim.transitions[0].occurrence_id.to_string()],
             |row| row.get(0),
         )
         .expect("claimed row type");
@@ -263,7 +285,7 @@ async fn schedule_store_claims_and_writes_over_legacy_text_rows() {
         ScheduleLifecycleInput::Pause { at_utc: Utc::now() },
     )
     .expect("pause should pass generated authority");
-    store
+    let _commit = store
         .commit_schedule_write(pause.into_authorized_write())
         .await
         .expect("commit_schedule_write over TEXT current row");

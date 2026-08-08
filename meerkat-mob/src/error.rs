@@ -97,6 +97,16 @@ pub enum SessionResumeUnavailableReason {
     /// The document exists and is intact, but is archived and its runtime
     /// lifecycle refuses revival.
     ArchivedNotRevivable,
+    /// Durable copies exist, but the session owner cannot prove which
+    /// committed boundary is authoritative. The copies remain intact and the
+    /// resume is parked until authority can be reconciled.
+    CommittedBoundaryUnprovable,
+    /// The store-issued authority or lifecycle observation changed while the
+    /// body was loaded. No body from that interval is authorized for resume.
+    AuthorityChangedDuringMaterialization,
+    /// Positive durable authority or lifecycle rows exist without a
+    /// materializable session body.
+    ContradictoryDurableAuthority,
     /// No durable session exists for this id.
     Absent,
 }
@@ -106,6 +116,15 @@ impl std::fmt::Display for SessionResumeUnavailableReason {
         match self {
             Self::ArchivedNotRevivable => {
                 f.write_str("archived and not revivable; the transcript is intact and preserved")
+            }
+            Self::CommittedBoundaryUnprovable => f.write_str(
+                "committed boundary is unprovable; durable copies are retained for reconciliation",
+            ),
+            Self::AuthorityChangedDuringMaterialization => {
+                f.write_str("durable authority changed during resume materialization")
+            }
+            Self::ContradictoryDurableAuthority => {
+                f.write_str("durable authority contradicts the materializable session body")
             }
             Self::Absent => f.write_str("missing durable session snapshot"),
         }
@@ -156,6 +175,9 @@ pub enum MobError {
         reason: SessionResumeUnavailableReason,
         /// Blocking runtime lifecycle, when one was recorded.
         runtime_state: Option<String>,
+        /// Full owner-issued verdict when this error came from the typed
+        /// operational resume pipeline.
+        verdict: Option<Box<crate::runtime::SessionResumeRejection>>,
     },
 
     /// A mob member with the given ID already exists.
@@ -762,6 +784,15 @@ impl MobError {
                 SessionResumeUnavailableReason::Absent => MobFailureClass::TargetMissing,
                 SessionResumeUnavailableReason::ArchivedNotRevivable => {
                     MobFailureClass::TargetArchived
+                }
+                SessionResumeUnavailableReason::CommittedBoundaryUnprovable => {
+                    MobFailureClass::Transport
+                }
+                SessionResumeUnavailableReason::AuthorityChangedDuringMaterialization => {
+                    MobFailureClass::Transport
+                }
+                SessionResumeUnavailableReason::ContradictoryDurableAuthority => {
+                    MobFailureClass::Internal
                 }
             },
             Self::MemberAlreadyExists(_) => MobFailureClass::TargetBusy,

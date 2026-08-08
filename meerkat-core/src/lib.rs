@@ -29,6 +29,7 @@ pub mod config_runtime;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod config_store;
 pub mod connection;
+pub mod context_budget;
 mod digest_observability;
 pub mod error;
 pub mod event;
@@ -163,6 +164,11 @@ pub use config_store::{
     ConfigResolvedPaths, ConfigStore, ConfigStoreMetadata, EffectiveConfigReader, FileConfigStore,
     MemoryConfigStore, RealmConfigSource, TaggedConfigStore, apply_config_patch_preview,
     merge_patch,
+};
+pub use context_budget::{
+    ContextBudgetEstimateProvenance, ContextBudgetFact, ContextBudgetFactError, ContextBudgetState,
+    context_budget_fact_for_messages, context_budget_fact_for_provider_request,
+    context_budget_fact_for_session,
 };
 pub use digest_observability::{
     DIGEST_SITE_LABELS, digest_site_bytes, global_session_content_digest_bytes,
@@ -360,11 +366,12 @@ pub use session_recovery::{
     session_allows_first_turn_build_overrides,
 };
 pub use session_store::{
-    IncrementalSessionStore, PreparedHeadCanonicalMutationRoute,
+    HeadCanonicalAuthorityCrossing, IncrementalSessionStore, PreparedHeadCanonicalMutationRoute,
     PreparedHeadCanonicalRewritePreflight, SessionFilter, SessionHead, SessionHeadCas,
     SessionMessageRowPrefixAccumulator, SessionStore, SessionStoreError, StrandLayout,
-    StrandRewriteLayout, TranscriptStrandId, VerifiedSessionHeadMaterialization,
-    head_canonical_plain_save_guard, session_head_cas_token, strand_layout_for_history,
+    StrandRewriteLayout, TranscriptStrandId, VerifiedHeadCanonicalAuthority,
+    VerifiedSessionHeadMaterialization, head_canonical_plain_save_guard, session_head_cas_token,
+    strand_layout_for_history,
 };
 pub use state::LoopState;
 pub use storage_diagnostics::{

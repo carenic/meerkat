@@ -544,7 +544,7 @@ mod tests {
         let apply_finished_wait = apply_finished.notified();
         tokio::pin!(apply_finished_wait);
         apply_finished_wait.as_mut().enable();
-        allow_finish.notify_waiters();
+        allow_finish.notify_one();
         tokio::time::timeout(std::time::Duration::from_secs(1), &mut apply_finished_wait)
             .await
             .expect("attached prompt should finish after release");

@@ -117,16 +117,43 @@ impl OccurrenceSupersessionAck {
 
 #[derive(Debug, Clone)]
 pub struct ScheduleLifecycleMutator {
-    pub schedule: Schedule,
-    pub effects: Vec<ScheduleLifecycleEffect>,
-    pub revision_bumped: bool,
+    pub(crate) schedule: Schedule,
+    pub(crate) effects: Vec<ScheduleLifecycleEffect>,
+    pub(crate) revision_bumped: bool,
     write_precondition: ScheduleWritePrecondition,
     pending_supersession: Option<PendingSupersession>,
 }
 
 impl ScheduleLifecycleMutator {
-    pub fn into_schedule(self) -> Schedule {
+    #[cfg(test)]
+    fn into_schedule(self) -> Schedule {
         self.schedule
+    }
+
+    pub fn schedule(&self) -> &Schedule {
+        &self.schedule
+    }
+
+    pub fn effects(&self) -> &[ScheduleLifecycleEffect] {
+        &self.effects
+    }
+
+    pub fn revision_bumped(&self) -> bool {
+        self.revision_bumped
+    }
+
+    pub fn into_effectless_schedule(self) -> Result<Schedule, ScheduleLifecycleError> {
+        if !self.effects.is_empty() || self.revision_bumped || self.pending_supersession.is_some() {
+            return Err(ScheduleLifecycleError::ProjectionMismatch {
+                reason: format!(
+                    "effectless schedule projection produced {} lifecycle effects, revision_bumped={}, pending_supersession={}",
+                    self.effects.len(),
+                    self.revision_bumped,
+                    self.pending_supersession.is_some()
+                ),
+            });
+        }
+        Ok(self.schedule)
     }
 
     pub fn absorb_followup(
@@ -160,6 +187,8 @@ impl ScheduleLifecycleMutator {
     pub fn into_authorized_write(self) -> AuthorizedScheduleWrite {
         AuthorizedScheduleWrite {
             schedule: self.schedule,
+            effects: self.effects,
+            revision_bumped: self.revision_bumped,
             precondition: self.write_precondition,
             pending_supersession: self.pending_supersession,
         }
@@ -169,11 +198,17 @@ impl ScheduleLifecycleMutator {
 #[derive(Debug, Clone)]
 pub struct AuthorizedScheduleWrite {
     schedule: Schedule,
+    effects: Vec<ScheduleLifecycleEffect>,
+    revision_bumped: bool,
     precondition: ScheduleWritePrecondition,
     pending_supersession: Option<PendingSupersession>,
 }
 
 impl AuthorizedScheduleWrite {
+    pub(crate) fn into_uncommitted_schedule_for_construction(self) -> Schedule {
+        self.schedule
+    }
+
     pub fn schedule(&self) -> &Schedule {
         &self.schedule
     }
@@ -190,12 +225,82 @@ impl AuthorizedScheduleWrite {
         self.pending_supersession.is_some()
     }
 
-    pub fn into_schedule(self) -> Schedule {
-        self.schedule
+    #[doc(hidden)]
+    pub fn pending_supersession(&self) -> Option<&PendingSupersession> {
+        self.pending_supersession.as_ref()
     }
 
-    pub fn into_parts(self) -> (Schedule, Option<PendingSupersession>) {
-        (self.schedule, self.pending_supersession)
+    pub fn effects(&self) -> &[ScheduleLifecycleEffect] {
+        &self.effects
+    }
+
+    pub fn revision_bumped(&self) -> bool {
+        self.revision_bumped
+    }
+
+    #[doc(hidden)]
+    /// Trusted-backend assertion used by open `ScheduleStore`
+    /// implementations after their transaction commits. Rust visibility
+    /// cannot prove that provenance across third-party store crates; invoking
+    /// this outside the successful store method violates the backend contract.
+    pub fn into_transition_commit_after_store_commit(
+        self,
+        successor: Schedule,
+    ) -> ScheduleTransitionCommit {
+        ScheduleTransitionCommit {
+            prior: self.precondition,
+            successor,
+            effects: self.effects,
+            revision_bumped: self.revision_bumped,
+        }
+    }
+}
+
+/// Trusted-store assertion for one committed schedule lifecycle transition.
+///
+/// This is not cryptographic or capability-token proof. Its provenance is the
+/// `ScheduleStore` implementation contract, and consumers must accept it only
+/// as the direct result of the store method they invoked.
+#[must_use = "a schedule transition commit carries lifecycle effects and revision authority that must be observed"]
+#[derive(Debug)]
+pub struct ScheduleTransitionCommit {
+    prior: ScheduleWritePrecondition,
+    successor: Schedule,
+    effects: Vec<ScheduleLifecycleEffect>,
+    revision_bumped: bool,
+}
+
+impl ScheduleTransitionCommit {
+    pub fn prior(&self) -> &ScheduleWritePrecondition {
+        &self.prior
+    }
+
+    pub fn successor(&self) -> &Schedule {
+        &self.successor
+    }
+
+    pub fn effects(&self) -> &[ScheduleLifecycleEffect] {
+        &self.effects
+    }
+
+    pub fn revision_bumped(&self) -> bool {
+        self.revision_bumped
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        ScheduleWritePrecondition,
+        Schedule,
+        Vec<ScheduleLifecycleEffect>,
+        bool,
+    ) {
+        (
+            self.prior,
+            self.successor,
+            self.effects,
+            self.revision_bumped,
+        )
     }
 }
 
@@ -578,22 +683,28 @@ pub struct CompletionSupersessionVerdict {
 
 #[derive(Debug, Clone)]
 pub struct OccurrenceLifecycleMutator {
-    pub occurrence: Occurrence,
-    pub effects: Vec<OccurrenceLifecycleEffect>,
+    pub(crate) occurrence: Occurrence,
+    pub(crate) effects: Vec<OccurrenceLifecycleEffect>,
     write_precondition: OccurrenceWritePrecondition,
     supersession_acks: Vec<OccurrenceSupersessionAck>,
 }
 
 impl OccurrenceLifecycleMutator {
-    pub fn into_occurrence(self) -> Occurrence {
+    pub fn occurrence(&self) -> &Occurrence {
+        &self.occurrence
+    }
+
+    pub fn effects(&self) -> &[OccurrenceLifecycleEffect] {
+        &self.effects
+    }
+
+    #[cfg(test)]
+    fn into_occurrence(self) -> Occurrence {
         self.occurrence
     }
 
-    pub fn into_parts(self) -> (Occurrence, Vec<OccurrenceLifecycleEffect>) {
-        (self.occurrence, self.effects)
-    }
-
-    pub fn into_parts_with_supersession_feedback(
+    #[cfg(test)]
+    fn into_parts_with_supersession_feedback(
         self,
     ) -> (
         Occurrence,
@@ -603,18 +714,68 @@ impl OccurrenceLifecycleMutator {
         (self.occurrence, self.effects, self.supersession_acks)
     }
 
+    /// Fold a generated follow-up transition into this still-uncommitted
+    /// transition while retaining the original durable CAS parent.
+    pub fn absorb_followup(
+        &mut self,
+        followup: OccurrenceLifecycleMutator,
+    ) -> Result<(), OccurrenceLifecycleError> {
+        let OccurrenceLifecycleMutator {
+            occurrence,
+            effects,
+            write_precondition,
+            supersession_acks,
+        } = followup;
+        write_precondition
+            .check_current(Some(&self.occurrence))
+            .map_err(|reason| OccurrenceLifecycleError::ProjectionMismatch { reason })?;
+        self.occurrence = occurrence;
+        self.effects.extend(effects);
+        self.supersession_acks.extend(supersession_acks);
+        Ok(())
+    }
+
     pub fn into_authorized_write(self) -> AuthorizedOccurrenceWrite {
         AuthorizedOccurrenceWrite {
             occurrence: self.occurrence,
             precondition: self.write_precondition,
+            effects: self.effects,
+            supersession_acks: self.supersession_acks,
         }
+    }
+
+    /// Consume a projection-only transition that is defined to emit no
+    /// lifecycle effects or supersession acknowledgements.
+    ///
+    /// If the generated machine later adds an output to such a transition,
+    /// this fails closed instead of silently erasing the new authority.
+    pub fn into_effectless_occurrence(self) -> Result<Occurrence, OccurrenceLifecycleError> {
+        if !self.effects.is_empty() || !self.supersession_acks.is_empty() {
+            return Err(OccurrenceLifecycleError::ProjectionMismatch {
+                reason: format!(
+                    "effectless occurrence projection produced {} lifecycle effects and {} supersession acknowledgements",
+                    self.effects.len(),
+                    self.supersession_acks.len()
+                ),
+            });
+        }
+        Ok(self.occurrence)
     }
 }
 
-#[derive(Debug, Clone)]
+/// Machine-authorized occurrence transition awaiting a durable store commit.
+///
+/// `precondition` binds the exact previous durable authority, `occurrence`
+/// carries the exact successor, and `effects` are the generated lifecycle
+/// verdicts emitted by that same transition. The authorized write is not a
+/// commit; an open [`crate::ScheduleStore`] backend is trusted to construct the
+/// commit assertion only after its durable transaction succeeds.
+#[derive(Debug)]
 pub struct AuthorizedOccurrenceWrite {
     occurrence: Occurrence,
     precondition: OccurrenceWritePrecondition,
+    effects: Vec<OccurrenceLifecycleEffect>,
+    supersession_acks: Vec<OccurrenceSupersessionAck>,
 }
 
 impl AuthorizedOccurrenceWrite {
@@ -630,8 +791,91 @@ impl AuthorizedOccurrenceWrite {
         &self.precondition
     }
 
-    pub fn into_occurrence(self) -> Occurrence {
-        self.occurrence
+    /// Whether this write has generated outputs that require a postcommit
+    /// carrier. Atomic schedule planning batches contain only effectless
+    /// absent-row inserts; backends must reject any other use of those batch
+    /// methods instead of silently erasing machine outputs.
+    pub fn has_generated_outputs(&self) -> bool {
+        !self.effects.is_empty() || !self.supersession_acks.is_empty()
+    }
+
+    #[doc(hidden)]
+    pub fn supersession_acks(&self) -> &[OccurrenceSupersessionAck] {
+        &self.supersession_acks
+    }
+
+    /// Trusted-backend assertion used after the backing store transaction has
+    /// successfully committed. Rust visibility cannot prove that provenance
+    /// across third-party store crates; calling it before commit or outside a
+    /// `ScheduleStore` implementation violates that trait's contract.
+    #[doc(hidden)]
+    pub fn into_transition_commit_after_store_commit(self) -> OccurrenceTransitionCommit {
+        OccurrenceTransitionCommit {
+            prior: self.precondition,
+            successor: self.occurrence,
+            effects: self.effects,
+            supersession_acks: self.supersession_acks,
+        }
+    }
+}
+
+/// Trusted-store assertion that one machine-authorized occurrence successor
+/// passed its exact prior-state CAS and was committed by the selected backend.
+///
+/// The generated effects and supersession acknowledgements are inseparable
+/// from that exact prior/successor pair. They are postcommit observations, not
+/// a durable outbox: callers must not claim crash-replayability or at-most-once
+/// external realization from this in-process carrier alone. This is not a
+/// cryptographic or capability-token proof; consumers must accept it only as
+/// the direct result of the `ScheduleStore` method they invoked.
+#[must_use = "a committed occurrence transition carries generated lifecycle outputs that must be observed"]
+#[derive(Debug)]
+pub struct OccurrenceTransitionCommit {
+    prior: OccurrenceWritePrecondition,
+    successor: Occurrence,
+    effects: Vec<OccurrenceLifecycleEffect>,
+    supersession_acks: Vec<OccurrenceSupersessionAck>,
+}
+
+impl OccurrenceTransitionCommit {
+    pub fn prior(&self) -> &OccurrenceWritePrecondition {
+        &self.prior
+    }
+
+    pub fn successor(&self) -> &Occurrence {
+        &self.successor
+    }
+
+    pub fn effects(&self) -> &[OccurrenceLifecycleEffect] {
+        &self.effects
+    }
+
+    pub fn supersession_acks(&self) -> &[OccurrenceSupersessionAck] {
+        &self.supersession_acks
+    }
+
+    pub fn into_parts(
+        self,
+    ) -> (
+        OccurrenceWritePrecondition,
+        Occurrence,
+        Vec<OccurrenceLifecycleEffect>,
+        Vec<OccurrenceSupersessionAck>,
+    ) {
+        (
+            self.prior,
+            self.successor,
+            self.effects,
+            self.supersession_acks,
+        )
+    }
+}
+
+impl std::ops::Deref for OccurrenceTransitionCommit {
+    type Target = Occurrence;
+
+    fn deref(&self) -> &Self::Target {
+        self.successor()
     }
 }
 
@@ -911,6 +1155,8 @@ impl Occurrence {
         Ok(AuthorizedOccurrenceWrite {
             precondition: OccurrenceWritePrecondition::absent(occurrence.occurrence_id.clone()),
             occurrence,
+            effects: Vec::new(),
+            supersession_acks: Vec::new(),
         })
     }
 

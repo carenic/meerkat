@@ -172,6 +172,27 @@ impl SqliteSessionIndex {
         Ok(())
     }
 
+    /// Read raw projection rows through a caller-owned connection. Doctor
+    /// supplies a read-only connection so diagnosis never applies migrations
+    /// or mutating connection pragmas.
+    pub(crate) fn read_all_meta_rows(
+        conn: &Connection,
+    ) -> Result<Vec<(String, Vec<u8>)>, StoreError> {
+        let mut statement = conn
+            .prepare("SELECT session_id, meta_json FROM session_index ORDER BY session_id ASC")?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, JsonColumnBytes>(1)?.into_bytes(),
+            ))
+        })?;
+        let mut result = Vec::new();
+        for row in rows {
+            result.push(row?);
+        }
+        Ok(result)
+    }
+
     pub fn remove(&self, id: &SessionId) -> Result<(), StoreError> {
         let conn = open_connection(&self.path)?;
         conn.execute(

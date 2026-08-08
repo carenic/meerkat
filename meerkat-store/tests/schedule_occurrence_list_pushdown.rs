@@ -59,8 +59,8 @@ async fn commit_schedule(store: &SqliteScheduleStore, name: &str) -> Schedule {
         ScheduleLifecycleInput::Create(sample_schedule_request(name)),
     )
     .expect("schedule creation should pass generated authority");
-    let schedule = mutator.schedule.clone();
-    store
+    let schedule = mutator.schedule().clone();
+    let _commit = store
         .commit_schedule_write(mutator.into_authorized_write())
         .await
         .expect("commit schedule");
@@ -77,11 +77,14 @@ async fn commit_occurrence(
         Occurrence::planned_write_from_schedule(schedule, OccurrenceOrdinal(ordinal), due_at_utc)
             .expect("occurrence planning should pass generated authority");
     let occurrence = write.occurrence().clone();
-    store
+    let commit = store
         .commit_occurrence_write(write)
         .await
         .expect("commit occurrence");
-    occurrence
+    assert_eq!(commit.successor(), &occurrence);
+    assert!(commit.effects().is_empty());
+    assert!(commit.supersession_acks().is_empty());
+    commit.successor().clone()
 }
 
 /// The exact filter chain `list_occurrences_impl` ran BEFORE the SQL
@@ -147,7 +150,15 @@ async fn seed_store(store: &SqliteScheduleStore) -> (Schedule, Schedule) {
         })
         .await
         .expect("claim");
-    assert_eq!(claimed.claimed.len(), 1, "one row claims, one misfires");
+    assert_eq!(
+        claimed
+            .transitions
+            .iter()
+            .filter(|commit| commit.phase == OccurrencePhase::Claimed)
+            .count(),
+        1,
+        "one row claims, one misfires"
+    );
     assert!(claimed.row_faults.is_empty(), "{:?}", claimed.row_faults);
     // Committed after the claim call so they stay Pending despite one being
     // already due.

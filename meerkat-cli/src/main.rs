@@ -9880,6 +9880,28 @@ impl meerkat_mob::MobSessionService for RunMobSessionService {
         .await
     }
 
+    async fn observe_session_resume_authority(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_mob::SessionResumeAuthority, meerkat_core::service::SessionError> {
+        <EphemeralSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::observe_session_resume_authority(
+            &self.inner,
+            session_id,
+        )
+        .await
+    }
+
+    async fn materialize_session_resume_verdict(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_mob::SessionResumeVerdict, meerkat_core::service::SessionError> {
+        <EphemeralSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::materialize_session_resume_verdict(
+            &self.inner,
+            session_id,
+        )
+        .await
+    }
+
     async fn create_session_under_runtime_turn_boundary(
         &self,
         req: meerkat_core::service::CreateSessionRequest,
@@ -12772,6 +12794,28 @@ impl meerkat_mob::MobSessionService for MobCliSessionService {
         session_id: &SessionId,
     ) -> Result<(), meerkat_core::service::SessionError> {
         <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::prepare_session_for_resume(
+            &self.inner,
+            session_id,
+        )
+        .await
+    }
+
+    async fn observe_session_resume_authority(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_mob::SessionResumeAuthority, meerkat_core::service::SessionError> {
+        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::observe_session_resume_authority(
+            &self.inner,
+            session_id,
+        )
+        .await
+    }
+
+    async fn materialize_session_resume_verdict(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_mob::SessionResumeVerdict, meerkat_core::service::SessionError> {
+        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::materialize_session_resume_verdict(
             &self.inner,
             session_id,
         )
@@ -19816,6 +19860,14 @@ default_model = "gemma"
             _session_id: &SessionId,
         ) -> Result<(), SessionError> {
             Ok(())
+        }
+
+        async fn observe_session_resume_authority(
+            &self,
+            _session_id: &SessionId,
+        ) -> Result<meerkat_mob::SessionResumeAuthority, SessionError> {
+            // This process-local test map has no RuntimeStore authority.
+            Ok(meerkat_mob::SessionResumeAuthority::default())
         }
 
         async fn acknowledge_committed_runtime_session_boundary_under_turn_finalization_boundary(

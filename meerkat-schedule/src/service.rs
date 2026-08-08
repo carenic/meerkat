@@ -1,8 +1,12 @@
 use crate::error::{ScheduleDomainError, ScheduleStoreError};
 use crate::lifecycle::{
-    AuthorizedOccurrenceWrite, ScheduleLifecycleInput, ScheduleLifecycleMutator,
+    AuthorizedOccurrenceWrite, OccurrenceLifecycleEffect, ScheduleLifecycleEffect,
+    ScheduleLifecycleInput, ScheduleLifecycleMutator, ScheduleTransitionCommit,
 };
-use crate::store::{OccurrenceFilter, ScheduleFilter, ScheduleRefillCandidate, ScheduleStore};
+use crate::store::{
+    OccurrenceFilter, ScheduleFilter, ScheduleMutationCommit, ScheduleRefillCandidate,
+    ScheduleStore,
+};
 use crate::trigger::{next_due_after, occurrences_for_horizon};
 use crate::types::{
     CreateScheduleRequest, Occurrence, OccurrencePhase, Schedule, ScheduleId, SchedulePhase,
@@ -25,7 +29,171 @@ pub struct ScheduleService {
     mutation_generation: watch::Sender<u64>,
 }
 
+struct ExpectedScheduleTransition {
+    effects: Vec<ScheduleLifecycleEffect>,
+    revision_bumped: bool,
+    pre_feedback_ack_ids: BTreeSet<crate::OccurrenceId>,
+}
+
+impl ExpectedScheduleTransition {
+    fn from_mutator(mutator: &ScheduleLifecycleMutator) -> Self {
+        Self {
+            effects: mutator.effects().to_vec(),
+            revision_bumped: mutator.revision_bumped(),
+            pre_feedback_ack_ids: mutator.schedule().superseded_ack_ids.clone(),
+        }
+    }
+}
+
 impl ScheduleService {
+    fn observe_effectless_occurrence_commit(
+        commit: crate::OccurrenceTransitionCommit,
+    ) -> Result<Occurrence, ScheduleDomainError> {
+        if !commit.effects().is_empty() || !commit.supersession_acks().is_empty() {
+            return Err(ScheduleDomainError::Internal(format!(
+                "effectless occurrence transition committed {} lifecycle effects and {} supersession acknowledgements",
+                commit.effects().len(),
+                commit.supersession_acks().len()
+            )));
+        }
+        Ok(commit.successor().clone())
+    }
+
+    fn observe_schedule_transition(
+        commit: ScheduleTransitionCommit,
+        expected: ExpectedScheduleTransition,
+    ) -> Result<Schedule, ScheduleDomainError> {
+        let revision_bumped = commit.revision_bumped();
+        let (_prior, schedule, effects, _) = commit.into_parts();
+        if effects != expected.effects || revision_bumped != expected.revision_bumped {
+            return Err(ScheduleDomainError::Internal(format!(
+                "schedule transition commit did not preserve its generated authority: expected {} effects and revision_bumped={}, committed {} effects and revision_bumped={}",
+                expected.effects.len(),
+                expected.revision_bumped,
+                effects.len(),
+                revision_bumped
+            )));
+        }
+        for effect in &effects {
+            let consistent = match effect {
+                ScheduleLifecycleEffect::EmitScheduleNotice {
+                    new_state,
+                    revision,
+                } => schedule.phase == *new_state && schedule.revision == *revision,
+                ScheduleLifecycleEffect::SupersedePendingOccurrences {
+                    superseding_revision,
+                    ..
+                } => schedule.revision == *superseding_revision,
+                ScheduleLifecycleEffect::PlanningWindowRecorded {
+                    planning_cursor_utc,
+                    next_occurrence_ordinal,
+                } => {
+                    schedule.planning_cursor_utc == Some(*planning_cursor_utc)
+                        && schedule.next_occurrence_ordinal == *next_occurrence_ordinal
+                }
+            };
+            if !consistent {
+                return Err(ScheduleDomainError::Internal(
+                    "schedule transition commit effect contradicted its committed successor"
+                        .to_string(),
+                ));
+            }
+        }
+        tracing::debug!(
+            schedule_id = %schedule.schedule_id,
+            revision = schedule.revision.0,
+            revision_bumped,
+            lifecycle_effects = effects.len(),
+            "observed committed schedule lifecycle authority"
+        );
+        Ok(schedule)
+    }
+
+    fn observe_schedule_commit(
+        commit: ScheduleMutationCommit,
+        expected: ExpectedScheduleTransition,
+    ) -> Result<Schedule, ScheduleDomainError> {
+        let (schedule_commit, occurrence_commits) = commit.into_parts();
+        let schedule = schedule_commit.successor();
+        if !expected
+            .pre_feedback_ack_ids
+            .is_subset(&schedule.superseded_ack_ids)
+        {
+            return Err(ScheduleDomainError::Internal(
+                "schedule mutation removed a previously committed supersession acknowledgement"
+                    .to_string(),
+            ));
+        }
+        let newly_added_ack_ids: BTreeSet<_> = schedule
+            .superseded_ack_ids
+            .difference(&expected.pre_feedback_ack_ids)
+            .cloned()
+            .collect();
+        let mut returned_ack_ids = BTreeSet::new();
+        let mut returned_ack_count = 0usize;
+        for occurrence in occurrence_commits {
+            let superseded_effects = occurrence
+                .effects()
+                .iter()
+                .filter(|effect| matches!(effect, OccurrenceLifecycleEffect::Superseded))
+                .count();
+            let routed_effects = occurrence
+                .effects()
+                .iter()
+                .filter(|effect| {
+                    matches!(
+                        effect,
+                        OccurrenceLifecycleEffect::OccurrencesSuperseded { .. }
+                    )
+                })
+                .count();
+            let routed_effect_matches_successor = occurrence.effects().iter().any(|effect| {
+                matches!(
+                    effect,
+                    OccurrenceLifecycleEffect::OccurrencesSuperseded {
+                        occurrence_id,
+                        superseding_revision,
+                    } if occurrence_id == &occurrence.successor().occurrence_id
+                        && *superseding_revision == schedule.revision
+                )
+            });
+            if occurrence.successor().phase != OccurrencePhase::Superseded
+                || occurrence.successor().schedule_id != schedule.schedule_id
+                || occurrence.successor().superseded_by_revision != Some(schedule.revision)
+                || occurrence.effects().len() != 2
+                || superseded_effects != 1
+                || routed_effects != 1
+                || !routed_effect_matches_successor
+                || occurrence.supersession_acks().len() != 1
+            {
+                return Err(ScheduleDomainError::Internal(
+                    "schedule mutation committed an incomplete supersession occurrence carrier"
+                        .to_string(),
+                ));
+            }
+            for ack in occurrence.supersession_acks() {
+                if ack.schedule_id() != &schedule.schedule_id
+                    || ack.superseding_revision() != schedule.revision
+                    || !schedule.superseded_ack_ids.contains(ack.occurrence_id())
+                {
+                    return Err(ScheduleDomainError::Internal(
+                        "schedule mutation committed supersession acknowledgement outside the committed schedule authority"
+                            .to_string(),
+                    ));
+                }
+                returned_ack_count += 1;
+                returned_ack_ids.insert(ack.occurrence_id().clone());
+            }
+        }
+        if returned_ack_count != returned_ack_ids.len() || returned_ack_ids != newly_added_ack_ids {
+            return Err(ScheduleDomainError::Internal(
+                "schedule mutation supersession acknowledgement delta did not exactly match its occurrence commits"
+                    .to_string(),
+            ));
+        }
+        Self::observe_schedule_transition(schedule_commit, expected)
+    }
+
     pub fn new(store: Arc<dyn ScheduleStore>) -> Self {
         let (mutation_generation, _) = watch::channel(0);
         Self {
@@ -67,13 +235,14 @@ impl ScheduleService {
             .map_err(|error| ScheduleDomainError::InvalidSchedule(error.to_string()))?;
         let store_now = self.store.get_store_time_utc().await?;
         let planned = self
-            .plan_schedule_occurrences(&mutator.schedule, store_now)
+            .plan_schedule_occurrences(mutator.schedule(), store_now)
             .await?;
         if let Some(planning_mutator) = planned.schedule_mutator {
             mutator
                 .absorb_followup(planning_mutator)
                 .map_err(|error| ScheduleDomainError::Internal(error.to_string()))?;
         }
+        let expected = ExpectedScheduleTransition::from_mutator(&mutator);
         let committed = self
             .store
             .commit_schedule_refill(
@@ -83,7 +252,7 @@ impl ScheduleService {
             )
             .await?;
         self.notify_mutation();
-        Ok(committed)
+        Self::observe_schedule_commit(committed, expected)
     }
 
     pub async fn get(&self, schedule_id: &ScheduleId) -> Result<Schedule, ScheduleDomainError> {
@@ -148,13 +317,14 @@ impl ScheduleService {
         .map_err(|error| ScheduleDomainError::InvalidSchedule(error.to_string()))?;
 
         let planned = self
-            .plan_schedule_occurrences(&mutator.schedule, store_now)
+            .plan_schedule_occurrences(mutator.schedule(), store_now)
             .await?;
         if let Some(planning_mutator) = planned.schedule_mutator {
             mutator
                 .absorb_followup(planning_mutator)
                 .map_err(|error| ScheduleDomainError::Internal(error.to_string()))?;
         }
+        let expected = ExpectedScheduleTransition::from_mutator(&mutator);
         let committed = self
             .store
             .commit_schedule_refill(
@@ -164,7 +334,7 @@ impl ScheduleService {
             )
             .await?;
         self.notify_mutation();
-        Ok(committed)
+        Self::observe_schedule_commit(committed, expected)
     }
 
     pub async fn pause(&self, schedule_id: &ScheduleId) -> Result<Schedule, ScheduleDomainError> {
@@ -177,12 +347,13 @@ impl ScheduleService {
             },
         )
         .map_err(|error| ScheduleDomainError::InvalidSchedule(error.to_string()))?;
-        let schedule = mutator.schedule.clone();
-        self.store
+        let expected = ExpectedScheduleTransition::from_mutator(&mutator);
+        let committed = self
+            .store
             .commit_schedule_write(mutator.into_authorized_write())
             .await?;
         self.notify_mutation();
-        Ok(schedule)
+        Self::observe_schedule_transition(committed, expected)
     }
 
     pub async fn resume(&self, schedule_id: &ScheduleId) -> Result<Schedule, ScheduleDomainError> {
@@ -197,13 +368,14 @@ impl ScheduleService {
         .map_err(|error| ScheduleDomainError::InvalidSchedule(error.to_string()))?;
         let store_now = self.store.get_store_time_utc().await?;
         let planned = self
-            .plan_schedule_occurrences(&mutator.schedule, store_now)
+            .plan_schedule_occurrences(mutator.schedule(), store_now)
             .await?;
         if let Some(planning_mutator) = planned.schedule_mutator {
             mutator
                 .absorb_followup(planning_mutator)
                 .map_err(|error| ScheduleDomainError::Internal(error.to_string()))?;
         }
+        let expected = ExpectedScheduleTransition::from_mutator(&mutator);
         let committed = self
             .store
             .commit_schedule_refill(
@@ -213,7 +385,7 @@ impl ScheduleService {
             )
             .await?;
         self.notify_mutation();
-        Ok(committed)
+        Self::observe_schedule_commit(committed, expected)
     }
 
     pub async fn delete(&self, schedule_id: &ScheduleId) -> Result<Schedule, ScheduleDomainError> {
@@ -225,12 +397,13 @@ impl ScheduleService {
             ScheduleLifecycleInput::Delete { at_utc: store_now },
         )
         .map_err(|error| ScheduleDomainError::InvalidSchedule(error.to_string()))?;
+        let expected = ExpectedScheduleTransition::from_mutator(&mutator);
         let committed = self
             .store
             .commit_schedule_mutation(mutator.into_authorized_write(), Vec::new())
             .await?;
         self.notify_mutation();
-        Ok(committed)
+        Self::observe_schedule_commit(committed, expected)
     }
 
     pub async fn list_occurrences(
@@ -269,7 +442,8 @@ impl ScheduleService {
             .map(|write| write.occurrence().clone())
             .collect();
         if let Some(planning_mutator) = planned.schedule_mutator {
-            let _ = self
+            let expected = ExpectedScheduleTransition::from_mutator(&planning_mutator);
+            let committed = self
                 .store
                 .commit_schedule_refill(
                     planning_mutator.into_authorized_write(),
@@ -277,6 +451,7 @@ impl ScheduleService {
                     planned.next_refill_at_utc,
                 )
                 .await?;
+            let _schedule = Self::observe_schedule_commit(committed, expected)?;
             self.notify_mutation();
         }
         Ok(occurrences)
@@ -301,7 +476,8 @@ impl ScheduleService {
             .map(|write| write.occurrence().clone())
             .collect();
         if let Some(planning_mutator) = planned.schedule_mutator {
-            let _ = self
+            let expected = ExpectedScheduleTransition::from_mutator(&planning_mutator);
+            let committed = self
                 .store
                 .commit_schedule_refill(
                     planning_mutator.into_authorized_write(),
@@ -309,6 +485,7 @@ impl ScheduleService {
                     planned.next_refill_at_utc,
                 )
                 .await?;
+            let _schedule = Self::observe_schedule_commit(committed, expected)?;
         } else {
             self.store
                 .record_refill_deadline_if_current(
@@ -341,10 +518,11 @@ impl ScheduleService {
                 target_snapshot: current.target.clone(),
             })
             .map_err(|error| ScheduleDomainError::Internal(error.to_string()))?;
-        occurrence = mutator.occurrence.clone();
-        self.store
+        let commit = self
+            .store
             .commit_occurrence_write(mutator.into_authorized_write())
             .await?;
+        occurrence = Self::observe_effectless_occurrence_commit(commit)?;
         self.notify_mutation();
         Ok(occurrence)
     }
@@ -371,9 +549,12 @@ impl ScheduleService {
                 },
             )
             .map_err(|error| ScheduleDomainError::Internal(error.to_string()))?;
-            self.store
+            let expected = ExpectedScheduleTransition::from_mutator(&mutator);
+            let committed = self
+                .store
                 .commit_schedule_write(mutator.into_authorized_write())
                 .await?;
+            Self::observe_schedule_transition(committed, expected)?;
             self.notify_mutation();
         }
 
@@ -405,7 +586,10 @@ impl ScheduleService {
 
         let pending_changed = !updated_pending.is_empty();
         if pending_changed {
-            self.store.commit_occurrence_writes(updated_pending).await?;
+            let commits = self.store.commit_occurrence_writes(updated_pending).await?;
+            for commit in commits {
+                Self::observe_effectless_occurrence_commit(commit)?;
+            }
             self.notify_mutation();
         }
 
@@ -553,13 +737,13 @@ struct PlannedScheduleOccurrences {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::OccurrenceLifecycleInput;
     use crate::types::{
         DeliveryReceipt, HelperOptionsSpec, IntervalTriggerSpec, MisfirePolicy, MobTargetBinding,
         OccurrenceId, ResolvedSpawnSnapshot, ScheduleSpawnTooling, ScheduledSessionAction,
         SessionMaterializationSpec, SessionTargetBinding, TargetBinding, TriggerSpec,
     };
     use crate::{MemoryScheduleStore, OverlapPolicy};
-    use crate::{OccurrenceLifecycleEffect, OccurrenceLifecycleInput};
     use chrono::{Duration, TimeZone};
     use meerkat_core::{ContentInput, ToolNameSet};
     use std::collections::BTreeMap;
@@ -616,7 +800,7 @@ mod tests {
         async fn commit_schedule_write(
             &self,
             write: crate::AuthorizedScheduleWrite,
-        ) -> Result<(), ScheduleStoreError> {
+        ) -> Result<crate::ScheduleTransitionCommit, ScheduleStoreError> {
             self.standalone_schedule_commits
                 .fetch_add(1, Ordering::SeqCst);
             self.inner.commit_schedule_write(write).await
@@ -639,14 +823,14 @@ mod tests {
         async fn commit_occurrence_write(
             &self,
             write: AuthorizedOccurrenceWrite,
-        ) -> Result<(), ScheduleStoreError> {
+        ) -> Result<crate::OccurrenceTransitionCommit, ScheduleStoreError> {
             self.inner.commit_occurrence_write(write).await
         }
 
         async fn commit_occurrence_writes(
             &self,
             writes: Vec<AuthorizedOccurrenceWrite>,
-        ) -> Result<(), ScheduleStoreError> {
+        ) -> Result<Vec<crate::OccurrenceTransitionCommit>, ScheduleStoreError> {
             self.inner.commit_occurrence_writes(writes).await
         }
 
@@ -654,7 +838,7 @@ mod tests {
             &self,
             schedule: crate::AuthorizedScheduleWrite,
             occurrences: Vec<AuthorizedOccurrenceWrite>,
-        ) -> Result<Schedule, ScheduleStoreError> {
+        ) -> Result<crate::ScheduleMutationCommit, ScheduleStoreError> {
             self.atomic_calls.fetch_add(1, Ordering::SeqCst);
             self.inner
                 .commit_schedule_mutation(schedule, occurrences)
@@ -666,7 +850,7 @@ mod tests {
             schedule: crate::AuthorizedScheduleWrite,
             occurrences: Vec<AuthorizedOccurrenceWrite>,
             next_refill_at_utc: Option<chrono::DateTime<Utc>>,
-        ) -> Result<Schedule, ScheduleStoreError> {
+        ) -> Result<crate::ScheduleMutationCommit, ScheduleStoreError> {
             self.atomic_calls.fetch_add(1, Ordering::SeqCst);
             self.inner
                 .commit_schedule_refill(schedule, occurrences, next_refill_at_utc)
@@ -704,10 +888,6 @@ mod tests {
             self.inner.list_occurrences(filter).await
         }
 
-        async fn append_receipt(&self, receipt: DeliveryReceipt) -> Result<(), ScheduleStoreError> {
-            self.inner.append_receipt(receipt).await
-        }
-
         async fn list_receipts(
             &self,
             occurrence_id: &OccurrenceId,
@@ -735,8 +915,7 @@ mod tests {
             expected_attempt: u32,
             expected_claim_token: Option<Uuid>,
             transition: OccurrenceLifecycleInput,
-        ) -> Result<Option<(Occurrence, Vec<OccurrenceLifecycleEffect>)>, ScheduleStoreError>
-        {
+        ) -> Result<Option<crate::OccurrenceTransitionCommit>, ScheduleStoreError> {
             self.inner
                 .transition_occurrence_if_current(
                     occurrence_id,
@@ -754,7 +933,7 @@ mod tests {
             expected_claim_token: Option<Uuid>,
             transition: OccurrenceLifecycleInput,
             runtime_outcome: Option<crate::RuntimeDeliveryOutcome>,
-        ) -> Result<Option<Occurrence>, ScheduleStoreError> {
+        ) -> Result<Option<crate::OccurrenceTransitionCommit>, ScheduleStoreError> {
             self.inner
                 .transition_occurrence_with_receipt_if_current(
                     occurrence_id,
@@ -1253,10 +1432,12 @@ mod tests {
             })
             .await?;
         let in_flight = claimed
-            .claimed
+            .transitions
             .into_iter()
             .next()
-            .expect("due occurrence should be claimed");
+            .expect("due occurrence should be claimed")
+            .successor()
+            .clone();
         assert_eq!(in_flight.phase, OccurrencePhase::Claimed);
 
         let deleted = service.delete(&created.schedule_id).await?;

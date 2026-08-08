@@ -135,13 +135,16 @@ assert_timeout_case() {
   set +e
   (
     cd "$TEST_ROOT"
+    # The fake cargo command injects status 124 deterministically for the
+    # selected lane. Give unrelated process startup enough room that host
+    # saturation cannot manufacture an additional timeout and retry.
     ROOT="$REPO_ROOT" \
       CARGO="$FAKE_CARGO" \
       MEERKAT_SKIP_PRE_PUSH_UNIT_CACHE=1 \
-      MEERKAT_PRE_PUSH_NEXTEST_TIMEOUT_SECS=1 \
-      MEERKAT_PRE_PUSH_UNIT_NEXTEST_TIMEOUT_SECS=1 \
-      MEERKAT_PRE_PUSH_INTEGRATION_NEXTEST_TIMEOUT_SECS=1 \
-      MEERKAT_PRE_PUSH_BUILD_TIMEOUT_SECS=1 \
+      MEERKAT_PRE_PUSH_NEXTEST_TIMEOUT_SECS=10 \
+      MEERKAT_PRE_PUSH_UNIT_NEXTEST_TIMEOUT_SECS=10 \
+      MEERKAT_PRE_PUSH_INTEGRATION_NEXTEST_TIMEOUT_SECS=10 \
+      MEERKAT_PRE_PUSH_BUILD_TIMEOUT_SECS=10 \
       MEERKAT_PRE_PUSH_TEST_LANE_LOG="$LANE_LOG" \
       MEERKAT_PRE_PUSH_TEST_FAIL_LANE="" \
       MEERKAT_PRE_PUSH_TEST_FAIL_STATUS=99 \

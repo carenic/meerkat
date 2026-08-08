@@ -1137,7 +1137,7 @@ mod tests {
         drop(fence);
 
         let mut expected = vec![
-            ("session-store", 1, 3),
+            ("session-store", 1, 4),
             ("runtime-store", 1, 2),
             ("schedule-store", 1, 2),
             ("workgraph", 1, 3),

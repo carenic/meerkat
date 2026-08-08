@@ -2553,7 +2553,13 @@ pub(super) async fn latest_persisted_session_for_member(
     mob_id: &crate::ids::MobId,
     role: &crate::ids::ProfileName,
     agent_identity: &crate::ids::AgentIdentity,
-) -> Result<Option<(meerkat_core::types::SessionId, meerkat_core::Session)>, MobError> {
+) -> Result<
+    Option<(
+        meerkat_core::types::SessionId,
+        super::session_service::AuthorizedSessionResume,
+    )>,
+    MobError,
+> {
     let canonical_comms_name = super::actor::render_member_comms_name(
         mob_id.as_str(),
         role.as_str(),
@@ -2602,14 +2608,23 @@ pub(super) async fn latest_persisted_session_for_member(
     // vanishes between the metadata match and materialization reads as "no
     // replacement" (`Ok(None)`) — the caller records the member's restore
     // failure exactly as if no candidate had matched.
-    let loaded = session_service
-        .materialize_session_for_resume(&winner_session_id)
-        .await?;
-    if matches!(&loaded, ResumeSessionLoad::Absent) {
-        return Ok(None);
-    }
-    let session = loaded.into_session_or_error(&winner_session_id)?;
-    Ok(Some((winner_session_id, session)))
+    let authorized = match session_service
+        .materialize_session_resume_verdict(&winner_session_id)
+        .await?
+    {
+        verdict @ super::session_service::SessionResumeVerdict::ResumeAuthorized { .. } => {
+            verdict.into_authorized().expect("authorized verdict")
+        }
+        super::session_service::SessionResumeVerdict::Rejected(rejection)
+            if rejection.kind == super::session_service::ResumeRejectionKind::Absent =>
+        {
+            return Ok(None);
+        }
+        super::session_service::SessionResumeVerdict::Rejected(rejection) => {
+            return Err(rejection.into_mob_error());
+        }
+    };
+    Ok(Some((winner_session_id, authorized)))
 }
 
 fn persisted_session_matches_member(
@@ -8717,30 +8732,22 @@ impl MobBuilder {
                 // replacement search; archived-but-not-revivable is a typed
                 // refusal (the transcript is intact on disk — rotating to a
                 // replacement session would silently abandon it).
-                let stored_session = match session_service
-                    .materialize_session_for_resume(&bridge_session_id)
+                let authorized_resume = match session_service
+                    .materialize_session_resume_verdict(&bridge_session_id)
                     .await?
                 {
-                    ResumeSessionLoad::Active(stored_session)
-                    | ResumeSessionLoad::Revivable(stored_session) => *stored_session,
-                    ResumeSessionLoad::ArchivedNotRevivable { runtime_state } => {
-                        let state = runtime_state.map_or_else(
-                            || "<no runtime record>".to_string(),
-                            |state| state.to_string(),
-                        );
-                        record_restore_failure(
-                            bridge_session_id.clone(),
-                            format!(
-                                "durable session '{bridge_session_id}' is archived and not \
-                                 revivable from runtime state {state}; the transcript is intact \
-                                 and preserved — not searching for a replacement session"
-                            ),
-                        )
-                        .await;
+                    verdict @ super::session_service::SessionResumeVerdict::ResumeAuthorized {
+                        ..
+                    } => verdict.into_authorized().expect("authorized verdict"),
+                    super::session_service::SessionResumeVerdict::Rejected(rejection)
+                        if rejection.kind
+                            != super::session_service::ResumeRejectionKind::Absent =>
+                    {
+                        record_restore_failure(bridge_session_id.clone(), rejection.detail).await;
                         continue;
                     }
-                    ResumeSessionLoad::Absent => {
-                        if let Some((replacement_session_id, replacement_session)) =
+                    super::session_service::SessionResumeVerdict::Rejected(_) => {
+                        if let Some((replacement_session_id, replacement_authorized)) =
                             latest_persisted_session_for_member(
                                 session_service.as_ref(),
                                 &listed_sessions,
@@ -8803,7 +8810,7 @@ impl MobBuilder {
                             if reuse_active_replacement {
                                 continue;
                             }
-                            replacement_session
+                            replacement_authorized
                         } else {
                             // Typed-observation contract: this arm is only
                             // reachable for a genuinely ABSENT session (the
@@ -8821,6 +8828,7 @@ impl MobBuilder {
                         }
                     }
                 };
+                let stored_session = *authorized_resume.session.clone();
                 // Prefer customizer/roster effective_profile_override on restore for lifecycle safety.
                 let mut profile = if let Some(ref p) = restore_profile_override {
                     p.clone()
@@ -8949,6 +8957,7 @@ impl MobBuilder {
                 match provisioner
                     .provision_member(super::provisioner::ProvisionMemberRequest {
                         create_session: req,
+                        authorized_resume: Some(authorized_resume),
                         session_origin: super::provisioner::ProvisionSessionOrigin::ResumedDurable,
                         binding: crate::RuntimeBinding::Session,
                         peer_name,
@@ -9095,6 +9104,7 @@ impl MobBuilder {
             )?;
             let mut provision_request = super::provisioner::ProvisionMemberRequest {
                 create_session: req,
+                authorized_resume: None,
                 session_origin: super::provisioner::ProvisionSessionOrigin::Fresh,
                 binding: crate::RuntimeBinding::Session,
                 peer_name,

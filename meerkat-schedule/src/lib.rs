@@ -30,9 +30,10 @@ pub use lifecycle::{
     ClaimedDispatchVerdict, CompletionSupersessionDisposition, CompletionSupersessionVerdict,
     LateCompletionResolutionClass, OccurrenceDueAction, OccurrenceLifecycleEffect,
     OccurrenceLifecycleError, OccurrenceLifecycleInput, OccurrenceLifecycleMutator,
-    OccurrenceSupersessionAck, OccurrenceWritePrecondition, ScheduleLifecycleEffect,
-    ScheduleLifecycleError, ScheduleLifecycleInput, ScheduleLifecycleMutator,
-    ScheduleWritePrecondition, StaleCompletionArrivalTrigger,
+    OccurrenceSupersessionAck, OccurrenceTransitionCommit, OccurrenceWritePrecondition,
+    ScheduleLifecycleEffect, ScheduleLifecycleError, ScheduleLifecycleInput,
+    ScheduleLifecycleMutator, ScheduleTransitionCommit, ScheduleWritePrecondition,
+    StaleCompletionArrivalTrigger,
 };
 pub use runnable::{
     HostRunnable, HostRunnableError, HostRunnableInvocation, HostRunnableOutcome,
@@ -42,9 +43,10 @@ pub use service::ScheduleService;
 pub use store::{
     ClaimDueRequest, ClaimDueResult, DisabledScheduleStore, MemoryScheduleStore, OccurrenceFilter,
     PendingSupersession, RenewOccurrenceLeaseOutcome, RenewOccurrenceLeaseRequest,
-    RenewOccurrenceLeaseResult, ScheduleFilter, ScheduleRefillBatch, ScheduleRefillCandidate,
-    ScheduleStore, ScheduleStoreActionTime, ScheduleStoreKind, ScheduleStoreRowFault,
-    ScheduleStoreRowFaultKind, ScheduleStoreWakeMode, apply_supersession_feedback,
+    RenewOccurrenceLeaseResult, ScheduleFilter, ScheduleMutationCommit, ScheduleRefillBatch,
+    ScheduleRefillCandidate, ScheduleStore, ScheduleStoreActionTime, ScheduleStoreKind,
+    ScheduleStoreRowFault, ScheduleStoreRowFaultKind, ScheduleStoreWakeMode,
+    apply_supersession_feedback,
 };
 pub use surface::wire_schedule_tools;
 pub use tool_surface::ScheduleToolSurface;

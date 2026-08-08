@@ -2400,7 +2400,8 @@ impl Schedule {
             None,
             crate::lifecycle::ScheduleLifecycleInput::Create(request),
         )?
-        .into_schedule())
+        .into_authorized_write()
+        .into_uncommitted_schedule_for_construction())
     }
 
     pub fn touch(&mut self) {

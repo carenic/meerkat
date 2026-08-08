@@ -65,6 +65,7 @@ use meerkat_session::{SessionAgent, SessionAgentBuilder, SessionSnapshot};
 use meerkat_store::{MemoryStore, SessionStore};
 use serde::Serialize;
 use serde_json::value::RawValue;
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::Write;
 use std::path::PathBuf;
@@ -1375,6 +1376,79 @@ enum RuntimeBoundaryAcknowledgement {
     },
 }
 
+fn test_resume_authority_from_atomic_snapshot(
+    session_id: &SessionId,
+    session: Option<Session>,
+    archived: bool,
+    store_revision: Option<u64>,
+) -> Result<SessionResumeAuthority, SessionError> {
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(session_id);
+    let (session_authority, catalog_entry) = match (session, store_revision) {
+        (Some(mut session), Some(store_revision)) => {
+            if archived {
+                session
+                    .set_lifecycle_terminal(meerkat_core::SessionLifecycleTerminal::Archived)
+                    .map_err(|error| {
+                        SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                            format!("failed to stamp test archive lifecycle: {error}"),
+                        ))
+                    })?;
+            }
+            let bytes = serde_json::to_vec(&session).map_err(|error| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
+                    "failed to encode test resume body: {error}"
+                )))
+            })?;
+            let digest = format!("row-sha256:{:x}", Sha256::digest(&bytes));
+            let authority = meerkat_runtime::store::WholeBlobStoreAuthority::from_store_record(
+                meerkat_runtime::store::WholeBlobStoreAuthority::VERSION,
+                session_id.clone(),
+                store_revision,
+                digest,
+            )
+            .map(meerkat_runtime::store::RuntimeSessionAuthority::WholeBlob)
+            .map_err(|error| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
+                    "failed to issue test resume authority: {error}"
+                )))
+            })?;
+            let catalog = meerkat_runtime::store::RuntimeSessionCatalogEntry::from_session(
+                &session,
+                meerkat_runtime::store::RuntimeSessionPersistenceProfile::WholeBlobV1,
+                None,
+            )
+            .map_err(|error| {
+                SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
+                    "failed to project test resume catalog: {error}"
+                )))
+            })?;
+            (Some(authority), Some(catalog))
+        }
+        (None, None) => (None, None),
+        _ => {
+            return Err(SessionError::Agent(
+                meerkat_core::error::AgentError::InternalError(
+                    "test resume body and store revision diverged".to_string(),
+                ),
+            ));
+        }
+    };
+    let observation = meerkat_runtime::store::RuntimeSessionResumeObservation::from_store_snapshot(
+        runtime_id,
+        session_authority,
+        catalog_entry,
+        meerkat_runtime::store::MachineLifecycleObservation::Missing,
+    )
+    .map_err(|error| {
+        SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
+            "failed to construct test resume observation: {error}"
+        )))
+    })?;
+    Ok(SessionResumeAuthority {
+        observation: Some(observation),
+    })
+}
+
 struct AtomicInFlightGuard<'a>(&'a AtomicU64);
 
 impl Drop for AtomicInFlightGuard<'_> {
@@ -1389,6 +1463,10 @@ struct MockSessionService {
     actor_registry: meerkat_session::LiveSessionActorRegistry,
     live_session_data: RwLock<HashMap<SessionId, Session>>,
     persisted_sessions: RwLock<HashMap<SessionId, Session>>,
+    /// Serializes the test store's body, archive marker, and issued revision.
+    resume_authority_gate: tokio::sync::Mutex<()>,
+    persisted_session_revisions: RwLock<HashMap<SessionId, u64>>,
+    next_persisted_session_revision: AtomicU64,
     /// Test-only physical-head bodies installed by the explicit operational
     /// resume preparation seam.
     prepared_resume_sessions: RwLock<HashMap<SessionId, Session>>,
@@ -1546,6 +1624,9 @@ impl MockSessionService {
             actor_registry: meerkat_session::LiveSessionActorRegistry::default(),
             live_session_data: RwLock::new(HashMap::new()),
             persisted_sessions: RwLock::new(HashMap::new()),
+            resume_authority_gate: tokio::sync::Mutex::new(()),
+            persisted_session_revisions: RwLock::new(HashMap::new()),
+            next_persisted_session_revision: AtomicU64::new(1),
             prepared_resume_sessions: RwLock::new(HashMap::new()),
             resume_prepare_calls: AtomicU64::new(0),
             keep_alive_notifiers: RwLock::new(HashMap::new()),
@@ -1654,6 +1735,7 @@ impl MockSessionService {
     }
 
     async fn replace_live_session(&self, session: Session) {
+        let _authority_guard = self.resume_authority_gate.lock().await;
         let session_id = session.id().clone();
         self.live_session_data
             .write()
@@ -1662,11 +1744,29 @@ impl MockSessionService {
         self.persisted_sessions
             .write()
             .await
-            .insert(session_id, session);
+            .insert(session_id.clone(), session);
+        self.archived_session_ids.write().await.remove(&session_id);
+        self.issue_persisted_session_revision(&session_id).await;
     }
 
     async fn delete_persisted_session(&self, session_id: &SessionId) {
+        let _authority_guard = self.resume_authority_gate.lock().await;
         self.persisted_sessions.write().await.remove(session_id);
+        self.persisted_session_revisions
+            .write()
+            .await
+            .remove(session_id);
+        self.archived_session_ids.write().await.remove(session_id);
+    }
+
+    async fn issue_persisted_session_revision(&self, session_id: &SessionId) {
+        let revision = self
+            .next_persisted_session_revision
+            .fetch_add(1, Ordering::Relaxed);
+        self.persisted_session_revisions
+            .write()
+            .await
+            .insert(session_id.clone(), revision);
     }
 
     async fn stage_prepared_resume_session(&self, session: Session) {
@@ -1682,9 +1782,18 @@ impl MockSessionService {
     /// from durable owners rather than inheriting warm in-memory evidence.
     async fn cold_restart_preserving_durable_state(&self) -> Self {
         let restarted = Self::new();
+        let _authority_guard = self.resume_authority_gate.lock().await;
         let persisted_sessions = self.persisted_sessions.read().await.clone();
         let persisted_ids = persisted_sessions.keys().cloned().collect::<HashSet<_>>();
         *restarted.persisted_sessions.write().await = persisted_sessions;
+        *restarted.persisted_session_revisions.write().await =
+            self.persisted_session_revisions.read().await.clone();
+        *restarted.archived_session_ids.write().await =
+            self.archived_session_ids.read().await.clone();
+        restarted.next_persisted_session_revision.store(
+            self.next_persisted_session_revision.load(Ordering::Relaxed),
+            Ordering::Relaxed,
+        );
         *restarted.session_comms_names.write().await = self
             .session_comms_names
             .read()
@@ -2471,6 +2580,7 @@ impl MockSessionService {
                 .set_session_metadata(metadata)
                 .expect("mock session metadata should serialize");
         }
+        let _authority_guard = self.resume_authority_gate.lock().await;
         self.live_session_data
             .write()
             .await
@@ -2479,6 +2589,9 @@ impl MockSessionService {
             .write()
             .await
             .insert(session_id.clone(), session);
+        self.archived_session_ids.write().await.remove(&session_id);
+        self.issue_persisted_session_revision(&session_id).await;
+        drop(_authority_guard);
         let is_keep_alive = req.build.as_ref().map(|b| b.keep_alive).unwrap_or(false);
         if is_keep_alive {
             self.keep_alive_notifiers
@@ -2920,7 +3033,12 @@ impl SessionService for MockSessionService {
         if archive_delay_ms > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(archive_delay_ms)).await;
         }
+        let _authority_guard = self.resume_authority_gate.lock().await;
         self.archived_session_ids.write().await.insert(id.clone());
+        if self.persisted_sessions.read().await.contains_key(id) {
+            self.issue_persisted_session_revision(id).await;
+        }
+        drop(_authority_guard);
         let runtime = {
             let mut sessions = self.sessions.write().await;
             let runtime = sessions.remove(id);
@@ -3272,12 +3390,35 @@ impl MobSessionService for MockSessionService {
             .await
             .remove(session_id)
         {
+            let _authority_guard = self.resume_authority_gate.lock().await;
             self.persisted_sessions
                 .write()
                 .await
                 .insert(session_id.clone(), prepared);
+            self.issue_persisted_session_revision(session_id).await;
         }
         Ok(())
+    }
+
+    async fn observe_session_resume_authority(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionResumeAuthority, SessionError> {
+        let _authority_guard = self.resume_authority_gate.lock().await;
+        let session = self
+            .persisted_sessions
+            .read()
+            .await
+            .get(session_id)
+            .cloned();
+        let archived = self.archived_session_ids.read().await.contains(session_id);
+        let revision = self
+            .persisted_session_revisions
+            .read()
+            .await
+            .get(session_id)
+            .copied();
+        test_resume_authority_from_atomic_snapshot(session_id, session, archived, revision)
     }
 
     /// Test double: nothing durable survives archive here, so the two-read
@@ -3481,6 +3622,7 @@ impl MobSessionService for MockSessionService {
         if delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
+        let _authority_guard = self.resume_authority_gate.lock().await;
         // Mirror PersistentSessionService: archived sessions have no loadable
         // durable snapshot (archive is terminal).
         let persisted = if self.archived_session_ids.read().await.contains(session_id) {
@@ -9124,6 +9266,15 @@ impl MobSessionService for PersistedListingSessionService {
         self.inner.prepare_session_for_resume(session_id).await
     }
 
+    async fn observe_session_resume_authority(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<super::session_service::SessionResumeAuthority, SessionError> {
+        self.inner
+            .observe_session_resume_authority(session_id)
+            .await
+    }
+
     async fn acknowledge_committed_runtime_session_boundary_under_turn_finalization_boundary(
         &self,
         session_id: &SessionId,
@@ -9435,6 +9586,15 @@ impl SessionServiceControlExt for InactiveReadSessionService {
 impl MobSessionService for InactiveReadSessionService {
     async fn prepare_session_for_resume(&self, session_id: &SessionId) -> Result<(), SessionError> {
         self.inner.prepare_session_for_resume(session_id).await
+    }
+
+    async fn observe_session_resume_authority(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<super::session_service::SessionResumeAuthority, SessionError> {
+        self.inner
+            .observe_session_resume_authority(session_id)
+            .await
     }
 
     async fn acknowledge_committed_runtime_session_boundary_under_turn_finalization_boundary(
@@ -9754,6 +9914,7 @@ async fn archived_document_without_runtime_record_is_revivable() {
         super::provisioner::SessionBackend::new(service.clone(), Some(adapter.clone()), None);
     let receipt = provisioner
         .provision_member(super::provisioner::ProvisionMemberRequest {
+            authorized_resume: None,
             session_origin: super::provisioner::ProvisionSessionOrigin::ResumedDurable,
             create_session: CreateSessionRequest {
                 injected_context: Vec::new(),
@@ -13069,11 +13230,8 @@ async fn test_destroy_autonomous_archive_failure_retry_reaches_archive_after_run
         "archive failure must retain the member roster anchor for retry"
     );
     assert!(
-        service
-            .has_live_session(&bridge_session_id)
-            .await
-            .expect("check worker session after archive failure"),
-        "failed archive must leave the bridge session available for retry"
+        !service.test_is_session_archived(&bridge_session_id).await,
+        "failed archive must leave durable session authority available for retry"
     );
 
     service
@@ -19192,6 +19350,7 @@ async fn test_wait_for_members_ready_marks_missing_bridge_session_broken() {
         .archive(&bridge_session_id)
         .await
         .expect("test should remove the live bridge session");
+    service.delete_persisted_session(&bridge_session_id).await;
 
     let snapshots = handle
         .wait_for_members_ready(
@@ -31928,6 +32087,7 @@ async fn provision_runtime_backed_disposal_fixture(
     let session_id = session.id().clone();
     provisioner
         .provision_member(super::provisioner::ProvisionMemberRequest {
+            authorized_resume: None,
             session_origin: super::provisioner::ProvisionSessionOrigin::Fresh,
             create_session: CreateSessionRequest {
                 injected_context: Vec::new(),
@@ -33524,6 +33684,7 @@ async fn test_provision_member_uses_local_bindings_before_routed_runtime_bound()
 
     provisioner
         .provision_member(super::provisioner::ProvisionMemberRequest {
+            authorized_resume: None,
             session_origin: super::provisioner::ProvisionSessionOrigin::Fresh,
             create_session: CreateSessionRequest {
                 injected_context: Vec::new(),
@@ -33560,6 +33721,172 @@ async fn test_provision_member_uses_local_bindings_before_routed_runtime_bound()
         signal_surface.log.lock().await.is_empty(),
         "member provisioning must not publish RuntimeBound with the session runtime id; the routed mob binding owns that signal"
     );
+}
+
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test]
+async fn test_multi_backend_session_provision_forwards_injected_authorized_resume() {
+    let service = Arc::new(MockSessionService::new());
+    let adapter = Arc::new(meerkat_runtime::MeerkatMachine::ephemeral());
+    service.set_runtime_adapter(adapter.clone());
+    let definition = sample_definition();
+    let supervisor_bridge = Arc::new(
+        crate::runtime::MobSupervisorBridge::new(
+            &definition.id,
+            default_supervisor_authority_record(),
+            None,
+        )
+        .await
+        .expect("build test supervisor bridge"),
+    );
+    let provisioner = super::provisioner::MultiBackendProvisioner::new(
+        service.clone(),
+        Some(adapter),
+        None,
+        None,
+        supervisor_bridge,
+    );
+    let session = Session::new();
+    let session_id = session.id().clone();
+    service.replace_live_session(session.clone()).await;
+    let durable_snapshot = serde_json::to_value(
+        service
+            .persisted_session_clone(&session_id)
+            .await
+            .expect("persisted resume fixture"),
+    )
+    .expect("serialize persisted resume fixture");
+    let authorized_resume = service
+        .materialize_session_resume_verdict(&session_id)
+        .await
+        .expect("materialize one owner-issued resume verdict")
+        .into_authorized()
+        .expect("persisted test session is resumable");
+    assert_eq!(
+        service.resume_prepare_calls.load(Ordering::Relaxed),
+        1,
+        "the caller should materialize exactly one resume verdict"
+    );
+
+    // Advance only the owner-issued revision after the caller has obtained its
+    // resume verdict. The injected body remains byte-identical, so the first
+    // divergence is observed by the post-Prepared authority check. That path
+    // must synchronously roll back Prepared+B before returning the typed error.
+    {
+        let _authority_guard = service.resume_authority_gate.lock().await;
+        service.issue_persisted_session_revision(&session_id).await;
+    }
+    let stale_error = provisioner
+        .provision_member(super::provisioner::ProvisionMemberRequest {
+            authorized_resume: Some(authorized_resume),
+            session_origin: super::provisioner::ProvisionSessionOrigin::ResumedDurable,
+            create_session: CreateSessionRequest {
+                injected_context: Vec::new(),
+                model: "claude-sonnet-4-5".to_string(),
+                prompt: "reject stale injected resume authority".to_string().into(),
+                system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+                max_tokens: None,
+                event_tx: None,
+                build: Some(meerkat_core::service::SessionBuildOptions {
+                    resume_session: Some(session),
+                    comms_name: Some("test-mob/worker/forward-authorized-resume".to_string()),
+                    keep_alive: true,
+                    ..Default::default()
+                }),
+                initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+                deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+                labels: None,
+            },
+            binding: crate::RuntimeBinding::Session,
+            peer_name: "forward-authorized-resume".to_string(),
+            owner_bridge_session_id: None,
+            ops_registry: None,
+            generated_self_owned_operation_owner: Some(session_id.clone()),
+            runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
+        })
+        .await
+        .expect_err("stale injected authority must fail after Prepared");
+    assert!(
+        matches!(
+            &stale_error,
+            MobError::SessionUnavailableForResume {
+                reason: crate::error::SessionResumeUnavailableReason::AuthorityChangedDuringMaterialization,
+                ..
+            }
+        ),
+        "the original typed authority-change error must survive exact Prepared rollback: {stale_error}"
+    );
+    assert!(
+        !service
+            .has_live_session(&session_id)
+            .await
+            .expect("observe live session after rejected resume"),
+        "post-Prepared rejection must not mint a live actor witness"
+    );
+    assert_eq!(
+        serde_json::to_value(
+            service
+                .persisted_session_clone(&session_id)
+                .await
+                .expect("persisted session after rejected resume"),
+        )
+        .expect("serialize persisted session after rejected resume"),
+        durable_snapshot,
+        "rejected materialization must preserve the durable body"
+    );
+
+    let authorized_resume = service
+        .materialize_session_resume_verdict(&session_id)
+        .await
+        .expect("materialize fresh resume verdict after rollback")
+        .into_authorized()
+        .expect("persisted test session remains resumable");
+    let retry_session = authorized_resume.session.as_ref().clone();
+    let receipt = provisioner
+        .provision_member(super::provisioner::ProvisionMemberRequest {
+            authorized_resume: Some(authorized_resume),
+            session_origin: super::provisioner::ProvisionSessionOrigin::ResumedDurable,
+            create_session: CreateSessionRequest {
+                injected_context: Vec::new(),
+                model: "claude-sonnet-4-5".to_string(),
+                prompt: "forward injected resume authority".to_string().into(),
+                system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+                max_tokens: None,
+                event_tx: None,
+                build: Some(meerkat_core::service::SessionBuildOptions {
+                    resume_session: Some(retry_session),
+                    comms_name: Some("test-mob/worker/forward-authorized-resume".to_string()),
+                    keep_alive: true,
+                    ..Default::default()
+                }),
+                initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+                deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+                labels: None,
+            },
+            binding: crate::RuntimeBinding::Session,
+            peer_name: "forward-authorized-resume".to_string(),
+            owner_bridge_session_id: None,
+            ops_registry: None,
+            generated_self_owned_operation_owner: Some(session_id.clone()),
+            runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
+        })
+        .await
+        .expect("session arm should consume the injected resume authorization");
+
+    assert_eq!(
+        service.resume_prepare_calls.load(Ordering::Relaxed),
+        2,
+        "MultiBackendProvisioner must forward the injected verdict instead of materializing it again"
+    );
+    assert_eq!(
+        receipt.member_ref.bridge_session_id(),
+        Some(&session_id),
+        "the immediate same-session retry must reacquire the rolled-back Prepared claim"
+    );
+    provisioner
+        .retire_member(&receipt.member_ref)
+        .await
+        .expect("retire forwarded-resume fixture");
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -33800,6 +34127,7 @@ async fn test_fresh_provision_failure_preserves_resumable_document_and_quiesces_
 
     let error = provisioner
         .provision_member(super::provisioner::ProvisionMemberRequest {
+            authorized_resume: None,
             session_origin: super::provisioner::ProvisionSessionOrigin::Fresh,
             create_session: CreateSessionRequest {
                 injected_context: Vec::new(),
@@ -33874,6 +34202,7 @@ async fn test_fresh_provision_failure_preserves_resumable_document_and_quiesces_
 
     let resumed = provisioner
         .provision_member(super::provisioner::ProvisionMemberRequest {
+            authorized_resume: None,
             session_origin: super::provisioner::ProvisionSessionOrigin::ResumedDurable,
             create_session: CreateSessionRequest {
                 injected_context: Vec::new(),
@@ -33947,6 +34276,7 @@ async fn test_retired_session_revival_failure_preserves_resumable_document() {
 
     let receipt = provisioner
         .provision_member(super::provisioner::ProvisionMemberRequest {
+            authorized_resume: None,
             session_origin: super::provisioner::ProvisionSessionOrigin::Fresh,
             create_session: CreateSessionRequest {
                 injected_context: Vec::new(),
@@ -34018,6 +34348,7 @@ async fn test_retired_session_revival_failure_preserves_resumable_document() {
     let mismatched_owner = SessionId::new();
     let error = provisioner
         .provision_member(super::provisioner::ProvisionMemberRequest {
+            authorized_resume: None,
             session_origin: super::provisioner::ProvisionSessionOrigin::ResumedDurable,
             create_session: CreateSessionRequest {
                 injected_context: Vec::new(),
@@ -34100,6 +34431,7 @@ async fn test_retired_session_revival_failure_preserves_resumable_document() {
 
     let resumed = provisioner
         .provision_member(super::provisioner::ProvisionMemberRequest {
+            authorized_resume: None,
             session_origin: super::provisioner::ProvisionSessionOrigin::ResumedDurable,
             create_session: CreateSessionRequest {
                 injected_context: Vec::new(),
@@ -40446,6 +40778,9 @@ struct RealCommsSessionService {
     /// the same typed snapshot as production.
     persisted_sessions: RwLock<HashMap<SessionId, Session>>,
     archived_session_ids: RwLock<HashSet<SessionId>>,
+    resume_authority_gate: tokio::sync::Mutex<()>,
+    persisted_session_revisions: RwLock<HashMap<SessionId, u64>>,
+    next_persisted_session_revision: AtomicU64,
     actor_registry: meerkat_session::LiveSessionActorRegistry,
     /// Production session-scoped comms reloads the persisted signing identity.
     /// Keep the same invariant in this in-memory harness so restarting comms
@@ -40463,6 +40798,9 @@ impl RealCommsSessionService {
             sessions: RwLock::new(HashMap::new()),
             persisted_sessions: RwLock::new(HashMap::new()),
             archived_session_ids: RwLock::new(HashSet::new()),
+            resume_authority_gate: tokio::sync::Mutex::new(()),
+            persisted_session_revisions: RwLock::new(HashMap::new()),
+            next_persisted_session_revision: AtomicU64::new(1),
             actor_registry: meerkat_session::LiveSessionActorRegistry::default(),
             session_keypairs: RwLock::new(HashMap::new()),
             keep_alive_notifiers: RwLock::new(HashMap::new()),
@@ -40470,6 +40808,16 @@ impl RealCommsSessionService {
             session_counter: AtomicU64::new(0),
             runtime_adapter: Arc::new(meerkat_runtime::MeerkatMachine::ephemeral()),
         }
+    }
+
+    async fn issue_persisted_session_revision(&self, session_id: &SessionId) {
+        let revision = self
+            .next_persisted_session_revision
+            .fetch_add(1, Ordering::Relaxed);
+        self.persisted_session_revisions
+            .write()
+            .await
+            .insert(session_id.clone(), revision);
     }
 
     async fn create_session_with_actor_witness_slot(
@@ -40614,11 +40962,14 @@ impl RealCommsSessionService {
                     )))
                 })?;
         }
+        let _authority_guard = self.resume_authority_gate.lock().await;
         self.archived_session_ids.write().await.remove(&session_id);
         self.persisted_sessions
             .write()
             .await
             .insert(session_id.clone(), session);
+        self.issue_persisted_session_revision(&session_id).await;
+        drop(_authority_guard);
 
         if let Some(permit) = actor_materialization_permit
             && let Err(error) = permit.commit()
@@ -40768,7 +41119,9 @@ impl SessionService for RealCommsSessionService {
             notifier.notify_waiters();
         }
         self.session_comms_names.write().await.remove(id);
+        let _authority_guard = self.resume_authority_gate.lock().await;
         self.persisted_sessions.write().await.remove(id);
+        self.persisted_session_revisions.write().await.remove(id);
         self.archived_session_ids.write().await.insert(id.clone());
         Ok(())
     }
@@ -40825,6 +41178,27 @@ impl MobSessionService for RealCommsSessionService {
         _session_id: &SessionId,
     ) -> Result<(), SessionError> {
         Ok(())
+    }
+
+    async fn observe_session_resume_authority(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionResumeAuthority, SessionError> {
+        let _authority_guard = self.resume_authority_gate.lock().await;
+        let session = self
+            .persisted_sessions
+            .read()
+            .await
+            .get(session_id)
+            .cloned();
+        let archived = self.archived_session_ids.read().await.contains(session_id);
+        let revision = self
+            .persisted_session_revisions
+            .read()
+            .await
+            .get(session_id)
+            .copied();
+        test_resume_authority_from_atomic_snapshot(session_id, session, archived, revision)
     }
 
     async fn acknowledge_committed_runtime_session_boundary_under_turn_finalization_boundary(
@@ -40958,6 +41332,7 @@ impl MobSessionService for RealCommsSessionService {
         &self,
         session_id: &SessionId,
     ) -> Result<Option<Session>, SessionError> {
+        let _authority_guard = self.resume_authority_gate.lock().await;
         if self.archived_session_ids.read().await.contains(session_id) {
             return Ok(None);
         }
@@ -41970,6 +42345,13 @@ impl MobSessionService for RuntimeBackedRealCommsSessionService {
         Ok(())
     }
 
+    async fn observe_session_resume_authority(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<SessionResumeAuthority, SessionError> {
+        Ok(SessionResumeAuthority::default())
+    }
+
     async fn acknowledge_committed_runtime_session_boundary_under_turn_finalization_boundary(
         &self,
         _session_id: &SessionId,
@@ -42035,7 +42417,7 @@ impl MobSessionService for RuntimeBackedRealCommsSessionService {
     }
 
     fn supports_persistent_sessions(&self) -> bool {
-        true
+        false
     }
 
     fn supports_runtime_turn_apply(&self) -> bool {
@@ -42421,6 +42803,7 @@ async fn create_test_mob_with_runtime_backed_real_comms(
     let storage = MobStorage::in_memory();
     let handle = MobBuilder::new(definition, storage)
         .with_session_service(service.clone())
+        .allow_ephemeral_sessions(true)
         .create()
         .await
         .expect("create mob");
@@ -42445,6 +42828,7 @@ async fn create_test_mob_with_persistent_runtime_backed_real_comms(
     let storage = MobStorage::in_memory();
     let handle = MobBuilder::new(definition, storage)
         .with_session_service(service.clone())
+        .allow_ephemeral_sessions(true)
         .create()
         .await
         .expect("create mob");
@@ -47130,6 +47514,7 @@ async fn test_member_status_marks_current_missing_bridge_session_broken() {
         .archive(&bridge_session_id)
         .await
         .expect("test should remove the live bridge session");
+    service.delete_persisted_session(&bridge_session_id).await;
 
     let snapshot = handle
         .member_status(&AgentIdentity::from("w-1"))
@@ -47193,6 +47578,7 @@ async fn test_missing_bridge_session_stops_member_from_looking_runnable_after_st
         .archive(&bridge_session_id)
         .await
         .expect("test should remove the live bridge session");
+    service.delete_persisted_session(&bridge_session_id).await;
 
     let _ = handle
         .member_status(&AgentIdentity::from("w-1"))
@@ -47260,6 +47646,7 @@ async fn test_submit_work_marks_missing_bridge_session_broken_without_prior_stat
         .archive(&bridge_session_id)
         .await
         .expect("test should remove the live bridge session");
+    service.delete_persisted_session(&bridge_session_id).await;
 
     let error = handle
         .submit_work(
@@ -47331,19 +47718,15 @@ async fn test_discarded_live_session_revived_by_machine_authorized_dispatch() {
     // preserve every persisted System row, including byte-identical repeats.
     // These are transcript events, not configuration entries to normalize.
     let expected_before_revival = {
-        let mut persisted_sessions = service.persisted_sessions.write().await;
-        let persisted = persisted_sessions
-            .get_mut(&bridge_session_id)
+        let mut persisted = service
+            .persisted_session_clone(&bridge_session_id)
+            .await
             .expect("durable bridge session");
         for _ in 0..12 {
             persisted.append_system_message("repeated runtime instruction".to_string());
         }
         let expected = persisted.messages().to_vec();
-        service
-            .live_session_data
-            .write()
-            .await
-            .insert(bridge_session_id.clone(), persisted.clone());
+        service.replace_live_session(persisted).await;
         expected
     };
 

@@ -1581,6 +1581,20 @@ pub struct IdentitySessionObservation {
 }
 
 impl IdentitySessionObservation {
+    pub(crate) fn matching_authority(
+        desired: &DesiredSessionTarget,
+        authority: IdentitySessionStoreAuthority,
+    ) -> Result<Self, IdentityIntentError> {
+        validate_session_target(desired)?;
+        authority.validate()?;
+        if authority.session_id() != &desired.session_id {
+            return Err(IdentityIntentError::SessionStoreAuthorityMismatch);
+        }
+        Ok(Self {
+            state: IdentitySessionObservationState::Matching { authority },
+        })
+    }
+
     pub(crate) fn matching(
         desired: &DesiredSessionTarget,
         observed: &Session,

@@ -5,8 +5,8 @@ use chrono::{Duration, Utc};
 use meerkat_core::{ContentInput, SessionId};
 use meerkat_schedule::{
     CreateScheduleRequest, IntervalTriggerSpec, MisfirePolicy, MissingTargetPolicy, Occurrence,
-    OccurrenceOrdinal, OverlapPolicy, Schedule, ScheduleLifecycleInput, ScheduleStore,
-    ScheduledSessionAction, SessionTargetBinding, TargetBinding, TriggerSpec,
+    OccurrenceLifecycleEffect, OccurrenceOrdinal, OverlapPolicy, Schedule, ScheduleLifecycleInput,
+    ScheduleStore, ScheduledSessionAction, SessionTargetBinding, TargetBinding, TriggerSpec,
 };
 use meerkat_store::SqliteScheduleStore;
 use rusqlite::{Connection, params};
@@ -46,8 +46,8 @@ async fn commit_sample_schedule(store: &SqliteScheduleStore) -> Schedule {
         ScheduleLifecycleInput::Create(sample_schedule_request()),
     )
     .expect("sample schedule creation should pass generated authority");
-    let schedule = mutator.schedule.clone();
-    store
+    let schedule = mutator.schedule().clone();
+    let _commit = store
         .commit_schedule_write(mutator.into_authorized_write())
         .await
         .expect("commit schedule");
@@ -188,10 +188,13 @@ async fn sqlite_occurrence_with_mismatched_phase_projection_fails_closed() {
         Occurrence::planned_write_from_schedule(&schedule, OccurrenceOrdinal(0), Utc::now())
             .expect("plan occurrence");
     let occurrence = occurrence_write.occurrence().clone();
-    store
+    let commit = store
         .commit_occurrence_write(occurrence_write)
         .await
         .expect("commit occurrence");
+    assert_eq!(commit.successor(), &occurrence);
+    assert!(commit.effects().is_empty());
+    assert!(commit.supersession_acks().is_empty());
 
     corrupt_json_blob(
         &path,
@@ -224,10 +227,13 @@ async fn sqlite_occurrence_with_unrecoverable_machine_state_fails_closed() {
         Occurrence::planned_write_from_schedule(&schedule, OccurrenceOrdinal(0), Utc::now())
             .expect("plan occurrence");
     let occurrence = occurrence_write.occurrence().clone();
-    store
+    let commit = store
         .commit_occurrence_write(occurrence_write)
         .await
         .expect("commit occurrence");
+    assert_eq!(commit.successor(), &occurrence);
+    assert!(commit.effects().is_empty());
+    assert!(commit.supersession_acks().is_empty());
 
     corrupt_json_blob(
         &path,
@@ -277,7 +283,7 @@ async fn sqlite_store_rejects_stale_generated_writes() {
         ScheduleLifecycleInput::Pause { at_utc: Utc::now() },
     )
     .expect("second pause from original should pass generated authority before durability CAS");
-    store
+    let _commit = store
         .commit_schedule_write(first_pause.into_authorized_write())
         .await
         .expect("first pause commit should pass");
@@ -294,10 +300,13 @@ async fn sqlite_store_rejects_stale_generated_writes() {
     )
     .expect("plan occurrence");
     let occurrence = occurrence_write.occurrence().clone();
-    store
+    let planned_commit = store
         .commit_occurrence_write(occurrence_write)
         .await
         .expect("commit planned occurrence");
+    assert_eq!(planned_commit.successor(), &occurrence);
+    assert!(planned_commit.effects().is_empty());
+    assert!(planned_commit.supersession_acks().is_empty());
     let first_claim = occurrence
         .clone()
         .apply(meerkat_schedule::OccurrenceLifecycleInput::Claim {
@@ -315,10 +324,18 @@ async fn sqlite_store_rejects_stale_generated_writes() {
             claim_token: uuid::Uuid::now_v7(),
         })
         .expect("stale claim should pass before durability CAS");
-    store
+    let claim_commit = store
         .commit_occurrence_write(first_claim.into_authorized_write())
         .await
         .expect("first claim commit should pass");
+    assert_eq!(
+        claim_commit.effects(),
+        &[OccurrenceLifecycleEffect::Claimed]
+    );
+    assert_eq!(
+        claim_commit.successor().phase,
+        meerkat_schedule::OccurrencePhase::Claimed
+    );
     let error = store
         .commit_occurrence_write(stale_claim.into_authorized_write())
         .await

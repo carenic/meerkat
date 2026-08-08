@@ -3,8 +3,8 @@
 use crate::{SessionFilter, SessionStore, SessionStoreError};
 use async_trait::async_trait;
 use meerkat_core::session_store::{
-    IncrementalSessionStore, PreparedHeadCanonicalParentTransition, SaveGuardWitness, SessionHead,
-    SessionHeadCas, StrandLayout, StrandSegment, StrandSplice,
+    HeadCanonicalAuthorityCrossing, IncrementalSessionStore, PreparedHeadCanonicalParentTransition,
+    SaveGuardWitness, SessionHead, SessionHeadCas, StrandLayout, StrandSegment, StrandSplice,
     head_canonical_plain_save_guard_with_prefix_witness, reconstruct_rewrite_record,
     session_head_cas_token, strand_layout_for_history, validate_commit_rewrite_transition,
     validate_save_head_transition,
@@ -951,6 +951,16 @@ impl SessionStore for MemoryStore {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl IncrementalSessionStore for MemoryStore {
+    async fn cross_head_canonical_authority(
+        &self,
+        _id: &SessionId,
+    ) -> Result<HeadCanonicalAuthorityCrossing, SessionStoreError> {
+        // MemoryStore's runtime persistence profile is WholeBlob. Its
+        // incremental rows are a semantic/reference-store capability, not a
+        // durable HeadCanonical runtime authority.
+        Ok(HeadCanonicalAuthorityCrossing::NotApplicable)
+    }
+
     async fn append_messages(
         &self,
         id: &SessionId,

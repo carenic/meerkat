@@ -26,7 +26,7 @@ use std::sync::Arc;
 use crate::TranscriptRewriteSelection;
 use crate::session::{
     SESSION_TRANSCRIPT_HISTORY_STATE_KEY, SESSION_TRANSCRIPT_REWRITE_PREFIX_AUTHORITY_KEY,
-    SessionHeadMetadataIdentity, SessionHeadMetadataProjection, SessionMeta,
+    SESSION_VERSION, SessionHeadMetadataIdentity, SessionHeadMetadataProjection, SessionMeta,
     TranscriptRevisionBody,
 };
 use crate::time_compat::SystemTime;
@@ -3084,6 +3084,143 @@ pub enum SessionHeadCas {
     IfToken(String),
 }
 
+/// Trusted-backend assertion of current HeadCanonical physical authority.
+///
+/// Construction consumes complete verified materialization data, re-derives
+/// the token from its head, and refuses every pre-current representation. This
+/// proves content consistency, not storage provenance: the trusted backend is
+/// responsible for reading the materialization inputs and stored token from
+/// one storage snapshot. Consumers must accept this assertion only as the
+/// direct result of [`IncrementalSessionStore::cross_head_canonical_authority`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct VerifiedHeadCanonicalAuthority {
+    head: SessionHead,
+    head_token: String,
+}
+
+impl VerifiedHeadCanonicalAuthority {
+    fn bind(
+        materialization: VerifiedSessionHeadMaterialization,
+        head_token: String,
+    ) -> Result<Self, SessionStoreError> {
+        let head = materialization.head;
+        validate_current_head_canonical_authority(&head)?;
+        let derived = session_head_cas_token(&head)?;
+        if derived != head_token {
+            return Err(SessionStoreError::TranscriptRevisionConflict {
+                id: head.id,
+                expected: derived,
+                actual: head_token,
+            });
+        }
+        Ok(Self { head, head_token })
+    }
+
+    /// Exact verified physical head carried by the backend assertion.
+    #[must_use]
+    pub fn head(&self) -> &SessionHead {
+        &self.head
+    }
+
+    /// Exact stable token for [`Self::head`].
+    #[must_use]
+    pub fn head_token(&self) -> &str {
+        &self.head_token
+    }
+
+    /// Consume the proof without separating its paired values beforehand.
+    #[must_use]
+    pub fn into_parts(self) -> (SessionHead, String) {
+        (self.head, self.head_token)
+    }
+}
+
+fn validate_current_head_canonical_authority(head: &SessionHead) -> Result<(), SessionStoreError> {
+    if head.version != SESSION_VERSION {
+        return Err(SessionStoreError::Corrupted(head.id.clone()));
+    }
+    validate_session_head_storage_representation(head)?;
+    let Some(message_row_prefix) = head.message_row_prefix.as_ref() else {
+        return Err(SessionStoreError::InvalidTranscriptRewrite {
+            id: head.id.clone(),
+            reason: "head-canonical authority predates the exact message-row prefix".to_string(),
+        });
+    };
+    if message_row_prefix.row_count() != head.message_count {
+        return Err(SessionStoreError::Corrupted(head.id.clone()));
+    }
+    if head.row_lineage_anchor.is_none() {
+        return Err(SessionStoreError::InvalidTranscriptRewrite {
+            id: head.id.clone(),
+            reason: "head-canonical authority has no exact row-lineage anchor".to_string(),
+        });
+    }
+    if head.rewrite_prefix.occurrence_count() != head.rewrite_count {
+        return Err(SessionStoreError::InvalidTranscriptRewrite {
+            id: head.id.clone(),
+            reason: format!(
+                "head-canonical rewrite prefix covers {} occurrences but rewrite_count is {}",
+                head.rewrite_prefix.occurrence_count(),
+                head.rewrite_count
+            ),
+        });
+    }
+    if head.realtime_event_prefix.is_none() || head.metadata_identity.is_none() {
+        return Err(SessionStoreError::InvalidTranscriptRewrite {
+            id: head.id.clone(),
+            reason: "head-canonical authority has not crossed to authenticated component and metadata sidecars"
+                .to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Result of the explicit supported HeadCanonical authority crossing.
+///
+/// `Converted` and `AlreadyCurrent` both carry the same trusted-backend
+/// assertion. The distinction tells activation whether physical conversion
+/// happened during this invocation without creating a second authority type.
+#[derive(Debug, Clone, PartialEq)]
+pub enum HeadCanonicalAuthorityCrossing {
+    /// The session is absent or this store's durable profile is not
+    /// HeadCanonical. This is not an "unsupported" escape hatch: every
+    /// [`IncrementalSessionStore`] must implement the operation explicitly.
+    NotApplicable,
+    /// This call atomically converted and verified the physical head.
+    Converted(VerifiedHeadCanonicalAuthority),
+    /// The physical head was already current and was reverified in this call.
+    AlreadyCurrent(VerifiedHeadCanonicalAuthority),
+}
+
+impl HeadCanonicalAuthorityCrossing {
+    /// Build the trusted backend's successfully converted authority assertion.
+    #[doc(hidden)]
+    pub fn converted(
+        materialization: VerifiedSessionHeadMaterialization,
+        head_token: String,
+    ) -> Result<Self, SessionStoreError> {
+        VerifiedHeadCanonicalAuthority::bind(materialization, head_token).map(Self::Converted)
+    }
+
+    /// Build the trusted backend's reverified current authority assertion.
+    #[doc(hidden)]
+    pub fn already_current(
+        materialization: VerifiedSessionHeadMaterialization,
+        head_token: String,
+    ) -> Result<Self, SessionStoreError> {
+        VerifiedHeadCanonicalAuthority::bind(materialization, head_token).map(Self::AlreadyCurrent)
+    }
+
+    /// Current physical authority, when this crossing applies.
+    #[must_use]
+    pub fn authority(&self) -> Option<&VerifiedHeadCanonicalAuthority> {
+        match self {
+            Self::Converted(authority) | Self::AlreadyCurrent(authority) => Some(authority),
+            Self::NotApplicable => None,
+        }
+    }
+}
+
 /// Sealed ordinary create/append mutation for a head-canonical session.
 ///
 /// This carrier is the only public path from a typed [`Session`] to the
@@ -4859,6 +4996,34 @@ fn validate_store_issued_head_identity_pair(
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait IncrementalSessionStore: SessionStore {
+    /// Cross one physical HeadCanonical session into current store authority.
+    ///
+    /// This operation is required and deliberately has no default. It is the
+    /// supported format-door crossing that must run during store activation,
+    /// before ordinary HeadCanonical materialization or append. A
+    /// HeadCanonical backend must, in one write transaction:
+    ///
+    /// 1. classify the exact stored head and token;
+    /// 2. verify the legacy source rows and rewrite lineage when conversion is
+    ///    required;
+    /// 3. install authenticated metadata and component-event sidecars;
+    /// 4. publish the successor head and token; and
+    /// 5. reverify every physical object named by the returned authority.
+    ///
+    /// An exact retry returns [`HeadCanonicalAuthorityCrossing::AlreadyCurrent`]
+    /// only after the same physical verification. Conversion failure must
+    /// leave the source bytes and format marker unchanged. This method commits
+    /// session-store physical authority only. It must not mint or commit a
+    /// runtime authority; activation consumes the returned proof through the
+    /// runtime's own typed transition. Consumers must treat an authority
+    /// assertion as trusted only when it is received directly from this
+    /// operation; the carrier verifies content but cannot prove that an
+    /// external backend read its inputs from one storage snapshot.
+    async fn cross_head_canonical_authority(
+        &self,
+        id: &SessionId,
+    ) -> Result<HeadCanonicalAuthorityCrossing, SessionStoreError>;
+
     /// Append messages to a strand. O(delta).
     ///
     /// Contiguity: `base_seq` must not exceed the strand's current row count
@@ -5993,6 +6158,13 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
     impl IncrementalSessionStore for DefaultVerbIncrementalStore {
+        async fn cross_head_canonical_authority(
+            &self,
+            _id: &SessionId,
+        ) -> Result<HeadCanonicalAuthorityCrossing, SessionStoreError> {
+            Ok(HeadCanonicalAuthorityCrossing::NotApplicable)
+        }
+
         async fn append_messages(
             &self,
             _id: &SessionId,
@@ -6048,6 +6220,54 @@ mod tests {
         ) -> Result<Vec<TranscriptRewriteRecord>, SessionStoreError> {
             Ok(self.rewrites.clone())
         }
+    }
+
+    #[test]
+    #[allow(clippy::expect_used)]
+    fn head_canonical_crossing_requires_verified_current_exact_head_token_pairs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let mut session = Session::new();
+        session.push(Message::User(UserMessage::text("seed".to_string())));
+        let mutation = PreparedHeadCanonicalMutation::prepare_root(&session)?;
+        let head = mutation.successor_head().clone();
+        let token = mutation.successor_head_token().to_string();
+        let serialized_rows = session
+            .messages()
+            .iter()
+            .map(serde_json::to_vec)
+            .collect::<Result<Vec<_>, _>>()?;
+        let realtime = VerifiedComponentEventSequence::verify_full(
+            head.realtime_event_prefix
+                .clone()
+                .expect("prepared root carries realtime authority"),
+            Vec::new(),
+        )?;
+        let verified = head
+            .clone()
+            .verify_serialized_rows_with_component_sequences(serialized_rows.clone(), realtime)?;
+
+        let current =
+            HeadCanonicalAuthorityCrossing::already_current(verified.clone(), token.clone())?;
+        let authority = current.authority().expect("current authority proof");
+        assert_eq!(authority.head(), &head);
+        assert_eq!(authority.head_token(), token.as_str());
+
+        assert!(matches!(
+            HeadCanonicalAuthorityCrossing::converted(
+                verified,
+                "head-v5-sha256:not-the-stored-head".to_string(),
+            ),
+            Err(SessionStoreError::TranscriptRevisionConflict { .. })
+        ));
+
+        let inline = SessionHead::from_session(&session, TranscriptStrandId::root(), 0)?;
+        let inline_token = session_head_cas_token(&inline)?;
+        let inline_verified = inline.verify_serialized_rows(serialized_rows)?;
+        assert!(matches!(
+            HeadCanonicalAuthorityCrossing::converted(inline_verified, inline_token),
+            Err(SessionStoreError::InvalidTranscriptRewrite { .. })
+        ));
+        Ok(())
     }
 
     #[tokio::test]

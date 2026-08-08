@@ -5,13 +5,14 @@ use crate::json_column::JsonColumnBytes;
 use crate::{SessionFilter, SessionStore, SessionStoreError, StoreError};
 use async_trait::async_trait;
 use meerkat_core::session_store::{
-    IncrementalSessionStore, PreparedHeadCanonicalMutation, PreparedHeadCanonicalParentSplice,
-    PreparedHeadCanonicalParentTransition, PreparedHeadCanonicalRewriteMutation,
-    SESSION_ROW_LINEAGE_REBASE_INTERVAL, SaveGuardWitness, SessionHead, SessionHeadCas,
-    SessionMessageRowPrefixAccumulator, StrandLayout, StrandRewriteLayout, StrandSegment,
-    StrandSplice, TranscriptStrandId, VerifiedHeadCanonicalTranscriptHistory,
-    head_canonical_plain_save_guard_with_prefix_witness, reconstruct_rewrite_record,
-    session_head_cas_token, strand_layout_for_history, validate_save_head_transition,
+    HeadCanonicalAuthorityCrossing, IncrementalSessionStore, PreparedHeadCanonicalMutation,
+    PreparedHeadCanonicalParentSplice, PreparedHeadCanonicalParentTransition,
+    PreparedHeadCanonicalRewriteMutation, SESSION_ROW_LINEAGE_REBASE_INTERVAL, SaveGuardWitness,
+    SessionHead, SessionHeadCas, SessionMessageRowPrefixAccumulator, StrandLayout,
+    StrandRewriteLayout, StrandSegment, StrandSplice, TranscriptStrandId,
+    VerifiedHeadCanonicalTranscriptHistory, head_canonical_plain_save_guard_with_prefix_witness,
+    reconstruct_rewrite_record, session_head_cas_token, strand_layout_for_history,
+    validate_save_head_transition,
 };
 use meerkat_core::time_compat::SystemTime;
 use meerkat_core::transcript_messages_digest;
@@ -337,6 +338,76 @@ fn migration_0003_authenticated_head_sidecars(tx: &Transaction<'_>) -> Result<()
     tx.execute_batch(CREATE_SESSION_HEAD_METADATA_HEAD_LINEAGE_SUCCESSOR_INDEX_SQL)?;
     migrate_released_blob_envelopes(tx)?;
     migrate_released_head_envelopes(tx)
+}
+
+/// Complete the supported HeadCanonical v1-to-v2 crossing.
+///
+/// Session schema v3 installed the authenticated sidecar tables and converted
+/// the exact released 0.8.10 row shape, but deliberately left migrated heads
+/// in the inline, pre-component representation for RuntimeStore activation.
+/// A v3 database could therefore expose a persisted HeadCanonical head which
+/// `PreparedHeadCanonicalMutation` correctly refused, while the only
+/// conversion entry point was the co-tenant runtime transaction. Advancing the
+/// session domain to v4 makes that representation door explicit and usable by
+/// every SQLite session-store composition.
+///
+/// The existing conversion helper is the authority here. For every supported
+/// current-version head it verifies the stored CAS token, resolves and commits
+/// the exact serialized row prefix, validates/backfills the compact rewrite
+/// graph, then installs the component and metadata authorities before replacing
+/// the head. Rows outside the supported current envelope are not candidates for
+/// this crossing. All conversion work happens inside this migration transaction,
+/// so a failed proof leaves both the source head and schema version unchanged.
+fn migration_0004_head_canonical_v2_authority(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
+    let session_ids = {
+        let mut statement = tx.prepare(
+            "SELECT session_id
+             FROM session_heads
+             WHERE version = ?1
+             ORDER BY session_id",
+        )?;
+        statement
+            .query_map(params![i64::from(meerkat_core::SESSION_VERSION)], |row| {
+                row.get::<_, String>(0)
+            })?
+            .collect::<Result<Vec<_>, _>>()?
+    };
+
+    for raw_id in session_ids {
+        let id = parse_session_id(raw_id.clone()).map_err(|error| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "head-canonical v1-to-v2 conversion found invalid session identity '{raw_id}': {error}"
+                ),
+            )))
+        })?;
+        let crossing = cross_head_canonical_authority_in_txn(tx, &id).map_err(|error| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("head-canonical v1-to-v2 conversion failed for session '{id}': {error}"),
+            )))
+        })?;
+        let authority = crossing.authority().ok_or_else(|| {
+            rusqlite::Error::ToSqlConversionFailure(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "head-canonical v1-to-v2 conversion lost session '{id}' while its head row was present"
+                ),
+            )))
+        })?;
+        if authority.head().id != id {
+            return Err(rusqlite::Error::ToSqlConversionFailure(Box::new(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "head-canonical v1-to-v2 conversion did not publish complete authority for session '{id}'"
+                    ),
+                ),
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn invalid_released_head_envelope(
@@ -986,12 +1057,19 @@ fn migrate_released_head_envelopes(tx: &Transaction<'_>) -> Result<(), rusqlite:
 fn initialize_current_session_schema(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
     migration_0001_session_schema(tx)?;
     migration_0002_strand_links(tx)?;
-    migration_0003_authenticated_head_sidecars(tx)
+    migration_0003_authenticated_head_sidecars(tx)?;
+    migration_0004_head_canonical_v2_authority(tx)
 }
 
 fn build_released_0_8_10_session_schema(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
     migration_0001_session_schema(tx)?;
     migration_0002_strand_links(tx)
+}
+
+fn build_released_v3_session_schema(tx: &Transaction<'_>) -> Result<(), rusqlite::Error> {
+    migration_0001_session_schema(tx)?;
+    migration_0002_strand_links(tx)?;
+    migration_0003_authenticated_head_sidecars(tx)
 }
 
 const RELEASED_0_8_10_SESSION_OBJECTS: &[meerkat_sqlite::SchemaObject] = &[
@@ -1025,12 +1103,100 @@ const RELEASED_0_8_10_SESSION_OBJECTS: &[meerkat_sqlite::SchemaObject] = &[
     },
 ];
 
+const RELEASED_V3_SESSION_OBJECTS: &[meerkat_sqlite::SchemaObject] = &[
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "sessions",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "sessions_updated_idx",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "session_strand_messages",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "session_strand_links",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "session_rewrites",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "session_heads",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "session_heads_updated_idx",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "session_component_events",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "session_head_metadata_cells",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "session_head_metadata_cells_route_key_idx",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "session_head_metadata_current",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "session_head_metadata_states",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "session_head_metadata_states_predecessor_idx",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "session_head_metadata_state_deltas",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "session_head_metadata_state_deltas_key_idx",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "session_head_metadata_refs",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Table,
+        name: "session_head_metadata_head_lineage",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "session_head_metadata_head_lineage_predecessor_idx",
+    },
+    meerkat_sqlite::SchemaObject {
+        kind: meerkat_sqlite::SchemaObjectKind::Index,
+        name: "session_head_metadata_head_lineage_successor_idx",
+    },
+];
+
 fn verify_released_0_8_10_session_schema(conn: &Connection) -> Result<(), String> {
     meerkat_sqlite::verify_released_schema_fingerprint(
         conn,
         &SESSION_STORE_DOMAIN,
         RELEASED_0_8_10_SESSION_OBJECTS,
         build_released_0_8_10_session_schema,
+    )
+}
+
+fn verify_released_v3_session_schema(conn: &Connection) -> Result<(), String> {
+    meerkat_sqlite::verify_released_schema_fingerprint(
+        conn,
+        &SESSION_STORE_DOMAIN,
+        RELEASED_V3_SESSION_OBJECTS,
+        build_released_v3_session_schema,
     )
 }
 
@@ -1053,13 +1219,24 @@ pub const SESSION_STORE_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::S
             name: "authenticated-head-sidecars",
             apply: migration_0003_authenticated_head_sidecars,
         },
+        meerkat_sqlite::Migration {
+            version: 4,
+            name: "head-canonical-v2-authority",
+            apply: migration_0004_head_canonical_v2_authority,
+        },
     ],
     initialize_current: initialize_current_session_schema,
-    allowed_existing_versions: &[2, 3],
-    released_predecessors: &[meerkat_sqlite::SchemaPredecessor {
-        version: 2,
-        verify: verify_released_0_8_10_session_schema,
-    }],
+    allowed_existing_versions: &[2, 3, 4],
+    released_predecessors: &[
+        meerkat_sqlite::SchemaPredecessor {
+            version: 2,
+            verify: verify_released_0_8_10_session_schema,
+        },
+        meerkat_sqlite::SchemaPredecessor {
+            version: 3,
+            verify: verify_released_v3_session_schema,
+        },
+    ],
     owned_objects: &[
         meerkat_sqlite::SchemaObject {
             kind: meerkat_sqlite::SchemaObjectKind::Table,
@@ -1146,6 +1323,47 @@ pub const SESSION_STORE_DOMAIN: meerkat_sqlite::SchemaDomain = meerkat_sqlite::S
 mod schema_floor_tests {
     use super::*;
 
+    fn pre_exact_head_canonical_v3() -> (Connection, SessionId, Vec<u8>, String) {
+        let mut conn = Connection::open_in_memory().expect("open v3 fixture");
+        let tx = conn.transaction().expect("v3 schema transaction");
+        migration_0001_session_schema(&tx).expect("base schema");
+        migration_0002_strand_links(&tx).expect("strand links");
+        migration_0003_authenticated_head_sidecars(&tx).expect("v3 sidecars");
+        tx.commit().expect("commit v3 schema");
+        conn.execute_batch(
+            "CREATE TABLE meerkat_schema (
+                 domain TEXT PRIMARY KEY,
+                 version INTEGER NOT NULL
+             );
+             INSERT INTO meerkat_schema VALUES ('session-store', 3);",
+        )
+        .expect("v3 ledger");
+
+        let mut session = Session::new();
+        session.push(Message::User(meerkat_core::types::UserMessage::text(
+            "v1 physical row".to_string(),
+        )));
+        let id = session.id().clone();
+        let tx = conn.transaction().expect("v1 head transaction");
+        let strand = TranscriptStrandId::root();
+        insert_strand_rows_in_txn(&tx, &id, &strand, 0, session.messages())
+            .expect("insert exact v1 rows");
+        let mut head = SessionHead::from_session(&session, strand, 0).expect("project v1 head");
+        head.message_row_prefix = None;
+        head.row_lineage_anchor = None;
+        head.realtime_event_prefix = None;
+        let token = write_head_row_only_in_txn(&tx, &head).expect("persist v1 head");
+        tx.commit().expect("commit v1 head");
+        let bytes = conn
+            .query_row(
+                "SELECT head_json FROM session_heads WHERE session_id = ?1",
+                params![id.to_string()],
+                |row| Ok(row.get::<_, JsonColumnBytes>(0)?.into_bytes()),
+            )
+            .expect("read v1 head bytes");
+        (conn, id, bytes, token)
+    }
+
     fn insert_head_with_versions(
         conn: &mut Connection,
         row_version: i64,
@@ -1209,7 +1427,188 @@ mod schema_floor_tests {
         let report = meerkat_sqlite::apply_domain_migrations(&mut conn, &SESSION_STORE_DOMAIN)
             .expect("upgrade");
         assert_eq!(report.from_version, 2);
-        assert_eq!(report.to_version, 3);
+        assert_eq!(report.to_version, 4);
+    }
+
+    #[test]
+    fn v3_pre_exact_head_crosses_to_append_ready_v2_authority_atomically() {
+        let (mut conn, id, source_head_bytes, source_token) = pre_exact_head_canonical_v3();
+
+        let report = meerkat_sqlite::apply_domain_migrations(&mut conn, &SESSION_STORE_DOMAIN)
+            .expect("cross v1 head to v2 authority");
+
+        assert_eq!((report.from_version, report.to_version), (3, 4));
+        let tx = conn
+            .transaction()
+            .expect("verify converted head transaction");
+        let (head, stored_token) = head_row_in_txn(&tx, &id)
+            .expect("read converted head")
+            .expect("converted head exists");
+        assert_ne!(
+            stored_token, source_token,
+            "conversion must rotate authority"
+        );
+        assert_eq!(
+            stored_token,
+            session_head_cas_token(&head).expect("converted head token")
+        );
+        assert!(head.message_row_prefix.is_some());
+        assert!(head.row_lineage_anchor.is_some());
+        assert!(head.realtime_event_prefix.is_some());
+        assert!(head.metadata_identity().is_some());
+        let verified = verify_physical_head_canonical_in_txn(&tx, &head)
+            .expect("converted head verifies against exact rows and sidecars");
+        let mut continued = verified.session().as_ref().clone();
+        continued.push(Message::User(meerkat_core::types::UserMessage::text(
+            "ordinary append".to_string(),
+        )));
+        PreparedHeadCanonicalMutation::prepare(&continued, Some(head))
+            .expect("converted head admits an ordinary prepared append");
+        assert_ne!(
+            tx.query_row(
+                "SELECT head_json FROM session_heads WHERE session_id = ?1",
+                params![id.to_string()],
+                |row| Ok(row.get::<_, JsonColumnBytes>(0)?.into_bytes()),
+            )
+            .expect("read converted head bytes"),
+            source_head_bytes,
+            "the source head must be replaced only after complete authority is ready"
+        );
+    }
+
+    #[test]
+    fn typed_head_crossing_reports_conversion_then_reverified_current_authority() {
+        let (mut conn, id, _source_head_bytes, source_token) = pre_exact_head_canonical_v3();
+
+        let tx = conn.transaction().expect("typed conversion transaction");
+        let converted = cross_head_canonical_authority_in_txn(&tx, &id)
+            .expect("typed crossing converts pre-exact authority");
+        assert!(matches!(
+            &converted,
+            HeadCanonicalAuthorityCrossing::Converted(_)
+        ));
+        let converted_token = converted
+            .authority()
+            .expect("converted authority")
+            .head_token()
+            .to_string();
+        assert_ne!(converted_token, source_token);
+        tx.commit().expect("commit typed conversion");
+
+        let tx = conn.transaction().expect("typed retry transaction");
+        let current = cross_head_canonical_authority_in_txn(&tx, &id)
+            .expect("typed crossing reverifies current authority");
+        assert!(matches!(
+            &current,
+            HeadCanonicalAuthorityCrossing::AlreadyCurrent(_)
+        ));
+        assert_eq!(
+            current.authority().expect("current authority").head_token(),
+            converted_token.as_str()
+        );
+        tx.commit().expect("commit typed retry");
+    }
+
+    #[test]
+    fn v3_current_authority_migration_preserves_referenced_head_token_and_bytes() {
+        let (mut conn, id, _source_head_bytes, _source_token) = pre_exact_head_canonical_v3();
+        let tx = conn
+            .transaction()
+            .expect("prepare current authority transaction");
+        let converted = cross_head_canonical_authority_in_txn(&tx, &id)
+            .expect("prepare current authority before schema crossing");
+        let referenced_token = converted
+            .authority()
+            .expect("prepared authority")
+            .head_token()
+            .to_string();
+        tx.commit().expect("commit prepared current authority");
+        let referenced_head_bytes = conn
+            .query_row(
+                "SELECT head_json FROM session_heads WHERE session_id = ?1",
+                params![id.to_string()],
+                |row| Ok(row.get::<_, JsonColumnBytes>(0)?.into_bytes()),
+            )
+            .expect("read referenced current head bytes");
+
+        let report = meerkat_sqlite::apply_domain_migrations(&mut conn, &SESSION_STORE_DOMAIN)
+            .expect("advance schema around current authority");
+
+        assert_eq!((report.from_version, report.to_version), (3, 4));
+        let tx = conn
+            .transaction()
+            .expect("read preserved authority transaction");
+        let (head, stored_token) = head_row_in_txn(&tx, &id)
+            .expect("read preserved authority")
+            .expect("preserved authority exists");
+        assert_eq!(stored_token, referenced_token);
+        assert_eq!(
+            tx.query_row(
+                "SELECT head_json FROM session_heads WHERE session_id = ?1",
+                params![id.to_string()],
+                |row| Ok(row.get::<_, JsonColumnBytes>(0)?.into_bytes()),
+            )
+            .expect("read preserved head bytes"),
+            referenced_head_bytes
+        );
+        verify_physical_head_canonical_in_txn(&tx, &head)
+            .expect("preserved authority remains fully verified");
+    }
+
+    #[test]
+    fn v3_unproved_source_rows_roll_back_head_sidecars_and_schema_floor() {
+        let (mut conn, id, source_head_bytes, _source_token) = pre_exact_head_canonical_v3();
+        let tampered = serde_json::to_vec(&Message::User(meerkat_core::types::UserMessage::text(
+            "tampered physical row".to_string(),
+        )))
+        .expect("serialize tampered row");
+        conn.execute(
+            "UPDATE session_strand_messages
+             SET message_json = ?1
+             WHERE session_id = ?2 AND seq = 0",
+            params![tampered, id.to_string()],
+        )
+        .expect("corrupt exact source row");
+
+        let error = meerkat_sqlite::apply_domain_migrations(&mut conn, &SESSION_STORE_DOMAIN)
+            .expect_err("unproved v1 authority must refuse");
+
+        assert!(
+            error.to_string().contains("v1-to-v2 conversion failed"),
+            "unexpected conversion error: {error}"
+        );
+        assert_eq!(
+            meerkat_sqlite::domain_version(&conn, SESSION_STORE_DOMAIN.name)
+                .expect("schema ledger"),
+            Some(3),
+            "failed conversion must not stamp v4"
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT head_json FROM session_heads WHERE session_id = ?1",
+                params![id.to_string()],
+                |row| Ok(row.get::<_, JsonColumnBytes>(0)?.into_bytes()),
+            )
+            .expect("read rolled-back head bytes"),
+            source_head_bytes,
+            "failed conversion must leave source head bytes intact"
+        );
+        for table in [
+            "session_component_events",
+            "session_head_metadata_cells",
+            "session_head_metadata_current",
+            "session_head_metadata_states",
+            "session_head_metadata_state_deltas",
+            "session_head_metadata_refs",
+            "session_head_metadata_head_lineage",
+        ] {
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .expect("count rolled-back sidecar rows");
+            assert_eq!(count, 0, "failed conversion must roll back {table}");
+        }
     }
 
     #[test]
@@ -1220,7 +1619,7 @@ mod schema_floor_tests {
         let report = meerkat_sqlite::apply_domain_migrations(&mut conn, &SESSION_STORE_DOMAIN)
             .expect("upgrade");
 
-        assert_eq!((report.from_version, report.to_version), (2, 3));
+        assert_eq!((report.from_version, report.to_version), (2, 4));
         let (row_version, migrated_json, migrated_token) = raw_head(&conn, &id);
         assert_eq!(
             row_version,
@@ -1256,7 +1655,7 @@ mod schema_floor_tests {
 
         let report = meerkat_sqlite::apply_domain_migrations(&mut conn, &SESSION_STORE_DOMAIN)
             .expect("v2 to current");
-        assert_eq!((report.from_version, report.to_version), (2, 3));
+        assert_eq!((report.from_version, report.to_version), (2, 4));
 
         assert_eq!(raw_head(&conn, &older_id), (1, older_json, older_token));
         assert_eq!(
@@ -5517,9 +5916,10 @@ pub fn derive_runtime_boundary_head_for_activation_in_txn(
 /// head-canonical boundaries must call
 /// [`apply_prepared_head_canonical_mutation_in_txn`] and remain bounded.
 /// The runtime may call this only from its explicit activation transaction,
-/// after fencing the exact current runtime authority and proving the released
-/// 0.8.10 source head. It borrows the caller's transaction and neither opens
-/// nor commits one.
+/// and the session store may call it from its ledgered authority crossing,
+/// after fencing the exact current authority and proving the released 0.8.10
+/// source head. It borrows the caller's transaction and neither opens nor
+/// commits one.
 #[doc(hidden)]
 pub fn ensure_head_canonical_for_runtime_in_txn(
     tx: &Transaction<'_>,
@@ -5556,6 +5956,60 @@ pub fn ensure_head_canonical_for_runtime_in_txn(
     )?;
     let upgraded_token = write_head_row_only_in_txn(tx, &upgraded)?;
     Ok(Some((upgraded, upgraded_token)))
+}
+
+/// Cross one persisted SQLite HeadCanonical representation and return the
+/// trusted-backend authority assertion proved in this same transaction.
+///
+/// Classification observes both the compact head and the out-of-line rewrite
+/// edges before conversion. The returned variant is constructed only after a
+/// full replay of every row and sidecar named by the successor head. The caller
+/// owns commit, so any verification or construction failure rolls the entire
+/// crossing back.
+fn cross_head_canonical_authority_in_txn(
+    tx: &Transaction<'_>,
+    id: &SessionId,
+) -> Result<HeadCanonicalAuthorityCrossing, SessionStoreError> {
+    let Some((source_head, source_token)) = head_row_in_txn(tx, id)? else {
+        return Ok(HeadCanonicalAuthorityCrossing::NotApplicable);
+    };
+    if source_head.id != *id || session_head_cas_token(&source_head)? != source_token {
+        return Err(SessionStoreError::Corrupted(id.clone()));
+    }
+    let replay_start = source_head
+        .row_lineage_anchor
+        .as_ref()
+        .map_or(0, |anchor| anchor.rewrite_count());
+    let missing_graph_edge = post_anchor_rewrite_graph_edge_is_missing_in_txn(
+        tx,
+        id,
+        replay_start,
+        source_head.rewrite_count,
+    )?;
+    let source_was_current = source_head.message_row_prefix.is_some()
+        && source_head.row_lineage_anchor.is_some()
+        && source_head.realtime_event_prefix.is_some()
+        && source_head.metadata_identity().is_some()
+        && !missing_graph_edge;
+
+    let (head, stored_token) = ensure_head_canonical_for_runtime_in_txn(tx, id)?
+        .ok_or_else(|| SessionStoreError::NotFound(id.clone()))?;
+    let (published_head, published_token) =
+        head_row_in_txn(tx, id)?.ok_or_else(|| SessionStoreError::NotFound(id.clone()))?;
+    if head.id != *id
+        || published_head.id != *id
+        || published_token != stored_token
+        || session_head_cas_token(&head)? != published_token
+        || session_head_cas_token(&published_head)? != published_token
+    {
+        return Err(SessionStoreError::Corrupted(id.clone()));
+    }
+    let verified = verify_physical_head_canonical_in_txn(tx, &published_head)?;
+    if source_was_current {
+        HeadCanonicalAuthorityCrossing::already_current(verified, published_token)
+    } else {
+        HeadCanonicalAuthorityCrossing::converted(verified, published_token)
+    }
 }
 
 /// Result of applying one sealed ordinary head-canonical mutation.
@@ -7879,6 +8333,15 @@ fn legacy_head_canonical_rewrite_error(id: &SessionId) -> SessionStoreError {
 
 #[async_trait]
 impl IncrementalSessionStore for SqliteSessionStore {
+    async fn cross_head_canonical_authority(
+        &self,
+        id: &SessionId,
+    ) -> Result<HeadCanonicalAuthorityCrossing, SessionStoreError> {
+        let id = id.clone();
+        self.in_write_txn(move |tx| cross_head_canonical_authority_in_txn(tx, &id))
+            .await
+    }
+
     async fn append_messages(
         &self,
         id: &SessionId,

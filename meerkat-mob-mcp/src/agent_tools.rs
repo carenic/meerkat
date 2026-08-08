@@ -3591,6 +3591,14 @@ mod tests {
             Ok(())
         }
 
+        async fn observe_session_resume_authority(
+            &self,
+            _session_id: &SessionId,
+        ) -> Result<meerkat_mob::SessionResumeAuthority, SessionError> {
+            // This process-local test map has no RuntimeStore authority.
+            Ok(meerkat_mob::SessionResumeAuthority::default())
+        }
+
         async fn acknowledge_committed_runtime_session_boundary_under_turn_finalization_boundary(
             &self,
             _session_id: &SessionId,

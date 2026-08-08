@@ -534,6 +534,11 @@ pub struct TurnErrorMetadata {
     pub model: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retryable: Option<bool>,
+    /// Exact typed failure reason retained from the terminal producer.
+    /// Health and recovery projections consume this instead of parsing
+    /// `detail` or re-observing an ephemeral actor failure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<AgentErrorReason>,
 }
 
 impl TurnErrorMetadata {
@@ -550,6 +555,7 @@ impl TurnErrorMetadata {
             provider: None,
             model: None,
             retryable: None,
+            reason: None,
         }
     }
 
@@ -575,6 +581,7 @@ impl TurnErrorMetadata {
                 );
                 metadata.provider = Some((*provider).to_string());
                 metadata.retryable = Some(error.is_recoverable());
+                metadata.reason = Some(AgentErrorReason::from_llm_reason(reason));
                 if let LlmFailureReason::InvalidModel(model) = reason {
                     metadata.model = Some(model.clone());
                 }
@@ -629,6 +636,7 @@ impl TurnErrorMetadata {
                     }
                     _ => {}
                 }
+                metadata.reason = Some(reason.clone());
                 Some(metadata)
             }
             _ => None,

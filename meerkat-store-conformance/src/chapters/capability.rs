@@ -187,6 +187,36 @@ where
         "the wrapper must serve exactly the messages written through the inner capability",
     )?;
 
+    // The authority crossing is required rather than defaulted, but a
+    // delegating wrapper could still implement it with a bogus
+    // `NotApplicable`. Pin exact authority forwarding so the wrapper cannot
+    // suppress a conversion or discard its backend-issued authority assertion.
+    // The second call may legitimately classify as AlreadyCurrent after the
+    // first call converted it, so compare the resulting authority, not the
+    // one-call transition label.
+    let step = "authority_crossing_forwarded";
+    let wrapped_crossing = steps.wrap(
+        step,
+        wrapped_inc
+            .cross_head_canonical_authority(reverse.id())
+            .await,
+    )?;
+    let inner_crossing = steps.wrap(
+        step,
+        inner_inc.cross_head_canonical_authority(reverse.id()).await,
+    )?;
+    let crossing_matches = match (wrapped_crossing.authority(), inner_crossing.authority()) {
+        (None, None) => true,
+        (Some(wrapped), Some(inner)) => wrapped == inner,
+        _ => false,
+    };
+    steps.ensure(
+        step,
+        crossing_matches,
+        "delegating wrapper must forward cross_head_canonical_authority; it may not \
+         suppress a conversion or substitute NotApplicable",
+    )?;
+
     // Range-read verb forwarding: `load_canonical_head` and
     // `load_rewrite_commits` have conservative trait defaults (None / derive
     // from load_rewrites), so a delegating incremental wrapper that fails to

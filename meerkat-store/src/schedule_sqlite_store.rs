@@ -6,12 +6,13 @@ use chrono::{DateTime, LocalResult, TimeZone, Utc};
 use meerkat_schedule::{
     AuthorizedOccurrenceWrite, AuthorizedScheduleWrite, ClaimDueRequest, ClaimDueResult,
     DeliveryReceipt, Occurrence, OccurrenceDueAction, OccurrenceFilter, OccurrenceId,
-    OccurrenceLifecycleEffect, OccurrenceLifecycleError, OccurrenceLifecycleInput,
-    OccurrenceSupersessionAck, PendingSupersession, RenewOccurrenceLeaseOutcome,
+    OccurrenceLifecycleError, OccurrenceLifecycleInput, OccurrenceLifecycleMutator,
+    OccurrenceTransitionCommit, PendingSupersession, RenewOccurrenceLeaseOutcome,
     RenewOccurrenceLeaseRequest, RenewOccurrenceLeaseResult, RuntimeDeliveryOutcome, Schedule,
-    ScheduleFilter, SchedulePhase, ScheduleRefillBatch, ScheduleRefillCandidate, ScheduleStore,
-    ScheduleStoreActionTime, ScheduleStoreError, ScheduleStoreKind, ScheduleStoreRowFault,
-    ScheduleStoreRowFaultKind, ScheduleStoreWakeMode, apply_supersession_feedback,
+    ScheduleFilter, ScheduleMutationCommit, SchedulePhase, ScheduleRefillBatch,
+    ScheduleRefillCandidate, ScheduleStore, ScheduleStoreActionTime, ScheduleStoreError,
+    ScheduleStoreKind, ScheduleStoreRowFault, ScheduleStoreRowFaultKind, ScheduleStoreWakeMode,
+    ScheduleTransitionCommit, apply_supersession_feedback,
 };
 use rusqlite::{Connection, OptionalExtension, Transaction, params};
 use std::path::{Path, PathBuf};
@@ -898,15 +899,15 @@ impl SqliteScheduleStore {
     async fn commit_schedule_write_impl(
         &self,
         write: AuthorizedScheduleWrite,
-    ) -> Result<(), StoreError> {
+    ) -> Result<ScheduleTransitionCommit, StoreError> {
         self.with_conn(move |conn| {
             let tx = begin_immediate_transaction(conn)?;
             reject_standalone_supersession_write(&write)?;
             verify_authorized_schedule_write_in_txn(&tx, &write)?;
-            let schedule = write.into_schedule();
+            let schedule = write.schedule().clone();
             write_schedule_in_txn(&tx, &schedule)?;
             tx.commit()?;
-            Ok(())
+            Ok(write.into_transition_commit_after_store_commit(schedule))
         })
         .await
     }
@@ -916,26 +917,36 @@ impl SqliteScheduleStore {
         schedule: AuthorizedScheduleWrite,
         occurrences: Vec<AuthorizedOccurrenceWrite>,
         refill_deadline: ScheduleRefillDeadlineProjection,
-    ) -> Result<Schedule, StoreError> {
+    ) -> Result<ScheduleMutationCommit, StoreError> {
         self.with_conn(move |conn| {
             let tx = begin_immediate_transaction(conn)?;
             verify_authorized_schedule_write_in_txn(&tx, &schedule)?;
             for occurrence in &occurrences {
+                if occurrence.has_generated_outputs() {
+                    return Err(StoreError::Internal(
+                        "atomic schedule planning mutation cannot consume an occurrence transition with generated postcommit outputs"
+                            .to_string(),
+                    ));
+                }
                 verify_authorized_occurrence_write_in_txn(&tx, occurrence)?;
             }
-            let (schedule, supersession) = schedule.into_parts();
-            let mut committed_schedule = schedule;
+            let supersession = schedule.pending_supersession().cloned();
+            let mut committed_schedule = schedule.schedule().clone();
             write_schedule_in_txn(&tx, &committed_schedule)?;
             for occurrence in occurrences {
-                let occurrence = occurrence.into_occurrence();
-                write_occurrence_in_txn(&tx, &occurrence)?;
+                write_occurrence_in_txn(&tx, occurrence.occurrence())?;
             }
+            let mut supersession_writes = Vec::new();
             if let Some(supersession) = supersession {
-                let acks = supersede_outstanding_occurrences_in_txn(
+                supersession_writes = supersede_outstanding_occurrences_in_txn(
                     &tx,
                     &committed_schedule,
                     supersession,
                 )?;
+                let acks = supersession_writes
+                    .iter()
+                    .flat_map(|write| write.supersession_acks().iter().cloned())
+                    .collect();
                 committed_schedule = apply_supersession_feedback(committed_schedule, acks)
                     .map_err(|error| StoreError::Internal(error.to_string()))?;
                 write_schedule_in_txn(&tx, &committed_schedule)?;
@@ -944,7 +955,13 @@ impl SqliteScheduleStore {
                 set_schedule_refill_deadline_in_txn(&tx, &committed_schedule, next_refill_at_utc)?;
             }
             tx.commit()?;
-            Ok(committed_schedule)
+            Ok(ScheduleMutationCommit::new(
+                schedule.into_transition_commit_after_store_commit(committed_schedule),
+                supersession_writes
+                    .into_iter()
+                    .map(AuthorizedOccurrenceWrite::into_transition_commit_after_store_commit)
+                    .collect(),
+            ))
         })
         .await
     }
@@ -1066,14 +1083,13 @@ impl SqliteScheduleStore {
     async fn commit_occurrence_write_impl(
         &self,
         write: AuthorizedOccurrenceWrite,
-    ) -> Result<(), StoreError> {
+    ) -> Result<OccurrenceTransitionCommit, StoreError> {
         self.with_conn(move |conn| {
             let tx = begin_immediate_transaction(conn)?;
             verify_authorized_occurrence_write_in_txn(&tx, &write)?;
-            let occurrence = write.into_occurrence();
-            write_occurrence_in_txn(&tx, &occurrence)?;
+            write_occurrence_in_txn(&tx, write.occurrence())?;
             tx.commit()?;
-            Ok(())
+            Ok(write.into_transition_commit_after_store_commit())
         })
         .await
     }
@@ -1081,18 +1097,20 @@ impl SqliteScheduleStore {
     async fn commit_occurrence_writes_impl(
         &self,
         writes: Vec<AuthorizedOccurrenceWrite>,
-    ) -> Result<(), StoreError> {
+    ) -> Result<Vec<OccurrenceTransitionCommit>, StoreError> {
         self.with_conn(move |conn| {
             let tx = begin_immediate_transaction(conn)?;
             for write in &writes {
                 verify_authorized_occurrence_write_in_txn(&tx, write)?;
             }
-            for write in writes {
-                let occurrence = write.into_occurrence();
-                write_occurrence_in_txn(&tx, &occurrence)?;
+            for write in &writes {
+                write_occurrence_in_txn(&tx, write.occurrence())?;
             }
             tx.commit()?;
-            Ok(())
+            Ok(writes
+                .into_iter()
+                .map(AuthorizedOccurrenceWrite::into_transition_commit_after_store_commit)
+                .collect())
         })
         .await
     }
@@ -1169,17 +1187,6 @@ impl SqliteScheduleStore {
                 }
             }
             Ok(occurrences)
-        })
-        .await
-    }
-
-    async fn append_receipt_impl(&self, receipt: DeliveryReceipt) -> Result<(), StoreError> {
-        self.with_conn(move |conn| {
-            let tx = begin_immediate_transaction(conn)?;
-            let canonical_receipt = record_occurrence_receipt_in_txn(&tx, &receipt)?;
-            write_receipt_in_txn(&tx, &canonical_receipt)?;
-            tx.commit()?;
-            Ok(())
         })
         .await
     }
@@ -1342,7 +1349,7 @@ impl SqliteScheduleStore {
                     return Ok((
                         ClaimDueResult {
                             store_now_utc,
-                            claimed: Vec::new(),
+                            transitions: Vec::new(),
                             row_faults: Vec::new(),
                         },
                         scan_after,
@@ -1412,7 +1419,8 @@ impl SqliteScheduleStore {
                     occurrences.push(occurrence);
                 }
 
-                let mut claimed = Vec::new();
+                let mut transition_writes = Vec::new();
+                let mut claimed_count = 0usize;
                 for occurrence in occurrences {
                     // Machine-owned due classification, tolerated per row: a
                     // refusal skips only this occurrence (typed fault) and the
@@ -1430,26 +1438,27 @@ impl SqliteScheduleStore {
                     };
                     match action {
                         Some(OccurrenceDueAction::MisfireRequired) => {
-                            if let Some(fault) =
-                                resolve_due_misfire_in_txn(&tx, &occurrence, store_now_utc)?
-                            {
-                                row_faults.push(fault);
+                            match resolve_due_misfire_in_txn(&tx, &occurrence, store_now_utc)? {
+                                Ok(write) => transition_writes.push(write),
+                                Err(fault) => row_faults.push(fault),
                             }
                         }
                         Some(OccurrenceDueAction::ClaimEligible) => {
-                            if claimed.len() >= limit {
+                            if claimed_count >= limit {
                                 continue;
                             }
-                            let claimed_occurrence =
-                                claim_occurrence_for_sqlite(occurrence, &request, store_now_utc)?;
-                            write_occurrence_in_txn(&tx, &claimed_occurrence)?;
-                            claimed.push(claimed_occurrence);
+                            let write =
+                                claim_occurrence_for_sqlite(occurrence, &request, store_now_utc)?
+                                    .into_authorized_write();
+                            write_occurrence_in_txn(&tx, write.occurrence())?;
+                            transition_writes.push(write);
+                            claimed_count += 1;
                         }
                         Some(OccurrenceDueAction::LeaseExpired) => {
-                            if claimed.len() >= limit {
+                            if claimed_count >= limit {
                                 continue;
                             }
-                            let (expired, receipt) = match expire_occurrence_lease_for_sqlite(
+                            let (mut mutator, receipt) = match expire_occurrence_lease_for_sqlite(
                                 occurrence.clone(),
                                 store_now_utc,
                             ) {
@@ -1464,16 +1473,19 @@ impl SqliteScheduleStore {
                                 }
                             };
                             write_receipt_in_txn(&tx, &receipt)?;
-                            write_occurrence_in_txn(&tx, &expired)?;
+                            let expired = mutator.occurrence().clone();
                             // A machine refusal of the follow-up claim is this
                             // row's typed fault, never a silent skip: the expiry
                             // above stays committed and the row re-enters the
                             // scan on the next tick.
-                            let claimed_occurrence =
+                            let claim_mutator =
                                 match claim_occurrence_for_sqlite(expired, &request, store_now_utc)
                                 {
                                     Ok(claimed_occurrence) => claimed_occurrence,
                                     Err(error) => {
+                                        let write = mutator.into_authorized_write();
+                                        write_occurrence_in_txn(&tx, write.occurrence())?;
+                                        transition_writes.push(write);
                                         row_faults.push(claim_row_fault(
                                             &occurrence,
                                             ScheduleStoreRowFaultKind::DueClassification,
@@ -1482,18 +1494,27 @@ impl SqliteScheduleStore {
                                         continue;
                                     }
                                 };
-                            write_occurrence_in_txn(&tx, &claimed_occurrence)?;
-                            claimed.push(claimed_occurrence);
+                            mutator
+                                .absorb_followup(claim_mutator)
+                                .map_err(|error| StoreError::Internal(error.to_string()))?;
+                            let write = mutator.into_authorized_write();
+                            write_occurrence_in_txn(&tx, write.occurrence())?;
+                            transition_writes.push(write);
+                            claimed_count += 1;
                         }
                         None => {}
                     }
                 }
 
                 tx.commit()?;
+                let transitions = transition_writes
+                    .into_iter()
+                    .map(AuthorizedOccurrenceWrite::into_transition_commit_after_store_commit)
+                    .collect();
                 Ok((
                     ClaimDueResult {
                         store_now_utc,
-                        claimed,
+                        transitions,
                         row_faults,
                     },
                     next_scan_cursor,
@@ -1571,7 +1592,7 @@ impl ScheduleStore for SqliteScheduleStore {
     async fn commit_schedule_write(
         &self,
         write: AuthorizedScheduleWrite,
-    ) -> Result<(), ScheduleStoreError> {
+    ) -> Result<ScheduleTransitionCommit, ScheduleStoreError> {
         self.commit_schedule_write_impl(write)
             .await
             .map_err(into_schedule_store_error)
@@ -1607,7 +1628,7 @@ impl ScheduleStore for SqliteScheduleStore {
     async fn commit_occurrence_write(
         &self,
         write: AuthorizedOccurrenceWrite,
-    ) -> Result<(), ScheduleStoreError> {
+    ) -> Result<OccurrenceTransitionCommit, ScheduleStoreError> {
         self.commit_occurrence_write_impl(write)
             .await
             .map_err(into_schedule_store_error)
@@ -1616,7 +1637,7 @@ impl ScheduleStore for SqliteScheduleStore {
     async fn commit_occurrence_writes(
         &self,
         writes: Vec<AuthorizedOccurrenceWrite>,
-    ) -> Result<(), ScheduleStoreError> {
+    ) -> Result<Vec<OccurrenceTransitionCommit>, ScheduleStoreError> {
         self.commit_occurrence_writes_impl(writes)
             .await
             .map_err(into_schedule_store_error)
@@ -1626,7 +1647,7 @@ impl ScheduleStore for SqliteScheduleStore {
         &self,
         schedule: AuthorizedScheduleWrite,
         occurrences: Vec<AuthorizedOccurrenceWrite>,
-    ) -> Result<Schedule, ScheduleStoreError> {
+    ) -> Result<ScheduleMutationCommit, ScheduleStoreError> {
         self.commit_schedule_mutation_impl(
             schedule,
             occurrences,
@@ -1641,7 +1662,7 @@ impl ScheduleStore for SqliteScheduleStore {
         schedule: AuthorizedScheduleWrite,
         occurrences: Vec<AuthorizedOccurrenceWrite>,
         next_refill_at_utc: Option<DateTime<Utc>>,
-    ) -> Result<Schedule, ScheduleStoreError> {
+    ) -> Result<ScheduleMutationCommit, ScheduleStoreError> {
         self.commit_schedule_mutation_impl(
             schedule,
             occurrences,
@@ -1707,12 +1728,6 @@ impl ScheduleStore for SqliteScheduleStore {
             .map_err(into_schedule_store_error)
     }
 
-    async fn append_receipt(&self, receipt: DeliveryReceipt) -> Result<(), ScheduleStoreError> {
-        self.append_receipt_impl(receipt)
-            .await
-            .map_err(into_schedule_store_error)
-    }
-
     async fn list_receipts(
         &self,
         occurrence_id: &meerkat_schedule::OccurrenceId,
@@ -1756,19 +1771,21 @@ impl ScheduleStore for SqliteScheduleStore {
                 });
             }
 
-            let renewed = current
+            let renewed_write = current
                 .apply(OccurrenceLifecycleInput::RenewLease {
                     claim_token: request.claim_token,
                     lease_expires_at_utc: store_now_utc + request.lease_duration,
                     at_utc: store_now_utc,
                 })
                 .map_err(|error: OccurrenceLifecycleError| StoreError::Internal(error.to_string()))?
-                .into_occurrence();
-            write_occurrence_in_txn(&tx, &renewed)?;
+                .into_authorized_write();
+            write_occurrence_in_txn(&tx, renewed_write.occurrence())?;
             tx.commit()?;
             Ok(RenewOccurrenceLeaseResult {
                 store_now_utc,
-                outcome: RenewOccurrenceLeaseOutcome::Renewed(renewed),
+                outcome: RenewOccurrenceLeaseOutcome::Renewed(
+                    renewed_write.into_transition_commit_after_store_commit(),
+                ),
             })
         })
         .await
@@ -1781,7 +1798,7 @@ impl ScheduleStore for SqliteScheduleStore {
         expected_attempt: u32,
         expected_claim_token: Option<Uuid>,
         transition: OccurrenceLifecycleInput,
-    ) -> Result<Option<(Occurrence, Vec<OccurrenceLifecycleEffect>)>, ScheduleStoreError> {
+    ) -> Result<Option<OccurrenceTransitionCommit>, ScheduleStoreError> {
         let occurrence_id = occurrence_id.to_string();
         self.with_conn(move |conn| {
             let tx = begin_immediate_transaction(conn)?;
@@ -1806,16 +1823,13 @@ impl ScheduleStore for SqliteScheduleStore {
                 return Ok(None);
             }
 
-            let mutator =
-                current
-                    .apply(transition)
-                    .map_err(|error: OccurrenceLifecycleError| {
-                        StoreError::Internal(error.to_string())
-                    })?;
-            let (updated, effects) = mutator.into_parts();
-            write_occurrence_in_txn(&tx, &updated)?;
+            let write = current
+                .apply(transition)
+                .map_err(|error: OccurrenceLifecycleError| StoreError::Internal(error.to_string()))?
+                .into_authorized_write();
+            write_occurrence_in_txn(&tx, write.occurrence())?;
             tx.commit()?;
-            Ok(Some((updated, effects)))
+            Ok(Some(write.into_transition_commit_after_store_commit()))
         })
         .await
         .map_err(into_schedule_store_error)
@@ -1828,7 +1842,7 @@ impl ScheduleStore for SqliteScheduleStore {
         expected_claim_token: Option<Uuid>,
         transition: OccurrenceLifecycleInput,
         runtime_outcome: Option<RuntimeDeliveryOutcome>,
-    ) -> Result<Option<Occurrence>, ScheduleStoreError> {
+    ) -> Result<Option<OccurrenceTransitionCommit>, ScheduleStoreError> {
         let occurrence_id = occurrence_id.clone();
         self.with_conn(move |conn| {
             let tx = begin_immediate_transaction(conn)?;
@@ -1843,31 +1857,40 @@ impl ScheduleStore for SqliteScheduleStore {
                 return Ok(None);
             }
 
-            let terminalized = current
-                .apply(transition)
-                .map_err(|error: OccurrenceLifecycleError| StoreError::Internal(error.to_string()))?
-                .into_occurrence();
+            let mut mutator =
+                current
+                    .apply(transition)
+                    .map_err(|error: OccurrenceLifecycleError| {
+                        StoreError::Internal(error.to_string())
+                    })?;
+            let terminalized = mutator.occurrence().clone();
             let receipt = terminalized
                 .delivery_receipt_from_authority(runtime_outcome)
                 .map_err(|error: OccurrenceLifecycleError| {
                     StoreError::Internal(error.to_string())
                 })?;
-            let updated = terminalized
+            let receipt_mutator = terminalized
                 .apply(OccurrenceLifecycleInput::RecordReceipt {
                     runtime_outcome: receipt.runtime_outcome.clone(),
                     receipt,
                 })
-                .map_err(|error: OccurrenceLifecycleError| StoreError::Internal(error.to_string()))?
-                .into_occurrence();
+                .map_err(|error: OccurrenceLifecycleError| {
+                    StoreError::Internal(error.to_string())
+                })?;
+            mutator
+                .absorb_followup(receipt_mutator)
+                .map_err(|error| StoreError::Internal(error.to_string()))?;
+            let write = mutator.into_authorized_write();
+            let updated = write.occurrence();
             let canonical_receipt = updated.last_receipt.clone().ok_or_else(|| {
                 StoreError::Internal(
                     "generated occurrence authority did not produce a receipt".to_string(),
                 )
             })?;
-            write_occurrence_in_txn(&tx, &updated)?;
+            write_occurrence_in_txn(&tx, updated)?;
             write_receipt_in_txn(&tx, &canonical_receipt)?;
             tx.commit()?;
-            Ok(Some(updated))
+            Ok(Some(write.into_transition_commit_after_store_commit()))
         })
         .await
         .map_err(into_schedule_store_error)
@@ -2310,49 +2333,61 @@ fn resolve_due_misfire_in_txn(
     tx: &rusqlite::Transaction<'_>,
     occurrence: &Occurrence,
     store_now_utc: chrono::DateTime<chrono::Utc>,
-) -> Result<Option<ScheduleStoreRowFault>, StoreError> {
+) -> Result<Result<AuthorizedOccurrenceWrite, ScheduleStoreRowFault>, StoreError> {
     let detail = Some(occurrence.due_misfire_detail_at(store_now_utc));
-    let mut updated = match occurrence
+    let mut mutator = match occurrence
         .clone()
         .apply(OccurrenceLifecycleInput::ResolveDueMisfire {
             detail,
             at_utc: store_now_utc,
         }) {
-        Ok(mutator) => mutator.into_occurrence(),
+        Ok(mutator) => mutator,
         Err(error) => {
-            return Ok(Some(claim_row_fault(
+            return Ok(Err(claim_row_fault(
                 occurrence,
                 ScheduleStoreRowFaultKind::DueClassification,
                 format!("misfire resolution: {error}"),
             )));
         }
     };
-    let receipt = match updated.delivery_receipt_from_authority(None) {
+    let receipt = match mutator.occurrence().delivery_receipt_from_authority(None) {
         Ok(receipt) => receipt,
         Err(error) => {
-            return Ok(Some(claim_row_fault(
+            return Ok(Err(claim_row_fault(
                 occurrence,
                 ScheduleStoreRowFaultKind::DueClassification,
                 format!("misfire receipt: {error}"),
             )));
         }
     };
-    updated = match updated.apply(OccurrenceLifecycleInput::RecordReceipt {
-        runtime_outcome: receipt.runtime_outcome.clone(),
-        receipt: receipt.clone(),
-    }) {
-        Ok(mutator) => mutator.into_occurrence(),
-        Err(error) => {
-            return Ok(Some(claim_row_fault(
-                occurrence,
-                ScheduleStoreRowFaultKind::DueClassification,
-                format!("misfire receipt record: {error}"),
-            )));
-        }
-    };
+    let receipt_mutator =
+        match mutator
+            .occurrence()
+            .clone()
+            .apply(OccurrenceLifecycleInput::RecordReceipt {
+                runtime_outcome: receipt.runtime_outcome.clone(),
+                receipt: receipt.clone(),
+            }) {
+            Ok(mutator) => mutator,
+            Err(error) => {
+                return Ok(Err(claim_row_fault(
+                    occurrence,
+                    ScheduleStoreRowFaultKind::DueClassification,
+                    format!("misfire receipt record: {error}"),
+                )));
+            }
+        };
+    if let Err(error) = mutator.absorb_followup(receipt_mutator) {
+        return Ok(Err(claim_row_fault(
+            occurrence,
+            ScheduleStoreRowFaultKind::DueClassification,
+            format!("misfire receipt record: {error}"),
+        )));
+    }
+    let write = mutator.into_authorized_write();
     write_receipt_in_txn(tx, &receipt)?;
-    write_occurrence_in_txn(tx, &updated)?;
-    Ok(None)
+    write_occurrence_in_txn(tx, write.occurrence())?;
+    Ok(Ok(write))
 }
 
 fn write_receipt_in_txn(
@@ -2386,29 +2421,31 @@ fn write_receipt_in_txn(
 fn expire_occurrence_lease_for_sqlite(
     occurrence: Occurrence,
     at_utc: DateTime<Utc>,
-) -> Result<(Occurrence, DeliveryReceipt), StoreError> {
-    let expired = occurrence
+) -> Result<(OccurrenceLifecycleMutator, DeliveryReceipt), StoreError> {
+    let mut mutator = occurrence
         .apply(OccurrenceLifecycleInput::LeaseExpired { at_utc })
-        .map_err(|error: OccurrenceLifecycleError| StoreError::Internal(error.to_string()))?
-        .into_occurrence();
+        .map_err(|error: OccurrenceLifecycleError| StoreError::Internal(error.to_string()))?;
+    let expired = mutator.occurrence().clone();
     let receipt = expired
         .delivery_receipt_from_authority(None)
         .map_err(|error: OccurrenceLifecycleError| StoreError::Internal(error.to_string()))?;
-    let expired = expired
+    let receipt_mutator = expired
         .apply(OccurrenceLifecycleInput::RecordReceipt {
             runtime_outcome: receipt.runtime_outcome.clone(),
             receipt: receipt.clone(),
         })
-        .map_err(|error: OccurrenceLifecycleError| StoreError::Internal(error.to_string()))?
-        .into_occurrence();
-    Ok((expired, receipt))
+        .map_err(|error: OccurrenceLifecycleError| StoreError::Internal(error.to_string()))?;
+    mutator
+        .absorb_followup(receipt_mutator)
+        .map_err(|error| StoreError::Internal(error.to_string()))?;
+    Ok((mutator, receipt))
 }
 
 fn claim_occurrence_for_sqlite(
     occurrence: Occurrence,
     request: &ClaimDueRequest,
     at_utc: DateTime<Utc>,
-) -> Result<Occurrence, StoreError> {
+) -> Result<OccurrenceLifecycleMutator, StoreError> {
     occurrence
         .apply(OccurrenceLifecycleInput::Claim {
             owner_id: request.owner_id.clone(),
@@ -2416,7 +2453,6 @@ fn claim_occurrence_for_sqlite(
             lease_expires_at_utc: at_utc + request.lease_duration,
             claim_token: Uuid::now_v7(),
         })
-        .map(|mutator| mutator.into_occurrence())
         .map_err(|error: OccurrenceLifecycleError| StoreError::Internal(error.to_string()))
 }
 
@@ -2424,7 +2460,7 @@ fn supersede_outstanding_occurrences_in_txn(
     tx: &rusqlite::Transaction<'_>,
     schedule: &Schedule,
     supersession: PendingSupersession,
-) -> Result<Vec<OccurrenceSupersessionAck>, StoreError> {
+) -> Result<Vec<AuthorizedOccurrenceWrite>, StoreError> {
     let mut stmt = tx.prepare(
         "SELECT occurrence_json
          FROM schedule_occurrences
@@ -2434,7 +2470,7 @@ fn supersede_outstanding_occurrences_in_txn(
     let rows = stmt.query_map(params![schedule.schedule_id.to_string()], |row| {
         Ok(row.get::<_, JsonColumnBytes>(0)?.into_bytes())
     })?;
-    let mut acks = Vec::new();
+    let mut writes = Vec::new();
     for row in rows {
         let bytes = row?;
         let occurrence: Occurrence =
@@ -2449,56 +2485,24 @@ fn supersede_outstanding_occurrences_in_txn(
         {
             continue;
         }
-        let mutator = occurrence
+        let write = occurrence
             .apply(OccurrenceLifecycleInput::Supersede {
                 superseded_by_revision: supersession.superseded_by_revision(),
                 at_utc: supersession.at_utc(),
             })
-            .map_err(|error: OccurrenceLifecycleError| StoreError::Internal(error.to_string()))?;
-        let (updated, _effects, mutator_acks) = mutator.into_parts_with_supersession_feedback();
+            .map_err(|error: OccurrenceLifecycleError| StoreError::Internal(error.to_string()))?
+            .into_authorized_write();
+        let updated = write.occurrence();
         // The commit-time sweep is the sole receipt minter for supersession
         // (0.7.2 D1): mint exactly one superseded receipt per swept row.
         let receipt = updated
             .delivery_receipt_from_authority(None)
             .map_err(|error: OccurrenceLifecycleError| StoreError::Internal(error.to_string()))?;
         write_receipt_in_txn(tx, &receipt)?;
-        acks.extend(mutator_acks);
-        write_occurrence_in_txn(tx, &updated)?;
+        write_occurrence_in_txn(tx, updated)?;
+        writes.push(write);
     }
-    Ok(acks)
-}
-
-fn record_occurrence_receipt_in_txn(
-    tx: &rusqlite::Transaction<'_>,
-    receipt: &DeliveryReceipt,
-) -> Result<DeliveryReceipt, StoreError> {
-    let occurrence_id = receipt.occurrence_id.to_string();
-    let Some(bytes) = tx
-        .query_row(
-            "SELECT occurrence_json FROM schedule_occurrences WHERE occurrence_id = ?1",
-            params![&occurrence_id],
-            |row| Ok(row.get::<_, JsonColumnBytes>(0)?.into_bytes()),
-        )
-        .optional()?
-    else {
-        return Err(StoreError::Internal(format!(
-            "occurrence {occurrence_id} not found while recording receipt"
-        )));
-    };
-    let occurrence: Occurrence =
-        serde_json::from_slice(&bytes).map_err(StoreError::Serialization)?;
-    let occurrence = occurrence
-        .apply(OccurrenceLifecycleInput::RecordReceipt {
-            runtime_outcome: receipt.runtime_outcome.clone(),
-            receipt: receipt.clone(),
-        })
-        .map_err(|error: OccurrenceLifecycleError| StoreError::Internal(error.to_string()))?
-        .into_occurrence();
-    let canonical_receipt = occurrence.last_receipt.clone().ok_or_else(|| {
-        StoreError::Internal("generated occurrence authority did not produce a receipt".to_string())
-    })?;
-    write_occurrence_in_txn(tx, &occurrence)?;
-    Ok(canonical_receipt)
+    Ok(writes)
 }
 
 fn schedule_phase_label(phase: meerkat_schedule::SchedulePhase) -> &'static str {
@@ -3172,8 +3176,8 @@ mod tests {
         let store = SqliteScheduleStore::open(&path).expect("open store");
 
         let mutator = sample_schedule_mutator();
-        let schedule = mutator.schedule.clone();
-        store
+        let schedule = mutator.schedule().clone();
+        let _commit = store
             .commit_schedule_write(mutator.into_authorized_write())
             .await
             .expect("commit schedule");

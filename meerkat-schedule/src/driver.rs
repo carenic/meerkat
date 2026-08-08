@@ -370,15 +370,59 @@ impl ScheduleDriver {
                 lease_duration: self.config.lease_duration,
             })
             .await?;
-        report.claimed_occurrences = claimed.claimed.len();
         report.occurrence_row_faults = claimed.row_faults;
 
-        for occurrence in claimed.claimed {
-            if self
-                .handle_claimed_occurrence(occurrence, claimed.store_now_utc)
-                .await?
-            {
-                report.terminalized_occurrences += 1;
+        for commit in claimed.transitions {
+            let successor = commit.successor();
+            match successor.phase {
+                OccurrencePhase::Claimed => {
+                    if !commit
+                        .effects()
+                        .iter()
+                        .any(|effect| matches!(effect, OccurrenceLifecycleEffect::Claimed))
+                    {
+                        return Err(ScheduleDomainError::Internal(
+                            "claim scan committed a Claimed successor without a Claimed effect"
+                                .to_string(),
+                        ));
+                    }
+                    report.claimed_occurrences += 1;
+                    if self
+                        .handle_claimed_occurrence(successor.clone(), claimed.store_now_utc)
+                        .await?
+                    {
+                        report.terminalized_occurrences += 1;
+                    }
+                }
+                OccurrencePhase::Misfired => {
+                    if !commit
+                        .effects()
+                        .iter()
+                        .any(|effect| matches!(effect, OccurrenceLifecycleEffect::Misfired))
+                    {
+                        return Err(ScheduleDomainError::Internal(
+                            "claim scan committed a Misfired successor without a Misfired effect"
+                                .to_string(),
+                        ));
+                    }
+                }
+                OccurrencePhase::Pending => {
+                    if !commit
+                        .effects()
+                        .iter()
+                        .any(|effect| matches!(effect, OccurrenceLifecycleEffect::LeaseExpired))
+                    {
+                        return Err(ScheduleDomainError::Internal(
+                            "claim scan committed a Pending lease-expiry successor without a LeaseExpired effect"
+                                .to_string(),
+                        ));
+                    }
+                }
+                phase => {
+                    return Err(ScheduleDomainError::Internal(format!(
+                        "claim scan returned unsupported committed occurrence phase {phase:?}"
+                    )));
+                }
             }
         }
 
@@ -397,7 +441,7 @@ impl ScheduleDriver {
         {
             ClaimedOccurrenceDispatchState::Ready(occurrence) => occurrence,
             ClaimedOccurrenceDispatchState::Frozen => {
-                let _ = self
+                let Some(commit) = self
                     .store
                     .transition_occurrence_with_receipt_if_current(
                         &frozen_occurrence.occurrence_id,
@@ -408,7 +452,21 @@ impl ScheduleDriver {
                         },
                         None,
                     )
-                    .await?;
+                    .await?
+                else {
+                    return Ok(false);
+                };
+                if commit.successor().phase != OccurrencePhase::Pending
+                    || !commit
+                        .effects()
+                        .iter()
+                        .any(|effect| matches!(effect, OccurrenceLifecycleEffect::LeaseExpired))
+                {
+                    return Err(ScheduleDomainError::Internal(
+                        "paused-schedule lease release committed without a Pending successor and LeaseExpired effect"
+                            .to_string(),
+                    ));
+                }
                 return Ok(false);
             }
             ClaimedOccurrenceDispatchState::Supersede {
@@ -440,7 +498,7 @@ impl ScheduleDriver {
         // - after this commit but before delivery leaves a retryable outbox row;
         // - after delivery but before observation replays the same idempotency
         //   key, never a newly minted effect identity.
-        let Some(mut dispatching) = self
+        let Some(dispatch_commit) = self
             .store
             .transition_occurrence_with_receipt_if_current(
                 &occurrence.occurrence_id,
@@ -456,6 +514,17 @@ impl ScheduleDriver {
         else {
             return Ok(false);
         };
+        if !dispatch_commit
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, OccurrenceLifecycleEffect::DispatchStarted))
+        {
+            return Err(ScheduleDomainError::Internal(
+                "committed dispatch-start transition lost its generated lifecycle effect"
+                    .to_string(),
+            ));
+        }
+        let mut dispatching = dispatch_commit.successor().clone();
 
         let dispatch = match self
             .delivery
@@ -506,7 +575,7 @@ impl ScheduleDriver {
                     "dispatch-accepted receipt omitted a successful admission outcome".to_string(),
                 )
             })?;
-            let Some(accepted) = self
+            let Some(accepted_commit) = self
                 .store
                 .transition_occurrence_with_receipt_if_current(
                     &dispatching.occurrence_id,
@@ -522,7 +591,28 @@ impl ScheduleDriver {
             else {
                 return Ok(false);
             };
-            dispatching = accepted;
+            let has_dispatch_accepted = accepted_commit
+                .effects()
+                .iter()
+                .any(|effect| matches!(effect, OccurrenceLifecycleEffect::DispatchAccepted));
+            let accepted_shape_is_valid = match accepted_commit.successor().phase {
+                OccurrencePhase::Dispatching => has_dispatch_accepted,
+                OccurrencePhase::Completed => {
+                    has_dispatch_accepted
+                        && accepted_commit
+                            .effects()
+                            .iter()
+                            .any(|effect| matches!(effect, OccurrenceLifecycleEffect::Completed))
+                }
+                _ => false,
+            };
+            if !accepted_shape_is_valid || !accepted_commit.supersession_acks().is_empty() {
+                return Err(ScheduleDomainError::Internal(
+                    "committed dispatch-accepted transition carried an incomplete or invalid lifecycle result"
+                        .to_string(),
+                ));
+            }
+            dispatching = accepted_commit.successor().clone();
             if dispatching.phase == OccurrencePhase::Completed {
                 return Ok(true);
             }
@@ -534,8 +624,6 @@ impl ScheduleDriver {
                 at_utc: store_now_utc,
             })
             .map_err(|error| ScheduleDomainError::Internal(error.to_string()))?;
-        // Capture the post-await occurrence before consuming the mutator.
-        let awaiting_occurrence = await_mutator.occurrence.clone();
         // 0.7.2 D1/D2a item 5: a schedule-commit sweep can supersede the
         // occurrence between the dispatch commit and the refetch/await-commit.
         // Two sub-cases:
@@ -554,7 +642,24 @@ impl ScheduleDriver {
             .commit_occurrence_write(await_mutator.into_authorized_write())
             .await
         {
-            Ok(()) => awaiting_occurrence,
+            Ok(commit) => {
+                let await_shape_is_valid = match commit.successor().phase {
+                    OccurrencePhase::AwaitingCompletion => commit.effects().iter().any(|effect| {
+                        matches!(effect, OccurrenceLifecycleEffect::AwaitingCompletion)
+                    }),
+                    OccurrencePhase::Superseded => {
+                        commit.effects().is_empty() && commit.supersession_acks().is_empty()
+                    }
+                    _ => false,
+                };
+                if !await_shape_is_valid {
+                    return Err(ScheduleDomainError::Internal(
+                        "committed await-completion transition carried an incomplete or invalid lifecycle result"
+                            .to_string(),
+                    ));
+                }
+                commit.successor().clone()
+            }
             Err(ScheduleStoreError::Concurrency(_)) => {
                 // The sweep raced the await commit. Re-read the current state.
                 let current = self
@@ -676,16 +781,14 @@ impl ScheduleDriver {
         // Predict the terminal phase the generated authority will resolve the
         // probe to so we can route Claimed (no receipt) and Skipped/Misfired
         // (typed delivery receipt) through the correct store method.
-        let predicted = occurrence
+        let predicted_phase = occurrence
             .clone()
             .apply(lifecycle.clone())
             .map_err(|error| ScheduleDomainError::Internal(error.to_string()))?
-            .into_occurrence();
-        let updated = match predicted.phase {
+            .occurrence()
+            .phase;
+        let commit = match predicted_phase {
             OccurrencePhase::Claimed => {
-                // `transition_occurrence_if_current` now returns the emitted
-                // effects alongside the occurrence; the target-probe Continue
-                // path does not consume them.
                 self.store
                     .transition_occurrence_if_current(
                         &occurrence.occurrence_id,
@@ -694,7 +797,6 @@ impl ScheduleDriver {
                         lifecycle,
                     )
                     .await?
-                    .map(|(updated, _effects)| updated)
             }
             OccurrencePhase::Skipped | OccurrencePhase::Misfired => {
                 self.store
@@ -713,9 +815,34 @@ impl ScheduleDriver {
                 )));
             }
         };
-        let Some(updated) = updated else {
+        let Some(commit) = commit else {
             return Ok(TargetProbeResolution::StaleClaim);
         };
+        let effect_is_valid = match commit.successor().phase {
+            OccurrencePhase::Claimed => {
+                commit.effects().is_empty() && commit.supersession_acks().is_empty()
+            }
+            OccurrencePhase::Skipped => commit
+                .effects()
+                .iter()
+                .any(|effect| matches!(effect, OccurrenceLifecycleEffect::Skipped)),
+            OccurrencePhase::Misfired => commit
+                .effects()
+                .iter()
+                .any(|effect| matches!(effect, OccurrenceLifecycleEffect::Misfired)),
+            other => {
+                return Err(ScheduleDomainError::Internal(format!(
+                    "committed target probe resolved to unsupported phase: {other:?}"
+                )));
+            }
+        };
+        if !effect_is_valid {
+            return Err(ScheduleDomainError::Internal(format!(
+                "committed target probe {:?} successor carried inconsistent lifecycle effects",
+                commit.successor().phase
+            )));
+        }
+        let updated = commit.successor().clone();
 
         match updated.phase {
             OccurrencePhase::Claimed => Ok(TargetProbeResolution::Continue(Box::new(updated))),
@@ -990,10 +1117,23 @@ async fn renew_lease_once(
         .await;
     match result {
         Ok(result) => match result.outcome {
-            RenewOccurrenceLeaseOutcome::Renewed(occurrence) => LeaseRenewalAttempt::Renewed {
-                store_now_utc: result.store_now_utc,
-                occurrence,
-            },
+            RenewOccurrenceLeaseOutcome::Renewed(commit) => {
+                if commit
+                    .effects()
+                    .iter()
+                    .any(|effect| matches!(effect, OccurrenceLifecycleEffect::LeaseRenewed))
+                {
+                    LeaseRenewalAttempt::Renewed {
+                        store_now_utc: result.store_now_utc,
+                        occurrence: commit.successor().clone(),
+                    }
+                } else {
+                    LeaseRenewalAttempt::Fatal(ScheduleStoreError::Internal(
+                        "committed lease renewal lost its LeaseRenewed lifecycle effect"
+                            .to_string(),
+                    ))
+                }
+            }
             RenewOccurrenceLeaseOutcome::StaleClaim => LeaseRenewalAttempt::StaleClaim,
         },
         Err(error) if error.is_transient() => LeaseRenewalAttempt::Transient(error),
@@ -1174,22 +1314,30 @@ async fn classify_stale_arrival(
             .apply(OccurrenceLifecycleInput::ClassifyStaleCompletionArrival { trigger })
             .map_err(|error| ScheduleDomainError::Internal(error.to_string()))?;
         // Log the classification effect before consuming the mutator.
-        if let Some(effect) = mutator.effects.iter().find(|e| {
-            matches!(
-                e,
-                OccurrenceLifecycleEffect::StaleCompletionArrivalClassified { .. }
-            )
-        }) {
-            tracing::debug!(
-                occurrence_id = %occurrence_id,
-                ?trigger,
-                ?effect,
-                "stale completion arrival classified as typed machine fact"
-            );
-        }
-        store
+        let commit = store
             .commit_occurrence_write(mutator.into_authorized_write())
             .await?;
+        let effect = commit
+            .effects()
+            .iter()
+            .find(|e| {
+                matches!(
+                    e,
+                    OccurrenceLifecycleEffect::StaleCompletionArrivalClassified { .. }
+                )
+            })
+            .ok_or_else(|| {
+                ScheduleDomainError::Internal(
+                    "committed stale-arrival classification lost its generated lifecycle effect"
+                        .to_string(),
+                )
+            })?;
+        tracing::debug!(
+            occurrence_id = %occurrence_id,
+            ?trigger,
+            ?effect,
+            "stale completion arrival classified as typed machine fact"
+        );
         Ok(())
     }
     .await;
@@ -1269,7 +1417,7 @@ async fn terminalize_occurrence_inner(
             // (`LateCompletionResolutionRecorded`) without minting a second
             // receipt. A `Supersede` landing on an already-superseded row is the
             // idempotent no-op (`SupersedeAlreadySuperseded`, zero effects).
-            let Some((_updated, effects)) = store
+            let Some(commit) = store
                 .transition_occurrence_if_current(
                     &occurrence.occurrence_id,
                     occurrence.attempt_count,
@@ -1284,7 +1432,7 @@ async fn terminalize_occurrence_inner(
                 return terminalize_late_completion_on_superseded(store, &occurrence, lifecycle)
                     .await;
             };
-            let late_recorded = effects.iter().any(|e| {
+            let late_recorded = commit.effects().iter().any(|e| {
                 matches!(
                     e,
                     OccurrenceLifecycleEffect::LateCompletionResolutionRecorded { .. }
@@ -1292,7 +1440,7 @@ async fn terminalize_occurrence_inner(
             });
             if late_recorded {
                 Ok(TerminalizeOutcome::LateRecorded)
-            } else if effects.is_empty() {
+            } else if commit.effects().is_empty() {
                 Ok(TerminalizeOutcome::IdempotentNoop)
             } else {
                 // A terminal transition unexpectedly succeeded on a Superseded
@@ -1311,7 +1459,7 @@ async fn terminalize_occurrence_inner(
             // Genuine terminal: the row is still live for the terminal
             // transition. Apply it and mint the canonical receipt atomically
             // inside the store transaction (D1). The receipt is written through
-            // the claim-screened store seam, never a separate `append_receipt`,
+            // the claim-screened store seam, never a separate raw receipt write,
             // so a partial receipt-append failure cannot leave a terminalized
             // occurrence without its receipt.
             let updated = store
@@ -1324,7 +1472,41 @@ async fn terminalize_occurrence_inner(
                 )
                 .await?;
             match updated {
-                Some(_) => Ok(TerminalizeOutcome::Applied),
+                Some(commit) => {
+                    let has_required_effect = match commit.successor().phase {
+                        OccurrencePhase::Completed => commit
+                            .effects()
+                            .iter()
+                            .any(|effect| matches!(effect, OccurrenceLifecycleEffect::Completed)),
+                        OccurrencePhase::Skipped => commit
+                            .effects()
+                            .iter()
+                            .any(|effect| matches!(effect, OccurrenceLifecycleEffect::Skipped)),
+                        OccurrencePhase::Misfired => commit
+                            .effects()
+                            .iter()
+                            .any(|effect| matches!(effect, OccurrenceLifecycleEffect::Misfired)),
+                        OccurrencePhase::Superseded => commit
+                            .effects()
+                            .iter()
+                            .any(|effect| matches!(effect, OccurrenceLifecycleEffect::Superseded)),
+                        OccurrencePhase::DeliveryFailed => commit.effects().iter().any(|effect| {
+                            matches!(effect, OccurrenceLifecycleEffect::DeliveryFailed)
+                        }),
+                        other => {
+                            return Err(ScheduleDomainError::Internal(format!(
+                                "terminal transition committed non-terminal successor phase {other:?}"
+                            )));
+                        }
+                    };
+                    if !has_required_effect {
+                        return Err(ScheduleDomainError::Internal(format!(
+                            "terminal transition committed {:?} without its required lifecycle effect",
+                            commit.successor().phase
+                        )));
+                    }
+                    Ok(TerminalizeOutcome::Applied)
+                }
                 None => Ok(TerminalizeOutcome::StaleClaim),
             }
         }
@@ -1356,7 +1538,7 @@ async fn terminalize_late_completion_on_superseded(
     let mutator = current
         .apply(lifecycle)
         .map_err(|error| ScheduleDomainError::Internal(error.to_string()))?;
-    let late_recorded = mutator.effects.iter().any(|e| {
+    let late_recorded = mutator.effects().iter().any(|e| {
         matches!(
             e,
             OccurrenceLifecycleEffect::LateCompletionResolutionRecorded { .. }
@@ -1369,10 +1551,21 @@ async fn terminalize_late_completion_on_superseded(
         // benign stale arrival the claim screen first detected.
         return Ok(TerminalizeOutcome::StaleClaim);
     }
-    store
+    let commit = store
         .commit_occurrence_write(mutator.into_authorized_write())
         .await?;
-    Ok(TerminalizeOutcome::LateRecorded)
+    if commit.effects().iter().any(|effect| {
+        matches!(
+            effect,
+            OccurrenceLifecycleEffect::LateCompletionResolutionRecorded { .. }
+        )
+    }) {
+        Ok(TerminalizeOutcome::LateRecorded)
+    } else {
+        Err(ScheduleDomainError::Internal(
+            "committed late completion transition lost its generated lifecycle effect".to_string(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -1733,7 +1926,7 @@ mod tests {
         async fn commit_schedule_write(
             &self,
             write: crate::AuthorizedScheduleWrite,
-        ) -> Result<(), ScheduleStoreError> {
+        ) -> Result<crate::ScheduleTransitionCommit, ScheduleStoreError> {
             self.inner.commit_schedule_write(write).await
         }
 
@@ -1769,7 +1962,7 @@ mod tests {
         async fn commit_occurrence_write(
             &self,
             write: crate::AuthorizedOccurrenceWrite,
-        ) -> Result<(), ScheduleStoreError> {
+        ) -> Result<crate::OccurrenceTransitionCommit, ScheduleStoreError> {
             self.inner.commit_occurrence_write(write).await
         }
 
@@ -1777,7 +1970,7 @@ mod tests {
             &self,
             schedule: crate::AuthorizedScheduleWrite,
             occurrences: Vec<crate::AuthorizedOccurrenceWrite>,
-        ) -> Result<crate::Schedule, ScheduleStoreError> {
+        ) -> Result<crate::ScheduleMutationCommit, ScheduleStoreError> {
             self.inner
                 .commit_schedule_mutation(schedule, occurrences)
                 .await
@@ -1788,7 +1981,7 @@ mod tests {
             schedule: crate::AuthorizedScheduleWrite,
             occurrences: Vec<crate::AuthorizedOccurrenceWrite>,
             next_refill_at_utc: Option<DateTime<Utc>>,
-        ) -> Result<crate::Schedule, ScheduleStoreError> {
+        ) -> Result<crate::ScheduleMutationCommit, ScheduleStoreError> {
             self.inner
                 .commit_schedule_refill(schedule, occurrences, next_refill_at_utc)
                 .await
@@ -1828,10 +2021,6 @@ mod tests {
             filter: crate::OccurrenceFilter,
         ) -> Result<Vec<Occurrence>, ScheduleStoreError> {
             self.inner.list_occurrences(filter).await
-        }
-
-        async fn append_receipt(&self, receipt: DeliveryReceipt) -> Result<(), ScheduleStoreError> {
-            self.inner.append_receipt(receipt).await
         }
 
         async fn list_receipts(
@@ -1880,8 +2069,7 @@ mod tests {
             expected_attempt: u32,
             expected_claim_token: Option<Uuid>,
             transition: OccurrenceLifecycleInput,
-        ) -> Result<Option<(Occurrence, Vec<OccurrenceLifecycleEffect>)>, ScheduleStoreError>
-        {
+        ) -> Result<Option<crate::OccurrenceTransitionCommit>, ScheduleStoreError> {
             self.inner
                 .transition_occurrence_if_current(
                     occurrence_id,
@@ -1899,7 +2087,7 @@ mod tests {
             expected_claim_token: Option<Uuid>,
             transition: OccurrenceLifecycleInput,
             runtime_outcome: Option<crate::RuntimeDeliveryOutcome>,
-        ) -> Result<Option<Occurrence>, ScheduleStoreError> {
+        ) -> Result<Option<crate::OccurrenceTransitionCommit>, ScheduleStoreError> {
             self.inner
                 .transition_occurrence_with_receipt_if_current(
                     occurrence_id,
@@ -2109,7 +2297,7 @@ mod tests {
         async fn commit_schedule_write(
             &self,
             write: crate::AuthorizedScheduleWrite,
-        ) -> Result<(), ScheduleStoreError> {
+        ) -> Result<crate::ScheduleTransitionCommit, ScheduleStoreError> {
             self.inner.commit_schedule_write(write).await
         }
 
@@ -2130,14 +2318,14 @@ mod tests {
         async fn commit_occurrence_write(
             &self,
             write: crate::AuthorizedOccurrenceWrite,
-        ) -> Result<(), ScheduleStoreError> {
+        ) -> Result<crate::OccurrenceTransitionCommit, ScheduleStoreError> {
             self.inner.commit_occurrence_write(write).await
         }
 
         async fn commit_occurrence_writes(
             &self,
             writes: Vec<crate::AuthorizedOccurrenceWrite>,
-        ) -> Result<(), ScheduleStoreError> {
+        ) -> Result<Vec<crate::OccurrenceTransitionCommit>, ScheduleStoreError> {
             self.inner.commit_occurrence_writes(writes).await
         }
 
@@ -2145,7 +2333,7 @@ mod tests {
             &self,
             schedule: crate::AuthorizedScheduleWrite,
             occurrences: Vec<crate::AuthorizedOccurrenceWrite>,
-        ) -> Result<crate::Schedule, ScheduleStoreError> {
+        ) -> Result<crate::ScheduleMutationCommit, ScheduleStoreError> {
             self.inner
                 .commit_schedule_mutation(schedule, occurrences)
                 .await
@@ -2156,7 +2344,7 @@ mod tests {
             schedule: crate::AuthorizedScheduleWrite,
             occurrences: Vec<crate::AuthorizedOccurrenceWrite>,
             next_refill_at_utc: Option<DateTime<Utc>>,
-        ) -> Result<crate::Schedule, ScheduleStoreError> {
+        ) -> Result<crate::ScheduleMutationCommit, ScheduleStoreError> {
             self.inner
                 .commit_schedule_refill(schedule, occurrences, next_refill_at_utc)
                 .await
@@ -2193,15 +2381,6 @@ mod tests {
             self.inner.list_occurrences(filter).await
         }
 
-        async fn append_receipt(
-            &self,
-            _receipt: DeliveryReceipt,
-        ) -> Result<(), ScheduleStoreError> {
-            Err(ScheduleStoreError::Internal(
-                "standalone receipt append disabled for regression".into(),
-            ))
-        }
-
         async fn list_receipts(
             &self,
             occurrence_id: &crate::OccurrenceId,
@@ -2229,8 +2408,7 @@ mod tests {
             expected_attempt: u32,
             expected_claim_token: Option<Uuid>,
             transition: OccurrenceLifecycleInput,
-        ) -> Result<Option<(Occurrence, Vec<OccurrenceLifecycleEffect>)>, ScheduleStoreError>
-        {
+        ) -> Result<Option<crate::OccurrenceTransitionCommit>, ScheduleStoreError> {
             self.inner
                 .transition_occurrence_if_current(
                     occurrence_id,
@@ -2248,7 +2426,7 @@ mod tests {
             expected_claim_token: Option<Uuid>,
             transition: OccurrenceLifecycleInput,
             runtime_outcome: Option<RuntimeDeliveryOutcome>,
-        ) -> Result<Option<Occurrence>, ScheduleStoreError> {
+        ) -> Result<Option<crate::OccurrenceTransitionCommit>, ScheduleStoreError> {
             self.inner
                 .transition_occurrence_with_receipt_if_current(
                     occurrence_id,
@@ -2259,6 +2437,115 @@ mod tests {
                 )
                 .await
         }
+    }
+
+    #[tokio::test]
+    async fn memory_store_issues_one_complete_occurrence_transition_commit()
+    -> Result<(), ScheduleDomainError> {
+        let store = Arc::new(MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
+        let service = ScheduleService::new(store.clone());
+        let schedule = service
+            .create(CreateScheduleRequest {
+                name: Some("transition-commit".to_string()),
+                description: None,
+                trigger: TriggerSpec::Once {
+                    due_at_utc: Utc::now() - Duration::seconds(1),
+                },
+                target: materialize_on_demand_target("scheduled prompt"),
+                misfire_policy: MisfirePolicy::Skip,
+                overlap_policy: OverlapPolicy::AllowConcurrent,
+                missing_target_policy: MissingTargetPolicy::MarkMisfired,
+                labels: BTreeMap::new(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(1),
+            })
+            .await?;
+        let claim = store
+            .claim_due_occurrences(ClaimDueRequest {
+                owner_id: "transition-commit-owner".to_string(),
+                limit: 1,
+                lease_duration: Duration::seconds(30),
+            })
+            .await?;
+        let claimed = claim
+            .transitions
+            .into_iter()
+            .next()
+            .ok_or_else(|| ScheduleDomainError::Internal("expected claimed occurrence".into()))?
+            .successor()
+            .clone();
+
+        let dispatch_commit = store
+            .transition_occurrence_if_current(
+                &claimed.occurrence_id,
+                claimed.attempt_count,
+                claimed.claim_token(),
+                OccurrenceLifecycleInput::DispatchStarted {
+                    correlation_id: Some("transition-commit-correlation".to_string()),
+                    at_utc: claim.store_now_utc,
+                },
+            )
+            .await?
+            .ok_or_else(|| ScheduleDomainError::Internal("dispatch CAS was stale".into()))?;
+        dispatch_commit
+            .prior()
+            .check_current(Some(&claimed))
+            .map_err(ScheduleDomainError::Internal)?;
+        assert_eq!(
+            dispatch_commit.successor().phase,
+            OccurrencePhase::Dispatching
+        );
+        assert_eq!(
+            dispatch_commit.effects(),
+            &[OccurrenceLifecycleEffect::DispatchStarted]
+        );
+        assert!(dispatch_commit.supersession_acks().is_empty());
+
+        let dispatching = dispatch_commit.successor().clone();
+        let superseding_revision = crate::ScheduleRevision(schedule.revision.0 + 1);
+        let supersede_commit = store
+            .transition_occurrence_if_current(
+                &dispatching.occurrence_id,
+                dispatching.attempt_count,
+                dispatching.claim_token(),
+                OccurrenceLifecycleInput::Supersede {
+                    superseded_by_revision: superseding_revision,
+                    at_utc: Utc::now(),
+                },
+            )
+            .await?
+            .ok_or_else(|| ScheduleDomainError::Internal("supersession CAS was stale".into()))?;
+        supersede_commit
+            .prior()
+            .check_current(Some(&dispatching))
+            .map_err(ScheduleDomainError::Internal)?;
+        assert_eq!(
+            supersede_commit.successor().phase,
+            OccurrencePhase::Superseded
+        );
+        assert!(supersede_commit.effects().iter().any(|effect| matches!(
+            effect,
+            OccurrenceLifecycleEffect::OccurrencesSuperseded {
+                occurrence_id,
+                superseding_revision: revision,
+            } if occurrence_id == &dispatching.occurrence_id && *revision == superseding_revision
+        )));
+        assert_eq!(supersede_commit.supersession_acks().len(), 1);
+        assert_eq!(
+            supersede_commit.supersession_acks()[0].occurrence_id(),
+            &dispatching.occurrence_id
+        );
+
+        let stale = store
+            .transition_occurrence_if_current(
+                &dispatching.occurrence_id,
+                dispatching.attempt_count,
+                Some(Uuid::now_v7()),
+                OccurrenceLifecycleInput::AwaitCompletion { at_utc: Utc::now() },
+            )
+            .await?;
+        assert!(stale.is_none(), "stale CAS must not mint a commit carrier");
+        Ok(())
     }
 
     #[tokio::test]
@@ -2949,7 +3236,7 @@ mod tests {
             terminalized,
             TerminalizeOutcome::Applied,
             "a genuine terminal completion must record its receipt atomically through the \
-             claim-screened store seam even when standalone append_receipt is unavailable"
+             claim-screened store seam; no standalone receipt-authority API exists"
         );
         let completed =
             wait_for_occurrence_phase(&service, &schedule.schedule_id, OccurrencePhase::Completed)
@@ -3546,12 +3833,14 @@ mod tests {
             })
             .await?;
         let occurrence = claimed
-            .claimed
+            .transitions
             .into_iter()
             .next()
-            .ok_or_else(|| ScheduleDomainError::Internal("expected a claim".to_string()))?;
+            .ok_or_else(|| ScheduleDomainError::Internal("expected a claim".to_string()))?
+            .successor()
+            .clone();
         let identity = ScheduleDeliveryIdentity::for_occurrence(&occurrence);
-        store
+        let commit = store
             .transition_occurrence_with_receipt_if_current(
                 &occurrence.occurrence_id,
                 occurrence.attempt_count,
@@ -3567,7 +3856,8 @@ mod tests {
                 ScheduleDomainError::Internal(
                     "claim evidence went stale before dispatch intent".to_string(),
                 )
-            })
+            })?;
+        Ok(commit.successor().clone())
     }
 
     /// Claim an occurrence through the store and drive it to
@@ -3586,30 +3876,40 @@ mod tests {
             })
             .await?;
         let occurrence = claimed
-            .claimed
+            .transitions
             .into_iter()
             .next()
-            .ok_or_else(|| ScheduleDomainError::Internal("expected a claim".to_string()))?;
+            .ok_or_else(|| ScheduleDomainError::Internal("expected a claim".to_string()))?
+            .successor()
+            .clone();
         let dispatch_mutator = occurrence
             .apply(OccurrenceLifecycleInput::DispatchStarted {
                 correlation_id: Some("other-process-dispatch".into()),
                 at_utc: claimed.store_now_utc,
             })
             .map_err(|error| ScheduleDomainError::Internal(error.to_string()))?;
-        let dispatching = dispatch_mutator.occurrence.clone();
-        store
+        let dispatch_commit = store
             .commit_occurrence_write(dispatch_mutator.into_authorized_write())
             .await?;
-        let await_mutator = dispatching
+        assert_eq!(
+            dispatch_commit.effects(),
+            &[OccurrenceLifecycleEffect::DispatchStarted]
+        );
+        let await_mutator = dispatch_commit
+            .successor()
+            .clone()
             .apply(OccurrenceLifecycleInput::AwaitCompletion {
                 at_utc: claimed.store_now_utc,
             })
             .map_err(|error| ScheduleDomainError::Internal(error.to_string()))?;
-        let awaiting = await_mutator.occurrence.clone();
-        store
+        let await_commit = store
             .commit_occurrence_write(await_mutator.into_authorized_write())
             .await?;
-        Ok(awaiting)
+        assert_eq!(
+            await_commit.effects(),
+            &[OccurrenceLifecycleEffect::AwaitingCompletion]
+        );
+        Ok(await_commit.successor().clone())
     }
 
     /// Stale-completion FENCING still holds under the renewal contract: when
@@ -3743,10 +4043,12 @@ mod tests {
             })
             .await?;
         let occurrence = claimed
-            .claimed
+            .transitions
             .into_iter()
             .next()
-            .expect("claimed occurrence");
+            .expect("claimed occurrence")
+            .successor()
+            .clone();
         service.pause(&schedule.schedule_id).await?;
 
         let terminalized = driver
@@ -3819,10 +4121,12 @@ mod tests {
             })
             .await?;
         let occurrence = claimed
-            .claimed
+            .transitions
             .into_iter()
             .next()
-            .expect("claimed occurrence");
+            .expect("claimed occurrence")
+            .successor()
+            .clone();
         service.delete(&schedule.schedule_id).await?;
 
         let terminalized = driver
@@ -3888,10 +4192,12 @@ mod tests {
             })
             .await?;
         let occurrence = claimed
-            .claimed
+            .transitions
             .into_iter()
             .next()
-            .expect("claimed occurrence");
+            .expect("claimed occurrence")
+            .successor()
+            .clone();
         let updated = service
             .update(
                 &schedule.schedule_id,
@@ -4224,11 +4530,12 @@ mod tests {
             })
             .await?;
         let occurrence = claimed
-            .claimed
-            .clone()
+            .transitions
             .into_iter()
             .next()
-            .expect("claimed occurrence");
+            .expect("claimed occurrence")
+            .successor()
+            .clone();
 
         let deleted = service.delete(&schedule.schedule_id).await?;
 
