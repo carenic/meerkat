@@ -6837,6 +6837,27 @@ mod tests {
         )
     }
 
+    struct VisibilityDispatcher {
+        tools: Arc<[Arc<meerkat_core::types::ToolDef>]>,
+    }
+
+    #[async_trait]
+    impl AgentToolDispatcher for VisibilityDispatcher {
+        fn tools(&self) -> Arc<[Arc<meerkat_core::types::ToolDef>]> {
+            Arc::clone(&self.tools)
+        }
+
+        async fn dispatch(
+            &self,
+            call: ToolCallView<'_>,
+        ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
+            Ok(
+                meerkat_core::ToolResult::new(call.id.to_string(), call.name.to_string(), false)
+                    .into(),
+            )
+        }
+    }
+
     fn inherited_visibility_authority(
         filter: meerkat_core::tool_scope::ToolFilter,
         tool_names: &[&str],
@@ -13723,6 +13744,75 @@ mod tests {
             "blob tool usage should be absent without a session blob store"
         );
     }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn shell_without_general_builtins_has_exact_surface_and_preserves_external_dispatcher() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = AgentFactory::new(temp.path().join("sessions"));
+        // These names resemble downstream category surfaces only to prove that
+        // the base composite preserves every tool supplied by its external
+        // dispatcher. Actual category composition happens later in build_agent.
+        let external_fixture_names = [
+            "external_callback",
+            "meerkat_schedule_list",
+            "list_members",
+            "generate_image",
+            "memory_search",
+            "mcp__homecore__probe",
+        ];
+        let external: Arc<dyn AgentToolDispatcher> = Arc::new(VisibilityDispatcher {
+            tools: external_fixture_names
+                .iter()
+                .map(|name| visibility_tool(name))
+                .collect::<Vec<_>>()
+                .into(),
+        });
+        let ops_lifecycle: Arc<dyn OpsLifecycleRegistry> =
+            Arc::new(RuntimeOpsLifecycleRegistry::new());
+
+        let (dispatcher, _) = factory
+            .build_tool_dispatcher_for_agent_with_overrides(
+                &Config::default(),
+                Some(external),
+                false,
+                true,
+                None,
+                None,
+                SessionId::new().to_string(),
+                ops_lifecycle,
+                None,
+                None,
+                None,
+                None,
+                ToolCategoryOverride::Inherit,
+                None,
+                ToolCategoryOverride::Inherit,
+                None,
+            )
+            .await
+            .expect("shell-only builtin composition should succeed");
+        let visible_names: std::collections::HashSet<_> = dispatcher
+            .tools()
+            .iter()
+            .map(|tool| tool.name.as_str().to_string())
+            .collect();
+        let expected_names: std::collections::HashSet<_> = [
+            "shell",
+            "shell_job_status",
+            "shell_jobs",
+            "shell_job_cancel",
+        ]
+        .into_iter()
+        .chain(external_fixture_names)
+        .map(String::from)
+        .collect();
+
+        assert_eq!(
+            visible_names, expected_names,
+            "shell-only builtin composition must expose exactly four shell tools while preserving the external dispatcher unchanged"
+        );
+    }
 }
 
 impl AgentFactory {
@@ -13755,8 +13845,8 @@ impl AgentFactory {
     ) -> Result<(Arc<dyn AgentToolDispatcher>, String), BuildAgentError> {
         let compose_image_generation =
             image_generation_visibility.resolve(false) && image_generation_machine.is_some();
-        if !effective_builtins && !compose_image_generation {
-            // No builtins — return the external tools if provided, otherwise empty.
+        if !effective_builtins && !effective_shell && !compose_image_generation {
+            // No builtins - return the external tools if provided, otherwise empty.
             return match external {
                 Some(ext) => {
                     let usage = render_tool_usage_instructions(ext.as_ref());
@@ -13798,19 +13888,22 @@ impl AgentFactory {
         // builtin namespace closed and let the capability registration add its
         // own tool(s). This keeps profile category intent one-owner: enabling
         // `image_generation` must not also expose task/patch/skill utilities.
-        let builtin_config = if effective_builtins {
-            if effective_shell {
-                BuiltinToolConfig {
-                    policy: ToolPolicyLayer::new()
-                        .enable_tool("shell")
-                        .enable_tool("shell_job_status")
-                        .enable_tool("shell_jobs")
-                        .enable_tool("shell_job_cancel"),
-                    ..Default::default()
-                }
-            } else {
-                BuiltinToolConfig::default()
+        let builtin_config = if effective_shell {
+            BuiltinToolConfig {
+                policy: ToolPolicyLayer::new()
+                    .enable_tool("shell")
+                    .enable_tool("shell_job_status")
+                    .enable_tool("shell_jobs")
+                    .enable_tool("shell_job_cancel")
+                    .with_mode(if effective_builtins {
+                        ToolMode::AllowAll
+                    } else {
+                        ToolMode::AllowList
+                    }),
+                ..Default::default()
             }
+        } else if effective_builtins {
+            BuiltinToolConfig::default()
         } else {
             BuiltinToolConfig {
                 policy: ToolPolicyLayer::new().with_mode(ToolMode::AllowList),
