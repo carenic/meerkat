@@ -33749,6 +33749,13 @@ async fn test_multi_backend_session_provision_forwards_injected_authorized_resum
     let session = Session::new();
     let session_id = session.id().clone();
     service.replace_live_session(session.clone()).await;
+    let durable_snapshot = serde_json::to_value(
+        service
+            .persisted_session_clone(&session_id)
+            .await
+            .expect("persisted resume fixture"),
+    )
+    .expect("serialize persisted resume fixture");
     let authorized_resume = service
         .materialize_session_resume_verdict(&session_id)
         .await
@@ -33761,14 +33768,22 @@ async fn test_multi_backend_session_provision_forwards_injected_authorized_resum
         "the caller should materialize exactly one resume verdict"
     );
 
-    let receipt = provisioner
+    // Advance only the owner-issued revision after the caller has obtained its
+    // resume verdict. The injected body remains byte-identical, so the first
+    // divergence is observed by the post-Prepared authority check. That path
+    // must synchronously roll back Prepared+B before returning the typed error.
+    {
+        let _authority_guard = service.resume_authority_gate.lock().await;
+        service.issue_persisted_session_revision(&session_id).await;
+    }
+    let stale_error = provisioner
         .provision_member(super::provisioner::ProvisionMemberRequest {
             authorized_resume: Some(authorized_resume),
             session_origin: super::provisioner::ProvisionSessionOrigin::ResumedDurable,
             create_session: CreateSessionRequest {
                 injected_context: Vec::new(),
                 model: "claude-sonnet-4-5".to_string(),
-                prompt: "forward injected resume authority".to_string().into(),
+                prompt: "reject stale injected resume authority".to_string().into(),
                 system_prompt: meerkat_core::SystemPromptOverride::Inherit,
                 max_tokens: None,
                 event_tx: None,
@@ -33786,7 +33801,73 @@ async fn test_multi_backend_session_provision_forwards_injected_authorized_resum
             peer_name: "forward-authorized-resume".to_string(),
             owner_bridge_session_id: None,
             ops_registry: None,
-            generated_self_owned_operation_owner: Some(session_id),
+            generated_self_owned_operation_owner: Some(session_id.clone()),
+            runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
+        })
+        .await
+        .expect_err("stale injected authority must fail after Prepared");
+    assert!(
+        matches!(
+            &stale_error,
+            MobError::SessionUnavailableForResume {
+                reason: crate::error::SessionResumeUnavailableReason::AuthorityChangedDuringMaterialization,
+                ..
+            }
+        ),
+        "the original typed authority-change error must survive exact Prepared rollback: {stale_error}"
+    );
+    assert!(
+        !service
+            .has_live_session(&session_id)
+            .await
+            .expect("observe live session after rejected resume"),
+        "post-Prepared rejection must not mint a live actor witness"
+    );
+    assert_eq!(
+        serde_json::to_value(
+            service
+                .persisted_session_clone(&session_id)
+                .await
+                .expect("persisted session after rejected resume"),
+        )
+        .expect("serialize persisted session after rejected resume"),
+        durable_snapshot,
+        "rejected materialization must preserve the durable body"
+    );
+
+    let authorized_resume = service
+        .materialize_session_resume_verdict(&session_id)
+        .await
+        .expect("materialize fresh resume verdict after rollback")
+        .into_authorized()
+        .expect("persisted test session remains resumable");
+    let retry_session = authorized_resume.session.as_ref().clone();
+    let receipt = provisioner
+        .provision_member(super::provisioner::ProvisionMemberRequest {
+            authorized_resume: Some(authorized_resume),
+            session_origin: super::provisioner::ProvisionSessionOrigin::ResumedDurable,
+            create_session: CreateSessionRequest {
+                injected_context: Vec::new(),
+                model: "claude-sonnet-4-5".to_string(),
+                prompt: "forward injected resume authority".to_string().into(),
+                system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+                max_tokens: None,
+                event_tx: None,
+                build: Some(meerkat_core::service::SessionBuildOptions {
+                    resume_session: Some(retry_session),
+                    comms_name: Some("test-mob/worker/forward-authorized-resume".to_string()),
+                    keep_alive: true,
+                    ..Default::default()
+                }),
+                initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+                deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+                labels: None,
+            },
+            binding: crate::RuntimeBinding::Session,
+            peer_name: "forward-authorized-resume".to_string(),
+            owner_bridge_session_id: None,
+            ops_registry: None,
+            generated_self_owned_operation_owner: Some(session_id.clone()),
             runtime_revival_intent: super::provisioner::RuntimeRevivalIntent::None,
         })
         .await
@@ -33794,8 +33875,13 @@ async fn test_multi_backend_session_provision_forwards_injected_authorized_resum
 
     assert_eq!(
         service.resume_prepare_calls.load(Ordering::Relaxed),
-        1,
+        2,
         "MultiBackendProvisioner must forward the injected verdict instead of materializing it again"
+    );
+    assert_eq!(
+        receipt.member_ref.bridge_session_id(),
+        Some(&session_id),
+        "the immediate same-session retry must reacquire the rolled-back Prepared claim"
     );
     provisioner
         .retire_member(&receipt.member_ref)

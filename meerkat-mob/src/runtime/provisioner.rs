@@ -7039,18 +7039,33 @@ impl MobProvisioner for SessionBackend {
         };
         tracing::debug!("SessionBackend::provision_member creating bridge session");
         if let Some(session_id) = admitted_bridge_session_id.as_ref() {
-            if let Some(transaction) = actor_transaction.as_ref() {
-                requested_materialization
-                    .revalidate_authority_after_machine_prepare(
-                        &backend.session_service,
-                        session_id,
-                        transaction.prepared()?,
-                    )
-                    .await?;
+            let revalidation = if let Some(transaction) = actor_transaction.as_ref() {
+                match transaction.prepared() {
+                    Ok(prepared) => {
+                        requested_materialization
+                            .revalidate_authority_after_machine_prepare(
+                                &backend.session_service,
+                                session_id,
+                                prepared,
+                            )
+                            .await
+                    }
+                    Err(error) => Err(error),
+                }
             } else {
                 requested_materialization
                     .revalidate_authority(&backend.session_service, session_id)
-                    .await?;
+                    .await
+            };
+            if let Err(error) = revalidation {
+                if let Some(transaction) = actor_transaction.take()
+                    && let Err(cleanup_error) = transaction.abort().await
+                {
+                    return Err(MobError::Internal(format!(
+                        "post-Prepared resume authority revalidation failed: {error}; exact actor/materialization cleanup failed: {cleanup_error}"
+                    )));
+                }
+                return Err(error);
             }
         }
         let reviving_retired_session = actor_materialization_route.is_revivable();
