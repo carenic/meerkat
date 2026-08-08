@@ -124,7 +124,7 @@ async fn assert_send_not_admitted(
                     receipt,
                     SendReceipt::PeerMessageSent {
                         delivery: meerkat_core::comms::PeerDeliveryOutcome::Acked
-                            | meerkat_core::comms::PeerDeliveryOutcome::HandedOff,
+                            | meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff,
                         ..
                     }
                 ),
@@ -283,7 +283,7 @@ async fn batch_wiring_with_mixed_placements_installs_both_transports() {
             receipt,
             SendReceipt::PeerMessageSent {
                 delivery: meerkat_core::comms::PeerDeliveryOutcome::Acked
-                    | meerkat_core::comms::PeerDeliveryOutcome::HandedOff,
+                    | meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff,
                 ..
             }
         ),
@@ -302,7 +302,7 @@ async fn batch_wiring_with_mixed_placements_installs_both_transports() {
     assert!(
         matches!(
             receipt.delivery,
-            meerkat_core::comms::PeerDeliveryOutcome::HandedOff
+            meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff
         ),
         "a1 -> a2 must be handed directly to the in-process inbox, got {receipt:?}"
     );
@@ -637,7 +637,7 @@ async fn retry_drains_obligations_idempotently() {
             receipt,
             SendReceipt::PeerMessageSent {
                 delivery: meerkat_core::comms::PeerDeliveryOutcome::Acked
-                    | meerkat_core::comms::PeerDeliveryOutcome::HandedOff,
+                    | meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff,
                 ..
             }
         ),
@@ -719,7 +719,7 @@ async fn unwire_removes_trust_and_subsequent_delivery_rejected() {
         receipt,
         SendReceipt::PeerMessageSent {
             delivery: meerkat_core::comms::PeerDeliveryOutcome::Acked
-                | meerkat_core::comms::PeerDeliveryOutcome::HandedOff,
+                | meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff,
             ..
         }
     ));
@@ -952,7 +952,7 @@ async fn same_host_second_remove_rejection_reinstalls_first_lane_before_return()
         forward,
         SendReceipt::PeerMessageSent {
             delivery: meerkat_core::comms::PeerDeliveryOutcome::Acked
-                | meerkat_core::comms::PeerDeliveryOutcome::HandedOff,
+                | meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff,
             ..
         }
     ));
@@ -967,7 +967,7 @@ async fn same_host_second_remove_rejection_reinstalls_first_lane_before_return()
         reverse,
         SendReceipt::PeerMessageSent {
             delivery: meerkat_core::comms::PeerDeliveryOutcome::Acked
-                | meerkat_core::comms::PeerDeliveryOutcome::HandedOff,
+                | meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff,
             ..
         }
     ));
@@ -1207,7 +1207,7 @@ async fn members_unwired_no_write_restart_repairs_routes_on_authenticated_host_s
         receipt,
         SendReceipt::PeerMessageSent {
             delivery: meerkat_core::comms::PeerDeliveryOutcome::Acked
-                | meerkat_core::comms::PeerDeliveryOutcome::HandedOff,
+                | meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff,
             ..
         }
     ));

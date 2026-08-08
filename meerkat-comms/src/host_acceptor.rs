@@ -1091,13 +1091,12 @@ async fn handle_host_pairing_connection(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::classify::test_support;
     use crate::identity::Signature;
     use crate::inbox::Inbox;
     use crate::router::{CommsConfig, Router, SendError};
     use crate::transport::codec::TransportCodec;
     use crate::trust::{TrustEntry, TrustStore};
-    use crate::types::{Envelope, InboxItem, MessageKind};
+    use crate::types::{Envelope, MessageKind};
     use futures::StreamExt;
     use meerkat_core::comms::{
         GeneratedCommsTrustAuthoritySourceKind, PeerAddress, PeerDeliveryOutcome, PeerId, PeerName,
@@ -1108,8 +1107,9 @@ mod tests {
     struct MemberFixture {
         keypair: Keypair,
         trusted: Arc<parking_lot::RwLock<TrustStore>>,
-        inbox: Inbox,
+        inbox: Arc<Inbox>,
         inbox_sender: InboxSender,
+        runtime_finalizer: Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer>,
     }
 
     fn member_trusting(sender_pubkey: &PubKey, require_peer_auth: bool) -> MemberFixture {
@@ -1125,15 +1125,43 @@ mod tests {
             })
             .expect("sender trust insert");
         let trusted = Arc::new(parking_lot::RwLock::new(store));
-        let (inbox, inbox_sender) = Inbox::new_classified(
-            test_support::classification_context_shared(trusted.clone(), require_peer_auth),
-        );
+        let (peer_comms_handle, runtime_finalizer) =
+            meerkat_runtime::test_peer_comms_handle_and_runtime_finalizer();
+        let context = Arc::new(crate::classify::IngressClassificationContext {
+            require_peer_auth,
+            trusted_peers: trusted.clone(),
+            peer_comms_handle: Arc::new(parking_lot::RwLock::new(Some(peer_comms_handle))),
+            inproc_namespace: None,
+            durable_runtime_consumer: true,
+        });
+        let (inbox, inbox_sender) = Inbox::new_classified(context);
         MemberFixture {
             keypair,
             trusted,
-            inbox,
+            inbox: Arc::new(inbox),
             inbox_sender,
+            runtime_finalizer: Arc::new(runtime_finalizer),
         }
+    }
+
+    fn spawn_finalize_next_runtime(
+        member: &MemberFixture,
+    ) -> tokio::task::JoinHandle<meerkat_core::interaction::PeerInputCandidate> {
+        let inbox = Arc::clone(&member.inbox);
+        let finalizer = Arc::clone(&member.runtime_finalizer);
+        tokio::spawn(async move {
+            let claimed = loop {
+                if let Some(claimed) = inbox.try_claim_one_classified() {
+                    break claimed;
+                }
+                tokio::task::yield_now().await;
+            };
+            let claim = crate::runtime::comms_runtime::test_peer_ingress_queue_claim(claimed);
+            finalizer
+                .finalize(claim)
+                .await
+                .expect("real test MeerkatMachine must durably finalize the exact host claim")
+        })
     }
 
     fn registry_with_owner() -> (
@@ -1616,14 +1644,14 @@ mod tests {
 
     // ---- §11 demux rows over real loopback TCP ----
 
-    /// Two identities on one acceptor: an envelope to A lands in A's inbox
-    /// with `delivery == Acked` — the router's `ack.from == sent_to` validation
-    /// IS the per-member ack-signing assertion — and the same holds for B.
+    /// Two identities on one acceptor: an envelope to A is durably admitted by
+    /// A's real runtime before the byte-compatible signed ACK comes from A's
+    /// keypair. The same holds independently for B.
     #[tokio::test]
     async fn acceptor_demuxes_by_to_and_acks_per_member() {
         let sender_keypair = Keypair::generate();
-        let mut member_a = member_trusting(&sender_keypair.public_key(), true);
-        let mut member_b = member_trusting(&sender_keypair.public_key(), true);
+        let member_a = member_trusting(&sender_keypair.public_key(), true);
+        let member_b = member_trusting(&sender_keypair.public_key(), true);
         let (registry, owner) = registry_with_owner();
         register_member(&registry, &owner, &member_a);
         register_member(&registry, &owner, &member_b);
@@ -1644,38 +1672,28 @@ mod tests {
             &address,
         );
 
+        let finalize_a = spawn_finalize_next_runtime(&member_a);
         let outcome_a = router
             .send(peer_a, test_message())
             .await
             .expect("send to A");
+        assert_eq!(outcome_a.delivery, PeerDeliveryOutcome::Acked);
+        let candidate_a = finalize_a.await.expect("A finalizer task");
+        assert_eq!(candidate_a.interaction.id.0, outcome_a.envelope_id);
         assert!(
-            matches!(outcome_a.delivery, PeerDeliveryOutcome::Acked),
-            "ack for A must be signed by A's keypair (ack.from == sent_to)"
-        );
-        let items_a = member_a.inbox.try_drain_classified();
-        assert_eq!(items_a.len(), 1, "envelope to A lands in A's inbox");
-        match &items_a[0].item {
-            InboxItem::External { envelope } => {
-                assert_eq!(envelope.to, member_a.keypair.public_key());
-            }
-            _ => panic!("expected External"),
-        }
-        assert!(
-            member_b.inbox.try_drain_classified().is_empty(),
+            member_b.inbox.test_classified_entries_snapshot().is_empty(),
             "B must not see A's envelope"
         );
 
+        let finalize_b = spawn_finalize_next_runtime(&member_b);
         let outcome_b = router
             .send(peer_b, test_message())
             .await
             .expect("send to B");
-        assert!(
-            matches!(outcome_b.delivery, PeerDeliveryOutcome::Acked),
-            "ack for B must be signed by B's keypair (ack.from == sent_to)"
-        );
-        let items_b = member_b.inbox.try_drain_classified();
-        assert_eq!(items_b.len(), 1, "envelope to B lands in B's inbox");
-        assert!(member_a.inbox.try_drain_classified().is_empty());
+        assert_eq!(outcome_b.delivery, PeerDeliveryOutcome::Acked);
+        let candidate_b = finalize_b.await.expect("B finalizer task");
+        assert_eq!(candidate_b.interaction.id.0, outcome_b.envelope_id);
+        assert!(member_a.inbox.test_classified_entries_snapshot().is_empty());
 
         handle.shutdown().await;
     }
@@ -1685,7 +1703,7 @@ mod tests {
     #[tokio::test]
     async fn acceptor_send_to_unregistered_identity_reports_peer_offline() {
         let sender_keypair = Keypair::generate();
-        let mut member_a = member_trusting(&sender_keypair.public_key(), true);
+        let member_a = member_trusting(&sender_keypair.public_key(), true);
         let stranger = Keypair::generate();
         let (registry, owner) = registry_with_owner();
         register_member(&registry, &owner, &member_a);
@@ -1700,7 +1718,7 @@ mod tests {
             matches!(outcome, Err(SendError::PeerOffline)),
             "misaddressed envelope must surface sender-side as PeerOffline, got {outcome:?}"
         );
-        assert!(member_a.inbox.try_drain_classified().is_empty());
+        assert!(member_a.inbox.test_classified_entries_snapshot().is_empty());
 
         handle.shutdown().await;
     }
@@ -1709,7 +1727,7 @@ mod tests {
     #[tokio::test]
     async fn acceptor_rejects_registered_then_removed_identity() {
         let sender_keypair = Keypair::generate();
-        let mut member_a = member_trusting(&sender_keypair.public_key(), true);
+        let member_a = member_trusting(&sender_keypair.public_key(), true);
         let (registry, owner) = registry_with_owner();
         register_member(&registry, &owner, &member_a);
         let handle =
@@ -1724,12 +1742,14 @@ mod tests {
             &address,
         );
 
+        let finalize_before = spawn_finalize_next_runtime(&member_a);
         let before = router
             .send(peer_a, test_message())
             .await
             .expect("send while registered");
-        assert!(matches!(before.delivery, PeerDeliveryOutcome::Acked));
-        assert_eq!(member_a.inbox.try_drain_classified().len(), 1);
+        assert_eq!(before.delivery, PeerDeliveryOutcome::Acked);
+        let candidate = finalize_before.await.expect("registered finalizer task");
+        assert_eq!(candidate.interaction.id.0, before.envelope_id);
 
         assert!(
             registry
@@ -1742,7 +1762,7 @@ mod tests {
             matches!(after, Err(SendError::PeerOffline)),
             "removed identity must reject like never-registered, got {after:?}"
         );
-        assert!(member_a.inbox.try_drain_classified().is_empty());
+        assert!(member_a.inbox.test_classified_entries_snapshot().is_empty());
 
         handle.shutdown().await;
     }
@@ -1754,7 +1774,7 @@ mod tests {
     #[tokio::test]
     async fn acceptor_rejects_unsigned_envelope_and_has_no_auth_knob() {
         let sender_keypair = Keypair::generate();
-        let mut member_a = member_trusting(&sender_keypair.public_key(), false);
+        let member_a = member_trusting(&sender_keypair.public_key(), false);
         let (registry, owner) = registry_with_owner();
         register_member(&registry, &owner, &member_a);
         let handle = spawn_loopback_acceptor(registry, None, HostAcceptorBounds::default()).await;
@@ -1781,7 +1801,7 @@ mod tests {
             read, 0,
             "connection must close with no ack for an unsigned envelope"
         );
-        assert!(member_a.inbox.try_drain_classified().is_empty());
+        assert!(member_a.inbox.test_classified_entries_snapshot().is_empty());
 
         handle.shutdown().await;
     }
@@ -1793,7 +1813,7 @@ mod tests {
     #[tokio::test]
     async fn acceptor_accepts_hand_encoded_envelope_bytes() {
         let sender_keypair = Keypair::generate();
-        let mut member_a = member_trusting(&sender_keypair.public_key(), true);
+        let member_a = member_trusting(&sender_keypair.public_key(), true);
         let (registry, owner) = registry_with_owner();
         register_member(&registry, &owner, &member_a);
         let handle = spawn_loopback_acceptor(registry, None, HostAcceptorBounds::default()).await;
@@ -1812,6 +1832,7 @@ mod tests {
         let mut stream = TcpStream::connect(handle.local_addr())
             .await
             .expect("connect");
+        let finalize = spawn_finalize_next_runtime(&member_a);
         stream.write_all(&bytes).await.expect("write frame");
         let mut framed = FramedRead::new(
             &mut stream,
@@ -1828,12 +1849,8 @@ mod tests {
         assert_eq!(ack.from, member_a.keypair.public_key());
         assert!(ack.verify());
 
-        let items = member_a.inbox.try_drain_classified();
-        assert_eq!(items.len(), 1);
-        match &items[0].item {
-            InboxItem::External { envelope } => assert_eq!(envelope.id, original_id),
-            _ => panic!("expected External"),
-        }
+        let candidate = finalize.await.expect("hand-encoded finalizer task");
+        assert_eq!(candidate.interaction.id.0, original_id);
 
         handle.shutdown().await;
     }

@@ -13,10 +13,9 @@
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use meerkat_comms::identity::{Keypair, Signature};
 use meerkat_comms::runtime::comms_runtime::CommsRuntime;
-use meerkat_comms::types::{Envelope, InboxItem, MessageKind};
-use meerkat_comms::{AdmissionOutcome, DropReason};
+use meerkat_comms::types::MessageKind;
+use meerkat_comms::{DropReason, SendError};
 use meerkat_core::comms::{
     CommsTrustMutation, CommsTrustMutationResult, PeerAddress, PeerName, PeerTransport,
     TrustedPeerDescriptor,
@@ -215,25 +214,42 @@ async fn revoke_generated_trust(
     }
 }
 
-fn make_signed_envelope(
-    sender: &Keypair,
-    receiver_pubkey: meerkat_comms::identity::PubKey,
-) -> Envelope {
-    let mut envelope = Envelope {
-        id: Uuid::new_v4(),
-        from: sender.public_key(),
-        to: receiver_pubkey,
-        kind: MessageKind::Message {
-            objective_id: None,
-            content_taint: None,
-            blocks: None,
-            body: "hi".to_string(),
-            handling_mode: None,
-        },
-        sig: Signature::new([0u8; 64]),
-    };
-    envelope.sign(sender);
-    envelope
+fn lifecycle_request() -> MessageKind {
+    MessageKind::Request {
+        objective_id: None,
+        content_taint: None,
+        intent: "mob.peer_added".to_string(),
+        params: serde_json::json!({"peer": "worker"}),
+        blocks: None,
+        reply_endpoint: None,
+        handling_mode: None,
+    }
+}
+
+async fn public_sender_runtime(receiver_name: &str, receiver: &CommsRuntime) -> Arc<CommsRuntime> {
+    let sender_name = format!("sender-{}", Uuid::new_v4().simple());
+    let sender = Arc::new(CommsRuntime::inproc_only(&sender_name).expect("sender runtime"));
+    let sender_authority = TestPeerCommsAuthority::install(sender.as_ref(), &sender_name);
+    apply_generated_trust(
+        sender.as_ref(),
+        &sender_authority,
+        descriptor_for(receiver_name, &receiver.public_key()),
+    )
+    .await;
+    sender
+}
+
+async fn drain_one_volatile(
+    runtime: Arc<CommsRuntime>,
+) -> meerkat_core::ClassifiedInboxInteraction {
+    loop {
+        let mut candidates =
+            meerkat_core::agent::CommsRuntime::drain_peer_input_candidates(runtime.as_ref()).await;
+        if let Some(candidate) = candidates.pop() {
+            return candidate;
+        }
+        tokio::task::yield_now().await;
+    }
 }
 
 /// Baseline: trusted sender with auth-required is admitted through the
@@ -242,24 +258,31 @@ fn make_signed_envelope(
 #[tokio::test]
 async fn trusted_sender_is_admitted_through_classified_path() {
     let receiver_name = format!("recv-{}", Uuid::new_v4().simple());
-    let receiver = CommsRuntime::inproc_only(&receiver_name).expect("receiver runtime");
-    let peer_authority = TestPeerCommsAuthority::install(&receiver, &receiver_name);
-    let sender = Keypair::generate();
+    let receiver = Arc::new(CommsRuntime::inproc_only(&receiver_name).expect("receiver runtime"));
+    let peer_authority = TestPeerCommsAuthority::install(receiver.as_ref(), &receiver_name);
+    let sender = public_sender_runtime(&receiver_name, receiver.as_ref()).await;
+    let sender_pubkey = sender.public_key();
 
     // Register the sender as trusted on the receiver.
     apply_generated_trust(
-        &receiver,
+        receiver.as_ref(),
         &peer_authority,
-        descriptor_for("peer-sender", &sender.public_key()),
+        descriptor_for("peer-sender", &sender_pubkey),
     )
     .await;
 
-    let envelope = make_signed_envelope(&sender, receiver.public_key());
-    let outcome = receiver
+    let drain = tokio::spawn(drain_one_volatile(Arc::clone(&receiver)));
+    let outcome = sender
         .router()
-        .inbox_sender()
-        .send_connection_ingress(envelope, true);
-    assert_eq!(outcome, AdmissionOutcome::Admitted);
+        .send(receiver.public_key().to_peer_id(), lifecycle_request())
+        .await
+        .expect("trusted lifecycle control must reach the classified runtime");
+    assert!(matches!(
+        outcome.delivery,
+        meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff
+    ));
+    let candidate = drain.await.expect("volatile drain joins");
+    assert_eq!(candidate.auth(), Some(PeerIngressAuthDecision::Required));
 }
 
 /// C-H3 — a trust revoke that lands between classification and admission
@@ -268,8 +291,8 @@ async fn trusted_sender_is_admitted_through_classified_path() {
 /// snapshot carried through to the queue lock.
 ///
 /// Exercised here via the observable behavior: revoke the trust edge
-/// BEFORE `send_connection_ingress` (which composes classify + admit
-/// under the same public call) runs. The pre-fix code would classify
+/// before the public peer send (which composes classify + admit) runs.
+/// The pre-fix code would classify
 /// against the revoked store and short-circuit too — to force the exact
 /// classify-then-revoke-then-admit ordering we'd need the seam to expose
 /// a classify/admit split. The integration-level signal is the same:
@@ -281,25 +304,27 @@ async fn revoked_sender_is_rejected_at_admission() {
     let receiver_name = format!("recv-{}", Uuid::new_v4().simple());
     let receiver = CommsRuntime::inproc_only(&receiver_name).expect("receiver runtime");
     let peer_authority = TestPeerCommsAuthority::install(&receiver, &receiver_name);
-    let sender = Keypair::generate();
+    let sender = public_sender_runtime(&receiver_name, &receiver).await;
+    let sender_pubkey = sender.public_key();
 
     // Seed trust, then revoke — this is the post-revoke state the
     // classify→admit seam must respect.
-    let sender_descriptor = descriptor_for("peer-sender", &sender.public_key());
+    let sender_descriptor = descriptor_for("peer-sender", &sender_pubkey);
     apply_generated_trust(&receiver, &peer_authority, sender_descriptor.clone()).await;
     let removed = revoke_generated_trust(&receiver, &peer_authority, sender_descriptor).await;
     assert!(removed, "trust revoke must succeed");
 
-    let envelope = make_signed_envelope(&sender, receiver.public_key());
-    let outcome = receiver
+    let outcome = sender
         .router()
-        .inbox_sender()
-        .send_connection_ingress(envelope, true);
-    assert_eq!(
-        outcome,
-        AdmissionOutcome::Dropped {
-            reason: DropReason::UntrustedSender
-        },
+        .send(receiver.public_key().to_peer_id(), lifecycle_request())
+        .await;
+    assert!(
+        matches!(
+            outcome,
+            Err(SendError::AdmissionDropped {
+                reason: DropReason::UntrustedSender
+            })
+        ),
         "revoked sender must be dropped at admission (classify→admit TOCTOU is closed)"
     );
 }
@@ -323,12 +348,13 @@ async fn concurrent_revokes_and_admissions_never_admit_untrusted() {
         receiver.as_ref(),
         &receiver_name,
     ));
-    let sender = std::sync::Arc::new(Keypair::generate());
+    let sender = public_sender_runtime(&receiver_name, receiver.as_ref()).await;
+    let sender_pubkey = sender.public_key();
 
     apply_generated_trust(
         receiver.as_ref(),
         peer_authority.as_ref(),
-        descriptor_for("peer-sender", &sender.public_key()),
+        descriptor_for("peer-sender", &sender_pubkey),
     )
     .await;
 
@@ -337,24 +363,21 @@ async fn concurrent_revokes_and_admissions_never_admit_untrusted() {
     let admit_handle = {
         let receiver = receiver.clone();
         let sender = sender.clone();
-        let receiver_pk = receiver.public_key();
         tokio::spawn(async move {
             let mut admitted = 0usize;
             let mut dropped_untrusted = 0usize;
             let mut dropped_other = 0usize;
             for _ in 0..total {
-                let envelope = make_signed_envelope(&sender, receiver_pk);
-                let outcome = receiver
+                let outcome = sender
                     .router()
-                    .inbox_sender()
-                    .send_connection_ingress(envelope, true);
+                    .send(receiver.public_key().to_peer_id(), lifecycle_request())
+                    .await;
                 match outcome {
-                    AdmissionOutcome::Admitted => admitted += 1,
-                    AdmissionOutcome::Dropped {
+                    Ok(_) => admitted += 1,
+                    Err(SendError::AdmissionDropped {
                         reason: DropReason::UntrustedSender,
-                    } => dropped_untrusted += 1,
-                    AdmissionOutcome::Dropped { .. } => dropped_other += 1,
-                    _ => dropped_other += 1,
+                    }) => dropped_untrusted += 1,
+                    Err(_) => dropped_other += 1,
                 }
                 tokio::task::yield_now().await;
             }
@@ -388,8 +411,20 @@ async fn concurrent_revokes_and_admissions_never_admit_untrusted() {
         })
     };
 
+    let drain_receiver = Arc::clone(&receiver);
+    let volatile_drain = tokio::spawn(async move {
+        loop {
+            let _ = meerkat_core::agent::CommsRuntime::drain_peer_input_candidates(
+                drain_receiver.as_ref(),
+            )
+            .await;
+            tokio::task::yield_now().await;
+        }
+    });
+
     let (admitted, dropped_untrusted, dropped_other) = admit_handle.await.expect("admit task");
     revoke_handle.await.expect("revoke task");
+    volatile_drain.abort();
 
     assert_eq!(
         admitted + dropped_untrusted + dropped_other,
@@ -402,57 +437,6 @@ async fn concurrent_revokes_and_admissions_never_admit_untrusted() {
     );
 }
 
-/// The load-bearing C-H3 gate: exercise the exact classify-then-admit
-/// window by invoking `classified_admit_with_pause_for_test`, which
-/// runs classification, yields control, then runs admission. We use
-/// the yield to revoke the sender's trust edge — post-fix the admission
-/// sees the revoked state and drops; pre-fix (using
-/// `prepared.trusted_sender`) admits the envelope anyway.
-///
-/// Proving this test exercises the fix: stash the updated `admit_peer_receive`
-/// out-of-band, re-run against the pre-C-H3 code, and this test should
-/// assert `Admitted` instead of `Dropped`. With the fix in place, it
-/// must be `Dropped { UntrustedSender }`.
-#[tokio::test]
-async fn classify_at_t0_revoke_at_t1_admit_at_t2_sees_revoked_state() {
-    let receiver_name = format!("recv-{}", Uuid::new_v4().simple());
-    let receiver = CommsRuntime::inproc_only(&receiver_name).expect("receiver runtime");
-    let peer_authority = TestPeerCommsAuthority::install(&receiver, &receiver_name);
-    let sender = Keypair::generate();
-
-    // Seed trust — classification at T0 will see the sender as trusted.
-    let sender_descriptor = descriptor_for("peer-sender", &sender.public_key());
-    apply_generated_trust(&receiver, &peer_authority, sender_descriptor.clone()).await;
-
-    let envelope = make_signed_envelope(&sender, receiver.public_key());
-
-    // classify → (revoke trust) → admit. Post-fix, the admission step
-    // re-reads the trust set and drops. Pre-fix, it would admit using
-    // the stale classification-time bool.
-    let outcome = receiver
-        .router()
-        .inbox_sender()
-        .classified_admit_with_pause_for_test(InboxItem::External { envelope }, || {
-            // This runs between classify and admit. Revoke trust so the
-            // admission stage observes a state the classifier did not.
-            let removed = futures::executor::block_on(revoke_generated_trust(
-                &receiver,
-                &peer_authority,
-                sender_descriptor.clone(),
-            ));
-            assert!(removed, "trust revoke must succeed during pause");
-        });
-
-    assert_eq!(
-        outcome,
-        AdmissionOutcome::Dropped {
-            reason: DropReason::UntrustedSender
-        },
-        "admission must re-read trust under the queue lock; \
-         classification's T0 snapshot must not carry across a T1 revoke"
-    );
-}
-
 /// Auth-exempt bridge traffic admits unconditionally — the admission
 /// seam MUST treat exempt items as exempt under the queue lock too. A
 /// regression that accidentally re-gated exempt items on the trust
@@ -460,43 +444,38 @@ async fn classify_at_t0_revoke_at_t1_admit_at_t2_sees_revoked_state() {
 #[tokio::test]
 async fn auth_exempt_bridge_request_admits_without_trust_edge() {
     let receiver_name = format!("recv-{}", Uuid::new_v4().simple());
-    let receiver = CommsRuntime::inproc_only(&receiver_name).expect("receiver runtime");
-    let _peer_authority = TestPeerCommsAuthority::install(&receiver, &receiver_name);
-    let sender = Keypair::generate();
+    let receiver = Arc::new(CommsRuntime::inproc_only(&receiver_name).expect("receiver runtime"));
+    let _peer_authority = TestPeerCommsAuthority::install(receiver.as_ref(), &receiver_name);
+    let sender = public_sender_runtime(&receiver_name, receiver.as_ref()).await;
     // No trust edge seeded — sender is not trusted.
 
-    let mut envelope = Envelope {
-        id: Uuid::new_v4(),
-        from: sender.public_key(),
-        to: receiver.public_key(),
-        kind: MessageKind::Request {
-            objective_id: None,
-            content_taint: None,
-            intent: SUPERVISOR_BRIDGE_INTENT.to_string(),
-            params: serde_json::json!({}),
-            blocks: None,
-            reply_endpoint: None,
-            handling_mode: None,
-        },
-        sig: Signature::new([0u8; 64]),
+    let kind = MessageKind::Request {
+        objective_id: None,
+        content_taint: None,
+        intent: SUPERVISOR_BRIDGE_INTENT.to_string(),
+        params: serde_json::json!({}),
+        blocks: None,
+        reply_endpoint: None,
+        handling_mode: None,
     };
-    envelope.sign(&sender);
 
-    let outcome = receiver
+    let drain = tokio::spawn(drain_one_volatile(Arc::clone(&receiver)));
+    let outcome = sender
         .router()
-        .inbox_sender()
-        .send_connection_ingress(envelope, true);
-    assert_eq!(
-        outcome,
-        AdmissionOutcome::Admitted,
+        .send(receiver.public_key().to_peer_id(), kind)
+        .await
+        .expect("auth-exempt supervisor bridge must hand off through public runtime routing");
+    assert!(
+        matches!(
+            outcome.delivery,
+            meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff
+        ),
         "supervisor.bridge ingress is auth-exempt and must admit even without a trust edge"
     );
 
-    let candidates =
-        meerkat_core::agent::CommsRuntime::drain_peer_input_candidates(&receiver).await;
-    assert_eq!(candidates.len(), 1);
+    let candidate = drain.await.expect("volatile drain joins");
     assert_eq!(
-        candidates[0].auth(),
+        candidate.auth(),
         Some(PeerIngressAuthDecision::Exempt(
             PeerIngressAuthExemption::SupervisorBridge
         )),

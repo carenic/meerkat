@@ -1787,6 +1787,20 @@ mod tests {
         );
         assert_schema_accepts(
             wire_types
+                .get("CommsSendErrorData")
+                .expect("CommsSendErrorData schema must be emitted"),
+            &serde_json::json!({
+                "code": "peer_input_rejected",
+                "peer": "peer-a",
+                "envelope_id": uuid::Uuid::nil().to_string(),
+                "message": format!(
+                    "peer 'peer-a' durably rejected envelope {}",
+                    uuid::Uuid::nil()
+                )
+            }),
+        );
+        assert_schema_accepts(
+            wire_types
                 .get("CommsPeersResult")
                 .expect("CommsPeersResult schema must be emitted"),
             &serde_json::json!({ "peers": [] }),

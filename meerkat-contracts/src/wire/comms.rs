@@ -570,16 +570,19 @@ pub enum CommsSendResult {
     },
     PeerLifecycleSent {
         envelope_id: String,
+        delivery: meerkat_core::comms::PeerDeliveryOutcome,
     },
     PeerRequestSent {
         envelope_id: String,
         interaction_id: String,
         request_id: String,
         stream_reserved: bool,
+        delivery: meerkat_core::comms::PeerDeliveryOutcome,
     },
     PeerResponseSent {
         envelope_id: String,
         in_reply_to: String,
+        delivery: meerkat_core::comms::PeerDeliveryOutcome,
     },
 }
 
@@ -600,15 +603,18 @@ impl From<meerkat_core::comms::SendReceipt> for CommsSendResult {
                 envelope_id: envelope_id.to_string(),
                 delivery,
             },
-            meerkat_core::comms::SendReceipt::PeerLifecycleSent { envelope_id } => {
-                Self::PeerLifecycleSent {
-                    envelope_id: envelope_id.to_string(),
-                }
-            }
+            meerkat_core::comms::SendReceipt::PeerLifecycleSent {
+                envelope_id,
+                delivery,
+            } => Self::PeerLifecycleSent {
+                envelope_id: envelope_id.to_string(),
+                delivery,
+            },
             meerkat_core::comms::SendReceipt::PeerRequestSent {
                 envelope_id,
                 interaction_id,
                 stream_reserved,
+                delivery,
             } => {
                 let envelope_id = envelope_id.to_string();
                 Self::PeerRequestSent {
@@ -616,14 +622,17 @@ impl From<meerkat_core::comms::SendReceipt> for CommsSendResult {
                     envelope_id,
                     interaction_id: interaction_id.0.to_string(),
                     stream_reserved,
+                    delivery,
                 }
             }
             meerkat_core::comms::SendReceipt::PeerResponseSent {
                 envelope_id,
                 in_reply_to,
+                delivery,
             } => Self::PeerResponseSent {
                 envelope_id: envelope_id.to_string(),
                 in_reply_to: in_reply_to.0.to_string(),
+                delivery,
             },
         }
     }
@@ -662,6 +671,11 @@ pub enum CommsSendErrorData {
         reason: meerkat_core::comms::AdmissionDropReason,
         message: String,
     },
+    PeerInputRejected {
+        peer: String,
+        envelope_id: String,
+        message: String,
+    },
     SendFailed {
         message: String,
     },
@@ -678,6 +692,7 @@ impl CommsSendErrorData {
             Self::PeerNotFoundOrNotTrusted { message, .. }
             | Self::PeerUnreachable { message, .. }
             | Self::PeerAdmissionDropped { message, .. }
+            | Self::PeerInputRejected { message, .. }
             | Self::SendFailed { message }
             | Self::InvalidCommand { message } => message,
         }
@@ -809,6 +824,7 @@ mod tests {
             "interaction_id": uuid::Uuid::new_v4().to_string(),
             "request_id": uuid::Uuid::new_v4().to_string(),
             "stream_reserved": true,
+            "delivery": "queued",
             "extra_behavior": true
         }))
         .expect_err("unknown result fields must fail at serde boundary");
@@ -818,6 +834,37 @@ mod tests {
             message.contains("extra_behavior") || message.contains("unknown field"),
             "expected unknown result field error, got: {message}"
         );
+    }
+
+    #[test]
+    fn comms_send_result_preserves_delivery_for_every_peer_receipt_kind() {
+        let envelope_id = uuid::Uuid::new_v4();
+        let interaction_id = meerkat_core::interaction::InteractionId(uuid::Uuid::new_v4());
+        let delivery = meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff;
+
+        let receipts = [
+            meerkat_core::comms::SendReceipt::PeerLifecycleSent {
+                envelope_id,
+                delivery,
+            },
+            meerkat_core::comms::SendReceipt::PeerRequestSent {
+                envelope_id,
+                interaction_id,
+                stream_reserved: true,
+                delivery,
+            },
+            meerkat_core::comms::SendReceipt::PeerResponseSent {
+                envelope_id,
+                in_reply_to: interaction_id,
+                delivery,
+            },
+        ];
+
+        for receipt in receipts {
+            let value = serde_json::to_value(CommsSendResult::from(receipt))
+                .expect("peer send result should serialize");
+            assert_eq!(value["delivery"], json!("volatile_handed_off"));
+        }
     }
 
     #[test]
@@ -841,6 +888,32 @@ mod tests {
                 reason: meerkat_core::comms::AdmissionDropReason::InboxFull,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn comms_send_error_data_preserves_peer_input_rejection_identity() {
+        let envelope_id = uuid::Uuid::new_v4();
+        let value = serde_json::to_value(CommsSendErrorData::PeerInputRejected {
+            peer: "peer-a".to_string(),
+            envelope_id: envelope_id.to_string(),
+            message: format!("peer 'peer-a' durably rejected envelope {envelope_id}"),
+        })
+        .expect("peer input rejection should serialize");
+
+        assert_eq!(value["code"], "peer_input_rejected");
+        assert_eq!(value["peer"], "peer-a");
+        assert_eq!(value["envelope_id"], envelope_id.to_string());
+
+        let roundtrip: CommsSendErrorData =
+            serde_json::from_value(value).expect("peer input rejection should deserialize");
+        assert!(matches!(
+            roundtrip,
+            CommsSendErrorData::PeerInputRejected {
+                peer,
+                envelope_id: projected_id,
+                ..
+            } if peer == "peer-a" && projected_id == envelope_id.to_string()
         ));
     }
 

@@ -3227,7 +3227,7 @@ async fn e2e_mob_host_partition_retains_route_install_obligations() {
             receipt,
             meerkat_core::SendReceipt::PeerMessageSent {
                 delivery: meerkat_core::comms::PeerDeliveryOutcome::Acked
-                    | meerkat_core::comms::PeerDeliveryOutcome::HandedOff,
+                    | meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff,
                 ..
             }
         ),

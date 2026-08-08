@@ -90,13 +90,18 @@ pub enum SendError {
     /// as "peer unreachable".
     #[error("Peer dropped envelope at admission: {reason:?}")]
     AdmissionDropped { reason: crate::inbox::DropReason },
+    /// Transport completed and the receiver durably resolved the exact
+    /// envelope as rejected. This is terminal, not an ambiguous/offline send.
+    #[error("Peer durably rejected envelope {envelope_id}")]
+    DurableAdmissionRejected { envelope_id: Uuid },
 }
 
 /// Outcome of a successful router send.
 ///
 /// Carries the strongest delivery fact the transport can truthfully prove:
-/// a verified peer ACK on stream transports, direct receiver-inbox admission
-/// on the wait-based inproc lane, or only a queued transport write.
+/// the receiver's signed durable terminal resolution on stream transports,
+/// the same terminal resolution on the wait-based inproc lane, or only a
+/// queued transport write for Ack itself.
 #[derive(Debug, Clone, Copy)]
 pub struct SendOutcome {
     pub envelope_id: Uuid,
@@ -625,8 +630,6 @@ impl Router {
                         if in_reply_to != sent_id {
                             return Err(SendError::PeerOffline);
                         }
-                        // A peer ACK was received and verified: this is the only
-                        // path that may report `PeerDeliveryOutcome::Acked`.
                         Ok(SendOutcome {
                             envelope_id: sent_id,
                             delivery: meerkat_core::comms::PeerDeliveryOutcome::Acked,
@@ -638,8 +641,8 @@ impl Router {
                 _ => Err(SendError::PeerOffline),
             }
         } else {
-            // No ACK was awaited (Ack/Response kinds), so we cannot claim one
-            // was received.
+            // Ack itself is the only non-acknowledged kind, preventing an
+            // acknowledgement loop.
             Ok(SendOutcome {
                 envelope_id: sent_id,
                 delivery: meerkat_core::comms::PeerDeliveryOutcome::Queued,
@@ -672,7 +675,7 @@ impl Router {
         dest: PeerId,
     ) -> Result<SendOutcome, SendError> {
         let registry = InprocRegistry::global();
-        let envelope_id = match self.inproc_namespace.as_deref() {
+        let delivery = match self.inproc_namespace.as_deref() {
             Some(namespace) => registry
                 .send_to_pubkey_in_namespace_with_id_wait(
                     namespace,
@@ -695,13 +698,30 @@ impl Router {
                 .await
                 .map_err(|err| map_inproc_send_error(err, dest))?,
         };
-        // The wait-based inproc handoff returns only after the receiver's
-        // trust-gated inbox admitted the envelope (every drop maps to a typed
-        // error above). This proves direct handoff, not a cryptographic peer
-        // ACK, so retain that distinction in the typed delivery outcome.
+        let outcome = match delivery.outcome {
+            crate::inbox::IngressDeliveryOutcome::DurablyResolved(
+                meerkat_core::interaction::PeerIngressTerminalOutcomeKind::Rejected,
+            ) => {
+                return Err(SendError::DurableAdmissionRejected {
+                    envelope_id: delivery.envelope_id,
+                });
+            }
+            crate::inbox::IngressDeliveryOutcome::DurablyResolved(outcome) => {
+                meerkat_core::comms::PeerDeliveryOutcome::DurablyResolved { outcome }
+            }
+            crate::inbox::IngressDeliveryOutcome::VolatileHandedOff => {
+                meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff
+            }
+            crate::inbox::IngressDeliveryOutcome::Queued => {
+                meerkat_core::comms::PeerDeliveryOutcome::Queued
+            }
+            crate::inbox::IngressDeliveryOutcome::Dropped { .. } => {
+                unreachable!("inproc delivery maps typed drops to errors")
+            }
+        };
         Ok(SendOutcome {
-            envelope_id,
-            delivery: meerkat_core::comms::PeerDeliveryOutcome::HandedOff,
+            envelope_id: delivery.envelope_id,
+            delivery: outcome,
         })
     }
 
@@ -731,8 +751,9 @@ impl Router {
     /// content-bearing kinds, INSIDE the signed region, before signing.
     ///
     /// The returned [`SendOutcome`] carries the strongest typed delivery fact
-    /// proved by the selected transport; only a verified stream ACK yields
-    /// [`meerkat_core::comms::PeerDeliveryOutcome::Acked`].
+    /// proved by the selected transport. Meerkat peer transports require a
+    /// signed durable-resolution fact for runtime-bound peer input. Response
+    /// retains its legacy queued/no-ack semantics.
     pub async fn send_with_id(
         &self,
         dest: PeerId,
@@ -753,6 +774,11 @@ impl Router {
             MessageKind::Response { in_reply_to, .. } => {
                 self.take_staged_correlated_reply_endpoint(&dest, *in_reply_to)
             }
+            _ => None,
+        };
+        let used_correlated_endpoint = correlated.is_some();
+        let response_correlation = match &kind {
+            MessageKind::Response { in_reply_to, .. } => Some(*in_reply_to),
             _ => None,
         };
         let dest_entry = match correlated {
@@ -780,6 +806,10 @@ impl Router {
                 (PeerAddr::parse(&endpoint.address)?, endpoint.pubkey)
             }
         };
+        let used_declared_endpoint = match &dest_entry {
+            ResolvedDest::Declared(endpoint) => Some(endpoint.clone()),
+            ResolvedDest::Trusted(_) => None,
+        };
         let resolved_taint = match content_taint {
             // Absent override = inherit. A declaration the caller already
             // constructed INTO the kind wins over the runtime-level
@@ -804,7 +834,7 @@ impl Router {
         }
 
         #[cfg(not(target_arch = "wasm32"))]
-        {
+        let result = {
             let wait_for_ack = should_wait_for_ack(&envelope.kind);
             let is_declared_reply = matches!(&dest_entry, ResolvedDest::Declared(_));
             match addr {
@@ -844,10 +874,10 @@ impl Router {
                     }
                 },
             }
-        }
+        };
 
         #[cfg(target_arch = "wasm32")]
-        {
+        let result = {
             match addr {
                 PeerAddr::Tcp(_) => Err(SendError::Transport(TransportError::InvalidAddress(
                     "TCP transport is not available on wasm32".to_string(),
@@ -864,7 +894,23 @@ impl Router {
                     }
                 },
             }
+        };
+
+        if matches!(
+            &result,
+            Err(SendError::PeerOffline | SendError::Transport(_) | SendError::Io(_))
+        ) && let Some(endpoint) = used_declared_endpoint
+        {
+            if used_correlated_endpoint {
+                if let Some(in_reply_to) = response_correlation {
+                    self.stage_correlated_reply_endpoint(dest, in_reply_to, endpoint);
+                }
+            } else {
+                self.stage_reply_endpoint(dest, endpoint);
+            }
         }
+
+        result
     }
 }
 
@@ -891,6 +937,43 @@ mod tests {
         )
     }
 
+    fn classified_inbox_with_runtime() -> (
+        Inbox,
+        crate::InboxSender,
+        Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer>,
+    ) {
+        let (peer_comms_handle, finalizer) =
+            meerkat_runtime::test_peer_comms_handle_and_runtime_finalizer();
+        let context = Arc::new(crate::classify::IngressClassificationContext {
+            require_peer_auth: false,
+            trusted_peers: Arc::new(RwLock::new(TrustStore::new())),
+            peer_comms_handle: Arc::new(RwLock::new(Some(peer_comms_handle))),
+            inproc_namespace: None,
+            durable_runtime_consumer: true,
+        });
+        let (inbox, sender) = Inbox::new_classified(context);
+        (inbox, sender, Arc::new(finalizer))
+    }
+
+    fn spawn_runtime_finalization(
+        inbox: Arc<Inbox>,
+        finalizer: Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer>,
+    ) -> tokio::task::JoinHandle<meerkat_core::interaction::PeerInputCandidate> {
+        tokio::spawn(async move {
+            let claimed = loop {
+                if let Some(claimed) = inbox.try_claim_one_classified() {
+                    break claimed;
+                }
+                tokio::task::yield_now().await;
+            };
+            let claim = crate::runtime::comms_runtime::test_peer_ingress_queue_claim(claimed);
+            finalizer
+                .finalize(claim)
+                .await
+                .expect("real test MeerkatMachine must durably finalize the router claim")
+        })
+    }
+
     fn peer(name: &str, pubkey: [u8; 32], addr: &str) -> TrustEntry {
         let pubkey = PubKey::new(pubkey);
         TrustEntry {
@@ -902,13 +985,14 @@ mod tests {
         }
     }
 
-    /// ROW #268 gate: the outcome reflects verified delivery-path authority.
-    /// A stream send that receives and verifies a peer ACK reports
-    /// [`PeerDeliveryOutcome::Acked`]; sends without receiver acknowledgement
-    /// report the weaker typed `Queued` or `HandedOff` outcome.
+    /// ROW #268 gate: a socket send reports only the evidence present in the
+    /// byte-compatible signed ACK. The receiver delays that ACK until its
+    /// message-kind delivery contract completes, but the legacy wire shape
+    /// cannot encode an exact durable outcome. Only Ack and Response skip a
+    /// receiver acknowledgement and report `Queued`.
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
-    async fn send_outcome_acked_reflects_verified_ack() {
+    async fn socket_send_reports_verified_legacy_ack_without_exact_outcome() {
         use crate::transport::codec::{EnvelopeFrame, TransportCodec};
         use crate::types::MessageKind;
         use futures::{SinkExt, StreamExt};
@@ -977,28 +1061,58 @@ mod tests {
             meerkat_core::comms::PeerDeliveryOutcome::Acked
         );
 
-        // A kind that does not await an ACK (Response) proves only a write.
-        let (mut client2, _server2) = tokio::io::duplex(4096);
-        let mut response_env = Envelope {
+        let weak_peer_pubkey = Keypair::generate().public_key();
+        let mut response = Envelope {
             id: Uuid::new_v4(),
             from: router_pubkey,
-            to: peer_pubkey,
+            to: weak_peer_pubkey,
             kind: MessageKind::Response {
                 objective_id: None,
+                content_taint: None,
                 in_reply_to: Uuid::new_v4(),
                 status: crate::types::Status::Completed,
-                result: serde_json::json!({"ok": true}),
+                result: serde_json::json!({}),
                 blocks: None,
-                content_taint: None,
                 handling_mode: None,
             },
             sig: crate::identity::Signature::new([0u8; 64]),
         };
-        response_env.sign(&router.keypair);
-        let no_ack = router
-            .send_on_stream(&mut client2, response_env, false)
+        response.sign(&router.keypair);
+        let (mut weak_client, weak_server) = tokio::io::duplex(4096);
+        let weak_peer_task = tokio::spawn(async move {
+            let mut framed =
+                Framed::new(weak_server, TransportCodec::new(DEFAULT_MAX_MESSAGE_BYTES));
+            framed
+                .next()
+                .await
+                .expect("peer receives Response")
+                .expect("Response frame decodes");
+        });
+        let weak_outcome = router
+            .send_on_stream(&mut weak_client, response, false)
             .await
-            .expect("non-ack-bearing send succeeds");
+            .expect("Response preserves queued/no-ack semantics");
+        weak_peer_task.await.expect("weak peer task completes");
+        assert_eq!(
+            weak_outcome.delivery,
+            meerkat_core::comms::PeerDeliveryOutcome::Queued
+        );
+
+        let (mut client2, _server2) = tokio::io::duplex(4096);
+        let mut ack_env = Envelope {
+            id: Uuid::new_v4(),
+            from: router_pubkey,
+            to: peer_pubkey,
+            kind: MessageKind::Ack {
+                in_reply_to: Uuid::new_v4(),
+            },
+            sig: crate::identity::Signature::new([0u8; 64]),
+        };
+        ack_env.sign(&router.keypair);
+        let no_ack = router
+            .send_on_stream(&mut client2, ack_env, false)
+            .await
+            .expect("Ack send succeeds without an acknowledgement loop");
         assert_eq!(
             no_ack.delivery,
             meerkat_core::comms::PeerDeliveryOutcome::Queued
@@ -1104,10 +1218,7 @@ mod tests {
         let receiver_kp = Keypair::generate();
         let receiver_pubkey = receiver_kp.public_key();
         let receiver_pubkey_bytes = *receiver_pubkey.as_bytes();
-        let (mut inbox_a, sender_a) = Inbox::new_classified(test_support::classification_context(
-            TrustStore::new(),
-            false,
-        ));
+        let (inbox_a, sender_a, finalizer_a) = classified_inbox_with_runtime();
         let (mut inbox_b, sender_b) = Inbox::new_classified(test_support::classification_context(
             TrustStore::new(),
             false,
@@ -1126,6 +1237,7 @@ mod tests {
             sender_b,
             PeerMeta::default(),
         );
+        let finalize_a = spawn_runtime_finalization(Arc::new(inbox_a), finalizer_a);
 
         let (_inbox, inbox_sender) = Inbox::new();
         let router = Router::new(
@@ -1157,15 +1269,17 @@ mod tests {
                 },
             )
             .await;
-        assert!(
-            result.is_ok(),
-            "namespace-scoped send must deliver via the in-namespace resolution \
-             even when the pubkey is also live elsewhere, got {result:?}"
+        let result = result.expect(
+            "namespace-scoped send must deliver via the in-namespace resolution even when the pubkey is also live elsewhere",
         );
-        assert!(
-            !inbox_a.try_drain_classified().is_empty(),
-            "envelope must arrive on the in-namespace inbox"
-        );
+        assert!(matches!(
+            result.delivery,
+            meerkat_core::comms::PeerDeliveryOutcome::DurablyResolved {
+                outcome: meerkat_core::PeerIngressTerminalOutcomeKind::Accepted
+            }
+        ));
+        let candidate = finalize_a.await.expect("runtime finalizer completes");
+        assert_eq!(candidate.interaction.id.0, result.envelope_id);
         assert!(
             inbox_b.try_drain_classified().is_empty(),
             "envelope must never arrive on the foreign-namespace inbox"
@@ -1332,9 +1446,7 @@ mod tests {
     /// override is absent; `Undeclared` strips it; `Declare(taint)` sets it.
     #[tokio::test]
     async fn send_with_id_stamps_outbound_content_taint_declaration() {
-        use crate::classify::test_support;
-        use crate::inbox::Inbox;
-        use crate::types::{InboxItem, MessageKind};
+        use crate::types::MessageKind;
         use meerkat_core::comms::SenderContentTaint;
 
         let registry = InprocRegistry::global();
@@ -1344,9 +1456,8 @@ mod tests {
         let receiver_kp = Keypair::generate();
         let receiver_pubkey = receiver_kp.public_key();
         let receiver_pubkey_bytes = *receiver_pubkey.as_bytes();
-        let (mut receiver_inbox, receiver_sender) = Inbox::new_classified(
-            test_support::classification_context(TrustStore::new(), false),
-        );
+        let (receiver_inbox, receiver_sender, finalizer) = classified_inbox_with_runtime();
+        let receiver_inbox = Arc::new(receiver_inbox);
         registry.register_with_meta_in_namespace(
             &namespace,
             "taint-receiver",
@@ -1383,38 +1494,45 @@ mod tests {
             content_taint: None,
             handling_mode: None,
         };
-        let mut received_taint = |expected_body: &str| {
-            let entries = receiver_inbox.try_drain_classified();
-            assert_eq!(entries.len(), 1, "expected exactly one delivered envelope");
-            let InboxItem::External { envelope } = &entries[0].item else {
-                panic!("expected external envelope");
-            };
-            let MessageKind::Message { body, .. } = &envelope.kind else {
-                panic!("expected message kind");
+        let received_taint = |candidate: meerkat_core::interaction::PeerInputCandidate,
+                              expected_body: &str| {
+            let meerkat_core::InteractionContent::Message { body, .. } =
+                &candidate.interaction.content
+            else {
+                panic!("expected message interaction");
             };
             assert_eq!(body, expected_body);
-            envelope.kind.content_taint()
+            candidate.interaction.sender_taint
         };
 
         // No runtime declaration + absent override => no declaration.
+        let finalized =
+            spawn_runtime_finalization(Arc::clone(&receiver_inbox), Arc::clone(&finalizer));
         router
             .send_with_id(peer_id, Uuid::new_v4(), message("undeclared"), None)
             .await
             .expect("send");
-        assert_eq!(received_taint("undeclared"), None);
+        assert_eq!(
+            received_taint(finalized.await.expect("runtime finalizer"), "undeclared"),
+            None
+        );
 
         // Runtime declaration + absent override => inherit.
         router.set_outbound_content_taint(Some(SenderContentTaint::Tainted));
+        let finalized =
+            spawn_runtime_finalization(Arc::clone(&receiver_inbox), Arc::clone(&finalizer));
         router
             .send_with_id(peer_id, Uuid::new_v4(), message("inherited"), None)
             .await
             .expect("send");
         assert_eq!(
-            received_taint("inherited"),
+            received_taint(finalized.await.expect("runtime finalizer"), "inherited"),
             Some(SenderContentTaint::Tainted)
         );
 
         // Runtime declaration + Undeclared override => strip.
+        let finalized =
+            spawn_runtime_finalization(Arc::clone(&receiver_inbox), Arc::clone(&finalizer));
         router
             .send_with_id(
                 peer_id,
@@ -1424,9 +1542,13 @@ mod tests {
             )
             .await
             .expect("send");
-        assert_eq!(received_taint("stripped"), None);
+        assert_eq!(
+            received_taint(finalized.await.expect("runtime finalizer"), "stripped"),
+            None
+        );
 
         // Declare override wins over the runtime declaration.
+        let finalized = spawn_runtime_finalization(Arc::clone(&receiver_inbox), finalizer);
         router
             .send_with_id(
                 peer_id,
@@ -1436,7 +1558,10 @@ mod tests {
             )
             .await
             .expect("send");
-        assert_eq!(received_taint("declared"), Some(SenderContentTaint::Clean));
+        assert_eq!(
+            received_taint(finalized.await.expect("runtime finalizer"), "declared"),
+            Some(SenderContentTaint::Clean)
+        );
 
         registry.unregister_in_namespace(&namespace, &receiver_pubkey);
     }
@@ -1446,6 +1571,7 @@ mod tests {
     #[cfg(not(target_arch = "wasm32"))]
     async fn accept_one_envelope(
         listener: tokio::net::TcpListener,
+        receiver_keypair: Keypair,
     ) -> tokio::task::JoinHandle<Envelope> {
         use crate::transport::codec::TransportCodec;
         use futures::StreamExt;
@@ -1453,12 +1579,14 @@ mod tests {
         tokio::spawn(async move {
             let (stream, _) = listener.accept().await.expect("accept reply connection");
             let mut framed = Framed::new(stream, TransportCodec::new(DEFAULT_MAX_MESSAGE_BYTES));
-            framed
+            let envelope = framed
                 .next()
                 .await
                 .expect("reply frame arrives")
                 .expect("reply frame decodes")
-                .envelope
+                .envelope;
+            let _ = receiver_keypair;
+            envelope
         })
     }
 
@@ -1466,6 +1594,7 @@ mod tests {
     async fn accept_envelopes(
         listener: tokio::net::TcpListener,
         count: usize,
+        receiver_keypair: Keypair,
     ) -> tokio::task::JoinHandle<Vec<Envelope>> {
         use crate::transport::codec::TransportCodec;
         use futures::StreamExt;
@@ -1475,15 +1604,15 @@ mod tests {
                 let (stream, _) = listener.accept().await.expect("accept reply connection");
                 let mut framed =
                     Framed::new(stream, TransportCodec::new(DEFAULT_MAX_MESSAGE_BYTES));
-                envelopes.push(
-                    framed
-                        .next()
-                        .await
-                        .expect("reply frame arrives")
-                        .expect("reply frame decodes")
-                        .envelope,
-                );
+                let envelope = framed
+                    .next()
+                    .await
+                    .expect("reply frame arrives")
+                    .expect("reply frame decodes")
+                    .envelope;
+                envelopes.push(envelope);
             }
+            let _ = receiver_keypair;
             envelopes
         })
     }
@@ -1632,7 +1761,7 @@ mod tests {
             .await
             .expect("bind reply listener");
         let address = format!("tcp://{}", listener.local_addr().expect("listener addr"));
-        let received = accept_one_envelope(listener).await;
+        let received = accept_one_envelope(listener, sender_kp.clone()).await;
 
         router.stage_reply_endpoint(
             dest,
@@ -1648,7 +1777,7 @@ mod tests {
         assert_eq!(
             outcome.delivery,
             meerkat_core::comms::PeerDeliveryOutcome::Queued,
-            "Response sends never wait for an ack"
+            "Response preserves legacy queued/no-ack delivery semantics"
         );
 
         let envelope = received.await.expect("receiver task");
@@ -1686,7 +1815,7 @@ mod tests {
             .await
             .expect("bind reply listener");
         let address = format!("tcp://{}", listener.local_addr().expect("listener addr"));
-        let received = accept_one_envelope(listener).await;
+        let received = accept_one_envelope(listener, sender_kp.clone()).await;
 
         router.stage_reply_endpoint(
             dest,
@@ -1739,7 +1868,7 @@ mod tests {
             .await
             .expect("bind trusted listener");
         let trusted_address = format!("tcp://{}", trusted_listener.local_addr().expect("addr"));
-        let received = accept_one_envelope(trusted_listener).await;
+        let received = accept_one_envelope(trusted_listener, sender_kp.clone()).await;
 
         let staged_listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1789,7 +1918,7 @@ mod tests {
             "tcp://{}",
             listener_a.local_addr().expect("listener A addr")
         );
-        let received_a = accept_one_envelope(listener_a).await;
+        let received_a = accept_one_envelope(listener_a, sender_kp.clone()).await;
         let listener_b = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind reply listener B");
@@ -1797,7 +1926,7 @@ mod tests {
             "tcp://{}",
             listener_b.local_addr().expect("listener B addr")
         );
-        let received_b = accept_one_envelope(listener_b).await;
+        let received_b = accept_one_envelope(listener_b, sender_kp.clone()).await;
 
         router.stage_correlated_reply_endpoint(
             dest,
@@ -1906,7 +2035,7 @@ mod tests {
                 .local_addr()
                 .expect("trusted listener addr")
         );
-        let trusted_received = accept_envelopes(trusted_listener, 2).await;
+        let trusted_received = accept_envelopes(trusted_listener, 2, sender_kp.clone()).await;
         router
             .add_trusted_peer_for_source(
                 peer("rotating-peer", sender_pubkey.0, &trusted_address),
@@ -1924,7 +2053,7 @@ mod tests {
                 .local_addr()
                 .expect("correlated listener addr")
         );
-        let correlated_received = accept_one_envelope(correlated_listener).await;
+        let correlated_received = accept_one_envelope(correlated_listener, sender_kp.clone()).await;
         router.stage_correlated_reply_endpoint(
             dest,
             correlation,

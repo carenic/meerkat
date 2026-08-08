@@ -6368,6 +6368,7 @@ mod tests {
             envelope_id,
             interaction_id,
             stream_reserved: true,
+            delivery: meerkat_core::comms::PeerDeliveryOutcome::Queued,
         })
         .expect("comms send payload serializes");
         let payload = unwrap_payload(wrapped);
@@ -6382,6 +6383,7 @@ mod tests {
             receipt["interaction_id"],
             serde_json::json!(interaction_id.0.to_string())
         );
+        assert_eq!(receipt["delivery"], serde_json::json!("queued"));
     }
 
     #[cfg(feature = "comms")]

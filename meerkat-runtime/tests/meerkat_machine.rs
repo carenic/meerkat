@@ -4239,25 +4239,10 @@ async fn unregister_session_aborts_spawned_drain_and_clears_suppression() {
             false
         }
 
-        async fn drain_peer_input_candidates(
-            &self,
-        ) -> Vec<meerkat_core::interaction::PeerInputCandidate> {
-            Vec::new()
-        }
-
-        async fn drain_classified_inbox_interactions(
+        async fn claim_classified_inbox_interaction(
             &self,
         ) -> Result<
-            Vec<meerkat_core::interaction::ClassifiedInboxInteraction>,
-            meerkat_core::agent::CommsCapabilityError,
-        > {
-            Ok(Vec::new())
-        }
-
-        async fn try_recv_classified_inbox_interaction(
-            &self,
-        ) -> Result<
-            Option<meerkat_core::interaction::ClassifiedInboxInteraction>,
+            Option<meerkat_core::interaction::PeerIngressQueueClaim>,
             meerkat_core::agent::CommsCapabilityError,
         > {
             Ok(None)
@@ -4331,25 +4316,10 @@ async fn idle_non_host_sessions_do_not_spawn_background_comms_drains() {
             false
         }
 
-        async fn drain_peer_input_candidates(
-            &self,
-        ) -> Vec<meerkat_core::interaction::PeerInputCandidate> {
-            Vec::new()
-        }
-
-        async fn drain_classified_inbox_interactions(
+        async fn claim_classified_inbox_interaction(
             &self,
         ) -> Result<
-            Vec<meerkat_core::interaction::ClassifiedInboxInteraction>,
-            meerkat_core::agent::CommsCapabilityError,
-        > {
-            Ok(Vec::new())
-        }
-
-        async fn try_recv_classified_inbox_interaction(
-            &self,
-        ) -> Result<
-            Option<meerkat_core::interaction::ClassifiedInboxInteraction>,
+            Option<meerkat_core::interaction::PeerIngressQueueClaim>,
             meerkat_core::agent::CommsCapabilityError,
         > {
             Ok(None)
@@ -4410,25 +4380,10 @@ async fn attached_sessions_do_not_spawn_comms_drains_without_keep_alive() {
             false
         }
 
-        async fn drain_peer_input_candidates(
-            &self,
-        ) -> Vec<meerkat_core::interaction::PeerInputCandidate> {
-            Vec::new()
-        }
-
-        async fn drain_classified_inbox_interactions(
+        async fn claim_classified_inbox_interaction(
             &self,
         ) -> Result<
-            Vec<meerkat_core::interaction::ClassifiedInboxInteraction>,
-            meerkat_core::agent::CommsCapabilityError,
-        > {
-            Ok(Vec::new())
-        }
-
-        async fn try_recv_classified_inbox_interaction(
-            &self,
-        ) -> Result<
-            Option<meerkat_core::interaction::ClassifiedInboxInteraction>,
+            Option<meerkat_core::interaction::PeerIngressQueueClaim>,
             meerkat_core::agent::CommsCapabilityError,
         > {
             Ok(None)

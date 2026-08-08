@@ -401,6 +401,7 @@ async fn drain_recovered_runless_runtime_terminations_classified(
             terminal_observation,
             runtime_termination_reason,
             completion_error_metadata,
+            terminal_recovery: _,
             phase,
         } = batch;
         let crate::input_state::InteractionTerminalBatchKey::RuntimeTermination {

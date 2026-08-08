@@ -21,7 +21,8 @@ use meerkat_core::comms::{
 use meerkat_core::comms::{PeerAddress, SendReceipt};
 use meerkat_core::event::AgentEvent;
 use meerkat_core::interaction::{
-    InteractionContent, PeerIngressFact, PeerInputCandidate, PeerInputClass,
+    InteractionContent, PeerIngressClaimCommitFacts, PeerIngressFact, PeerIngressQueueClaim,
+    PeerInputCandidate, PeerInputClass,
 };
 use meerkat_core::time_compat::Instant;
 use meerkat_core::types::SessionId;
@@ -157,9 +158,8 @@ pub fn spawn_comms_drain(
             // indistinguishable from an idle inbox and triggering the
             // idle/dismiss lifecycle branch below). Empty-because-error must be
             // distinguishable from empty-because-idle before deciding to idle.
-            let candidates = match comms_runtime.try_recv_classified_inbox_interaction().await {
-                Ok(Some(candidate)) => vec![candidate],
-                Ok(None) => Vec::new(),
+            let claim = match comms_runtime.claim_classified_inbox_interaction().await {
+                Ok(claim) => claim,
                 Err(err) => {
                     // A classified-drain fault is NOT an idle inbox. Fail closed
                     // with the typed `Failed` terminal owned by the drain
@@ -189,7 +189,7 @@ pub fn spawn_comms_drain(
                     return;
                 }
             };
-            if candidates.is_empty() {
+            let Some(claim) = claim else {
                 // Lifecycle dismissal is NOT driven by a peer message body. A
                 // peer-controlled string must never stop this executor; the
                 // typed dismissal path is owned by the runtime drain-lifecycle
@@ -222,10 +222,45 @@ pub fn spawn_comms_drain(
                     return;
                 }
                 continue;
-            }
+            };
 
-            // Route each classified interaction through the adapter.
-            for candidate in candidates {
+            // Route one exact FIFO head. Durable-runtime entries retain their
+            // non-destructive claim until AcceptWithCompletion returns an
+            // opaque receipt. Volatile-control entries are atomically removed
+            // and reported as handed off before handler progress.
+            {
+                let candidate_class = claim.class();
+                let raw_item_id = claim.raw_item_id();
+                let (claim, candidate) = match claim.delivery_contract() {
+                    meerkat_core::PeerIngressDeliveryContract::DurableRuntime => {
+                        let candidate = claim.candidate().cloned();
+                        (RoutedPeerIngressClaim::Durable(claim), candidate)
+                    }
+                    meerkat_core::PeerIngressDeliveryContract::VolatileControl => {
+                        let candidate = match claim.__handoff_volatile() {
+                            Ok(candidate) => candidate,
+                            Err(error) => {
+                                tracing::error!(%error, %raw_item_id, "comms_drain: exact volatile peer ingress handoff failed");
+                                notify_claim_mechanism_failure(&adapter, &session_id).await;
+                                return;
+                            }
+                        };
+                        (RoutedPeerIngressClaim::Volatile, candidate)
+                    }
+                };
+                let Some(candidate) = candidate else {
+                    if candidate_class == PeerInputClass::Ack {
+                        commit_non_runtime_claim(claim, "transport ack");
+                        continue;
+                    }
+                    tracing::error!(
+                        class = ?candidate_class,
+                        raw_item_id = %raw_item_id,
+                        "comms_drain: classified claim had no runtime candidate"
+                    );
+                    commit_non_runtime_claim(claim, "typed malformed projection rejection");
+                    continue;
+                };
                 if try_handle_supervisor_bridge_command(
                     &adapter,
                     &session_id,
@@ -234,12 +269,12 @@ pub fn spawn_comms_drain(
                 )
                 .await
                 {
+                    commit_non_runtime_claim(claim, "supervisor bridge command handled");
                     continue;
                 }
-                let candidate_class = candidate.class();
                 match candidate_class {
                     PeerInputClass::Ack => {
-                        // Ack envelopes are filtered at ingress. Skip here.
+                        commit_non_runtime_claim(claim, "transport ack");
                     }
                     PeerInputClass::PeerLifecycleAdded
                     | PeerInputClass::PeerLifecycleRetired
@@ -257,6 +292,7 @@ pub fn spawn_comms_drain(
                             lifecycle_peer = ?candidate.lifecycle_peer,
                             "comms_drain: consumed silent peer lifecycle notice"
                         );
+                        commit_non_runtime_claim(claim, "silent peer lifecycle handled");
                     }
                     PeerInputClass::ResponseProgress | PeerInputClass::ResponseTerminal => {
                         // Response progress/terminal status is fixed by the
@@ -290,6 +326,10 @@ pub fn spawn_comms_drain(
                                         interaction_id = %candidate.interaction.id,
                                         "comms_drain: rejected peer response with unsupported terminal disposition"
                                     );
+                                    commit_non_runtime_claim(
+                                        claim,
+                                        "unsupported terminal response rejected",
+                                    );
                                     continue;
                                 }
                             },
@@ -308,6 +348,10 @@ pub fn spawn_comms_drain(
                                     terminality = ?terminality,
                                     interaction_id = %candidate.interaction.id,
                                     "comms_drain: rejected peer response with missing or inconsistent machine terminality"
+                                );
+                                commit_non_runtime_claim(
+                                    claim,
+                                    "inconsistent response terminality rejected",
                                 );
                                 continue;
                             }
@@ -330,6 +374,10 @@ pub fn spawn_comms_drain(
                                     tracing::warn!(
                                         content = ?other,
                                         "comms_drain: terminal response candidate missing response content"
+                                    );
+                                    commit_non_runtime_claim(
+                                        claim,
+                                        "terminal response content rejected",
                                     );
                                     continue;
                                 }
@@ -365,6 +413,10 @@ pub fn spawn_comms_drain(
                                         &candidate,
                                         "generated peer terminal transition rejected",
                                     );
+                                    commit_non_runtime_claim(
+                                        claim,
+                                        "peer terminal lifecycle rejected",
+                                    );
                                     continue;
                                 }
                             }
@@ -391,6 +443,7 @@ pub fn spawn_comms_drain(
                                     }
                                 }
                                 comms_runtime.mark_interaction_complete(&interaction_id);
+                                commit_non_runtime_claim(claim, "bridge reply waiter handled");
                                 continue;
                             }
 
@@ -413,14 +466,23 @@ pub fn spawn_comms_drain(
                                     } else {
                                         comms_runtime.mark_interaction_complete(&interaction_id);
                                     }
+                                    commit_non_runtime_claim(
+                                        claim,
+                                        "malformed terminal ingress rejected",
+                                    );
                                     continue;
                                 }
                             };
-                            let result = adapter
-                                .accept_input_with_completion(&session_id, content_input)
-                                .await;
-                            match result {
-                                Ok((_outcome, handle)) => {
+                            match accept_routed_peer_ingress(
+                                &adapter,
+                                claim,
+                                &session_id,
+                                content_input,
+                                None,
+                            )
+                            .await
+                            {
+                                Ok(handle) => {
                                     if subscriber.is_some() || handle.is_some() {
                                         spawn_completion_bridge(
                                             Some(comms_runtime.clone()),
@@ -437,14 +499,8 @@ pub fn spawn_comms_drain(
                                         error = %err,
                                         "comms_drain: failed to inject terminal response"
                                     );
-                                    if dsl_installed {
-                                        comms_runtime.abandon_interaction_stream(
-                                            &interaction_id,
-                                            meerkat_core::InteractionStreamAbandonReason::ResponseRejected,
-                                        );
-                                    } else {
-                                        comms_runtime.mark_interaction_complete(&interaction_id);
-                                    }
+                                    notify_claim_mechanism_failure(&adapter, &session_id).await;
+                                    return;
                                 }
                             }
                         } else {
@@ -471,6 +527,10 @@ pub fn spawn_comms_drain(
                                         &candidate,
                                         "generated peer progress transition rejected",
                                     );
+                                    commit_non_runtime_claim(
+                                        claim,
+                                        "peer progress lifecycle rejected",
+                                    );
                                     continue;
                                 }
                             }
@@ -488,6 +548,7 @@ pub fn spawn_comms_drain(
                             } = &candidate.interaction.content
                                 && comms_runtime.has_bridge_reply_waiter(in_reply_to)
                             {
+                                commit_non_runtime_claim(claim, "bridge reply progress suppressed");
                                 continue;
                             }
 
@@ -502,14 +563,28 @@ pub fn spawn_comms_drain(
                                         interaction_id = %candidate.interaction.id,
                                         "comms_drain: rejected malformed progress peer ingress"
                                     );
+                                    commit_non_runtime_claim(
+                                        claim,
+                                        "malformed progress ingress rejected",
+                                    );
                                     continue;
                                 }
                             };
-                            if let Err(err) = adapter.accept_input(&session_id, input).await {
-                                tracing::warn!(
-                                    error = %err,
-                                    "comms_drain: failed to inject progress response"
-                                );
+                            match accept_routed_peer_ingress(
+                                &adapter,
+                                claim,
+                                &session_id,
+                                input,
+                                None,
+                            )
+                            .await
+                            {
+                                Ok(_) => {}
+                                Err(err) => {
+                                    tracing::warn!(error = %err, "comms_drain: failed to inject progress response");
+                                    notify_claim_mechanism_failure(&adapter, &session_id).await;
+                                    return;
+                                }
                             }
                         }
                     }
@@ -567,7 +642,12 @@ pub fn spawn_comms_drain(
                                     &interaction_id,
                                     meerkat_core::InteractionStreamAbandonReason::AdmissionRejected,
                                 );
-                                continue;
+                                tracing::error!(
+                                    interaction_id = %interaction_id,
+                                    "comms_drain: retained durable request because request authority is unavailable"
+                                );
+                                notify_claim_mechanism_failure(&adapter, &session_id).await;
+                                return;
                             };
                             let corr_id =
                                 meerkat_core::PeerCorrelationId::from_uuid(interaction_id.0);
@@ -584,7 +664,12 @@ pub fn spawn_comms_drain(
                                     &interaction_id,
                                     meerkat_core::InteractionStreamAbandonReason::AdmissionRejected,
                                 );
-                                continue;
+                                tracing::error!(
+                                    interaction_id = %interaction_id,
+                                    "comms_drain: retained durable request after request lifecycle rejection"
+                                );
+                                notify_claim_mechanism_failure(&adapter, &session_id).await;
+                                return;
                             }
                         }
 
@@ -604,28 +689,24 @@ pub fn spawn_comms_drain(
                                     &interaction_id,
                                     meerkat_core::InteractionStreamAbandonReason::AdmissionRejected,
                                 );
-                                continue;
+                                tracing::error!(
+                                    interaction_id = %interaction_id,
+                                    "comms_drain: retained durable ingress after projection failure"
+                                );
+                                notify_claim_mechanism_failure(&adapter, &session_id).await;
+                                return;
                             }
                         };
-                        let result = match fenced_member.as_ref() {
-                            Some(expected_member) => {
-                                adapter
-                                    .accept_input_with_completion_for_member_residency(
-                                        &session_id,
-                                        input,
-                                        Some(expected_member),
-                                    )
-                                    .await
-                            }
-                            None => {
-                                adapter
-                                    .accept_input_with_completion(&session_id, input)
-                                    .await
-                            }
-                        };
-
-                        match result {
-                            Ok((_outcome, handle)) => {
+                        match accept_routed_peer_ingress(
+                            &adapter,
+                            claim,
+                            &session_id,
+                            input,
+                            fenced_member.as_ref(),
+                        )
+                        .await
+                        {
+                            Ok(handle) => {
                                 if subscriber.is_some() || handle.is_some() {
                                     spawn_completion_bridge(
                                         Some(comms_runtime.clone()),
@@ -642,10 +723,8 @@ pub fn spawn_comms_drain(
                                     error = %err,
                                     "comms_drain: failed to accept peer input"
                                 );
-                                comms_runtime.abandon_interaction_stream(
-                                    &interaction_id,
-                                    meerkat_core::InteractionStreamAbandonReason::AdmissionRejected,
-                                );
+                                notify_claim_mechanism_failure(&adapter, &session_id).await;
+                                return;
                             }
                         }
                     }
@@ -653,6 +732,116 @@ pub fn spawn_comms_drain(
             }
         }
     })
+}
+
+enum RoutedPeerIngressClaim {
+    Durable(PeerIngressQueueClaim),
+    Volatile,
+}
+
+fn finalize_peer_ingress_claim(
+    claim: RoutedPeerIngressClaim,
+    receipt: Arc<dyn std::any::Any + Send + Sync>,
+) -> Result<(), crate::RuntimeDriverError> {
+    let RoutedPeerIngressClaim::Durable(claim) = claim else {
+        return Err(crate::RuntimeDriverError::Internal(
+            "comms_drain: volatile peer ingress received a durable receipt".to_string(),
+        ));
+    };
+    claim
+        .__finalize_with_runtime_receipt(receipt)
+        .map_err(|error| {
+            crate::RuntimeDriverError::Internal(format!(
+                "comms_drain: exact peer ingress claim commit failed: {error}"
+            ))
+        })
+}
+
+async fn accept_routed_peer_ingress(
+    adapter: &MeerkatMachine,
+    claim: RoutedPeerIngressClaim,
+    session_id: &SessionId,
+    input: crate::Input,
+    expected_member: Option<&BridgeMemberIncarnation>,
+) -> Result<Option<crate::CompletionHandle>, crate::RuntimeDriverError> {
+    match claim {
+        RoutedPeerIngressClaim::Durable(claim) => {
+            let facts = PeerIngressClaimCommitFacts {
+                claim_id: claim.claim_id(),
+                raw_item_id: claim.raw_item_id(),
+                class: claim.class(),
+            };
+            let result = match expected_member {
+                Some(expected_member) => {
+                    adapter
+                        .accept_peer_ingress_with_completion_for_member_residency(
+                            facts,
+                            session_id,
+                            input,
+                            Some(expected_member),
+                        )
+                        .await
+                }
+                None => {
+                    adapter
+                        .accept_peer_ingress_with_completion(facts, session_id, input)
+                        .await
+                }
+            };
+            match result {
+                crate::meerkat_machine::PeerIngressAcceptFinalization::Finalized {
+                    receipt,
+                    completion,
+                    ..
+                } => {
+                    finalize_peer_ingress_claim(RoutedPeerIngressClaim::Durable(claim), receipt)?;
+                    Ok(completion)
+                }
+                crate::meerkat_machine::PeerIngressAcceptFinalization::MechanismError(error) => {
+                    Err(error)
+                }
+            }
+        }
+        RoutedPeerIngressClaim::Volatile => match expected_member {
+            Some(expected_member) => adapter
+                .accept_input_with_completion_for_member_residency(
+                    session_id,
+                    input,
+                    Some(expected_member),
+                )
+                .await
+                .map(|(_, completion)| completion),
+            None => adapter
+                .accept_input_with_completion(session_id, input)
+                .await
+                .map(|(_, completion)| completion),
+        },
+    }
+}
+
+fn commit_non_runtime_claim(claim: RoutedPeerIngressClaim, handled_as: &'static str) {
+    if matches!(claim, RoutedPeerIngressClaim::Durable(_)) {
+        tracing::error!(
+            handled_as,
+            "comms_drain: durable-runtime peer ingress reached a volatile handler"
+        );
+    }
+}
+
+async fn notify_claim_mechanism_failure(adapter: &Arc<MeerkatMachine>, session_id: &SessionId) {
+    if let Err(error) = adapter
+        .notify_comms_drain_exited(session_id, DrainExitReason::Failed)
+        .await
+    {
+        tracing::error!(
+            %session_id,
+            %error,
+            "comms_drain: failed to publish typed exit after retained peer ingress claim"
+        );
+        adapter
+            .project_comms_drain_failed_safety_net(session_id)
+            .await;
+    }
 }
 
 fn reject_peer_response_observation_via_authority(
@@ -6668,11 +6857,118 @@ mod tests {
     use meerkat_core::InteractionId;
     use meerkat_core::SendError;
     use meerkat_core::interaction::InboxInteraction;
-    use meerkat_core::interaction::{PeerIngressConvention, PeerIngressIdentity};
+    use meerkat_core::interaction::{
+        PeerIngressClaimCommitError, PeerIngressClaimId, PeerIngressClaimLease,
+        PeerIngressConvention, PeerIngressIdentity,
+    };
     use meerkat_core::types::HandlingMode;
     use serde_json::json;
     use std::collections::{HashMap, HashSet, VecDeque};
     use uuid::Uuid;
+
+    #[derive(Default)]
+    struct TestPeerIngressQueue {
+        candidates: std::sync::Mutex<VecDeque<PeerInputCandidate>>,
+        outstanding: std::sync::Mutex<Option<(PeerIngressClaimId, InteractionId)>>,
+    }
+
+    impl TestPeerIngressQueue {
+        fn new(candidates: impl IntoIterator<Item = PeerInputCandidate>) -> Arc<Self> {
+            Arc::new(Self {
+                candidates: std::sync::Mutex::new(candidates.into_iter().collect()),
+                outstanding: std::sync::Mutex::new(None),
+            })
+        }
+
+        fn remaining(&self) -> usize {
+            self.candidates.lock().expect("candidate mutex").len()
+        }
+
+        fn claim(self: &Arc<Self>) -> Option<PeerIngressQueueClaim> {
+            let mut outstanding = self.outstanding.lock().expect("outstanding claim mutex");
+            if outstanding.is_some() {
+                return None;
+            }
+            let candidate = self
+                .candidates
+                .lock()
+                .expect("candidate mutex")
+                .front()
+                .cloned()?;
+            let claim_id = PeerIngressClaimId(Uuid::new_v4());
+            let raw_item_id = candidate.interaction.id;
+            let class = candidate.ingress.class;
+            let delivery_contract = if matches!(
+                class,
+                PeerInputClass::ActionableMessage | PeerInputClass::PlainEvent
+            ) || (class == PeerInputClass::ActionableRequest
+                && !candidate.ingress.auth.is_some_and(|auth| auth.is_exempt()))
+            {
+                meerkat_core::PeerIngressDeliveryContract::DurableRuntime
+            } else {
+                meerkat_core::PeerIngressDeliveryContract::VolatileControl
+            };
+            *outstanding = Some((claim_id, raw_item_id));
+            Some(PeerIngressQueueClaim::from_comms_queue(
+                claim_id,
+                raw_item_id,
+                class,
+                delivery_contract,
+                Some(candidate),
+                Arc::clone(self) as Arc<dyn PeerIngressClaimLease>,
+            ))
+        }
+    }
+
+    impl PeerIngressClaimLease for TestPeerIngressQueue {
+        fn commit(
+            &self,
+            claim_id: PeerIngressClaimId,
+            _receipt: Arc<dyn std::any::Any + Send + Sync>,
+        ) -> Result<(), PeerIngressClaimCommitError> {
+            let mut outstanding = self.outstanding.lock().expect("outstanding claim mutex");
+            let Some((current_claim_id, raw_item_id)) = *outstanding else {
+                return Err(PeerIngressClaimCommitError::NoOutstandingClaim);
+            };
+            if current_claim_id != claim_id {
+                return Err(PeerIngressClaimCommitError::ClaimMismatch);
+            }
+            let mut candidates = self.candidates.lock().expect("candidate mutex");
+            if candidates.front().map(|candidate| candidate.interaction.id) != Some(raw_item_id) {
+                return Err(PeerIngressClaimCommitError::HeadMismatch);
+            }
+            candidates.pop_front();
+            *outstanding = None;
+            Ok(())
+        }
+
+        fn handoff_volatile(
+            &self,
+            claim_id: PeerIngressClaimId,
+        ) -> Result<(), PeerIngressClaimCommitError> {
+            let mut outstanding = self.outstanding.lock().expect("outstanding claim mutex");
+            let Some((current_claim_id, raw_item_id)) = *outstanding else {
+                return Err(PeerIngressClaimCommitError::NoOutstandingClaim);
+            };
+            if current_claim_id != claim_id {
+                return Err(PeerIngressClaimCommitError::ClaimMismatch);
+            }
+            let mut candidates = self.candidates.lock().expect("candidate mutex");
+            if candidates.front().map(|candidate| candidate.interaction.id) != Some(raw_item_id) {
+                return Err(PeerIngressClaimCommitError::HeadMismatch);
+            }
+            candidates.pop_front();
+            *outstanding = None;
+            Ok(())
+        }
+
+        fn release(&self, claim_id: PeerIngressClaimId) {
+            let mut outstanding = self.outstanding.lock().expect("outstanding claim mutex");
+            if outstanding.map(|(current_claim_id, _)| current_claim_id) == Some(claim_id) {
+                *outstanding = None;
+            }
+        }
+    }
 
     struct ExhaustedDirectedTurnObservation;
 
@@ -7709,7 +8005,7 @@ mod tests {
 
     struct OneShotPeerRequestRuntime {
         notify: Arc<tokio::sync::Notify>,
-        candidate: std::sync::Mutex<Option<PeerInputCandidate>>,
+        queue: Arc<TestPeerIngressQueue>,
         peer_handle: Option<Arc<dyn meerkat_core::handles::PeerInteractionHandle>>,
         peer_request_response_handle: Option<Arc<dyn meerkat_core::handles::PeerInteractionHandle>>,
         completed_count: std::sync::atomic::AtomicUsize,
@@ -7724,7 +8020,7 @@ mod tests {
         ) -> Self {
             Self {
                 notify: Arc::new(tokio::sync::Notify::new()),
-                candidate: std::sync::Mutex::new(Some(candidate)),
+                queue: TestPeerIngressQueue::new([candidate]),
                 peer_handle,
                 peer_request_response_handle: None,
                 completed_count: std::sync::atomic::AtomicUsize::new(0),
@@ -7738,7 +8034,7 @@ mod tests {
         ) -> Self {
             Self {
                 notify: Arc::new(tokio::sync::Notify::new()),
-                candidate: std::sync::Mutex::new(Some(candidate)),
+                queue: TestPeerIngressQueue::new([candidate]),
                 peer_handle: Some(peer_handle.clone()),
                 peer_request_response_handle: Some(peer_handle),
                 completed_count: std::sync::atomic::AtomicUsize::new(0),
@@ -7772,7 +8068,7 @@ mod tests {
         }
 
         fn dismiss_received(&self) -> bool {
-            self.candidate.lock().expect("candidate mutex").is_none()
+            self.queue.remaining() == 0
         }
 
         fn peer_interaction_handle(
@@ -7787,27 +8083,11 @@ mod tests {
             self.peer_request_response_handle.clone()
         }
 
-        async fn drain_classified_inbox_interactions(
+        async fn claim_classified_inbox_interaction(
             &self,
-        ) -> Result<
-            Vec<meerkat_core::interaction::ClassifiedInboxInteraction>,
-            meerkat_core::agent::CommsCapabilityError,
-        > {
-            Ok(self
-                .candidate
-                .lock()
-                .expect("candidate mutex")
-                .take()
-                .into_iter()
-                .collect())
-        }
-        async fn try_recv_classified_inbox_interaction(
-            &self,
-        ) -> Result<
-            Option<meerkat_core::interaction::ClassifiedInboxInteraction>,
-            meerkat_core::agent::CommsCapabilityError,
-        > {
-            Ok(self.candidate.lock().expect("candidate mutex").take())
+        ) -> Result<Option<PeerIngressQueueClaim>, meerkat_core::agent::CommsCapabilityError>
+        {
+            Ok(self.queue.claim())
         }
 
         fn mark_interaction_complete(&self, _id: &InteractionId) {
@@ -7940,7 +8220,7 @@ mod tests {
 
     struct PrefixPausingRuntime {
         notify: Arc<tokio::sync::Notify>,
-        candidates: std::sync::Mutex<VecDeque<PeerInputCandidate>>,
+        queue: Arc<TestPeerIngressQueue>,
         received: std::sync::Mutex<Vec<InteractionId>>,
         receive_calls: std::sync::atomic::AtomicUsize,
         pause_before_receive: usize,
@@ -7955,7 +8235,7 @@ mod tests {
         ) -> Self {
             Self {
                 notify: Arc::new(tokio::sync::Notify::new()),
-                candidates: std::sync::Mutex::new(candidates.into()),
+                queue: TestPeerIngressQueue::new(candidates),
                 received: std::sync::Mutex::new(Vec::new()),
                 receive_calls: std::sync::atomic::AtomicUsize::new(0),
                 pause_before_receive,
@@ -7964,7 +8244,7 @@ mod tests {
         }
 
         fn remaining(&self) -> usize {
-            self.candidates.lock().expect("candidate mutex").len()
+            self.queue.remaining()
         }
 
         fn received(&self) -> Vec<InteractionId> {
@@ -7982,12 +8262,10 @@ mod tests {
             self.notify.clone()
         }
 
-        async fn try_recv_classified_inbox_interaction(
+        async fn claim_classified_inbox_interaction(
             &self,
-        ) -> Result<
-            Option<meerkat_core::interaction::ClassifiedInboxInteraction>,
-            meerkat_core::agent::CommsCapabilityError,
-        > {
+        ) -> Result<Option<PeerIngressQueueClaim>, meerkat_core::agent::CommsCapabilityError>
+        {
             let call = self
                 .receive_calls
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
@@ -7998,14 +8276,14 @@ mod tests {
                 }
                 std::future::pending::<()>().await;
             }
-            let candidate = self.candidates.lock().expect("candidate mutex").pop_front();
-            if let Some(candidate) = candidate.as_ref() {
+            let claim = self.queue.claim();
+            if let Some(candidate) = claim.as_ref().and_then(PeerIngressQueueClaim::candidate) {
                 self.received
                     .lock()
                     .expect("received mutex")
                     .push(candidate.interaction.id);
             }
-            Ok(candidate)
+            Ok(claim)
         }
     }
 
@@ -8050,27 +8328,10 @@ mod tests {
             self.notify.clone()
         }
 
-        async fn drain_classified_inbox_interactions(
+        async fn claim_classified_inbox_interaction(
             &self,
-        ) -> Result<
-            Vec<meerkat_core::interaction::ClassifiedInboxInteraction>,
-            meerkat_core::agent::CommsCapabilityError,
-        > {
-            if self.fail_classified_drain {
-                Err(meerkat_core::agent::CommsCapabilityError::Unsupported(
-                    "synthetic classification fault".to_string(),
-                ))
-            } else {
-                Ok(Vec::new())
-            }
-        }
-
-        async fn try_recv_classified_inbox_interaction(
-            &self,
-        ) -> Result<
-            Option<meerkat_core::interaction::ClassifiedInboxInteraction>,
-            meerkat_core::agent::CommsCapabilityError,
-        > {
+        ) -> Result<Option<PeerIngressQueueClaim>, meerkat_core::agent::CommsCapabilityError>
+        {
             if self.fail_classified_drain {
                 Err(meerkat_core::agent::CommsCapabilityError::Unsupported(
                     "synthetic classification fault".to_string(),
@@ -9054,8 +9315,8 @@ mod tests {
                 bootstrap_token: member_runtime.bridge_bootstrap_token().to_owned().into(),
             },
         );
-        let request_receipt = supervisor_runtime
-            .send(CommsCommand::PeerRequest {
+        let (request_receipt, candidate) = tokio::join!(
+            supervisor_runtime.send(CommsCommand::PeerRequest {
                 content_taint: None,
                 to: PeerRoute::with_display_name(member_spec.peer_id, member_spec.name.clone()),
                 intent: SUPERVISOR_BRIDGE_INTENT.to_string(),
@@ -9064,15 +9325,16 @@ mod tests {
                 handling_mode: HandlingMode::Queue,
                 stream: meerkat_core::comms::InputStreamMode::None,
                 objective_id: None,
-            })
-            .await
-            .expect("supervisor sends bootstrap BindMember over TCP");
+            }),
+            drain_one_candidate(&member_runtime, "member BindMember request"),
+        );
+        let request_receipt =
+            request_receipt.expect("supervisor sends bootstrap BindMember over TCP");
         let meerkat_core::SendReceipt::PeerRequestSent { interaction_id, .. } = request_receipt
         else {
             panic!("expected PeerRequestSent receipt, got {request_receipt:?}");
         };
 
-        let candidate = drain_one_candidate(&member_runtime, "member BindMember request").await;
         assert_eq!(
             candidate.interaction.id, interaction_id,
             "member must receive the correlated bridge request"
@@ -9216,8 +9478,8 @@ mod tests {
                 bootstrap_token: member_runtime.bridge_bootstrap_token().to_owned().into(),
             },
         );
-        let request_receipt = supervisor_runtime
-            .send(CommsCommand::PeerRequest {
+        let (request_receipt, candidate) = tokio::join!(
+            supervisor_runtime.send(CommsCommand::PeerRequest {
                 content_taint: None,
                 to: PeerRoute::with_display_name(member_spec.peer_id, member_spec.name.clone()),
                 intent: SUPERVISOR_BRIDGE_INTENT.to_string(),
@@ -9226,15 +9488,16 @@ mod tests {
                 handling_mode: HandlingMode::Queue,
                 stream: meerkat_core::comms::InputStreamMode::None,
                 objective_id: None,
-            })
-            .await
-            .expect("supervisor sends idempotent BindMember over TCP");
+            }),
+            drain_one_candidate(&member_runtime, "member BindMember request"),
+        );
+        let request_receipt =
+            request_receipt.expect("supervisor sends idempotent BindMember over TCP");
         let meerkat_core::SendReceipt::PeerRequestSent { interaction_id, .. } = request_receipt
         else {
             panic!("expected PeerRequestSent receipt, got {request_receipt:?}");
         };
 
-        let candidate = drain_one_candidate(&member_runtime, "member BindMember request").await;
         assert_eq!(
             candidate.interaction.id, interaction_id,
             "member must receive the correlated bridge request"
@@ -9697,21 +9960,20 @@ mod tests {
             new_supervisor_spec.address.to_string(),
             "regression requires the durable authority and probe listeners to differ"
         );
-        let receipt = probe_runtime
-            .send_peer_request_at_endpoint(
+        let (receipt, observe_candidate) = tokio::join!(
+            probe_runtime.send_peer_request_at_endpoint(
                 PeerRoute::with_display_name(member_spec.peer_id, member_spec.name.clone()),
                 SUPERVISOR_BRIDGE_INTENT,
                 serde_json::to_value(&observe).expect("serialize observe command"),
                 reply_endpoint.clone(),
-            )
-            .await
-            .expect("send signed observation from alternate-authority probe");
+            ),
+            drain_one_candidate(&member_runtime, "alternate-authority observation request"),
+        );
+        let receipt = receipt.expect("send signed observation from alternate-authority probe");
         let SendReceipt::PeerRequestSent { envelope_id, .. } = receipt else {
             panic!("expected peer request receipt, got {receipt:?}");
         };
         let observe_id = InteractionId(envelope_id);
-        let observe_candidate =
-            drain_one_candidate(&member_runtime, "alternate-authority observation request").await;
         assert_eq!(observe_candidate.interaction.id, observe_id);
         assert_eq!(
             observe_candidate.ingress.declared_reply_endpoint,
@@ -10243,6 +10505,7 @@ mod tests {
                     meerkat_core::SendReceipt::PeerResponseSent {
                         envelope_id: Uuid::new_v4(),
                         in_reply_to: *in_reply_to,
+                        delivery: meerkat_core::comms::PeerDeliveryOutcome::Queued,
                     }
                 }
                 other => {
@@ -12389,11 +12652,15 @@ mod tests {
                     meerkat_core::comms::SendReceipt::PeerResponseSent {
                         envelope_id: Uuid::new_v4(),
                         in_reply_to: *in_reply_to,
+                        delivery: meerkat_core::comms::PeerDeliveryOutcome::Queued,
                     }
                 }
                 _ => meerkat_core::comms::SendReceipt::PeerMessageSent {
                     envelope_id: Uuid::new_v4(),
-                    delivery: meerkat_core::comms::PeerDeliveryOutcome::Acked,
+                    delivery: meerkat_core::comms::PeerDeliveryOutcome::DurablyResolved {
+                        outcome:
+                            meerkat_core::interaction::PeerIngressTerminalOutcomeKind::Accepted,
+                    },
                 },
             };
             self.sent.lock().await.push(cmd);
@@ -14404,7 +14671,7 @@ mod tests {
     /// yields no sender on take, and is consumed by take).
     struct WaiterReplyRuntime {
         notify: Arc<tokio::sync::Notify>,
-        candidate: std::sync::Mutex<Option<PeerInputCandidate>>,
+        queue: Arc<TestPeerIngressQueue>,
         peer_handle: Option<Arc<dyn meerkat_core::handles::PeerInteractionHandle>>,
         completed_count: std::sync::atomic::AtomicUsize,
         waiters: std::sync::Mutex<HashMap<Uuid, TestWaiterEntry>>,
@@ -14421,7 +14688,7 @@ mod tests {
             waiters.insert(in_reply_to.0, entry);
             Self {
                 notify: Arc::new(tokio::sync::Notify::new()),
-                candidate: std::sync::Mutex::new(Some(candidate)),
+                queue: TestPeerIngressQueue::new([candidate]),
                 peer_handle,
                 completed_count: std::sync::atomic::AtomicUsize::new(0),
                 waiters: std::sync::Mutex::new(waiters),
@@ -14454,28 +14721,11 @@ mod tests {
             self.peer_handle.clone()
         }
 
-        async fn drain_classified_inbox_interactions(
+        async fn claim_classified_inbox_interaction(
             &self,
-        ) -> Result<
-            Vec<meerkat_core::interaction::ClassifiedInboxInteraction>,
-            meerkat_core::agent::CommsCapabilityError,
-        > {
-            Ok(self
-                .candidate
-                .lock()
-                .expect("candidate mutex")
-                .take()
-                .into_iter()
-                .collect())
-        }
-
-        async fn try_recv_classified_inbox_interaction(
-            &self,
-        ) -> Result<
-            Option<meerkat_core::interaction::ClassifiedInboxInteraction>,
-            meerkat_core::agent::CommsCapabilityError,
-        > {
-            Ok(self.candidate.lock().expect("candidate mutex").take())
+        ) -> Result<Option<PeerIngressQueueClaim>, meerkat_core::agent::CommsCapabilityError>
+        {
+            Ok(self.queue.claim())
         }
 
         fn mark_interaction_complete(&self, _id: &InteractionId) {

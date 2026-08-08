@@ -263,7 +263,7 @@ mod tests {
 
     #[test]
     fn test_comms_event_injector_sends_to_inbox() {
-        let (mut inbox, sender) = classified_inbox();
+        let (inbox, sender) = classified_inbox();
         let injector = CommsEventInjector::new(sender, new_subscriber_registry());
 
         injector
@@ -275,7 +275,7 @@ mod tests {
             )
             .unwrap();
 
-        let items = inbox.try_drain_classified();
+        let items = inbox.test_classified_entries_snapshot();
         assert_eq!(items.len(), 1);
         match &items[0].item {
             InboxItem::PlainEvent { body, source, .. } => {
@@ -321,7 +321,7 @@ mod tests {
     fn test_comms_event_injector_as_dyn() {
         use std::sync::Arc;
 
-        let (mut inbox, sender) = classified_inbox();
+        let (inbox, sender) = classified_inbox();
         let injector: Arc<dyn EventInjector> =
             Arc::new(CommsEventInjector::new(sender, new_subscriber_registry()));
 
@@ -334,7 +334,7 @@ mod tests {
             )
             .unwrap();
 
-        let items = inbox.try_drain_classified();
+        let items = inbox.test_classified_entries_snapshot();
         assert_eq!(items.len(), 1);
     }
 
@@ -343,7 +343,7 @@ mod tests {
         use meerkat_core::event_injector::SubscribableInjector;
 
         let registry = new_subscriber_registry();
-        let (mut inbox, sender) = classified_inbox();
+        let (inbox, sender) = classified_inbox();
         let injector = CommsEventInjector::new(sender, registry.clone());
 
         let sub = injector
@@ -356,7 +356,7 @@ mod tests {
             .unwrap();
 
         // Verify item in inbox has interaction_id
-        let items = inbox.try_drain_classified();
+        let items = inbox.test_classified_entries_snapshot();
         assert_eq!(items.len(), 1);
         match &items[0].item {
             InboxItem::PlainEvent {

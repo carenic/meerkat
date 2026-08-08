@@ -76,8 +76,15 @@ pub fn classified_interaction_to_runtime_input(
                     transcript_eligible: true,
                     operator_eligible: true,
                 },
-                idempotency_key: input_identity
-                    .map(|identity| IdempotencyKey::new(identity.idempotency_key.clone())),
+                idempotency_key: Some(input_identity.map_or_else(
+                    || {
+                        IdempotencyKey::new(format!(
+                            "peer-ingress:event:{source_name}:{}",
+                            interaction.id
+                        ))
+                    },
+                    |identity| IdempotencyKey::new(identity.idempotency_key.clone()),
+                )),
                 supersession_key: None,
                 correlation_id: Some(CorrelationId::from_uuid(interaction.id.0)),
             },
@@ -125,13 +132,19 @@ fn peer_input_from_ingress_fact(
                 interaction_id: interaction.id,
             })?;
     let peer_id = canonical_peer_id.to_string();
-    let idempotency_key =
-        matches!(&convention, PeerConvention::ResponseTerminal { .. }).then(|| {
+    let idempotency_key = Some(
+        if matches!(&convention, PeerConvention::ResponseTerminal { .. }) {
             peer_response_terminal_idempotency_key(
                 canonical_peer_id,
                 meerkat_core::PeerCorrelationId::from_uuid(transcript_correlation_id.0),
             )
-        });
+        } else {
+            IdempotencyKey::new(format!(
+                "peer-ingress:{}:{}",
+                canonical_peer_id, interaction.id
+            ))
+        },
+    );
     let display_identity = ingress
         .route
         .as_ref()

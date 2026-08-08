@@ -395,7 +395,7 @@ impl PeerCommsEndpoint {
 /// Send one plain peer message from `from` to `to` and return the typed
 /// receipt.
 ///
-/// Load-bearing fact making `Acked` or in-process `HandedOff` a
+/// Load-bearing fact making `Acked` or in-process `VolatileHandedOff` a
 /// delivery-admission PROOF (DEC-P4H-9): the receiving io task sends a stream
 /// transport ack only on `AdmissionOutcome::Admitted`, while the wait-based
 /// in-process lane reports direct inbox handoff.

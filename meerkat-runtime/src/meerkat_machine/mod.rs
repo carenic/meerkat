@@ -65,6 +65,38 @@ use crate::traits::{
     RuntimeControlPlaneError, RuntimeDriverError,
 };
 
+/// Opaque proof minted only inside MeerkatMachine after AcceptWithCompletion
+/// has returned a durable Accepted/Deduplicated result, or a typed validation
+/// rejection. The shell can carry but cannot construct or alter this value.
+pub(crate) struct DurablePeerIngressAdmissionReceipt {
+    facts: meerkat_core::interaction::PeerIngressClaimCommitFacts,
+    outcome: meerkat_core::interaction::PeerIngressClaimTerminalOutcome,
+}
+
+impl DurablePeerIngressAdmissionReceipt {
+    fn new(
+        facts: meerkat_core::interaction::PeerIngressClaimCommitFacts,
+        outcome: meerkat_core::interaction::PeerIngressClaimTerminalOutcome,
+    ) -> Self {
+        Self { facts, outcome }
+    }
+
+    pub(crate) fn validate(
+        &self,
+        facts: meerkat_core::interaction::PeerIngressClaimCommitFacts,
+    ) -> Option<meerkat_core::interaction::PeerIngressClaimTerminalOutcome> {
+        (self.facts == facts).then(|| self.outcome.clone())
+    }
+}
+
+pub(crate) enum PeerIngressAcceptFinalization {
+    Finalized {
+        receipt: Arc<dyn std::any::Any + Send + Sync>,
+        completion: Option<crate::completion::CompletionHandle>,
+    },
+    MechanismError(RuntimeDriverError),
+}
+
 #[allow(clippy::expect_used)]
 #[cfg(test)]
 pub(crate) fn recover_projected_authority(

@@ -4825,7 +4825,7 @@ pub fn build_host_comms_runtime(
     participant_name: &str,
     keypair: meerkat_comms::Keypair,
 ) -> Result<HostCommsRuntime, MobHostActorError> {
-    let runtime = meerkat_comms::CommsRuntime::inproc_only_with_keypair_and_silent_intents(
+    let runtime = meerkat_comms::CommsRuntime::inproc_control_only_with_keypair_and_silent_intents(
         participant_name,
         None,
         keypair,

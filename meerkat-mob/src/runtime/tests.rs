@@ -1122,6 +1122,7 @@ impl CoreCommsRuntime for MockCommsRuntime {
                     .push(kind.as_str().to_string());
                 Ok(SendReceipt::PeerLifecycleSent {
                     envelope_id: uuid::Uuid::new_v4(),
+                    delivery: meerkat_core::comms::PeerDeliveryOutcome::Queued,
                 })
             }
             CommsCommand::PeerRequest { to, intent, .. } => {
@@ -1169,6 +1170,7 @@ impl CoreCommsRuntime for MockCommsRuntime {
                     envelope_id: uuid::Uuid::new_v4(),
                     interaction_id: InteractionId(uuid::Uuid::new_v4()),
                     stream_reserved: false,
+                    delivery: meerkat_core::comms::PeerDeliveryOutcome::Queued,
                 })
             }
             CommsCommand::PeerMessage { to, .. } => {
@@ -1198,7 +1200,7 @@ impl CoreCommsRuntime for MockCommsRuntime {
                     .push("peer_message".to_string());
                 Ok(SendReceipt::PeerMessageSent {
                     envelope_id: uuid::Uuid::new_v4(),
-                    delivery: meerkat_core::comms::PeerDeliveryOutcome::HandedOff,
+                    delivery: meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff,
                 })
             }
             unsupported => Err(SendError::Unsupported(format!(
@@ -5819,6 +5821,7 @@ struct HarnessSupervisorState {
 struct LiveExternalPeerHarness {
     binding: crate::RuntimeBinding,
     runtime: Arc<meerkat_comms::CommsRuntime>,
+    ingress_finalizer: Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer>,
     bind_count: Arc<std::sync::atomic::AtomicUsize>,
     interrupt_count: Arc<std::sync::atomic::AtomicUsize>,
     bind_protocol_versions: Arc<RwLock<Vec<super::bridge_protocol::BridgeProtocolVersion>>>,
@@ -5876,21 +5879,10 @@ impl LiveExternalPeerHarness {
     }
 
     async fn remove_trusted_peer(&self, peer_id: &str) {
-        remove_test_peer_projection_trust(
-            self.runtime.as_ref(),
+        remove_live_external_peer_trust(
+            &self.ingress_finalizer,
+            &self.runtime,
             peer_id,
-            "remove trusted peer from harness runtime",
-        )
-        .await;
-    }
-
-    async fn remove_trusted_peer_descriptor(
-        runtime: &Arc<meerkat_comms::CommsRuntime>,
-        peer: &meerkat_core::comms::TrustedPeerDescriptor,
-    ) {
-        remove_test_peer_projection_trust(
-            runtime.as_ref(),
-            &peer.peer_id.to_string(),
             "remove trusted peer from harness runtime",
         )
         .await;
@@ -5989,8 +5981,9 @@ impl LiveExternalPeerHarness {
     ) {
         let target = meerkat_core::comms::TrustedPeerDescriptor::try_from(target)
             .expect("valid legacy rotation target");
-        apply_test_peer_projection_trust(
-            self.runtime.as_ref(),
+        install_live_external_peer_trust(
+            &self.ingress_finalizer,
+            &self.runtime,
             target.clone(),
             "install legacy rotated supervisor trust",
         )
@@ -6004,8 +5997,9 @@ impl LiveExternalPeerHarness {
                 epoch,
             });
         if let Some(previous) = previous {
-            remove_test_peer_projection_trust(
-                self.runtime.as_ref(),
+            remove_live_external_peer_trust(
+                &self.ingress_finalizer,
+                &self.runtime,
                 &previous.supervisor.peer_id.to_string(),
                 "fence old supervisor for legacy rotation",
             )
@@ -6056,6 +6050,73 @@ impl LiveExternalPeerHarness {
     async fn override_next_bind_peer_id(&self, peer_id: String) {
         *self.bind_peer_id_override.write().await = Some(peer_id);
     }
+}
+
+async fn install_live_external_peer_trust(
+    finalizer: &meerkat_runtime::TestPeerIngressRuntimeFinalizer,
+    runtime: &Arc<meerkat_comms::CommsRuntime>,
+    peer: TrustedPeerDescriptor,
+    context: &'static str,
+) {
+    if let Some(existing) = runtime
+        .trusted_peers_shared()
+        .entries()
+        .into_iter()
+        .find(|existing| existing.peer_id == peer.peer_id)
+    {
+        let existing = TrustedPeerDescriptor {
+            peer_id: existing.peer_id,
+            name: existing.name,
+            address: existing.address,
+            pubkey: *existing.pubkey.as_bytes(),
+        };
+        if existing == peer {
+            return;
+        }
+        let comms_runtime: Arc<dyn CoreCommsRuntime> = runtime.clone();
+        finalizer
+            .remove_peer_from_runtime(existing, comms_runtime)
+            .await
+            .unwrap_or_else(|error| {
+                panic!("{context}: remove superseded generated member trust: {error}")
+            });
+    }
+    let comms_runtime: Arc<dyn CoreCommsRuntime> = runtime.clone();
+    finalizer
+        .trust_peer_on_runtime(peer, comms_runtime)
+        .await
+        .unwrap_or_else(|error| panic!("{context}: add generated member trust: {error}"));
+}
+
+async fn remove_live_external_peer_trust(
+    finalizer: &meerkat_runtime::TestPeerIngressRuntimeFinalizer,
+    runtime: &Arc<meerkat_comms::CommsRuntime>,
+    peer_id: &str,
+    context: &'static str,
+) {
+    let Some(peer) = runtime
+        .trusted_peers_shared()
+        .entries()
+        .into_iter()
+        .find(|peer| peer.peer_id.to_string() == peer_id)
+    else {
+        // Lifecycle cleanup is deliberately idempotent. The explicit bridge
+        // command may have already removed this exact peer before the later
+        // one-way lifecycle projection is observed by the same generated
+        // authority.
+        return;
+    };
+    let peer = TrustedPeerDescriptor {
+        peer_id: peer.peer_id,
+        name: peer.name,
+        address: peer.address,
+        pubkey: *peer.pubkey.as_bytes(),
+    };
+    let comms_runtime: Arc<dyn CoreCommsRuntime> = runtime.clone();
+    finalizer
+        .remove_peer_from_runtime(peer, comms_runtime)
+        .await
+        .unwrap_or_else(|error| panic!("{context}: remove generated member trust: {error}"));
 }
 
 fn consume_countdown_failure(countdown: &AtomicUsize) -> bool {
@@ -6110,10 +6171,18 @@ async fn spawn_live_external_peer_with_transport(
     let _ = listen_tcp;
     let runtime_address = runtime.advertised_address();
     let runtime = Arc::new(runtime);
-    install_ephemeral_peer_request_response_authority(
-        &runtime,
-        &format!("live-external-peer-{peer_name}"),
+    let (_peer_comms, ingress_finalizer) =
+        meerkat_runtime::test_peer_comms_handle_and_runtime_finalizer();
+    ingress_finalizer
+        .install_on(runtime.as_ref())
+        .expect("install member-style durable ingress authority");
+    runtime.install_peer_request_response_authority(
+        meerkat_comms::PeerRequestResponseAuthority::new(
+            ingress_finalizer.peer_interaction_handle(),
+            ingress_finalizer.interaction_stream_handle(),
+        ),
     );
+    let ingress_finalizer = Arc::new(ingress_finalizer);
     let bootstrap_token = runtime.bridge_bootstrap_token().to_string();
     let peer_pubkey = *runtime.public_key().as_bytes();
     let binding = crate::RuntimeBinding::External {
@@ -6123,6 +6192,7 @@ async fn spawn_live_external_peer_with_transport(
         pubkey: peer_pubkey,
     };
     let responder_runtime = runtime.clone();
+    let responder_ingress_finalizer = Arc::clone(&ingress_finalizer);
     let bind_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let responder_bind_count = bind_count.clone();
     let interrupt_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -6190,8 +6260,11 @@ async fn spawn_live_external_peer_with_transport(
             let notified = inbox_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let candidates = responder_runtime.drain_peer_input_candidates().await;
-            if candidates.is_empty() {
+            let claim =
+                CoreCommsRuntime::claim_classified_inbox_interaction(responder_runtime.as_ref())
+                    .await
+                    .expect("live external peer must expose classified claim authority");
+            let Some(claim) = claim else {
                 if responder_runtime.dismiss_received() {
                     break;
                 }
@@ -6208,9 +6281,21 @@ async fn spawn_live_external_peer_with_transport(
                     }
                 }
                 continue;
-            }
+            };
+            let candidate = match claim.delivery_contract() {
+                meerkat_core::PeerIngressDeliveryContract::DurableRuntime => {
+                    responder_ingress_finalizer
+                        .finalize(claim)
+                        .await
+                        .expect("member runtime must durably finalize the exact claimed input")
+                }
+                meerkat_core::PeerIngressDeliveryContract::VolatileControl => claim
+                    .__handoff_volatile()
+                    .expect("volatile supervisor control handoff must commit the exact claim")
+                    .expect("volatile supervisor control claim must retain its candidate"),
+            };
 
-            for candidate in candidates {
+            for candidate in [candidate] {
                 match &candidate.interaction.content {
                     meerkat_core::interaction::InteractionContent::Message { body, .. } => {
                         let delivery = serde_json::from_str::<
@@ -6294,8 +6379,9 @@ async fn spawn_live_external_peer_with_transport(
                                     submission.target.clone(),
                                 )
                                 .expect("valid rotation target");
-                            apply_test_peer_projection_trust(
-                                responder_runtime.as_ref(),
+                            install_live_external_peer_trust(
+                                &responder_ingress_finalizer,
+                                &responder_runtime,
                                 target.clone(),
                                 "publish rotated supervisor trust",
                             )
@@ -6313,8 +6399,9 @@ async fn spawn_live_external_peer_with_transport(
                                 },
                             );
                             if let Some(previous) = previous {
-                                remove_test_peer_projection_trust(
-                                    responder_runtime.as_ref(),
+                                remove_live_external_peer_trust(
+                                    &responder_ingress_finalizer,
+                                    &responder_runtime,
                                     &previous.supervisor.peer_id.to_string(),
                                     "revoke previous supervisor after operation commit",
                                 )
@@ -6410,8 +6497,12 @@ async fn spawn_live_external_peer_with_transport(
                             )
                             .await
                         } else {
-                            trust_candidate_sender_for_reply(responder_runtime.as_ref(), &candidate)
-                                .await
+                            trust_live_external_candidate_sender_for_reply(
+                                &responder_ingress_finalizer,
+                                &responder_runtime,
+                                &candidate,
+                            )
+                            .await
                         };
                         let mut remove_supervisors_after_response = Vec::new();
                         let response = if let Ok(command) = bridge_parse {
@@ -6529,8 +6620,9 @@ async fn spawn_live_external_peer_with_transport(
                                                         .write()
                                                         .await
                                                         .push(supervisor_spec.address.to_string());
-                                                    apply_test_peer_projection_trust(
-                                                        responder_runtime.as_ref(),
+                                                    install_live_external_peer_trust(
+                                                        &responder_ingress_finalizer,
+                                                        &responder_runtime,
                                                         supervisor_spec,
                                                         "bind supervisor",
                                                     )
@@ -6613,8 +6705,9 @@ async fn spawn_live_external_peer_with_transport(
                                                 payload.supervisor.clone(),
                                             )
                                             .expect("valid supervisor spec");
-                                        apply_test_peer_projection_trust(
-                                            responder_runtime.as_ref(),
+                                        install_live_external_peer_trust(
+                                            &responder_ingress_finalizer,
+                                            &responder_runtime,
                                             supervisor_spec,
                                             "trust supervisor for rejection",
                                         )
@@ -6676,8 +6769,9 @@ async fn spawn_live_external_peer_with_transport(
                                                     .write()
                                                     .await
                                                     .push(supervisor_spec.address.to_string());
-                                                apply_test_peer_projection_trust(
-                                                    responder_runtime.as_ref(),
+                                                install_live_external_peer_trust(
+                                                    &responder_ingress_finalizer,
+                                                    &responder_runtime,
                                                     supervisor_spec,
                                                     "authorize supervisor",
                                                 )
@@ -6708,8 +6802,9 @@ async fn spawn_live_external_peer_with_transport(
                                                 .write()
                                                 .await
                                                 .push(supervisor_spec.address.to_string());
-                                            apply_test_peer_projection_trust(
-                                                responder_runtime.as_ref(),
+                                            install_live_external_peer_trust(
+                                                &responder_ingress_finalizer,
+                                                &responder_runtime,
                                                 supervisor_spec,
                                                 "trust supervisor for initial rejection",
                                             )
@@ -6830,8 +6925,9 @@ async fn spawn_live_external_peer_with_transport(
                                                 payload.supervisor,
                                             )
                                             .expect("valid supervisor spec");
-                                        apply_test_peer_projection_trust(
-                                            responder_runtime.as_ref(),
+                                        install_live_external_peer_trust(
+                                            &responder_ingress_finalizer,
+                                            &responder_runtime,
                                             supervisor_spec,
                                             "refresh supervisor for delivery",
                                         )
@@ -6867,8 +6963,9 @@ async fn spawn_live_external_peer_with_transport(
                                             payload.peer_spec,
                                         )
                                         .expect("valid peer spec");
-                                    apply_test_peer_projection_trust(
-                                        responder_runtime.as_ref(),
+                                    install_live_external_peer_trust(
+                                        &responder_ingress_finalizer,
+                                        &responder_runtime,
                                         peer_spec,
                                         "wire trust",
                                     )
@@ -6894,8 +6991,9 @@ async fn spawn_live_external_peer_with_transport(
                                                 payload.peer_spec,
                                             )
                                             .expect("valid peer spec");
-                                        remove_test_peer_projection_trust(
-                                            responder_runtime.as_ref(),
+                                        remove_live_external_peer_trust(
+                                            &responder_ingress_finalizer,
+                                            &responder_runtime,
                                             &peer_spec.peer_id.to_string(),
                                             "unwire trust",
                                         )
@@ -7043,8 +7141,9 @@ async fn spawn_live_external_peer_with_transport(
                                             .expect("peer_added peer_spec")
                                             .try_into()
                                             .expect("peer_added trusted peer spec");
-                                    apply_test_peer_projection_trust(
-                                        responder_runtime.as_ref(),
+                                    install_live_external_peer_trust(
+                                        &responder_ingress_finalizer,
+                                        &responder_runtime,
                                         peer_spec,
                                         "peer_added trust",
                                     )
@@ -7061,8 +7160,9 @@ async fn spawn_live_external_peer_with_transport(
                                             .expect("peer lifecycle peer_spec")
                                             .try_into()
                                             .expect("peer lifecycle trusted peer spec");
-                                    remove_test_peer_projection_trust(
-                                        responder_runtime.as_ref(),
+                                    remove_live_external_peer_trust(
+                                        &responder_ingress_finalizer,
+                                        &responder_runtime,
                                         &peer_spec.peer_id.to_string(),
                                         "peer lifecycle remove trust",
                                     )
@@ -7078,8 +7178,9 @@ async fn spawn_live_external_peer_with_transport(
                             // converge by retrying the exact command.
                             responder_runtime.mark_interaction_complete(candidate.interaction.id.0);
                             for supervisor_pubkey in remove_supervisors_after_response {
-                                remove_test_peer_projection_trust(
-                                    responder_runtime.as_ref(),
+                                remove_live_external_peer_trust(
+                                    &responder_ingress_finalizer,
+                                    &responder_runtime,
                                     &supervisor_pubkey.to_peer_id().to_string(),
                                     "remove rotated supervisor trust after dropped response",
                                 )
@@ -7130,8 +7231,9 @@ async fn spawn_live_external_peer_with_transport(
                             }
                             responder_runtime.mark_interaction_complete(interaction_id.0);
                             for supervisor_pubkey in remove_supervisors_after_response {
-                                remove_test_peer_projection_trust(
-                                    responder_runtime.as_ref(),
+                                remove_live_external_peer_trust(
+                                    &responder_ingress_finalizer,
+                                    &responder_runtime,
                                     &supervisor_pubkey.to_peer_id().to_string(),
                                     "remove rotated supervisor trust",
                                 )
@@ -7149,6 +7251,7 @@ async fn spawn_live_external_peer_with_transport(
                         // responder. The JoinSet is dropped with the harness,
                         // aborting any remaining dead-probe retries.
                         let reply_runtime = Arc::clone(&responder_runtime);
+                        let reply_ingress_finalizer = Arc::clone(&responder_ingress_finalizer);
                         let interaction_id = candidate.interaction.id;
                         reply_tasks.spawn(async move {
                             let send_deadline =
@@ -7182,8 +7285,9 @@ async fn spawn_live_external_peer_with_transport(
                             }
                             reply_runtime.mark_interaction_complete(interaction_id.0);
                             for supervisor_pubkey in remove_supervisors_after_response {
-                                remove_test_peer_projection_trust(
-                                    reply_runtime.as_ref(),
+                                remove_live_external_peer_trust(
+                                    &reply_ingress_finalizer,
+                                    &reply_runtime,
                                     &supervisor_pubkey.to_peer_id().to_string(),
                                     "remove rotated supervisor trust",
                                 )
@@ -7202,6 +7306,7 @@ async fn spawn_live_external_peer_with_transport(
     LiveExternalPeerHarness {
         binding,
         runtime,
+        ingress_finalizer,
         bind_count,
         interrupt_count,
         bind_protocol_versions,
@@ -8946,6 +9051,51 @@ async fn trust_candidate_sender_for_reply(
         comms,
         descriptor,
         "trust typed ingress sender for bridge reply",
+    )
+    .await;
+    route
+}
+
+async fn trust_live_external_candidate_sender_for_reply(
+    finalizer: &meerkat_runtime::TestPeerIngressRuntimeFinalizer,
+    comms: &Arc<meerkat_comms::CommsRuntime>,
+    candidate: &meerkat_core::interaction::PeerInputCandidate,
+) -> PeerRoute {
+    let route = candidate
+        .ingress
+        .route
+        .clone()
+        .or_else(|| {
+            candidate.interaction.from_route.map(|peer_id| {
+                PeerRoute::with_display_name(
+                    peer_id,
+                    PeerName::new(candidate.interaction.from.clone())
+                        .expect("candidate sender display name should be valid"),
+                )
+            })
+        })
+        .expect("peer request candidate must carry a typed reply route");
+    let display_name = route
+        .display_name
+        .clone()
+        .or_else(|| candidate.ingress.display_name.clone())
+        .expect("inproc reply route must carry the sender display name");
+    let signing_pubkey = candidate
+        .ingress
+        .signing_pubkey
+        .expect("peer request candidate must carry the sender signing pubkey");
+    let descriptor = TrustedPeerDescriptor::unsigned_with_pubkey(
+        display_name.as_str(),
+        route.peer_id.to_string(),
+        signing_pubkey,
+        format!("inproc://{}", display_name.as_str()),
+    )
+    .expect("typed ingress sender should convert to a reply trusted peer");
+    install_live_external_peer_trust(
+        finalizer,
+        comms,
+        descriptor,
+        "trust typed ingress sender for live external bridge reply",
     )
     .await;
     route
@@ -40788,6 +40938,7 @@ struct RealCommsSessionService {
     session_keypairs: RwLock<HashMap<SessionId, meerkat_comms::Keypair>>,
     keep_alive_notifiers: RwLock<HashMap<SessionId, Arc<tokio::sync::Notify>>>,
     session_comms_names: RwLock<HashMap<SessionId, String>>,
+    volatile_intake_tasks: std::sync::Mutex<HashMap<SessionId, tokio::task::JoinHandle<()>>>,
     session_counter: AtomicU64,
     runtime_adapter: Arc<meerkat_runtime::MeerkatMachine>,
 }
@@ -40805,6 +40956,7 @@ impl RealCommsSessionService {
             session_keypairs: RwLock::new(HashMap::new()),
             keep_alive_notifiers: RwLock::new(HashMap::new()),
             session_comms_names: RwLock::new(HashMap::new()),
+            volatile_intake_tasks: std::sync::Mutex::new(HashMap::new()),
             session_counter: AtomicU64::new(0),
             runtime_adapter: Arc::new(meerkat_runtime::MeerkatMachine::ephemeral()),
         }
@@ -40818,6 +40970,77 @@ impl RealCommsSessionService {
             .write()
             .await
             .insert(session_id.clone(), revision);
+    }
+
+    fn install_volatile_control_intake(
+        &self,
+        session_id: SessionId,
+        runtime: Arc<meerkat_comms::CommsRuntime>,
+    ) {
+        let task = tokio::spawn(async move {
+            let inbox_notify = runtime.inbox_notify();
+            loop {
+                let notified = inbox_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let claim = CoreCommsRuntime::claim_classified_inbox_interaction(runtime.as_ref())
+                    .await
+                    .expect("real-comms fixture must expose classified claim authority");
+                let Some(claim) = claim else {
+                    if runtime.dismiss_received() {
+                        return;
+                    }
+                    (&mut notified).await;
+                    continue;
+                };
+                if claim.delivery_contract()
+                    != meerkat_core::PeerIngressDeliveryContract::VolatileControl
+                {
+                    // This trust-focused fixture owns only volatile lifecycle
+                    // control. Retain any runtime-bound head for the real
+                    // machine drain instead of laundering it into handoff.
+                    return;
+                }
+                if !matches!(
+                    claim.class(),
+                    meerkat_core::PeerInputClass::PeerLifecycleAdded
+                        | meerkat_core::PeerInputClass::PeerLifecycleRetired
+                        | meerkat_core::PeerInputClass::PeerLifecycleUnwired
+                        | meerkat_core::PeerInputClass::PeerLifecycleKickoffFailed
+                        | meerkat_core::PeerInputClass::PeerLifecycleKickoffCancelled
+                ) {
+                    // Direct comms tests deliberately inspect other volatile
+                    // interactions through the public inbox API. Retain that
+                    // exact FIFO head instead of letting this lifecycle-only
+                    // projection worker become a second general consumer.
+                    return;
+                }
+                let candidate = claim
+                    .__handoff_volatile()
+                    .expect("volatile fixture handoff must commit the exact claim")
+                    .expect("volatile fixture claim must retain its candidate");
+                runtime.mark_interaction_complete(candidate.interaction.id.0);
+            }
+        });
+        let previous = self
+            .volatile_intake_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id, task);
+        if let Some(previous) = previous {
+            previous.abort();
+        }
+    }
+
+    fn remove_volatile_control_intake(&self, session_id: &SessionId) {
+        if let Some(task) = self
+            .volatile_intake_tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id)
+        {
+            task.abort();
+        }
     }
 
     async fn create_session_with_actor_witness_slot(
@@ -40882,6 +41105,7 @@ impl RealCommsSessionService {
             sessions.insert(session_id.clone(), Arc::clone(&comms));
             actor_witness
         };
+        self.install_volatile_control_intake(session_id.clone(), Arc::clone(&comms));
         let is_keep_alive = req.build.as_ref().map(|b| b.keep_alive).unwrap_or(false);
         if is_keep_alive {
             self.keep_alive_notifiers
@@ -41004,6 +41228,7 @@ impl RealCommsSessionService {
         debug_assert!(registry_removed);
         sessions.remove(witness.session_id());
         let session_id = witness.session_id();
+        self.remove_volatile_control_intake(session_id);
         if let Some(notifier) = self.keep_alive_notifiers.write().await.remove(session_id) {
             notifier.notify_waiters();
         }
@@ -41115,6 +41340,7 @@ impl SessionService for RealCommsSessionService {
         if sessions.remove(id).is_some() {
             self.actor_registry.remove_current(id);
         }
+        self.remove_volatile_control_intake(id);
         if let Some(notifier) = self.keep_alive_notifiers.write().await.remove(id) {
             notifier.notify_waiters();
         }
@@ -41367,6 +41593,7 @@ impl MobSessionService for RealCommsSessionService {
         if sessions.remove(session_id).is_some() {
             self.actor_registry.remove_current(session_id);
         }
+        self.remove_volatile_control_intake(session_id);
         if let Some(notifier) = self.keep_alive_notifiers.write().await.remove(session_id) {
             notifier.notify_waiters();
         }
@@ -41422,7 +41649,21 @@ impl RealCommsSessionService {
             .write()
             .await
             .insert(session_id.clone(), comms_name.to_string());
+        self.install_volatile_control_intake(session_id.clone(), Arc::clone(&comms));
         comms
+    }
+}
+
+impl Drop for RealCommsSessionService {
+    fn drop(&mut self) {
+        for (_, task) in self
+            .volatile_intake_tasks
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .drain()
+        {
+            task.abort();
+        }
     }
 }
 
@@ -46444,6 +46685,9 @@ async fn test_wire_enables_peer_request_delivery() {
 
     let _ = CoreCommsRuntime::drain_inbox_interactions(&*comms_a).await;
     let _ = CoreCommsRuntime::drain_inbox_interactions(&*comms_b).await;
+    let ingress_before = CoreCommsRuntime::peer_ingress_queue_snapshot(&*comms_b)
+        .await
+        .expect("worker peer ingress snapshot before request");
 
     let cmd = meerkat_core::comms::CommsCommand::PeerRequest {
         objective_id: None,
@@ -46458,27 +46702,35 @@ async fn test_wire_enables_peer_request_delivery() {
     let receipt = CoreCommsRuntime::send(&*comms_a, cmd)
         .await
         .expect("PeerRequest from l-1 to w-1 should succeed after wire()");
-    assert!(
-        matches!(
-            receipt,
-            meerkat_core::comms::SendReceipt::PeerRequestSent { .. }
-        ),
-        "expected PeerRequestSent, got: {receipt:?}"
-    );
-
-    let interactions = CoreCommsRuntime::drain_inbox_interactions(&*comms_b).await;
+    let envelope_id = match receipt {
+        meerkat_core::comms::SendReceipt::PeerRequestSent {
+            envelope_id,
+            delivery:
+                meerkat_core::comms::PeerDeliveryOutcome::DurablyResolved {
+                    outcome:
+                        meerkat_core::PeerIngressTerminalOutcomeKind::Accepted
+                        | meerkat_core::PeerIngressTerminalOutcomeKind::Deduplicated,
+                },
+            ..
+        } => envelope_id,
+        other => panic!("expected durably resolved PeerRequestSent, got: {other:?}"),
+    };
+    let ingress_after = CoreCommsRuntime::peer_ingress_queue_snapshot(&*comms_b)
+        .await
+        .expect("worker peer ingress snapshot after request");
     assert_eq!(
-        interactions.len(),
-        1,
-        "w-1 should have received exactly one interaction after wire"
+        ingress_after.durably_admitted_count,
+        ingress_before.durably_admitted_count + 1,
+        "wire must deliver the request through exact durable runtime admission"
     );
-    match &interactions[0].content {
-        meerkat_core::InteractionContent::Request { intent, params, .. } => {
-            assert_eq!(intent, "mob.test_ping");
-            assert_eq!(params["test"], true);
-        }
-        other => panic!("expected Request interaction, got: {other:?}"),
-    }
+    assert_eq!(
+        ingress_after
+            .last_delivery_correlation
+            .as_ref()
+            .map(|correlation| correlation.raw_item_id.0),
+        Some(envelope_id),
+        "durable admission correlation must retain the exact sent envelope"
+    );
 }
 
 #[tokio::test]

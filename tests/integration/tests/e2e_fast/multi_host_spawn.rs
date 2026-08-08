@@ -172,15 +172,19 @@ async fn multi_host_spawn_lifecycle_walk() {
     let receipt = send_peer_text(&b2_runtime, b21_peer, "phase-4 wiring beat")
         .await
         .expect("B2 -> B21 delivers over the wired edge");
+    let delivery_proves_admission = match &receipt {
+        SendReceipt::PeerMessageSent {
+            delivery: meerkat_core::comms::PeerDeliveryOutcome::Acked,
+            ..
+        } => true,
+        SendReceipt::PeerMessageSent {
+            delivery: meerkat_core::comms::PeerDeliveryOutcome::DurablyResolved { outcome },
+            ..
+        } => outcome.is_durable_admission(),
+        _ => false,
+    };
     assert!(
-        matches!(
-            receipt,
-            SendReceipt::PeerMessageSent {
-                delivery: meerkat_core::comms::PeerDeliveryOutcome::Acked
-                    | meerkat_core::comms::PeerDeliveryOutcome::HandedOff,
-                ..
-            }
-        ),
+        delivery_proves_admission,
         "B2 -> B21 must be receiver-acked, got {receipt:?}"
     );
     // Unwire: symmetric trust removal, then delivery is refused at the

@@ -639,6 +639,190 @@ where
     .expect("test peer-comms authority thread should finish")
 }
 
+/// Real MeerkatMachine authority for transport tests that must prove durable
+/// peer-ingress admission rather than merely echoing claim facts.
+#[cfg(all(not(target_arch = "wasm32"), any(test, feature = "test-support")))]
+#[doc(hidden)]
+pub struct TestPeerIngressRuntimeFinalizer {
+    machine: Arc<MeerkatMachine>,
+    session_id: meerkat_core::SessionId,
+    runtime_id: LogicalRuntimeId,
+    bindings: meerkat_core::SessionRuntimeBindings,
+}
+
+#[cfg(all(not(target_arch = "wasm32"), any(test, feature = "test-support")))]
+impl TestPeerIngressRuntimeFinalizer {
+    /// Install the exact generated classification authority paired with this
+    /// test finalizer onto a test comms runtime.
+    #[doc(hidden)]
+    pub fn install_on(
+        &self,
+        target: &(dyn meerkat_core::handles::PeerCommsInstallTarget + '_),
+    ) -> Result<(), String> {
+        self.bindings.install_peer_comms_on(target)
+    }
+
+    #[doc(hidden)]
+    pub fn peer_interaction_handle(&self) -> Arc<dyn meerkat_core::handles::PeerInteractionHandle> {
+        Arc::clone(self.bindings.peer_interaction())
+    }
+
+    #[doc(hidden)]
+    pub fn interaction_stream_handle(
+        &self,
+    ) -> Arc<dyn meerkat_core::handles::InteractionStreamHandle> {
+        Arc::clone(self.bindings.interaction_stream())
+    }
+
+    /// Add one peer through the same generated machine authority used by this
+    /// test finalizer.
+    #[doc(hidden)]
+    pub async fn trust_peer_on_runtime(
+        &self,
+        peer: meerkat_core::comms::TrustedPeerDescriptor,
+        runtime: Arc<dyn meerkat_core::agent::CommsRuntime>,
+    ) -> Result<(), String> {
+        self.machine
+            .stage_add_direct_peer_endpoint(
+                &self.session_id,
+                crate::meerkat_machine::dsl::PeerEndpoint::from(&peer),
+                runtime,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Remove one peer through the same generated machine authority used by
+    /// this test finalizer.
+    #[doc(hidden)]
+    pub async fn remove_peer_from_runtime(
+        &self,
+        peer: meerkat_core::comms::TrustedPeerDescriptor,
+        runtime: Arc<dyn meerkat_core::agent::CommsRuntime>,
+    ) -> Result<(), String> {
+        self.machine
+            .stage_remove_direct_peer_endpoint(
+                &self.session_id,
+                crate::meerkat_machine::dsl::PeerEndpoint::from(&peer),
+                runtime,
+            )
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    /// Run the exact claimed runtime-bound candidate through real
+    /// AcceptWithCompletion, then commit only the machine-minted opaque
+    /// receipt to the queue lease.
+    #[doc(hidden)]
+    pub async fn finalize(
+        &self,
+        claim: meerkat_core::PeerIngressQueueClaim,
+    ) -> Result<meerkat_core::interaction::PeerInputCandidate, String> {
+        if claim.delivery_contract() != meerkat_core::PeerIngressDeliveryContract::DurableRuntime {
+            return Err("test runtime finalizer requires a DurableRuntime claim".to_string());
+        }
+        let candidate = claim
+            .candidate()
+            .cloned()
+            .ok_or_else(|| "test runtime finalizer requires a runtime candidate".to_string())?;
+        let input = crate::comms_bridge::classified_interaction_to_runtime_input(
+            &candidate,
+            &self.runtime_id,
+        )
+        .map_err(|error| format!("test peer-ingress projection failed: {error}"))?;
+        let facts = meerkat_core::interaction::PeerIngressClaimCommitFacts {
+            claim_id: claim.claim_id(),
+            raw_item_id: claim.raw_item_id(),
+            class: claim.class(),
+        };
+        let expected_member = match &candidate.interaction.content {
+            meerkat_core::InteractionContent::IncarnationFencedMessage {
+                expected_recipient,
+                ..
+            } => Some(
+                meerkat_contracts::wire::supervisor_bridge::BridgeMemberIncarnation {
+                    mob_id: expected_recipient.mob_id.clone(),
+                    agent_identity: expected_recipient.agent_identity.clone(),
+                    host_id: expected_recipient.host_id.clone(),
+                    binding_generation: expected_recipient.binding_generation,
+                    member_session_id: expected_recipient.member_session_id.clone(),
+                    generation: expected_recipient.generation,
+                    fence_token: expected_recipient.fence_token,
+                },
+            ),
+            _ => None,
+        };
+        let finalization = match expected_member.as_ref() {
+            Some(expected_member) => {
+                self.machine
+                    .accept_peer_ingress_with_completion_for_member_residency(
+                        facts,
+                        &self.session_id,
+                        input,
+                        Some(expected_member),
+                    )
+                    .await
+            }
+            None => {
+                self.machine
+                    .accept_peer_ingress_with_completion(facts, &self.session_id, input)
+                    .await
+            }
+        };
+        match finalization {
+            crate::meerkat_machine::PeerIngressAcceptFinalization::Finalized {
+                receipt, ..
+            } => {
+                claim
+                    .__finalize_with_runtime_receipt(receipt)
+                    .map_err(|error| format!("test peer-ingress claim commit failed: {error}"))?;
+                Ok(candidate)
+            }
+            crate::meerkat_machine::PeerIngressAcceptFinalization::MechanismError(error) => {
+                Err(format!("test AcceptWithCompletion failed: {error}"))
+            }
+        }
+    }
+}
+
+/// Build a generated classification handle and matching durable-admission
+/// finalizer backed by the same real ephemeral MeerkatMachine session.
+#[cfg(all(not(target_arch = "wasm32"), any(test, feature = "test-support")))]
+#[doc(hidden)]
+#[allow(clippy::expect_used)]
+pub fn test_peer_comms_handle_and_runtime_finalizer() -> (
+    Arc<dyn meerkat_core::handles::PeerCommsHandle>,
+    TestPeerIngressRuntimeFinalizer,
+) {
+    std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test peer-ingress runtime should build");
+        runtime.block_on(async move {
+            let machine = Arc::new(MeerkatMachine::ephemeral());
+            let session_id = meerkat_core::SessionId::new();
+            let bindings = machine
+                .prepare_bindings(session_id.clone())
+                .await
+                .expect("MeerkatMachine should prepare test peer-ingress bindings");
+            let peer_comms = Arc::clone(bindings.peer_comms());
+            let runtime_id = LogicalRuntimeId::new(session_id.to_string());
+            (
+                peer_comms,
+                TestPeerIngressRuntimeFinalizer {
+                    machine,
+                    session_id,
+                    runtime_id,
+                    bindings,
+                },
+            )
+        })
+    })
+    .join()
+    .expect("test peer-ingress authority thread should finish")
+}
+
 #[cfg(all(not(target_arch = "wasm32"), any(test, feature = "test-support")))]
 #[doc(hidden)]
 #[allow(clippy::expect_used)]

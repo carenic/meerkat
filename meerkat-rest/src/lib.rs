@@ -56,8 +56,8 @@ use meerkat::{
     schedule_tools_list,
 };
 use meerkat_contracts::{
-    CommsSendParams, CommsSendResult, ErrorCode, RuntimeStateResult, SessionLocator, SkillsParams,
-    WireError, format_session_ref,
+    CommsSendErrorData, CommsSendParams, CommsSendResult, ErrorCode, RuntimeStateResult,
+    SessionLocator, SkillsParams, WireError, format_session_ref,
 };
 use meerkat_core::EventEnvelope;
 #[cfg(test)]
@@ -3077,6 +3077,25 @@ fn normalize_rest_comms_send_error(
                         reason.as_code()
                     ),
                 }),
+            }
+        }
+        meerkat_core::comms::SendError::DurableAdmissionRejected { envelope_id } => {
+            let peer = peer_name.unwrap_or("<unknown>");
+            let message = format!("peer '{peer}' durably rejected envelope {envelope_id}");
+            let data = CommsSendErrorData::PeerInputRejected {
+                peer: peer.to_string(),
+                envelope_id: envelope_id.to_string(),
+                message: message.clone(),
+            };
+            match serde_json::to_value(data) {
+                Ok(details) => ApiError::InternalWithData {
+                    message: format!("peer_input_rejected: {message}"),
+                    code: "peer_input_rejected".to_string(),
+                    details,
+                },
+                Err(error) => {
+                    ApiError::Internal(format!("failed to serialize comms error data: {error}"))
+                }
             }
         }
         other => ApiError::InternalWithData {
@@ -10936,6 +10955,30 @@ mod tests {
 
     #[cfg(feature = "comms")]
     #[test]
+    fn test_normalize_rest_comms_send_error_preserves_durable_rejection_identity() {
+        let envelope_id = uuid::Uuid::new_v4();
+        let err = normalize_rest_comms_send_error(
+            Some("peer-a"),
+            &meerkat_core::comms::SendError::DurableAdmissionRejected { envelope_id },
+        );
+        match err {
+            ApiError::InternalWithData {
+                message,
+                code,
+                details,
+            } => {
+                assert!(message.starts_with("peer_input_rejected:"));
+                assert_eq!(code, "peer_input_rejected");
+                assert_eq!(details["code"], "peer_input_rejected");
+                assert_eq!(details["peer"], "peer-a");
+                assert_eq!(details["envelope_id"], envelope_id.to_string());
+            }
+            other => panic!("expected structured internal error, got {other:?}"),
+        }
+    }
+
+    #[cfg(feature = "comms")]
+    #[test]
     fn test_rest_comms_send_result_uses_contract_peer_request_projection() {
         let envelope_id = uuid::Uuid::new_v4();
         let interaction_id = meerkat_core::interaction::InteractionId(uuid::Uuid::new_v4());
@@ -10945,6 +10988,7 @@ mod tests {
                 envelope_id,
                 interaction_id,
                 stream_reserved: true,
+                delivery: meerkat_core::comms::PeerDeliveryOutcome::Queued,
             },
         ))
         .unwrap();
@@ -10957,6 +11001,7 @@ mod tests {
             payload["interaction_id"],
             serde_json::json!(interaction_id.0.to_string())
         );
+        assert_eq!(payload["delivery"], serde_json::json!("queued"));
     }
 
     #[cfg(feature = "comms")]

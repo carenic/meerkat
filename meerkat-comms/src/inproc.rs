@@ -26,11 +26,16 @@ use parking_lot::RwLock;
 use uuid::Uuid;
 
 use crate::identity::{Keypair, PubKey, Signature};
-use crate::inbox::{AdmissionOutcome, DropReason, InboxSender};
+use crate::inbox::{AdmissionOutcome, DropReason, InboxSender, IngressDeliveryOutcome};
 use crate::peer_meta::PeerMeta;
 use crate::types::{Envelope, InboxItem, MessageKind};
 
 const DEFAULT_NAMESPACE: &str = "";
+
+pub(crate) struct InprocDelivery {
+    pub(crate) envelope_id: Uuid,
+    pub(crate) outcome: IngressDeliveryOutcome,
+}
 
 /// Snapshot of an inproc peer returned by [`InprocRegistry::peers()`].
 #[derive(Debug, Clone)]
@@ -512,7 +517,7 @@ impl InprocRegistry {
         envelope_id: Uuid,
         kind: MessageKind,
         sign_envelope: bool,
-    ) -> Result<uuid::Uuid, InprocSendError> {
+    ) -> Result<InprocDelivery, InprocSendError> {
         let sender = self
             .get_by_pubkey_any_namespace(to_pubkey)
             .ok_or_else(|| InprocSendError::PeerNotFound(to_pubkey.to_peer_id().to_string()))?;
@@ -547,7 +552,7 @@ impl InprocRegistry {
         envelope_id: Uuid,
         kind: MessageKind,
         sign_envelope: bool,
-    ) -> Result<uuid::Uuid, InprocSendError> {
+    ) -> Result<InprocDelivery, InprocSendError> {
         let sender = self
             .get_by_pubkey_in_namespace(namespace, to_pubkey)
             .ok_or_else(|| InprocSendError::PeerNotFound(to_pubkey.to_peer_id().to_string()))?;
@@ -570,7 +575,8 @@ impl InprocRegistry {
         envelope_id: Uuid,
         kind: MessageKind,
         sign_envelope: bool,
-    ) -> Result<uuid::Uuid, InprocSendError> {
+    ) -> Result<InprocDelivery, InprocSendError> {
+        let response_uses_legacy_queue_semantics = matches!(&kind, MessageKind::Response { .. });
         let mut envelope = Envelope {
             id: envelope_id,
             from: from_keypair.public_key(),
@@ -583,20 +589,45 @@ impl InprocRegistry {
         }
 
         let envelope_id = envelope.id;
-        match sender.send_wait(InboxItem::External { envelope }).await {
-            AdmissionOutcome::Admitted => {}
-            AdmissionOutcome::Dropped {
+        if response_uses_legacy_queue_semantics {
+            return match sender.send_wait(InboxItem::External { envelope }).await {
+                AdmissionOutcome::Admitted => Ok(InprocDelivery {
+                    envelope_id,
+                    outcome: IngressDeliveryOutcome::Queued,
+                }),
+                AdmissionOutcome::Dropped {
+                    reason: DropReason::SessionClosed,
+                } => Err(InprocSendError::InboxClosed),
+                AdmissionOutcome::Dropped {
+                    reason: DropReason::InboxFull,
+                } => Err(InprocSendError::InboxFull),
+                AdmissionOutcome::Dropped { reason } => {
+                    Err(InprocSendError::IngressDropped(reason))
+                }
+            };
+        }
+        match sender
+            .send_wait_for_delivery(InboxItem::External { envelope })
+            .await
+        {
+            IngressDeliveryOutcome::Queued => unreachable!(
+                "only the immediate legacy Response path produces queued inproc delivery"
+            ),
+            outcome @ (IngressDeliveryOutcome::DurablyResolved(_)
+            | IngressDeliveryOutcome::VolatileHandedOff) => Ok(InprocDelivery {
+                envelope_id,
+                outcome,
+            }),
+            IngressDeliveryOutcome::Dropped {
                 reason: DropReason::SessionClosed,
-            } => return Err(InprocSendError::InboxClosed),
-            AdmissionOutcome::Dropped {
+            } => Err(InprocSendError::InboxClosed),
+            IngressDeliveryOutcome::Dropped {
                 reason: DropReason::InboxFull,
-            } => return Err(InprocSendError::InboxFull),
-            AdmissionOutcome::Dropped { reason } => {
-                return Err(InprocSendError::IngressDropped(reason));
+            } => Err(InprocSendError::InboxFull),
+            IngressDeliveryOutcome::Dropped { reason } => {
+                Err(InprocSendError::IngressDropped(reason))
             }
         }
-
-        Ok(envelope_id)
     }
 
     /// List all registered peer names in an explicit namespace.
@@ -656,12 +687,81 @@ mod tests {
     use crate::classify::test_support;
     use crate::inbox::Inbox;
     use crate::trust::TrustStore;
+    use parking_lot::RwLock;
+    use std::sync::Arc;
 
     fn classified_inbox() -> (Inbox, crate::InboxSender) {
+        classified_inbox_with_auth(false)
+    }
+
+    fn classified_inbox_with_auth(require_peer_auth: bool) -> (Inbox, crate::InboxSender) {
         Inbox::new_classified(test_support::classification_context(
             TrustStore::new(),
-            false,
+            require_peer_auth,
         ))
+    }
+
+    fn classified_inbox_with_runtime() -> (
+        Inbox,
+        crate::InboxSender,
+        Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer>,
+    ) {
+        let (peer_comms_handle, finalizer) =
+            meerkat_runtime::test_peer_comms_handle_and_runtime_finalizer();
+        let context = Arc::new(crate::classify::IngressClassificationContext {
+            require_peer_auth: false,
+            trusted_peers: Arc::new(RwLock::new(TrustStore::new())),
+            peer_comms_handle: Arc::new(RwLock::new(Some(peer_comms_handle))),
+            inproc_namespace: None,
+            durable_runtime_consumer: true,
+        });
+        let (inbox, sender) = Inbox::new_classified(context);
+        (inbox, sender, Arc::new(finalizer))
+    }
+
+    fn spawn_runtime_finalization(
+        inbox: Arc<Inbox>,
+        finalizer: Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer>,
+    ) -> tokio::task::JoinHandle<meerkat_core::interaction::PeerInputCandidate> {
+        tokio::spawn(async move {
+            let claimed = loop {
+                if let Some(claimed) = inbox.try_claim_one_classified() {
+                    break claimed;
+                }
+                tokio::task::yield_now().await;
+            };
+            let claim = crate::runtime::comms_runtime::test_peer_ingress_queue_claim(claimed);
+            finalizer
+                .finalize(claim)
+                .await
+                .expect("real test MeerkatMachine must durably finalize the exact inproc claim")
+        })
+    }
+
+    fn spawn_volatile_handoff(
+        inbox: Arc<Inbox>,
+    ) -> tokio::task::JoinHandle<crate::inbox::ClassifiedInboxEntry> {
+        tokio::spawn(async move {
+            let claimed = loop {
+                if let Some(claimed) = inbox.try_claim_one_classified() {
+                    break claimed;
+                }
+                tokio::task::yield_now().await;
+            };
+            let entry = claimed.entry.clone();
+            let claim = meerkat_core::interaction::PeerIngressQueueClaim::from_comms_queue(
+                claimed.claim_id,
+                claimed.entry.raw_item_id,
+                claimed.entry.class,
+                claimed.entry.delivery_contract,
+                None,
+                claimed.lease,
+            );
+            claim
+                .__handoff_volatile()
+                .expect("volatile inproc handoff must remove the exact claimed head");
+            entry
+        })
     }
 
     fn make_keypair() -> Keypair {
@@ -967,8 +1067,9 @@ mod tests {
 
         // Set up receiver
         let receiver_keypair = make_keypair();
-        let (mut inbox, sender) = classified_inbox();
+        let (inbox, sender, finalizer) = classified_inbox_with_runtime();
         registry.register("receiver", receiver_keypair.public_key(), sender);
+        let finalize = spawn_runtime_finalization(Arc::new(inbox), finalizer);
 
         // Set up sender
         let sender_keypair = make_keypair();
@@ -990,29 +1091,208 @@ mod tests {
                 true,
             )
             .await;
-        assert!(result.is_ok());
+        let delivery = result.expect("runtime-bound Message must be durably admitted");
+        assert!(matches!(
+            delivery.outcome,
+            IngressDeliveryOutcome::DurablyResolved(
+                meerkat_core::PeerIngressTerminalOutcomeKind::Accepted
+            )
+        ));
 
-        // Verify message was received
-        let items = inbox.try_drain_classified();
-        assert_eq!(items.len(), 1);
-
-        match &items[0].item {
-            InboxItem::External { envelope } => {
-                assert_eq!(envelope.from, sender_keypair.public_key());
-                assert_eq!(envelope.to, receiver_keypair.public_key());
-                match &envelope.kind {
-                    MessageKind::Message {
-                        blocks: None, body, ..
-                    } => {
-                        assert_eq!(body, "hello inproc");
-                    }
-                    _ => panic!("expected Message kind"),
-                }
-                // Verify signature
-                assert!(envelope.verify());
+        let candidate = finalize.await.expect("runtime finalizer completes");
+        assert_eq!(
+            candidate.interaction.from,
+            sender_keypair.public_key().to_pubkey_string()
+        );
+        match candidate.interaction.content {
+            meerkat_core::InteractionContent::Message { body, blocks: None } => {
+                assert_eq!(body, "hello inproc");
             }
-            _ => panic!("expected External inbox item"),
+            other => panic!("expected Message interaction, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn retrying_same_envelope_deduplicates_before_exact_claim_commit() {
+        let registry = InprocRegistry::new();
+        let receiver_keypair = make_keypair();
+        let (inbox, sender, finalizer) = classified_inbox_with_runtime();
+        let inbox = Arc::new(inbox);
+        registry.register("receiver", receiver_keypair.public_key(), sender);
+        let sender_keypair = make_keypair();
+        let envelope_id = Uuid::new_v4();
+        let message = || MessageKind::Message {
+            objective_id: None,
+            content_taint: None,
+            blocks: None,
+            body: "stable retry".to_string(),
+            handling_mode: None,
+        };
+
+        let first_finalize = spawn_runtime_finalization(Arc::clone(&inbox), Arc::clone(&finalizer));
+        let first = registry
+            .send_to_pubkey_in_namespace_with_id_wait(
+                "",
+                &sender_keypair,
+                &receiver_keypair.public_key(),
+                envelope_id,
+                message(),
+                true,
+            )
+            .await
+            .expect("first stable envelope delivery should resolve");
+        first_finalize
+            .await
+            .expect("first actual-machine admission should complete");
+        assert!(matches!(
+            first.outcome,
+            IngressDeliveryOutcome::DurablyResolved(
+                meerkat_core::PeerIngressTerminalOutcomeKind::Accepted
+            )
+        ));
+
+        let retry_finalize = spawn_runtime_finalization(Arc::clone(&inbox), Arc::clone(&finalizer));
+        let retry = registry
+            .send_to_pubkey_in_namespace_with_id_wait(
+                "",
+                &sender_keypair,
+                &receiver_keypair.public_key(),
+                envelope_id,
+                message(),
+                true,
+            )
+            .await
+            .expect("same-envelope retry should resolve by durable deduplication");
+        retry_finalize
+            .await
+            .expect("retry actual-machine admission should complete");
+        assert!(matches!(
+            retry.outcome,
+            IngressDeliveryOutcome::DurablyResolved(
+                meerkat_core::PeerIngressTerminalOutcomeKind::Deduplicated
+            )
+        ));
+
+        let projection = inbox
+            .classified_snapshot()
+            .expect("classified queue projection should exist");
+        assert_eq!(projection.total_count, 0);
+        assert_eq!(projection.durably_admitted_count, 2);
+        assert_eq!(projection.terminal_outcomes.accepted, 1);
+        assert_eq!(projection.terminal_outcomes.deduplicated, 1);
+        let correlation = projection
+            .last_delivery_correlation
+            .expect("retry commit should publish stable delivery correlation");
+        assert_eq!(
+            correlation.raw_item_id,
+            meerkat_core::InteractionId(envelope_id)
+        );
+        assert_eq!(
+            correlation.outcome,
+            meerkat_core::PeerIngressTerminalOutcomeKind::Deduplicated
+        );
+        assert!(correlation.existing_runtime_input_id.is_some());
+    }
+
+    #[tokio::test]
+    async fn response_preserves_legacy_queued_inproc_semantics() {
+        let registry = InprocRegistry::new();
+        let receiver_keypair = make_keypair();
+        let in_reply_to = meerkat_core::InteractionId(Uuid::new_v4());
+        let (mut inbox, sender) = classified_inbox();
+        registry.register("receiver", receiver_keypair.public_key(), sender);
+        let sender_keypair = make_keypair();
+        let response_id = Uuid::new_v4();
+
+        let delivery = registry
+            .send_to_pubkey_in_namespace_with_id_wait(
+                "",
+                &sender_keypair,
+                &receiver_keypair.public_key(),
+                response_id,
+                MessageKind::Response {
+                    objective_id: None,
+                    content_taint: None,
+                    in_reply_to: in_reply_to.0,
+                    status: crate::types::Status::Completed,
+                    result: serde_json::json!({}),
+                    blocks: None,
+                    handling_mode: None,
+                },
+                true,
+            )
+            .await
+            .expect("Response must complete after queue admission");
+
+        assert_eq!(delivery.envelope_id, response_id);
+        assert!(matches!(delivery.outcome, IngressDeliveryOutcome::Queued));
+        let mut entries = inbox.try_drain_classified();
+        assert_eq!(entries.len(), 1);
+        let entry = entries.pop().expect("queued Response entry");
+        let InboxItem::External { envelope } = entry.item else {
+            panic!("expected external Response envelope");
+        };
+        assert_eq!(envelope.id, response_id);
+    }
+
+    #[tokio::test]
+    async fn supervisor_bridge_request_is_auth_exempt_volatile_control() {
+        let registry = InprocRegistry::new();
+        let receiver_keypair = make_keypair();
+        let (inbox, sender) = classified_inbox_with_auth(true);
+        registry.register("receiver", receiver_keypair.public_key(), sender);
+        let handoff = spawn_volatile_handoff(Arc::new(inbox));
+        let sender_keypair = make_keypair();
+        let request_id = Uuid::new_v4();
+
+        let delivery = registry
+            .send_to_pubkey_in_namespace_with_id_wait(
+                "",
+                &sender_keypair,
+                &receiver_keypair.public_key(),
+                request_id,
+                MessageKind::Request {
+                    objective_id: None,
+                    content_taint: None,
+                    intent: meerkat_core::SUPERVISOR_BRIDGE_INTENT.to_string(),
+                    params: serde_json::json!({
+                        "command": "bind_member",
+                        "supervisor": {
+                            "name": "mob/__mob_supervisor__",
+                            "peer_id": sender_keypair.public_key().to_peer_id(),
+                            "address": "inproc://mob/__mob_supervisor__"
+                        },
+                        "epoch": 1,
+                        "protocol_version": 1,
+                        "expected_peer_id": "peer-id",
+                        "expected_address": "inproc://peer"
+                    }),
+                    blocks: None,
+                    reply_endpoint: None,
+                    handling_mode: None,
+                },
+                true,
+            )
+            .await
+            .expect("auth-exempt supervisor bridge request must hand off as volatile control");
+
+        assert_eq!(delivery.envelope_id, request_id);
+        assert!(matches!(
+            delivery.outcome,
+            IngressDeliveryOutcome::VolatileHandedOff
+        ));
+        let entry = handoff.await.expect("volatile handoff task completes");
+        assert_eq!(entry.class, meerkat_core::PeerInputClass::ActionableRequest);
+        assert_eq!(
+            entry.auth,
+            meerkat_core::PeerIngressAuthDecision::Exempt(
+                meerkat_core::PeerIngressAuthExemption::SupervisorBridge
+            )
+        );
+        let InboxItem::External { envelope } = entry.item else {
+            panic!("expected external supervisor bridge Request envelope");
+        };
+        assert_eq!(envelope.id, request_id);
     }
 
     #[tokio::test]
@@ -1077,7 +1357,7 @@ mod tests {
     async fn test_registry_namespace_isolation_for_lookup_and_send() {
         let registry = InprocRegistry::new();
         let receiver_keypair = make_keypair();
-        let (mut inbox, sender) = classified_inbox();
+        let (inbox, sender, finalizer) = classified_inbox_with_runtime();
         registry.register_with_meta_in_namespace(
             "realm-a",
             "receiver",
@@ -1085,6 +1365,7 @@ mod tests {
             sender,
             PeerMeta::default(),
         );
+        let finalize = spawn_runtime_finalization(Arc::new(inbox), finalizer);
 
         // Default namespace cannot see realm-a registrations.
         assert!(
@@ -1117,7 +1398,12 @@ mod tests {
                 true,
             )
             .await;
-        assert!(ok.is_ok());
+        assert!(matches!(
+            ok.expect("matching namespace must deliver").outcome,
+            IngressDeliveryOutcome::DurablyResolved(
+                meerkat_core::PeerIngressTerminalOutcomeKind::Accepted
+            )
+        ));
 
         // Different namespace cannot route to receiver.
         let wrong_ns = registry
@@ -1138,8 +1424,7 @@ mod tests {
             .await;
         assert!(matches!(wrong_ns, Err(InprocSendError::PeerNotFound(_))));
 
-        let items = inbox.try_drain_classified();
-        assert_eq!(items.len(), 1);
+        finalize.await.expect("runtime finalizer completes");
     }
 
     #[tokio::test]
@@ -1149,7 +1434,7 @@ mod tests {
         let target_pubkey = target_keypair.public_key();
         let shadow_keypair = make_keypair();
         let shadow_pubkey = shadow_keypair.public_key();
-        let (mut target_inbox, target_sender) = classified_inbox();
+        let (target_inbox, target_sender, target_finalizer) = classified_inbox_with_runtime();
         let (mut shadow_inbox, shadow_sender) = classified_inbox();
 
         registry.register_with_meta_in_namespace(
@@ -1159,6 +1444,7 @@ mod tests {
             target_sender,
             PeerMeta::default(),
         );
+        let finalize_target = spawn_runtime_finalization(Arc::new(target_inbox), target_finalizer);
         registry.register_with_meta_in_namespace(
             "",
             "shared-display-name",
@@ -1184,15 +1470,19 @@ mod tests {
                 true,
             )
             .await;
-        assert!(result.is_ok());
+        let delivery = result.expect("canonical target must receive");
+        assert!(matches!(
+            delivery.outcome,
+            IngressDeliveryOutcome::DurablyResolved(
+                meerkat_core::PeerIngressTerminalOutcomeKind::Accepted
+            )
+        ));
 
         assert_eq!(shadow_inbox.try_drain_classified().len(), 0);
-        let items = target_inbox.try_drain_classified();
-        assert_eq!(items.len(), 1);
-        let InboxItem::External { envelope } = &items[0].item else {
-            panic!("expected external envelope");
-        };
-        assert_eq!(envelope.to, target_pubkey);
+        let candidate = finalize_target
+            .await
+            .expect("target runtime finalizer completes");
+        assert_eq!(candidate.interaction.id.0, delivery.envelope_id);
     }
 
     #[tokio::test]

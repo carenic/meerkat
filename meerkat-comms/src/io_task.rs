@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncWrite};
 use tokio_util::codec::Framed;
 
 use crate::identity::{Keypair, PubKey, Signature};
-use crate::inbox::{AdmissionOutcome, DropReason, InboxSender};
+use crate::inbox::{DropReason, InboxSender};
 use crate::transport::TransportError;
 use crate::transport::codec::{EnvelopeFrame, TransportCodec};
 use crate::types::{Envelope, MessageKind};
@@ -160,17 +160,54 @@ where
         });
     };
 
+    // Ack remains fire-and-forget. Response retains its legacy queue-admission
+    // semantics: it neither waits for a handler nor produces another ACK.
+    if matches!(
+        &envelope.kind,
+        MessageKind::Ack { .. } | MessageKind::Response { .. }
+    ) {
+        return match inbox_sender.send_connection_ingress(envelope, require_peer_auth) {
+            crate::inbox::AdmissionOutcome::Admitted => Ok(()),
+            crate::inbox::AdmissionOutcome::Dropped { reason } => Err(match reason {
+                DropReason::SessionClosed => IoTaskError::InboxClosed,
+                DropReason::InboxFull => IoTaskError::InboxFull,
+                DropReason::UntrustedSender | DropReason::ClassificationRejected => {
+                    IoTaskError::IngressDropped(reason)
+                }
+            }),
+        };
+    }
+
     // Admit through the inbox seam first. Typed admission outcome: explicit
     // drops are surfaced as `IoTaskError` so the IO task can react (close
     // connection, log, etc.) rather than silently returning `Ok(())`.
+    // Runtime-bound peer input is acknowledged only after exact durable
+    // admission. Control traffic receives a signed legacy ack as soon as its
+    // exact FIFO head is handed to the volatile consumer; that weaker ack does
+    // not claim runtime durability.
     let admission = match observed_tcp_source {
         Some(source) => {
-            inbox_sender.send_tcp_connection_ingress(envelope.clone(), require_peer_auth, source)
+            inbox_sender
+                .send_tcp_connection_ingress_for_delivery(
+                    envelope.clone(),
+                    require_peer_auth,
+                    source,
+                )
+                .await
         }
-        None => inbox_sender.send_connection_ingress(envelope.clone(), require_peer_auth),
+        None => {
+            inbox_sender
+                .send_connection_ingress_for_delivery(envelope.clone(), require_peer_auth)
+                .await
+        }
     };
     match admission {
-        AdmissionOutcome::Admitted => {
+        crate::inbox::IngressDeliveryOutcome::DurablyResolved(
+            meerkat_core::interaction::PeerIngressTerminalOutcomeKind::Rejected,
+        ) => Err(IoTaskError::DurableAdmissionRejected {
+            envelope_id: envelope.id,
+        }),
+        crate::inbox::IngressDeliveryOutcome::DurablyResolved(_) => {
             if should_ack(&envelope.kind) {
                 let ack = create_ack(&envelope, &keypair);
                 let frame = EnvelopeFrame {
@@ -181,7 +218,19 @@ where
             }
             Ok(())
         }
-        AdmissionOutcome::Dropped { reason } => Err(match reason {
+        crate::inbox::IngressDeliveryOutcome::VolatileHandedOff => {
+            if should_ack(&envelope.kind) {
+                let ack = create_ack(&envelope, &keypair);
+                let frame = EnvelopeFrame {
+                    envelope: ack,
+                    raw: Arc::new(Bytes::new()),
+                };
+                framed.send(frame).await?;
+            }
+            Ok(())
+        }
+        crate::inbox::IngressDeliveryOutcome::Queued => Ok(()),
+        crate::inbox::IngressDeliveryOutcome::Dropped { reason } => Err(match reason {
             DropReason::SessionClosed => IoTaskError::InboxClosed,
             DropReason::InboxFull => IoTaskError::InboxFull,
             DropReason::UntrustedSender | DropReason::ClassificationRejected => {
@@ -196,7 +245,8 @@ where
 /// Per spec:
 /// - Message: Yes
 /// - Request: Yes
-/// - Response: No
+/// - Response: No (legacy queued/no-ack semantics)
+/// - Lifecycle: Yes (legacy volatile handoff ack)
 /// - Ack: Never (would cause infinite loop)
 fn should_ack(kind: &MessageKind) -> bool {
     matches!(
@@ -204,6 +254,7 @@ fn should_ack(kind: &MessageKind) -> bool {
         MessageKind::Message { .. }
             | MessageKind::IncarnationFencedMessage { .. }
             | MessageKind::Request { .. }
+            | MessageKind::Lifecycle { .. }
     )
 }
 
@@ -241,6 +292,8 @@ pub enum IoTaskError {
     InvalidSignature { envelope_id: uuid::Uuid },
     #[error("Rejected envelope {envelope_id}: misaddressed (not addressed to us)")]
     Misaddressed { envelope_id: uuid::Uuid },
+    #[error("Rejected envelope {envelope_id}: durable peer input was rejected")]
+    DurableAdmissionRejected { envelope_id: uuid::Uuid },
 }
 
 impl IoTaskError {
@@ -250,7 +303,10 @@ impl IoTaskError {
     pub fn is_admission_rejection(&self) -> bool {
         matches!(
             self,
-            Self::InvalidSignature { .. } | Self::Misaddressed { .. } | Self::IngressDropped(_)
+            Self::InvalidSignature { .. }
+                | Self::Misaddressed { .. }
+                | Self::IngressDropped(_)
+                | Self::DurableAdmissionRejected { .. }
         )
     }
 }
@@ -263,7 +319,6 @@ mod tests {
     use crate::identity::PubKey;
     use crate::inbox::Inbox;
     use crate::trust::{TrustEntry, TrustStore};
-    use crate::types::InboxItem;
     use futures::StreamExt;
     use parking_lot::RwLock;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -304,6 +359,74 @@ mod tests {
             trusted.clone(),
             require_peer_auth,
         ))
+    }
+
+    fn classified_inbox_for_trust_with_runtime(
+        trusted: &Arc<RwLock<TrustStore>>,
+        require_peer_auth: bool,
+    ) -> (
+        Inbox,
+        InboxSender,
+        meerkat_runtime::TestPeerIngressRuntimeFinalizer,
+    ) {
+        let (peer_comms_handle, finalizer) =
+            meerkat_runtime::test_peer_comms_handle_and_runtime_finalizer();
+        let context = Arc::new(crate::classify::IngressClassificationContext {
+            require_peer_auth,
+            trusted_peers: trusted.clone(),
+            peer_comms_handle: Arc::new(RwLock::new(Some(peer_comms_handle))),
+            inproc_namespace: None,
+            durable_runtime_consumer: true,
+        });
+        let (inbox, sender) = Inbox::new_classified(context);
+        (inbox, sender, finalizer)
+    }
+
+    fn spawn_finalize_next_runtime(
+        inbox: Arc<Inbox>,
+        finalizer: meerkat_runtime::TestPeerIngressRuntimeFinalizer,
+    ) -> tokio::task::JoinHandle<meerkat_core::interaction::PeerInputCandidate> {
+        tokio::spawn(async move {
+            let claimed = loop {
+                if let Some(claimed) = inbox.try_claim_one_classified() {
+                    break claimed;
+                }
+                tokio::task::yield_now().await;
+            };
+            let claim = crate::runtime::comms_runtime::test_peer_ingress_queue_claim(claimed);
+            finalizer
+                .finalize(claim)
+                .await
+                .expect("real test MeerkatMachine must durably finalize the exact claim")
+        })
+    }
+
+    async fn handoff_next_volatile(inbox: &Inbox) -> crate::inbox::ClassifiedInboxEntry {
+        let claimed = loop {
+            if let Some(claimed) = inbox.try_claim_one_classified() {
+                break claimed;
+            }
+            tokio::task::yield_now().await;
+        };
+        let entry = claimed.entry.clone();
+        let claim = meerkat_core::interaction::PeerIngressQueueClaim::from_comms_queue(
+            claimed.claim_id,
+            claimed.entry.raw_item_id,
+            claimed.entry.class,
+            claimed.entry.delivery_contract,
+            None,
+            claimed.lease,
+        );
+        claim
+            .__handoff_volatile()
+            .expect("volatile test handoff must remove the exact claimed head");
+        entry
+    }
+
+    fn spawn_handoff_next_volatile(
+        inbox: Arc<Inbox>,
+    ) -> tokio::task::JoinHandle<crate::inbox::ClassifiedInboxEntry> {
+        tokio::spawn(async move { handoff_next_volatile(&inbox).await })
     }
 
     fn make_signed_envelope(from_keypair: &Keypair, to: PubKey, kind: MessageKind) -> Envelope {
@@ -533,7 +656,9 @@ mod tests {
         let sender_keypair = make_keypair();
         let receiver_keypair = make_keypair();
         let trusted = make_trusted_peers(&make_keypair().public_key());
-        let (mut inbox, inbox_sender) = classified_inbox_for_trust(&trusted, false);
+        let (inbox, inbox_sender, finalizer) =
+            classified_inbox_for_trust_with_runtime(&trusted, false);
+        let finalize = spawn_finalize_next_runtime(Arc::new(inbox), finalizer);
 
         let envelope = Envelope {
             id: Uuid::new_v4(),
@@ -568,12 +693,8 @@ mod tests {
             _ => panic!("expected Ack"),
         }
 
-        let items = inbox.try_drain_classified();
-        assert_eq!(items.len(), 1);
-        match &items[0].item {
-            InboxItem::External { envelope } => assert_eq!(envelope.id, expected_id),
-            _ => panic!("expected External"),
-        }
+        let candidate = finalize.await.unwrap();
+        assert_eq!(candidate.interaction.id.0, expected_id);
     }
 
     #[tokio::test]
@@ -582,7 +703,9 @@ mod tests {
         let receiver_keypair = make_keypair();
         let untrusted_keypair = make_keypair();
         let trusted = make_trusted_peers(&untrusted_keypair.public_key()); // not relevant in no-auth mode
-        let (mut inbox, inbox_sender) = classified_inbox_for_trust(&trusted, false);
+        let (inbox, inbox_sender, finalizer) =
+            classified_inbox_for_trust_with_runtime(&trusted, false);
+        let finalize = spawn_finalize_next_runtime(Arc::new(inbox), finalizer);
 
         let envelope = make_signed_envelope(
             &sender_keypair, // not in trusted list
@@ -615,12 +738,8 @@ mod tests {
             _ => panic!("expected Ack"),
         }
 
-        let items = inbox.try_drain_classified();
-        assert_eq!(items.len(), 1);
-        match &items[0].item {
-            InboxItem::External { envelope } => assert_eq!(envelope.id, expected_id),
-            _ => panic!("expected External"),
-        }
+        let candidate = finalize.await.unwrap();
+        assert_eq!(candidate.interaction.id.0, expected_id);
     }
 
     #[tokio::test]
@@ -628,7 +747,9 @@ mod tests {
         let sender_keypair = make_keypair();
         let receiver_keypair = make_keypair();
         let trusted = make_trusted_peers(&sender_keypair.public_key());
-        let (_inbox, inbox_sender) = classified_inbox_for_trust(&trusted, true);
+        let (inbox, inbox_sender, finalizer) =
+            classified_inbox_for_trust_with_runtime(&trusted, true);
+        let finalize = spawn_finalize_next_runtime(Arc::new(inbox), finalizer);
 
         let envelope = make_signed_envelope(
             &sender_keypair,
@@ -660,6 +781,7 @@ mod tests {
         // Read ack from client side
         let ack = read_one_envelope(&mut client_read).await.unwrap();
         handle.await.unwrap().unwrap();
+        finalize.await.unwrap();
 
         // Verify ack
         match ack.kind {
@@ -676,7 +798,9 @@ mod tests {
         let sender_keypair = make_keypair();
         let receiver_keypair = make_keypair();
         let trusted = make_trusted_peers(&sender_keypair.public_key());
-        let (mut inbox, inbox_sender) = classified_inbox_for_trust(&trusted, true);
+        let (inbox, inbox_sender, finalizer) =
+            classified_inbox_for_trust_with_runtime(&trusted, true);
+        let finalize = spawn_finalize_next_runtime(Arc::new(inbox), finalizer);
 
         let envelope = make_signed_envelope(
             &sender_keypair,
@@ -706,15 +830,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Check inbox
-        let items = inbox.try_drain_classified();
-        assert_eq!(items.len(), 1);
-        match &items[0].item {
-            InboxItem::External { envelope } => {
-                assert_eq!(envelope.id, envelope_id);
-            }
-            _ => panic!("expected External"),
-        }
+        let candidate = finalize.await.unwrap();
+        assert_eq!(candidate.interaction.id.0, envelope_id);
     }
 
     #[tokio::test]
@@ -722,7 +839,9 @@ mod tests {
         let sender_keypair = make_keypair();
         let receiver_keypair = make_keypair();
         let trusted = make_trusted_peers(&sender_keypair.public_key());
-        let (_inbox, inbox_sender) = classified_inbox_for_trust(&trusted, true);
+        let (inbox, inbox_sender, finalizer) =
+            classified_inbox_for_trust_with_runtime(&trusted, true);
+        let finalize = spawn_finalize_next_runtime(Arc::new(inbox), finalizer);
 
         let envelope = make_signed_envelope(
             &sender_keypair,
@@ -752,6 +871,7 @@ mod tests {
         // Should receive an ack
         let ack = read_one_envelope(&mut client_read).await.unwrap();
         handle.await.unwrap().unwrap();
+        finalize.await.unwrap();
 
         match ack.kind {
             MessageKind::Ack { in_reply_to } => assert_eq!(in_reply_to, original_id),
@@ -764,7 +884,9 @@ mod tests {
         let sender_keypair = make_keypair();
         let receiver_keypair = make_keypair();
         let trusted = make_trusted_peers(&sender_keypair.public_key());
-        let (_inbox, inbox_sender) = classified_inbox_for_trust(&trusted, true);
+        let (inbox, inbox_sender, finalizer) =
+            classified_inbox_for_trust_with_runtime(&trusted, true);
+        let finalize = spawn_finalize_next_runtime(Arc::new(inbox), finalizer);
 
         let envelope = make_signed_envelope(
             &sender_keypair,
@@ -796,6 +918,7 @@ mod tests {
 
         let ack = read_one_envelope(&mut client_read).await.unwrap();
         handle.await.unwrap().unwrap();
+        finalize.await.unwrap();
 
         match ack.kind {
             MessageKind::Ack { in_reply_to } => assert_eq!(in_reply_to, original_id),
@@ -808,7 +931,9 @@ mod tests {
         let sender_keypair = make_keypair();
         let receiver_keypair = make_keypair();
         let trusted = make_trusted_peers(&sender_keypair.public_key());
-        let (_inbox, inbox_sender) = classified_inbox_for_trust(&trusted, true);
+        let (inbox, inbox_sender, finalizer) =
+            classified_inbox_for_trust_with_runtime(&trusted, true);
+        let finalize = spawn_finalize_next_runtime(Arc::new(inbox), finalizer);
 
         let envelope = make_signed_envelope(
             &sender_keypair,
@@ -840,6 +965,7 @@ mod tests {
         // Should receive an ack
         let ack = read_one_envelope(&mut client_read).await.unwrap();
         handle.await.unwrap().unwrap();
+        finalize.await.unwrap();
 
         match ack.kind {
             MessageKind::Ack { in_reply_to } => assert_eq!(in_reply_to, original_id),
@@ -848,11 +974,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn incarnation_fenced_durable_rejection_closes_without_success_ack() {
+        let sender_keypair = make_keypair();
+        let receiver_keypair = make_keypair();
+        let trusted = make_trusted_peers(&sender_keypair.public_key());
+        let (inbox, inbox_sender, finalizer) =
+            classified_inbox_for_trust_with_runtime(&trusted, true);
+        let finalize = spawn_finalize_next_runtime(Arc::new(inbox), finalizer);
+
+        let envelope = make_signed_envelope(
+            &sender_keypair,
+            receiver_keypair.public_key(),
+            MessageKind::IncarnationFencedMessage {
+                objective_id: None,
+                content_taint: None,
+                blocks: None,
+                body: "fenced work".to_string(),
+                handling_mode: None,
+                expected_recipient: meerkat_core::comms::PeerRecipientIncarnation {
+                    mob_id: "mob".to_string(),
+                    agent_identity: "worker".to_string(),
+                    host_id: "host".to_string(),
+                    binding_generation: 1,
+                    member_session_id: "different-session".to_string(),
+                    generation: 1,
+                    fence_token: 7,
+                },
+            },
+        );
+        let original_id = envelope.id;
+        let bytes = envelope_to_bytes(&envelope).await;
+        let (client, server) = tokio::io::duplex(4096);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        tokio::spawn(async move {
+            client_write.write_all(&bytes).await.unwrap();
+        });
+
+        let handle = tokio::spawn(async move {
+            handle_connection(server, true, &receiver_keypair, &inbox_sender).await
+        });
+        let ack = read_one_envelope(&mut client_read).await;
+        let error = handle
+            .await
+            .unwrap()
+            .expect_err("durable rejection must close without an ACK");
+        let candidate = finalize.await.unwrap();
+
+        assert_eq!(candidate.interaction.id.0, original_id);
+        assert!(matches!(
+            candidate.interaction.content,
+            meerkat_core::InteractionContent::IncarnationFencedMessage { .. }
+        ));
+        assert!(
+            ack.is_err(),
+            "durable rejection must not produce a success ACK"
+        );
+        assert!(matches!(
+            error,
+            IoTaskError::DurableAdmissionRejected { envelope_id }
+                if envelope_id == original_id
+        ));
+    }
+
+    #[tokio::test]
     async fn tcp_handler_threads_observed_source_into_reply_endpoint_classification() {
         let sender_keypair = make_keypair();
         let receiver_keypair = make_keypair();
         let trusted = make_trusted_peers(&sender_keypair.public_key());
-        let (mut inbox, inbox_sender) = classified_inbox_for_trust(&trusted, true);
+        let (inbox, inbox_sender, finalizer) =
+            classified_inbox_for_trust_with_runtime(&trusted, true);
+        let finalize = spawn_finalize_next_runtime(Arc::new(inbox), finalizer);
         let declared = meerkat_core::comms::PeerAddress::parse("tcp://203.0.113.88:4311").unwrap();
         let envelope = make_signed_envelope(
             &sender_keypair,
@@ -882,10 +1073,9 @@ mod tests {
         let _ack = read_one_envelope(&mut client_read).await.unwrap();
         handle.await.unwrap().unwrap();
 
-        let entries = inbox.try_drain_classified();
-        assert_eq!(entries.len(), 1);
+        let candidate = finalize.await.unwrap();
         assert_eq!(
-            entries[0].ingress_fact.declared_reply_endpoint,
+            candidate.ingress.declared_reply_endpoint,
             Some(meerkat_core::comms::PeerAddress::parse("tcp://192.0.2.77:4311").unwrap())
         );
     }
@@ -923,11 +1113,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_no_ack_for_response() {
+    async fn test_response_preserves_legacy_queued_no_ack_semantics() {
         let sender_keypair = make_keypair();
         let receiver_keypair = make_keypair();
         let trusted = make_trusted_peers(&sender_keypair.public_key());
-        let (_inbox, inbox_sender) = classified_inbox_for_trust(&trusted, true);
+        let in_reply_to = Uuid::new_v4();
+        let (mut inbox, inbox_sender) = classified_inbox_for_trust(&trusted, true);
 
         let envelope = make_signed_envelope(
             &sender_keypair,
@@ -935,7 +1126,7 @@ mod tests {
             MessageKind::Response {
                 objective_id: None,
                 content_taint: None,
-                in_reply_to: Uuid::new_v4(),
+                in_reply_to,
                 status: crate::types::Status::Completed,
                 result: serde_json::json!({}),
                 blocks: None,
@@ -955,11 +1146,87 @@ mod tests {
             .await
             .unwrap();
 
-        // Should NOT receive an ack - connection closes without data
-        let result = read_one_envelope(&mut client_read).await;
         assert!(
-            result.is_err(),
-            "Should not receive ack for Response message"
+            read_one_envelope(&mut client_read).await.is_err(),
+            "Response must not receive an ACK"
+        );
+        let entries = inbox.try_drain_classified();
+        assert_eq!(
+            entries.len(),
+            1,
+            "Response must remain queued for its consumer"
+        );
+        assert_eq!(
+            entries[0].class,
+            meerkat_core::PeerInputClass::ResponseTerminal
+        );
+    }
+
+    #[tokio::test]
+    async fn supervisor_bridge_request_acknowledges_exact_volatile_handoff() {
+        let sender_keypair = make_keypair();
+        let receiver_keypair = make_keypair();
+        let trusted = make_trusted_peers(&make_keypair().public_key());
+        let (inbox, inbox_sender) = classified_inbox_for_trust(&trusted, true);
+        let handoff = spawn_handoff_next_volatile(Arc::new(inbox));
+
+        let envelope = make_signed_envelope(
+            &sender_keypair,
+            receiver_keypair.public_key(),
+            MessageKind::Request {
+                objective_id: None,
+                content_taint: None,
+                intent: meerkat_core::SUPERVISOR_BRIDGE_INTENT.to_string(),
+                params: serde_json::json!({
+                    "command": "bind_member",
+                    "supervisor": {
+                        "name": "mob/__mob_supervisor__",
+                        "peer_id": sender_keypair.public_key().to_peer_id(),
+                        "address": "inproc://mob/__mob_supervisor__"
+                    },
+                    "epoch": 1,
+                    "protocol_version": 1,
+                    "expected_peer_id": "peer-id",
+                    "expected_address": "inproc://peer"
+                }),
+                blocks: None,
+                reply_endpoint: None,
+                handling_mode: None,
+            },
+        );
+        let original_id = envelope.id;
+        let bytes = envelope_to_bytes(&envelope).await;
+        let (client, server) = tokio::io::duplex(4096);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        tokio::spawn(async move {
+            client_write.write_all(&bytes).await.unwrap();
+        });
+
+        handle_connection(server, true, &receiver_keypair, &inbox_sender)
+            .await
+            .expect("supervisor bridge request must complete after volatile handoff");
+
+        let ack = read_one_envelope(&mut client_read)
+            .await
+            .expect("supervisor bridge request must receive a signed weak ACK");
+        assert!(matches!(
+            ack.kind,
+            MessageKind::Ack {
+                in_reply_to,
+            } if in_reply_to == original_id
+        ));
+        assert!(ack.verify(), "supervisor bridge ACK must be signed");
+
+        let entry = handoff.await.expect("volatile handoff task");
+        assert_eq!(
+            entry.auth,
+            meerkat_core::PeerIngressAuthDecision::Exempt(
+                meerkat_core::PeerIngressAuthExemption::SupervisorBridge
+            )
+        );
+        assert_eq!(
+            entry.delivery_contract,
+            meerkat_core::PeerIngressDeliveryContract::VolatileControl
         );
     }
 
@@ -1109,7 +1376,9 @@ mod tests {
         // spawn time, the subsequent add below would not be visible and
         // the envelope would be silently dropped.
         let trusted = Arc::new(RwLock::new(TrustStore::new()));
-        let (mut inbox, inbox_sender) = classified_inbox_for_trust(&trusted, true);
+        let (inbox, inbox_sender, finalizer) =
+            classified_inbox_for_trust_with_runtime(&trusted, true);
+        let finalize = spawn_finalize_next_runtime(Arc::new(inbox), finalizer);
 
         let envelope = make_signed_envelope(
             &sender_keypair,
@@ -1151,12 +1420,8 @@ mod tests {
             .await
             .unwrap();
 
-        let items = inbox.try_drain_classified();
-        assert_eq!(items.len(), 1, "envelope should be admitted via live trust");
-        match &items[0].item {
-            InboxItem::External { envelope } => assert_eq!(envelope.id, envelope_id),
-            _ => panic!("expected External"),
-        }
+        let candidate = finalize.await.unwrap();
+        assert_eq!(candidate.interaction.id.0, envelope_id);
     }
 
     // ---- host acceptor demux path (D1) ----
@@ -1195,7 +1460,9 @@ mod tests {
         let member_b = make_keypair();
         let trusted = make_trusted_peers(&sender_keypair.public_key());
         let (mut inbox_a, inbox_sender_a) = classified_inbox_for_trust(&trusted, true);
-        let (mut inbox_b, inbox_sender_b) = classified_inbox_for_trust(&trusted, true);
+        let (inbox_b, inbox_sender_b, finalizer_b) =
+            classified_inbox_for_trust_with_runtime(&trusted, true);
+        let finalize_b = spawn_finalize_next_runtime(Arc::new(inbox_b), finalizer_b);
         let (registry, _owner) =
             demux_registry(&[(&member_a, &inbox_sender_a), (&member_b, &inbox_sender_b)]);
 
@@ -1223,6 +1490,7 @@ mod tests {
 
         let ack = read_one_envelope(&mut client_read).await.unwrap();
         handle.await.unwrap().unwrap();
+        let candidate_b = finalize_b.await.unwrap();
 
         match ack.kind {
             MessageKind::Ack { in_reply_to } => assert_eq!(in_reply_to, original_id),
@@ -1235,12 +1503,7 @@ mod tests {
         );
         assert!(ack.verify(), "ack must carry a valid member-B signature");
 
-        let items_b = inbox_b.try_drain_classified();
-        assert_eq!(items_b.len(), 1, "envelope should land in B's inbox");
-        match &items_b[0].item {
-            InboxItem::External { envelope } => assert_eq!(envelope.id, original_id),
-            _ => panic!("expected External"),
-        }
+        assert_eq!(candidate_b.interaction.id.0, original_id);
         assert!(
             inbox_a.try_drain_classified().is_empty(),
             "member A must not receive an envelope addressed to B"
@@ -1252,7 +1515,9 @@ mod tests {
         let sender_keypair = make_keypair();
         let member = make_keypair();
         let trusted = make_trusted_peers(&sender_keypair.public_key());
-        let (mut inbox, inbox_sender) = classified_inbox_for_trust(&trusted, true);
+        let (inbox, inbox_sender, finalizer) =
+            classified_inbox_for_trust_with_runtime(&trusted, true);
+        let finalize = spawn_finalize_next_runtime(Arc::new(inbox), finalizer);
         let (registry, _owner) = demux_registry(&[(&member, &inbox_sender)]);
         let envelope = make_signed_envelope(
             &sender_keypair,
@@ -1283,10 +1548,9 @@ mod tests {
         let _ack = read_one_envelope(&mut client_read).await.unwrap();
         handle.await.unwrap().unwrap();
 
-        let entries = inbox.try_drain_classified();
-        assert_eq!(entries.len(), 1);
+        let candidate = finalize.await.unwrap();
         assert_eq!(
-            entries[0].ingress_fact.declared_reply_endpoint,
+            candidate.ingress.declared_reply_endpoint,
             Some(meerkat_core::comms::PeerAddress::parse("tcp://192.0.2.91:4311").unwrap())
         );
     }
@@ -1449,7 +1713,9 @@ mod tests {
         let sender_keypair = make_keypair();
         let member_a = make_keypair();
         let trusted = make_trusted_peers(&sender_keypair.public_key());
-        let (mut inbox_a, inbox_sender_a) = classified_inbox_for_trust(&trusted, true);
+        let (inbox_a, inbox_sender_a, finalizer_a) =
+            classified_inbox_for_trust_with_runtime(&trusted, true);
+        let finalize_a = spawn_finalize_next_runtime(Arc::new(inbox_a), finalizer_a);
         let (registry, _owner) = demux_registry(&[(&member_a, &inbox_sender_a)]);
 
         let envelope = make_signed_envelope(
@@ -1483,17 +1749,13 @@ mod tests {
 
         let ack = read_one_envelope(&mut client_read).await.unwrap();
         handle.await.unwrap().unwrap();
+        let candidate = finalize_a.await.unwrap();
         match ack.kind {
             MessageKind::Ack { in_reply_to } => assert_eq!(in_reply_to, original_id),
             _ => panic!("expected Ack"),
         }
         assert_eq!(ack.from, member_a.public_key());
 
-        let items = inbox_a.try_drain_classified();
-        assert_eq!(items.len(), 1);
-        match &items[0].item {
-            InboxItem::External { envelope } => assert_eq!(envelope.id, original_id),
-            _ => panic!("expected External"),
-        }
+        assert_eq!(candidate.interaction.id.0, original_id);
     }
 }

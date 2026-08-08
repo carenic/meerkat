@@ -51,7 +51,10 @@ fn placed_orchestrator_resume_notification_is_non_gating(error: &MobError) -> bo
         | MobError::BridgeDeliveryRejected { .. } => true,
         MobError::CommsError(error) => matches!(
             error,
-            SendError::PeerNotFound(_) | SendError::PeerOffline | SendError::Transport(_)
+            SendError::PeerNotFound(_)
+                | SendError::PeerOffline
+                | SendError::Transport(_)
+                | SendError::AmbiguousDelivery { .. }
         ),
         _ => false,
     }

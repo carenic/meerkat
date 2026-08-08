@@ -6,6 +6,8 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
 
 use crate::comms::{
@@ -898,6 +900,8 @@ pub struct PeerIngressEntrySnapshot {
     /// Mirrors the MeerkatMachine PeerIngress classification effect; consumers
     /// filter on this bit instead of re-deriving the class->actionable grouping.
     pub actionable: bool,
+    /// Sender-visible completion contract fixed at classification time.
+    pub delivery_contract: PeerIngressDeliveryContract,
     /// Coarse admitted kind.
     pub kind: PeerIngressKind,
     /// Display-only sender label, if applicable. Not route/trust authority.
@@ -925,6 +929,15 @@ pub struct PeerIngressEntrySnapshot {
     pub response_terminality: Option<TerminalityClass>,
 }
 
+/// Immutable sender-visible contract for one classified ingress item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerIngressDeliveryContract {
+    /// Success requires an exact opaque receipt from runtime durable admission.
+    DurableRuntime,
+    /// Success proves only exact FIFO handoff to a volatile control consumer.
+    VolatileControl,
+}
+
 /// Non-destructive snapshot of the queued peer-ingress surface.
 ///
 /// This is intentionally queue-shaped rather than a full PeerComms model. It
@@ -939,7 +952,231 @@ pub struct PeerIngressQueueSnapshot {
     pub silent_request_count: usize,
     pub ack_count: usize,
     pub plain_event_count: usize,
+    /// Current FIFO-head claim, if the runtime handover task owns one.
+    pub outstanding_claim: Option<PeerIngressClaimSnapshot>,
+    /// Number of queue heads claimed for durable runtime admission or handed
+    /// to a volatile control consumer.
+    pub handed_off_count: u64,
+    /// Number of runtime handovers that reached Accepted or Deduplicated.
+    pub durably_admitted_count: u64,
+    /// Number of runtime handovers that reached a typed terminal outcome.
+    pub runtime_handover_count: u64,
+    /// Typed terminal outcomes observed at exact queue-claim commit.
+    pub terminal_outcomes: PeerIngressTerminalOutcomeCounts,
+    /// Most recent stable raw/runtime correlation committed by the queue.
+    pub last_delivery_correlation: Option<PeerIngressDeliveryCorrelation>,
     pub queued_entries: Vec<PeerIngressEntrySnapshot>,
+}
+
+/// Read-only projection of the one outstanding FIFO-head claim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerIngressClaimSnapshot {
+    pub claim_id: PeerIngressClaimId,
+    pub raw_item_id: InteractionId,
+    pub delivery_contract: PeerIngressDeliveryContract,
+    pub age: Duration,
+}
+
+/// Opaque identity minted for one acquisition of the current queue head.
+///
+/// This is deliberately distinct from `raw_item_id`: release and reacquire
+/// mints a new claim so a stale committer cannot win an ABA race.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PeerIngressClaimId(pub Uuid);
+
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PeerIngressClaimCommitFacts {
+    pub claim_id: PeerIngressClaimId,
+    pub raw_item_id: InteractionId,
+    pub class: PeerInputClass,
+}
+
+/// Projection-only counters derived from successful exact claim commits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct PeerIngressTerminalOutcomeCounts {
+    pub accepted: u64,
+    pub deduplicated: u64,
+    pub rejected: u64,
+}
+
+/// Stable correlation emitted by the latest exact queue-claim commit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeerIngressDeliveryCorrelation {
+    pub raw_item_id: InteractionId,
+    pub interaction_id: Option<InteractionId>,
+    pub runtime_input_id: Option<crate::lifecycle::InputId>,
+    pub existing_runtime_input_id: Option<crate::lifecycle::InputId>,
+    pub outcome: PeerIngressTerminalOutcomeKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum PeerIngressTerminalOutcomeKind {
+    Accepted,
+    Deduplicated,
+    Rejected,
+}
+
+impl PeerIngressTerminalOutcomeKind {
+    pub fn is_durable_admission(self) -> bool {
+        matches!(self, Self::Accepted | Self::Deduplicated)
+    }
+}
+
+/// Terminal fact that permits removal of one exact claimed FIFO head.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[doc(hidden)]
+pub enum PeerIngressClaimTerminalOutcome {
+    RuntimeAccepted {
+        input_id: crate::lifecycle::InputId,
+    },
+    RuntimeDeduplicated {
+        input_id: crate::lifecycle::InputId,
+        existing_id: crate::lifecycle::InputId,
+    },
+    RuntimeRejected {
+        input_id: crate::lifecycle::InputId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[doc(hidden)]
+pub enum PeerIngressClaimCommitError {
+    #[error("peer ingress has no outstanding claim")]
+    NoOutstandingClaim,
+    #[error("peer ingress claim id does not own the outstanding claim")]
+    ClaimMismatch,
+    #[error("peer ingress claimed raw item is no longer the FIFO head")]
+    HeadMismatch,
+    #[error("peer ingress terminal receipt was rejected by runtime authority: {0}")]
+    AuthorityRejected(String),
+}
+
+/// Concrete queue lease implemented by the comms crate.
+///
+/// The synchronous release is load-bearing: dropping an in-flight future must
+/// make the same head claimable again without awaiting cleanup.
+#[doc(hidden)]
+pub trait PeerIngressClaimLease: Send + Sync {
+    fn commit(
+        &self,
+        claim_id: PeerIngressClaimId,
+        receipt: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<(), PeerIngressClaimCommitError>;
+    fn handoff_volatile(
+        &self,
+        claim_id: PeerIngressClaimId,
+    ) -> Result<(), PeerIngressClaimCommitError>;
+    fn release(&self, claim_id: PeerIngressClaimId);
+}
+
+/// Cancellation-safe ownership of one non-destructively claimed queue head.
+#[must_use = "dropping the claim releases the head; durably finalize or explicitly hand off the exact head"]
+pub struct PeerIngressQueueClaim {
+    claim_id: PeerIngressClaimId,
+    raw_item_id: InteractionId,
+    class: PeerInputClass,
+    delivery_contract: PeerIngressDeliveryContract,
+    candidate: Option<ClassifiedInboxInteraction>,
+    lease: Option<Arc<dyn PeerIngressClaimLease>>,
+}
+
+impl std::fmt::Debug for PeerIngressQueueClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PeerIngressQueueClaim")
+            .field("claim_id", &self.claim_id)
+            .field("raw_item_id", &self.raw_item_id)
+            .field("class", &self.class)
+            .field("delivery_contract", &self.delivery_contract)
+            .field("candidate", &self.candidate)
+            .finish_non_exhaustive()
+    }
+}
+
+impl PeerIngressQueueClaim {
+    #[doc(hidden)]
+    pub fn from_comms_queue(
+        claim_id: PeerIngressClaimId,
+        raw_item_id: InteractionId,
+        class: PeerInputClass,
+        delivery_contract: PeerIngressDeliveryContract,
+        candidate: Option<ClassifiedInboxInteraction>,
+        lease: Arc<dyn PeerIngressClaimLease>,
+    ) -> Self {
+        Self {
+            claim_id,
+            raw_item_id,
+            class,
+            delivery_contract,
+            candidate,
+            lease: Some(lease),
+        }
+    }
+
+    pub fn claim_id(&self) -> PeerIngressClaimId {
+        self.claim_id
+    }
+
+    pub fn raw_item_id(&self) -> InteractionId {
+        self.raw_item_id
+    }
+
+    pub fn class(&self) -> PeerInputClass {
+        self.class
+    }
+
+    pub fn delivery_contract(&self) -> PeerIngressDeliveryContract {
+        self.delivery_contract
+    }
+
+    pub fn candidate(&self) -> Option<&ClassifiedInboxInteraction> {
+        self.candidate.as_ref()
+    }
+
+    /// Finalize with an opaque receipt whose concrete type is private to the
+    /// runtime that owns AcceptWithCompletion.
+    /// The installed generated PeerCommsHandle validates the receipt type and
+    /// exact claim/raw identities before the comms queue may dequeue.
+    #[doc(hidden)]
+    pub fn __finalize_with_runtime_receipt(
+        mut self,
+        receipt: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<(), PeerIngressClaimCommitError> {
+        let Some(lease) = self.lease.as_ref() else {
+            return Err(PeerIngressClaimCommitError::NoOutstandingClaim);
+        };
+        lease.commit(self.claim_id, receipt)?;
+        self.lease = None;
+        Ok(())
+    }
+
+    /// Commit an explicitly volatile handoff of this exact queue head.
+    ///
+    /// This is not durable admission and creates no terminal runtime fact. It
+    /// exists only for control traffic whose consumer is outside the runtime
+    /// input ledger. The queue reports that weaker fact to the sender before
+    /// handler progress and removes the head by exact claim-id CAS.
+    #[doc(hidden)]
+    pub fn __handoff_volatile(
+        mut self,
+    ) -> Result<Option<ClassifiedInboxInteraction>, PeerIngressClaimCommitError> {
+        let Some(lease) = self.lease.as_ref() else {
+            return Err(PeerIngressClaimCommitError::NoOutstandingClaim);
+        };
+        lease.handoff_volatile(self.claim_id)?;
+        self.lease = None;
+        Ok(self.candidate.take())
+    }
+}
+
+impl Drop for PeerIngressQueueClaim {
+    fn drop(&mut self) {
+        if let Some(lease) = self.lease.take() {
+            lease.release(self.claim_id);
+        }
+    }
 }
 
 /// Canonical phase of the peer-ingress authority.

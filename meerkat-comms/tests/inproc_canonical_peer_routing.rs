@@ -3,8 +3,8 @@
 use std::sync::{Arc, LazyLock, Mutex};
 
 use meerkat_comms::{
-    AdmissionOutcome, CommsConfig, CommsRuntime, DropReason, Envelope, Inbox, InprocRegistry,
-    Keypair, MessageKind, PeerMeta, PubKey, Router, SendError, Signature,
+    CommsConfig, CommsRuntime, Inbox, InprocRegistry, Keypair, MessageKind, PeerMeta, PubKey,
+    Router, SendError,
 };
 use meerkat_core::agent::CommsRuntime as CoreCommsRuntime;
 use meerkat_core::comms::CommsTrustMutation;
@@ -293,37 +293,34 @@ async fn runtime_auth_disabled_directory_skips_zero_pubkey_inproc_identity() {
 }
 
 #[tokio::test]
-async fn ingress_rejects_late_shared_zero_pubkey_trust_mutation() {
+async fn public_router_rejects_late_shared_zero_pubkey_registry_mutation() {
+    let _lock = INPROC_REGISTRY_LOCK.lock().await;
+    let registry = InprocRegistry::global();
+    registry.clear();
+
     let suffix = uuid::Uuid::new_v4().simple().to_string();
-    let receiver =
-        CommsRuntime::inproc_only(&format!("zero-ingress-receiver-{suffix}")).expect("runtime");
-    let _peer_authority =
-        TestPeerCommsAuthority::install(&receiver, &format!("zero-ingress-receiver-{suffix}"));
-    let envelope = Envelope {
-        id: uuid::Uuid::new_v4(),
-        from: zero_pubkey(),
-        to: receiver.public_key(),
-        kind: message("zero pubkey ingress must not admit"),
-        sig: Signature::new([0u8; 64]),
-    };
-
-    let outcome = receiver
-        .router_arc()
-        .inbox_sender()
-        .send_connection_ingress(envelope, true);
-    assert_eq!(
-        outcome,
-        AdmissionOutcome::Dropped {
-            reason: DropReason::UntrustedSender
-        },
-        "late shared zero-pubkey trust mutation must not admit ingress"
+    let target_name = format!("late-zero-registry-target-{suffix}");
+    let (_, router_inbox_sender) = Inbox::new();
+    let router = Router::new(
+        Keypair::generate(),
+        CommsConfig::default(),
+        router_inbox_sender,
+        false,
     );
 
-    let drained = CoreCommsRuntime::drain_messages(&receiver).await;
+    // Mutate the shared registry only after the public router is live. A zero
+    // public key must remain unrepresentable at the public send boundary.
+    let _target_inbox = register_zero_pubkey_inproc_target(registry, &target_name);
+    let dest = zero_pubkey().to_peer_id();
+    let outcome = router
+        .send(dest, message("late zero-pubkey registry mutation"))
+        .await;
     assert!(
-        drained.is_empty(),
-        "zero-pubkey ingress must not reach runtime messages: {drained:?}"
+        matches!(outcome, Err(SendError::PeerNotFound(peer_id)) if peer_id == dest),
+        "late shared zero-pubkey registry mutation must not create sendable ingress: {outcome:?}"
     );
+
+    registry.clear();
 }
 
 #[tokio::test]

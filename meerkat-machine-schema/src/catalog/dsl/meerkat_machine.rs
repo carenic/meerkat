@@ -3819,7 +3819,11 @@ macro_rules! meerkat_catalog_machine_dsl {
             Reset,
             StopRuntimeExecutor { reason: String },
             RuntimeExecutorExited,
-            RecoverRuntimeCompletionResultCorrelation { run_id: RunId },
+            RecoverRuntimeCompletionResultCorrelation {
+                run_id: RunId,
+                terminal_outcome: Option<Enum<TurnTerminalOutcome>>,
+                terminal_cause_kind: Option<Enum<TurnTerminalCauseKind>>,
+            },
             ResolveRuntimeCompletionResult {
                 run_id: Option<RunId>,
                 terminal: Enum<RuntimeCompletionTerminalObservation>,
@@ -10179,21 +10183,67 @@ macro_rules! meerkat_catalog_machine_dsl {
         }
 
         // A durable unpublished interaction-terminal batch is the recovery
-        // witness for a run whose ordinary in-memory RunCompleted correlation
-        // was lost with the prior process. The runtime validates and adopts
-        // that exact batch before applying this input. Keep the correlation
-        // single-valued: two different pending runs are recovery corruption,
-        // not an invitation for the shell to overwrite machine truth.
+        // witness for a run whose ordinary in-memory completion correlation
+        // and terminal facts were lost with the prior process. The runtime
+        // validates and adopts that exact batch before applying this input.
+        // Keep both correlation and terminal truth single-valued: divergent
+        // recovery facts are corruption, not an invitation for the shell to
+        // overwrite machine truth.
         transition RecoverRuntimeCompletionResultCorrelation {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
-            on input RecoverRuntimeCompletionResultCorrelation { run_id }
+            on input RecoverRuntimeCompletionResultCorrelation { run_id, terminal_outcome, terminal_cause_kind }
             guard "session_registered" { self.session_id != None }
             guard "correlation_absent_or_same" {
                 self.runtime_completion_result_run_id == None
                 || self.runtime_completion_result_run_id == Some(run_id)
             }
+            guard "terminal_recovery_shape_coherent" {
+                (terminal_outcome == None && terminal_cause_kind == None)
+                || (
+                    terminal_outcome == Some(TurnTerminalOutcome::Cancelled)
+                    && terminal_cause_kind == None
+                )
+                || (
+                    terminal_outcome == Some(TurnTerminalOutcome::BudgetExhausted)
+                    && terminal_cause_kind == Some(TurnTerminalCauseKind::BudgetExhausted)
+                )
+                || (
+                    terminal_outcome == Some(TurnTerminalOutcome::TimeBudgetExceeded)
+                    && terminal_cause_kind == Some(TurnTerminalCauseKind::TimeBudgetExceeded)
+                )
+                || (
+                    terminal_outcome == Some(TurnTerminalOutcome::StructuredOutputValidationFailed)
+                    && terminal_cause_kind == Some(TurnTerminalCauseKind::StructuredOutputValidationFailed)
+                )
+                || (
+                    terminal_outcome == Some(TurnTerminalOutcome::Failed)
+                    && terminal_cause_kind != None
+                    && terminal_cause_kind != Some(TurnTerminalCauseKind::Unknown)
+                    && terminal_cause_kind != Some(TurnTerminalCauseKind::BudgetExhausted)
+                    && terminal_cause_kind != Some(TurnTerminalCauseKind::TimeBudgetExceeded)
+                    && terminal_cause_kind != Some(TurnTerminalCauseKind::StructuredOutputValidationFailed)
+                )
+            }
+            guard "terminal_outcome_absent_or_same" {
+                terminal_outcome == None
+                || self.terminal_outcome == None
+                || self.terminal_outcome == terminal_outcome
+            }
+            guard "terminal_cause_absent_or_same" {
+                terminal_cause_kind == None
+                || self.terminal_cause_kind == None
+                || self.terminal_cause_kind == terminal_cause_kind
+            }
+            guard "cancelled_has_no_existing_failure_cause" {
+                terminal_outcome != Some(TurnTerminalOutcome::Cancelled)
+                || self.terminal_cause_kind == None
+            }
             update {
                 self.runtime_completion_result_run_id = Some(run_id);
+                if terminal_outcome != None {
+                    self.terminal_outcome = terminal_outcome;
+                    self.terminal_cause_kind = terminal_cause_kind;
+                }
             }
             to Idle
         }

@@ -27,6 +27,10 @@ pub(crate) struct IngressClassificationContext {
     pub(crate) trusted_peers: Arc<parking_lot::RwLock<TrustStore>>,
     pub(crate) peer_comms_handle: PeerCommsHandleSlot,
     pub(crate) inproc_namespace: Option<String>,
+    /// Composition fact: only a full runtime endpoint may receive queue heads
+    /// whose success requires AcceptWithCompletion. Control-only host
+    /// endpoints reject those envelopes before enqueue.
+    pub(crate) durable_runtime_consumer: bool,
 }
 
 /// Classified ingress descriptor for one inbox item.
@@ -43,6 +47,8 @@ pub(crate) struct PreparedIngressItem {
     /// bit instead of re-deriving the class->actionable grouping locally.
     pub(crate) actionable: bool,
     pub(crate) auth: PeerIngressAuthDecision,
+    /// Immutable delivery contract fixed by machine classification facts.
+    pub(crate) delivery_contract: meerkat_core::PeerIngressDeliveryContract,
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) trusted_sender: bool,
     pub(crate) from_peer: Option<String>,
@@ -271,7 +277,7 @@ impl IngressClassificationContext {
                             status: (*status).into(),
                             result: result.clone(),
                         },
-                        MessageKind::Ack { in_reply_to } => PeerIngressEnvelopeKind::Ack {
+                        MessageKind::Ack { in_reply_to, .. } => PeerIngressEnvelopeKind::Ack {
                             in_reply_to: in_reply_to.to_string(),
                         },
                     },
@@ -333,7 +339,7 @@ impl IngressClassificationContext {
                         in_reply_to: request_id?,
                         status: (*status).into(),
                     },
-                    MessageKind::Ack { in_reply_to: _ } => PeerIngressConvention::Ack {
+                    MessageKind::Ack { in_reply_to: _, .. } => PeerIngressConvention::Ack {
                         in_reply_to: request_id?,
                     },
                 };
@@ -365,12 +371,44 @@ impl IngressClassificationContext {
                     | MessageKind::Ack { .. } => PeerContentShape::Text,
                 };
 
+                let delivery_contract = match classification.class {
+                    PeerInputClass::ActionableMessage | PeerInputClass::SilentRequest => {
+                        meerkat_core::PeerIngressDeliveryContract::DurableRuntime
+                    }
+                    PeerInputClass::ActionableRequest if !classification.auth.is_exempt() => {
+                        meerkat_core::PeerIngressDeliveryContract::DurableRuntime
+                    }
+                    PeerInputClass::ActionableRequest
+                    | PeerInputClass::ResponseProgress
+                    | PeerInputClass::ResponseTerminal
+                    | PeerInputClass::PeerLifecycleAdded
+                    | PeerInputClass::PeerLifecycleRetired
+                    | PeerInputClass::PeerLifecycleUnwired
+                    | PeerInputClass::PeerLifecycleKickoffFailed
+                    | PeerInputClass::PeerLifecycleKickoffCancelled
+                    | PeerInputClass::Ack => {
+                        meerkat_core::PeerIngressDeliveryContract::VolatileControl
+                    }
+                    PeerInputClass::PlainEvent => {
+                        unreachable!("plain events use the dedicated classification branch")
+                    }
+                };
+                if delivery_contract == meerkat_core::PeerIngressDeliveryContract::DurableRuntime
+                    && !self.durable_runtime_consumer
+                {
+                    tracing::warn!(
+                        class = ?classification.class,
+                        "runtime-bound peer ingress rejected by a volatile-control-only endpoint"
+                    );
+                    return None;
+                }
                 Some(PreparedIngressItem {
                     raw_item_id: InteractionId(envelope.id),
                     kind: classification.kind,
                     class: classification.class,
                     actionable: classification.actionable,
                     auth: classification.auth,
+                    delivery_contract,
                     trusted_sender,
                     from_peer: Some(from_name),
                     lifecycle_peer,
@@ -407,12 +445,19 @@ impl IngressClassificationContext {
                     classification.kind,
                     input_identity.clone(),
                 );
+                if !self.durable_runtime_consumer {
+                    tracing::warn!(
+                        "runtime-bound plain ingress rejected by a volatile-control-only endpoint"
+                    );
+                    return None;
+                }
                 Some(PreparedIngressItem {
                     raw_item_id: InteractionId(interaction_id),
                     kind: classification.kind,
                     class: classification.class,
                     actionable: classification.actionable,
                     auth: classification.auth,
+                    delivery_contract: meerkat_core::PeerIngressDeliveryContract::DurableRuntime,
                     trusted_sender: true,
                     from_peer: None,
                     lifecycle_peer: None,
@@ -477,6 +522,7 @@ pub(crate) mod test_support {
                 Some(runtime_peer_comms_handle()),
             )),
             inproc_namespace: None,
+            durable_runtime_consumer: true,
         })
     }
 }
@@ -747,6 +793,7 @@ mod tests {
             trusted_peers: Arc::new(parking_lot::RwLock::new(trusted_peers)),
             peer_comms_handle: Arc::new(parking_lot::RwLock::new(peer_comms_handle)),
             inproc_namespace,
+            durable_runtime_consumer: true,
         }
     }
 

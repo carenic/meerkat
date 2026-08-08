@@ -7,7 +7,7 @@
 //!
 //! Scenario:
 //!   1. Peer A sends a `PeerRequest` with `InputStreamMode::ReserveInteraction`.
-//!   2. Peer B drains its inbox, observes the request, replies with a
+//!   2. Peer B durably finalizes the exact claimed request, then replies with a
 //!      `PeerResponse` whose `in_reply_to` is the request's envelope id.
 //!   3. Peer A drains its inbox, observes the terminal response, and its
 //!      reserved subscriber is correlated via the same envelope id.
@@ -45,29 +45,35 @@ async fn reserve_interaction_subscriber_fires_on_matching_response() {
     let name_a = format!("cov-a-{suffix}");
     let name_b = format!("cov-b-{suffix}");
 
-    let (a, b) = inproc_pair_with_generated_trust(&name_a, &name_b)
+    let (a, b, b_finalizer) = inproc_pair_with_generated_trust(&name_a, &name_b)
         .await
         .expect("inproc pair with mutual trust");
 
     // 1. A sends a reserved-stream PeerRequest to B.
-    let receipt = CoreCommsRuntime::send(
-        a.as_ref(),
-        CommsCommand::PeerRequest {
-            objective_id: None,
-            content_taint: None,
-            to: PeerRoute::with_display_name(
-                b.public_key().to_peer_id(),
-                PeerName::new(name_b.clone()).expect("peer_name valid"),
-            ),
-            intent: "reservation-contract-probe".to_string(),
-            params: serde_json::json!({"probe": true}),
-            blocks: None,
-            handling_mode: HandlingMode::Queue,
-            stream: InputStreamMode::ReserveInteraction,
-        },
-    )
-    .await
-    .expect("peer request send should succeed");
+    let (receipt, request_at_b) = tokio::join!(
+        CoreCommsRuntime::send(
+            a.as_ref(),
+            CommsCommand::PeerRequest {
+                objective_id: None,
+                content_taint: None,
+                to: PeerRoute::with_display_name(
+                    b.public_key().to_peer_id(),
+                    PeerName::new(name_b.clone()).expect("peer_name valid"),
+                ),
+                intent: "reservation-contract-probe".to_string(),
+                params: serde_json::json!({"probe": true}),
+                blocks: None,
+                handling_mode: HandlingMode::Queue,
+                stream: InputStreamMode::ReserveInteraction,
+            },
+        ),
+        finalize_one_runtime_peer_input(
+            &b,
+            b_finalizer.as_ref(),
+            "B finalizes reserved peer request",
+        ),
+    );
+    let receipt = receipt.expect("peer request send should succeed");
 
     let envelope_id = match receipt {
         SendReceipt::PeerRequestSent {
@@ -84,18 +90,12 @@ async fn reserve_interaction_subscriber_fires_on_matching_response() {
         other => panic!("expected PeerRequestSent, got {other:?}"),
     };
 
-    // 2. B drains its inbox, observes the request, replies with a terminal
-    //    PeerResponse. Drain with a short retry to tolerate inproc delivery.
-    let request_at_b = drain_until_nonempty(b.as_ref(), 50, 20).await;
-    assert_eq!(
-        request_at_b.len(),
-        1,
-        "B should observe exactly one request"
-    );
-    let request = &request_at_b[0].interaction;
+    // 2. B observes the request returned by exact durable finalization, then
+    //    replies with a terminal legacy PeerResponse.
+    let request = &request_at_b.interaction;
     assert!(
         matches!(request.content, InteractionContent::Request { .. }),
-        "B's drained interaction should be a Request, got {:?}",
+        "B's durably finalized interaction should be a Request, got {:?}",
         request.content,
     );
     assert_eq!(
@@ -172,20 +172,58 @@ async fn reserve_interaction_subscriber_fires_on_matching_response() {
 async fn inproc_pair_with_generated_trust(
     name_a: &str,
     name_b: &str,
-) -> Result<(Arc<CommsRuntime>, Arc<CommsRuntime>), String> {
+) -> Result<
+    (
+        Arc<CommsRuntime>,
+        Arc<CommsRuntime>,
+        Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer>,
+    ),
+    String,
+> {
     let a = Arc::new(CommsRuntime::inproc_only(name_a).map_err(|err| err.to_string())?);
     let b = Arc::new(CommsRuntime::inproc_only(name_b).map_err(|err| err.to_string())?);
     let descriptor_a = descriptor_for_runtime(a.as_ref())?;
     let descriptor_b = descriptor_for_runtime(b.as_ref())?;
     let authority_a =
         install_ephemeral_peer_request_response_authority(&a, "integration-generated-trust-a");
-    let authority_b =
-        install_ephemeral_peer_request_response_authority(&b, "integration-generated-trust-b");
+    let (_peer_comms, b_finalizer) =
+        meerkat_runtime::test_peer_comms_handle_and_runtime_finalizer();
+    b_finalizer.install_on(b.as_ref())?;
+    b.install_peer_request_response_authority(meerkat_comms::PeerRequestResponseAuthority::new(
+        b_finalizer.peer_interaction_handle(),
+        b_finalizer.interaction_stream_handle(),
+    ));
+    let b_finalizer = Arc::new(b_finalizer);
     publish_local_endpoint(&authority_a, &descriptor_a)?;
-    publish_local_endpoint(&authority_b, &descriptor_b)?;
     add_generated_trust(a.as_ref(), &authority_a, descriptor_b.clone()).await?;
-    add_generated_trust(b.as_ref(), &authority_b, descriptor_a).await?;
-    Ok((a, b))
+    let b_runtime: Arc<dyn CoreCommsRuntime> = Arc::clone(&b) as Arc<dyn CoreCommsRuntime>;
+    b_finalizer
+        .trust_peer_on_runtime(descriptor_a, b_runtime)
+        .await?;
+    Ok((a, b, b_finalizer))
+}
+
+async fn finalize_one_runtime_peer_input(
+    runtime: &Arc<CommsRuntime>,
+    finalizer: &meerkat_runtime::TestPeerIngressRuntimeFinalizer,
+    context: &'static str,
+) -> meerkat_core::interaction::PeerInputCandidate {
+    let inbox_notify = runtime.inbox_notify();
+    loop {
+        let notified = inbox_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if let Some(claim) = CoreCommsRuntime::claim_classified_inbox_interaction(runtime.as_ref())
+            .await
+            .unwrap_or_else(|error| panic!("{context}: claim failed: {error}"))
+        {
+            return finalizer
+                .finalize(claim)
+                .await
+                .unwrap_or_else(|error| panic!("{context}: durable finalization failed: {error}"));
+        }
+        (&mut notified).await;
+    }
 }
 
 fn descriptor_for_runtime(runtime: &CommsRuntime) -> Result<TrustedPeerDescriptor, String> {

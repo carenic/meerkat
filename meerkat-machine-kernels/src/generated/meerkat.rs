@@ -11735,6 +11735,8 @@ pub mod inputs {
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct RecoverRuntimeCompletionResultCorrelation {
         pub run_id: RunId,
+        pub terminal_outcome: Option<TurnTerminalOutcome>,
+        pub terminal_cause_kind: Option<TurnTerminalCauseKind>,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct ResolveRuntimeCompletionResult {

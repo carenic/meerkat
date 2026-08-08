@@ -128,6 +128,7 @@ pub(crate) struct InteractionTerminalRecoveryBatch {
         crate::meerkat_machine::dsl::RuntimeCompletionTerminalObservation,
     pub(crate) runtime_termination_reason: Option<String>,
     pub(crate) completion_error_metadata: Option<meerkat_core::TurnErrorMetadata>,
+    pub(crate) terminal_recovery: crate::input_state::RuntimeCompletionTerminalRecovery,
     pub(crate) phase: InteractionTerminalRecoveryPhase,
 }
 
@@ -139,6 +140,7 @@ pub(crate) struct InputTerminalCompletionRecoveryBatch {
         crate::meerkat_machine::dsl::RuntimeCompletionTerminalObservation,
     pub(crate) runtime_termination_reason: Option<String>,
     pub(crate) completion_error_metadata: Option<meerkat_core::TurnErrorMetadata>,
+    pub(crate) terminal_recovery: crate::input_state::RuntimeCompletionTerminalRecovery,
     pub(crate) requires_session_checkpoint: bool,
     pub(crate) has_interaction_terminal_outbox: bool,
 }
@@ -2037,7 +2039,10 @@ impl DriverEntry {
         // two unpublished run-scoped batches for different runs are durable
         // corruption, not an iteration-order choice. Runtime-termination
         // batches are runless and remain independent.
-        let mut recovered_run_id: Option<RunId> = None;
+        let mut recovered_run: Option<(
+            RunId,
+            crate::input_state::RuntimeCompletionTerminalRecovery,
+        )> = None;
         let mut validated_batches = Vec::new();
         for (batch_key, mut outboxes) in grouped {
             outboxes.sort_by_key(|outbox| outbox.batch_ordinal);
@@ -2101,17 +2106,27 @@ impl DriverEntry {
                             .to_string(),
                     })?;
             let adoption = self.authorize_interaction_terminal_outbox_adoption(&outboxes)?;
+            let terminal_recovery = candidate
+                .runtime_completion_terminal_recovery()
+                .map_err(|reason| RuntimeDriverError::RecoveryCorruption { reason })?;
             if let Some(run_id) = batch_key.run_id() {
-                if let Some(recovered) = recovered_run_id.as_ref() {
-                    if recovered != run_id {
+                if let Some((recovered_run_id, recovered_terminal)) = recovered_run.as_ref() {
+                    if recovered_run_id != run_id {
                         return Err(RuntimeDriverError::RecoveryCorruption {
                             reason: format!(
-                                "interaction terminal recovery found unpublished batches for distinct runs {recovered} and {run_id}"
+                                "interaction terminal recovery found unpublished batches for distinct runs {recovered_run_id} and {run_id}"
+                            ),
+                        });
+                    }
+                    if recovered_terminal != &terminal_recovery {
+                        return Err(RuntimeDriverError::RecoveryCorruption {
+                            reason: format!(
+                                "interaction terminal recovery found divergent terminal facts for run {run_id}"
                             ),
                         });
                     }
                 } else {
-                    recovered_run_id = Some(run_id.clone());
+                    recovered_run = Some((run_id.clone(), terminal_recovery));
                 }
             }
 
@@ -2187,13 +2202,18 @@ impl DriverEntry {
                         _ => None,
                     },
                     completion_error_metadata: candidate.completion_error_metadata(),
+                    terminal_recovery,
                     phase,
                 },
             });
         }
 
-        if let Some(run_id) = recovered_run_id.as_ref() {
-            machine_validate_runtime_completion_result_correlation_recovery(self, run_id)?;
+        if let Some((run_id, terminal_recovery)) = recovered_run.as_ref() {
+            machine_validate_runtime_completion_result_correlation_recovery(
+                self,
+                run_id,
+                *terminal_recovery,
+            )?;
         }
 
         let mut batches = Vec::with_capacity(validated_batches.len());
@@ -2300,6 +2320,9 @@ impl DriverEntry {
                 _ => None,
             };
             let terminal = candidate.core_apply_terminal();
+            let terminal_recovery = candidate
+                .runtime_completion_terminal_recovery()
+                .map_err(|reason| RuntimeDriverError::RecoveryCorruption { reason })?;
             let has_interaction_terminal_outbox =
                 interaction_terminal_batch_identities.contains(&(
                     batch_key.clone(),
@@ -2317,6 +2340,7 @@ impl DriverEntry {
                 terminal_observation: candidate.terminal_observation(),
                 runtime_termination_reason,
                 completion_error_metadata: candidate.completion_error_metadata(),
+                terminal_recovery,
                 requires_session_checkpoint: owner.requires_session_checkpoint,
                 has_interaction_terminal_outbox,
             });
@@ -7595,12 +7619,33 @@ pub(crate) fn machine_resolve_runtime_completion_result(
 fn apply_runtime_completion_result_correlation_recovery(
     authority: &mut crate::meerkat_machine::dsl::MeerkatMachineAuthority,
     run_id: &RunId,
+    terminal_recovery: crate::input_state::RuntimeCompletionTerminalRecovery,
 ) -> Result<(), RuntimeDriverError> {
+    let (terminal_outcome, terminal_cause_kind) = match terminal_recovery {
+        crate::input_state::RuntimeCompletionTerminalRecovery::NonMachine => (None, None),
+        crate::input_state::RuntimeCompletionTerminalRecovery::Cancelled => (
+            Some(crate::meerkat_machine::dsl::TurnTerminalOutcome::Cancelled),
+            None,
+        ),
+        crate::input_state::RuntimeCompletionTerminalRecovery::MachineFailure {
+            outcome,
+            cause,
+        } => (
+            Some(crate::meerkat_machine::dsl::TurnTerminalOutcome::from(
+                outcome,
+            )),
+            Some(crate::meerkat_machine::dsl::TurnTerminalCauseKind::from(
+                cause,
+            )),
+        ),
+    };
     crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
         authority,
         crate::meerkat_machine::dsl::MeerkatMachineInput::
             RecoverRuntimeCompletionResultCorrelation {
                 run_id: crate::meerkat_machine::dsl::RunId::from_domain(run_id),
+                terminal_outcome,
+                terminal_cause_kind,
             },
     )
     .map(|_| ())
@@ -7615,6 +7660,7 @@ fn apply_runtime_completion_result_correlation_recovery(
 fn machine_validate_runtime_completion_result_correlation_recovery(
     driver: &DriverEntry,
     run_id: &RunId,
+    terminal_recovery: crate::input_state::RuntimeCompletionTerminalRecovery,
 ) -> Result<(), RuntimeDriverError> {
     let authority = driver.shared_dsl_authority();
     let state = authority
@@ -7631,21 +7677,22 @@ fn machine_validate_runtime_completion_result_correlation_recovery(
             "RecoverRuntimeCompletionResultCorrelation preview",
         ))
     })?;
-    apply_runtime_completion_result_correlation_recovery(&mut preview, run_id)
+    apply_runtime_completion_result_correlation_recovery(&mut preview, run_id, terminal_recovery)
 }
 
-/// Restore the single generated completion-result correlation from an exact
-/// durable unpublished interaction-terminal batch after whole-image preview
-/// validation and owner adoption have succeeded.
+/// Restore the generated completion-result correlation and any exact terminal
+/// facts from a validated durable batch after whole-image preview validation
+/// and owner adoption have succeeded.
 pub(crate) fn machine_recover_runtime_completion_result_correlation(
     driver: &DriverEntry,
     run_id: &RunId,
+    terminal_recovery: crate::input_state::RuntimeCompletionTerminalRecovery,
 ) -> Result<(), RuntimeDriverError> {
     let authority = driver.shared_dsl_authority();
     let mut authority = authority
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    apply_runtime_completion_result_correlation_recovery(&mut authority, run_id)
+    apply_runtime_completion_result_correlation_recovery(&mut authority, run_id, terminal_recovery)
 }
 
 #[cfg(test)]
@@ -9626,8 +9673,12 @@ mod recovery_tests {
 
         let machine_run_id = RunId::new();
         let mut driver = DriverEntry::Persistent(persistent);
-        machine_recover_runtime_completion_result_correlation(&driver, &machine_run_id)
-            .expect("seed a different machine-owned run correlation");
+        machine_recover_runtime_completion_result_correlation(
+            &driver,
+            &machine_run_id,
+            crate::input_state::RuntimeCompletionTerminalRecovery::NonMachine,
+        )
+        .expect("seed a different machine-owned run correlation");
         let shell_before = driver
             .as_driver()
             .stored_input_states_snapshot()

@@ -531,7 +531,7 @@ impl MobSupervisorBridge {
         start_tcp_listener: bool,
     ) -> Result<PreparedSupervisorRuntime, MobError> {
         let prepared =
-            meerkat_comms::CommsRuntime::prepare_inproc_only_with_keypair_and_silent_intents(
+            meerkat_comms::CommsRuntime::prepare_inproc_control_only_with_keypair_and_silent_intents(
                 participant_name,
                 None,
                 authority.keypair(),
@@ -3176,6 +3176,82 @@ mod tests {
     }
 
     #[cfg(not(target_arch = "wasm32"))]
+    async fn send_supervisor_control_probe(
+        sender: &Arc<meerkat_comms::CommsRuntime>,
+        recipient_runtime: &Arc<meerkat_comms::CommsRuntime>,
+        recipient: &TrustedPeerDescriptor,
+        probe: &'static str,
+    ) -> PeerInputCandidate {
+        let intake_runtime = Arc::clone(recipient_runtime);
+        let intake = tokio::spawn(async move { next_remote_candidate(&intake_runtime).await });
+        let receipt = sender
+            .send(CommsCommand::PeerRequest {
+                objective_id: None,
+                to: PeerRoute::with_display_name(recipient.peer_id, recipient.name.clone()),
+                intent: super::super::bridge_protocol::SUPERVISOR_BRIDGE_INTENT.to_string(),
+                params: serde_json::json!({"probe": probe}),
+                blocks: None,
+                content_taint: None,
+                handling_mode: HandlingMode::Queue,
+                stream: InputStreamMode::None,
+            })
+            .await
+            .expect("authenticated supervisor control probe should reach volatile intake");
+        let SendReceipt::PeerRequestSent { delivery, .. } = receipt else {
+            panic!("supervisor control probe returned an unexpected receipt: {receipt:?}");
+        };
+        let expected_delivery = if recipient.address.transport() == PeerTransport::Inproc {
+            meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff
+        } else {
+            // The byte-compatible socket ACK can prove handoff timing but
+            // cannot encode the exact volatile disposition.
+            meerkat_core::comms::PeerDeliveryOutcome::Acked
+        };
+        assert_eq!(delivery, expected_delivery);
+        let candidate = intake
+            .await
+            .expect("supervisor control intake task should not panic");
+        assert!(matches!(
+            &candidate.interaction.content,
+            InteractionContent::Request { intent, .. }
+                if intent == super::super::bridge_protocol::SUPERVISOR_BRIDGE_INTENT
+        ));
+        assert_eq!(
+            candidate.auth(),
+            Some(meerkat_core::PeerIngressAuthDecision::Exempt(
+                meerkat_core::PeerIngressAuthExemption::SupervisorBridge,
+            )),
+            "control-only bridge intake must be authorized by the typed supervisor exemption"
+        );
+        candidate
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn finalize_next_member_candidate(
+        runtime: Arc<meerkat_comms::CommsRuntime>,
+        finalizer: Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer>,
+    ) -> PeerInputCandidate {
+        let claim = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(claim) =
+                    CoreCommsRuntime::claim_classified_inbox_interaction(runtime.as_ref())
+                        .await
+                        .expect("member runtime must expose the classified claim surface")
+                {
+                    break claim;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("member runtime candidate should arrive");
+        finalizer
+            .finalize(claim)
+            .await
+            .expect("member MeerkatMachine must durably finalize the exact claim")
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
     async fn attach_inproc_remote(
         bridge: &Arc<MobSupervisorBridge>,
         label: &str,
@@ -3451,6 +3527,8 @@ mod tests {
             .live_runtime_reply_endpoint(runtime.as_ref())
             .expect("live reply endpoint should resolve");
 
+        let intake_runtime = Arc::clone(&recipient_runtime);
+        let intake = tokio::spawn(async move { next_remote_candidate(&intake_runtime).await });
         let request_envelope_id = bridge
             .send_supervisor_request(
                 &runtime,
@@ -3461,11 +3539,18 @@ mod tests {
             )
             .await
             .expect("ordinary supervisor request should send");
-        let mut candidates = recipient_runtime.drain_peer_input_candidates().await;
-        assert_eq!(candidates.len(), 1, "recipient should admit one request");
-        let candidate = candidates.pop().expect("one admitted request");
+        let candidate = intake
+            .await
+            .expect("recipient volatile control intake should not panic");
 
         assert_eq!(candidate.interaction.id.0, request_envelope_id);
+        assert_eq!(
+            candidate.auth(),
+            Some(meerkat_core::PeerIngressAuthDecision::Exempt(
+                meerkat_core::PeerIngressAuthExemption::SupervisorBridge,
+            )),
+            "ordinary supervisor request must use the typed control exemption"
+        );
         assert_eq!(
             candidate.ingress.declared_reply_endpoint,
             Some(expected_reply_endpoint),
@@ -3538,23 +3623,16 @@ mod tests {
         .await
         .expect("remote should trust shared supervisor identity");
 
-        let receipt = remote_runtime
-            .send(CommsCommand::PeerMessage {
-                objective_id: None,
-                to: PeerRoute::with_display_name(supervisor.peer_id, supervisor.name.clone()),
-                body: "shared-ingress-probe".to_string(),
-                blocks: None,
-                content_taint: None,
-                handling_mode: HandlingMode::Queue,
-            })
-            .await
-            .expect("remote envelope should traverse the shared TCP listener");
-        assert!(matches!(receipt, SendReceipt::PeerMessageSent { .. }));
-        let candidates = live_runtime.drain_peer_input_candidates().await;
-        assert_eq!(candidates.len(), 1);
+        let candidate = send_supervisor_control_probe(
+            &remote_runtime,
+            &live_runtime,
+            &supervisor,
+            "shared-ingress-probe",
+        )
+        .await;
         assert!(matches!(
-            &candidates[0].interaction.content,
-            InteractionContent::Message { body, .. } if body == "shared-ingress-probe"
+            candidate.interaction.content,
+            InteractionContent::Request { .. }
         ));
 
         bridge.shutdown().await;
@@ -3589,16 +3667,18 @@ mod tests {
 
         let old_send = tokio::time::timeout(
             Duration::from_secs(2),
-            remote_runtime.send(CommsCommand::PeerMessage {
+            remote_runtime.send(CommsCommand::PeerRequest {
                 objective_id: None,
                 to: PeerRoute::with_display_name(
                     old_supervisor.peer_id,
                     old_supervisor.name.clone(),
                 ),
-                body: "retired-shared-key".to_string(),
+                intent: super::super::bridge_protocol::SUPERVISOR_BRIDGE_INTENT.to_string(),
+                params: serde_json::json!({"probe": "retired-shared-key"}),
                 blocks: None,
                 content_taint: None,
                 handling_mode: HandlingMode::Queue,
+                stream: InputStreamMode::None,
             }),
         )
         .await
@@ -3616,39 +3696,17 @@ mod tests {
         )
         .await
         .expect("remote should trust the replacement supervisor identity");
-        let receipt = remote_runtime
-            .send(CommsCommand::PeerMessage {
-                objective_id: None,
-                to: PeerRoute::with_display_name(
-                    next_supervisor.peer_id,
-                    next_supervisor.name.clone(),
-                ),
-                body: "replacement-shared-key".to_string(),
-                blocks: None,
-                content_taint: None,
-                handling_mode: HandlingMode::Queue,
-            })
-            .await
-            .expect("replacement key should be accepted immediately");
-        assert!(matches!(receipt, SendReceipt::PeerMessageSent { .. }));
         let replacement_runtime = bridge.runtime().await;
-        let delivered = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if let Some(candidate) = replacement_runtime
-                    .drain_peer_input_candidates()
-                    .await
-                    .pop()
-                {
-                    break candidate;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("replacement runtime should receive the new-key envelope");
+        let delivered = send_supervisor_control_probe(
+            &remote_runtime,
+            &replacement_runtime,
+            &next_supervisor,
+            "replacement-shared-key",
+        )
+        .await;
         assert!(matches!(
             delivered.interaction.content,
-            InteractionContent::Message { body, .. } if body == "replacement-shared-key"
+            InteractionContent::Request { .. }
         ));
 
         bridge.shutdown().await;
@@ -3702,34 +3760,16 @@ mod tests {
             "failed inproc publication must drop the prepared acceptor reservation inertly"
         );
 
-        let receipt = remote_runtime
-            .send(CommsCommand::PeerMessage {
-                objective_id: None,
-                to: PeerRoute::with_display_name(
-                    old_supervisor.peer_id,
-                    old_supervisor.name.clone(),
-                ),
-                body: "old-route-after-conflict".to_string(),
-                blocks: None,
-                content_taint: None,
-                handling_mode: HandlingMode::Queue,
-            })
-            .await
-            .expect("old shared route must remain live after publication conflict");
-        assert!(matches!(receipt, SendReceipt::PeerMessageSent { .. }));
-        let delivered = tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                if let Some(candidate) = current_runtime.drain_peer_input_candidates().await.pop() {
-                    break candidate;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("current runtime should still receive through the old shared key");
+        let delivered = send_supervisor_control_probe(
+            &remote_runtime,
+            &current_runtime,
+            &old_supervisor,
+            "old-route-after-conflict",
+        )
+        .await;
         assert!(matches!(
             delivered.interaction.content,
-            InteractionContent::Message { body, .. } if body == "old-route-after-conflict"
+            InteractionContent::Request { .. }
         ));
 
         drop(conflict);
@@ -3824,27 +3864,6 @@ mod tests {
         );
         assert_ne!(requested_authority, authority);
 
-        let delivery =
-            super::super::bridge_protocol::BridgeSupervisorDelivery::SubmitSupervisorRotation(
-                super::super::bridge_protocol::BridgeSupervisorRotationSubmit {
-                    operation_id: super::super::bridge_protocol::SupervisorRotationOperationId::new(
-                    ),
-                    target: supervisor.clone().into(),
-                    target_epoch: authority.epoch,
-                    protocol_version:
-                        super::super::bridge_protocol::SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
-                },
-            );
-        bridge
-            .send_supervisor_delivery_as_authority(&requested_authority, &remote, &delivery)
-            .await
-            .expect("current-authority delivery should reuse the live shared lease");
-        let delivered = next_remote_candidate(&remote_runtime).await;
-        assert!(matches!(
-            delivered.interaction.content,
-            InteractionContent::Message { .. }
-        ));
-
         let command = super::super::bridge_protocol::BridgeCommand::HostStatus(
             super::super::bridge_protocol::BridgeHostStatusPayload {
                 supervisor: supervisor.into(),
@@ -3854,6 +3873,8 @@ mod tests {
                 mob_id: "mob/shared-current-authority".to_string(),
             },
         );
+        let intake_runtime = Arc::clone(&remote_runtime);
+        let intake = tokio::spawn(async move { next_remote_candidate(&intake_runtime).await });
         bridge
             .send_bridge_command_as_authority(
                 &requested_authority,
@@ -3863,12 +3884,22 @@ mod tests {
             )
             .await
             .expect_err("unanswered current-authority request should time out after send");
-        let unclassified = next_remote_candidate(&remote_runtime).await;
+        let unclassified = intake
+            .await
+            .expect("current-authority volatile intake should not panic");
         assert!(matches!(
-            unclassified.interaction.content,
+            &unclassified.interaction.content,
             InteractionContent::Request { .. }
         ));
+        assert!(matches!(
+            unclassified.auth(),
+            Some(meerkat_core::PeerIngressAuthDecision::Exempt(
+                meerkat_core::PeerIngressAuthExemption::SupervisorBridge
+            ))
+        ));
 
+        let intake_runtime = Arc::clone(&remote_runtime);
+        let intake = tokio::spawn(async move { next_remote_candidate(&intake_runtime).await });
         let classified = bridge
             .send_bridge_command_as_authority_classified(
                 &requested_authority,
@@ -3881,10 +3912,18 @@ mod tests {
             matches!(classified, Err(BridgeRequestFailure::AfterSend(_))),
             "a current-authority shared request must reach the transport before timing out: {classified:?}"
         );
-        let classified_candidate = next_remote_candidate(&remote_runtime).await;
+        let classified_candidate = intake
+            .await
+            .expect("classified current-authority volatile intake should not panic");
         assert!(matches!(
-            classified_candidate.interaction.content,
+            &classified_candidate.interaction.content,
             InteractionContent::Request { .. }
+        ));
+        assert!(matches!(
+            classified_candidate.auth(),
+            Some(meerkat_core::PeerIngressAuthDecision::Exempt(
+                meerkat_core::PeerIngressAuthExemption::SupervisorBridge
+            ))
         ));
         assert_eq!(
             config.registration_count_for_test().await,
@@ -4694,30 +4733,13 @@ mod tests {
         let (remote_runtime, _remote_dsl, _remote, current_supervisor) =
             attach_inproc_remote(&bridge, "prebuild-route").await;
 
-        let send_probe = |body: &'static str| {
-            let remote_runtime = Arc::clone(&remote_runtime);
-            let current_supervisor = current_supervisor.clone();
-            async move {
-                remote_runtime
-                    .send(CommsCommand::PeerMessage {
-                        objective_id: None,
-                        to: PeerRoute::with_display_name(
-                            current_supervisor.peer_id,
-                            current_supervisor.name,
-                        ),
-                        body: body.to_string(),
-                        blocks: None,
-                        content_taint: None,
-                        handling_mode: HandlingMode::Queue,
-                    })
-                    .await
-            }
-        };
-
-        send_probe("before-prebuild")
-            .await
-            .expect("live inproc route should work before prebuild");
-        assert_eq!(current_runtime.drain_peer_input_candidates().await.len(), 1);
+        send_supervisor_control_probe(
+            &remote_runtime,
+            &current_runtime,
+            &current_supervisor,
+            "before-prebuild",
+        )
+        .await;
 
         let mut next = SupervisorAuthorityRecord::generate(
             super::super::bridge_protocol::SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
@@ -4730,16 +4752,22 @@ mod tests {
             .prepare_live_runtime(&next)
             .await
             .expect("rotation candidate should prebuild");
-        send_probe("while-prebuilt")
-            .await
-            .expect("uncommitted prebuild must not evict the live inproc route");
-        assert_eq!(current_runtime.drain_peer_input_candidates().await.len(), 1);
+        send_supervisor_control_probe(
+            &remote_runtime,
+            &current_runtime,
+            &current_supervisor,
+            "while-prebuilt",
+        )
+        .await;
 
         drop(uncommitted);
-        send_probe("after-prebuild-drop")
-            .await
-            .expect("dropping an uncommitted prebuild must preserve the live inproc route");
-        assert_eq!(current_runtime.drain_peer_input_candidates().await.len(), 1);
+        send_supervisor_control_probe(
+            &remote_runtime,
+            &current_runtime,
+            &current_supervisor,
+            "after-prebuild-drop",
+        )
+        .await;
 
         bridge.shutdown().await;
         remote_runtime.stop_listeners_for_rebind().await;
@@ -5020,28 +5048,20 @@ mod tests {
         let replacement_notify = replacement_runtime.inbox_notify();
         let mut replacement_wake = std::pin::pin!(replacement_notify.notified());
         replacement_wake.as_mut().enable();
-        remote_runtime
-            .send(CommsCommand::PeerMessage {
-                objective_id: None,
-                to: PeerRoute::with_display_name(
-                    replacement_supervisor.peer_id,
-                    replacement_supervisor.name.clone(),
-                ),
-                body: "post-rotation-delivery".to_string(),
-                blocks: None,
-                content_taint: None,
-                handling_mode: HandlingMode::Queue,
-            })
-            .await
-            .expect("post-rotation delivery should traverse shared ingress");
+        let candidate = send_supervisor_control_probe(
+            &remote_runtime,
+            &replacement_runtime,
+            &replacement_supervisor,
+            "post-rotation-delivery",
+        )
+        .await;
         tokio::time::timeout(Duration::from_secs(1), replacement_wake.as_mut())
             .await
             .expect("new runtime inbox should wake for post-rotation delivery");
-        let candidates = replacement_runtime.drain_peer_input_candidates().await;
-        assert!(candidates.iter().any(|candidate| matches!(
-            &candidate.interaction.content,
-            InteractionContent::Message { body, .. } if body == "post-rotation-delivery"
-        )));
+        assert!(matches!(
+            candidate.interaction.content,
+            InteractionContent::Request { .. }
+        ));
 
         bridge.shutdown().await;
         remote_runtime.stop_listeners_for_rebind().await;
@@ -5248,16 +5268,16 @@ mod tests {
         .await
         .expect("supervisor bridge should build");
         let recipient_name = format!("rotation-delivery-recipient-{suffix}");
-        let recipient_authority = SupervisorAuthorityRecord::generate(
-            super::super::bridge_protocol::SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
+        let recipient_runtime = Arc::new(
+            meerkat_comms::CommsRuntime::inproc_only(&recipient_name)
+                .expect("member runtime should build"),
         );
-        let (recipient_runtime, recipient_dsl) = MobSupervisorBridge::build_runtime(
-            &recipient_name,
-            &recipient_authority,
-            &SupervisorBridgeEndpointConfig::default(),
-        )
-        .await
-        .expect("recipient runtime should build");
+        let (_peer_comms, finalizer) =
+            meerkat_runtime::test_peer_comms_handle_and_runtime_finalizer();
+        finalizer
+            .install_on(recipient_runtime.as_ref())
+            .expect("member runtime should install generated peer-ingress authority");
+        let finalizer = Arc::new(finalizer);
         let recipient = TrustedPeerDescriptor::unsigned_with_pubkey(
             recipient_name,
             recipient_runtime.public_key().to_peer_id().to_string(),
@@ -5273,14 +5293,11 @@ mod tests {
             .supervisor_spec_for_recipient(&recipient)
             .await
             .expect("sender descriptor");
-        MobSupervisorBridge::apply_bridge_trust(
-            &bridge.trust_reconcile_gate,
-            &recipient_runtime,
-            &recipient_dsl,
-            sender.clone(),
-        )
-        .await
-        .expect("recipient trusts sender");
+        let recipient_comms: Arc<dyn CoreCommsRuntime> = recipient_runtime.clone();
+        finalizer
+            .trust_peer_on_runtime(sender.clone(), recipient_comms)
+            .await
+            .expect("member runtime should trust the supervisor through generated authority");
 
         let operation_id = super::super::bridge_protocol::SupervisorRotationOperationId::new();
         let delivery =
@@ -5293,16 +5310,18 @@ mod tests {
                         super::super::bridge_protocol::SUPERVISOR_BRIDGE_PROTOCOL_VERSION,
                 },
             );
+        let member_runtime = Arc::clone(&recipient_runtime);
+        let member_finalizer = Arc::clone(&finalizer);
+        let intake = tokio::spawn(async move {
+            finalize_next_member_candidate(member_runtime, member_finalizer).await
+        });
         bridge
             .send_supervisor_delivery(&recipient, &delivery)
             .await
-            .expect("one-way delivery should send");
-
-        let candidates = recipient_runtime.drain_peer_input_candidates().await;
-        let candidate = candidates
-            .into_iter()
-            .next()
-            .expect("recipient should receive one delivery");
+            .expect("one-way delivery should durably reach the member runtime");
+        let candidate = intake
+            .await
+            .expect("member durable intake task should not panic");
         let InteractionContent::Message { body, .. } = candidate.interaction.content else {
             panic!("rotation submission must not create request/response authority");
         };
@@ -5578,22 +5597,8 @@ mod tests {
             RecipientTrustInstall::NewlyInstalled
         );
 
-        let add_probe = runtime
-            .send(CommsCommand::PeerRequest {
-                objective_id: None,
-                to: PeerRoute::with_display_name(recipient.peer_id, recipient.name.clone()),
-                intent: super::super::bridge_protocol::SUPERVISOR_BRIDGE_INTENT.to_string(),
-                params: serde_json::json!({"probe": "trust-added"}),
-                blocks: None,
-                content_taint: None,
-                handling_mode: HandlingMode::Queue,
-                stream: InputStreamMode::None,
-            })
+        send_supervisor_control_probe(&runtime, &recipient_runtime, &recipient, "trust-added")
             .await;
-        assert!(
-            matches!(add_probe, Ok(SendReceipt::PeerRequestSent { .. })),
-            "repair-add must install the live router row, got {add_probe:?}"
-        );
 
         fail_next_bridge_trust_remove_reconcile_for_test(&recipient.peer_id.to_string());
         MobSupervisorBridge::remove_bridge_trust(

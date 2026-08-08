@@ -1687,11 +1687,12 @@ pub trait CommsRuntime: Send + Sync {
         None
     }
 
-    /// Drain classified inbox interactions.
+    /// Drain the contiguous volatile-control prefix of classified ingress.
     ///
-    /// Returns interactions with pre-computed classification from ingress.
-    /// The host loop routes on the stored `PeerInputClass` instead of
-    /// re-classifying after drain.
+    /// Durable-runtime heads are never removed through this compatibility
+    /// surface; they require `claim_classified_inbox_interaction` and an
+    /// AcceptWithCompletion receipt. The host loop routes returned control
+    /// interactions on their stored `PeerInputClass`.
     ///
     /// Default returns `Unsupported`. Comms-enabled runtimes must override.
     async fn drain_classified_inbox_interactions(
@@ -1702,26 +1703,24 @@ pub trait CommsRuntime: Send + Sync {
         ))
     }
 
-    /// Receive at most one classified inbox interaction.
+    /// Non-destructively claim at most one classified FIFO-head interaction.
     ///
-    /// Session-backed drain loops must use this cancellation-safe dequeue
-    /// surface before awaiting admission. Removing a whole batch and then
-    /// awaiting each admission can strand the unprocessed tail in task-local
-    /// memory if the drain task is aborted or replaced.
-    async fn try_recv_classified_inbox_interaction(
+    /// A DurableRuntime head remains queued until committed with an opaque
+    /// runtime admission receipt. A VolatileControl head may be handed off by
+    /// exact claim-id CAS. Dropping either claim releases it synchronously.
+    async fn claim_classified_inbox_interaction(
         &self,
-    ) -> Result<Option<crate::interaction::ClassifiedInboxInteraction>, CommsCapabilityError> {
+    ) -> Result<Option<crate::interaction::PeerIngressQueueClaim>, CommsCapabilityError> {
         Err(CommsCapabilityError::Unsupported(
-            "try_recv_classified_inbox_interaction".to_string(),
+            "claim_classified_inbox_interaction".to_string(),
         ))
     }
 
-    /// Drain canonical peer/event ingress candidates.
+    /// Drain canonical volatile-control ingress candidates.
     ///
-    /// This remains the live runtime drain bridge for call sites that consume
-    /// the `PeerInputCandidate` noun directly. The underlying drain unit is
-    /// identical to `ClassifiedInboxInteraction`, so the default
-    /// implementation simply forwards the classified drain path.
+    /// This remains the compatibility bridge for control consumers that own
+    /// `PeerInputCandidate` directly. DurableRuntime input is intentionally
+    /// absent and must use the claim/receipt path.
     async fn drain_peer_input_candidates(&self) -> Vec<crate::interaction::PeerInputCandidate> {
         self.drain_classified_inbox_interactions()
             .await

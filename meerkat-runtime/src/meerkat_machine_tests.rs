@@ -4211,16 +4211,9 @@ impl CommsRuntime for FakeDrainRuntime {
         self.dismiss.load(Ordering::Acquire)
     }
 
-    async fn drain_classified_inbox_interactions(
+    async fn claim_classified_inbox_interaction(
         &self,
-    ) -> Result<Vec<meerkat_core::interaction::ClassifiedInboxInteraction>, CommsCapabilityError>
-    {
-        Ok(Vec::new())
-    }
-
-    async fn try_recv_classified_inbox_interaction(
-        &self,
-    ) -> Result<Option<meerkat_core::interaction::ClassifiedInboxInteraction>, CommsCapabilityError>
+    ) -> Result<Option<meerkat_core::interaction::PeerIngressQueueClaim>, CommsCapabilityError>
     {
         Ok(None)
     }
@@ -6959,6 +6952,329 @@ async fn input_terminal_status_by_idempotency_key_survives_restart() {
         stored.seed.last_run_id.is_some(),
         "the terminal status must carry the resolving run id"
     );
+}
+
+struct ColdTerminalRecoveryExecutor;
+
+#[async_trait::async_trait]
+impl CoreExecutor for ColdTerminalRecoveryExecutor {
+    async fn apply(
+        &mut self,
+        run_id: RunId,
+        primitive: RunPrimitive,
+    ) -> Result<CoreApplyOutput, CoreExecutorError> {
+        Ok(CoreApplyOutput::with_untyped_snapshot(
+            RunBoundaryReceiptDraft {
+                run_id,
+                boundary: RunApplyBoundary::RunStart,
+                contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                conversation_digest: None,
+                message_count: 0,
+            },
+            None,
+            None,
+        ))
+    }
+
+    async fn cancel_after_boundary(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
+        Ok(())
+    }
+
+    async fn stop_runtime_executor(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
+        Ok(())
+    }
+}
+
+struct ColdTerminalRecoverySeed {
+    store: Arc<crate::store::InMemoryRuntimeStore>,
+    store_trait: Arc<dyn crate::store::RuntimeStore>,
+    session_id: SessionId,
+    runtime_id: crate::identifiers::LogicalRuntimeId,
+    input_id: InputId,
+}
+
+async fn seed_cold_pending_terminal_candidate(
+    candidate: crate::input_state::InteractionTerminalCandidate,
+) -> ColdTerminalRecoverySeed {
+    use crate::input_state::{
+        InputLifecycleState, InputTerminalCompletion, InputTerminalCompletionBatchKey,
+        InputTerminalCompletionPhase, InputTerminalOutcome, StoredInputState,
+        interaction_terminal_payload_digest,
+    };
+    use crate::store::RuntimeStore;
+
+    let store = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let store_trait: Arc<dyn RuntimeStore> = store.clone();
+    let session_id = SessionId::new();
+    let runtime_id = crate::identifiers::LogicalRuntimeId::for_session(&session_id);
+    let run_id = RunId::new();
+    let input_id = InputId::new();
+
+    {
+        let first = MeerkatMachine::persistent(Arc::clone(&store_trait), memory_blob_store());
+        first
+            .register_session(session_id.clone())
+            .await
+            .expect("seed persistent runtime lifecycle before cold terminal recovery");
+    }
+
+    let candidate_digest =
+        interaction_terminal_payload_digest(&candidate).expect("digest terminal candidate");
+    let completion_input_ids = vec![input_id.clone()];
+    let completion_input_ids_digest = interaction_terminal_payload_digest(&completion_input_ids)
+        .expect("digest terminal completion recipients");
+    let mut stored = StoredInputState::new_accepted(input_id.clone());
+    stored.seed.phase = InputLifecycleState::Consumed;
+    stored.seed.terminal_outcome = Some(InputTerminalOutcome::Consumed);
+    stored.seed.last_run_id = Some(run_id.clone());
+    stored.state.terminal_completion = Some(InputTerminalCompletion {
+        input_id: input_id.clone(),
+        batch_ordinal: 0,
+        batch_key: InputTerminalCompletionBatchKey::Run { run_id },
+        owner_input_id: input_id.clone(),
+        candidate_digest,
+        completion_input_ids_digest,
+        requires_session_checkpoint: false,
+        candidate: Some(candidate),
+        completion_input_ids: Some(completion_input_ids),
+        outcome: None,
+        phase: InputTerminalCompletionPhase::Pending,
+    });
+    let record = crate::input_state::InputStatePersistenceRecord::from_machine_snapshot(stored)
+        .expect("pending terminal candidate must have generated persistence authority");
+    store
+        .persist_input_state(&runtime_id, &record)
+        .await
+        .expect("persist pending terminal candidate");
+
+    ColdTerminalRecoverySeed {
+        store,
+        store_trait,
+        session_id,
+        runtime_id,
+        input_id,
+    }
+}
+
+async fn recover_cold_pending_terminal_candidate(
+    test_name: &str,
+    candidate: crate::input_state::InteractionTerminalCandidate,
+) -> (
+    crate::completion::CompletionOutcome,
+    crate::completion::CompletionOutcome,
+) {
+    use crate::store::RuntimeStore;
+
+    let ColdTerminalRecoverySeed {
+        store,
+        store_trait,
+        session_id,
+        runtime_id,
+        input_id,
+    } = seed_cold_pending_terminal_candidate(candidate).await;
+
+    let restarted = Arc::new(MeerkatMachine::persistent(
+        Arc::clone(&store_trait),
+        memory_blob_store(),
+    ));
+    restarted
+        .register_session_with_executor(session_id.clone(), Box::new(ColdTerminalRecoveryExecutor))
+        .await
+        .expect("cold registration must finalize terminal recovery before serving");
+
+    let rows = store
+        .load_input_states_strict(&runtime_id)
+        .await
+        .expect("load finalized cold terminal receipt");
+    let recovered = crate::input_state::input_terminal_completion_outcome(&rows, &input_id)
+        .expect("validate finalized cold terminal receipt")
+        .expect("cold startup must persist the exact final receipt");
+
+    let serving = make_prompt(&format!("{test_name} startup serving probe"));
+    let (accepted, completion) = restarted
+        .accept_input_with_completion(&session_id, serving)
+        .await
+        .expect("cold-recovered runtime must accept new work");
+    assert!(accepted.is_accepted());
+    let served = tokio::time::timeout(
+        Duration::from_secs(2),
+        completion
+            .expect("accepted serving probe must have a completion")
+            .wait_authorized(),
+    )
+    .await
+    .expect("cold-recovered runtime must serve new work");
+
+    (recovered, served)
+}
+
+#[tokio::test]
+async fn cold_attached_recovery_restores_cancelled_terminal_authority_before_serving() {
+    let (recovered, served) = recover_cold_pending_terminal_candidate(
+        "cancelled terminal recovery",
+        crate::input_state::InteractionTerminalCandidate::Cancelled,
+    )
+    .await;
+    assert!(matches!(
+        recovered,
+        crate::completion::CompletionOutcome::Cancelled
+    ));
+    assert!(matches!(
+        served,
+        crate::completion::CompletionOutcome::CompletedWithoutResult
+    ));
+}
+
+#[tokio::test]
+async fn cold_attached_recovery_restores_machine_failure_authority_before_serving() {
+    let expected = meerkat_core::TurnErrorMetadata::runtime_apply_failure(
+        "cold recovery retained the exact machine failure",
+    );
+    let (recovered, served) = recover_cold_pending_terminal_candidate(
+        "machine failure terminal recovery",
+        crate::input_state::InteractionTerminalCandidate::MachineTerminalFailure {
+            error: expected.clone(),
+        },
+    )
+    .await;
+    match recovered {
+        crate::completion::CompletionOutcome::AbandonedWithError { error, .. } => {
+            assert_eq!(error, expected);
+        }
+        other => panic!("expected exact machine failure receipt, got {other:?}"),
+    }
+    assert!(matches!(
+        served,
+        crate::completion::CompletionOutcome::CompletedWithoutResult
+    ));
+}
+
+#[tokio::test]
+async fn cold_attached_recovery_rejects_mismatched_failure_outcome_and_cause() {
+    use crate::store::RuntimeStore;
+
+    let mut mismatched =
+        meerkat_core::TurnErrorMetadata::runtime_apply_failure("mismatched durable terminal facts");
+    mismatched.outcome = Some(meerkat_core::TurnTerminalOutcome::BudgetExhausted);
+    let ColdTerminalRecoverySeed {
+        store,
+        store_trait,
+        session_id,
+        runtime_id,
+        input_id,
+    } = seed_cold_pending_terminal_candidate(
+        crate::input_state::InteractionTerminalCandidate::MachineTerminalFailure {
+            error: mismatched,
+        },
+    )
+    .await;
+    let restarted = Arc::new(MeerkatMachine::persistent(store_trait, memory_blob_store()));
+    let error = restarted
+        .register_session_with_executor(session_id, Box::new(ColdTerminalRecoveryExecutor))
+        .await
+        .expect_err("cold recovery must reject an impossible outcome/cause pair");
+    assert!(
+        error.to_string().contains("does not match cause"),
+        "unexpected cold recovery rejection: {error}"
+    );
+    let rows = store
+        .load_input_states_strict(&runtime_id)
+        .await
+        .expect("load retained pending terminal candidate");
+    assert!(
+        crate::input_state::input_terminal_completion_outcome(&rows, &input_id)
+            .expect("validate retained pending terminal candidate")
+            .is_none(),
+        "rejected recovery must not mint a final receipt"
+    );
+}
+
+fn modeled_terminal_recovery_enum(enum_name: &str, variant: &str) -> KernelValue {
+    KernelValue::NamedVariant {
+        enum_name: meerkat_machine_schema::identity::EnumTypeId::parse(enum_name)
+            .expect("terminal recovery enum name"),
+        variant: meerkat_machine_schema::identity::EnumVariantId::parse(variant)
+            .expect("terminal recovery enum variant"),
+    }
+}
+
+fn modeled_registered_terminal_recovery_state() -> KernelState {
+    let schema = modeled_meerkat_kernel::schema();
+    let kernel = GeneratedMachineKernel::new(schema.clone());
+    let mut state = kernel.initial_state().expect("initial modeled state");
+    state.phase =
+        meerkat_machine_schema::identity::PhaseId::parse("Idle").expect("modeled idle phase");
+    let session_field = schema
+        .state
+        .fields
+        .iter()
+        .find(|field| field.name.as_str() == "session_id")
+        .expect("modeled session field");
+    state.fields.insert(
+        session_field.name.clone(),
+        runtime_modeled_coerce_value_to_type(
+            &session_field.ty,
+            KernelValue::String("terminal-recovery-session".into()),
+        ),
+    );
+    state
+}
+
+fn modeled_terminal_recovery_input(outcome: &str, cause: &str) -> KernelInput {
+    modeled_kernel_input(
+        "RecoverRuntimeCompletionResultCorrelation",
+        [
+            (
+                "run_id",
+                KernelValue::String("terminal-recovery-run".into()),
+            ),
+            (
+                "terminal_outcome",
+                modeled_terminal_recovery_enum("TurnTerminalOutcome", outcome),
+            ),
+            (
+                "terminal_cause_kind",
+                modeled_terminal_recovery_enum("TurnTerminalCauseKind", cause),
+            ),
+        ],
+    )
+}
+
+#[test]
+fn modeled_terminal_recovery_rejects_mismatched_failure_outcome_and_cause() {
+    let kernel = GeneratedMachineKernel::new(modeled_meerkat_kernel::schema());
+    let error = kernel
+        .transition(
+            &modeled_registered_terminal_recovery_state(),
+            &modeled_terminal_recovery_input("BudgetExhausted", "RuntimeApplyFailure"),
+        )
+        .expect_err("modeled recovery must reject an impossible outcome/cause pair");
+    assert!(
+        matches!(error, TransitionRefusal::NoMatchingTransition { .. }),
+        "unexpected modeled recovery rejection: {error:?}"
+    );
+}
+
+#[test]
+fn modeled_terminal_recovery_accepts_exact_special_failure_pairs() {
+    let kernel = GeneratedMachineKernel::new(modeled_meerkat_kernel::schema());
+    for (outcome, cause) in [
+        ("BudgetExhausted", "BudgetExhausted"),
+        ("TimeBudgetExceeded", "TimeBudgetExceeded"),
+        (
+            "StructuredOutputValidationFailed",
+            "StructuredOutputValidationFailed",
+        ),
+    ] {
+        kernel
+            .transition(
+                &modeled_registered_terminal_recovery_state(),
+                &modeled_terminal_recovery_input(outcome, cause),
+            )
+            .unwrap_or_else(|error| {
+                panic!("modeled recovery rejected exact pair {outcome}/{cause}: {error:?}")
+            });
+    }
 }
 
 /// Shared setup for the restart-first-class terminal-status lane: drive a

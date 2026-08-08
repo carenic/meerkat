@@ -58,6 +58,14 @@ pub(crate) fn normalize_send_error(
                 ),
             }
         }
+        meerkat_core::comms::SendError::DurableAdmissionRejected { envelope_id } => {
+            let peer = peer_name.unwrap_or("<unknown>");
+            CommsSendErrorData::PeerInputRejected {
+                peer: peer.to_string(),
+                envelope_id: envelope_id.to_string(),
+                message: format!("peer '{peer}' durably rejected envelope {envelope_id}"),
+            }
+        }
         other => CommsSendErrorData::SendFailed {
             message: other.to_string(),
         },
@@ -298,6 +306,7 @@ mod tests {
             envelope_id,
             interaction_id,
             stream_reserved: true,
+            delivery: meerkat_core::comms::PeerDeliveryOutcome::Queued,
         })
         .expect("well-formed receipt serializes");
 
@@ -309,6 +318,7 @@ mod tests {
             payload["interaction_id"],
             serde_json::json!(interaction_id.0.to_string())
         );
+        assert_eq!(payload["delivery"], serde_json::json!("queued"));
     }
 
     #[test]
@@ -330,6 +340,24 @@ mod tests {
         assert_eq!(json["reason"], "inbox_full");
     }
 
+    #[test]
+    fn normalize_send_error_preserves_durable_rejection_identity() {
+        let envelope_id = uuid::Uuid::new_v4();
+        let data = normalize_send_error(
+            Some("peer-a"),
+            &meerkat_core::comms::SendError::DurableAdmissionRejected { envelope_id },
+        );
+
+        assert_eq!(
+            data.message(),
+            format!("peer 'peer-a' durably rejected envelope {envelope_id}")
+        );
+        let json = serde_json::to_value(data).unwrap();
+        assert_eq!(json["code"], "peer_input_rejected");
+        assert_eq!(json["peer"], "peer-a");
+        assert_eq!(json["envelope_id"], envelope_id.to_string());
+    }
+
     // Gate (#62): `send_receipt_json` returns a typed `Result` and no longer
     // launders a serialization failure into a fabricated empty `{}` object.
     // A well-formed receipt serializes to a real payload; the contract change
@@ -344,6 +372,7 @@ mod tests {
             envelope_id,
             interaction_id,
             stream_reserved: true,
+            delivery: meerkat_core::comms::PeerDeliveryOutcome::Queued,
         });
 
         let payload = result.expect("well-formed receipt serializes");

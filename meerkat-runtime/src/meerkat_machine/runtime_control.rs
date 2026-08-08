@@ -1622,6 +1622,94 @@ impl MeerkatMachine {
             .await
     }
 
+    pub(crate) async fn accept_peer_ingress_with_completion(
+        &self,
+        facts: meerkat_core::interaction::PeerIngressClaimCommitFacts,
+        session_id: &SessionId,
+        input: Input,
+    ) -> super::PeerIngressAcceptFinalization {
+        let submitted_input_id = input.id().clone();
+        self.finalize_peer_ingress_accept(
+            facts,
+            submitted_input_id,
+            self.accept_input_with_completion_boxed(session_id, input)
+                .await,
+        )
+    }
+
+    pub(crate) async fn accept_peer_ingress_with_completion_for_member_residency(
+        &self,
+        facts: meerkat_core::interaction::PeerIngressClaimCommitFacts,
+        session_id: &SessionId,
+        input: Input,
+        expected_member: Option<
+            &meerkat_contracts::wire::supervisor_bridge::BridgeMemberIncarnation,
+        >,
+    ) -> super::PeerIngressAcceptFinalization {
+        let submitted_input_id = input.id().clone();
+        let result = self
+            .accept_input_with_completion_for_member_residency(session_id, input, expected_member)
+            .await;
+        // An exact member-residency mismatch is an authoritative rejection of
+        // this addressed delivery, not an uncertain transport failure.  The
+        // runtime-owned peer-ingress seam therefore terminalizes the queue
+        // claim as Rejected so the sender cannot mistake a definite fence
+        // refusal for ambiguous delivery.
+        let result = match result {
+            Err(RuntimeDriverError::StaleAuthority { reason }) => {
+                Err(RuntimeDriverError::ValidationFailed { reason })
+            }
+            other => other,
+        };
+        self.finalize_peer_ingress_accept(facts, submitted_input_id, result)
+    }
+
+    fn finalize_peer_ingress_accept(
+        &self,
+        facts: meerkat_core::interaction::PeerIngressClaimCommitFacts,
+        submitted_input_id: meerkat_core::lifecycle::InputId,
+        result: Result<
+            (AcceptOutcome, Option<crate::completion::CompletionHandle>),
+            RuntimeDriverError,
+        >,
+    ) -> super::PeerIngressAcceptFinalization {
+        use meerkat_core::interaction::PeerIngressClaimTerminalOutcome as Terminal;
+        let (terminal, completion) = match result {
+            Ok((outcome, completion)) => {
+                let terminal = match &outcome {
+                    AcceptOutcome::Accepted { input_id, .. } => Terminal::RuntimeAccepted {
+                        input_id: input_id.clone(),
+                    },
+                    AcceptOutcome::Deduplicated {
+                        input_id,
+                        existing_id,
+                        ..
+                    } => Terminal::RuntimeDeduplicated {
+                        input_id: input_id.clone(),
+                        existing_id: existing_id.clone(),
+                    },
+                    AcceptOutcome::Rejected { .. } => Terminal::RuntimeRejected {
+                        input_id: submitted_input_id,
+                    },
+                };
+                (terminal, completion)
+            }
+            Err(RuntimeDriverError::ValidationFailed { .. }) => (
+                Terminal::RuntimeRejected {
+                    input_id: submitted_input_id,
+                },
+                None,
+            ),
+            Err(error) => return super::PeerIngressAcceptFinalization::MechanismError(error),
+        };
+        super::PeerIngressAcceptFinalization::Finalized {
+            receipt: Arc::new(super::DurablePeerIngressAdmissionReceipt::new(
+                facts, terminal,
+            )),
+            completion,
+        }
+    }
+
     /// Accept input only if one exact committed executor attachment still owns
     /// the session. The machine holds that session's mutation gate from the
     /// witness check through durable admission, so an attachment replacement

@@ -138,7 +138,7 @@ fn interaction_stream_abandon_reason_for_send_error(
     error: &SendError,
 ) -> meerkat_core::InteractionStreamAbandonReason {
     match error {
-        SendError::AdmissionDropped { .. } => {
+        SendError::AdmissionDropped { .. } | SendError::DurableAdmissionRejected { .. } => {
             meerkat_core::InteractionStreamAbandonReason::AdmissionRejected
         }
         _ => meerkat_core::InteractionStreamAbandonReason::SendFailed,
@@ -542,6 +542,7 @@ fn classified_entry_to_interaction(
     use crate::agent::types::MessageIntent;
     use crate::types::MessageKind;
 
+    let raw_item_id = entry.raw_item_id;
     let ingress = entry.ingress_fact;
     let lifecycle_peer = entry.lifecycle_peer;
     let from_peer = entry.from_peer.unwrap_or_else(|| "unknown".to_string());
@@ -695,7 +696,7 @@ fn classified_entry_to_interaction(
             ..
         } => Some(meerkat_core::ClassifiedInboxInteraction {
             interaction: meerkat_core::InboxInteraction {
-                id: meerkat_core::InteractionId(interaction_id.unwrap_or_else(uuid::Uuid::new_v4)),
+                id: meerkat_core::InteractionId(interaction_id.unwrap_or(raw_item_id.0)),
                 from_route: None,
                 from: format!("event:{source}"),
                 content: meerkat_core::InteractionContent::Message { body, blocks },
@@ -712,6 +713,32 @@ fn classified_entry_to_interaction(
             response_terminality: entry.response_terminality,
         }),
     }
+}
+
+#[cfg(test)]
+pub(crate) fn test_peer_ingress_queue_claim(
+    claim: crate::inbox::ClassifiedInboxClaim,
+) -> meerkat_core::PeerIngressQueueClaim {
+    let raw_item_id = claim.entry.raw_item_id;
+    let class = claim.entry.class;
+    let delivery_contract = claim.entry.delivery_contract;
+    let candidate = classified_entry_to_interaction(claim.entry);
+    meerkat_core::PeerIngressQueueClaim::from_comms_queue(
+        claim.claim_id,
+        raw_item_id,
+        class,
+        delivery_contract,
+        candidate,
+        claim.lease,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn test_install_peer_comms_handle(
+    runtime: &CommsRuntime,
+    handle: Arc<dyn meerkat_core::handles::PeerCommsHandle>,
+) {
+    runtime.install_peer_comms_handle(handle);
 }
 
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
@@ -1253,6 +1280,7 @@ impl CoreCommsRuntime for CommsRuntime {
                 .await
                 .map(|outcome| SendReceipt::PeerLifecycleSent {
                     envelope_id: outcome.envelope_id,
+                    delivery: outcome.delivery,
                 }),
             CommsCommand::PeerRequest {
                 to,
@@ -1349,7 +1377,7 @@ impl CoreCommsRuntime for CommsRuntime {
                 } else {
                     None
                 };
-                let envelope_id = self
+                let send_outcome = self
                     .send_peer_command(
                         &to,
                         crate::types::MessageKind::Response {
@@ -1363,8 +1391,7 @@ impl CoreCommsRuntime for CommsRuntime {
                         },
                         content_taint,
                     )
-                    .await?
-                    .envelope_id;
+                    .await?;
 
                 // The terminal inbound transition is coupled to the actual
                 // response send outcome: route/transport failure leaves the
@@ -1380,8 +1407,11 @@ impl CoreCommsRuntime for CommsRuntime {
                     )));
                 }
                 Ok(SendReceipt::PeerResponseSent {
-                    envelope_id,
+                    envelope_id: send_outcome.envelope_id,
                     in_reply_to,
+                    // Response preserves the legacy no-ACK contract. The
+                    // transport write does not prove receiver admission.
+                    delivery: meerkat_core::comms::PeerDeliveryOutcome::Queued,
                 })
             }
         }
@@ -1544,15 +1574,26 @@ impl CoreCommsRuntime for CommsRuntime {
             .collect())
     }
 
-    async fn try_recv_classified_inbox_interaction(
+    async fn claim_classified_inbox_interaction(
         &self,
-    ) -> Result<Option<meerkat_core::ClassifiedInboxInteraction>, meerkat_core::CommsCapabilityError>
+    ) -> Result<Option<meerkat_core::PeerIngressQueueClaim>, meerkat_core::CommsCapabilityError>
     {
-        let mut inbox = self.inbox.lock().await;
-        // Use stored classification metadata — NO trust re-check.
-        // Snapshot semantics: classification was fixed at enqueue time.
-        Ok(std::iter::from_fn(|| inbox.try_recv_one_classified())
-            .find_map(classified_entry_to_interaction))
+        let inbox = self.inbox.lock().await;
+        let Some(claim) = inbox.try_claim_one_classified() else {
+            return Ok(None);
+        };
+        let class = claim.entry.class;
+        let delivery_contract = claim.entry.delivery_contract;
+        let raw_item_id = claim.entry.raw_item_id;
+        let candidate = classified_entry_to_interaction(claim.entry);
+        Ok(Some(meerkat_core::PeerIngressQueueClaim::from_comms_queue(
+            claim.claim_id,
+            raw_item_id,
+            class,
+            delivery_contract,
+            candidate,
+            claim.lease,
+        )))
     }
 
     async fn peer_ingress_queue_snapshot(
@@ -1836,7 +1877,7 @@ pub struct CommsRuntime {
     /// whether a terminal Response candidate is delivered to an
     /// agent-blocking waiter, discarded (tombstone), or takes the ordinary
     /// session path.
-    bridge_reply_waiters: Mutex<HashMap<Uuid, BridgeReplyWaiterEntry>>,
+    bridge_reply_waiters: Arc<Mutex<HashMap<Uuid, BridgeReplyWaiterEntry>>>,
 }
 
 /// Fully constructed comms runtime whose inproc route is still dormant.
@@ -2017,11 +2058,14 @@ impl CommsRuntime {
         let peer_comms_handle = Arc::new(parking_lot::RwLock::new(None));
         let require_peer_comms_machine_authority =
             Arc::new(AtomicBool::new(require_machine_authority));
+        let bridge_reply_waiters: Arc<Mutex<HashMap<Uuid, BridgeReplyWaiterEntry>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let classification_context = Arc::new(crate::classify::IngressClassificationContext {
             require_peer_auth: config.require_peer_auth,
             trusted_peers: trusted_peers.clone(),
             peer_comms_handle: peer_comms_handle.clone(),
             inproc_namespace: config.inproc_namespace.clone(),
+            durable_runtime_consumer: true,
         });
         let (inbox, inbox_sender) = crate::Inbox::new_classified(classification_context);
         let inbox_notify = inbox.notify();
@@ -2062,7 +2106,7 @@ impl CommsRuntime {
             blob_store: None,
             peer_interaction_handle: parking_lot::RwLock::new(None),
             interaction_stream_handle: parking_lot::RwLock::new(None),
-            bridge_reply_waiters: Mutex::new(HashMap::new()),
+            bridge_reply_waiters,
         };
         let mut runtime = runtime;
         runtime.publish_prepared_inproc(None)?;
@@ -2104,6 +2148,25 @@ impl CommsRuntime {
         .publish()
     }
 
+    /// Construct an inproc endpoint whose composition has no runtime input
+    /// consumer. It accepts only volatile control traffic and rejects any
+    /// envelope that would require an AcceptWithCompletion receipt.
+    pub fn inproc_control_only_with_keypair_and_silent_intents(
+        name: &str,
+        namespace: Option<String>,
+        keypair: Keypair,
+        silent_intents: Arc<HashSet<String>>,
+    ) -> Result<Self, CommsRuntimeError> {
+        Self::prepare_inproc_only_with_keypair_and_delivery_mode(
+            name,
+            namespace,
+            keypair,
+            silent_intents,
+            false,
+        )?
+        .publish()
+    }
+
     /// Construct a complete inproc runtime without publishing its global
     /// route. This is the two-phase seam for cancellation-safe supervisor
     /// rotation and other exact runtime replacement.
@@ -2111,7 +2174,41 @@ impl CommsRuntime {
         name: &str,
         namespace: Option<String>,
         keypair: Keypair,
+        silent_intents: Arc<HashSet<String>>,
+    ) -> Result<PreparedCommsRuntime, CommsRuntimeError> {
+        Self::prepare_inproc_only_with_keypair_and_delivery_mode(
+            name,
+            namespace,
+            keypair,
+            silent_intents,
+            true,
+        )
+    }
+
+    /// Prepare an unpublished inproc control endpoint. Durable runtime input
+    /// is rejected before enqueue because this composition has no
+    /// AcceptWithCompletion consumer.
+    pub fn prepare_inproc_control_only_with_keypair_and_silent_intents(
+        name: &str,
+        namespace: Option<String>,
+        keypair: Keypair,
+        silent_intents: Arc<HashSet<String>>,
+    ) -> Result<PreparedCommsRuntime, CommsRuntimeError> {
+        Self::prepare_inproc_only_with_keypair_and_delivery_mode(
+            name,
+            namespace,
+            keypair,
+            silent_intents,
+            false,
+        )
+    }
+
+    fn prepare_inproc_only_with_keypair_and_delivery_mode(
+        name: &str,
+        namespace: Option<String>,
+        keypair: Keypair,
         _silent_intents: Arc<HashSet<String>>,
+        durable_runtime_consumer: bool,
     ) -> Result<PreparedCommsRuntime, CommsRuntimeError> {
         let public_key = keypair.public_key();
         // Single source of truth — same Arc shared by Router, classification, and callers.
@@ -2119,11 +2216,14 @@ impl CommsRuntime {
 
         let peer_comms_handle = Arc::new(parking_lot::RwLock::new(None));
         let require_peer_comms_machine_authority = Arc::new(AtomicBool::new(false));
+        let bridge_reply_waiters: Arc<Mutex<HashMap<Uuid, BridgeReplyWaiterEntry>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let classification_context = Arc::new(crate::classify::IngressClassificationContext {
             require_peer_auth: true,
             trusted_peers: trusted_peers.clone(),
             peer_comms_handle: peer_comms_handle.clone(),
             inproc_namespace: namespace.clone(),
+            durable_runtime_consumer,
         });
         let (inbox, inbox_sender) = crate::Inbox::new_classified(classification_context);
         let inbox_notify = inbox.notify();
@@ -2192,7 +2292,7 @@ impl CommsRuntime {
             blob_store: None,
             peer_interaction_handle: parking_lot::RwLock::new(None),
             interaction_stream_handle: parking_lot::RwLock::new(None),
-            bridge_reply_waiters: Mutex::new(HashMap::new()),
+            bridge_reply_waiters,
         };
         Ok(PreparedCommsRuntime { runtime })
     }
@@ -2242,11 +2342,14 @@ impl CommsRuntime {
 
         let peer_comms_handle = Arc::new(parking_lot::RwLock::new(None));
         let require_peer_comms_machine_authority = Arc::new(AtomicBool::new(true));
+        let bridge_reply_waiters: Arc<Mutex<HashMap<Uuid, BridgeReplyWaiterEntry>>> =
+            Arc::new(Mutex::new(HashMap::new()));
         let classification_context = Arc::new(crate::classify::IngressClassificationContext {
             require_peer_auth: true,
             trusted_peers: trusted_peers.clone(),
             peer_comms_handle: peer_comms_handle.clone(),
             inproc_namespace: namespace.clone(),
+            durable_runtime_consumer: true,
         });
         let (inbox, inbox_sender) = crate::Inbox::new_classified(classification_context);
         let inbox_notify = inbox.notify();
@@ -2304,7 +2407,7 @@ impl CommsRuntime {
             blob_store: None,
             peer_interaction_handle: parking_lot::RwLock::new(None),
             interaction_stream_handle: parking_lot::RwLock::new(None),
-            bridge_reply_waiters: Mutex::new(HashMap::new()),
+            bridge_reply_waiters,
         };
         let mut runtime = runtime;
         runtime.publish_prepared_inproc(None)?;
@@ -3095,18 +3198,20 @@ impl CommsRuntime {
         kind: crate::types::MessageKind,
         content_taint: Option<meerkat_core::comms::SendTaintOverride>,
     ) -> Result<crate::router::SendOutcome, SendError> {
-        let dest_peer_id = route.peer_id;
         let kind = self.hydrate_message_kind_for_transport(kind).await?;
         let result = self
             .router
-            .send_with_id(dest_peer_id, envelope_id, kind, content_taint)
+            .send_with_id(route.peer_id, envelope_id, kind, content_taint)
             .await;
         match result {
             Ok(outcome) => Ok(outcome),
             Err(crate::router::SendError::PeerNotFound(peer_id)) => {
                 Err(SendError::PeerNotFound(peer_id.to_string()))
             }
-            Err(crate::router::SendError::PeerOffline) => Err(SendError::PeerOffline),
+            Err(crate::router::SendError::PeerOffline) => Err(SendError::AmbiguousDelivery {
+                envelope_id,
+                detail: "peer delivery acknowledgement was not observed".to_string(),
+            }),
             Err(crate::router::SendError::AdmissionDropped { reason }) => {
                 // Transport worked; the receiver's ingress admission policy
                 // rejected us. Surface the typed reason all the way to the
@@ -3116,9 +3221,15 @@ impl CommsRuntime {
                     reason: reason.into(),
                 })
             }
+            Err(crate::router::SendError::DurableAdmissionRejected { envelope_id }) => {
+                Err(SendError::DurableAdmissionRejected { envelope_id })
+            }
             Err(
                 error @ (crate::router::SendError::Transport(_) | crate::router::SendError::Io(_)),
-            ) => Err(SendError::Transport(error.to_string())),
+            ) => Err(SendError::AmbiguousDelivery {
+                envelope_id,
+                detail: error.to_string(),
+            }),
         }
     }
 
@@ -3226,7 +3337,7 @@ impl CommsRuntime {
             return Err(err);
         }
 
-        let envelope_id = match self
+        let send_outcome = match self
             .send_peer_command_with_id(
                 to,
                 interaction_id,
@@ -3243,7 +3354,13 @@ impl CommsRuntime {
             )
             .await
         {
-            Ok(outcome) => outcome.envelope_id,
+            Ok(outcome) => outcome,
+            Err(error @ SendError::AmbiguousDelivery { .. }) => {
+                // Receiver admission may already have committed. Preserve the
+                // sent/reserved projections so callers can reconcile against
+                // durable work truth without inventing a second lifecycle.
+                return Err(error);
+            }
             Err(error) => {
                 if stream_reserved {
                     self.abandon_interaction_stream(
@@ -3259,9 +3376,10 @@ impl CommsRuntime {
         };
 
         Ok(SendReceipt::PeerRequestSent {
-            envelope_id,
+            envelope_id: send_outcome.envelope_id,
             interaction_id: meerkat_core::InteractionId(interaction_id),
             stream_reserved,
+            delivery: send_outcome.delivery,
         })
     }
 
@@ -3383,9 +3501,10 @@ impl CommsRuntime {
                 )))
             }
             Err(error) => {
-                // A send failure is NOT a timeout: remove (not tombstone) the
-                // waiter — the envelope never left, so no late reply exists —
-                // and return the typed error verbatim.
+                // The caller receives the typed send error rather than the
+                // reply receiver, so retaining this process-local waiter would
+                // create unreachable authority. Ambiguous delivery is
+                // reconciled by the caller against durable work truth.
                 self.remove_bridge_reply_waiter(interaction_id);
                 Err(error)
             }
@@ -4444,6 +4563,27 @@ mod tests {
     use super::*;
     use crate::classify::test_support;
 
+    async fn snapshot_runtime_candidates(
+        runtime: &CommsRuntime,
+    ) -> Vec<meerkat_core::ClassifiedInboxInteraction> {
+        let inbox = runtime.inbox.lock().await;
+        inbox
+            .test_classified_entries_snapshot()
+            .into_iter()
+            .filter_map(classified_entry_to_interaction)
+            .collect()
+    }
+
+    async fn snapshot_runtime_interactions(
+        runtime: &CommsRuntime,
+    ) -> Vec<meerkat_core::InboxInteraction> {
+        snapshot_runtime_candidates(runtime)
+            .await
+            .into_iter()
+            .map(|candidate| candidate.interaction)
+            .collect()
+    }
+
     #[tokio::test]
     async fn pairing_frame_reader_accepts_the_exact_size_boundary() {
         let mut wire = vec![b' '; MAX_PAIRING_MESSAGE_BYTES];
@@ -5455,6 +5595,62 @@ mod tests {
         runtime.install_peer_comms_handle(test_support::runtime_peer_comms_handle());
     }
 
+    fn install_test_peer_ingress_runtime(
+        runtime: &CommsRuntime,
+    ) -> Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer> {
+        let (peer_comms_handle, finalizer) =
+            meerkat_runtime::test_peer_comms_handle_and_runtime_finalizer();
+        runtime.install_peer_comms_handle(peer_comms_handle);
+        Arc::new(finalizer)
+    }
+
+    fn spawn_runtime_finalization(
+        runtime: Arc<CommsRuntime>,
+        finalizer: Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer>,
+    ) -> tokio::task::JoinHandle<meerkat_core::interaction::PeerInputCandidate> {
+        tokio::spawn(async move {
+            let claim = loop {
+                if let Some(claim) =
+                    CoreCommsRuntime::claim_classified_inbox_interaction(runtime.as_ref())
+                        .await
+                        .expect("test runtime claim surface must be available")
+                {
+                    break claim;
+                }
+                tokio::task::yield_now().await;
+            };
+            finalizer
+                .finalize(claim)
+                .await
+                .expect("real MeerkatMachine must durably finalize the exact comms claim")
+        })
+    }
+
+    fn spawn_volatile_handoff(
+        runtime: Arc<CommsRuntime>,
+    ) -> tokio::task::JoinHandle<meerkat_core::interaction::PeerInputCandidate> {
+        tokio::spawn(async move {
+            let claim = loop {
+                if let Some(claim) =
+                    CoreCommsRuntime::claim_classified_inbox_interaction(runtime.as_ref())
+                        .await
+                        .expect("test runtime claim surface must be available")
+                {
+                    break claim;
+                }
+                tokio::task::yield_now().await;
+            };
+            let candidate = claim
+                .candidate()
+                .cloned()
+                .expect("volatile peer ingress must retain its classified candidate");
+            claim
+                .__handoff_volatile()
+                .expect("volatile test handoff must remove the exact claimed head");
+            candidate
+        })
+    }
+
     fn inproc_only_with_test_peer_authority(name: &str) -> CommsRuntime {
         let runtime = CommsRuntime::inproc_only(name).unwrap();
         install_test_peer_comms_handle(&runtime);
@@ -5474,15 +5670,17 @@ mod tests {
         )
     }
 
-    async fn trusted_inproc_pair(prefix: &str) -> (CommsRuntime, CommsRuntime, String) {
+    async fn trusted_inproc_pair(prefix: &str) -> (Arc<CommsRuntime>, Arc<CommsRuntime>, String) {
         let suffix = Uuid::new_v4().simple().to_string();
         let sender_name = format!("{prefix}-sender-{suffix}");
         let receiver_name = format!("{prefix}-receiver-{suffix}");
-        let sender = CommsRuntime::inproc_only(&sender_name).expect("sender runtime");
-        let receiver = inproc_only_with_test_peer_authority(&receiver_name);
+        let sender = Arc::new(CommsRuntime::inproc_only(&sender_name).expect("sender runtime"));
+        let receiver =
+            Arc::new(CommsRuntime::inproc_only(&receiver_name).expect("receiver runtime"));
+        let _finalizer = install_test_peer_ingress_runtime(receiver.as_ref());
 
         add_trusted_peer_with_generated_authority(
-            &sender,
+            sender.as_ref(),
             trusted_descriptor(
                 &receiver_name,
                 receiver.public_key(),
@@ -5491,7 +5689,7 @@ mod tests {
         )
         .await;
         add_trusted_peer_with_generated_authority(
-            &receiver,
+            receiver.as_ref(),
             trusted_descriptor(
                 &sender_name,
                 sender.public_key(),
@@ -5504,10 +5702,10 @@ mod tests {
     }
 
     async fn enqueue_fenced_then_plain(
-        sender: &CommsRuntime,
-        receiver: &CommsRuntime,
+        sender: Arc<CommsRuntime>,
+        receiver: Arc<CommsRuntime>,
         receiver_name: &str,
-    ) {
+    ) -> Vec<tokio::task::JoinHandle<Result<SendReceipt, SendError>>> {
         let to = peer_route(receiver_name, receiver.public_key());
         let fenced = CommsCommand::IncarnationFencedPeerMessage {
             to: to.clone(),
@@ -5526,22 +5724,58 @@ mod tests {
                 fence_token: 5,
             },
         };
-        CoreCommsRuntime::send(sender, fenced)
+        let fenced_sender = Arc::clone(&sender);
+        let fenced_send =
+            tokio::spawn(
+                async move { CoreCommsRuntime::send(fenced_sender.as_ref(), fenced).await },
+            );
+        loop {
+            let snapshot = CoreCommsRuntime::peer_ingress_queue_snapshot(receiver.as_ref())
+                .await
+                .expect("classified queue snapshot");
+            if snapshot.total_count == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+
+        let plain_send = tokio::spawn(async move {
+            CoreCommsRuntime::send(
+                sender.as_ref(),
+                CommsCommand::PeerMessage {
+                    to,
+                    body: "ordinary message".to_string(),
+                    blocks: None,
+                    content_taint: None,
+                    handling_mode: meerkat_core::types::HandlingMode::Queue,
+                    objective_id: None,
+                },
+            )
             .await
-            .expect("fenced send");
-        CoreCommsRuntime::send(
-            sender,
-            CommsCommand::PeerMessage {
-                to,
-                body: "ordinary message".to_string(),
-                blocks: None,
-                content_taint: None,
-                handling_mode: meerkat_core::types::HandlingMode::Queue,
-                objective_id: None,
-            },
-        )
-        .await
-        .expect("ordinary send");
+        });
+        loop {
+            let snapshot = CoreCommsRuntime::peer_ingress_queue_snapshot(receiver.as_ref())
+                .await
+                .expect("classified queue snapshot");
+            if snapshot.total_count == 2 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        vec![fenced_send, plain_send]
+    }
+
+    async fn abort_pending_runtime_sends(
+        sends: Vec<tokio::task::JoinHandle<Result<SendReceipt, SendError>>>,
+    ) {
+        for send in sends {
+            send.abort();
+            assert!(
+                send.await
+                    .expect_err("aborted pending send must not complete")
+                    .is_cancelled()
+            );
+        }
     }
 
     fn missing_peer_route(name: &str) -> PeerRoute {
@@ -6305,7 +6539,7 @@ mod tests {
                 reason: meerkat_core::comms::AdmissionDropReason::ClassificationRejected
             })
         ));
-        let interactions = CoreCommsRuntime::drain_inbox_interactions(&receiver).await;
+        let interactions = snapshot_runtime_interactions(&receiver).await;
         assert!(
             interactions.is_empty(),
             "runtime-required ingress without a machine handle must not reach the inbox"
@@ -6512,7 +6746,7 @@ mod tests {
             .into_result()
             .unwrap();
 
-        let interactions = CoreCommsRuntime::drain_inbox_interactions(&runtime).await;
+        let interactions = snapshot_runtime_interactions(&runtime).await;
         assert_eq!(interactions.len(), 3);
 
         assert!(interactions.iter().any(|i| {
@@ -6609,7 +6843,7 @@ mod tests {
                 .unwrap();
         }
 
-        let interactions = CoreCommsRuntime::drain_inbox_interactions(&runtime).await;
+        let interactions = snapshot_runtime_interactions(&runtime).await;
         assert_eq!(interactions.len(), 3);
 
         let taint_for = |predicate: &dyn Fn(&meerkat_core::InboxInteraction) -> bool| {
@@ -6731,7 +6965,7 @@ mod tests {
             .into_result()
             .unwrap();
 
-        let interactions = CoreCommsRuntime::drain_inbox_interactions(&runtime).await;
+        let interactions = snapshot_runtime_interactions(&runtime).await;
         assert_eq!(interactions.len(), 1);
         let interaction = &interactions[0];
         assert_eq!(
@@ -6788,7 +7022,7 @@ mod tests {
 
         // The body-string trigger is gone: the message survives the drain as a
         // normal peer message rather than being consumed as a dismiss signal.
-        let interactions = CoreCommsRuntime::drain_inbox_interactions(&runtime).await;
+        let interactions = snapshot_runtime_interactions(&runtime).await;
         assert_eq!(
             interactions.len(),
             1,
@@ -6812,7 +7046,9 @@ mod tests {
     /// ROW #291 gate: a peer-request transport send failure must surface as a
     /// typed `SendError` to the caller, never be laundered into a timeout
     /// success/receipt. The connectivity failure (unreachable TCP peer) is a
-    /// `Transport`/`PeerOffline` send error, not a `PeerRequestSent` receipt.
+    /// typed ambiguity error carrying the exact envelope identity, not a
+    /// `PeerRequestSent` receipt. Once an envelope may have crossed the
+    /// transport boundary, connection failure cannot prove non-delivery.
     #[cfg(not(target_arch = "wasm32"))]
     #[tokio::test]
     async fn peer_request_send_failure_is_typed_send_error_not_timeout() {
@@ -6850,13 +7086,19 @@ mod tests {
         // The failure must be a typed send error, never a successful receipt
         // (which would have masqueraded as a delivered-then-timed-out request).
         match result {
-            Err(SendError::Transport(_) | SendError::PeerOffline | SendError::PeerNotFound(_)) => {}
+            Err(SendError::AmbiguousDelivery { envelope_id, .. }) => {
+                assert_ne!(
+                    envelope_id,
+                    Uuid::nil(),
+                    "ambiguity must retain envelope identity"
+                );
+            }
             Ok(receipt) => {
                 panic!("transport send failure must not produce a success receipt, got {receipt:?}")
             }
-            Err(other) => panic!(
-                "transport send failure must be a typed connectivity send error, got {other:?}"
-            ),
+            Err(other) => {
+                panic!("transport send failure must be a typed ambiguity error, got {other:?}")
+            }
         }
     }
 
@@ -6864,8 +7106,8 @@ mod tests {
     async fn test_subscription_correlation_e2e_one_shot() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = test_runtime_config("subscription", &tmp);
-        let runtime = CommsRuntime::new(config).await.unwrap();
-        install_test_peer_comms_handle(&runtime);
+        let runtime = Arc::new(CommsRuntime::new(config).await.unwrap());
+        let finalizer = install_test_peer_ingress_runtime(runtime.as_ref());
 
         let injector = CommsEventInjector::new(
             runtime.router.inbox_sender().clone(),
@@ -6881,13 +7123,14 @@ mod tests {
             .unwrap();
         let tracked_id = sub.id;
 
-        let interactions = CoreCommsRuntime::drain_inbox_interactions(&runtime).await;
-        assert_eq!(interactions.len(), 1);
-        assert_eq!(interactions[0].id, tracked_id);
+        let candidate = spawn_runtime_finalization(Arc::clone(&runtime), finalizer)
+            .await
+            .expect("actual-machine plain-event finalization must complete");
+        assert_eq!(candidate.interaction.id, tracked_id);
 
-        let first = CoreCommsRuntime::interaction_subscriber(&runtime, &tracked_id);
+        let first = CoreCommsRuntime::interaction_subscriber(runtime.as_ref(), &tracked_id);
         assert!(first.is_some(), "subscriber should be found");
-        let second = CoreCommsRuntime::interaction_subscriber(&runtime, &tracked_id);
+        let second = CoreCommsRuntime::interaction_subscriber(runtime.as_ref(), &tracked_id);
         assert!(second.is_none(), "subscriber should be one-shot");
     }
 
@@ -6897,7 +7140,8 @@ mod tests {
         let peer_name = format!("corr-peer-{suffix}");
         let runtime_name = format!("corr-runtime-{suffix}");
 
-        let peer = inproc_only_with_test_peer_authority(&peer_name);
+        let peer = Arc::new(CommsRuntime::inproc_only(&peer_name).unwrap());
+        let finalizer = install_test_peer_ingress_runtime(peer.as_ref());
         let runtime = Arc::new(CommsRuntime::inproc_only(&runtime_name).unwrap());
         install_test_peer_request_response_authority(&runtime);
         {
@@ -6925,6 +7169,7 @@ mod tests {
         )
         .await;
 
+        let finalize = spawn_runtime_finalization(Arc::clone(&peer), finalizer);
         let receipt = CoreCommsRuntime::send(
             runtime.as_ref(),
             CommsCommand::PeerRequest {
@@ -6940,6 +7185,9 @@ mod tests {
         )
         .await
         .expect("peer request send should succeed");
+        finalize
+            .await
+            .expect("actual-machine reserved request finalization must complete");
 
         let envelope_id = match receipt {
             SendReceipt::PeerRequestSent { envelope_id, .. } => envelope_id,
@@ -7164,7 +7412,6 @@ mod tests {
             peer_handle.clone(),
             Arc::new(TestInteractionStreamHandle::default()),
         ));
-        install_test_peer_comms_handle(receiver.as_ref());
         let receiver_peer_handle = Arc::new(TestPeerInteractionHandle::default());
         receiver.install_peer_request_response_authority(PeerRequestResponseAuthority::new(
             receiver_peer_handle.clone(),
@@ -7211,6 +7458,7 @@ mod tests {
         )
         .expect("receiver machine authority should expect the response");
 
+        let handoff = spawn_volatile_handoff(Arc::clone(&receiver));
         let receipt = CoreCommsRuntime::send(
             sender.as_ref(),
             CommsCommand::PeerResponse {
@@ -7228,10 +7476,12 @@ mod tests {
         .expect("terminal response send should succeed");
         assert!(matches!(receipt, SendReceipt::PeerResponseSent { .. }));
 
-        let interactions = CoreCommsRuntime::drain_inbox_interactions(receiver.as_ref()).await;
-        assert_eq!(interactions.len(), 1);
+        let interaction = handoff
+            .await
+            .expect("legacy Response queue handoff must complete")
+            .interaction;
         assert_eq!(
-            interactions[0].handling_mode,
+            interaction.handling_mode,
             meerkat_core::types::HandlingMode::Queue
         );
         assert!(
@@ -7242,7 +7492,7 @@ mod tests {
             .is_none()
         );
         assert!(matches!(
-            &interactions[0].content,
+            &interaction.content,
             meerkat_core::InteractionContent::Response { in_reply_to, .. }
                 if in_reply_to.0 == interaction_id
         ));
@@ -7461,7 +7711,8 @@ mod tests {
         let receiver_name = format!("life-receiver-{suffix}");
 
         let sender = CommsRuntime::inproc_only(&sender_name).unwrap();
-        let receiver = inproc_only_with_test_peer_authority(&receiver_name);
+        let receiver = Arc::new(CommsRuntime::inproc_only(&receiver_name).unwrap());
+        install_test_peer_comms_handle(receiver.as_ref());
 
         add_trusted_peer_with_generated_authority(
             &sender,
@@ -7473,7 +7724,7 @@ mod tests {
         )
         .await;
         add_trusted_peer_with_generated_authority(
-            &receiver,
+            receiver.as_ref(),
             trusted_descriptor(
                 &sender_name,
                 sender.public_key(),
@@ -7482,6 +7733,7 @@ mod tests {
         )
         .await;
 
+        let handoff = spawn_volatile_handoff(Arc::clone(&receiver));
         let receipt = CoreCommsRuntime::send(
             &sender,
             CommsCommand::PeerLifecycle {
@@ -7497,22 +7749,23 @@ mod tests {
         .expect("peer lifecycle send should succeed");
 
         match receipt {
-            SendReceipt::PeerLifecycleSent { .. } => {}
+            SendReceipt::PeerLifecycleSent {
+                delivery: meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff,
+                ..
+            } => {}
             other => panic!("expected PeerLifecycleSent, got {other:?}"),
         }
 
-        let interactions = receiver
-            .drain_classified_inbox_interactions()
+        let interaction = handoff
             .await
-            .expect("classified drain should succeed");
-        assert_eq!(interactions.len(), 1);
+            .expect("exact lifecycle volatile handoff must complete");
         assert_eq!(
-            interactions[0].class(),
+            interaction.class(),
             meerkat_core::PeerInputClass::PeerLifecycleAdded
         );
-        assert_eq!(interactions[0].lifecycle_peer.as_deref(), Some("worker-1"));
+        assert_eq!(interaction.lifecycle_peer.as_deref(), Some("worker-1"));
         assert!(
-            interactions[0].interaction.rendered_text.is_empty(),
+            interaction.interaction.rendered_text.is_empty(),
             "silent lifecycle notices must not synthesize prompt text"
         );
     }
@@ -7521,8 +7774,8 @@ mod tests {
     async fn test_subscription_correlation_preserves_inline_blocks() {
         let tmp = tempfile::TempDir::new().unwrap();
         let config = test_runtime_config("subscription-blocks", &tmp);
-        let runtime = CommsRuntime::new(config).await.unwrap();
-        install_test_peer_comms_handle(&runtime);
+        let runtime = Arc::new(CommsRuntime::new(config).await.unwrap());
+        let finalizer = install_test_peer_ingress_runtime(runtime.as_ref());
 
         let injector = CommsEventInjector::new(
             runtime.router.inbox_sender().clone(),
@@ -7546,10 +7799,11 @@ mod tests {
             .unwrap();
         let tracked_id = sub.id;
 
-        let interactions = CoreCommsRuntime::drain_inbox_interactions(&runtime).await;
-        assert_eq!(interactions.len(), 1);
-        assert_eq!(interactions[0].id, tracked_id);
-        match &interactions[0].content {
+        let candidate = spawn_runtime_finalization(Arc::clone(&runtime), finalizer)
+            .await
+            .expect("actual-machine block plain-event finalization must complete");
+        assert_eq!(candidate.interaction.id, tracked_id);
+        match &candidate.interaction.content {
             meerkat_core::InteractionContent::Message { blocks, .. } => {
                 let blocks = blocks.as_ref().expect("blocks preserved");
                 assert!(
@@ -7716,7 +7970,7 @@ mod tests {
             .into_result()
             .unwrap();
 
-        let interactions = CoreCommsRuntime::drain_inbox_interactions(&runtime).await;
+        let interactions = snapshot_runtime_interactions(&runtime).await;
         assert_eq!(interactions.len(), 1);
         assert_eq!(interactions[0].id.0, interaction_id);
     }
@@ -7748,7 +8002,7 @@ mod tests {
             .into_result()
             .unwrap();
 
-        let interactions = runtime.drain_classified_inbox_interactions().await.unwrap();
+        let interactions = snapshot_runtime_candidates(&runtime).await;
         assert_eq!(interactions.len(), 1);
         let interaction = &interactions[0].interaction;
         assert_eq!(
@@ -7796,7 +8050,7 @@ mod tests {
             "the queue snapshot should expose the same stable ingress id it uses as the raw item key"
         );
 
-        let interactions = CoreCommsRuntime::drain_inbox_interactions(&runtime).await;
+        let interactions = snapshot_runtime_interactions(&runtime).await;
         assert_eq!(interactions.len(), 1);
         assert_eq!(interactions[0].id.0, ingress_id);
     }
@@ -7864,7 +8118,7 @@ mod tests {
             meerkat_core::PeerIngressKind::PlainEvent
         );
 
-        let interactions = runtime.drain_classified_inbox_interactions().await.unwrap();
+        let interactions = snapshot_runtime_candidates(&runtime).await;
         assert_eq!(
             interactions.len(),
             2,
@@ -8083,14 +8337,14 @@ mod tests {
             );
         }
 
-        let interactions = runtime.drain_classified_inbox_interactions().await.unwrap();
+        let interactions = snapshot_runtime_candidates(&runtime).await;
         assert_eq!(interactions.len(), 1);
 
         {
             let inbox = runtime.inbox.lock().await;
             assert_eq!(
                 inbox.peer_authority_test_snapshot(),
-                Some((PeerIngressState::Delivered, 0))
+                Some((PeerIngressState::Received, 1))
             );
         }
 
@@ -8114,7 +8368,7 @@ mod tests {
             let inbox = runtime.inbox.lock().await;
             assert_eq!(
                 inbox.peer_authority_test_snapshot(),
-                Some((PeerIngressState::Delivered, 0))
+                Some((PeerIngressState::Received, 1))
             );
             assert_eq!(
                 inbox.peer_authority_trusts_peer_for_test(&pubkey_for_authority_check),
@@ -8170,14 +8424,14 @@ mod tests {
             );
         }
 
-        let interactions = runtime.drain_classified_inbox_interactions().await.unwrap();
+        let interactions = snapshot_runtime_candidates(&runtime).await;
         assert_eq!(interactions.len(), 1);
 
         {
             let inbox = runtime.inbox.lock().await;
             assert_eq!(
                 inbox.peer_authority_test_snapshot(),
-                Some((PeerIngressState::Delivered, 0))
+                Some((PeerIngressState::Received, 1))
             );
         }
     }
@@ -8216,7 +8470,7 @@ mod tests {
             other => panic!("Expected InputAccepted, got: {other:?}"),
         }
 
-        let interactions = CoreCommsRuntime::drain_inbox_interactions(&runtime).await;
+        let interactions = snapshot_runtime_interactions(&runtime).await;
         assert_eq!(interactions.len(), 1);
         assert!(matches!(
             &interactions[0].content,
@@ -8253,7 +8507,7 @@ mod tests {
             other => panic!("Expected InputAccepted, got: {other:?}"),
         };
 
-        let interactions = CoreCommsRuntime::drain_inbox_interactions(&runtime).await;
+        let interactions = snapshot_runtime_interactions(&runtime).await;
         assert_eq!(interactions.len(), 1);
         // The injected event's interaction id is the SAME as the returned
         // handle — the handle correlates with the event, not a fresh UUID.
@@ -8436,7 +8690,8 @@ mod tests {
         let sender_name = format!("sender-{suffix}");
         let receiver_name = format!("receiver-{suffix}");
         let sender = CommsRuntime::inproc_only(&sender_name).unwrap();
-        let receiver = inproc_only_with_test_peer_authority(&receiver_name);
+        let receiver = Arc::new(CommsRuntime::inproc_only(&receiver_name).unwrap());
+        let finalizer = install_test_peer_ingress_runtime(receiver.as_ref());
 
         add_trusted_peer_with_generated_authority(
             &sender,
@@ -8449,7 +8704,7 @@ mod tests {
         .await;
 
         add_trusted_peer_with_generated_authority(
-            &receiver,
+            receiver.as_ref(),
             trusted_descriptor(
                 &sender_name,
                 sender.public_key(),
@@ -8467,6 +8722,7 @@ mod tests {
             handling_mode: meerkat_core::types::HandlingMode::Queue,
         };
 
+        let finalize = spawn_runtime_finalization(Arc::clone(&receiver), finalizer);
         let receipt = CoreCommsRuntime::send(&sender, cmd).await;
         match receipt {
             Ok(SendReceipt::PeerMessageSent {
@@ -8474,15 +8730,18 @@ mod tests {
                 delivery,
             }) => assert_eq!(
                 delivery,
-                meerkat_core::comms::PeerDeliveryOutcome::HandedOff
+                meerkat_core::comms::PeerDeliveryOutcome::DurablyResolved {
+                    outcome: meerkat_core::PeerIngressTerminalOutcomeKind::Accepted,
+                }
             ),
             other => panic!("Expected peer message receipt, got: {other:?}"),
         }
-
-        let interactions = CoreCommsRuntime::drain_inbox_interactions(&receiver).await;
-        assert_eq!(interactions.len(), 1);
+        let interaction = finalize
+            .await
+            .expect("actual-machine finalization task must complete")
+            .interaction;
         assert!(matches!(
-            &interactions[0].content,
+            &interaction.content,
             meerkat_core::InteractionContent::Message { body, .. } if body == "greeting"
         ));
     }
@@ -8493,7 +8752,8 @@ mod tests {
         let sender_name = format!("sender-blob-{suffix}");
         let receiver_name = format!("receiver-blob-{suffix}");
         let mut sender = CommsRuntime::inproc_only(&sender_name).unwrap();
-        let receiver = inproc_only_with_test_peer_authority(&receiver_name);
+        let receiver = Arc::new(CommsRuntime::inproc_only(&receiver_name).unwrap());
+        let finalizer = install_test_peer_ingress_runtime(receiver.as_ref());
         let blob_store: Arc<dyn BlobStore> = Arc::new(TestBlobStore::default());
         let blob_ref = blob_store
             .put_image("image/png", "aGVsbG8=")
@@ -8512,7 +8772,7 @@ mod tests {
         .await;
 
         add_trusted_peer_with_generated_authority(
-            &receiver,
+            receiver.as_ref(),
             trusted_descriptor(
                 &sender_name,
                 sender.public_key(),
@@ -8535,12 +8795,14 @@ mod tests {
             handling_mode: meerkat_core::types::HandlingMode::Queue,
         };
 
+        let finalize = spawn_runtime_finalization(Arc::clone(&receiver), finalizer);
         let receipt = CoreCommsRuntime::send(&sender, cmd).await;
         assert!(matches!(receipt, Ok(SendReceipt::PeerMessageSent { .. })));
-
-        let interactions = CoreCommsRuntime::drain_inbox_interactions(&receiver).await;
-        assert_eq!(interactions.len(), 1);
-        match &interactions[0].content {
+        let interaction = finalize
+            .await
+            .expect("actual-machine blob-message finalization must complete")
+            .interaction;
+        match &interaction.content {
             meerkat_core::InteractionContent::Message { blocks, .. } => {
                 let blocks = blocks.as_ref().expect("received blocks");
                 assert!(matches!(
@@ -8561,7 +8823,8 @@ mod tests {
         let sender_name = format!("sender-fenced-blob-{suffix}");
         let receiver_name = format!("receiver-fenced-blob-{suffix}");
         let mut sender = CommsRuntime::inproc_only(&sender_name).unwrap();
-        let receiver = inproc_only_with_test_peer_authority(&receiver_name);
+        let receiver = Arc::new(CommsRuntime::inproc_only(&receiver_name).unwrap());
+        let finalizer = install_test_peer_ingress_runtime(receiver.as_ref());
         let blob_store: Arc<dyn BlobStore> = Arc::new(TestBlobStore::default());
         let blob_ref = blob_store
             .put_image("image/png", "aGVsbG8=")
@@ -8579,7 +8842,7 @@ mod tests {
         )
         .await;
         add_trusted_peer_with_generated_authority(
-            &receiver,
+            receiver.as_ref(),
             trusted_descriptor(
                 &sender_name,
                 sender.public_key(),
@@ -8612,13 +8875,18 @@ mod tests {
             },
         };
 
+        let finalize = spawn_runtime_finalization(Arc::clone(&receiver), finalizer);
         let receipt = CoreCommsRuntime::send(&sender, cmd).await;
-        assert!(matches!(receipt, Ok(SendReceipt::PeerMessageSent { .. })));
-
-        let interactions = CoreCommsRuntime::drain_inbox_interactions(&receiver).await;
-        assert_eq!(interactions.len(), 1);
-        assert_eq!(interactions[0].objective_id, Some(objective_id));
-        match &interactions[0].content {
+        assert!(matches!(
+            receipt,
+            Err(SendError::DurableAdmissionRejected { .. })
+        ));
+        let interaction = finalize
+            .await
+            .expect("actual-machine fenced-message finalization must complete")
+            .interaction;
+        assert_eq!(interaction.objective_id, Some(objective_id));
+        match &interaction.content {
             meerkat_core::InteractionContent::IncarnationFencedMessage { blocks, .. } => {
                 let blocks = blocks.as_ref().expect("received blocks");
                 assert!(matches!(
@@ -8636,39 +8904,52 @@ mod tests {
     #[tokio::test]
     async fn inherent_message_drain_excludes_fenced_but_keeps_ordinary_message() {
         let (sender, receiver, receiver_name) = trusted_inproc_pair("legacy-drain-fence").await;
-        enqueue_fenced_then_plain(&sender, &receiver, &receiver_name).await;
+        let sends = enqueue_fenced_then_plain(sender, Arc::clone(&receiver), &receiver_name).await;
 
-        let messages = CommsRuntime::drain_messages(&receiver).await;
-        assert_eq!(messages.len(), 1);
-        assert!(matches!(
-            &messages[0].content,
-            crate::agent::CommsContent::Message { body, .. } if body == "ordinary message"
-        ));
+        let messages = CommsRuntime::drain_messages(receiver.as_ref()).await;
+        assert!(
+            messages.is_empty(),
+            "legacy drain must stop at a durable fenced head instead of bypassing it"
+        );
+        let snapshot = CoreCommsRuntime::peer_ingress_queue_snapshot(receiver.as_ref())
+            .await
+            .expect("classified queue snapshot");
+        assert_eq!(snapshot.total_count, 2);
+        abort_pending_runtime_sends(sends).await;
     }
 
     #[tokio::test]
     async fn inherent_message_recv_skips_fenced_queue_head() {
         let (sender, receiver, receiver_name) = trusted_inproc_pair("legacy-recv-fence").await;
-        enqueue_fenced_then_plain(&sender, &receiver, &receiver_name).await;
+        let sends = enqueue_fenced_then_plain(sender, Arc::clone(&receiver), &receiver_name).await;
 
-        let message = CommsRuntime::recv_message(&receiver)
+        let next = receiver.inbox.lock().await.try_recv_one_classified();
+        assert!(
+            next.is_none(),
+            "legacy recv primitive must not bypass a durable fenced queue head"
+        );
+        let snapshot = CoreCommsRuntime::peer_ingress_queue_snapshot(receiver.as_ref())
             .await
-            .expect("ordinary message behind fenced queue head");
-        assert!(matches!(
-            message.content,
-            crate::agent::CommsContent::Message { body, .. } if body == "ordinary message"
-        ));
+            .expect("classified queue snapshot");
+        assert_eq!(snapshot.total_count, 2);
+        abort_pending_runtime_sends(sends).await;
     }
 
     #[tokio::test]
     async fn core_string_drain_excludes_fenced_but_keeps_ordinary_message() {
         let (sender, receiver, receiver_name) = trusted_inproc_pair("core-string-fence").await;
-        enqueue_fenced_then_plain(&sender, &receiver, &receiver_name).await;
+        let sends = enqueue_fenced_then_plain(sender, Arc::clone(&receiver), &receiver_name).await;
 
-        let messages = CoreCommsRuntime::drain_messages(&receiver).await;
-        assert_eq!(messages.len(), 1);
-        assert!(messages[0].contains("ordinary message"));
-        assert!(!messages[0].contains("authority-bearing fenced message"));
+        let messages = CoreCommsRuntime::drain_messages(receiver.as_ref()).await;
+        assert!(
+            messages.is_empty(),
+            "legacy string drain must stop at the durable head"
+        );
+        let snapshot = CoreCommsRuntime::peer_ingress_queue_snapshot(receiver.as_ref())
+            .await
+            .expect("classified queue snapshot");
+        assert_eq!(snapshot.total_count, 2);
+        abort_pending_runtime_sends(sends).await;
     }
 
     #[tokio::test]
@@ -8677,7 +8958,8 @@ mod tests {
         let sender_name = format!("sender-request-blob-{suffix}");
         let receiver_name = format!("receiver-request-blob-{suffix}");
         let mut sender_runtime = CommsRuntime::inproc_only(&sender_name).unwrap();
-        let receiver = inproc_only_with_test_peer_authority(&receiver_name);
+        let receiver = Arc::new(CommsRuntime::inproc_only(&receiver_name).unwrap());
+        let finalizer = install_test_peer_ingress_runtime(receiver.as_ref());
         let blob_store: Arc<dyn BlobStore> = Arc::new(TestBlobStore::default());
         let blob_ref = blob_store
             .put_image("image/png", "aGVsbG8=")
@@ -8698,7 +8980,7 @@ mod tests {
         .await;
 
         add_trusted_peer_with_generated_authority(
-            &receiver,
+            receiver.as_ref(),
             trusted_descriptor(
                 &sender_name,
                 sender.public_key(),
@@ -8723,12 +9005,14 @@ mod tests {
             stream: InputStreamMode::ReserveInteraction,
         };
 
+        let finalize = spawn_runtime_finalization(Arc::clone(&receiver), finalizer);
         let receipt = CoreCommsRuntime::send(sender.as_ref(), cmd).await;
         assert!(matches!(receipt, Ok(SendReceipt::PeerRequestSent { .. })));
-
-        let interactions = CoreCommsRuntime::drain_inbox_interactions(&receiver).await;
-        assert_eq!(interactions.len(), 1);
-        match &interactions[0].content {
+        let interaction = finalize
+            .await
+            .expect("actual-machine peer-request finalization must complete")
+            .interaction;
+        match &interaction.content {
             meerkat_core::InteractionContent::Request { blocks, .. } => {
                 let blocks = blocks.as_ref().expect("received blocks");
                 assert!(matches!(
@@ -8749,7 +9033,7 @@ mod tests {
         let sender_name = format!("sender-response-blob-{suffix}");
         let receiver_name = format!("receiver-response-blob-{suffix}");
         let mut sender_runtime = CommsRuntime::inproc_only(&sender_name).unwrap();
-        let receiver = inproc_only_with_test_peer_authority(&receiver_name);
+        let receiver = Arc::new(CommsRuntime::inproc_only(&receiver_name).unwrap());
         let blob_store: Arc<dyn BlobStore> = Arc::new(TestBlobStore::default());
         let blob_ref = blob_store
             .put_image("image/png", "aGVsbG8=")
@@ -8774,7 +9058,7 @@ mod tests {
         .await;
 
         add_trusted_peer_with_generated_authority(
-            &receiver,
+            receiver.as_ref(),
             trusted_descriptor(
                 &sender_name,
                 sender.public_key(),
@@ -8808,12 +9092,14 @@ mod tests {
             handling_mode: Some(meerkat_core::types::HandlingMode::Queue),
         };
 
+        let handoff = spawn_volatile_handoff(Arc::clone(&receiver));
         let receipt = CoreCommsRuntime::send(sender.as_ref(), cmd).await;
         assert!(matches!(receipt, Ok(SendReceipt::PeerResponseSent { .. })));
-
-        let interactions = CoreCommsRuntime::drain_inbox_interactions(&receiver).await;
-        assert_eq!(interactions.len(), 1);
-        match &interactions[0].content {
+        let interaction = handoff
+            .await
+            .expect("legacy Response queue handoff must complete")
+            .interaction;
+        match &interaction.content {
             meerkat_core::InteractionContent::Response { blocks, .. } => {
                 let blocks = blocks.as_ref().expect("received blocks");
                 assert!(matches!(
@@ -8851,7 +9137,7 @@ mod tests {
             other => panic!("Expected peer-not-found for missing trust, got: {other:?}"),
         }
 
-        let interactions = CoreCommsRuntime::drain_inbox_interactions(&receiver).await;
+        let interactions = snapshot_runtime_interactions(&receiver).await;
         assert_eq!(interactions.len(), 0);
     }
 
@@ -8922,7 +9208,7 @@ mod tests {
             other => panic!("Expected peer-not-found without generated trust, got: {other:?}"),
         }
 
-        let interactions = CoreCommsRuntime::drain_inbox_interactions(&receiver).await;
+        let interactions = snapshot_runtime_interactions(&receiver).await;
         assert_eq!(interactions.len(), 0);
 
         assert!(crate::InprocRegistry::global().unregister(&sender_pubkey));
@@ -8995,7 +9281,8 @@ mod tests {
         let sender_name = format!("trust-sender-{suffix}");
         let receiver_name = format!("trust-receiver-{suffix}");
         let sender = CommsRuntime::inproc_only(&sender_name).unwrap();
-        let receiver = inproc_only_with_test_peer_authority(&receiver_name);
+        let receiver = Arc::new(CommsRuntime::inproc_only(&receiver_name).unwrap());
+        let finalizer = install_test_peer_ingress_runtime(receiver.as_ref());
 
         let peer_spec = trusted_descriptor(
             &receiver_name,
@@ -9011,7 +9298,7 @@ mod tests {
             &format!("inproc://{sender_name}"),
         );
 
-        add_trusted_peer_with_generated_authority(&receiver, reverse_spec).await;
+        add_trusted_peer_with_generated_authority(receiver.as_ref(), reverse_spec).await;
 
         let peers = CoreCommsRuntime::peers(&sender).await;
         let receiver_entries: Vec<_> = peers
@@ -9028,13 +9315,15 @@ mod tests {
             body: "hello trusted peer".to_string(),
             handling_mode: meerkat_core::types::HandlingMode::Queue,
         };
+        let finalize = spawn_runtime_finalization(Arc::clone(&receiver), finalizer);
         let receipt = CoreCommsRuntime::send(&sender, send_cmd).await;
         assert!(matches!(receipt, Ok(SendReceipt::PeerMessageSent { .. })));
-
-        let interactions = CoreCommsRuntime::drain_inbox_interactions(&receiver).await;
-        assert_eq!(interactions.len(), 1);
+        let interaction = finalize
+            .await
+            .expect("actual-machine trusted-peer finalization must complete")
+            .interaction;
         assert!(matches!(
-            &interactions[0].content,
+            &interaction.content,
             meerkat_core::InteractionContent::Message { body, .. } if body == "hello trusted peer"
         ));
     }
@@ -9646,7 +9935,8 @@ mod tests {
         let sender_name = format!("reach-sender-{suffix}");
         let receiver_name = format!("reach-receiver-{suffix}");
         let sender = CommsRuntime::inproc_only(&sender_name).unwrap();
-        let receiver = inproc_only_with_test_peer_authority(&receiver_name);
+        let receiver = Arc::new(CommsRuntime::inproc_only(&receiver_name).unwrap());
+        let finalizer = install_test_peer_ingress_runtime(receiver.as_ref());
 
         add_trusted_peer_with_generated_authority(
             &sender,
@@ -9663,7 +9953,7 @@ mod tests {
         // reports `Dropped { UntrustedSender }`, which surfaces to this caller
         // as `PeerOffline`. Mutual trust mirrors real deployments.
         add_trusted_peer_with_generated_authority(
-            &receiver,
+            receiver.as_ref(),
             trusted_descriptor(
                 &sender_name,
                 sender.public_key(),
@@ -9672,6 +9962,7 @@ mod tests {
         )
         .await;
 
+        let finalize = spawn_runtime_finalization(Arc::clone(&receiver), finalizer);
         CoreCommsRuntime::send(
             &sender,
             CommsCommand::PeerMessage {
@@ -9685,6 +9976,9 @@ mod tests {
         )
         .await
         .expect("send should succeed");
+        finalize
+            .await
+            .expect("actual-machine peer-directory send finalization must complete");
 
         let peers_after = CoreCommsRuntime::peers(&sender).await;
         let after = peers_after
@@ -9720,8 +10014,8 @@ mod tests {
         )
         .await;
         assert!(
-            matches!(result, Err(SendError::Transport(_))),
-            "transport failure should surface as a typed transport send error, got: {result:?}"
+            matches!(result, Err(SendError::AmbiguousDelivery { .. })),
+            "post-send transport failure should surface exact delivery ambiguity, got: {result:?}"
         );
 
         let peers = CoreCommsRuntime::peers(&sender).await;
@@ -10312,7 +10606,8 @@ mod tests {
         let peer_name = format!("m5-peer-{suffix}");
         let runtime_name = format!("m5-runtime-{suffix}");
 
-        let peer = inproc_only_with_test_peer_authority(&peer_name);
+        let peer = Arc::new(CommsRuntime::inproc_only(&peer_name).unwrap());
+        let finalizer = install_test_peer_ingress_runtime(peer.as_ref());
         let runtime = CommsRuntime::inproc_only(&runtime_name).unwrap();
         {
             let mut trusted = runtime.trusted_peers.write();
@@ -10344,7 +10639,11 @@ mod tests {
             body: "not streamable".to_string(),
             handling_mode: meerkat_core::types::HandlingMode::Queue,
         };
+        let finalize = spawn_runtime_finalization(Arc::clone(&peer), finalizer);
         let result = CoreCommsRuntime::send_and_stream(&runtime, cmd).await;
+        finalize
+            .await
+            .expect("actual-machine non-streamable message finalization must complete");
         match result {
             Err(SendAndStreamError::StreamAttach { receipt, error }) => {
                 assert!(
@@ -10703,7 +11002,7 @@ mod tests {
         let sender_name = format!("declared-skip-sender-{suffix}");
         let receiver_name = format!("declared-skip-receiver-{suffix}");
         let sender = CommsRuntime::inproc_only(&sender_name).unwrap();
-        let receiver = CommsRuntime::inproc_only(&receiver_name).unwrap();
+        let receiver = Arc::new(CommsRuntime::inproc_only(&receiver_name).unwrap());
         add_trusted_peer_with_generated_authority(
             &sender,
             trusted_descriptor(
@@ -10714,7 +11013,7 @@ mod tests {
         )
         .await;
         add_trusted_peer_with_generated_authority(
-            &receiver,
+            receiver.as_ref(),
             trusted_descriptor(
                 &sender_name,
                 sender.public_key(),
@@ -10736,6 +11035,7 @@ mod tests {
         .await
         .expect("staging for a routable peer must be an Ok no-op");
 
+        let handoff = spawn_volatile_handoff(Arc::clone(&receiver));
         sender
             .router()
             .send_with_id(
@@ -10754,6 +11054,9 @@ mod tests {
             )
             .await
             .expect("trusted route must serve the Response");
+        handoff
+            .await
+            .expect("legacy staged Response queue handoff must complete");
     }
 
     #[tokio::test]
@@ -10885,7 +11188,7 @@ mod tests {
             peer_handle.clone(),
             Arc::new(TestInteractionStreamHandle::default()),
         ));
-        install_test_peer_comms_handle(receiver.as_ref());
+        let finalizer = install_test_peer_ingress_runtime(receiver.as_ref());
         add_trusted_peer_with_generated_authority(
             sender.as_ref(),
             trusted_descriptor(
@@ -10907,6 +11210,7 @@ mod tests {
         let endpoint = meerkat_core::comms::PeerAddress::parse("tcp://127.0.0.1:4311")
             .expect("valid reply endpoint");
 
+        let finalize = spawn_runtime_finalization(Arc::clone(&receiver), finalizer);
         let receipt = sender
             .send_peer_request_at_endpoint(
                 peer_route(&receiver_name, receiver.public_key()),
@@ -10931,10 +11235,11 @@ mod tests {
             "no-waiter helper must not mutate the session-drain waiter registry"
         );
 
-        let candidates = CoreCommsRuntime::drain_peer_input_candidates(receiver.as_ref()).await;
-        assert_eq!(candidates.len(), 1);
+        let candidate = finalize
+            .await
+            .expect("actual-machine endpoint request finalization must complete");
         assert_eq!(
-            candidates[0].ingress.declared_reply_endpoint, None,
+            candidate.ingress.declared_reply_endpoint, None,
             "serialized endpoint data is not promoted without observed TCP source evidence"
         );
     }
@@ -10970,7 +11275,7 @@ mod tests {
             peer_handle.clone(),
             Arc::new(TestInteractionStreamHandle::default()),
         ));
-        install_test_peer_comms_handle(receiver.as_ref());
+        let finalizer = install_test_peer_ingress_runtime(receiver.as_ref());
         add_trusted_peer_with_generated_authority(
             sender.as_ref(),
             trusted_descriptor(
@@ -10990,6 +11295,7 @@ mod tests {
         )
         .await;
 
+        let finalize = spawn_runtime_finalization(Arc::clone(&receiver), finalizer);
         let (reply_rx, envelope_id) = sender
             .send_peer_request_with_reply_waiter(
                 peer_route(&receiver_name, receiver.public_key()),
@@ -11015,10 +11321,12 @@ mod tests {
             "request_sent must be recorded exactly like the PeerRequest arm"
         );
 
-        let interactions = CoreCommsRuntime::drain_inbox_interactions(receiver.as_ref()).await;
-        assert_eq!(interactions.len(), 1, "receiver must see the Request");
+        let interaction = finalize
+            .await
+            .expect("actual-machine waiter request finalization must complete")
+            .interaction;
         assert!(matches!(
-            &interactions[0].content,
+            &interaction.content,
             meerkat_core::InteractionContent::Request { intent, .. }
                 if intent == "test.bridge.upcall"
         ));
@@ -11073,7 +11381,7 @@ mod tests {
             peer_handle.clone(),
             Arc::new(TestInteractionStreamHandle::default()),
         ));
-        install_test_peer_comms_handle(receiver.as_ref());
+        let finalizer = install_test_peer_ingress_runtime(receiver.as_ref());
         add_trusted_peer_with_generated_authority(
             sender.as_ref(),
             trusted_descriptor(
@@ -11093,6 +11401,7 @@ mod tests {
         )
         .await;
 
+        let finalize = spawn_runtime_finalization(Arc::clone(&receiver), finalizer);
         let (_reply_rx, envelope_id) = sender
             .send_peer_request_with_reply_waiter(
                 peer_route(&receiver_name, receiver.public_key()),
@@ -11101,6 +11410,9 @@ mod tests {
             )
             .await
             .expect("waiter-registered request must dispatch");
+        finalize
+            .await
+            .expect("actual-machine waiter request finalization must complete");
 
         sender.tombstone_bridge_reply_waiter(envelope_id);
         let interaction_id = InteractionId(envelope_id);

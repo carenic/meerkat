@@ -12,7 +12,7 @@ use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::Notify;
+use tokio::sync::{Notify, oneshot};
 
 use crate::classify::{IngressClassificationContext, PeerCommsHandleSlot, PreparedIngressItem};
 use crate::peer_types::PeerIngressState;
@@ -20,10 +20,10 @@ use crate::trust::TrustStore;
 use crate::types::{Envelope, InboxItem};
 use meerkat_core::{
     InteractionId, PeerIngressAdmissionDiagnostic, PeerIngressAuthDecision,
-    PeerIngressDequeueAuthority, PeerIngressDequeueFacts, PeerIngressDiagnosticDisplay,
-    PeerIngressEntrySnapshot, PeerIngressFact, PeerIngressKind, PeerIngressQueueSnapshot,
-    PeerIngressReceiveAuthority, PeerIngressReceiveFacts, PeerIngressReceiveOutcome,
-    PeerInputClass, TerminalityClass,
+    PeerIngressDeliveryContract, PeerIngressDequeueAuthority, PeerIngressDequeueFacts,
+    PeerIngressDiagnosticDisplay, PeerIngressEntrySnapshot, PeerIngressFact, PeerIngressKind,
+    PeerIngressQueueSnapshot, PeerIngressReceiveAuthority, PeerIngressReceiveFacts,
+    PeerIngressReceiveOutcome, PeerInputClass, TerminalityClass,
 };
 
 const DEFAULT_INBOX_CAPACITY: usize = 1024;
@@ -105,7 +105,7 @@ impl From<DropReason> for meerkat_core::comms::AdmissionDropReason {
 }
 
 /// A classified inbox entry, pairing an item with its ingress classification.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct ClassifiedInboxEntry {
     pub(crate) raw_item_id: InteractionId,
     pub(crate) item: InboxItem,
@@ -114,6 +114,7 @@ pub(crate) struct ClassifiedInboxEntry {
     /// MeerkatMachine PeerIngress classification effect (via `PreparedIngressItem`).
     pub(crate) actionable: bool,
     pub(crate) auth: PeerIngressAuthDecision,
+    pub(crate) delivery_contract: PeerIngressDeliveryContract,
     pub(crate) kind: PeerIngressKind,
     pub(crate) from_peer: Option<String>,
     pub(crate) ingress_fact: PeerIngressFact,
@@ -121,6 +122,7 @@ pub(crate) struct ClassifiedInboxEntry {
     pub(crate) request_id: Option<InteractionId>,
     pub(crate) admission_diagnostic: Option<PeerIngressAdmissionDiagnostic>,
     pub(crate) response_terminality: Option<TerminalityClass>,
+    ingress_completion: Option<IngressCompletion>,
     pub(crate) text_projection: String,
 }
 
@@ -158,6 +160,61 @@ struct ClassifiedInboxQueue {
     phase: PeerIngressState,
     dropped_count: Arc<AtomicU64>,
     capacity_notify: Arc<Notify>,
+    ingress_notify: Arc<Notify>,
+    outstanding_claim: Option<OutstandingClaim>,
+    handed_off_count: u64,
+    durably_admitted_count: u64,
+    runtime_handover_count: u64,
+    terminal_outcomes: meerkat_core::interaction::PeerIngressTerminalOutcomeCounts,
+    last_delivery_correlation: Option<meerkat_core::interaction::PeerIngressDeliveryCorrelation>,
+}
+
+#[derive(Debug, Clone)]
+struct IngressCompletion(Arc<Mutex<Option<oneshot::Sender<IngressDeliveryOutcome>>>>);
+
+impl IngressCompletion {
+    fn new() -> (Self, IngressDeliveryReceipt) {
+        let (sender, receiver) = oneshot::channel();
+        (
+            Self(Arc::new(Mutex::new(Some(sender)))),
+            IngressDeliveryReceipt(receiver),
+        )
+    }
+
+    fn resolve(&self, outcome: IngressDeliveryOutcome) {
+        if let Some(sender) = self.0.lock().take() {
+            let _ = sender.send(outcome);
+        }
+    }
+}
+
+pub(crate) struct IngressDeliveryReceipt(oneshot::Receiver<IngressDeliveryOutcome>);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IngressDeliveryOutcome {
+    Queued,
+    DurablyResolved(meerkat_core::interaction::PeerIngressTerminalOutcomeKind),
+    VolatileHandedOff,
+    Dropped { reason: DropReason },
+}
+
+impl IngressDeliveryReceipt {
+    pub(crate) async fn wait(self) -> IngressDeliveryOutcome {
+        match self.0.await {
+            Ok(outcome) => outcome,
+            Err(_) => IngressDeliveryOutcome::Dropped {
+                reason: DropReason::SessionClosed,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OutstandingClaim {
+    claim_id: meerkat_core::interaction::PeerIngressClaimId,
+    raw_item_id: InteractionId,
+    delivery_contract: PeerIngressDeliveryContract,
+    claimed_at: std::time::Instant,
 }
 
 impl ClassifiedInboxQueue {
@@ -166,6 +223,7 @@ impl ClassifiedInboxQueue {
         auth_required: bool,
         trusted_peers: Arc<RwLock<TrustStore>>,
         peer_comms_handle: PeerCommsHandleSlot,
+        ingress_notify: Arc<Notify>,
     ) -> Self {
         Self {
             capacity,
@@ -177,6 +235,13 @@ impl ClassifiedInboxQueue {
             phase: PeerIngressState::Absent,
             dropped_count: Arc::new(AtomicU64::new(0)),
             capacity_notify: Arc::new(Notify::new()),
+            ingress_notify,
+            outstanding_claim: None,
+            handed_off_count: 0,
+            durably_admitted_count: 0,
+            runtime_handover_count: 0,
+            terminal_outcomes: Default::default(),
+            last_delivery_correlation: None,
         }
     }
 
@@ -303,7 +368,11 @@ impl ClassifiedInboxQueue {
         }
     }
 
-    fn admit_and_push(&mut self, prepared: PreparedIngressItem) -> AdmissionPushDecision {
+    fn admit_and_push(
+        &mut self,
+        prepared: PreparedIngressItem,
+        ingress_completion: Option<IngressCompletion>,
+    ) -> AdmissionPushDecision {
         let kind = prepared.kind;
         let decision = self.admit_peer_receive(&prepared);
         if let AdmissionOutcome::Dropped { reason } = decision.outcome {
@@ -334,6 +403,7 @@ impl ClassifiedInboxQueue {
             class: prepared.class,
             actionable: prepared.actionable,
             auth: prepared.auth,
+            delivery_contract: prepared.delivery_contract,
             kind,
             from_peer: prepared.from_peer,
             ingress_fact: prepared.ingress_fact,
@@ -341,6 +411,7 @@ impl ClassifiedInboxQueue {
             request_id: prepared.request_id,
             admission_diagnostic: decision.admission_diagnostic,
             response_terminality: prepared.response_terminality,
+            ingress_completion,
             text_projection: prepared.text_projection,
         };
         let is_actionable = entry.actionable;
@@ -365,29 +436,210 @@ impl ClassifiedInboxQueue {
         }
     }
 
-    fn drain(&mut self) -> Vec<ClassifiedInboxEntry> {
-        let drained: Vec<_> = self.entries.drain(..).collect();
-        for entry in &drained {
-            self.note_peer_dequeue(entry);
+    fn drain_volatile(&mut self) -> Vec<ClassifiedInboxEntry> {
+        if self.outstanding_claim.is_some() {
+            return Vec::new();
         }
-        if !drained.is_empty() {
-            self.capacity_notify.notify_waiters();
+        let mut drained = Vec::new();
+        while self.entries.front().is_some_and(|entry| {
+            entry.delivery_contract == PeerIngressDeliveryContract::VolatileControl
+        }) {
+            if let Some(entry) = self.pop_front_volatile() {
+                drained.push(entry);
+            }
         }
         drained
     }
 
-    fn pop_front(&mut self) -> Option<ClassifiedInboxEntry> {
+    fn pop_front_volatile(&mut self) -> Option<ClassifiedInboxEntry> {
+        if self.outstanding_claim.is_some()
+            || self.entries.front()?.delivery_contract
+                != PeerIngressDeliveryContract::VolatileControl
+        {
+            return None;
+        }
         let entry = self.entries.pop_front();
         if let Some(entry_ref) = entry.as_ref() {
             self.note_peer_dequeue(entry_ref);
             self.capacity_notify.notify_one();
+            if let Some(completion) = &entry_ref.ingress_completion {
+                completion.resolve(IngressDeliveryOutcome::VolatileHandedOff);
+            }
         }
         entry
     }
 
+    fn claim_front(&mut self) -> Option<(OutstandingClaim, ClassifiedInboxEntry)> {
+        if self.outstanding_claim.is_some() {
+            return None;
+        }
+        let entry = self.entries.front()?.clone();
+        let claim = OutstandingClaim {
+            claim_id: meerkat_core::interaction::PeerIngressClaimId(uuid::Uuid::new_v4()),
+            raw_item_id: entry.raw_item_id,
+            delivery_contract: entry.delivery_contract,
+            claimed_at: std::time::Instant::now(),
+        };
+        self.outstanding_claim = Some(claim);
+        self.handed_off_count = self.handed_off_count.saturating_add(1);
+        Some((claim, entry))
+    }
+
+    fn release_claim(&mut self, claim_id: meerkat_core::interaction::PeerIngressClaimId) {
+        if self.outstanding_claim.map(|claim| claim.claim_id) == Some(claim_id) {
+            self.outstanding_claim = None;
+            self.ingress_notify.notify_waiters();
+        }
+    }
+
+    fn commit_claim(
+        &mut self,
+        claim_id: meerkat_core::interaction::PeerIngressClaimId,
+        receipt: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<(), meerkat_core::interaction::PeerIngressClaimCommitError> {
+        let claim = self
+            .outstanding_claim
+            .ok_or(meerkat_core::interaction::PeerIngressClaimCommitError::NoOutstandingClaim)?;
+        if claim.claim_id != claim_id {
+            return Err(meerkat_core::interaction::PeerIngressClaimCommitError::ClaimMismatch);
+        }
+        if self.entries.front().map(|entry| entry.raw_item_id) != Some(claim.raw_item_id) {
+            return Err(meerkat_core::interaction::PeerIngressClaimCommitError::HeadMismatch);
+        }
+        let entry_ref = self
+            .entries
+            .front()
+            .ok_or(meerkat_core::interaction::PeerIngressClaimCommitError::HeadMismatch)?;
+        if entry_ref.delivery_contract != PeerIngressDeliveryContract::DurableRuntime {
+            return Err(
+                meerkat_core::interaction::PeerIngressClaimCommitError::AuthorityRejected(
+                    "volatile control ingress cannot be committed as durable runtime input"
+                        .to_string(),
+                ),
+            );
+        }
+        let handle = self.peer_comms_handle.read().clone().ok_or_else(|| {
+            meerkat_core::interaction::PeerIngressClaimCommitError::AuthorityRejected(
+                "generated peer comms handle is not installed".to_string(),
+            )
+        })?;
+        let outcome = handle
+            .authorize_peer_ingress_claim_commit(
+                meerkat_core::interaction::PeerIngressClaimCommitFacts {
+                    claim_id,
+                    raw_item_id: claim.raw_item_id,
+                    class: entry_ref.class,
+                },
+                receipt.as_ref(),
+            )
+            .map_err(|error| {
+                meerkat_core::interaction::PeerIngressClaimCommitError::AuthorityRejected(
+                    error.to_string(),
+                )
+            })?;
+        let entry = self
+            .entries
+            .pop_front()
+            .ok_or(meerkat_core::interaction::PeerIngressClaimCommitError::HeadMismatch)?;
+        self.outstanding_claim = None;
+        self.note_peer_dequeue(&entry);
+        self.capacity_notify.notify_one();
+        if !self.entries.is_empty() {
+            self.ingress_notify.notify_waiters();
+        }
+
+        use meerkat_core::interaction::{
+            PeerIngressClaimTerminalOutcome as Outcome, PeerIngressTerminalOutcomeKind as Kind,
+        };
+        let interaction_id = match &entry.item {
+            InboxItem::External { envelope } => Some(InteractionId(envelope.id)),
+            InboxItem::PlainEvent { interaction_id, .. } => {
+                Some(InteractionId(interaction_id.unwrap_or(entry.raw_item_id.0)))
+            }
+        };
+        let (kind, runtime_input_id, existing_runtime_input_id) = match outcome {
+            Outcome::RuntimeAccepted { input_id } => {
+                self.durably_admitted_count = self.durably_admitted_count.saturating_add(1);
+                self.runtime_handover_count = self.runtime_handover_count.saturating_add(1);
+                self.terminal_outcomes.accepted = self.terminal_outcomes.accepted.saturating_add(1);
+                (Kind::Accepted, Some(input_id), None)
+            }
+            Outcome::RuntimeDeduplicated {
+                input_id,
+                existing_id,
+            } => {
+                self.durably_admitted_count = self.durably_admitted_count.saturating_add(1);
+                self.runtime_handover_count = self.runtime_handover_count.saturating_add(1);
+                self.terminal_outcomes.deduplicated =
+                    self.terminal_outcomes.deduplicated.saturating_add(1);
+                (Kind::Deduplicated, Some(input_id), Some(existing_id))
+            }
+            Outcome::RuntimeRejected { input_id } => {
+                self.runtime_handover_count = self.runtime_handover_count.saturating_add(1);
+                self.terminal_outcomes.rejected = self.terminal_outcomes.rejected.saturating_add(1);
+                (Kind::Rejected, Some(input_id), None)
+            }
+        };
+        self.last_delivery_correlation =
+            Some(meerkat_core::interaction::PeerIngressDeliveryCorrelation {
+                raw_item_id: entry.raw_item_id,
+                interaction_id,
+                runtime_input_id,
+                existing_runtime_input_id,
+                outcome: kind,
+            });
+        if let Some(completion) = entry.ingress_completion {
+            completion.resolve(IngressDeliveryOutcome::DurablyResolved(kind));
+        }
+        Ok(())
+    }
+
+    fn handoff_volatile_claim(
+        &mut self,
+        claim_id: meerkat_core::interaction::PeerIngressClaimId,
+    ) -> Result<(), meerkat_core::interaction::PeerIngressClaimCommitError> {
+        let claim = self
+            .outstanding_claim
+            .ok_or(meerkat_core::interaction::PeerIngressClaimCommitError::NoOutstandingClaim)?;
+        if claim.claim_id != claim_id {
+            return Err(meerkat_core::interaction::PeerIngressClaimCommitError::ClaimMismatch);
+        }
+        if self.entries.front().map(|entry| entry.raw_item_id) != Some(claim.raw_item_id) {
+            return Err(meerkat_core::interaction::PeerIngressClaimCommitError::HeadMismatch);
+        }
+        if self.entries.front().is_some_and(|entry| {
+            entry.delivery_contract != PeerIngressDeliveryContract::VolatileControl
+        }) {
+            return Err(
+                meerkat_core::interaction::PeerIngressClaimCommitError::AuthorityRejected(
+                    "durable runtime ingress requires an AcceptWithCompletion receipt".to_string(),
+                ),
+            );
+        }
+        let entry = self
+            .entries
+            .pop_front()
+            .ok_or(meerkat_core::interaction::PeerIngressClaimCommitError::HeadMismatch)?;
+        self.outstanding_claim = None;
+        self.note_peer_dequeue(&entry);
+        self.capacity_notify.notify_one();
+        if !self.entries.is_empty() {
+            self.ingress_notify.notify_waiters();
+        }
+        if let Some(completion) = entry.ingress_completion {
+            completion.resolve(IngressDeliveryOutcome::VolatileHandedOff);
+        }
+        Ok(())
+    }
+
     fn close(&mut self) {
         self.closed = true;
+        self.outstanding_claim = None;
+        for entry in &mut self.entries {
+            entry.ingress_completion = None;
+        }
         self.capacity_notify.notify_waiters();
+        self.ingress_notify.notify_waiters();
     }
 
     fn snapshot(&self) -> PeerIngressQueueSnapshot {
@@ -437,6 +689,19 @@ impl ClassifiedInboxQueue {
             silent_request_count,
             ack_count,
             plain_event_count,
+            outstanding_claim: self.outstanding_claim.map(|claim| {
+                meerkat_core::interaction::PeerIngressClaimSnapshot {
+                    claim_id: claim.claim_id,
+                    raw_item_id: claim.raw_item_id,
+                    delivery_contract: claim.delivery_contract,
+                    age: claim.claimed_at.elapsed(),
+                }
+            }),
+            handed_off_count: self.handed_off_count,
+            durably_admitted_count: self.durably_admitted_count,
+            runtime_handover_count: self.runtime_handover_count,
+            terminal_outcomes: self.terminal_outcomes,
+            last_delivery_correlation: self.last_delivery_correlation.clone(),
             queued_entries,
         }
     }
@@ -444,6 +709,37 @@ impl ClassifiedInboxQueue {
     fn runtime_snapshot(&self) -> (PeerIngressQueueSnapshot, PeerIngressState, usize) {
         let queue_len = self.entries.len();
         (self.snapshot(), self.phase, queue_len)
+    }
+}
+
+pub(crate) struct ClassifiedInboxClaim {
+    pub(crate) claim_id: meerkat_core::interaction::PeerIngressClaimId,
+    pub(crate) entry: ClassifiedInboxEntry,
+    pub(crate) lease: Arc<ClassifiedInboxClaimLease>,
+}
+
+pub(crate) struct ClassifiedInboxClaimLease {
+    queue: Arc<Mutex<ClassifiedInboxQueue>>,
+}
+
+impl meerkat_core::interaction::PeerIngressClaimLease for ClassifiedInboxClaimLease {
+    fn commit(
+        &self,
+        claim_id: meerkat_core::interaction::PeerIngressClaimId,
+        receipt: Arc<dyn std::any::Any + Send + Sync>,
+    ) -> Result<(), meerkat_core::interaction::PeerIngressClaimCommitError> {
+        self.queue.lock().commit_claim(claim_id, receipt)
+    }
+
+    fn handoff_volatile(
+        &self,
+        claim_id: meerkat_core::interaction::PeerIngressClaimId,
+    ) -> Result<(), meerkat_core::interaction::PeerIngressClaimCommitError> {
+        self.queue.lock().handoff_volatile_claim(claim_id)
+    }
+
+    fn release(&self, claim_id: meerkat_core::interaction::PeerIngressClaimId) {
+        self.queue.lock().release_claim(claim_id);
     }
 }
 
@@ -529,6 +825,7 @@ impl Inbox {
             context.require_peer_auth,
             context.trusted_peers.clone(),
             context.peer_comms_handle.clone(),
+            notify.clone(),
         );
         let dropped_count = queue.dropped_counter();
         let classified_queue = Arc::new(Mutex::new(queue));
@@ -557,17 +854,30 @@ impl Inbox {
         self.notify.clone()
     }
 
-    /// Try to drain all classified entries without blocking.
+    /// Try to drain the contiguous volatile-control prefix without blocking.
+    /// Durable runtime entries are never removed through this legacy control
+    /// seam and an outstanding exact claim blocks destructive handoff.
     pub(crate) fn try_drain_classified(&mut self) -> Vec<ClassifiedInboxEntry> {
         self.classified_queue
             .as_ref()
-            .map(|queue| queue.lock().drain())
+            .map(|queue| queue.lock().drain_volatile())
             .unwrap_or_default()
     }
 
-    /// Try to receive a single classified entry without blocking.
+    /// Try to receive one volatile-control entry without blocking.
     pub(crate) fn try_recv_one_classified(&mut self) -> Option<ClassifiedInboxEntry> {
-        self.classified_queue.as_ref()?.lock().pop_front()
+        self.classified_queue.as_ref()?.lock().pop_front_volatile()
+    }
+
+    /// Non-destructively claim the current FIFO head.
+    pub(crate) fn try_claim_one_classified(&self) -> Option<ClassifiedInboxClaim> {
+        let queue = self.classified_queue.as_ref()?.clone();
+        let (claim, entry) = queue.lock().claim_front()?;
+        Some(ClassifiedInboxClaim {
+            claim_id: claim.claim_id,
+            entry,
+            lease: Arc::new(ClassifiedInboxClaimLease { queue }),
+        })
     }
 
     /// Get the actionable-input notifier (fires only for actionable classes).
@@ -580,6 +890,17 @@ impl Inbox {
         self.classified_queue
             .as_ref()
             .map(|queue| queue.lock().snapshot())
+    }
+
+    /// Test-only payload snapshot. Production observers use the typed queue
+    /// snapshot; tests that need exact bodies may clone entries without
+    /// bypassing durable claim authority or changing FIFO state.
+    #[cfg(test)]
+    pub(crate) fn test_classified_entries_snapshot(&self) -> Vec<ClassifiedInboxEntry> {
+        self.classified_queue
+            .as_ref()
+            .map(|queue| queue.lock().entries.iter().cloned().collect())
+            .unwrap_or_default()
     }
 
     pub(crate) fn peer_runtime_snapshot(
@@ -649,8 +970,8 @@ impl InboxSender {
     /// Returns `None` on non-classified inboxes (there is no admission
     /// step to exercise). Marked `#[doc(hidden)]` so it is callable from
     /// integration tests without appearing on the public API surface.
-    #[doc(hidden)]
-    pub fn classified_admit_with_pause_for_test(
+    #[cfg(test)]
+    pub(crate) fn classified_admit_with_pause_for_test(
         &self,
         item: InboxItem,
         pause: impl FnOnce(),
@@ -670,7 +991,7 @@ impl InboxSender {
         pause();
         let decision = {
             let mut queue = classified_queue.lock();
-            queue.admit_and_push(result)
+            queue.admit_and_push(result, None)
         };
         match decision.outcome {
             AdmissionOutcome::Admitted => {
@@ -687,7 +1008,7 @@ impl InboxSender {
     /// transport task. Classified runtimes route through `send_classified()`;
     /// raw inboxes are transport-only and cannot assert semantic peer ingress
     /// admission without machine authority.
-    pub fn send_connection_ingress(
+    pub(crate) fn send_connection_ingress(
         &self,
         envelope: Envelope,
         require_peer_auth: bool,
@@ -705,6 +1026,19 @@ impl InboxSender {
         self.record_drop(DropReason::ClassificationRejected)
     }
 
+    /// Admit a connection envelope, then wait until its exact queue claim is
+    /// either durably resolved by runtime admission or explicitly handed to a
+    /// volatile control consumer.
+    pub(crate) async fn send_connection_ingress_for_delivery(
+        &self,
+        envelope: Envelope,
+        require_peer_auth: bool,
+    ) -> IngressDeliveryOutcome {
+        let _ = require_peer_auth;
+        self.send_classified_for_delivery(InboxItem::External { envelope }, None)
+            .await
+    }
+
     /// Admit one envelope received on a TCP connection together with the
     /// kernel-observed remote socket address.
     ///
@@ -712,26 +1046,15 @@ impl InboxSender {
     /// serialized, replayed, or sender-forged. Open-auth listeners deliberately
     /// discard the source metadata for callback-routing purposes.
     #[cfg(not(target_arch = "wasm32"))]
-    pub(crate) fn send_tcp_connection_ingress(
+    pub(crate) async fn send_tcp_connection_ingress_for_delivery(
         &self,
         envelope: Envelope,
         require_peer_auth: bool,
         observed_source: SocketAddr,
-    ) -> AdmissionOutcome {
-        if self.classification_context.is_some() {
-            let observed_source = require_peer_auth.then_some(observed_source);
-            return self.send_classified_with_observed_tcp_source(
-                InboxItem::External { envelope },
-                observed_source,
-            );
-        }
-
-        tracing::warn!(
-            peer_id = %envelope.from.to_peer_id(),
-            reason = ?DropReason::ClassificationRejected,
-            "raw inbox rejected external TCP peer ingress because no machine classification context is installed"
-        );
-        self.record_drop(DropReason::ClassificationRejected)
+    ) -> IngressDeliveryOutcome {
+        let observed_source = require_peer_auth.then_some(observed_source);
+        self.send_classified_for_delivery(InboxItem::External { envelope }, observed_source)
+            .await
     }
 
     /// Send an item to the inbox.
@@ -742,7 +1065,8 @@ impl InboxSender {
     /// installed to classify admission or public result facts.
     ///
     /// Returns a typed `AdmissionOutcome`. Drops are never surfaced as `Ok(())`.
-    pub fn send(&self, item: InboxItem) -> AdmissionOutcome {
+    #[cfg(test)]
+    pub(crate) fn send(&self, item: InboxItem) -> AdmissionOutcome {
         // If classification context is available, route through classified path.
         if self.classification_context.is_some() {
             return self.send_classified(item);
@@ -768,7 +1092,7 @@ impl InboxSender {
     ///
     /// Classified items are enqueued only on the classified queue, then the
     /// appropriate notify is fired.
-    pub fn send_classified(&self, item: InboxItem) -> AdmissionOutcome {
+    pub(crate) fn send_classified(&self, item: InboxItem) -> AdmissionOutcome {
         self.send_classified_with_observed_tcp_source(item, None)
     }
 
@@ -805,7 +1129,7 @@ impl InboxSender {
         // change the public admission result.
         let decision = {
             let mut queue = classified_queue.lock();
-            queue.admit_and_push(result)
+            queue.admit_and_push(result, None)
         };
         match decision.outcome {
             AdmissionOutcome::Admitted => {
@@ -829,7 +1153,7 @@ impl InboxSender {
     /// This is used by runtime-originated peer sends where backpressure is
     /// preferable to semantic loss. Policy and closed-queue failures remain
     /// typed `Dropped` outcomes; only capacity waits.
-    pub async fn send_wait(&self, item: InboxItem) -> AdmissionOutcome {
+    pub(crate) async fn send_wait(&self, item: InboxItem) -> AdmissionOutcome {
         if self.classification_context.is_some() {
             return self.send_classified_wait(item).await;
         }
@@ -839,6 +1163,72 @@ impl InboxSender {
             "raw inbox rejected semantic item while waiting because no machine classification context is installed"
         );
         self.record_drop(DropReason::ClassificationRejected)
+    }
+
+    /// Wait for queue capacity and then for authoritative durable admission.
+    /// Used by in-process delivery, whose successful return has the same
+    /// meaning as a signed transport ack.
+    pub(crate) async fn send_wait_for_delivery(&self, item: InboxItem) -> IngressDeliveryOutcome {
+        let (Some(ctx), Some(classified_queue)) =
+            (&self.classification_context, &self.classified_queue)
+        else {
+            return IngressDeliveryOutcome::Dropped {
+                reason: DropReason::ClassificationRejected,
+            };
+        };
+        let Some(prepared) = ctx.prepare(item) else {
+            return IngressDeliveryOutcome::Dropped {
+                reason: DropReason::ClassificationRejected,
+            };
+        };
+        let kind = prepared.kind;
+        let mut prepared = Some(prepared);
+        let capacity_notify = classified_queue.lock().capacity_notifier();
+        let (completion, receipt) = IngressCompletion::new();
+        let mut completion = Some(completion);
+
+        loop {
+            let notified = capacity_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let admitted = {
+                let mut queue = classified_queue.lock();
+                if queue.closed {
+                    return IngressDeliveryOutcome::Dropped {
+                        reason: DropReason::SessionClosed,
+                    };
+                }
+                if queue.entries.len() < queue.capacity {
+                    let Some(prepared) = prepared.take() else {
+                        tracing::error!(kind = ?kind, "durable send lost prepared ingress item");
+                        return IngressDeliveryOutcome::Dropped {
+                            reason: DropReason::SessionClosed,
+                        };
+                    };
+                    Some(queue.admit_and_push(prepared, completion.take()))
+                } else {
+                    None
+                }
+            };
+            if let Some(decision) = admitted {
+                match decision.outcome {
+                    AdmissionOutcome::Dropped { reason } => {
+                        return IngressDeliveryOutcome::Dropped { reason };
+                    }
+                    AdmissionOutcome::Admitted => {
+                        if decision.is_actionable
+                            && let Some(actionable) = &self.actionable_notify
+                        {
+                            actionable.notify_waiters();
+                        }
+                        self.notify.notify_waiters();
+                        return receipt.wait().await;
+                    }
+                }
+            }
+            run_classified_send_wait_before_await_hook();
+            notified.await;
+        }
     }
 
     async fn send_classified_wait(&self, item: InboxItem) -> AdmissionOutcome {
@@ -882,7 +1272,7 @@ impl InboxSender {
                         );
                         return self.record_drop(DropReason::SessionClosed);
                     };
-                    let decision = queue.admit_and_push(result);
+                    let decision = queue.admit_and_push(result, None);
                     if let AdmissionOutcome::Dropped { reason } = decision.outcome {
                         return self.record_drop(reason);
                     }
@@ -903,7 +1293,7 @@ impl InboxSender {
                         );
                         return self.record_drop(DropReason::SessionClosed);
                     };
-                    let decision = queue.admit_and_push(result);
+                    let decision = queue.admit_and_push(result, None);
                     if let AdmissionOutcome::Dropped { reason } = decision.outcome {
                         return self.record_drop(reason);
                     }
@@ -918,6 +1308,41 @@ impl InboxSender {
             }
             run_classified_send_wait_before_await_hook();
             notified.await;
+        }
+    }
+
+    async fn send_classified_for_delivery(
+        &self,
+        item: InboxItem,
+        observed_tcp_source: Option<SocketAddr>,
+    ) -> IngressDeliveryOutcome {
+        let (Some(ctx), Some(classified_queue)) =
+            (&self.classification_context, &self.classified_queue)
+        else {
+            return IngressDeliveryOutcome::Dropped {
+                reason: DropReason::ClassificationRejected,
+            };
+        };
+        let Some(prepared) = ctx.prepare_with_observed_tcp_source(item, observed_tcp_source) else {
+            return IngressDeliveryOutcome::Dropped {
+                reason: DropReason::ClassificationRejected,
+            };
+        };
+        let (completion, receipt) = IngressCompletion::new();
+        let decision = classified_queue
+            .lock()
+            .admit_and_push(prepared, Some(completion));
+        match decision.outcome {
+            AdmissionOutcome::Dropped { reason } => IngressDeliveryOutcome::Dropped { reason },
+            AdmissionOutcome::Admitted => {
+                if decision.is_actionable
+                    && let Some(actionable) = &self.actionable_notify
+                {
+                    actionable.notify_waiters();
+                }
+                self.notify.notify_waiters();
+                receipt.wait().await
+            }
         }
     }
 
@@ -946,6 +1371,7 @@ fn snapshot_entry(entry: &ClassifiedInboxEntry) -> PeerIngressEntrySnapshot {
         },
         class: entry.class,
         actionable: entry.actionable,
+        delivery_contract: entry.delivery_contract,
         kind: entry.kind,
         from_peer_display: entry
             .from_peer
@@ -1236,6 +1662,7 @@ mod tests {
             trusted_peers: Arc::new(parking_lot::RwLock::new(trusted)),
             peer_comms_handle: Arc::new(parking_lot::RwLock::new(peer_comms_handle)),
             inproc_namespace: None,
+            durable_runtime_consumer: true,
         })
     }
 
@@ -1248,6 +1675,7 @@ mod tests {
             ctx.require_peer_auth,
             ctx.trusted_peers.clone(),
             ctx.peer_comms_handle.clone(),
+            Arc::new(Notify::new()),
         )
     }
 
@@ -1496,7 +1924,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_classified_try_drain() {
+    async fn test_classified_durable_head_requires_a_claim() {
         let sender_pubkey = PubKey::new([1u8; 32]);
         let ctx = make_classification_context(make_trusted("peer", &sender_pubkey), false);
         let (mut inbox, sender) = Inbox::new_classified(ctx);
@@ -1508,20 +1936,152 @@ mod tests {
             .into_result()
             .unwrap();
 
-        let entries = inbox.try_drain_classified();
+        let entries = inbox.test_classified_entries_snapshot();
         assert_eq!(entries.len(), 1);
         assert!(!entries[0].raw_item_id.to_string().is_empty());
         assert_eq!(
             entries[0].class,
             meerkat_core::PeerInputClass::ActionableMessage
         );
+        assert!(
+            inbox.try_drain_classified().is_empty(),
+            "legacy volatile drain must retain DurableRuntime ingress"
+        );
+        assert_eq!(inbox.test_classified_entries_snapshot().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn durable_claim_cancel_retains_the_exact_head() {
+        let sender_pubkey = PubKey::new([1u8; 32]);
+        let ctx = make_classification_context(make_trusted("peer", &sender_pubkey), false);
+        let (inbox, sender) = Inbox::new_classified(ctx);
+        let envelope = make_test_envelope();
+        let raw_item_id = InteractionId(envelope.id);
+        sender
+            .send_classified(InboxItem::External { envelope })
+            .into_result()
+            .unwrap();
+
+        let claimed = inbox
+            .try_claim_one_classified()
+            .expect("durable head claim");
+        let claim = meerkat_core::PeerIngressQueueClaim::from_comms_queue(
+            claimed.claim_id,
+            claimed.entry.raw_item_id,
+            claimed.entry.class,
+            claimed.entry.delivery_contract,
+            None,
+            claimed.lease,
+        );
+        drop(claim);
+
+        let entries = inbox.test_classified_entries_snapshot();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].raw_item_id, raw_item_id);
+    }
+
+    #[tokio::test]
+    async fn wrong_claim_id_is_rejected_without_releasing_or_removing_head() {
+        use meerkat_core::interaction::PeerIngressClaimLease as _;
+
+        let sender_pubkey = PubKey::new([1u8; 32]);
+        let ctx = make_classification_context(make_trusted("peer", &sender_pubkey), false);
+        let (inbox, sender) = Inbox::new_classified(ctx);
+        sender
+            .send_classified(InboxItem::External {
+                envelope: make_test_envelope(),
+            })
+            .into_result()
+            .unwrap();
+
+        let claimed = inbox
+            .try_claim_one_classified()
+            .expect("durable head claim");
+        let wrong = meerkat_core::interaction::PeerIngressClaimId(Uuid::new_v4());
+        assert_eq!(
+            claimed.lease.handoff_volatile(wrong),
+            Err(meerkat_core::interaction::PeerIngressClaimCommitError::ClaimMismatch)
+        );
+        assert!(
+            inbox.try_claim_one_classified().is_none(),
+            "wrong claim id must leave the original lease outstanding"
+        );
+        claimed.lease.release(claimed.claim_id);
+        assert_eq!(inbox.test_classified_entries_snapshot().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn released_fifo_claim_reacquires_the_same_head_with_a_new_claim_id() {
+        let sender_pubkey = PubKey::new([1u8; 32]);
+        let ctx = make_classification_context(make_trusted("peer", &sender_pubkey), false);
+        let (inbox, sender) = Inbox::new_classified(ctx);
+        let first = make_test_envelope();
+        let first_raw_id = InteractionId(first.id);
+        let second = make_test_envelope();
+        let second_raw_id = InteractionId(second.id);
+        for envelope in [first, second] {
+            sender
+                .send_classified(InboxItem::External { envelope })
+                .into_result()
+                .unwrap();
+        }
+
+        let first_claim = inbox.try_claim_one_classified().expect("first FIFO claim");
+        let first_claim_id = first_claim.claim_id;
+        assert_eq!(first_claim.entry.raw_item_id, first_raw_id);
+        let claim = meerkat_core::PeerIngressQueueClaim::from_comms_queue(
+            first_claim.claim_id,
+            first_claim.entry.raw_item_id,
+            first_claim.entry.class,
+            first_claim.entry.delivery_contract,
+            None,
+            first_claim.lease,
+        );
+        drop(claim);
+
+        let reacquired = inbox
+            .try_claim_one_classified()
+            .expect("released FIFO head must be claimable again");
+        assert_ne!(reacquired.claim_id, first_claim_id);
+        assert_eq!(reacquired.entry.raw_item_id, first_raw_id);
+        assert_ne!(reacquired.entry.raw_item_id, second_raw_id);
+    }
+
+    #[tokio::test]
+    async fn durable_raw_item_id_is_stable_across_snapshot_and_claim_cycles() {
+        let sender_pubkey = PubKey::new([1u8; 32]);
+        let ctx = make_classification_context(make_trusted("peer", &sender_pubkey), false);
+        let (inbox, sender) = Inbox::new_classified(ctx);
+        let envelope = make_test_envelope();
+        let expected = InteractionId(envelope.id);
+        sender
+            .send_classified(InboxItem::External { envelope })
+            .into_result()
+            .unwrap();
+
+        let snapshot_raw = inbox.test_classified_entries_snapshot()[0].raw_item_id;
+        let first = inbox.try_claim_one_classified().expect("first claim");
+        assert_eq!(first.entry.raw_item_id, expected);
+        let first_core = meerkat_core::PeerIngressQueueClaim::from_comms_queue(
+            first.claim_id,
+            first.entry.raw_item_id,
+            first.entry.class,
+            first.entry.delivery_contract,
+            None,
+            first.lease,
+        );
+        drop(first_core);
+        let second = inbox.try_claim_one_classified().expect("second claim");
+
+        assert_eq!(snapshot_raw, expected);
+        assert_eq!(second.entry.raw_item_id, expected);
     }
 
     #[tokio::test]
     async fn test_classified_snapshot_is_non_destructive() {
         let sender_pubkey = PubKey::new([1u8; 32]);
         let ctx = make_classification_context(make_trusted("peer", &sender_pubkey), false);
-        let (mut inbox, sender) = Inbox::new_classified(ctx);
+        let (inbox, sender) = Inbox::new_classified(ctx);
 
         sender
             .send_classified(InboxItem::External {
@@ -1580,8 +2140,11 @@ mod tests {
                 .expect("plain event interaction id should be present")
         );
 
-        let drained = inbox.try_drain_classified();
-        assert_eq!(drained.len(), 2, "snapshot must not drain queued ingress");
+        assert_eq!(
+            inbox.test_classified_entries_snapshot().len(),
+            2,
+            "snapshot must not drain queued ingress"
+        );
     }
 
     #[tokio::test]
@@ -1729,7 +2292,7 @@ mod tests {
     #[tokio::test]
     async fn test_classified_snapshot_trust_observation_is_diagnostic_only() {
         let ctx = make_classification_context(TrustStore::new(), false);
-        let (mut inbox, sender) = Inbox::new_classified(ctx);
+        let (inbox, sender) = Inbox::new_classified(ctx);
 
         sender
             .send_classified(InboxItem::External {
@@ -1752,7 +2315,7 @@ mod tests {
             "the fallback sender label is display-only diagnostics"
         );
 
-        let drained = inbox.try_drain_classified();
+        let drained = inbox.test_classified_entries_snapshot();
         assert_eq!(
             drained.len(),
             1,
@@ -1802,6 +2365,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn classification_then_trust_revoke_then_admission_rechecks_live_trust() {
+        let sender_pubkey = PubKey::new([1u8; 32]);
+        let ctx = make_classification_context(make_trusted("peer", &sender_pubkey), true);
+        let (inbox, sender) = Inbox::new_classified(ctx.clone());
+        let mut envelope = make_test_envelope();
+        envelope.from = sender_pubkey;
+
+        let outcome =
+            sender.classified_admit_with_pause_for_test(InboxItem::External { envelope }, || {
+                *ctx.trusted_peers.write() = TrustStore::new();
+            });
+
+        assert_eq!(
+            outcome,
+            AdmissionOutcome::Dropped {
+                reason: DropReason::UntrustedSender
+            },
+            "admission must re-read trust after classification and reject the T1 revoke"
+        );
+        assert_eq!(inbox.test_classified_entries_snapshot().len(), 0);
+        assert_eq!(inbox.dropped_count(), Some(1));
+    }
+
+    #[tokio::test]
     async fn test_machine_rejection_returns_classification_rejected_drop_reason() {
         let sender_pubkey = PubKey::new([1u8; 32]);
         let machine = RejectingPeerCommsHandle::new();
@@ -1810,7 +2397,7 @@ mod tests {
             true,
             Some(machine.clone() as Arc<dyn meerkat_core::handles::PeerCommsHandle>),
         );
-        let (mut inbox, sender) = Inbox::new_classified(ctx);
+        let (inbox, sender) = Inbox::new_classified(ctx);
 
         let outcome = sender.send_classified(InboxItem::External {
             envelope: make_test_envelope(),
@@ -1823,7 +2410,7 @@ mod tests {
             }
         );
         assert_eq!(inbox.dropped_count(), Some(1));
-        assert_eq!(inbox.try_drain_classified().len(), 0);
+        assert_eq!(inbox.test_classified_entries_snapshot().len(), 0);
         assert_eq!(machine.external_calls(), 1);
     }
 
@@ -1832,7 +2419,7 @@ mod tests {
         let sender_pubkey = PubKey::new([1u8; 32]);
         let ctx =
             make_classification_context_without_machine(make_trusted("peer", &sender_pubkey), true);
-        let (mut inbox, sender) = Inbox::new_classified(ctx);
+        let (inbox, sender) = Inbox::new_classified(ctx);
 
         let outcome = sender.send_classified(InboxItem::External {
             envelope: make_response_envelope(Uuid::new_v4()),
@@ -1846,7 +2433,7 @@ mod tests {
             "peer response must not be accepted or terminalized without machine authority"
         );
         assert_eq!(inbox.dropped_count(), Some(1));
-        assert_eq!(inbox.try_drain_classified().len(), 0);
+        assert_eq!(inbox.test_classified_entries_snapshot().len(), 0);
     }
 
     #[tokio::test]
@@ -1909,7 +2496,7 @@ mod tests {
 
         assert_eq!(
             sender.send_classified(InboxItem::External {
-                envelope: make_test_envelope(),
+                envelope: make_response_envelope(Uuid::new_v4()),
             }),
             AdmissionOutcome::Admitted
         );
@@ -1918,7 +2505,7 @@ mod tests {
         let waiting = tokio::spawn(async move {
             waiting_sender
                 .send_wait(InboxItem::External {
-                    envelope: make_test_envelope(),
+                    envelope: make_response_envelope(Uuid::new_v4()),
                 })
                 .await
         });
@@ -1928,7 +2515,7 @@ mod tests {
             "send_wait must wait instead of dropping when the classified queue is full"
         );
 
-        assert!(classified_queue.lock().pop_front().is_some());
+        assert!(classified_queue.lock().pop_front_volatile().is_some());
         assert_eq!(
             waiting.await.expect("send_wait task should complete"),
             AdmissionOutcome::Admitted
@@ -1959,7 +2546,7 @@ mod tests {
 
         assert_eq!(
             sender.send_classified(InboxItem::External {
-                envelope: make_test_envelope(),
+                envelope: make_response_envelope(Uuid::new_v4()),
             }),
             AdmissionOutcome::Admitted
         );
@@ -1968,7 +2555,7 @@ mod tests {
         let waiting = tokio::spawn(async move {
             waiting_sender
                 .send_wait(InboxItem::External {
-                    envelope: make_test_envelope(),
+                    envelope: make_response_envelope(Uuid::new_v4()),
                 })
                 .await
         });
@@ -1979,7 +2566,7 @@ mod tests {
         );
 
         *ctx.trusted_peers.write() = TrustStore::new();
-        assert!(classified_queue.lock().pop_front().is_some());
+        assert!(classified_queue.lock().pop_front_volatile().is_some());
 
         assert_eq!(
             waiting.await.expect("send_wait task should complete"),
@@ -2015,7 +2602,7 @@ mod tests {
 
         assert_eq!(
             sender.send_classified(InboxItem::External {
-                envelope: make_test_envelope(),
+                envelope: make_response_envelope(Uuid::new_v4()),
             }),
             AdmissionOutcome::Admitted
         );
@@ -2026,7 +2613,7 @@ mod tests {
         let hook: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
             if !hook_released_capacity.swap(true, Ordering::SeqCst) {
                 assert!(
-                    hook_queue.lock().pop_front().is_some(),
+                    hook_queue.lock().pop_front_volatile().is_some(),
                     "test hook must free the exactly-full queue"
                 );
             }
@@ -2038,7 +2625,7 @@ mod tests {
             async move {
                 waiting_sender
                     .send_wait(InboxItem::External {
-                        envelope: make_test_envelope(),
+                        envelope: make_response_envelope(Uuid::new_v4()),
                     })
                     .await
             },
@@ -2082,7 +2669,7 @@ mod tests {
 
         assert_eq!(
             sender.send_classified(InboxItem::External {
-                envelope: make_test_envelope(),
+                envelope: make_response_envelope(Uuid::new_v4()),
             }),
             AdmissionOutcome::Admitted
         );
@@ -2102,7 +2689,7 @@ mod tests {
             async move {
                 waiting_sender
                     .send_wait(InboxItem::External {
-                        envelope: make_test_envelope(),
+                        envelope: make_response_envelope(Uuid::new_v4()),
                     })
                     .await
             },
@@ -2147,7 +2734,7 @@ mod tests {
         for _ in 0..CAPACITY {
             assert_eq!(
                 sender.send_classified(InboxItem::External {
-                    envelope: make_test_envelope(),
+                    envelope: make_response_envelope(Uuid::new_v4()),
                 }),
                 AdmissionOutcome::Admitted
             );
@@ -2159,7 +2746,7 @@ mod tests {
             waiters.push(tokio::spawn(async move {
                 waiting_sender
                     .send_wait(InboxItem::External {
-                        envelope: make_test_envelope(),
+                        envelope: make_response_envelope(Uuid::new_v4()),
                     })
                     .await
             }));
@@ -2172,7 +2759,7 @@ mod tests {
 
         for _ in 0..(CAPACITY + WAITERS) {
             loop {
-                if classified_queue.lock().pop_front().is_some() {
+                if classified_queue.lock().pop_front_volatile().is_some() {
                     break;
                 }
                 tokio::task::yield_now().await;

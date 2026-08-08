@@ -1775,10 +1775,22 @@ impl CommsCommand {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum PeerDeliveryOutcome {
-    /// A peer acknowledgement was received and verified.
+    /// The receiver durably terminalized peer ingress for this exact
+    /// envelope before acknowledging it.
+    DurablyResolved {
+        outcome: crate::interaction::PeerIngressTerminalOutcomeKind,
+    },
+    /// A byte-compatible transport acknowledgement was received and verified.
+    ///
+    /// The ACK proves that the receiver completed the delivery contract for
+    /// this message kind, but the legacy signed wire shape cannot distinguish
+    /// durable Accepted from Deduplicated, or durable runtime admission from
+    /// volatile control handoff. Exact outcomes are available only on inproc
+    /// delivery, where no rolling-upgrade wire claim is involved.
     Acked,
-    /// The receiver's local inbox admitted the envelope directly.
-    HandedOff,
+    /// The receiver's volatile control consumer accepted ownership of the
+    /// envelope. This is explicitly weaker than durable runtime admission.
+    VolatileHandedOff,
     /// The envelope was written to a transport that does not acknowledge this
     /// message kind; receiver admission is not known.
     Queued,
@@ -1797,15 +1809,18 @@ pub enum SendReceipt {
     },
     PeerLifecycleSent {
         envelope_id: uuid::Uuid,
+        delivery: PeerDeliveryOutcome,
     },
     PeerRequestSent {
         envelope_id: uuid::Uuid,
         interaction_id: InteractionId,
         stream_reserved: bool,
+        delivery: PeerDeliveryOutcome,
     },
     PeerResponseSent {
         envelope_id: uuid::Uuid,
         in_reply_to: InteractionId,
+        delivery: PeerDeliveryOutcome,
     },
 }
 
@@ -2083,6 +2098,20 @@ pub enum SendError {
     /// transport cause for diagnostics (`details` payloads).
     #[error("transport error: {0}")]
     Transport(String),
+    /// The envelope may have reached the receiver, but its terminal delivery
+    /// receipt was not observed. The id is correlation evidence owned by the
+    /// caller, which must reconcile against durable work truth before deciding
+    /// whether a new delivery attempt is safe. No process-local retry authority
+    /// is implied.
+    #[error("peer delivery outcome is ambiguous for envelope {envelope_id}: {detail}")]
+    AmbiguousDelivery {
+        envelope_id: uuid::Uuid,
+        detail: String,
+    },
+    /// The receiver durably resolved this exact peer envelope as rejected.
+    /// Delivery is terminal and unambiguous, but no input was admitted.
+    #[error("peer durably rejected envelope {envelope_id}")]
+    DurableAdmissionRejected { envelope_id: uuid::Uuid },
     /// Receiver admitted the envelope-transport but rejected it at ingress
     /// for a typed policy reason (untrusted sender, full inbox, etc.). This
     /// is semantically distinct from `PeerOffline` — transport worked,

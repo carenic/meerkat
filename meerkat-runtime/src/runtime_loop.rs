@@ -1478,12 +1478,15 @@ async fn drain_recovered_interaction_terminal_outboxes_under_authority(
             terminal_observation,
             runtime_termination_reason,
             completion_error_metadata,
+            terminal_recovery,
             phase,
         } = batch;
         if let Some(run_id) = batch_key.run_id() {
             let driver = driver.lock().await;
             crate::meerkat_machine::driver::machine_recover_runtime_completion_result_correlation(
-                &driver, run_id,
+                &driver,
+                run_id,
+                terminal_recovery,
             )
             .map_err(|error| {
                 InteractionTerminalPublicationError::from_generated_authority(
@@ -1671,6 +1674,7 @@ async fn drain_recovered_input_terminal_completions(
             crate::meerkat_machine::driver::machine_recover_runtime_completion_result_correlation(
                 &driver_guard,
                 run_id,
+                batch.terminal_recovery,
             )
             .map_err(|error| {
                 InteractionTerminalPublicationError::from_generated_authority(

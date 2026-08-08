@@ -100,6 +100,61 @@ fn install_ephemeral_peer_request_response_authority(
     dsl
 }
 
+fn install_real_peer_ingress_finalizer(
+    runtime: &Arc<CommsRuntime>,
+) -> Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer> {
+    let (_peer_comms, finalizer) = meerkat_runtime::test_peer_comms_handle_and_runtime_finalizer();
+    finalizer
+        .install_on(runtime.as_ref())
+        .expect("install real test peer-ingress authority");
+    runtime.install_peer_request_response_authority(PeerRequestResponseAuthority::new(
+        finalizer.peer_interaction_handle(),
+        finalizer.interaction_stream_handle(),
+    ));
+    Arc::new(finalizer)
+}
+
+async fn trust_peer_with_real_finalizer(
+    finalizer: &meerkat_runtime::TestPeerIngressRuntimeFinalizer,
+    runtime: &Arc<CommsRuntime>,
+    peer: TrustedPeerDescriptor,
+    context: &'static str,
+) {
+    let runtime: Arc<dyn CoreCommsRuntime> = Arc::clone(runtime) as Arc<dyn CoreCommsRuntime>;
+    finalizer
+        .trust_peer_on_runtime(peer, runtime)
+        .await
+        .unwrap_or_else(|error| panic!("{context}: {error}"));
+}
+
+async fn finalize_one_runtime_peer_input(
+    runtime: &Arc<CommsRuntime>,
+    finalizer: &meerkat_runtime::TestPeerIngressRuntimeFinalizer,
+    context: &'static str,
+) -> meerkat_core::interaction::PeerInputCandidate {
+    let inbox_notify = runtime.inbox_notify();
+    loop {
+        let notified = inbox_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if let Some(claim) = CoreCommsRuntime::claim_classified_inbox_interaction(runtime.as_ref())
+            .await
+            .unwrap_or_else(|error| panic!("{context}: claim failed: {error}"))
+        {
+            return finalizer
+                .finalize(claim)
+                .await
+                .unwrap_or_else(|error| panic!("{context}: durable finalization failed: {error}"));
+        }
+        (&mut notified).await;
+    }
+}
+
+type PeerSendAndCandidate = (
+    Result<SendReceipt, meerkat_core::SendError>,
+    meerkat_core::interaction::PeerInputCandidate,
+);
+
 fn initialized_test_comms_dsl(session_id: &str) -> Arc<meerkat_runtime::HandleDslAuthority> {
     let dsl = Arc::new(meerkat_runtime::HandleDslAuthority::ephemeral());
     dsl.apply_signal(
@@ -417,34 +472,26 @@ async fn contract_mob_002_peer_request_response_round_trip() {
 
     let sender = Arc::new(CommsRuntime::inproc_only(&sender_name).unwrap());
     let receiver = Arc::new(CommsRuntime::inproc_only(&receiver_name).unwrap());
-    let sender_dsl = install_ephemeral_peer_request_response_authority(
-        &sender,
-        &format!("c002-sender-{suffix}"),
-    );
-    let receiver_dsl = install_ephemeral_peer_request_response_authority(
-        &receiver,
-        &format!("c002-receiver-{suffix}"),
-    );
+    let sender_finalizer = install_real_peer_ingress_finalizer(&sender);
+    let receiver_finalizer = install_real_peer_ingress_finalizer(&receiver);
 
     // Establish bidirectional trust
     let peer_spec =
         inproc_peer_descriptor(&receiver_name, receiver.as_ref()).expect("valid peer spec");
-    apply_generated_peer_projection_trust_with_dsl(
-        sender.as_ref(),
-        Arc::clone(&sender_dsl),
+    trust_peer_with_real_finalizer(
+        sender_finalizer.as_ref(),
+        &sender,
         peer_spec,
-        1,
         "add sender->receiver trust",
     )
     .await;
 
     let reverse_spec =
         inproc_peer_descriptor(&sender_name, sender.as_ref()).expect("valid reverse spec");
-    apply_generated_peer_projection_trust_with_dsl(
-        receiver.as_ref(),
-        Arc::clone(&receiver_dsl),
+    trust_peer_with_real_finalizer(
+        receiver_finalizer.as_ref(),
+        &receiver,
         reverse_spec,
-        1,
         "add receiver->sender trust",
     )
     .await;
@@ -460,9 +507,15 @@ async fn contract_mob_002_peer_request_response_round_trip() {
         handling_mode: meerkat_core::types::HandlingMode::Queue,
         stream: meerkat_core::comms::InputStreamMode::None,
     };
-    let receipt = CoreCommsRuntime::send(sender.as_ref(), request_cmd)
-        .await
-        .expect("PeerRequest send should succeed");
+    let (receipt, request_candidate): PeerSendAndCandidate = tokio::join!(
+        CoreCommsRuntime::send(sender.as_ref(), request_cmd),
+        finalize_one_runtime_peer_input(
+            &receiver,
+            receiver_finalizer.as_ref(),
+            "receiver finalizes contract request",
+        ),
+    );
+    let receipt = receipt.expect("PeerRequest send should succeed");
     let (request_envelope_id, request_interaction_id) = match receipt {
         SendReceipt::PeerRequestSent {
             envelope_id,
@@ -481,14 +534,9 @@ async fn contract_mob_002_peer_request_response_round_trip() {
         "peer request envelope id should be populated"
     );
 
-    // Receiver drains inbox and sees the request
-    let interactions = CoreCommsRuntime::drain_inbox_interactions(receiver.as_ref()).await;
-    assert_eq!(
-        interactions.len(),
-        1,
-        "receiver should see exactly one interaction"
-    );
-    let request_interaction = &interactions[0];
+    // The real runtime authority durably consumes the exact claimed request
+    // and returns the candidate projection that crossed that boundary.
+    let request_interaction = &request_candidate.interaction;
     assert_eq!(request_interaction.from, sender_name);
     assert!(request_interaction.rendered_text.contains(&format!(
         "\"peer_id\":\"{}\"",
@@ -587,7 +635,7 @@ async fn contract_mob_002b_terminal_transition_drives_registry_cleanup_via_effec
     let receiver_name = format!("c002b-receiver-{suffix}");
 
     let sender = Arc::new(CommsRuntime::inproc_only(&sender_name).unwrap());
-    let receiver = CommsRuntime::inproc_only(&receiver_name).unwrap();
+    let receiver = Arc::new(CommsRuntime::inproc_only(&receiver_name).unwrap());
 
     // Install a real session-shaped DSL authority + handle on the sender,
     // then register the sender runtime as the cleanup observer. That's
@@ -618,23 +666,21 @@ async fn contract_mob_002b_terminal_transition_drives_registry_cleanup_via_effec
             Arc::new(RuntimeInteractionStreamHandle::new(Arc::clone(&dsl))),
         ),
     );
-    let receiver_dsl =
-        install_generated_peer_comms_authority(&receiver, &format!("c002b-receiver-{suffix}"));
+    let receiver_finalizer = install_real_peer_ingress_finalizer(&receiver);
 
     // Establish bidirectional trust.
     apply_generated_peer_projection_trust_with_dsl(
         sender.as_ref(),
         Arc::clone(&dsl),
-        inproc_peer_descriptor(&receiver_name, &receiver).unwrap(),
+        inproc_peer_descriptor(&receiver_name, receiver.as_ref()).unwrap(),
         1,
         "add sender->receiver trust",
     )
     .await;
-    apply_generated_peer_projection_trust_with_dsl(
+    trust_peer_with_real_finalizer(
+        receiver_finalizer.as_ref(),
         &receiver,
-        Arc::clone(&receiver_dsl),
         inproc_peer_descriptor(&sender_name, sender.as_ref()).unwrap(),
-        1,
         "add receiver->sender trust",
     )
     .await;
@@ -645,16 +691,22 @@ async fn contract_mob_002b_terminal_transition_drives_registry_cleanup_via_effec
     let request_cmd = CommsCommand::PeerRequest {
         objective_id: None,
         content_taint: None,
-        to: inproc_peer_route(&receiver_name, &receiver).unwrap(),
+        to: inproc_peer_route(&receiver_name, receiver.as_ref()).unwrap(),
         intent: "mob.ping".into(),
         params: serde_json::json!({"seq": 1}),
         blocks: None,
         handling_mode: meerkat_core::types::HandlingMode::Queue,
         stream: InputStreamMode::ReserveInteraction,
     };
-    let receipt = CoreCommsRuntime::send(sender.as_ref(), request_cmd)
-        .await
-        .unwrap();
+    let (receipt, _request_candidate): PeerSendAndCandidate = tokio::join!(
+        CoreCommsRuntime::send(sender.as_ref(), request_cmd),
+        finalize_one_runtime_peer_input(
+            &receiver,
+            receiver_finalizer.as_ref(),
+            "receiver finalizes terminal-cleanup contract request",
+        ),
+    );
+    let receipt = receipt.unwrap();
     let request_interaction_id = match receipt {
         SendReceipt::PeerRequestSent {
             interaction_id,
@@ -701,8 +753,14 @@ async fn contract_mob_002b_terminal_transition_drives_registry_cleanup_via_effec
     .expect("peer terminal cleanup must leave the response stream claimable");
     drop(stream);
 
-    // Drain the receiver's inbox so no test-wide notifies leak.
-    let _ = CoreCommsRuntime::drain_inbox_interactions(&receiver).await;
+    assert_eq!(
+        CoreCommsRuntime::peer_ingress_queue_snapshot(receiver.as_ref())
+            .await
+            .expect("receiver ingress snapshot")
+            .total_count,
+        0,
+        "durable finalization must consume the exact receiver queue head"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -723,7 +781,7 @@ async fn contract_mob_002c_dsl_reject_refuses_shell_commit() {
     let sender_name = format!("c002c-sender-{suffix}");
     let receiver_name = format!("c002c-receiver-{suffix}");
     let sender = Arc::new(CommsRuntime::inproc_only(&sender_name).unwrap());
-    let receiver = CommsRuntime::inproc_only(&receiver_name).unwrap();
+    let receiver = Arc::new(CommsRuntime::inproc_only(&receiver_name).unwrap());
 
     let dsl = Arc::new(meerkat_runtime::HandleDslAuthority::ephemeral());
     dsl.apply_signal(
@@ -754,24 +812,22 @@ async fn contract_mob_002c_dsl_reject_refuses_shell_commit() {
             Arc::clone(&dsl),
         )),
     ));
-    let receiver_dsl =
-        install_generated_peer_comms_authority(&receiver, &format!("c002c-receiver-{suffix}"));
+    let receiver_finalizer = install_real_peer_ingress_finalizer(&receiver);
 
     apply_generated_peer_projection_trust_with_dsl(
         sender.as_ref(),
         Arc::clone(&dsl),
-        inproc_peer_descriptor(&receiver_name, &receiver).unwrap(),
+        inproc_peer_descriptor(&receiver_name, receiver.as_ref()).unwrap(),
         1,
         "add sender->receiver trust",
     )
     .await;
     // Bidirectional trust — W1-B's typed admission drops from untrusted
     // senders at the receiver's inbox.
-    apply_generated_peer_projection_trust_with_dsl(
+    trust_peer_with_real_finalizer(
+        receiver_finalizer.as_ref(),
         &receiver,
-        Arc::clone(&receiver_dsl),
         inproc_peer_descriptor(&sender_name, sender.as_ref()).unwrap(),
-        1,
         "add receiver->sender trust",
     )
     .await;
@@ -801,24 +857,28 @@ async fn contract_mob_002c_dsl_reject_refuses_shell_commit() {
     // fresh Uuids; instead assert that a normal fresh send still works —
     // proving the reject above is on state-correctness grounds, not a
     // blanket gate failure.
-    let ok_receipt = CoreCommsRuntime::send(
-        sender.as_ref(),
-        CommsCommand::PeerRequest {
-            objective_id: None,
-            content_taint: None,
-            to: inproc_peer_route(&receiver_name, &receiver).unwrap(),
-            intent: "mob.ping".into(),
-            params: serde_json::json!({"seq": 2}),
-            blocks: None,
-            handling_mode: meerkat_core::types::HandlingMode::Queue,
-            stream: InputStreamMode::None,
-        },
-    )
-    .await
-    .expect("fresh send with unique corr_id should succeed");
+    let (ok_receipt, _request_candidate): PeerSendAndCandidate = tokio::join!(
+        CoreCommsRuntime::send(
+            sender.as_ref(),
+            CommsCommand::PeerRequest {
+                objective_id: None,
+                content_taint: None,
+                to: inproc_peer_route(&receiver_name, receiver.as_ref()).unwrap(),
+                intent: "mob.ping".into(),
+                params: serde_json::json!({"seq": 2}),
+                blocks: None,
+                handling_mode: meerkat_core::types::HandlingMode::Queue,
+                stream: InputStreamMode::None,
+            },
+        ),
+        finalize_one_runtime_peer_input(
+            &receiver,
+            receiver_finalizer.as_ref(),
+            "receiver finalizes fresh contract request",
+        ),
+    );
+    let ok_receipt = ok_receipt.expect("fresh send with unique corr_id should succeed");
     assert!(matches!(ok_receipt, SendReceipt::PeerRequestSent { .. }));
-
-    let _ = CoreCommsRuntime::drain_inbox_interactions(&receiver).await;
 }
 
 // ---------------------------------------------------------------------------
@@ -1076,14 +1136,13 @@ async fn contract_mob_005_remove_trusted_peer_revokes_send() {
     let receiver_name = format!("c005-receiver-{suffix}");
 
     let sender = CommsRuntime::inproc_only(&sender_name).unwrap();
-    let receiver = CommsRuntime::inproc_only(&receiver_name).unwrap();
+    let receiver = Arc::new(CommsRuntime::inproc_only(&receiver_name).unwrap());
     let sender_dsl =
         install_generated_peer_comms_authority(&sender, &format!("c005-sender-{suffix}"));
-    let receiver_dsl =
-        install_generated_peer_comms_authority(&receiver, &format!("c005-receiver-{suffix}"));
+    let receiver_finalizer = install_real_peer_ingress_finalizer(&receiver);
 
     // Establish trust
-    let spec = inproc_peer_descriptor(&receiver_name, &receiver).expect("valid spec");
+    let spec = inproc_peer_descriptor(&receiver_name, receiver.as_ref()).expect("valid spec");
     apply_generated_peer_projection_trust_with_dsl(
         &sender,
         Arc::clone(&sender_dsl),
@@ -1098,11 +1157,10 @@ async fn contract_mob_005_remove_trusted_peer_revokes_send() {
     // upstream as `PeerOffline`) instead of silently returning `Ok(())`.
     // Mutual trust matches what real deployments set up.
     let reverse_spec = inproc_peer_descriptor(&sender_name, &sender).expect("valid spec");
-    apply_generated_peer_projection_trust_with_dsl(
+    trust_peer_with_real_finalizer(
+        receiver_finalizer.as_ref(),
         &receiver,
-        Arc::clone(&receiver_dsl),
         reverse_spec,
-        1,
         "add reverse trusted peer",
     )
     .await;
@@ -1111,19 +1169,23 @@ async fn contract_mob_005_remove_trusted_peer_revokes_send() {
     let cmd = CommsCommand::PeerMessage {
         objective_id: None,
         content_taint: None,
-        to: inproc_peer_route(&receiver_name, &receiver).expect("valid peer route"),
+        to: inproc_peer_route(&receiver_name, receiver.as_ref()).expect("valid peer route"),
         body: "before removal".to_string(),
         blocks: None,
         handling_mode: meerkat_core::types::HandlingMode::Queue,
     };
-    let receipt = CoreCommsRuntime::send(&sender, cmd).await;
+    let (receipt, _message_candidate): PeerSendAndCandidate = tokio::join!(
+        CoreCommsRuntime::send(&sender, cmd),
+        finalize_one_runtime_peer_input(
+            &receiver,
+            receiver_finalizer.as_ref(),
+            "receiver finalizes pre-removal peer message",
+        ),
+    );
     assert!(
         matches!(receipt, Ok(SendReceipt::PeerMessageSent { .. })),
         "send should succeed before removal"
     );
-
-    // Drain the message so it doesn't interfere
-    let _ = CoreCommsRuntime::drain_inbox_interactions(&receiver).await;
 
     // Remove trusted peer by canonical PeerId.
     let peer_id = receiver.public_key().to_peer_id().to_string();
@@ -1148,7 +1210,7 @@ async fn contract_mob_005_remove_trusted_peer_revokes_send() {
     let cmd_after = CommsCommand::PeerMessage {
         objective_id: None,
         content_taint: None,
-        to: inproc_peer_route(&receiver_name, &receiver).expect("valid peer route"),
+        to: inproc_peer_route(&receiver_name, receiver.as_ref()).expect("valid peer route"),
         body: "after removal".to_string(),
         blocks: None,
         handling_mode: meerkat_core::types::HandlingMode::Queue,
@@ -1344,17 +1406,27 @@ async fn contract_mob_006_generated_trust_gates_peer_discovery() {
 
 struct ContractSessionService {
     sessions: RwLock<HashMap<SessionId, Arc<CommsRuntime>>>,
+    ingress_finalizers:
+        RwLock<HashMap<SessionId, Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer>>>,
 }
 
 impl ContractSessionService {
     fn new() -> Self {
         Self {
             sessions: RwLock::new(HashMap::new()),
+            ingress_finalizers: RwLock::new(HashMap::new()),
         }
     }
 
     async fn comms(&self, id: &SessionId) -> Option<Arc<CommsRuntime>> {
         self.sessions.read().await.get(id).cloned()
+    }
+
+    async fn ingress_finalizer(
+        &self,
+        id: &SessionId,
+    ) -> Option<Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer>> {
+        self.ingress_finalizers.read().await.get(id).cloned()
     }
 }
 
@@ -1393,15 +1465,16 @@ impl SessionService for ContractSessionService {
                 "failed to create comms runtime: {e}"
             )))
         })?);
-        install_ephemeral_peer_request_response_authority(
-            &comms,
-            &format!("contract-{session_id}"),
-        );
+        let ingress_finalizer = install_real_peer_ingress_finalizer(&comms);
 
         self.sessions
             .write()
             .await
             .insert(session_id.clone(), comms);
+        self.ingress_finalizers
+            .write()
+            .await
+            .insert(session_id.clone(), ingress_finalizer);
 
         Ok(run_result(session_id, "session created"))
     }
@@ -1473,6 +1546,7 @@ impl SessionService for ContractSessionService {
     async fn archive(&self, id: &SessionId) -> Result<(), SessionError> {
         let removed = self.sessions.write().await.remove(id).is_some();
         if removed {
+            self.ingress_finalizers.write().await.remove(id);
             Ok(())
         } else {
             Err(SessionError::NotFound { id: id.clone() })
@@ -1518,13 +1592,21 @@ async fn contract_mob_001_keep_alive_session_stays_alive() {
 
     let comms_a = service.comms(&sid_a).await.expect("comms for A");
     let comms_b = service.comms(&sid_b).await.expect("comms for B");
+    let finalizer_a = service
+        .ingress_finalizer(&sid_a)
+        .await
+        .expect("peer ingress finalizer for A");
+    let finalizer_b = service
+        .ingress_finalizer(&sid_b)
+        .await
+        .expect("peer ingress finalizer for B");
 
     // Trust both sides so peer requests can flow.
     let a_to_b = inproc_peer_descriptor(&b_name, &comms_b).expect("valid trusted peer spec a->b");
-    apply_generated_peer_projection_trust(&comms_a, a_to_b, "trust a->b").await;
+    trust_peer_with_real_finalizer(finalizer_a.as_ref(), &comms_a, a_to_b, "trust a->b").await;
 
     let b_to_a = inproc_peer_descriptor(&a_name, &comms_a).expect("valid trusted peer spec b->a");
-    apply_generated_peer_projection_trust(&comms_b, b_to_a, "trust b->a").await;
+    trust_peer_with_real_finalizer(finalizer_b.as_ref(), &comms_b, b_to_a, "trust b->a").await;
 
     // Verify comms request before additional turns.
     let before_cmd = CommsCommand::PeerRequest {
@@ -1537,19 +1619,24 @@ async fn contract_mob_001_keep_alive_session_stays_alive() {
         handling_mode: meerkat_core::types::HandlingMode::Queue,
         stream: meerkat_core::comms::InputStreamMode::None,
     };
-    let before_receipt = CoreCommsRuntime::send(&*comms_a, before_cmd)
-        .await
-        .expect("send before turn");
+    let (before_receipt, before_candidate): PeerSendAndCandidate = tokio::join!(
+        CoreCommsRuntime::send(&*comms_a, before_cmd),
+        finalize_one_runtime_peer_input(
+            &comms_b,
+            finalizer_b.as_ref(),
+            "B finalizes pre-turn contract request",
+        ),
+    );
+    let before_receipt = before_receipt.expect("send before turn");
     assert!(
         matches!(before_receipt, SendReceipt::PeerRequestSent { .. }),
         "expected peer request send before turn, got: {before_receipt:?}"
     );
-    let before_interactions = CoreCommsRuntime::drain_inbox_interactions(&*comms_b).await;
-    assert_eq!(
-        before_interactions.len(),
-        1,
-        "receiver should get request before additional turn"
-    );
+    assert!(matches!(
+        before_candidate.interaction.content,
+        meerkat_core::InteractionContent::Request { ref intent, .. }
+            if intent == "mob.contract.before"
+    ));
 
     // Run another turn on A. Host-mode session should remain alive.
     service
@@ -1577,19 +1664,24 @@ async fn contract_mob_001_keep_alive_session_stays_alive() {
         handling_mode: meerkat_core::types::HandlingMode::Queue,
         stream: meerkat_core::comms::InputStreamMode::None,
     };
-    let after_receipt = CoreCommsRuntime::send(&*comms_b, after_cmd)
-        .await
-        .expect("send after turn");
+    let (after_receipt, after_candidate): PeerSendAndCandidate = tokio::join!(
+        CoreCommsRuntime::send(&*comms_b, after_cmd),
+        finalize_one_runtime_peer_input(
+            &comms_a,
+            finalizer_a.as_ref(),
+            "A finalizes post-turn contract request",
+        ),
+    );
+    let after_receipt = after_receipt.expect("send after turn");
     assert!(
         matches!(after_receipt, SendReceipt::PeerRequestSent { .. }),
         "expected peer request send after turn, got: {after_receipt:?}"
     );
-    let after_interactions = CoreCommsRuntime::drain_inbox_interactions(&*comms_a).await;
-    assert_eq!(
-        after_interactions.len(),
-        1,
-        "sender should still receive peer request after additional turn"
-    );
+    assert!(matches!(
+        after_candidate.interaction.content,
+        meerkat_core::InteractionContent::Request { ref intent, .. }
+            if intent == "mob.contract.after"
+    ));
 }
 
 // ---------------------------------------------------------------------------

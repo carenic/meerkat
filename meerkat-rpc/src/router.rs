@@ -4210,6 +4210,7 @@ mod tests {
             envelope_id,
             interaction_id,
             stream_reserved: true,
+            delivery: meerkat_core::comms::PeerDeliveryOutcome::Queued,
         })
         .expect("well-formed receipt serializes");
 
@@ -4221,6 +4222,7 @@ mod tests {
             payload["interaction_id"],
             serde_json::json!(interaction_id.0.to_string())
         );
+        assert_eq!(payload["delivery"], serde_json::json!("queued"));
     }
 
     // Gate (#62): a serialization failure on the authoritative reply/stream must

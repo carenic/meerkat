@@ -723,6 +723,10 @@ async fn dispatch(ctx: &ToolContext, command: CommsCommand) -> Result<Value, Str
                     reason.as_code()
                 )
             }
+            SendError::DurableAdmissionRejected { envelope_id } => format!(
+                "peer_input_rejected: peer '{}' durably rejected envelope {envelope_id}",
+                peer_for_errors.as_deref().unwrap_or("<unknown>")
+            ),
             other => other.to_string(),
         })?;
         return Ok(sent_result(&cmd_kind, receipt));
@@ -839,6 +843,7 @@ async fn dispatch(ctx: &ToolContext, command: CommsCommand) -> Result<Value, Str
                 &cmd_kind,
                 SendReceipt::PeerLifecycleSent {
                     envelope_id: outcome.envelope_id,
+                    delivery: outcome.delivery,
                 },
             ))
         }
@@ -910,6 +915,9 @@ fn format_router_send_error(peer_name: &str, error: crate::router::SendError) ->
                 code.as_code()
             )
         }
+        crate::router::SendError::DurableAdmissionRejected { envelope_id } => format!(
+            "peer_input_rejected: peer '{peer_name}' durably rejected envelope {envelope_id}"
+        ),
         crate::router::SendError::Transport(inner) => {
             format!(
                 "peer_unreachable: peer '{peer_name}' is unreachable: transport_error ({inner})"
@@ -1093,7 +1101,7 @@ mod tests {
                 CommsCommand::PeerMessage { .. } => {
                     meerkat_core::comms::SendReceipt::PeerMessageSent {
                         envelope_id: uuid::Uuid::from_u128(5),
-                        delivery: meerkat_core::comms::PeerDeliveryOutcome::HandedOff,
+                        delivery: meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff,
                     }
                 }
                 CommsCommand::PeerRequest { stream, .. } => {
@@ -1101,12 +1109,14 @@ mod tests {
                         envelope_id: uuid::Uuid::from_u128(1),
                         interaction_id: InteractionId(uuid::Uuid::from_u128(2)),
                         stream_reserved: *stream == InputStreamMode::ReserveInteraction,
+                        delivery: meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff,
                     }
                 }
                 CommsCommand::PeerResponse { in_reply_to, .. } => {
                     meerkat_core::comms::SendReceipt::PeerResponseSent {
                         envelope_id: uuid::Uuid::from_u128(3),
                         in_reply_to: *in_reply_to,
+                        delivery: meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff,
                     }
                 }
                 other => {
@@ -1294,6 +1304,7 @@ mod tests {
         meerkat_core::comms::PeerId,
         Arc<CommsRuntime>,
         Arc<CommsRuntime>,
+        Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer>,
     ) {
         let nonce = uuid::Uuid::new_v4().simple();
         let sender_name = format!("mcp-tools-runtime-less-sender-{nonce}");
@@ -1301,7 +1312,6 @@ mod tests {
         let sender = Arc::new(CommsRuntime::inproc_only(&sender_name).expect("sender runtime"));
         let receiver =
             Arc::new(CommsRuntime::inproc_only(&receiver_name).expect("receiver runtime"));
-
         add_generated_peer_projection_trust(
             sender.as_ref(),
             TrustedPeerDescriptor::unsigned_with_pubkey(
@@ -1327,13 +1337,48 @@ mod tests {
         )
         .await;
 
+        let (peer_comms_handle, finalizer) =
+            meerkat_runtime::test_peer_comms_handle_and_runtime_finalizer();
+        crate::runtime::comms_runtime::test_install_peer_comms_handle(
+            receiver.as_ref(),
+            peer_comms_handle,
+        );
+
         let receiver_peer_id = receiver.public_key().to_peer_id();
         let context = ToolContext {
             router: sender.router_arc(),
             trusted_peers: sender.trusted_peers_shared(),
             runtime: None,
         };
-        (context, receiver_peer_id, sender, receiver)
+        (
+            context,
+            receiver_peer_id,
+            sender,
+            receiver,
+            Arc::new(finalizer),
+        )
+    }
+
+    fn spawn_runtime_finalization(
+        receiver: Arc<CommsRuntime>,
+        finalizer: Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer>,
+    ) -> tokio::task::JoinHandle<meerkat_core::interaction::PeerInputCandidate> {
+        tokio::spawn(async move {
+            let claim = loop {
+                if let Some(claim) =
+                    CoreCommsRuntime::claim_classified_inbox_interaction(receiver.as_ref())
+                        .await
+                        .expect("test runtime claim surface must be available")
+                {
+                    break claim;
+                }
+                tokio::task::yield_now().await;
+            };
+            finalizer
+                .finalize(claim)
+                .await
+                .expect("real MeerkatMachine must durably finalize the exact tool-send claim")
+        })
     }
 
     #[test]
@@ -2578,13 +2623,15 @@ mod tests {
         .expect("send_message should return a typed receipt");
 
         assert_eq!(result["receipt"]["kind"], "peer_message_sent");
-        assert_eq!(result["receipt"]["delivery"], "handed_off");
+        assert_eq!(result["receipt"]["delivery"], "volatile_handed_off");
         assert!(result["receipt"].get("acked").is_none());
     }
 
     #[tokio::test]
     async fn test_runtime_less_inproc_send_message_returns_typed_delivery_outcome() {
-        let (ctx, peer_id, _sender, _receiver) = make_runtime_less_inproc_delivery_pair().await;
+        let (ctx, peer_id, _sender, receiver, finalizer) =
+            make_runtime_less_inproc_delivery_pair().await;
+        let finalize = spawn_runtime_finalization(receiver, finalizer);
 
         let result = handle_tools_call(
             &ctx,
@@ -2597,7 +2644,13 @@ mod tests {
         assert_eq!(result["status"], "sent");
         assert_eq!(result["kind"], "peer_message");
         assert_eq!(result["receipt"]["kind"], "peer_message_sent");
-        assert_eq!(result["receipt"]["delivery"], "handed_off");
+        assert_eq!(
+            result["receipt"]["delivery"],
+            json!({"durably_resolved": {"outcome": "accepted"}})
+        );
+        finalize
+            .await
+            .expect("tool-send finalization task must complete");
         let envelope_id = result["receipt"]["envelope_id"]
             .as_str()
             .expect("receipt envelope_id must be a string");
@@ -2609,7 +2662,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_runtime_less_send_message_rejects_sender_local_blob_before_transport() {
-        let (ctx, peer_id, _sender, _receiver) = make_runtime_less_inproc_delivery_pair().await;
+        let (ctx, peer_id, _sender, _receiver, _finalizer) =
+            make_runtime_less_inproc_delivery_pair().await;
 
         let error = handle_tools_call_with_context(
             &ctx,
@@ -2635,9 +2689,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_runtime_less_inproc_fenced_send_has_peer_message_receipt_parity() {
-        let (ctx, peer_id, _sender, _receiver) = make_runtime_less_inproc_delivery_pair().await;
+        let (ctx, peer_id, _sender, receiver, finalizer) =
+            make_runtime_less_inproc_delivery_pair().await;
+        let finalize = spawn_runtime_finalization(receiver, finalizer);
 
-        let result = dispatch(
+        let error = dispatch(
             &ctx,
             CommsCommand::IncarnationFencedPeerMessage {
                 to: PeerRoute::new(peer_id),
@@ -2658,19 +2714,12 @@ mod tests {
             },
         )
         .await
-        .expect("runtime-less fenced send should return a typed receipt");
+        .expect_err("runtime-less fenced send should surface durable rejection");
 
-        assert_eq!(result["status"], "sent");
-        assert_eq!(result["kind"], "incarnation_fenced_peer_message");
-        assert_eq!(result["receipt"]["kind"], "peer_message_sent");
-        assert_eq!(result["receipt"]["delivery"], "handed_off");
-        let envelope_id = result["receipt"]["envelope_id"]
-            .as_str()
-            .expect("receipt envelope_id must be a string");
-        assert_ne!(
-            uuid::Uuid::parse_str(envelope_id).expect("receipt envelope_id must be a UUID"),
-            uuid::Uuid::nil()
-        );
+        assert!(error.starts_with("peer_input_rejected:"), "{error}");
+        finalize
+            .await
+            .expect("fenced tool-send finalization task must complete");
     }
 
     #[tokio::test]

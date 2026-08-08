@@ -548,7 +548,7 @@ mod tests {
     fn test_message_kind_ack_fields() {
         let id = Uuid::new_v4();
         let ack = MessageKind::Ack { in_reply_to: id };
-        if let MessageKind::Ack { in_reply_to } = ack {
+        if let MessageKind::Ack { in_reply_to, .. } = ack {
             assert_eq!(in_reply_to, id);
         } else {
             panic!("Expected Ack variant");
@@ -890,7 +890,7 @@ mod tests {
             valid_ack.from, sent_envelope.to,
             "ACK from should match sent to"
         );
-        if let MessageKind::Ack { in_reply_to } = valid_ack.kind {
+        if let MessageKind::Ack { in_reply_to, .. } = valid_ack.kind {
             assert_eq!(in_reply_to, sent_id, "ACK in_reply_to should match sent id");
         }
     }
@@ -917,7 +917,7 @@ mod tests {
         wrong_ack.sign(&receiver_keypair);
 
         assert!(wrong_ack.verify(), "signature should still verify");
-        if let MessageKind::Ack { in_reply_to } = wrong_ack.kind {
+        if let MessageKind::Ack { in_reply_to, .. } = wrong_ack.kind {
             assert_ne!(
                 in_reply_to, sent_id,
                 "wrong ACK in_reply_to should not match sent id"

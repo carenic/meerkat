@@ -3255,6 +3255,7 @@ mod tests {
                         envelope_id: uuid::Uuid::new_v4(),
                         interaction_id: InteractionId(uuid::Uuid::new_v4()),
                         stream_reserved: false,
+                        delivery: meerkat_core::comms::PeerDeliveryOutcome::Queued,
                     })
                 }
                 unsupported => Err(SendError::Unsupported(format!(

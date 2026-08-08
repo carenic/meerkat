@@ -397,7 +397,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `GrantMobOperatorManageMob`(mob_id: String)
 - `SetMobOperatorSpawnProfilesInMob`(mob_id: String, profiles: Set<String>)
 - `RuntimeExecutorExited`
-- `RecoverRuntimeCompletionResultCorrelation`(run_id: RunId)
+- `RecoverRuntimeCompletionResultCorrelation`(run_id: RunId, terminal_outcome: Option<TurnTerminalOutcome>, terminal_cause_kind: Option<TurnTerminalCauseKind>)
 - `ResolveRuntimeCompletionResult`(run_id: Option<RunId>, terminal: RuntimeCompletionTerminalObservation, finalization: RuntimeCompletionFinalizationObservation)
 - `ResolveRuntimeCompletionCleanup`(session_id: SessionId, observation_session_id: SessionId, observation_agent_runtime_id: Option<AgentRuntimeId>, observation_fence_token: Option<FenceToken>, observation_runtime_generation: Option<Generation>, observation_runtime_epoch_id: Option<RuntimeEpochId>, outcome: RuntimeCompletionObservedOutcome, archived_by_authority: Bool, live_session: RuntimeCompletionLiveSessionObservation)
 - `ResolveRuntimeCompletionWaitFailure`(session_id: SessionId, failure: RuntimeCompletionWaitFailureObservation)
@@ -4646,50 +4646,74 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `RecoverRuntimeCompletionResultCorrelationInitializing`
 - From: `Initializing`
-- On: `RecoverRuntimeCompletionResultCorrelation`(run_id)
+- On: `RecoverRuntimeCompletionResultCorrelation`(run_id, terminal_outcome, terminal_cause_kind)
 - Guards:
   - `session_registered`
   - `correlation_absent_or_same`
+  - `terminal_recovery_shape_coherent`
+  - `terminal_outcome_absent_or_same`
+  - `terminal_cause_absent_or_same`
+  - `cancelled_has_no_existing_failure_cause`
 - To: `Initializing`
 
 ### `RecoverRuntimeCompletionResultCorrelationIdle`
 - From: `Idle`
-- On: `RecoverRuntimeCompletionResultCorrelation`(run_id)
+- On: `RecoverRuntimeCompletionResultCorrelation`(run_id, terminal_outcome, terminal_cause_kind)
 - Guards:
   - `session_registered`
   - `correlation_absent_or_same`
+  - `terminal_recovery_shape_coherent`
+  - `terminal_outcome_absent_or_same`
+  - `terminal_cause_absent_or_same`
+  - `cancelled_has_no_existing_failure_cause`
 - To: `Idle`
 
 ### `RecoverRuntimeCompletionResultCorrelationAttached`
 - From: `Attached`
-- On: `RecoverRuntimeCompletionResultCorrelation`(run_id)
+- On: `RecoverRuntimeCompletionResultCorrelation`(run_id, terminal_outcome, terminal_cause_kind)
 - Guards:
   - `session_registered`
   - `correlation_absent_or_same`
+  - `terminal_recovery_shape_coherent`
+  - `terminal_outcome_absent_or_same`
+  - `terminal_cause_absent_or_same`
+  - `cancelled_has_no_existing_failure_cause`
 - To: `Attached`
 
 ### `RecoverRuntimeCompletionResultCorrelationRunning`
 - From: `Running`
-- On: `RecoverRuntimeCompletionResultCorrelation`(run_id)
+- On: `RecoverRuntimeCompletionResultCorrelation`(run_id, terminal_outcome, terminal_cause_kind)
 - Guards:
   - `session_registered`
   - `correlation_absent_or_same`
+  - `terminal_recovery_shape_coherent`
+  - `terminal_outcome_absent_or_same`
+  - `terminal_cause_absent_or_same`
+  - `cancelled_has_no_existing_failure_cause`
 - To: `Running`
 
 ### `RecoverRuntimeCompletionResultCorrelationRetired`
 - From: `Retired`
-- On: `RecoverRuntimeCompletionResultCorrelation`(run_id)
+- On: `RecoverRuntimeCompletionResultCorrelation`(run_id, terminal_outcome, terminal_cause_kind)
 - Guards:
   - `session_registered`
   - `correlation_absent_or_same`
+  - `terminal_recovery_shape_coherent`
+  - `terminal_outcome_absent_or_same`
+  - `terminal_cause_absent_or_same`
+  - `cancelled_has_no_existing_failure_cause`
 - To: `Retired`
 
 ### `RecoverRuntimeCompletionResultCorrelationStopped`
 - From: `Stopped`
-- On: `RecoverRuntimeCompletionResultCorrelation`(run_id)
+- On: `RecoverRuntimeCompletionResultCorrelation`(run_id, terminal_outcome, terminal_cause_kind)
 - Guards:
   - `session_registered`
   - `correlation_absent_or_same`
+  - `terminal_recovery_shape_coherent`
+  - `terminal_outcome_absent_or_same`
+  - `terminal_cause_absent_or_same`
+  - `cancelled_has_no_existing_failure_cause`
 - To: `Stopped`
 
 ### `ResolveRuntimeCompletionResultCompletedInitializing`

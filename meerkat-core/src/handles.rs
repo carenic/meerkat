@@ -1490,6 +1490,21 @@ pub trait PeerCommsHandle: Send + Sync {
         facts: PeerIngressDequeueFacts,
     ) -> Result<PeerIngressDequeueAuthority, DslTransitionError>;
 
+    /// Validate the opaque, runtime-private receipt for one exact queue claim.
+    /// Production comms installs only the generated runtime handle; arbitrary
+    /// callers cannot construct the private receipt type it accepts.
+    #[doc(hidden)]
+    fn authorize_peer_ingress_claim_commit(
+        &self,
+        _facts: crate::interaction::PeerIngressClaimCommitFacts,
+        _receipt: &(dyn std::any::Any + Send + Sync),
+    ) -> Result<crate::interaction::PeerIngressClaimTerminalOutcome, DslTransitionError> {
+        Err(DslTransitionError::guard_rejected(
+            "PeerCommsHandle::authorize_peer_ingress_claim_commit",
+            "runtime-private durable admission receipt required",
+        ))
+    }
+
     /// Fire the `SetPeerIngressContext { keep_alive }` input.
     fn set_peer_ingress_context(&self, keep_alive: bool) -> Result<(), DslTransitionError>;
 

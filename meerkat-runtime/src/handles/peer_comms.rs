@@ -4,9 +4,9 @@ use std::sync::Arc;
 
 use meerkat_core::handles::{DslTransitionError, PeerCommsHandle};
 use meerkat_core::interaction::{
-    PeerIngressAdmission, PeerIngressDequeueAuthority, PeerIngressDequeueFacts,
-    PeerIngressEnvelopeFacts, PeerIngressPlainEventFacts, PeerIngressReceiveAuthority,
-    PeerIngressReceiveFacts,
+    PeerIngressAdmission, PeerIngressClaimCommitFacts, PeerIngressClaimTerminalOutcome,
+    PeerIngressDequeueAuthority, PeerIngressDequeueFacts, PeerIngressEnvelopeFacts,
+    PeerIngressPlainEventFacts, PeerIngressReceiveAuthority, PeerIngressReceiveFacts,
 };
 
 use super::HandleDslAuthority;
@@ -570,6 +570,28 @@ impl PeerCommsHandle for RuntimePeerCommsHandle {
         Ok(PeerIngressDequeueAuthority {
             authority_phase: phase_from_dsl(phase),
         })
+    }
+
+    fn authorize_peer_ingress_claim_commit(
+        &self,
+        facts: PeerIngressClaimCommitFacts,
+        receipt: &(dyn std::any::Any + Send + Sync),
+    ) -> Result<PeerIngressClaimTerminalOutcome, DslTransitionError> {
+        let context = "PeerCommsHandle::authorize_peer_ingress_claim_commit";
+        if let Some(receipt) =
+            receipt.downcast_ref::<crate::meerkat_machine::DurablePeerIngressAdmissionReceipt>()
+        {
+            return receipt.validate(facts).ok_or_else(|| {
+                DslTransitionError::guard_rejected(
+                    context,
+                    "durable receipt does not bind the exact claim id, raw item id, and class",
+                )
+            });
+        }
+        Err(DslTransitionError::guard_rejected(
+            context,
+            "receipt was not minted by runtime durable admission",
+        ))
     }
 
     fn set_peer_ingress_context(&self, keep_alive: bool) -> Result<(), DslTransitionError> {

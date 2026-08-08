@@ -139,6 +139,21 @@ pub(crate) enum InteractionTerminalCandidate {
     },
 }
 
+/// Exact generated-machine facts recoverable from one validated durable
+/// terminal candidate. This is deliberately closed: ordinary completion
+/// candidates carry no terminal facts, cancellation carries only its outcome,
+/// and a machine failure must carry both a failure outcome and a specific
+/// machine-owned cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RuntimeCompletionTerminalRecovery {
+    NonMachine,
+    Cancelled,
+    MachineFailure {
+        outcome: meerkat_core::TurnTerminalOutcome,
+        cause: meerkat_core::TurnTerminalCauseKind,
+    },
+}
+
 impl InteractionTerminalCandidate {
     pub(crate) fn from_core_apply_terminal(
         terminal: Option<&meerkat_core::lifecycle::core_executor::CoreApplyTerminal>,
@@ -228,6 +243,72 @@ impl InteractionTerminalCandidate {
         match self {
             Self::MachineTerminalFailure { error } => Some(error.clone()),
             _ => None,
+        }
+    }
+
+    pub(crate) fn runtime_completion_terminal_recovery(
+        &self,
+    ) -> Result<RuntimeCompletionTerminalRecovery, String> {
+        use meerkat_core::TurnTerminalOutcome;
+
+        match self {
+            Self::MachineTerminalFailure { error } => {
+                if !error.terminal {
+                    return Err(
+                        "durable machine-terminal recovery metadata was not marked terminal"
+                            .to_string(),
+                    );
+                }
+                let outcome = error.outcome.ok_or_else(|| {
+                    "durable machine-terminal recovery metadata omitted its terminal outcome"
+                        .to_string()
+                })?;
+                if !matches!(
+                    outcome,
+                    TurnTerminalOutcome::Failed
+                        | TurnTerminalOutcome::BudgetExhausted
+                        | TurnTerminalOutcome::TimeBudgetExceeded
+                        | TurnTerminalOutcome::StructuredOutputValidationFailed
+                ) {
+                    return Err(format!(
+                        "durable machine-terminal recovery metadata carried non-failure outcome {outcome:?}"
+                    ));
+                }
+                if !error.kind.is_specific_failure_cause() {
+                    return Err(
+                        "durable machine-terminal recovery metadata used a nonspecific failure cause"
+                            .to_string(),
+                    );
+                }
+                let expected_outcome = match error.kind {
+                    meerkat_core::TurnTerminalCauseKind::BudgetExhausted => {
+                        TurnTerminalOutcome::BudgetExhausted
+                    }
+                    meerkat_core::TurnTerminalCauseKind::TimeBudgetExceeded => {
+                        TurnTerminalOutcome::TimeBudgetExceeded
+                    }
+                    meerkat_core::TurnTerminalCauseKind::StructuredOutputValidationFailed => {
+                        TurnTerminalOutcome::StructuredOutputValidationFailed
+                    }
+                    _ => TurnTerminalOutcome::Failed,
+                };
+                if outcome != expected_outcome {
+                    return Err(format!(
+                        "durable machine-terminal recovery outcome {outcome:?} does not match cause {:?}",
+                        error.kind
+                    ));
+                }
+                Ok(RuntimeCompletionTerminalRecovery::MachineFailure {
+                    outcome,
+                    cause: error.kind,
+                })
+            }
+            Self::Cancelled => Ok(RuntimeCompletionTerminalRecovery::Cancelled),
+            Self::RunResult { .. }
+            | Self::CompletedWithoutResult
+            | Self::CallbackPending { .. }
+            | Self::CallbackBatchPending { .. }
+            | Self::RuntimeTerminated { .. } => Ok(RuntimeCompletionTerminalRecovery::NonMachine),
         }
     }
 }
@@ -1702,6 +1783,38 @@ mod tests {
                 .is_none(),
             "a kill after the terminal transaction must recover the candidate, not invent a final outcome"
         );
+    }
+
+    #[test]
+    fn terminal_recovery_candidate_accepts_exact_special_failure_pairs() {
+        use meerkat_core::{TurnErrorMetadata, TurnTerminalCauseKind, TurnTerminalOutcome};
+
+        for (outcome, cause) in [
+            (
+                TurnTerminalOutcome::BudgetExhausted,
+                TurnTerminalCauseKind::BudgetExhausted,
+            ),
+            (
+                TurnTerminalOutcome::TimeBudgetExceeded,
+                TurnTerminalCauseKind::TimeBudgetExceeded,
+            ),
+            (
+                TurnTerminalOutcome::StructuredOutputValidationFailed,
+                TurnTerminalCauseKind::StructuredOutputValidationFailed,
+            ),
+        ] {
+            let recovery = InteractionTerminalCandidate::MachineTerminalFailure {
+                error: TurnErrorMetadata::terminal(cause, outcome, "exact special pair"),
+            }
+            .runtime_completion_terminal_recovery()
+            .unwrap_or_else(|error| {
+                panic!("candidate rejected exact pair {outcome:?}/{cause:?}: {error}")
+            });
+            assert_eq!(
+                recovery,
+                RuntimeCompletionTerminalRecovery::MachineFailure { outcome, cause }
+            );
+        }
     }
 
     #[test]
