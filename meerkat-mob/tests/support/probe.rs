@@ -10,7 +10,7 @@
 #![allow(dead_code)]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -46,14 +46,13 @@ use meerkat_runtime::meerkat_machine::dsl as machine_dsl;
 ///   3. a projection-trust seam (`trust`) so the endpoint can address peers.
 pub struct PeerCommsEndpoint {
     pub runtime: Arc<meerkat_comms::CommsRuntime>,
-    /// Raw machine authority behind the generated peer-comms owner; trust
-    /// obligations are minted from it (same-owner rule).
-    machine_authority: Arc<std::sync::Mutex<machine_dsl::MeerkatMachineAuthority>>,
-    /// Peer request/response DSL authority (the supervisor-bridge non-session
-    /// recipe, meerkat-mob/src/runtime/supervisor_bridge.rs::build_runtime).
-    pub interaction_dsl: Arc<meerkat_runtime::HandleDslAuthority>,
+    runtime_finalizer: Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer>,
     overlay_epoch: AtomicU64,
     overlay_endpoints: std::sync::Mutex<BTreeSet<machine_dsl::PeerEndpoint>>,
+    observed_runtime_inputs:
+        Arc<tokio::sync::Mutex<VecDeque<meerkat_core::interaction::PeerInputCandidate>>>,
+    observed_runtime_input_notify: Arc<tokio::sync::Notify>,
+    runtime_drain_task: tokio::task::JoinHandle<()>,
 }
 
 /// Spawn a standalone peer. `listen_tcp` binds a real loopback listener
@@ -85,75 +84,80 @@ pub async fn spawn_peer_comms_endpoint(
     }
     let runtime = Arc::new(runtime);
 
-    // Generated peer-comms owner (classification + trust), machine-backed.
-    // The comms-e2e recipe: an Attached MeerkatMachine state recovered into a
-    // shared authority, installed as the runtime's generated owner.
-    let state = machine_dsl::MeerkatMachineState {
-        lifecycle_phase: machine_dsl::MeerkatPhase::Attached,
-        session_id: Some(machine_dsl::SessionId::from(format!(
-            "support-endpoint-{peer_name}"
-        ))),
-        ..Default::default()
-    };
-    let machine_authority = Arc::new(std::sync::Mutex::new(
-        machine_dsl::MeerkatMachineAuthority::recover_from_state(state)
-            .expect("endpoint machine state must be recoverable"),
-    ));
-    let owner_dsl = Arc::new(meerkat_runtime::HandleDslAuthority::from_shared(
-        Arc::clone(&machine_authority),
-    ));
-    meerkat_runtime::RuntimePeerCommsHandle::install_generated_on(owner_dsl, runtime.as_ref())
+    // A probe that advertises a durable runtime consumer must install the
+    // matching real machine finalizer. Classification authority alone would
+    // make ordinary Message/Request sends wait forever while legacy drains
+    // are correctly forbidden from removing their durable queue head.
+    let (_peer_comms, runtime_finalizer) =
+        meerkat_runtime::test_peer_comms_handle_and_runtime_finalizer();
+    runtime_finalizer
+        .install_on(runtime.as_ref())
         .expect("install generated peer comms owner on endpoint runtime");
-
-    // Peer request/response authority (records inbound bridge requests so the
-    // endpoint can reply, and outbound request_sent for raw sends). The
-    // Initialize → RegisterSession → EnsureSessionWithExecutor ladder is the
-    // supervisor-bridge non-session recipe
-    // (meerkat-mob/src/runtime/supervisor_bridge.rs::install_supervisor_peer_request_response_authority).
-    let interaction_session_id =
-        machine_dsl::SessionId::from(format!("support-endpoint-interactions-{peer_name}"));
-    let interaction_dsl = Arc::new(meerkat_runtime::HandleDslAuthority::ephemeral());
-    interaction_dsl
-        .apply_signal(
-            machine_dsl::MeerkatMachineSignal::Initialize,
-            "support_endpoint::initialize",
-        )
-        .expect("initialize endpoint peer interaction authority");
-    interaction_dsl
-        .apply_input(
-            machine_dsl::MeerkatMachineInput::RegisterSession {
-                session_id: interaction_session_id.clone(),
-            },
-            "support_endpoint::register",
-        )
-        .expect("register endpoint peer interaction authority");
-    interaction_dsl
-        .apply_input(
-            machine_dsl::MeerkatMachineInput::EnsureSessionWithExecutor {
-                session_id: interaction_session_id,
-            },
-            "support_endpoint::ensure_executor",
-        )
-        .expect("attach endpoint peer interaction authority");
+    let runtime_finalizer = Arc::new(runtime_finalizer);
     runtime.install_peer_request_response_authority(
         meerkat_comms::PeerRequestResponseAuthority::new(
-            Arc::new(meerkat_runtime::handles::RuntimePeerInteractionHandle::new(
-                Arc::clone(&interaction_dsl),
-            )),
-            Arc::new(
-                meerkat_runtime::handles::RuntimeInteractionStreamHandle::new(Arc::clone(
-                    &interaction_dsl,
-                )),
-            ),
+            runtime_finalizer.peer_interaction_handle(),
+            runtime_finalizer.interaction_stream_handle(),
         ),
     );
 
+    let observed_runtime_inputs = Arc::new(tokio::sync::Mutex::new(VecDeque::new()));
+    let observed_runtime_input_notify = Arc::new(tokio::sync::Notify::new());
+    let runtime_drain_task = {
+        let runtime = Arc::clone(&runtime);
+        let runtime_finalizer = Arc::clone(&runtime_finalizer);
+        let observed_runtime_inputs = Arc::clone(&observed_runtime_inputs);
+        let observed_runtime_input_notify = Arc::clone(&observed_runtime_input_notify);
+        tokio::spawn(async move {
+            let inbox_notify = runtime.inbox_notify();
+            loop {
+                let notified = inbox_notify.notified();
+                tokio::pin!(notified);
+                notified.as_mut().enable();
+                let durable_head = runtime
+                    .peer_ingress_queue_snapshot()
+                    .await
+                    .ok()
+                    .and_then(|snapshot| snapshot.queued_entries.into_iter().next())
+                    .is_some_and(|entry| {
+                        entry.delivery_contract
+                            == meerkat_core::PeerIngressDeliveryContract::DurableRuntime
+                    });
+                if !durable_head {
+                    (&mut notified).await;
+                    continue;
+                }
+                let Some(claim) = runtime
+                    .claim_classified_inbox_interaction()
+                    .await
+                    .expect("probe runtime claim")
+                else {
+                    continue;
+                };
+                if claim.delivery_contract()
+                    != meerkat_core::PeerIngressDeliveryContract::DurableRuntime
+                {
+                    drop(claim);
+                    continue;
+                }
+                let candidate = runtime_finalizer
+                    .finalize(claim)
+                    .await
+                    .expect("probe runtime durable finalization");
+                observed_runtime_inputs.lock().await.push_back(candidate);
+                observed_runtime_input_notify.notify_waiters();
+            }
+        })
+    };
+
     PeerCommsEndpoint {
         runtime,
-        machine_authority,
-        interaction_dsl,
+        runtime_finalizer,
         overlay_epoch: AtomicU64::new(0),
         overlay_endpoints: std::sync::Mutex::new(BTreeSet::new()),
+        observed_runtime_inputs,
+        observed_runtime_input_notify,
+        runtime_drain_task,
     }
 }
 
@@ -250,32 +254,12 @@ impl PeerCommsEndpoint {
         epoch: u64,
         endpoints: BTreeSet<machine_dsl::PeerEndpoint>,
     ) {
-        let transition = {
-            let mut guard = self
-                .machine_authority
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            machine_dsl::MeerkatMachineMutator::apply(
-                &mut *guard,
-                machine_dsl::MeerkatMachineInput::ApplyMobPeerOverlay { epoch, endpoints },
-            )
-            .expect("ApplyMobPeerOverlay input")
-        };
-        let obligation =
-            meerkat_runtime::protocol_comms_trust_reconcile::extract_obligations_with_freshness(
-                &transition,
-                meerkat_runtime::protocol_comms_trust_reconcile::PeerProjectionFreshnessAuthority::from_authority(
-                    Arc::clone(&self.machine_authority),
-                ),
-            )
-            .pop()
-            .expect("generated reconcile obligation");
-        meerkat_runtime::comms_trust_reconcile::CommsTrustReconciler::new(
-            Arc::clone(&self.runtime) as Arc<dyn meerkat_core::agent::CommsRuntime>,
-        )
-        .reconcile(&obligation)
-        .await
-        .expect("reconcile endpoint trust");
+        let runtime: Arc<dyn meerkat_core::agent::CommsRuntime> =
+            Arc::clone(&self.runtime) as Arc<dyn meerkat_core::agent::CommsRuntime>;
+        self.runtime_finalizer
+            .apply_mob_peer_overlay_on_runtime(epoch, endpoints, runtime)
+            .await
+            .expect("apply and reconcile endpoint mob peer overlay");
     }
 
     /// Send a supervisor-bridge request carrying `command` to `recipient` and
@@ -353,15 +337,27 @@ impl PeerCommsEndpoint {
 
     /// Drain plain peer-message bodies delivered to this endpoint's inbox.
     pub async fn drain_message_bodies(&self) -> Vec<String> {
-        self.runtime
-            .drain_peer_input_candidates()
+        let mut bodies = self
+            .observed_runtime_inputs
+            .lock()
             .await
-            .into_iter()
+            .drain(..)
             .filter_map(|candidate| match candidate.interaction.content {
                 InteractionContent::Message { body, .. } => Some(body),
                 _ => None,
             })
-            .collect()
+            .collect::<Vec<_>>();
+        bodies.extend(
+            self.runtime
+                .drain_peer_input_candidates()
+                .await
+                .into_iter()
+                .filter_map(|candidate| match candidate.interaction.content {
+                    InteractionContent::Message { body, .. } => Some(body),
+                    _ => None,
+                }),
+        );
+        bodies
     }
 
     /// Wait (notify-driven) until `predicate` matches a drained message body.
@@ -373,9 +369,12 @@ impl PeerCommsEndpoint {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let inbox_notify = self.runtime.inbox_notify();
-            let notified = inbox_notify.notified();
-            tokio::pin!(notified);
-            notified.as_mut().enable();
+            let inbox_notified = inbox_notify.notified();
+            let observed_notified = self.observed_runtime_input_notify.notified();
+            tokio::pin!(inbox_notified);
+            tokio::pin!(observed_notified);
+            inbox_notified.as_mut().enable();
+            observed_notified.as_mut().enable();
             for body in self.drain_message_bodies().await {
                 if body.contains(needle) {
                     return Ok(body);
@@ -387,8 +386,20 @@ impl PeerCommsEndpoint {
             if remaining.is_zero() {
                 return Err(format!("timed out waiting for message body '{needle}'"));
             }
-            let _ = tokio::time::timeout(remaining, &mut notified).await;
+            let _ = tokio::time::timeout(remaining, async {
+                tokio::select! {
+                    () = &mut inbox_notified => {}
+                    () = &mut observed_notified => {}
+                }
+            })
+            .await;
         }
+    }
+}
+
+impl Drop for PeerCommsEndpoint {
+    fn drop(&mut self) {
+        self.runtime_drain_task.abort();
     }
 }
 

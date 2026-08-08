@@ -710,6 +710,22 @@ impl TestPeerIngressRuntimeFinalizer {
             .map_err(|error| error.to_string())
     }
 
+    /// Apply one generated mob peer-overlay transition through the same
+    /// machine authority that mints this finalizer's durable admission
+    /// receipts.
+    #[doc(hidden)]
+    pub async fn apply_mob_peer_overlay_on_runtime(
+        &self,
+        epoch: u64,
+        endpoints: std::collections::BTreeSet<crate::meerkat_machine::dsl::PeerEndpoint>,
+        runtime: Arc<dyn meerkat_core::agent::CommsRuntime>,
+    ) -> Result<(), String> {
+        self.machine
+            .test_stage_mob_peer_overlay(&self.session_id, epoch, endpoints, runtime)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     /// Run the exact claimed runtime-bound candidate through real
     /// AcceptWithCompletion, then commit only the machine-minted opaque
     /// receipt to the queue lease.

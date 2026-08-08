@@ -2493,6 +2493,33 @@ impl MeerkatMachine {
         drive_reconciler(&reconciler, reconcile_obligation).await
     }
 
+    /// Test-support: apply the same generated mob-overlay transition used by
+    /// standalone peer fixtures while retaining this session's exact runtime
+    /// admission authority.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn test_stage_mob_peer_overlay(
+        &self,
+        session_id: &SessionId,
+        epoch: u64,
+        endpoints: BTreeSet<crate::meerkat_machine::dsl::PeerEndpoint>,
+        comms_runtime: Arc<dyn meerkat_core::agent::CommsRuntime>,
+    ) -> Result<(), PeerEndpointStageError> {
+        for endpoint in &endpoints {
+            validate_peer_endpoint_for_stage(endpoint)?;
+        }
+        let (reconciler, reconcile_obligation) = self
+            .stage_peer_projection_input(
+                session_id,
+                crate::meerkat_machine::dsl::MeerkatMachineInput::ApplyMobPeerOverlay {
+                    epoch,
+                    endpoints,
+                },
+                comms_runtime,
+            )
+            .await?;
+        drive_reconciler(&reconciler, reconcile_obligation).await
+    }
+
     /// Stage the generated absent-endpoint repair path for a direct peer id.
     ///
     /// This is used when machine state already says the direct endpoint is

@@ -64,6 +64,26 @@ fn identity(name: &str) -> AgentIdentity {
     AgentIdentity::from(name)
 }
 
+fn runtime_delivery_proves_admission(delivery: &meerkat_core::comms::PeerDeliveryOutcome) -> bool {
+    match delivery {
+        meerkat_core::comms::PeerDeliveryOutcome::Acked => true,
+        meerkat_core::comms::PeerDeliveryOutcome::DurablyResolved { outcome } => {
+            outcome.is_durable_admission()
+        }
+        meerkat_core::comms::PeerDeliveryOutcome::Queued
+        | meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff => false,
+        _ => false,
+    }
+}
+
+fn peer_message_receipt_proves_admission(receipt: &SendReceipt) -> bool {
+    matches!(
+        receipt,
+        SendReceipt::PeerMessageSent { delivery, .. }
+            if runtime_delivery_proves_admission(delivery)
+    )
+}
+
 async fn spawn_local_worker(controlling: &ControllingMob, member: &str) {
     controlling
         .handle
@@ -120,14 +140,14 @@ async fn assert_send_not_admitted(
         Ok(Err(_typed_refusal)) => {}
         Ok(Ok(receipt)) => {
             assert!(
-                !matches!(
-                    receipt,
-                    SendReceipt::PeerMessageSent {
-                        delivery: meerkat_core::comms::PeerDeliveryOutcome::Acked
-                            | meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff,
-                        ..
-                    }
-                ),
+                !peer_message_receipt_proves_admission(&receipt)
+                    && !matches!(
+                        receipt,
+                        SendReceipt::PeerMessageSent {
+                            delivery: meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff,
+                            ..
+                        }
+                    ),
                 "send must not be admitted by the receiver, got {receipt:?}"
             );
         }
@@ -279,14 +299,7 @@ async fn batch_wiring_with_mixed_placements_installs_both_transports() {
         .await
         .expect("b2 -> a1 delivers");
     assert!(
-        matches!(
-            receipt,
-            SendReceipt::PeerMessageSent {
-                delivery: meerkat_core::comms::PeerDeliveryOutcome::Acked
-                    | meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff,
-                ..
-            }
-        ),
+        peer_message_receipt_proves_admission(&receipt),
         "b2 -> a1 must be receiver-acked, got {receipt:?}"
     );
     let receipt = controlling
@@ -301,10 +314,11 @@ async fn batch_wiring_with_mixed_placements_installs_both_transports() {
         .expect("a1 -> a2 delivers on the local arm");
     assert!(
         matches!(
-            receipt.delivery,
-            meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff
+            &receipt.delivery,
+            meerkat_core::comms::PeerDeliveryOutcome::DurablyResolved { outcome }
+                if outcome.is_durable_admission()
         ),
-        "a1 -> a2 must be handed directly to the in-process inbox, got {receipt:?}"
+        "a1 -> a2 must be durably admitted by the in-process runtime, got {receipt:?}"
     );
 
     fixture.shutdown().await;
@@ -633,14 +647,7 @@ async fn retry_drains_obligations_idempotently() {
     .await
     .expect("post-retry send is admitted");
     assert!(
-        matches!(
-            receipt,
-            SendReceipt::PeerMessageSent {
-                delivery: meerkat_core::comms::PeerDeliveryOutcome::Acked
-                    | meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff,
-                ..
-            }
-        ),
+        peer_message_receipt_proves_admission(&receipt),
         "post-retry delivery must be receiver-acked, got {receipt:?}"
     );
     probe
@@ -715,14 +722,7 @@ async fn unwire_removes_trust_and_subsequent_delivery_rejected() {
     let receipt = send_peer_text(&b2_runtime, a1_peer, "t-w4 positive control back")
         .await
         .expect("b2 -> a1 delivers before the unwire");
-    assert!(matches!(
-        receipt,
-        SendReceipt::PeerMessageSent {
-            delivery: meerkat_core::comms::PeerDeliveryOutcome::Acked
-                | meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff,
-            ..
-        }
-    ));
+    assert!(peer_message_receipt_proves_admission(&receipt));
 
     controlling
         .handle
@@ -948,14 +948,7 @@ async fn same_host_second_remove_rejection_reinstalls_first_lane_before_return()
     )
     .await
     .expect("b2 still trusts c3 after compensation");
-    assert!(matches!(
-        forward,
-        SendReceipt::PeerMessageSent {
-            delivery: meerkat_core::comms::PeerDeliveryOutcome::Acked
-                | meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff,
-            ..
-        }
-    ));
+    assert!(peer_message_receipt_proves_admission(&forward));
     let reverse = send_peer_text(
         &c3_runtime,
         b2.self_descriptor().peer_id,
@@ -963,14 +956,7 @@ async fn same_host_second_remove_rejection_reinstalls_first_lane_before_return()
     )
     .await
     .expect("c3 still trusts b2 after compensation");
-    assert!(matches!(
-        reverse,
-        SendReceipt::PeerMessageSent {
-            delivery: meerkat_core::comms::PeerDeliveryOutcome::Acked
-                | meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff,
-            ..
-        }
-    ));
+    assert!(peer_message_receipt_proves_admission(&reverse));
 
     controlling
         .handle
@@ -1203,14 +1189,7 @@ async fn members_unwired_no_write_restart_repairs_routes_on_authenticated_host_s
     )
     .await
     .expect("periodic HostStatus repairs the reverse b2 -> local a1 route");
-    assert!(matches!(
-        receipt,
-        SendReceipt::PeerMessageSent {
-            delivery: meerkat_core::comms::PeerDeliveryOutcome::Acked
-                | meerkat_core::comms::PeerDeliveryOutcome::VolatileHandedOff,
-            ..
-        }
-    ));
+    assert!(peer_message_receipt_proves_admission(&receipt));
     scripted.shutdown();
 }
 
