@@ -3734,10 +3734,21 @@ impl SessionRuntime {
         generated_machine_archived_resume_admission: GeneratedMachineArchivedResumeAdmission,
     ) -> ServiceStartTurnResultReceiver {
         let pre_turn_hook = self.pending_promotion_pre_turn_hook_callback();
+        let expected_session_id = session_id.clone();
+        let runtime_actor_witness_slots = Arc::clone(&self.runtime_actor_witness_slots);
+        let actor_witness_capture: meerkat::session_runtime::staged_promotion::ActorWitnessSlotCaptureFn =
+            Arc::new(move |materialized_session_id, actor_witness_slot| {
+                debug_assert_eq!(materialized_session_id, expected_session_id);
+                runtime_actor_witness_slots
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(materialized_session_id, actor_witness_slot);
+            });
         meerkat::session_runtime::staged_promotion::spawn_pending_create_and_start_turn_with_admission_guard(
             Arc::clone(&self.service),
             Arc::clone(&self.staged_sessions),
             Arc::clone(&self.runtime_adapter),
+            actor_witness_capture,
             pre_turn_hook,
             session_id,
             create_req,
@@ -4387,6 +4398,14 @@ impl SessionRuntime {
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
+        let runtime_actor_witness_slots = Arc::clone(&self.runtime_actor_witness_slots);
+        let actor_witness_capture: meerkat::session_runtime::staged_promotion::ActorWitnessSlotCaptureFn =
+            Arc::new(move |materialized_session_id, actor_witness_slot| {
+                runtime_actor_witness_slots
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(materialized_session_id, actor_witness_slot);
+            });
         meerkat::session_runtime::live_orchestration::LiveOrchestrator {
             service: &self.service,
             staged_sessions: &self.staged_sessions,
@@ -4405,6 +4424,7 @@ impl SessionRuntime {
             // `open_live_channel` installs `RpcLiveIngressReconciler` on
             // its per-call orchestrator.
             ingress_reconciler: None,
+            actor_witness_capture,
         }
     }
 

@@ -20,6 +20,23 @@ enum UnregisterTeardownAdmission {
 enum UnregisterTeardownWait {
     CallerGrace,
     UntilTerminal,
+    ReturnObserver,
+}
+
+enum UnregisterTeardownWaitOutcome {
+    Completed(bool),
+    Pending(RuntimeSessionUnregisterObserver),
+}
+
+impl UnregisterTeardownWaitOutcome {
+    fn require_completed(self) -> Result<bool, RuntimeDriverError> {
+        match self {
+            Self::Completed(completed) => Ok(completed),
+            Self::Pending(_) => Err(RuntimeDriverError::Internal(
+                "unregister observer escaped a synchronous wait".to_string(),
+            )),
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -826,7 +843,7 @@ mod ops_persistence_worker_tests {
         let runtime_id = LogicalRuntimeId::new("ops-worker-unregister-test");
         let epoch_id = meerkat_core::RuntimeEpochId::new();
         let cursor_state = Arc::new(meerkat_core::EpochCursorState::new());
-        let registry = crate::ops_lifecycle::RuntimeOpsLifecycleRegistry::new();
+        let registry = Arc::new(crate::ops_lifecycle::RuntimeOpsLifecycleRegistry::new());
         let (persist_tx, persist_rx) = crate::tokio::sync::mpsc::unbounded_channel();
         let worker = spawn_ops_lifecycle_persistence_worker(
             Arc::clone(&store),
@@ -850,8 +867,8 @@ mod ops_persistence_worker_tests {
             })
             .unwrap();
         registry.provisioning_succeeded(&operation_id).unwrap();
-        registry
-            .retire_owner_for_unregister("test unregister".into())
+        retire_ops_lifecycle_owner_for_unregister(Arc::clone(&registry), "test unregister".into())
+            .await
             .unwrap();
         join_ops_lifecycle_persistence_worker(worker)
             .await
@@ -873,6 +890,49 @@ mod ops_persistence_worker_tests {
             ),
             Err(OpsLifecycleError::OwnerRetired)
         );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn unregister_ops_retirement_does_not_block_its_async_persistence_owner() {
+        let epoch_id = meerkat_core::RuntimeEpochId::new();
+        let cursor_state = Arc::new(meerkat_core::EpochCursorState::new());
+        let registry = Arc::new(crate::ops_lifecycle::RuntimeOpsLifecycleRegistry::new());
+        let (persist_tx, mut persist_rx) = crate::tokio::sync::mpsc::unbounded_channel();
+        registry.set_persistence_channel(persist_tx, epoch_id, cursor_state);
+
+        let operation_id = OperationId::new();
+        registry
+            .register_operation(OperationSpec {
+                id: operation_id.clone(),
+                kind: OperationKind::BackgroundToolOp,
+                owner_session_id: SessionId::new(),
+                display_name: "current-thread persistence".into(),
+                source_label: "ops worker liveness test".into(),
+                operation_source: None,
+                child_session_id: None,
+                expect_peer_channel: false,
+            })
+            .unwrap();
+        registry.provisioning_succeeded(&operation_id).unwrap();
+
+        let persistence_owner = crate::tokio::spawn(async move {
+            while let Some(request) = persist_rx.recv().await {
+                request.complete(Ok(()));
+            }
+        });
+        crate::tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            retire_ops_lifecycle_owner_for_unregister(
+                Arc::clone(&registry),
+                "current-thread unregister".into(),
+            ),
+        )
+        .await
+        .expect("owned blocking retirement must leave the async persistence owner runnable")
+        .expect("ops retirement must converge");
+        persistence_owner
+            .await
+            .expect("sealed persistence owner must exit");
     }
 }
 
@@ -999,6 +1059,39 @@ async fn join_ops_lifecycle_persistence_worker(
     worker.handle.await.map_err(|error| {
         RuntimeDriverError::Internal(format!("ops lifecycle persistence worker failed: {error}"))
     })
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn retire_ops_lifecycle_owner_for_unregister(
+    registry: Arc<crate::ops_lifecycle::RuntimeOpsLifecycleRegistry>,
+    reason: String,
+) -> Result<(), RuntimeDriverError> {
+    crate::tokio::task::spawn_blocking(move || registry.retire_owner_for_unregister(reason))
+        .await
+        .map_err(|error| {
+            RuntimeDriverError::Internal(format!(
+                "ops lifecycle unregister retirement task failed: {error}"
+            ))
+        })?
+        .map_err(|error| {
+            RuntimeDriverError::Internal(format!(
+                "failed to terminalize ops lifecycle before unregister: {error}"
+            ))
+        })
+}
+
+#[cfg(target_arch = "wasm32")]
+async fn retire_ops_lifecycle_owner_for_unregister(
+    registry: Arc<crate::ops_lifecycle::RuntimeOpsLifecycleRegistry>,
+    reason: String,
+) -> Result<(), RuntimeDriverError> {
+    registry
+        .retire_owner_for_unregister(reason)
+        .map_err(|error| {
+            RuntimeDriverError::Internal(format!(
+                "failed to terminalize ops lifecycle before unregister: {error}"
+            ))
+        })
 }
 
 impl MeerkatMachine {
@@ -1544,6 +1637,8 @@ impl MeerkatMachine {
         tool_visibility_owner.bind_dsl_authority(Arc::clone(&dsl_authority));
         let session_entry = RuntimeSessionEntry {
             runtime_id: runtime_id.clone(),
+            archive_recovered_registration: false,
+            archive_recovered_from_quiescent: false,
             mutation_gate: Arc::new(Mutex::new(())),
             durability_health: None,
             #[cfg(feature = "live")]
@@ -1715,6 +1810,8 @@ impl MeerkatMachine {
         tool_visibility_owner.bind_dsl_authority(Arc::clone(&dsl_authority));
         let session_entry = RuntimeSessionEntry {
             runtime_id: runtime_id.clone(),
+            archive_recovered_registration: false,
+            archive_recovered_from_quiescent: false,
             mutation_gate: Arc::new(Mutex::new(())),
             durability_health: None,
             #[cfg(feature = "live")]
@@ -1926,6 +2023,8 @@ impl MeerkatMachine {
         let handle_teardown_gate = crate::handles::HandleTeardownGate::open();
         let session_entry = RuntimeSessionEntry {
             runtime_id: runtime_id.clone(),
+            archive_recovered_registration: false,
+            archive_recovered_from_quiescent: false,
             mutation_gate: Arc::new(Mutex::new(())),
             durability_health: durability_health.clone(),
             #[cfg(feature = "live")]
@@ -1973,6 +2072,73 @@ impl MeerkatMachine {
             })?;
         }
         Ok((session_entry, cold_recovered_generated_draining))
+    }
+
+    /// Recover one persistent session entry without holding the stable
+    /// registration transaction. The caller must publish the returned
+    /// candidate only through
+    /// `commit_prepared_archive_session_registration_under_transaction`.
+    pub(super) async fn prepare_archive_session_registration(
+        &self,
+        session_id: SessionId,
+        durable_lifecycle_was_quiescent: bool,
+    ) -> Result<super::PreparedArchiveSessionRegistration, RuntimeDriverError> {
+        let runtime_id = Self::logical_runtime_id(&session_id);
+        let recovery = self
+            .runtime_authority_for_registration(&runtime_id, &session_id)
+            .await?;
+        let (mut entry, cold_recovered_generated_draining) = self
+            .prepare_registered_session_entry(&session_id, &runtime_id, recovery, None, None)
+            .await?;
+        entry.archive_recovered_registration = true;
+        entry.archive_recovered_from_quiescent = durable_lifecycle_was_quiescent;
+        Ok(super::PreparedArchiveSessionRegistration {
+            session_id,
+            runtime_id,
+            entry,
+            cold_recovered_generated_draining,
+        })
+    }
+
+    /// Publish an already recovered archive candidate while T is held. This
+    /// method performs no RuntimeStore I/O. A concurrent ordinary registration
+    /// that won T is authoritative and causes the candidate to be discarded.
+    pub(super) async fn commit_prepared_archive_session_registration_under_transaction(
+        &self,
+        prepared: super::PreparedArchiveSessionRegistration,
+    ) -> Result<RegisterSessionInnerOutcome, RuntimeDriverError> {
+        let super::PreparedArchiveSessionRegistration {
+            session_id,
+            runtime_id,
+            entry,
+            cold_recovered_generated_draining,
+        } = prepared;
+        let mut sessions = self.sessions.write().await;
+        if let Some(existing) = sessions.get_mut(&session_id) {
+            if let Some(error) = existing.registration_blocked_by_unregister(&session_id) {
+                return Err(error);
+            }
+            if existing.clear_dead_attachment() {
+                existing
+                    .stage_generated_executor_exit_observation()
+                    .map_err(|reason| {
+                        RuntimeDriverError::Internal(format!(
+                            "generated MeerkatMachine rejected executor-exit observation: {reason}"
+                        ))
+                    })?;
+            }
+            return Ok(RegisterSessionInnerOutcome::Existing);
+        }
+        sessions.insert(session_id, entry);
+        tracing::debug!(
+            %runtime_id,
+            "MeerkatMachine published pre-recovered archive session"
+        );
+        if cold_recovered_generated_draining {
+            Ok(RegisterSessionInnerOutcome::InsertedColdRecoveredDraining)
+        } else {
+            Ok(RegisterSessionInnerOutcome::Inserted)
+        }
     }
 
     async fn register_session_inner_impl(
@@ -3459,6 +3625,8 @@ impl MeerkatMachine {
                     session_id.clone(),
                     RuntimeSessionEntry {
                         runtime_id,
+                        archive_recovered_registration: false,
+                        archive_recovered_from_quiescent: false,
                         mutation_gate: Arc::clone(&mutation_gate),
                         durability_health: durability_health.clone(),
                         #[cfg(feature = "live")]
@@ -4143,7 +4311,8 @@ impl MeerkatMachine {
             Some(witness),
             UnregisterTeardownWait::CallerGrace,
         )
-        .await
+        .await?
+        .require_completed()
     }
 
     /// Unregister only when `witness` still names this machine's exact current
@@ -4711,6 +4880,64 @@ impl MeerkatMachine {
     ) -> Result<(), RuntimeDriverError> {
         self.join_or_start_unregister_teardown(session_id, None, UnregisterTeardownCaller::Explicit)
             .await
+    }
+
+    /// Unregister only while `registration` still names this machine's exact
+    /// current session registration. Unlike terminal-registration cleanup,
+    /// this admits the ordinary attached-runtime teardown path. A stale or
+    /// absent registration is an idempotent `Ok(false)` and can never open or
+    /// join teardown for a same-SessionId replacement.
+    pub async fn unregister_session_registration_if_current(
+        &self,
+        registration: &RuntimeSessionRegistrationWitness,
+    ) -> Result<bool, RuntimeDriverError> {
+        if !registration.belongs_to(self) {
+            return Ok(false);
+        }
+        self.join_or_start_unregister_teardown_with_admission(
+            registration.session_id(),
+            Some(registration.epoch_id()),
+            UnregisterTeardownCaller::Explicit,
+            UnregisterTeardownAdmission::AnyCurrentRegistration,
+            Some(registration),
+            UnregisterTeardownWait::CallerGrace,
+        )
+        .await?
+        .require_completed()
+    }
+
+    /// Atomically start or join unregister for `registration` and return a
+    /// read-only observer when its exact coordinator remains in progress.
+    /// This never waits for teardown and never retries by SessionId after the
+    /// captured registration has been replaced.
+    pub async fn observe_unregister_session_registration_if_current(
+        &self,
+        registration: &RuntimeSessionRegistrationWitness,
+    ) -> Result<RuntimeSessionUnregisterAdmission, RuntimeDriverError> {
+        if !registration.belongs_to(self) {
+            return Ok(RuntimeSessionUnregisterAdmission::NotCurrent);
+        }
+        match self
+            .join_or_start_unregister_teardown_with_admission(
+                registration.session_id(),
+                Some(registration.epoch_id()),
+                UnregisterTeardownCaller::Explicit,
+                UnregisterTeardownAdmission::AnyCurrentRegistration,
+                Some(registration),
+                UnregisterTeardownWait::ReturnObserver,
+            )
+            .await?
+        {
+            UnregisterTeardownWaitOutcome::Completed(true) => {
+                Ok(RuntimeSessionUnregisterAdmission::Completed)
+            }
+            UnregisterTeardownWaitOutcome::Completed(false) => {
+                Ok(RuntimeSessionUnregisterAdmission::NotCurrent)
+            }
+            UnregisterTeardownWaitOutcome::Pending(observer) => {
+                Ok(RuntimeSessionUnregisterAdmission::Pending(observer))
+            }
+        }
     }
 
     /// Start or join the one owned ordinary-stop operation for this epoch.
@@ -5496,6 +5723,7 @@ impl MeerkatMachine {
             UnregisterTeardownWait::CallerGrace,
         )
         .await
+        .and_then(UnregisterTeardownWaitOutcome::require_completed)
         .map(|_| ())
     }
 
@@ -5597,9 +5825,12 @@ impl MeerkatMachine {
         admission: UnregisterTeardownAdmission,
         expected_registration: Option<&RuntimeSessionRegistrationWitness>,
         wait: UnregisterTeardownWait,
-    ) -> Result<bool, RuntimeDriverError> {
+    ) -> Result<UnregisterTeardownWaitOutcome, RuntimeDriverError> {
         enum CoordinatorDecision {
-            Join(crate::tokio::sync::watch::Receiver<Option<UnregisterTeardownResult>>),
+            Join {
+                coordinator_id: uuid::Uuid,
+                result_rx: crate::tokio::sync::watch::Receiver<Option<UnregisterTeardownResult>>,
+            },
             Start {
                 epoch_id: meerkat_core::RuntimeEpochId,
                 coordinator_id: uuid::Uuid,
@@ -5627,6 +5858,8 @@ impl MeerkatMachine {
                 admission == UnregisterTeardownAdmission::AnyCurrentRegistration
                     && sessions.get(session_id).is_some_and(|entry| {
                         !expected_epoch.is_some_and(|expected| expected != &entry.epoch_id)
+                            && expected_registration
+                                .is_none_or(|witness| witness.matches_entry(entry))
                             && entry.unregister_coordinator.is_some()
                     })
             };
@@ -5635,17 +5868,20 @@ impl MeerkatMachine {
             } else {
                 Some(self.lock_session_registration_transaction(session_id).await)
             };
-            let exact_mutation_guard =
-                if admission == UnregisterTeardownAdmission::ExactTerminalUnattachedRegistration {
-                    match expected_registration
-                        .and_then(RuntimeSessionRegistrationWitness::registration_gate)
-                    {
-                        Some(gate) => Some(gate.lock_owned().await),
-                        None => None,
-                    }
-                } else {
-                    None
-                };
+            // An optimistic join is read-only and rechecks the exact witness
+            // plus coordinator under the session-map write lock below. Every
+            // path that may install a coordinator holds T first, then the
+            // witness's exact M, before taking that map lock.
+            let exact_mutation_guard = if registration_transaction_guard.is_some() {
+                match expected_registration
+                    .and_then(RuntimeSessionRegistrationWitness::registration_gate)
+                {
+                    Some(gate) => Some(gate.lock_owned().await),
+                    None => None,
+                }
+            } else {
+                None
+            };
             let decision = {
                 let mut sessions = self.sessions.write().await;
                 match sessions.get_mut(session_id) {
@@ -5656,10 +5892,8 @@ impl MeerkatMachine {
                         CoordinatorDecision::EpochChanged
                     }
                     Some(entry)
-                        if admission
-                            == UnregisterTeardownAdmission::ExactTerminalUnattachedRegistration
-                            && !expected_registration
-                                .is_some_and(|witness| witness.matches_entry(entry)) =>
+                        if expected_registration
+                            .is_some_and(|witness| !witness.matches_entry(entry)) =>
                     {
                         CoordinatorDecision::RegistrationChanged
                     }
@@ -5690,7 +5924,10 @@ impl MeerkatMachine {
                                         "unregister teardown for session {session_id} attempted to join its own coordinator task"
                                     )));
                                 }
-                                CoordinatorDecision::Join(coordinator.result_rx.clone())
+                                CoordinatorDecision::Join {
+                                    coordinator_id: coordinator.coordinator_id,
+                                    result_rx: coordinator.result_rx.clone(),
+                                }
                             } else {
                                 return Err(RuntimeDriverError::Internal(format!(
                                     "stale unregister coordinator epoch for session {session_id}"
@@ -5741,7 +5978,7 @@ impl MeerkatMachine {
             if registration_transaction_guard.is_none()
                 && !matches!(
                     &decision,
-                    CoordinatorDecision::Join(_) | CoordinatorDecision::Completed(_)
+                    CoordinatorDecision::Join { .. } | CoordinatorDecision::Completed(_)
                 )
             {
                 // The coordinator seen by the optimistic join check completed
@@ -5762,20 +5999,23 @@ impl MeerkatMachine {
         // incarnation, so release this admission fence before joining/spawning.
         drop(exact_mutation_guard);
 
-        let mut result_rx = match decision {
-            CoordinatorDecision::Join(result_rx) => {
+        let (mut result_rx, coordinator_id) = match decision {
+            CoordinatorDecision::Join {
+                coordinator_id,
+                result_rx,
+            } => {
                 drop(registration_transaction_guard.take());
-                result_rx
+                (result_rx, coordinator_id)
             }
             CoordinatorDecision::AlreadyAbsent
             | CoordinatorDecision::EpochChanged
             | CoordinatorDecision::RegistrationChanged => {
                 drop(registration_transaction_guard.take());
-                return Ok(false);
+                return Ok(UnregisterTeardownWaitOutcome::Completed(false));
             }
             CoordinatorDecision::Completed(result) => {
                 drop(registration_transaction_guard.take());
-                return result.map(|()| true);
+                return result.map(|()| UnregisterTeardownWaitOutcome::Completed(true));
             }
             CoordinatorDecision::Retry => {
                 drop(registration_transaction_guard.take());
@@ -5840,9 +6080,20 @@ impl MeerkatMachine {
                         .await;
                     let _ = result_tx.send(Some(result));
                 });
-                result_rx
+                (result_rx, coordinator_id)
             }
         };
+
+        if wait == UnregisterTeardownWait::ReturnObserver {
+            let registration = expected_registration.cloned().ok_or_else(|| {
+                RuntimeDriverError::Internal(format!(
+                    "unregister observer for session {session_id} was requested without exact registration identity"
+                ))
+            })?;
+            return Ok(UnregisterTeardownWaitOutcome::Pending(
+                RuntimeSessionUnregisterObserver::new(registration, coordinator_id, result_rx),
+            ));
+        }
 
         let wait_for_owned_result = async {
             loop {
@@ -5857,7 +6108,9 @@ impl MeerkatMachine {
             }
         };
         match wait {
-            UnregisterTeardownWait::UntilTerminal => wait_for_owned_result.await.map(|()| true),
+            UnregisterTeardownWait::UntilTerminal => wait_for_owned_result
+                .await
+                .map(|()| UnregisterTeardownWaitOutcome::Completed(true)),
             UnregisterTeardownWait::CallerGrace => {
                 match crate::tokio::time::timeout(
                     UNREGISTER_CALLER_WAIT_GRACE,
@@ -5865,11 +6118,14 @@ impl MeerkatMachine {
                 )
                 .await
                 {
-                    Ok(result) => result.map(|()| true),
+                    Ok(result) => result.map(|()| UnregisterTeardownWaitOutcome::Completed(true)),
                     Err(_elapsed) => Err(RuntimeDriverError::UnregisterInProgress {
                         runtime_id: LogicalRuntimeId::for_session(session_id),
                     }),
                 }
+            }
+            UnregisterTeardownWait::ReturnObserver => {
+                unreachable!("unregister observer return is handled before synchronous waiting")
             }
         }
     }
@@ -7210,13 +7466,11 @@ impl MeerkatMachine {
         // coordinator, Draining state, and retained live lease continue to
         // reject replacement and rematerialization.
         drop(finalization_gate_guard);
-        ops_lifecycle
-            .retire_owner_for_unregister("runtime session unregistered".into())
-            .map_err(|error| {
-                RuntimeDriverError::Internal(format!(
-                    "failed to terminalize ops lifecycle before unregister: {error}"
-                ))
-            })?;
+        retire_ops_lifecycle_owner_for_unregister(
+            Arc::clone(&ops_lifecycle),
+            "runtime session unregistered".into(),
+        )
+        .await?;
 
         let persistence_worker = loop {
             #[cfg(feature = "live")]

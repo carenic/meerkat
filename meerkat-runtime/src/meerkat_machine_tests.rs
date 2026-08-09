@@ -15750,6 +15750,107 @@ mod stop_under_gate_deadlock_class {
             .await
             .expect("explicit unregister should remove the stopped runtime");
     }
+
+    #[tokio::test]
+    async fn exact_unregister_observer_survives_caller_drop_and_fences_replacement() {
+        let machine = Arc::new(MeerkatMachine::ephemeral());
+        let session_id = SessionId::new();
+        let cleanup_entered = Arc::new(Notify::new());
+        let cleanup_release = Arc::new(Notify::new());
+        machine
+            .register_session_with_executor(
+                session_id.clone(),
+                Box::new(BlockingPostStopCleanupExecutor {
+                    entered: Arc::clone(&cleanup_entered),
+                    release: Arc::clone(&cleanup_release),
+                }),
+            )
+            .await
+            .expect("runtime executor registration should succeed");
+        let registration = machine
+            .current_session_registration_witness(&session_id)
+            .await
+            .expect("registered session must expose exact registration identity");
+
+        let first_observer = match machine
+            .observe_unregister_session_registration_if_current(&registration)
+            .await
+            .expect("exact unregister admission should succeed")
+        {
+            RuntimeSessionUnregisterAdmission::Pending(observer) => observer,
+            other => panic!("blocking cleanup must retain a pending observer, got {other:?}"),
+        };
+        tokio::time::timeout(Duration::from_secs(1), cleanup_entered.notified())
+            .await
+            .expect("owned unregister must reach blocking cleanup");
+        assert!(
+            first_observer
+                .try_result()
+                .expect("observer channel must remain live")
+                .is_none(),
+            "blocked coordinator must not publish a premature result"
+        );
+        drop(first_observer);
+
+        let observer = match machine
+            .observe_unregister_session_registration_if_current(&registration)
+            .await
+            .expect("same exact registration must join its retained coordinator")
+        {
+            RuntimeSessionUnregisterAdmission::Pending(observer) => observer,
+            other => panic!("same exact coordinator must remain pending, got {other:?}"),
+        };
+        cleanup_release.notify_one();
+        let result = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(result) = observer
+                    .try_result()
+                    .expect("observer channel must publish terminal truth")
+                {
+                    break result;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("retained observer must receive terminal unregister result");
+        result.expect("exact unregister must succeed after cleanup release");
+        assert!(
+            machine
+                .current_session_registration_witness(&session_id)
+                .await
+                .is_none(),
+            "successful exact unregister must remove registration A"
+        );
+
+        machine
+            .register_session(session_id.clone())
+            .await
+            .expect("same-SessionId replacement B should register");
+        let replacement = machine
+            .current_session_registration_witness(&session_id)
+            .await
+            .expect("replacement B must expose distinct exact identity");
+        assert_ne!(registration, replacement);
+        assert!(matches!(
+            machine
+                .observe_unregister_session_registration_if_current(&registration)
+                .await
+                .expect("stale observer admission should be an idempotent no-op"),
+            RuntimeSessionUnregisterAdmission::NotCurrent
+        ));
+        assert_eq!(
+            machine
+                .current_session_registration_witness(&session_id)
+                .await,
+            Some(replacement),
+            "stale A admission must not affect replacement B"
+        );
+        machine
+            .unregister_session(&session_id)
+            .await
+            .expect("clean replacement fixture");
+    }
 }
 
 struct BoundaryCancelCallbackRaceHandle {
@@ -41783,6 +41884,8 @@ mod prepared_materialization_transactions {
 
     struct BlockingInterruptHandle {
         entered: Arc<Notify>,
+        release: Arc<Notify>,
+        apply_release: Arc<Notify>,
     }
 
     #[async_trait::async_trait]
@@ -41793,12 +41896,17 @@ mod prepared_materialization_transactions {
             _reason: String,
         ) -> Result<bool, CoreExecutorError> {
             self.entered.notify_one();
-            std::future::pending::<Result<bool, CoreExecutorError>>().await
+            self.release.notified().await;
+            self.apply_release.notify_one();
+            Ok(true)
         }
     }
 
     struct BlockingInterruptExecutor {
         entered: Arc<Notify>,
+        interrupt_release: Arc<Notify>,
+        apply_started: Arc<Notify>,
+        apply_release: Arc<Notify>,
     }
 
     #[async_trait::async_trait]
@@ -41806,15 +41914,29 @@ mod prepared_materialization_transactions {
         fn interrupt_handle(&self) -> Option<Arc<dyn CoreExecutorInterruptHandle>> {
             Some(Arc::new(BlockingInterruptHandle {
                 entered: Arc::clone(&self.entered),
+                release: Arc::clone(&self.interrupt_release),
+                apply_release: Arc::clone(&self.apply_release),
             }))
         }
 
         async fn apply(
             &mut self,
-            _run_id: RunId,
-            _primitive: RunPrimitive,
+            run_id: RunId,
+            primitive: RunPrimitive,
         ) -> Result<CoreApplyOutput, CoreExecutorError> {
-            unreachable!("cancellation test does not enqueue input")
+            self.apply_started.notify_one();
+            self.apply_release.notified().await;
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
+                    run_id,
+                    boundary: RunApplyBoundary::RunStart,
+                    contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                    conversation_digest: None,
+                    message_count: 0,
+                },
+                None,
+                None,
+            ))
         }
 
         async fn cancel_after_boundary(
@@ -42613,15 +42735,31 @@ mod prepared_materialization_transactions {
         let machine = Arc::new(MeerkatMachine::ephemeral());
         let session_id = SessionId::new();
         let interrupt_entered = Arc::new(Notify::new());
+        let interrupt_release = Arc::new(Notify::new());
+        let apply_started = Arc::new(Notify::new());
+        let apply_release = Arc::new(Notify::new());
         machine
             .ensure_session_with_executor(
                 session_id.clone(),
                 Box::new(BlockingInterruptExecutor {
                     entered: Arc::clone(&interrupt_entered),
+                    interrupt_release: Arc::clone(&interrupt_release),
+                    apply_started: Arc::clone(&apply_started),
+                    apply_release,
                 }),
             )
             .await
             .expect("attach cancellation fixture");
+        machine
+            .accept_input(
+                &session_id,
+                make_prompt("owned unregister coordinator cancellation fixture"),
+            )
+            .await
+            .expect("cancellation fixture input should be accepted");
+        tokio::time::timeout(Duration::from_secs(1), apply_started.notified())
+            .await
+            .expect("cancellation fixture should bind an exact active run");
 
         let machine_for_unregister = Arc::clone(&machine);
         let session_for_unregister = session_id.clone();
@@ -42649,6 +42787,8 @@ mod prepared_materialization_transactions {
                 "caller cancellation must not cancel the independently-owned unregister saga"
             );
         }
+
+        interrupt_release.notify_one();
 
         tokio::time::timeout(
             Duration::from_secs(1),

@@ -8901,8 +8901,21 @@ mod tests {
 
     #[tokio::test]
     async fn exact_released_0810_corpus_imports_and_fully_loads_current_session() {
-        let source = Path::new(env!("CARGO_MANIFEST_DIR")).join(
-            "../meerkat-runtime/tests/fixtures/v0_8_10_released_realm/corpus/realm/sessions.sqlite3",
+        let workspace_root = std::env::var_os("MEERKAT_WORKSPACE_ROOT")
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .filter(|root| root.join("Cargo.toml").is_file())
+            })
+            .unwrap_or_else(|| {
+                Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .parent()
+                    .expect("meerkat-store manifest has a workspace parent")
+                    .to_path_buf()
+            });
+        let source = workspace_root.join(
+            "meerkat-runtime/tests/fixtures/v0_8_10_released_realm/corpus/realm/sessions.sqlite3",
         );
         let dir = TempDir::new().unwrap();
         let path = dir.path().join("sessions.sqlite3");

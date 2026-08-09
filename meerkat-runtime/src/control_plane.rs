@@ -586,21 +586,6 @@ async fn drain_recovered_runless_runtime_terminations_classified(
     Ok(())
 }
 
-pub(crate) async fn drain_recovered_runless_runtime_terminations(
-    driver: &SharedDriver,
-    completions: Option<&SharedCompletionRegistry>,
-    publication_handle: Option<&dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
-) -> Result<(), RuntimeDriverError> {
-    drain_recovered_runless_runtime_terminations_classified(
-        driver,
-        completions,
-        publication_handle,
-        None,
-    )
-    .await
-    .map_err(RunlessTerminalConvergenceError::into_driver_error)
-}
-
 pub(crate) async fn has_committed_runless_recovery_carrier(
     driver: &SharedDriver,
 ) -> Result<bool, RunlessTerminalConvergenceError> {

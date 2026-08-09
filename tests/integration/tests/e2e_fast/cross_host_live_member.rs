@@ -85,7 +85,7 @@ async fn member_open_mints_bootstrap_from_advertised_url_not_local_addr() {
     let advertise = "ws://advertised.live-member.test.invalid:19099".to_string();
     let fixture = spawn_host_daemon_fixture(HostFixtureOptions {
         live_endpoint: Some(advertise.clone()),
-        ..HostFixtureOptions::named("xlm-advertise-host").with_member_build()
+        ..HostFixtureOptions::named("xlm-advertise-host").with_realtime_member_build()
     })
     .await
     .expect("spawn member host fixture");
@@ -159,7 +159,7 @@ async fn member_live_ws_input_token_misuse_and_reconciliation_primitives() {
     let advertise = format!("ws://{local_addr}");
     let fixture = spawn_host_daemon_fixture(HostFixtureOptions {
         live_endpoint: Some(advertise.clone()),
-        ..HostFixtureOptions::named("xlm-ws-host").with_member_build()
+        ..HostFixtureOptions::named("xlm-ws-host").with_realtime_member_build()
     })
     .await
     .expect("spawn member host fixture");

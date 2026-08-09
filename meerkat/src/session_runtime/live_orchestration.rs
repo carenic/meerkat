@@ -717,6 +717,11 @@ mod orchestrator {
         /// when a session-owned reconcile is actually required — callers
         /// that never open (precheck/config/propagate paths) pass `None`.
         pub ingress_reconciler: Option<&'a dyn LiveSessionIngressReconciler>,
+        /// Exact service-minted actor authority handoff. Deferred live/open
+        /// materialization must publish this slot to the owning surface before
+        /// ingress reconciliation can attach its runtime executor.
+        pub actor_witness_capture:
+            crate::session_runtime::staged_promotion::ActorWitnessSlotCaptureFn,
     }
 
     /// Per-call transport-stage inputs for the open/verb pipeline methods
@@ -930,14 +935,17 @@ mod orchestrator {
                 Some(adm) => adm,
                 None => self.service.reserve_create_session_admission().await?,
             };
-            match crate::session_runtime::staged_promotion::materialize_session_actor_unattached(
+            match crate::session_runtime::staged_promotion::materialize_session_actor_unattached_with_actor_slot(
                 self.service,
                 self.runtime_adapter,
                 create_req,
                 admission,
             )
             .await
-            {
+            .map(|(result, actor_witness_slot)| {
+                (self.actor_witness_capture)(result.session_id.clone(), actor_witness_slot);
+                result
+            }) {
                 Ok(_) => {
                     promotion_cleanup.mark_materialized();
                     let _ = promotion_cleanup.finish_now().await;

@@ -35,6 +35,39 @@ use meerkat_store::{SessionFilter, SessionStore, SessionStoreError};
 use serde_json::json;
 use std::sync::Mutex;
 
+fn normalized_llm_usage(provider: Provider, request: &LlmRequest) -> LlmEvent {
+    LlmEvent::UsageUpdate {
+        usage: meerkat_core::TurnUsage::host_declared(
+            provider,
+            &request.model,
+            meerkat_core::Usage::default(),
+        ),
+    }
+}
+
+fn provider_for_successful_factory_test_model(model: &str) -> Provider {
+    if model.starts_with("claude-") {
+        Provider::Anthropic
+    } else if model.starts_with("gpt-") || model.starts_with("o1-") {
+        Provider::OpenAI
+    } else if model.starts_with("gemini-") {
+        Provider::Gemini
+    } else if model.starts_with("gemma-") {
+        Provider::SelfHosted
+    } else {
+        Provider::Other
+    }
+}
+
+fn normalized_agent_usage(client: &dyn AgentLlmClient) -> meerkat_core::Usage {
+    meerkat_core::TurnUsage::host_declared(
+        client.provider(),
+        client.model(),
+        meerkat_core::Usage::default(),
+    )
+    .into_inner()
+}
+
 // ---------------------------------------------------------------------------
 // Mock LLM client (returns a simple text response)
 // ---------------------------------------------------------------------------
@@ -52,7 +85,7 @@ impl LlmClient for MockLlmClient {
 
     fn stream<'a>(
         &'a self,
-        _request: &'a LlmRequest,
+        request: &'a LlmRequest,
     ) -> Pin<Box<dyn futures::Stream<Item = Result<LlmEvent, meerkat_client::LlmError>> + Send + 'a>>
     {
         Box::pin(stream::iter(vec![
@@ -60,6 +93,10 @@ impl LlmClient for MockLlmClient {
                 delta: "Hello from mock".to_string(),
                 meta: None,
             }),
+            Ok(normalized_llm_usage(
+                provider_for_successful_factory_test_model(&request.model),
+                request,
+            )),
             Ok(LlmEvent::Done {
                 outcome: LlmDoneOutcome::Success {
                     stop_reason: meerkat_core::StopReason::EndTurn,
@@ -97,13 +134,7 @@ impl AgentLlmClient for MockAgentLlmClient {
                 meta: None,
             }],
             meerkat_core::StopReason::EndTurn,
-            meerkat_core::Usage {
-                input_tokens: 0,
-                output_tokens: 0,
-                cache_creation_tokens: None,
-                cache_read_tokens: None,
-                provider_accounting: None,
-            },
+            normalized_agent_usage(self),
         ))
     }
 
@@ -194,11 +225,20 @@ async fn add_trusted_peer_with_generated_authority(
         .expect("generated peer projection should reconcile trusted peer");
 }
 
-#[derive(Default)]
 struct CaptureClient {
     inner: TestClient,
     seen_tools: Mutex<Vec<String>>,
     seen_tool_defs: Mutex<Vec<ToolDef>>,
+}
+
+impl Default for CaptureClient {
+    fn default() -> Self {
+        Self {
+            inner: TestClient::for_provider(Provider::Anthropic),
+            seen_tools: Mutex::new(Vec::new()),
+            seen_tool_defs: Mutex::new(Vec::new()),
+        }
+    }
 }
 
 impl CaptureClient {
@@ -3294,6 +3334,7 @@ impl LlmClient for ParamsCaptureClient {
                 delta: "ok".to_string(),
                 meta: None,
             }),
+            Ok(normalized_llm_usage(self.provider, request)),
             Ok(LlmEvent::Done {
                 outcome: LlmDoneOutcome::Success {
                     stop_reason: meerkat_core::StopReason::EndTurn,
@@ -3685,7 +3726,7 @@ async fn factory_built_agent_honors_config_tools_timeout() {
                         meta: None,
                     }],
                     meerkat_core::StopReason::ToolUse,
-                    meerkat_core::Usage::default(),
+                    normalized_agent_usage(self),
                 )
             } else {
                 LlmStreamResult::new(
@@ -3694,7 +3735,7 @@ async fn factory_built_agent_honors_config_tools_timeout() {
                         meta: None,
                     }],
                     meerkat_core::StopReason::EndTurn,
-                    meerkat_core::Usage::default(),
+                    normalized_agent_usage(self),
                 )
             };
             *calls += 1;

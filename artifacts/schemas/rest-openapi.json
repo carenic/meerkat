@@ -1766,12 +1766,12 @@
           },
           "current_protocol_version": {
             "$ref": "#/components/schemas/BridgeProtocolVersion",
-            "default": 4,
+            "default": 5,
             "description": "Protocol version implemented by the responding member runtime."
           },
           "default_protocol_version": {
             "$ref": "#/components/schemas/BridgeProtocolVersion",
-            "default": 4,
+            "default": 5,
             "description": "Protocol version new supervisors should use for fresh authority records."
           },
           "deliver_member_input": {
@@ -1825,7 +1825,8 @@
             "default": [
               2,
               3,
-              4
+              4,
+              5
             ],
             "description": "Protocol versions accepted by the responding member runtime.",
             "items": {
@@ -1874,6 +1875,10 @@
                 "description": "Expected canonical member `PeerId`; not an Ed25519 public-key string.",
                 "type": "string"
               },
+              "member": {
+                "$ref": "#/components/schemas/BridgeDirectMemberIncarnation",
+                "description": "Mob-owned semantic identity for the controller-member incarnation being\ninstalled. The receiving runtime returns the corresponding exact\nruntime/session fence in [`BridgeBindResponse::member_fence`]."
+              },
               "protocol_version": {
                 "$ref": "#/components/schemas/BridgeProtocolVersion"
               },
@@ -1888,7 +1893,8 @@
               "protocol_version",
               "expected_peer_id",
               "expected_address",
-              "bootstrap_token"
+              "bootstrap_token",
+              "member"
             ],
             "type": "object"
           },
@@ -2213,7 +2219,7 @@
           },
           {
             "additionalProperties": false,
-            "description": "Supervisor authority credentials included in every bridge command.",
+            "description": "Retire one exact peer-only controller-member runtime incarnation (V5).\n\nSupervisor authentication proves who issued the command. `member_fence`\nseparately proves which exact Mob incarnation and runtime/session epoch the\ncontroller is authorized to retire. Neither authority may be inferred from\nthe other or from the addressed session id.",
             "properties": {
               "command": {
                 "const": "retire_member",
@@ -2223,6 +2229,9 @@
                 "format": "uint64",
                 "minimum": 0,
                 "type": "integer"
+              },
+              "member_fence": {
+                "$ref": "#/components/schemas/BridgeDirectMemberFence"
               },
               "protocol_version": {
                 "$ref": "#/components/schemas/BridgeProtocolVersion"
@@ -2235,7 +2244,8 @@
               "command",
               "supervisor",
               "epoch",
-              "protocol_version"
+              "protocol_version",
+              "member_fence"
             ],
             "type": "object"
           },
@@ -3390,6 +3400,110 @@
           }
         ]
       },
+      "BridgeDirectMemberFence": {
+        "additionalProperties": false,
+        "description": "Exact controller-member authority minted and stored by the receiving\npeer-only runtime during `BindMember`.\n\n`runtime_session_token` is opaque to the controller. It identifies the\nexact runtime epoch serving `member_session_id`; callers cannot reconstruct\nit from the session id or the Mob semantic incarnation. Retirement must\npresent this complete value byte-for-byte.",
+        "properties": {
+          "agent_identity": {
+            "type": "string"
+          },
+          "fence_token": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "generation": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "member_session_id": {
+            "type": "string"
+          },
+          "mob_id": {
+            "type": "string"
+          },
+          "runtime_session_token": {
+            "$ref": "#/components/schemas/BridgeDirectRuntimeSessionToken"
+          }
+        },
+        "required": [
+          "mob_id",
+          "agent_identity",
+          "generation",
+          "fence_token",
+          "member_session_id",
+          "runtime_session_token"
+        ],
+        "type": "object"
+      },
+      "BridgeDirectMemberFenceEvidence": {
+        "additionalProperties": false,
+        "description": "Non-authorizing observation of one direct member fence.\n\nThis deliberately omits [`BridgeDirectRuntimeSessionToken`]. A stale\npredecessor may learn which semantic incarnation is current for\nconvergence, but must never receive the successor's bearer authority.",
+        "properties": {
+          "agent_identity": {
+            "type": "string"
+          },
+          "fence_token": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "generation": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "member_session_id": {
+            "type": "string"
+          },
+          "mob_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mob_id",
+          "agent_identity",
+          "generation",
+          "fence_token",
+          "member_session_id"
+        ],
+        "title": "BridgeDirectMemberFenceEvidence",
+        "type": "object"
+      },
+      "BridgeDirectMemberIncarnation": {
+        "additionalProperties": false,
+        "description": "Mob-owned semantic incarnation presented when a controller binds one\ndirectly addressed peer-only member runtime.\n\nThis is identity and topology evidence, not mechanical runtime authority.\nThe receiving runtime combines it with its own exact runtime/session token\nand returns a [`BridgeDirectMemberFence`].",
+        "properties": {
+          "agent_identity": {
+            "type": "string"
+          },
+          "fence_token": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "generation": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "mob_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "mob_id",
+          "agent_identity",
+          "generation",
+          "fence_token"
+        ],
+        "type": "object"
+      },
+      "BridgeDirectRuntimeSessionToken": {
+        "description": "Host-minted opaque identity for one exact peer-only runtime/session epoch.\n\nThe UUID-shaped wire value is validated by serde. The private field blocks\nunchecked string construction, and Debug remains redacted because this\nvalue participates in effect authorization.",
+        "type": "string"
+      },
       "BridgeEventCursor": {
         "description": "Cursor into a member's event stream.\n\n`seq` is the owning host's durable `StoredEvent.seq` for the session\nbound at `generation` — NEVER a session-task or per-stream counter. A\nfresh-session respawn starts a new seq domain, while same-session Resume\ncontinues that session's seqs behind a host-recorded generation floor;\npage replies always carry the current generation so consumers restart at\nthe owning host's resolved floor.",
         "oneOf": [
@@ -3907,6 +4021,11 @@
             "type": "string"
           },
           {
+            "const": "bind_admission_outcome_unknown",
+            "description": "V5 direct-member semantic admission is process-owned and may already\nhave committed. The controller must retain pending bind authority and\nretry the exact request; this response does not certify no mutation.",
+            "type": "string"
+          },
+          {
             "const": "stale_fence",
             "description": "The command carried a superseded `(generation, fence_token)` tuple.",
             "type": "string"
@@ -4026,6 +4145,27 @@
             "const": "unavailable",
             "description": "The addressed member/host is transiently unable to serve the\ncommand (observation degrades typed, never quiet).",
             "type": "string"
+          },
+          {
+            "additionalProperties": false,
+            "description": "An exact member-runtime retirement has been admitted and retains its\nteardown authority, but did not converge within the bounded bridge\nobservation window. The controller may retry the same exact\n`ReleaseMember` tuple; this cause is never used for generic host\nunavailability.",
+            "properties": {
+              "runtime_retirement_in_progress": {
+                "properties": {
+                  "stage": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "stage"
+                ],
+                "type": "object"
+              }
+            },
+            "required": [
+              "runtime_retirement_in_progress"
+            ],
+            "type": "object"
           },
           {
             "additionalProperties": false,
@@ -4354,6 +4494,9 @@
               "capabilities": {
                 "$ref": "#/components/schemas/BridgeCapabilities"
               },
+              "member_fence": {
+                "$ref": "#/components/schemas/BridgeDirectMemberFence"
+              },
               "peer_id": {
                 "description": "Canonical member `PeerId`; transport public-key bytes stay out of this field.",
                 "type": "string"
@@ -4367,7 +4510,8 @@
               "result",
               "peer_id",
               "address",
-              "capabilities"
+              "capabilities",
+              "member_fence"
             ],
             "type": "object"
           },
@@ -4500,15 +4644,8 @@
             "additionalProperties": false,
             "description": "Response to a retire command.",
             "properties": {
-              "inputs_abandoned": {
-                "format": "uint",
-                "minimum": 0,
-                "type": "integer"
-              },
-              "inputs_pending_drain": {
-                "format": "uint",
-                "minimum": 0,
-                "type": "integer"
+              "outcome": {
+                "$ref": "#/components/schemas/BridgeRetireOutcome"
               },
               "result": {
                 "const": "retire",
@@ -4517,8 +4654,7 @@
             },
             "required": [
               "result",
-              "inputs_abandoned",
-              "inputs_pending_drain"
+              "outcome"
             ],
             "type": "object"
           },
@@ -5025,6 +5161,64 @@
           }
         ],
         "title": "BridgeReply"
+      },
+      "BridgeRetireOutcome": {
+        "description": "Typed outcome of one exact-fence peer-only retirement.",
+        "oneOf": [
+          {
+            "additionalProperties": false,
+            "properties": {
+              "inputs_abandoned": {
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "inputs_pending_drain": {
+                "format": "uint",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "status": {
+                "const": "retired",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "inputs_abandoned",
+              "inputs_pending_drain"
+            ],
+            "type": "object"
+          },
+          {
+            "additionalProperties": false,
+            "description": "The presented fence no longer names the runtime's current direct\nmember incarnation. `current: None` means no currently valid direct\nmember fence is installed for this runtime/session epoch.",
+            "properties": {
+              "current": {
+                "anyOf": [
+                  {
+                    "$ref": "#/components/schemas/BridgeDirectMemberFenceEvidence"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              },
+              "presented": {
+                "$ref": "#/components/schemas/BridgeDirectMemberFenceEvidence"
+              },
+              "status": {
+                "const": "stale",
+                "type": "string"
+              }
+            },
+            "required": [
+              "status",
+              "presented"
+            ],
+            "type": "object"
+          }
+        ]
       },
       "BridgeSupervisorRotationOperationReceipt": {
         "additionalProperties": false,
@@ -20138,7 +20332,7 @@
   },
   "info": {
     "title": "Meerkat REST API",
-    "version": "0.8.21"
+    "version": "0.8.22"
   },
   "openapi": "3.1.0",
   "paths": {

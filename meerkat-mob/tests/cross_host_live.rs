@@ -37,7 +37,8 @@ use support::{
     create_controlling_mob_with_definition, create_controlling_mob_with_member_live_host,
     member_descriptor_from_ack, member_incarnation_from_ack, raw_close_member_live_channel_command,
     raw_member_live_status_command, raw_open_member_live_channel_command,
-    realtime_portable_member_spec, scripted_member_client_completing, spawn_host_daemon_fixture,
+    realtime_portable_member_spec, scripted_member_client_completing,
+    scripted_member_client_completing_for_provider, spawn_host_daemon_fixture,
     spawn_peer_comms_endpoint, wait_until,
 };
 
@@ -54,6 +55,15 @@ async fn live_host_fixture(
     advertise: Option<String>,
     factory: Arc<live_support::ScriptedRealtimeSessionFactory>,
 ) -> (support::HostDaemonFixture, live_support::FixtureLivePlane) {
+    live_host_fixture_for_provider(name, advertise, factory, meerkat_core::Provider::OpenAI).await
+}
+
+async fn live_host_fixture_for_provider(
+    name: &str,
+    advertise: Option<String>,
+    factory: Arc<live_support::ScriptedRealtimeSessionFactory>,
+    member_provider: meerkat_core::Provider,
+) -> (support::HostDaemonFixture, live_support::FixtureLivePlane) {
     let (listener, local_addr) = live_support::bind_live_listener().await;
     let advertise_value = advertise
         .clone()
@@ -66,7 +76,10 @@ async fn live_host_fixture(
         meerkat_core::Provider::Anthropic,
         meerkat_core::Provider::OpenAI,
     ];
-    opts.member_llm_client = Some(scripted_member_client_completing("live-done"));
+    opts.member_llm_client = Some(scripted_member_client_completing_for_provider(
+        "live-done",
+        member_provider,
+    ));
     let fixture = spawn_host_daemon_fixture(opts)
         .await
         .expect("spawn live member-host fixture");
@@ -684,7 +697,10 @@ async fn reply_loss_probe_then_close_reconciles_without_resend() {
         meerkat_core::Provider::Anthropic,
         meerkat_core::Provider::OpenAI,
     ];
-    opts.member_llm_client = Some(scripted_member_client_completing("t9-done"));
+    opts.member_llm_client = Some(scripted_member_client_completing_for_provider(
+        "t9-done",
+        meerkat_core::Provider::OpenAI,
+    ));
     let fixture = spawn_host_daemon_fixture(opts)
         .await
         .expect("spawn live member-host fixture");
@@ -870,10 +886,11 @@ async fn member_side_causes_round_trip_typed() {
 
     // (a) Non-realtime model: B19 catalog gate ⇒ ModelNotRealtime{model,
     //     provider} across the bridge.
-    let (fixture, _plane) = live_host_fixture(
+    let (fixture, _plane) = live_host_fixture_for_provider(
         "xhl-t11a-host-b",
         None,
         live_support::scripted_realtime_factory(),
+        meerkat_core::Provider::Anthropic,
     )
     .await;
     let controlling =
@@ -1411,7 +1428,10 @@ async fn placed_lifecycle_live_fixture(
         meerkat_core::Provider::Anthropic,
         meerkat_core::Provider::OpenAI,
     ];
-    opts.member_llm_client = Some(scripted_member_client_completing("placed-live-done"));
+    opts.member_llm_client = Some(scripted_member_client_completing_for_provider(
+        "placed-live-done",
+        meerkat_core::Provider::OpenAI,
+    ));
     let fixture = spawn_host_daemon_fixture(opts)
         .await
         .expect("spawn placed lifecycle member host");
@@ -1524,10 +1544,20 @@ async fn shutdown_closes_active_controller_local_live_channel() {
         .expect("controller shutdown closes the controller-local live channel");
 
     assert_eq!(gateway.active_channel(), None);
+    let calls = gateway.calls();
     assert_eq!(
-        gateway.calls(),
-        vec!["status", "close"],
+        calls.get(..2),
+        Some(["status", "close"].as_slice()),
         "shutdown discovers and closes the active channel owned by its local Session member"
+    );
+    assert!(
+        calls[2..].iter().all(|call| *call == "status"),
+        "level-triggered shutdown retries may reobserve the absent channel while exact runtime unregister drains, but must not close it twice: {calls:?}"
+    );
+    assert_eq!(
+        calls.iter().filter(|call| **call == "close").count(),
+        1,
+        "the 2 second shutdown bound must converge after one exact channel close: {calls:?}"
     );
 }
 

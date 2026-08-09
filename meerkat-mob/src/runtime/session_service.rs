@@ -634,7 +634,44 @@ impl SessionResumeVerdict {
     }
 }
 
-pub(crate) async fn materialize_nonpersistent_session_resume_verdict<S>(
+/// Explicit opt-in for services whose session body has no durable committed
+/// boundary to prepare before actor materialization.
+///
+/// Persistent implementations and decorators must forward or implement the
+/// combined owner-issued verdict instead. Refusing services that claim
+/// persistence keeps this helper from becoming a silent fallback when a
+/// public wrapper forgets to forward that authority seam.
+pub async fn materialize_nonpersistent_session_resume_verdict<S>(
+    session_service: &S,
+    session_id: &SessionId,
+) -> Result<SessionResumeVerdict, SessionError>
+where
+    S: MobSessionService + ?Sized,
+{
+    if session_service.supports_persistent_sessions() {
+        return Err(SessionError::Unsupported(format!(
+            "persistent session service must issue an owner-prepared resume verdict for session '{session_id}'"
+        )));
+    }
+    materialize_nonpersistent_session_resume_verdict_inner(session_service, session_id).await
+}
+
+/// Crate-private composition seam for persistence-model test doubles that
+/// deliberately model only the body/authority bracket and never consume a
+/// persistent committed-boundary receipt. Public implementations must use the
+/// checked helper above or forward their persistent owner's combined verdict.
+#[cfg(test)]
+pub(crate) async fn materialize_nonpersistent_session_resume_verdict_unchecked<S>(
+    session_service: &S,
+    session_id: &SessionId,
+) -> Result<SessionResumeVerdict, SessionError>
+where
+    S: MobSessionService + ?Sized,
+{
+    materialize_nonpersistent_session_resume_verdict_inner(session_service, session_id).await
+}
+
+async fn materialize_nonpersistent_session_resume_verdict_inner<S>(
     session_service: &S,
     session_id: &SessionId,
 ) -> Result<SessionResumeVerdict, SessionError>
@@ -1226,9 +1263,7 @@ pub trait MobSessionService:
     async fn materialize_session_resume_verdict(
         &self,
         session_id: &SessionId,
-    ) -> Result<SessionResumeVerdict, SessionError> {
-        materialize_nonpersistent_session_resume_verdict(self, session_id).await
-    }
+    ) -> Result<SessionResumeVerdict, SessionError>;
 
     /// Load the persisted session METADATA view when available.
     ///
@@ -1519,6 +1554,13 @@ impl<B> MobSessionService for meerkat_session::EphemeralSessionService<B>
 where
     B: meerkat_session::SessionAgentBuilder + 'static,
 {
+    async fn materialize_session_resume_verdict(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionResumeVerdict, SessionError> {
+        materialize_nonpersistent_session_resume_verdict(self, session_id).await
+    }
+
     async fn create_session_under_runtime_turn_boundary(
         &self,
         req: meerkat_core::service::CreateSessionRequest,

@@ -99,7 +99,9 @@ pub(crate) enum MobMachineCommand {
         fence_token: FenceToken,
     },
     Stop,
-    Resume,
+    Resume {
+        deadline: meerkat_core::time_compat::Instant,
+    },
     Complete,
     Reset,
     Destroy,

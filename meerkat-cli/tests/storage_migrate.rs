@@ -683,7 +683,7 @@ fn explicit_pre_floor_bridge_migrates_then_reopens_idempotently() {
     let runtime_ledger = ledger_entries(&realms[0], "runtime-store", "sessions.sqlite3");
     assert_eq!(runtime_ledger.len(), 1, "{report:#}");
     assert_eq!(runtime_ledger[0]["action"], "stamped", "{report:#}");
-    assert_eq!(runtime_ledger[0]["after"], 2, "{report:#}");
+    assert_eq!(runtime_ledger[0]["after"], 3, "{report:#}");
 
     let list = run_rkat(
         &temp,

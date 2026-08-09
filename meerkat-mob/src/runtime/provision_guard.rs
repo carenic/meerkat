@@ -339,6 +339,8 @@ mod tests {
         async fn prepare_member_session_for_explicit_resume(
             &self,
             _session_id: &SessionId,
+            _deadline: meerkat_core::time_compat::Instant,
+            _admission: Option<crate::runtime::state::LifecycleAdmissionSignal>,
         ) -> Result<bool, MobError> {
             Ok(false)
         }

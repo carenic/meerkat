@@ -196,18 +196,16 @@ retry_lane \
     -E 'kind(test)' \
     --show-progress none --status-level none --final-status-level fail
 retry_lane \
-  "HeadCanonical process-death build" \
+  "HeadCanonical cold-restart build" \
   "$BUILD_TIMEOUT_SECS" \
   "$CARGO" nextest run -p meerkat-mob --test cold_restart_mob_resume \
-    --features test-support --profile fast --no-tests=fail --no-run \
-    -E 'test(mob_cold_restart_resume_after_kill_between_commit_points)'
+    --features test-support --profile fast --no-tests=fail --no-run
 retry_lane \
-  "HeadCanonical process-death lane" \
+  "HeadCanonical cold-restart lane" \
   "$NEXTEST_TIMEOUT_SECS" \
   "$CARGO" nextest run -p meerkat-mob --test cold_restart_mob_resume \
     --features test-support --profile fast --no-tests=fail \
-    --show-progress none --status-level none --final-status-level fail \
-    -E 'test(mob_cold_restart_resume_after_kill_between_commit_points)'
+    --show-progress none --status-level none --final-status-level fail
 retry_lane \
   "e2e-fast build" \
   "$BUILD_TIMEOUT_SECS" \

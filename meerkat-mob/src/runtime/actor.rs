@@ -61,6 +61,12 @@ enum ActorLoopControl {
     BreakActor,
 }
 
+enum ActorLoopWakeSelection {
+    Routed(RoutedMobCommand),
+    Continue,
+    BreakActor,
+}
+
 // Expand the command match synchronously so each arm constructs and erases
 // its own async future. A single async block around the whole match recreates
 // the aggregate command-loop poll frame this boundary exists to avoid.
@@ -4994,6 +5000,10 @@ pub(super) struct MobActor {
     /// including member-session operator tools created by the actor.
     pub(super) flow_target_provisioner:
         Arc<std::sync::RwLock<Option<super::handle::FlowTargetProvisioner>>>,
+    /// Handle-clone shared explicit-Resume operation custody. Actor-admitted
+    /// lifecycle commands invalidate predecessor results at this serialized
+    /// ownership boundary.
+    pub(super) explicit_resume_operations: Arc<super::handle::ResumeOperationRegistry>,
     pub(super) tool_bundles: BTreeMap<String, Arc<dyn AgentToolDispatcher>>,
     pub(super) default_llm_client: Option<Arc<dyn LlmClient>>,
     pub(super) retired_event_index: Arc<RwLock<HashSet<String>>>,
@@ -5088,6 +5098,14 @@ pub(super) struct MobActor {
     pub(super) session_service: Arc<dyn MobSessionService>,
     #[cfg(feature = "runtime-adapter")]
     pub(super) runtime_adapter: Option<Arc<meerkat_runtime::MeerkatMachine>>,
+    /// Caller-side observers for exact runtime unregister coordinators that
+    /// outlived Runtime's synchronous acknowledgement grace during Shutdown.
+    /// Runtime owns teardown authority; these read-only observers expose its
+    /// exact terminal result without letting actor-command retries start
+    /// duplicate teardown or join a same-SessionId replacement.
+    #[cfg(feature = "runtime-adapter")]
+    pub(super) shutdown_runtime_unregister_observers:
+        HashMap<SessionId, meerkat_runtime::RuntimeSessionUnregisterObserver>,
     pub(super) restore_diagnostics:
         Arc<RwLock<HashMap<AgentIdentity, super::handle::RestoreFailureDiagnostic>>>,
     /// Per bridge-session shell lifecycle locks for #37 live-materialization
@@ -12016,6 +12034,7 @@ impl MobActor {
             // actor do not dial realtime endpoints.
             realtime_session_factory: None,
             flow_target_provisioner: Arc::clone(&self.flow_target_provisioner),
+            explicit_resume_operations: Arc::clone(&self.explicit_resume_operations),
         }
     }
 
@@ -14234,11 +14253,11 @@ impl MobActor {
         Ok(())
     }
 
-    async fn teardown_session_runtime_bindings_from_machine(&self) -> Result<(), MobError> {
+    async fn teardown_session_runtime_bindings_from_machine(&mut self) -> Result<(), MobError> {
         #[cfg(feature = "runtime-adapter")]
-        if let Some(adapter) = &self.runtime_adapter {
+        if let Some(adapter) = self.runtime_adapter.clone() {
             let state = self.dsl_authority.state();
-            let session_ids = state
+            let mut session_ids = state
                 .member_session_bindings
                 .iter()
                 .filter(|(identity, _)| !state.member_placement.contains_key(*identity))
@@ -14251,33 +14270,115 @@ impl MobActor {
                         ))
                     })
                 })
-                .collect::<Result<Vec<_>, MobError>>()?;
+                .collect::<Result<HashSet<_>, MobError>>()?;
+            session_ids.extend(self.shutdown_runtime_unregister_observers.keys().cloned());
             let mut failures = Vec::new();
+            let mut unregister_pending = false;
             for session_id in session_ids {
-                // `unregister_session` now runs the two-phase drain internally
-                // (0.7.2 D1): it aborts the comms drain task *and* awaits its
-                // quiescence before committing teardown, so a separate
-                // pre-unregister `abort_comms_drain` here is redundant.
-                let unregister_result = match adapter.unregister_session(&session_id).await {
-                    // Unregister is an independently-owned saga. Its caller
-                    // grace can race the final teardown acknowledgement, so
-                    // join (or deliberately retry) that exact registration
-                    // once more before classifying the binding as unresolved.
-                    // A second in-progress result remains a bounded,
-                    // retryable shutdown failure.
-                    Err(meerkat_runtime::RuntimeDriverError::UnregisterInProgress { .. }) => {
-                        adapter.unregister_session(&session_id).await
+                if let Some(observer) = self.shutdown_runtime_unregister_observers.get(&session_id)
+                {
+                    let result = match observer.try_result() {
+                        Ok(Some(result)) => result,
+                        Ok(None) => {
+                            unregister_pending = true;
+                            continue;
+                        }
+                        Err(error) => {
+                            failures.push(format!(
+                                "failed to observe runtime unregister for session {session_id} during mob teardown: {error}"
+                            ));
+                            self.shutdown_runtime_unregister_observers
+                                .remove(&session_id);
+                            continue;
+                        }
+                    };
+                    let registration = observer.registration().clone();
+                    match result {
+                        Err(error) => {
+                            self.shutdown_runtime_unregister_observers
+                                .remove(&session_id);
+                            failures.push(format!(
+                                "failed to unregister runtime session {session_id} during mob teardown: {error}"
+                            ));
+                        }
+                        Ok(()) => match adapter
+                            .current_session_registration_witness(&session_id)
+                            .await
+                        {
+                            None => {}
+                            Some(current) if current == registration => failures.push(format!(
+                                "runtime unregister coordinator for session {session_id} published success while its exact registration remained current"
+                            )),
+                            Some(_) => failures.push(format!(
+                                "runtime session {session_id} was replaced during exact mob shutdown teardown"
+                            )),
+                        },
                     }
-                    result => result,
+                    continue;
+                }
+                let Some(registration) = adapter
+                    .current_session_registration_witness(&session_id)
+                    .await
+                else {
+                    continue;
                 };
-                if let Err(error) = unregister_result {
-                    failures.push(format!(
-                        "failed to unregister runtime session {session_id} during mob teardown: {error}"
-                    ));
+                // Exact-current unregister runs the two-phase drain internally
+                // (0.7.2 D1). Capturing the opaque registration witness before
+                // admission prevents a same-SessionId replacement from being
+                // reached by this Shutdown attempt or its retained observer.
+                match adapter
+                    .observe_unregister_session_registration_if_current(&registration)
+                    .await
+                {
+                    Ok(meerkat_runtime::RuntimeSessionUnregisterAdmission::Completed) => {
+                        match adapter
+                            .current_session_registration_witness(&session_id)
+                            .await
+                        {
+                            None => {}
+                            Some(current) if current == registration => failures.push(format!(
+                                "runtime unregister coordinator for session {session_id} completed while its exact registration remained current"
+                            )),
+                            Some(_) => failures.push(format!(
+                                "runtime session {session_id} was replaced during exact mob shutdown teardown"
+                            )),
+                        }
+                    }
+                    Ok(meerkat_runtime::RuntimeSessionUnregisterAdmission::NotCurrent) => {
+                        if adapter
+                            .current_session_registration_witness(&session_id)
+                            .await
+                            .is_some()
+                        {
+                            failures.push(format!(
+                                "runtime session {session_id} changed before exact mob shutdown teardown admission"
+                            ));
+                        }
+                    }
+                    Ok(meerkat_runtime::RuntimeSessionUnregisterAdmission::Pending(observer)) => {
+                        // The runtime coordinator is independently owned and
+                        // exact-registration fenced. Retain only its read-only
+                        // result observer, so later actor commands never wait,
+                        // restart cleanup, or acquire authority over a
+                        // same-SessionId replacement.
+                        self.shutdown_runtime_unregister_observers
+                            .insert(session_id.clone(), observer);
+                        unregister_pending = true;
+                    }
+                    Err(error) => {
+                        failures.push(format!(
+                            "failed to unregister runtime session {session_id} during mob teardown: {error}"
+                        ));
+                    }
                 }
             }
             if !failures.is_empty() {
                 return Err(MobError::Internal(failures.join("; ")));
+            }
+            if unregister_pending {
+                return Err(MobError::LifecycleOperationPending {
+                    intent: "shutdown_runtime_unregister".to_string(),
+                });
             }
         }
         Ok(())
@@ -14506,8 +14607,11 @@ impl MobActor {
     /// Disposal owns an authenticated host Release/Revoke and then disposes
     /// exact placed kickoff custody. It must not wait for the ordinary Stop
     /// cancellation lane first: a blackholed cancel would otherwise prevent
-    /// the stronger release authority from ever running. Local members still
-    /// complete their in-process interrupt synchronously.
+    /// the stronger release authority from ever running. For local members,
+    /// this step closes kickoff and comms ingress only. The later
+    /// `ArchiveSession` transaction owns exact-run quiescence under its one
+    /// absolute retirement deadline; ambient interruption is intentionally
+    /// inadmissible once durable Retiring has closed admission.
     async fn stop_autonomous_member_for_disposal(
         &mut self,
         agent_identity: &AgentIdentity,
@@ -14520,20 +14624,28 @@ impl MobActor {
         )) {
             return Ok(());
         }
-        let incarnation = AutonomousStopInterruptIncarnation {
-            member_ref: member_ref.clone(),
-            expected_member: None,
-        };
-        if let Err(error) = self.provisioner.interrupt_member(member_ref, None).await
-            && !matches!(
-                error,
-                MobError::SessionError(meerkat_core::service::SessionError::NotFound { .. })
-            )
+        #[cfg(feature = "runtime-adapter")]
+        if let (Some(adapter), Some(session_id)) =
+            (&self.runtime_adapter, member_ref.bridge_session_id())
         {
-            return Err(error);
+            // The durable kickoff stop above owns producer quiescence. This
+            // abort is only a mechanical wake for a drain that may already be
+            // absent after a prior ArchiveSession completed. Failing it must
+            // not retain the machine's KickoffQuiesced obligation forever;
+            // ArchiveSession remains the sole exact-run and unregister owner.
+            if let Err(error) = adapter.abort_comms_drain(session_id).await {
+                tracing::warn!(
+                    mob_id = %self.definition.id,
+                    agent_identity = %agent_identity,
+                    session_id = %session_id,
+                    error = %error,
+                    "comms drain abort did not complete during disposal; continuing to exact archive quiescence"
+                );
+            }
         }
-        self.finish_autonomous_member_stop(agent_identity, &incarnation)
-            .await
+        #[cfg(not(feature = "runtime-adapter"))]
+        let _ = member_ref;
+        Ok(())
     }
 
     /// Poll or launch exact, timeout-bounded interrupts without awaiting their
@@ -14691,6 +14803,44 @@ impl MobActor {
         entry: &RosterEntry,
     ) -> Result<bool, MobError> {
         let session_id = entry.member_ref.bridge_session_id().cloned();
+        #[cfg(feature = "runtime-adapter")]
+        if let (Some(adapter), Some(session_id), Some(stopped_registration)) = (
+            self.runtime_adapter.as_ref(),
+            session_id.as_ref(),
+            session_id.as_ref().and_then(|session_id| {
+                self.shutdown_runtime_unregister_observers
+                    .get(session_id)
+                    .map(|observer| observer.registration().clone())
+            }),
+        ) {
+            let current = adapter
+                .current_session_registration_witness(session_id)
+                .await;
+            match current.as_ref() {
+                None => {
+                    // A is absent after its exact unregister. Retain the
+                    // terminal observer as the member-stop stage witness until
+                    // this actor exits successfully.
+                    return Ok(false);
+                }
+                Some(current) if current == &stopped_registration => {
+                    // This exact registration reached the completed
+                    // member-stop stage before its unregister observer was
+                    // installed. Re-run the global stop scan on every
+                    // Shutdown retry, but suppress only this one exact A.
+                    return Ok(false);
+                }
+                Some(_) => {
+                    // A same-SessionId replacement B is fresh shutdown work.
+                    // Drop only A's read-only observer so this retry stops B
+                    // and later admits an unregister coordinator for B's
+                    // exact registration. A's coordinator remains exact-fenced
+                    // and process-owned after its observer is dropped.
+                    self.shutdown_runtime_unregister_observers
+                        .remove(session_id);
+                }
+            }
+        }
         let dsl_identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
         let placed_host = self
             .dsl_authority
@@ -14955,6 +15105,8 @@ impl MobActor {
     /// machine journal still carries a stale session binding for it.
     async fn prepare_explicit_resume_member_sessions(
         &self,
+        deadline: Instant,
+        admission: super::state::LifecycleAdmissionSignal,
     ) -> Result<Vec<ExplicitResumeMemberRebuild>, MobError> {
         let entries = {
             let roster = self.roster.read().await;
@@ -15006,7 +15158,11 @@ impl MobActor {
         for (entry, member_ref, session_id) in candidates {
             let requires_materialization = self
                 .provisioner
-                .prepare_member_session_for_explicit_resume(&session_id)
+                .prepare_member_session_for_explicit_resume(
+                    &session_id,
+                    deadline,
+                    Some(admission.clone()),
+                )
                 .await?;
             if !requires_materialization {
                 continue;
@@ -15075,7 +15231,11 @@ impl MobActor {
             })?;
             let replacement_requires_materialization = self
                 .provisioner
-                .prepare_member_session_for_explicit_resume(&replacement_session_id)
+                .prepare_member_session_for_explicit_resume(
+                    &replacement_session_id,
+                    deadline,
+                    Some(admission.clone()),
+                )
                 .await?;
             // Publish an endpoint from a live successor only when this exact
             // provisioner is allowed to reuse that attachment. If preparation
@@ -19990,7 +20150,11 @@ impl MobActor {
                     reply_tx,
                 } => {
                     let respawn_identity = agent_identity.clone();
-                    match Box::pin(self.handle_respawn(agent_identity, initial_message)).await {
+                    match boxed_arm_future(|| {
+                        self.handle_respawn(agent_identity, initial_message)
+                    })
+                    .await
+                    {
                         Ok(RespawnProgress::Completed(receipt)) => {
                             if !self.respawn_topology_reply_withheld {
                                 let _ = reply_tx.send(Ok(receipt));
@@ -21397,8 +21561,20 @@ impl MobActor {
                         let _ = reply_tx.send(result);
                     }
                 }
-                MobCommand::ResumeLifecycle { reply_tx } => {
-                    let result = match self.probe_command_admission(
+                MobCommand::ResumeLifecycle {
+                    deadline,
+                    admission,
+                    reply_tx,
+                } => {
+                    let result = if Instant::now() >= deadline {
+                        Err(
+                            MobError::LifecycleOperationAdmissionPending {
+                                intent: "explicit_resume".to_string(),
+                                stage: "actor_command_execution",
+                            },
+                        )
+                    } else {
+                        match self.probe_command_admission(
                         mob_dsl::MobMachineInput::Resume,
                         MobState::Running,
                         "resume_command_admission",
@@ -21408,7 +21584,10 @@ impl MobActor {
                             self.provisioner.rearm_all_checkpointers().await;
 
                             let rebuild = match self
-                                .prepare_explicit_resume_member_sessions()
+                                .prepare_explicit_resume_member_sessions(
+                                    deadline,
+                                    admission.clone(),
+                                )
                                 .await
                             {
                                 Ok(rebuild) => rebuild,
@@ -21450,6 +21629,25 @@ impl MobActor {
                             // retired foreign attachments; failure remains a
                             // stopped, discoverable session set that an
                             // explicit retry can rebuild.
+                            if Instant::now() >= deadline {
+                                let timeout_error =
+                                    MobError::LifecycleOperationAdmissionPending {
+                                        intent: "explicit_resume".to_string(),
+                                        stage: "lifecycle_transition_admission",
+                                    };
+                                if !rebuilt_attachment
+                                    && let Err(stop_error) =
+                                        self.stop_all_autonomous_members().await
+                                {
+                                    self.provisioner.cancel_all_checkpointers().await;
+                                    return Err(MobError::Internal(format!(
+                                        "{timeout_error}; exact pre-admission Resume rollback failed while stopping autonomous loops: {stop_error}"
+                                    )));
+                                }
+                                self.provisioner.cancel_all_checkpointers().await;
+                                return Err(timeout_error);
+                            }
+                            admission.admit();
                             if let Err(error) = self.resume_lifecycle_after_quiesce().await {
                                 if !rebuilt_attachment
                                     && let Err(stop_error) =
@@ -21605,6 +21803,7 @@ impl MobActor {
                         }
                         .await,
                         Err(error) => Err(error),
+                    }
                     };
                     let _ = reply_tx.send(result);
                 }
@@ -21994,8 +22193,171 @@ impl MobActor {
         }
     }
 
-    /// Main actor loop: process commands sequentially until Shutdown.
-    pub(super) async fn run(mut self, mut command_rx: mpsc::Receiver<RoutedMobCommand>) {
+    /// Wait for one actor-loop input or reconcile one completed background
+    /// operation.
+    ///
+    /// This is erased before a command handler is polled. In debug builds the
+    /// select branches otherwise reserve their state beside the selected
+    /// command's already-deep lifecycle stack even though they are mutually
+    /// exclusive at runtime.
+    async fn wait_for_actor_wake(
+        &mut self,
+        command_rx: &mut mpsc::Receiver<RoutedMobCommand>,
+        deferred_commands: &mut VecDeque<RoutedMobCommand>,
+        host_status_polls_in_flight: &mut BTreeSet<mob_dsl::HostId>,
+        identity_session_witnesses: &mut IdentityConvergedSessionWitnesses,
+        host_status_poll: &mut tokio::time::Interval,
+        identity_reconcile_safety_scan: &mut tokio::time::Interval,
+    ) -> ActorLoopWakeSelection {
+        self.drain_completed_actor_io_tasks();
+        self.drain_completed_peer_delivery_tasks();
+        if let Err(error) = self.drain_completed_lifecycle_tasks() {
+            tracing::warn!(
+                mob_id = %self.definition.id,
+                error = %error,
+                "orchestrator lifecycle completion reconciliation failed"
+            );
+            self.retain_lifecycle_delivery_error(error);
+        }
+        self.drain_completed_member_live_mutations().await;
+        if self.durable_uncertainty_fail_stop {
+            return ActorLoopWakeSelection::Continue;
+        }
+
+        enum RegularActorWake {
+            Routed(Option<RoutedMobCommand>),
+            HostStatusPoll,
+            IdentityReconcile,
+            IdentityBackoffDeadline,
+            IdentitySafetyScan,
+        }
+
+        let actor_io_pending = !self.actor_io_tasks.is_empty();
+        let peer_delivery_pending = !self.peer_delivery_tasks.is_empty();
+        let lifecycle_pending = !self.lifecycle_tasks.is_empty();
+        let member_live_mutation_pending = !self.member_live_mutation_tasks.is_empty();
+        let identity_reconcile_pending = !self.identity_reconcile_queue.is_empty();
+        let identity_reconcile_backoff_wait = self.identity_reconcile_next_backoff_wait();
+        let deferred_command_pending = !deferred_commands.is_empty();
+        let regular_wake = async {
+            tokio::select! {
+                routed = command_rx.recv() => RegularActorWake::Routed(routed),
+                _tick = host_status_poll.tick() => RegularActorWake::HostStatusPoll,
+                _ready = std::future::ready(()), if identity_reconcile_pending => {
+                    RegularActorWake::IdentityReconcile
+                }
+                _deadline = async move {
+                    match identity_reconcile_backoff_wait {
+                        Some(wait) => tokio::time::sleep(wait).await,
+                        None => std::future::pending::<()>().await,
+                    }
+                } => RegularActorWake::IdentityBackoffDeadline,
+                _tick = identity_reconcile_safety_scan.tick() => {
+                    RegularActorWake::IdentitySafetyScan
+                }
+            }
+        };
+        let deferred_command = async { deferred_commands.pop_front() };
+        let routed = tokio::select! {
+            biased;
+            joined = self.actor_io_tasks.join_next(), if actor_io_pending => {
+                if let Some(joined) = joined {
+                    self.reconcile_actor_io_task_join(joined);
+                }
+                return ActorLoopWakeSelection::Continue;
+            }
+            joined = self.peer_delivery_tasks.join_next(), if peer_delivery_pending => {
+                if let Some(joined) = joined {
+                    match joined {
+                        Ok(completion) => {
+                            self.peer_delivery_inflight.remove(&completion.id);
+                        }
+                        Err(error) => {
+                            let _ = self.reconcile_peer_delivery_join_error(
+                                error,
+                                "peer delivery completion",
+                                ActorTaskJoinPanicDisposition::AmbiguousEffectFailStop,
+                            );
+                        }
+                    }
+                }
+                return ActorLoopWakeSelection::Continue;
+            }
+            joined = self.lifecycle_tasks.join_next(), if lifecycle_pending => {
+                if let Some(joined) = joined
+                    && let Err(error) = self.surface_lifecycle_task_outcome(joined)
+                {
+                    tracing::warn!(
+                        mob_id = %self.definition.id,
+                        error = %error,
+                        "orchestrator lifecycle completion reconciliation failed"
+                    );
+                    self.retain_lifecycle_delivery_error(error);
+                }
+                return ActorLoopWakeSelection::Continue;
+            }
+            joined = self.member_live_mutation_tasks.join_next(),
+                if member_live_mutation_pending =>
+            {
+                if let Some(joined) = joined
+                    && let Err(error) = self
+                        .reconcile_joined_member_live_mutation(
+                            joined,
+                            MemberLiveReconcileMode::Background,
+                        )
+                        .await
+                {
+                    tracing::warn!(
+                        mob_id = %self.definition.id,
+                        error = %error,
+                        "mutating member-live completion reconciliation failed"
+                    );
+                }
+                return ActorLoopWakeSelection::Continue;
+            }
+            deferred = deferred_command, if deferred_command_pending => {
+                let Some(routed) = deferred else {
+                    return ActorLoopWakeSelection::Continue;
+                };
+                routed
+            }
+            wake = regular_wake => {
+                match wake {
+                    RegularActorWake::Routed(Some(routed)) => routed,
+                    RegularActorWake::Routed(None) => {
+                        return ActorLoopWakeSelection::BreakActor;
+                    }
+                    RegularActorWake::HostStatusPoll => {
+                        self.spawn_periodic_host_status_polls(host_status_polls_in_flight)
+                            .await;
+                        return ActorLoopWakeSelection::Continue;
+                    }
+                    RegularActorWake::IdentityReconcile => {
+                        self.reconcile_next_identity(identity_session_witnesses).await;
+                        return ActorLoopWakeSelection::Continue;
+                    }
+                    RegularActorWake::IdentityBackoffDeadline => {
+                        self.enqueue_due_identity_reconcile_backoffs();
+                        return ActorLoopWakeSelection::Continue;
+                    }
+                    RegularActorWake::IdentitySafetyScan => {
+                        self.enqueue_next_identity_intent_safety_page().await;
+                        return ActorLoopWakeSelection::Continue;
+                    }
+                }
+            }
+        };
+        ActorLoopWakeSelection::Routed(routed)
+    }
+
+    /// Recover actor-owned volatile drivers before command admission.
+    ///
+    /// Keep this state machine out of `run`: debug builds reserve distinct
+    /// stack slots for locals that live across each await even when startup
+    /// and command dispatch can never execute concurrently. Erasing this
+    /// phase drops the recovery frame before a deeply nested command handler
+    /// is polled, without moving actor authority out of the serialized task.
+    async fn prepare_actor_run(&mut self) -> bool {
         if matches!(self.dsl_state(), MobState::Running) {
             if let Err(error) = self.restore_generated_member_operation_bindings().await {
                 tracing::error!(
@@ -22014,7 +22376,7 @@ impl MobActor {
                 "durable member-live Open cleanup recovery failed; fail-stopping before command admission"
             );
             self.quiesce_volatile_producers_after_fail_stop().await;
-            return;
+            return false;
         }
         // Prune only after generated member bindings have recovered: before
         // that point the machine snapshot may not yet contain every current
@@ -22048,6 +22410,14 @@ impl MobActor {
                     .await;
             }
         }
+        true
+    }
+
+    /// Main actor loop: process commands sequentially until Shutdown.
+    pub(super) async fn run(mut self, mut command_rx: mpsc::Receiver<RoutedMobCommand>) {
+        if !boxed_arm_future(|| self.prepare_actor_run()).await {
+            return;
+        }
         // Desired-state recovery is independent from the legacy roster
         // projection. Every cold actor incarnation starts by reading the sole
         // durable intent authority and scheduling one level-triggered pass per
@@ -22075,13 +22445,6 @@ impl MobActor {
         // `tokio_with_wasm` intervals already wait one full period before
         // their first tick. Awaiting a startup tick on wasm would therefore
         // park the actor for the five-minute identity safety cadence.
-        enum RegularActorWake {
-            Routed(Option<RoutedMobCommand>),
-            HostStatusPoll,
-            IdentityReconcile,
-            IdentityBackoffDeadline,
-            IdentitySafetyScan,
-        }
         'actor: loop {
             // Detached completion paths can re-enter through `continue` or
             // `SkipBoundary`, bypassing the ordinary post-command boundary.
@@ -22096,145 +22459,21 @@ impl MobActor {
                 command_rx.close();
                 break;
             }
-            self.drain_completed_actor_io_tasks();
-            self.drain_completed_peer_delivery_tasks();
-            if let Err(error) = self.drain_completed_lifecycle_tasks() {
-                tracing::warn!(
-                    mob_id = %self.definition.id,
-                    error = %error,
-                    "orchestrator lifecycle completion reconciliation failed"
-                );
-                self.retain_lifecycle_delivery_error(error);
-            }
-            self.drain_completed_member_live_mutations().await;
-            if self.durable_uncertainty_fail_stop {
-                // A drain may have just classified an actor-owned task as an
-                // ambiguous effect. Re-enter the loop-top fail-stop before
-                // selecting or dispatching even one more command.
-                continue;
-            }
-            let actor_io_pending = !self.actor_io_tasks.is_empty();
-            let peer_delivery_pending = !self.peer_delivery_tasks.is_empty();
-            let lifecycle_pending = !self.lifecycle_tasks.is_empty();
-            let member_live_mutation_pending = !self.member_live_mutation_tasks.is_empty();
-            let identity_reconcile_pending = !self.identity_reconcile_queue.is_empty();
-            let identity_reconcile_backoff_wait = self.identity_reconcile_next_backoff_wait();
-            let deferred_command_pending = !deferred_commands.is_empty();
-            // Task completions are the actor's fault boundary. The outer
-            // biased select observes every ready JoinError before either a
-            // deferred or newly received command can be admitted. The inner
-            // select retains fairness for the always-ready identity lane
-            // versus new commands and timers.
-            let regular_wake = async {
-                tokio::select! {
-                    routed = command_rx.recv() => RegularActorWake::Routed(routed),
-                    _tick = host_status_poll.tick() => RegularActorWake::HostStatusPoll,
-                    // Queue admission is itself the causal wake. Tokio's
-                    // default select fairness arbitrates this always-ready
-                    // branch with commands and timers, so a self-requeued
-                    // identity cannot monopolize the actor.
-                    _ready = std::future::ready(()), if identity_reconcile_pending => {
-                        RegularActorWake::IdentityReconcile
-                    }
-                    _deadline = async move {
-                        match identity_reconcile_backoff_wait {
-                            Some(wait) => tokio::time::sleep(wait).await,
-                            None => std::future::pending::<()>().await,
-                        }
-                    } => RegularActorWake::IdentityBackoffDeadline,
-                    _tick = identity_reconcile_safety_scan.tick() => {
-                        RegularActorWake::IdentitySafetyScan
-                    }
-                }
-            };
-            let deferred_command = async { deferred_commands.pop_front() };
-            let routed = tokio::select! {
-                biased;
-                joined = self.actor_io_tasks.join_next(), if actor_io_pending => {
-                    if let Some(joined) = joined {
-                        self.reconcile_actor_io_task_join(joined);
-                    }
-                    continue;
-                }
-                joined = self.peer_delivery_tasks.join_next(), if peer_delivery_pending => {
-                    if let Some(joined) = joined {
-                        match joined {
-                            Ok(completion) => {
-                                self.peer_delivery_inflight.remove(&completion.id);
-                            }
-                            Err(error) => {
-                                let _ = self.reconcile_peer_delivery_join_error(
-                                    error,
-                                    "peer delivery completion",
-                                    ActorTaskJoinPanicDisposition::AmbiguousEffectFailStop,
-                                );
-                            }
-                        }
-                    }
-                    continue;
-                }
-                joined = self.lifecycle_tasks.join_next(), if lifecycle_pending => {
-                    if let Some(joined) = joined
-                        && let Err(error) = self.surface_lifecycle_task_outcome(joined)
-                    {
-                        tracing::warn!(
-                            mob_id = %self.definition.id,
-                            error = %error,
-                            "orchestrator lifecycle completion reconciliation failed"
-                        );
-                        self.retain_lifecycle_delivery_error(error);
-                    }
-                    continue;
-                }
-                joined = self.member_live_mutation_tasks.join_next(),
-                    if member_live_mutation_pending =>
-                {
-                    if let Some(joined) = joined
-                        && let Err(error) =
-                            self.reconcile_joined_member_live_mutation(
-                                joined,
-                                MemberLiveReconcileMode::Background,
-                            ).await
-                    {
-                        tracing::warn!(
-                            mob_id = %self.definition.id,
-                            error = %error,
-                            "mutating member-live completion reconciliation failed"
-                        );
-                    }
-                    continue;
-                }
-                deferred = deferred_command, if deferred_command_pending => {
-                    let Some(routed) = deferred else {
-                        continue;
-                    };
-                    routed
-                }
-                wake = regular_wake => {
-                    match wake {
-                        RegularActorWake::Routed(Some(routed)) => routed,
-                        RegularActorWake::Routed(None) => break,
-                        RegularActorWake::HostStatusPoll => {
-                            self.spawn_periodic_host_status_polls(
-                                &mut host_status_polls_in_flight,
-                            )
-                            .await;
-                            continue;
-                        }
-                        RegularActorWake::IdentityReconcile => {
-                            self.reconcile_next_identity(&mut identity_session_witnesses).await;
-                            continue;
-                        }
-                        RegularActorWake::IdentityBackoffDeadline => {
-                            self.enqueue_due_identity_reconcile_backoffs();
-                            continue;
-                        }
-                        RegularActorWake::IdentitySafetyScan => {
-                            self.enqueue_next_identity_intent_safety_page().await;
-                            continue;
-                        }
-                    }
-                }
+            let routed = match boxed_arm_future(|| {
+                self.wait_for_actor_wake(
+                    &mut command_rx,
+                    &mut deferred_commands,
+                    &mut host_status_polls_in_flight,
+                    &mut identity_session_witnesses,
+                    &mut host_status_poll,
+                    &mut identity_reconcile_safety_scan,
+                )
+            })
+            .await
+            {
+                ActorLoopWakeSelection::Routed(routed) => routed,
+                ActorLoopWakeSelection::Continue => continue,
+                ActorLoopWakeSelection::BreakActor => break,
             };
             // Chokepoint (a): resolve+require BEFORE any handler logic, on
             // the actor's own serialized machine state (DEC-P5E-4). Deferred
@@ -22247,6 +22486,22 @@ impl MobActor {
                 // reply channel by `reject_scope_denied`.
                 ScopeAdmission::Denied => continue,
             };
+            // Only actor-admitted lifecycle authority can invalidate a
+            // retained explicit-Resume terminal. A caller that merely fails
+            // mailbox/scope admission must not erase the still-authoritative
+            // result. This serialized boundary also fences late publication
+            // from the predecessor generation.
+            if matches!(
+                &cmd,
+                MobCommand::Stop { .. }
+                    | MobCommand::Complete { .. }
+                    | MobCommand::Reset { .. }
+                    | MobCommand::Destroy { .. }
+                    | MobCommand::Shutdown { .. }
+            ) {
+                self.explicit_resume_operations
+                    .invalidate_after_lifecycle_admission();
+            }
             match self
                 .dispatch_command_boxed(
                     &authority,
@@ -27147,8 +27402,8 @@ impl MobActor {
             remote,
             direct_member_fence,
         });
-        let admitted = Box::pin(self.finalize_spawn_admit(&ctx, provision)).await?;
-        Box::pin(self.finalize_spawn_activate(ctx, admitted)).await
+        let admitted = boxed_arm_future(|| self.finalize_spawn_admit(&ctx, provision)).await?;
+        boxed_arm_future(|| self.finalize_spawn_activate(ctx, admitted)).await
     }
 
     /// Consume a pending provision on a FAILED spawn finalization. Local
@@ -28248,10 +28503,12 @@ impl MobActor {
                     continue;
                 }
                 let peer_agent_identity = crate::ids::AgentIdentity::from(peer_identity.as_str());
-                if let Err(error) = Box::pin(self.handle_wire(
-                    agent_identity.clone(),
-                    super::handle::PeerTarget::Local(peer_agent_identity),
-                ))
+                if let Err(error) = boxed_arm_future(|| {
+                    self.repair_machine_owned_respawn_wire(
+                        agent_identity.clone(),
+                        peer_agent_identity,
+                    )
+                })
                 .await
                 {
                     tracing::warn!(
@@ -31566,6 +31823,357 @@ impl MobActor {
         Ok(())
     }
 
+    /// Reinstall the shell trust/route projection for an edge the MobMachine
+    /// already owns. This excludes every new-edge branch so respawn topology
+    /// restoration does not poll the generic wire future's large frame on the
+    /// already-deep spawn/respawn actor stack.
+    async fn repair_existing_member_wire(
+        &mut self,
+        edge: &mob_dsl::WiringEdge,
+        local: &AgentIdentity,
+        peer_member_identity: &AgentIdentity,
+        local_endpoint: &WiringEndpoint,
+        peer_endpoint: &WiringEndpoint,
+    ) -> Result<(), MobError> {
+        let authority = self.apply_wire_members_idempotent(edge)?;
+        if !authority.is_repair() {
+            return Err(MobError::WiringError(
+                "idempotent wire repair did not produce generated repair authority".to_string(),
+            ));
+        }
+        let handoff = authority.member_handoff()?;
+        match (local_endpoint, peer_endpoint) {
+            (
+                WiringEndpoint::Local {
+                    comms: local_comms,
+                    spec: local_spec,
+                    ..
+                },
+                WiringEndpoint::Local {
+                    comms: peer_comms,
+                    spec: peer_spec,
+                    ..
+                },
+            ) => {
+                let peer_key = Self::trusted_peer_removal_key(peer_spec);
+                let local_key = Self::trusted_peer_removal_key(local_spec);
+                handoff.require_peer_id_for(peer_member_identity, &peer_key)?;
+                let local_trust_created = match self
+                    .apply_trusted_peer_add_report(
+                        local_comms.as_ref(),
+                        peer_spec.clone(),
+                        handoff.repair_authority_for(
+                            peer_member_identity,
+                            &peer_key,
+                            &self.dsl_authority,
+                        )?,
+                    )
+                    .await
+                {
+                    Ok(created) => created,
+                    Err(error) => return Err(MobError::from(error)),
+                };
+                handoff.require_peer_id_for(local, &local_key)?;
+                if let Err(error) = self
+                    .apply_trusted_peer_add_report(
+                        peer_comms.as_ref(),
+                        local_spec.clone(),
+                        handoff.repair_authority_for(local, &local_key, &self.dsl_authority)?,
+                    )
+                    .await
+                {
+                    if local_trust_created {
+                        self.rollback_peer_only_trust(
+                            edge,
+                            local_comms.as_ref(),
+                            peer_member_identity,
+                            &peer_key,
+                            "wire_members_repair_rollback_trust_authority",
+                        )
+                        .await;
+                    }
+                    return Err(MobError::from(error));
+                }
+            }
+            (
+                WiringEndpoint::PeerOnly {
+                    spec: local_spec,
+                    binding: local_binding,
+                },
+                WiringEndpoint::PeerOnly {
+                    spec: peer_spec,
+                    binding: peer_binding,
+                },
+            ) => {
+                self.wire_peer_only_recipient(
+                    local_spec,
+                    Some(local_binding),
+                    peer_spec,
+                    std::time::Duration::from_secs(10),
+                )
+                .await
+                .map_err(|error| {
+                    tracing::debug!(
+                        mob_id = %self.definition.id,
+                        %error,
+                        "peer-only trust repair failed before reciprocal side"
+                    );
+                    error
+                })?;
+                if let Err(error) = self
+                    .wire_peer_only_recipient(
+                        peer_spec,
+                        Some(peer_binding),
+                        local_spec,
+                        std::time::Duration::from_secs(10),
+                    )
+                    .await
+                {
+                    self.rollback_peer_only_wire(
+                        edge,
+                        false,
+                        WiringSides::local(),
+                        local,
+                        peer_member_identity,
+                        local_spec,
+                        peer_spec,
+                    )
+                    .await;
+                    return Err(error);
+                }
+            }
+            (
+                WiringEndpoint::Local {
+                    comms: local_comms,
+                    spec: local_spec,
+                    ..
+                },
+                WiringEndpoint::PeerOnly {
+                    spec: peer_spec,
+                    binding: peer_binding,
+                },
+            ) => {
+                let peer_key = Self::trusted_peer_removal_key(peer_spec);
+                handoff.require_peer_id_for(peer_member_identity, &peer_key)?;
+                let local_trust_created = match self
+                    .apply_trusted_peer_add_report(
+                        local_comms.as_ref(),
+                        peer_spec.clone(),
+                        handoff.repair_authority_for(
+                            peer_member_identity,
+                            &peer_key,
+                            &self.dsl_authority,
+                        )?,
+                    )
+                    .await
+                {
+                    Ok(created) => created,
+                    Err(error) => return Err(MobError::from(error)),
+                };
+                if let Err(error) = self
+                    .wire_peer_only_recipient(
+                        peer_spec,
+                        Some(peer_binding),
+                        local_spec,
+                        std::time::Duration::from_secs(10),
+                    )
+                    .await
+                {
+                    if local_trust_created {
+                        self.rollback_peer_only_trust(
+                            edge,
+                            local_comms.as_ref(),
+                            peer_member_identity,
+                            &peer_key,
+                            "wire_members_peer_only_repair_rollback_trust_authority",
+                        )
+                        .await;
+                    }
+                    return Err(error);
+                }
+            }
+            (
+                WiringEndpoint::PeerOnly {
+                    spec: local_spec,
+                    binding: local_binding,
+                },
+                WiringEndpoint::Local {
+                    comms: peer_comms,
+                    spec: peer_spec,
+                    ..
+                },
+            ) => {
+                let local_key = Self::trusted_peer_removal_key(local_spec);
+                handoff.require_peer_id_for(local, &local_key)?;
+                let peer_trust_created = match self
+                    .apply_trusted_peer_add_report(
+                        peer_comms.as_ref(),
+                        local_spec.clone(),
+                        handoff.repair_authority_for(local, &local_key, &self.dsl_authority)?,
+                    )
+                    .await
+                {
+                    Ok(created) => created,
+                    Err(error) => return Err(MobError::from(error)),
+                };
+                if let Err(error) = self
+                    .wire_peer_only_recipient(
+                        local_spec,
+                        Some(local_binding),
+                        peer_spec,
+                        std::time::Duration::from_secs(10),
+                    )
+                    .await
+                {
+                    if peer_trust_created {
+                        self.rollback_peer_only_trust(
+                            edge,
+                            peer_comms.as_ref(),
+                            local,
+                            &local_key,
+                            "wire_members_peer_only_repair_rollback_trust_authority",
+                        )
+                        .await;
+                    }
+                    return Err(error);
+                }
+            }
+            (
+                WiringEndpoint::Local {
+                    comms: local_comms, ..
+                },
+                WiringEndpoint::Placed {
+                    identity: placed_identity,
+                    spec: placed_spec,
+                    ..
+                },
+            ) => {
+                // LOCAL-side reinstall only: the placed side's trust
+                // repair rides the route-install obligations re-driven
+                // below.
+                let placed_key = Self::trusted_peer_removal_key(placed_spec);
+                handoff.require_peer_id_for(placed_identity, &placed_key)?;
+                self.apply_trusted_peer_add_report(
+                    local_comms.as_ref(),
+                    placed_spec.clone(),
+                    handoff.repair_authority_for(
+                        placed_identity,
+                        &placed_key,
+                        &self.dsl_authority,
+                    )?,
+                )
+                .await
+                .map_err(MobError::from)?;
+            }
+            (
+                WiringEndpoint::Placed {
+                    identity: placed_identity,
+                    spec: placed_spec,
+                    ..
+                },
+                WiringEndpoint::Local {
+                    comms: peer_comms, ..
+                },
+            ) => {
+                let placed_key = Self::trusted_peer_removal_key(placed_spec);
+                handoff.require_peer_id_for(placed_identity, &placed_key)?;
+                self.apply_trusted_peer_add_report(
+                    peer_comms.as_ref(),
+                    placed_spec.clone(),
+                    handoff.repair_authority_for(
+                        placed_identity,
+                        &placed_key,
+                        &self.dsl_authority,
+                    )?,
+                )
+                .await
+                .map_err(MobError::from)?;
+            }
+            (WiringEndpoint::Placed { .. }, WiringEndpoint::Placed { .. }) => {
+                // Both endpoints remote: every trust lane rides the
+                // route-install obligations re-driven below.
+            }
+            (WiringEndpoint::Placed { .. }, WiringEndpoint::PeerOnly { .. })
+            | (WiringEndpoint::PeerOnly { .. }, WiringEndpoint::Placed { .. }) => {
+                return Err(MobError::WiringError(format!(
+                    "wire between a placed member and a legacy external (peer-only) member is unsupported ('{local}' <-> '{peer_member_identity}')"
+                )));
+            }
+        }
+        // Repair is the operator retry lane (§9 "retry drains
+        // obligations idempotently"): re-record + re-drive the
+        // cross-host obligations for this edge (set-insert idempotent,
+        // no epoch bump; the machine re-emits `RouteInstallRequested`).
+        self.fold_route_install_obligations_after_wire(edge).await;
+        Ok(())
+    }
+
+    /// Respawn-only existing-edge repair. The preserved topology ledger is
+    /// machine authority that the edge already exists; this wrapper rechecks
+    /// that fact and resolves the exact current endpoint incarnations before
+    /// entering the compact repair-only future above.
+    async fn repair_machine_owned_respawn_wire(
+        &mut self,
+        local: AgentIdentity,
+        peer_identity: AgentIdentity,
+    ) -> Result<(), MobError> {
+        let peer_member_identity = AgentIdentity::from(peer_identity.as_str());
+        let edge = mob_dsl::WiringEdge::new(
+            mob_dsl::AgentIdentity::from_domain(&local),
+            mob_dsl::AgentIdentity::from_domain(&peer_identity),
+        );
+        self.probe_command_admission(
+            mob_dsl::MobMachineInput::WireMembers { edge: edge.clone() },
+            MobState::Running,
+            "respawn_wire_repair_command_admission",
+        )?;
+        if local == peer_identity {
+            return Err(MobError::WiringError(format!(
+                "wire requires distinct members (got '{local}')"
+            )));
+        }
+        self.ensure_member_not_broken(&local).await?;
+        self.ensure_member_not_broken(&peer_member_identity).await?;
+        if !self
+            .dsl_authority
+            .state()
+            .wiring_edges
+            .iter()
+            .any(|existing| existing == &edge)
+        {
+            return Err(MobError::WiringError(format!(
+                "respawn topology restore requires machine-owned edge ('{local}' <-> '{peer_identity}')"
+            )));
+        }
+        let (local_entry, peer_entry) = {
+            let roster = self.roster.read().await;
+            (
+                roster
+                    .get(&local)
+                    .cloned()
+                    .ok_or_else(|| MobError::MemberNotFound(local.clone()))?,
+                roster
+                    .get(&peer_member_identity)
+                    .cloned()
+                    .ok_or_else(|| MobError::MemberNotFound(peer_member_identity.clone()))?,
+            )
+        };
+        let local_endpoint = self
+            .resolve_wiring_endpoint(&local_entry, "respawn wire repair")
+            .await?;
+        let peer_endpoint = self
+            .resolve_wiring_endpoint(&peer_entry, "respawn wire repair")
+            .await?;
+        self.repair_existing_member_wire(
+            &edge,
+            &local,
+            &peer_member_identity,
+            &local_endpoint,
+            &peer_endpoint,
+        )
+        .await
+    }
+
     /// D-wire-handler (#26) + #31 D-trust-reconciliation (Wave D): forward a
     /// wire command to the MobMachine DSL and install bidirectional comms
     /// trust + peer notifications.
@@ -31670,285 +32278,15 @@ impl MobActor {
         let local_endpoint = self.resolve_wiring_endpoint(&local_entry, "wire").await?;
         let peer_endpoint = self.resolve_wiring_endpoint(&peer_entry, "wire").await?;
         if dsl_has_edge {
-            let authority = self.apply_wire_members_idempotent(&edge)?;
-            if !authority.is_repair() {
-                return Err(MobError::WiringError(
-                    "idempotent wire repair did not produce generated repair authority".to_string(),
-                ));
-            }
-            let handoff = authority.member_handoff()?;
-            match (&local_endpoint, &peer_endpoint) {
-                (
-                    WiringEndpoint::Local {
-                        comms: local_comms,
-                        spec: local_spec,
-                        ..
-                    },
-                    WiringEndpoint::Local {
-                        comms: peer_comms,
-                        spec: peer_spec,
-                        ..
-                    },
-                ) => {
-                    let peer_key = Self::trusted_peer_removal_key(peer_spec);
-                    let local_key = Self::trusted_peer_removal_key(local_spec);
-                    handoff.require_peer_id_for(&peer_member_identity, &peer_key)?;
-                    let local_trust_created = match self
-                        .apply_trusted_peer_add_report(
-                            local_comms.as_ref(),
-                            peer_spec.clone(),
-                            handoff.repair_authority_for(
-                                &peer_member_identity,
-                                &peer_key,
-                                &self.dsl_authority,
-                            )?,
-                        )
-                        .await
-                    {
-                        Ok(created) => created,
-                        Err(error) => return Err(MobError::from(error)),
-                    };
-                    handoff.require_peer_id_for(&local, &local_key)?;
-                    if let Err(error) = self
-                        .apply_trusted_peer_add_report(
-                            peer_comms.as_ref(),
-                            local_spec.clone(),
-                            handoff.repair_authority_for(
-                                &local,
-                                &local_key,
-                                &self.dsl_authority,
-                            )?,
-                        )
-                        .await
-                    {
-                        if local_trust_created {
-                            self.rollback_peer_only_trust(
-                                &edge,
-                                local_comms.as_ref(),
-                                &peer_member_identity,
-                                &peer_key,
-                                "wire_members_repair_rollback_trust_authority",
-                            )
-                            .await;
-                        }
-                        return Err(MobError::from(error));
-                    }
-                }
-                (
-                    WiringEndpoint::PeerOnly {
-                        spec: local_spec,
-                        binding: local_binding,
-                    },
-                    WiringEndpoint::PeerOnly {
-                        spec: peer_spec,
-                        binding: peer_binding,
-                    },
-                ) => {
-                    self.wire_peer_only_recipient(
-                        local_spec,
-                        Some(local_binding),
-                        peer_spec,
-                        std::time::Duration::from_secs(10),
-                    )
-                    .await
-                    .map_err(|error| {
-                        tracing::debug!(
-                            mob_id = %self.definition.id,
-                            %error,
-                            "peer-only trust repair failed before reciprocal side"
-                        );
-                        error
-                    })?;
-                    if let Err(error) = self
-                        .wire_peer_only_recipient(
-                            peer_spec,
-                            Some(peer_binding),
-                            local_spec,
-                            std::time::Duration::from_secs(10),
-                        )
-                        .await
-                    {
-                        self.rollback_peer_only_wire(
-                            &edge,
-                            false,
-                            WiringSides::local(),
-                            &local,
-                            &peer_member_identity,
-                            local_spec,
-                            peer_spec,
-                        )
-                        .await;
-                        return Err(error);
-                    }
-                }
-                (
-                    WiringEndpoint::Local {
-                        comms: local_comms,
-                        spec: local_spec,
-                        ..
-                    },
-                    WiringEndpoint::PeerOnly {
-                        spec: peer_spec,
-                        binding: peer_binding,
-                    },
-                ) => {
-                    let peer_key = Self::trusted_peer_removal_key(peer_spec);
-                    handoff.require_peer_id_for(&peer_member_identity, &peer_key)?;
-                    let local_trust_created = match self
-                        .apply_trusted_peer_add_report(
-                            local_comms.as_ref(),
-                            peer_spec.clone(),
-                            handoff.repair_authority_for(
-                                &peer_member_identity,
-                                &peer_key,
-                                &self.dsl_authority,
-                            )?,
-                        )
-                        .await
-                    {
-                        Ok(created) => created,
-                        Err(error) => return Err(MobError::from(error)),
-                    };
-                    if let Err(error) = self
-                        .wire_peer_only_recipient(
-                            peer_spec,
-                            Some(peer_binding),
-                            local_spec,
-                            std::time::Duration::from_secs(10),
-                        )
-                        .await
-                    {
-                        if local_trust_created {
-                            self.rollback_peer_only_trust(
-                                &edge,
-                                local_comms.as_ref(),
-                                &peer_member_identity,
-                                &peer_key,
-                                "wire_members_peer_only_repair_rollback_trust_authority",
-                            )
-                            .await;
-                        }
-                        return Err(error);
-                    }
-                }
-                (
-                    WiringEndpoint::PeerOnly {
-                        spec: local_spec,
-                        binding: local_binding,
-                    },
-                    WiringEndpoint::Local {
-                        comms: peer_comms,
-                        spec: peer_spec,
-                        ..
-                    },
-                ) => {
-                    let local_key = Self::trusted_peer_removal_key(local_spec);
-                    handoff.require_peer_id_for(&local, &local_key)?;
-                    let peer_trust_created = match self
-                        .apply_trusted_peer_add_report(
-                            peer_comms.as_ref(),
-                            local_spec.clone(),
-                            handoff.repair_authority_for(
-                                &local,
-                                &local_key,
-                                &self.dsl_authority,
-                            )?,
-                        )
-                        .await
-                    {
-                        Ok(created) => created,
-                        Err(error) => return Err(MobError::from(error)),
-                    };
-                    if let Err(error) = self
-                        .wire_peer_only_recipient(
-                            local_spec,
-                            Some(local_binding),
-                            peer_spec,
-                            std::time::Duration::from_secs(10),
-                        )
-                        .await
-                    {
-                        if peer_trust_created {
-                            self.rollback_peer_only_trust(
-                                &edge,
-                                peer_comms.as_ref(),
-                                &local,
-                                &local_key,
-                                "wire_members_peer_only_repair_rollback_trust_authority",
-                            )
-                            .await;
-                        }
-                        return Err(error);
-                    }
-                }
-                (
-                    WiringEndpoint::Local {
-                        comms: local_comms, ..
-                    },
-                    WiringEndpoint::Placed {
-                        identity: placed_identity,
-                        spec: placed_spec,
-                        ..
-                    },
-                ) => {
-                    // LOCAL-side reinstall only: the placed side's trust
-                    // repair rides the route-install obligations re-driven
-                    // below.
-                    let placed_key = Self::trusted_peer_removal_key(placed_spec);
-                    handoff.require_peer_id_for(placed_identity, &placed_key)?;
-                    self.apply_trusted_peer_add_report(
-                        local_comms.as_ref(),
-                        placed_spec.clone(),
-                        handoff.repair_authority_for(
-                            placed_identity,
-                            &placed_key,
-                            &self.dsl_authority,
-                        )?,
-                    )
-                    .await
-                    .map_err(MobError::from)?;
-                }
-                (
-                    WiringEndpoint::Placed {
-                        identity: placed_identity,
-                        spec: placed_spec,
-                        ..
-                    },
-                    WiringEndpoint::Local {
-                        comms: peer_comms, ..
-                    },
-                ) => {
-                    let placed_key = Self::trusted_peer_removal_key(placed_spec);
-                    handoff.require_peer_id_for(placed_identity, &placed_key)?;
-                    self.apply_trusted_peer_add_report(
-                        peer_comms.as_ref(),
-                        placed_spec.clone(),
-                        handoff.repair_authority_for(
-                            placed_identity,
-                            &placed_key,
-                            &self.dsl_authority,
-                        )?,
-                    )
-                    .await
-                    .map_err(MobError::from)?;
-                }
-                (WiringEndpoint::Placed { .. }, WiringEndpoint::Placed { .. }) => {
-                    // Both endpoints remote: every trust lane rides the
-                    // route-install obligations re-driven below.
-                }
-                (WiringEndpoint::Placed { .. }, WiringEndpoint::PeerOnly { .. })
-                | (WiringEndpoint::PeerOnly { .. }, WiringEndpoint::Placed { .. }) => {
-                    return Err(MobError::WiringError(format!(
-                        "wire between a placed member and a legacy external (peer-only) member is unsupported ('{local}' <-> '{peer_identity}')"
-                    )));
-                }
-            }
-            // Repair is the operator retry lane (§9 "retry drains
-            // obligations idempotently"): re-record + re-drive the
-            // cross-host obligations for this edge (set-insert idempotent,
-            // no epoch bump; the machine re-emits `RouteInstallRequested`).
-            self.fold_route_install_obligations_after_wire(&edge).await;
-            return Ok(());
+            return self
+                .repair_existing_member_wire(
+                    &edge,
+                    &local,
+                    &peer_member_identity,
+                    &local_endpoint,
+                    &peer_endpoint,
+                )
+                .await;
         }
         if matches!(local_endpoint, WiringEndpoint::Placed { .. })
             || matches!(peer_endpoint, WiringEndpoint::Placed { .. })
@@ -31974,76 +32312,79 @@ impl MobActor {
             },
         ) = (&local_endpoint, &peer_endpoint)
         {
-            let authority = self.apply_wire_members_idempotent(&edge)?;
-            let dsl_added = authority.dsl_added();
-            if let Err(error) = self
-                .wire_peer_only_recipient(
-                    local_spec,
-                    Some(local_binding),
-                    peer_spec,
-                    std::time::Duration::from_secs(10),
-                )
-                .await
-            {
-                self.rollback_peer_only_wire(
-                    &edge,
-                    dsl_added,
-                    WiringSides::empty(),
-                    &local,
-                    &peer_member_identity,
-                    local_spec,
-                    peer_spec,
-                )
-                .await;
-                return Err(error);
-            }
-            if let Err(error) = self
-                .wire_peer_only_recipient(
-                    peer_spec,
-                    Some(peer_binding),
-                    local_spec,
-                    std::time::Duration::from_secs(10),
-                )
-                .await
-            {
-                self.rollback_peer_only_wire(
-                    &edge,
-                    dsl_added,
-                    WiringSides::local(),
-                    &local,
-                    &peer_member_identity,
-                    local_spec,
-                    peer_spec,
-                )
-                .await;
-                return Err(error);
-            }
-            let event = NewMobEvent {
-                mob_id: self.definition.id.clone(),
-                timestamp: None,
-                kind: MobEventKind::MembersWired {
-                    a: AgentIdentity::from(edge.a.0.as_str()),
-                    b: AgentIdentity::from(edge.b.0.as_str()),
-                },
-            };
-            let stored = match self.events.append(event).await {
-                Ok(stored) => stored,
-                Err(error) => {
+            return boxed_arm_future(|| async {
+                let authority = self.apply_wire_members_idempotent(&edge)?;
+                let dsl_added = authority.dsl_added();
+                if let Err(error) = self
+                    .wire_peer_only_recipient(
+                        local_spec,
+                        Some(local_binding),
+                        peer_spec,
+                        std::time::Duration::from_secs(10),
+                    )
+                    .await
+                {
                     self.rollback_peer_only_wire(
                         &edge,
                         dsl_added,
-                        WiringSides::both(),
+                        WiringSides::empty(),
                         &local,
                         &peer_member_identity,
                         local_spec,
                         peer_spec,
                     )
                     .await;
-                    return Err(MobError::from(error));
+                    return Err(error);
                 }
-            };
-            self.roster.write().await.apply_event(&stored);
-            return Ok(());
+                if let Err(error) = self
+                    .wire_peer_only_recipient(
+                        peer_spec,
+                        Some(peer_binding),
+                        local_spec,
+                        std::time::Duration::from_secs(10),
+                    )
+                    .await
+                {
+                    self.rollback_peer_only_wire(
+                        &edge,
+                        dsl_added,
+                        WiringSides::local(),
+                        &local,
+                        &peer_member_identity,
+                        local_spec,
+                        peer_spec,
+                    )
+                    .await;
+                    return Err(error);
+                }
+                let event = NewMobEvent {
+                    mob_id: self.definition.id.clone(),
+                    timestamp: None,
+                    kind: MobEventKind::MembersWired {
+                        a: AgentIdentity::from(edge.a.0.as_str()),
+                        b: AgentIdentity::from(edge.b.0.as_str()),
+                    },
+                };
+                let stored = match self.events.append(event).await {
+                    Ok(stored) => stored,
+                    Err(error) => {
+                        self.rollback_peer_only_wire(
+                            &edge,
+                            dsl_added,
+                            WiringSides::both(),
+                            &local,
+                            &peer_member_identity,
+                            local_spec,
+                            peer_spec,
+                        )
+                        .await;
+                        return Err(MobError::from(error));
+                    }
+                };
+                self.roster.write().await.apply_event(&stored);
+                Ok(())
+            })
+            .await;
         }
         if let (
             WiringEndpoint::Local {
@@ -32057,25 +32398,58 @@ impl MobActor {
             },
         ) = (&local_endpoint, &peer_endpoint)
         {
-            let authority = self.apply_wire_members_idempotent(&edge)?;
-            let dsl_added = authority.dsl_added();
-            let handoff = authority.member_handoff()?;
-            let peer_key = Self::trusted_peer_removal_key(peer_spec);
-            handoff.require_peer_id_for(&peer_member_identity, &peer_key)?;
-            let local_trust_created = match self
-                .apply_trusted_peer_add_report(
-                    local_comms.as_ref(),
-                    peer_spec.clone(),
-                    handoff.wiring_authority_for(
-                        &peer_member_identity,
-                        &peer_key,
-                        &self.dsl_authority,
-                    )?,
-                )
-                .await
-            {
-                Ok(created) => created,
-                Err(error) => {
+            return boxed_arm_future(|| async {
+                let authority = self.apply_wire_members_idempotent(&edge)?;
+                let dsl_added = authority.dsl_added();
+                let handoff = authority.member_handoff()?;
+                let peer_key = Self::trusted_peer_removal_key(peer_spec);
+                handoff.require_peer_id_for(&peer_member_identity, &peer_key)?;
+                let local_trust_created = match self
+                    .apply_trusted_peer_add_report(
+                        local_comms.as_ref(),
+                        peer_spec.clone(),
+                        handoff.wiring_authority_for(
+                            &peer_member_identity,
+                            &peer_key,
+                            &self.dsl_authority,
+                        )?,
+                    )
+                    .await
+                {
+                    Ok(created) => created,
+                    Err(error) => {
+                        self.rollback_peer_only_wire(
+                            &edge,
+                            dsl_added,
+                            WiringSides::empty(),
+                            &local,
+                            &peer_member_identity,
+                            local_spec,
+                            peer_spec,
+                        )
+                        .await;
+                        return Err(MobError::from(error));
+                    }
+                };
+                if let Err(error) = self
+                    .wire_peer_only_recipient(
+                        peer_spec,
+                        Some(peer_binding),
+                        local_spec,
+                        std::time::Duration::from_secs(10),
+                    )
+                    .await
+                {
+                    if local_trust_created {
+                        self.rollback_peer_only_trust(
+                            &edge,
+                            local_comms.as_ref(),
+                            &peer_member_identity,
+                            &peer_key,
+                            "wire_members_peer_only_rollback_trust_authority",
+                        )
+                        .await;
+                    }
                     self.rollback_peer_only_wire(
                         &edge,
                         dsl_added,
@@ -32086,76 +32460,46 @@ impl MobActor {
                         peer_spec,
                     )
                     .await;
-                    return Err(MobError::from(error));
+                    return Err(error);
                 }
-            };
-            if let Err(error) = self
-                .wire_peer_only_recipient(
-                    peer_spec,
-                    Some(peer_binding),
-                    local_spec,
-                    std::time::Duration::from_secs(10),
-                )
-                .await
-            {
-                if local_trust_created {
-                    self.rollback_peer_only_trust(
-                        &edge,
-                        local_comms.as_ref(),
-                        &peer_member_identity,
-                        &peer_key,
-                        "wire_members_peer_only_rollback_trust_authority",
-                    )
-                    .await;
-                }
-                self.rollback_peer_only_wire(
-                    &edge,
-                    dsl_added,
-                    WiringSides::empty(),
-                    &local,
-                    &peer_member_identity,
-                    local_spec,
-                    peer_spec,
-                )
-                .await;
-                return Err(error);
-            }
-            let event = NewMobEvent {
-                mob_id: self.definition.id.clone(),
-                timestamp: None,
-                kind: MobEventKind::MembersWired {
-                    a: AgentIdentity::from(edge.a.0.as_str()),
-                    b: AgentIdentity::from(edge.b.0.as_str()),
-                },
-            };
-            let stored = match self.events.append(event).await {
-                Ok(stored) => stored,
-                Err(error) => {
-                    if local_trust_created {
-                        self.rollback_peer_only_trust(
+                let event = NewMobEvent {
+                    mob_id: self.definition.id.clone(),
+                    timestamp: None,
+                    kind: MobEventKind::MembersWired {
+                        a: AgentIdentity::from(edge.a.0.as_str()),
+                        b: AgentIdentity::from(edge.b.0.as_str()),
+                    },
+                };
+                let stored = match self.events.append(event).await {
+                    Ok(stored) => stored,
+                    Err(error) => {
+                        if local_trust_created {
+                            self.rollback_peer_only_trust(
+                                &edge,
+                                local_comms.as_ref(),
+                                &peer_member_identity,
+                                &peer_key,
+                                "wire_members_peer_only_event_rollback_trust_authority",
+                            )
+                            .await;
+                        }
+                        self.rollback_peer_only_wire(
                             &edge,
-                            local_comms.as_ref(),
+                            dsl_added,
+                            WiringSides::peer(),
+                            &local,
                             &peer_member_identity,
-                            &peer_key,
-                            "wire_members_peer_only_event_rollback_trust_authority",
+                            local_spec,
+                            peer_spec,
                         )
                         .await;
+                        return Err(MobError::from(error));
                     }
-                    self.rollback_peer_only_wire(
-                        &edge,
-                        dsl_added,
-                        WiringSides::peer(),
-                        &local,
-                        &peer_member_identity,
-                        local_spec,
-                        peer_spec,
-                    )
-                    .await;
-                    return Err(MobError::from(error));
-                }
-            };
-            self.roster.write().await.apply_event(&stored);
-            return Ok(());
+                };
+                self.roster.write().await.apply_event(&stored);
+                Ok(())
+            })
+            .await;
         }
         if let (
             WiringEndpoint::PeerOnly {
@@ -32169,21 +32513,54 @@ impl MobActor {
             },
         ) = (&local_endpoint, &peer_endpoint)
         {
-            let authority = self.apply_wire_members_idempotent(&edge)?;
-            let dsl_added = authority.dsl_added();
-            let handoff = authority.member_handoff()?;
-            let local_key = Self::trusted_peer_removal_key(local_spec);
-            handoff.require_peer_id_for(&local, &local_key)?;
-            let peer_trust_created = match self
-                .apply_trusted_peer_add_report(
-                    peer_comms.as_ref(),
-                    local_spec.clone(),
-                    handoff.wiring_authority_for(&local, &local_key, &self.dsl_authority)?,
-                )
-                .await
-            {
-                Ok(created) => created,
-                Err(error) => {
+            return boxed_arm_future(|| async {
+                let authority = self.apply_wire_members_idempotent(&edge)?;
+                let dsl_added = authority.dsl_added();
+                let handoff = authority.member_handoff()?;
+                let local_key = Self::trusted_peer_removal_key(local_spec);
+                handoff.require_peer_id_for(&local, &local_key)?;
+                let peer_trust_created = match self
+                    .apply_trusted_peer_add_report(
+                        peer_comms.as_ref(),
+                        local_spec.clone(),
+                        handoff.wiring_authority_for(&local, &local_key, &self.dsl_authority)?,
+                    )
+                    .await
+                {
+                    Ok(created) => created,
+                    Err(error) => {
+                        self.rollback_peer_only_wire(
+                            &edge,
+                            dsl_added,
+                            WiringSides::empty(),
+                            &local,
+                            &peer_member_identity,
+                            local_spec,
+                            peer_spec,
+                        )
+                        .await;
+                        return Err(MobError::from(error));
+                    }
+                };
+                if let Err(error) = self
+                    .wire_peer_only_recipient(
+                        local_spec,
+                        Some(local_binding),
+                        peer_spec,
+                        std::time::Duration::from_secs(10),
+                    )
+                    .await
+                {
+                    if peer_trust_created {
+                        self.rollback_peer_only_trust(
+                            &edge,
+                            peer_comms.as_ref(),
+                            &local,
+                            &local_key,
+                            "wire_members_peer_only_rollback_trust_authority",
+                        )
+                        .await;
+                    }
                     self.rollback_peer_only_wire(
                         &edge,
                         dsl_added,
@@ -32194,76 +32571,46 @@ impl MobActor {
                         peer_spec,
                     )
                     .await;
-                    return Err(MobError::from(error));
+                    return Err(error);
                 }
-            };
-            if let Err(error) = self
-                .wire_peer_only_recipient(
-                    local_spec,
-                    Some(local_binding),
-                    peer_spec,
-                    std::time::Duration::from_secs(10),
-                )
-                .await
-            {
-                if peer_trust_created {
-                    self.rollback_peer_only_trust(
-                        &edge,
-                        peer_comms.as_ref(),
-                        &local,
-                        &local_key,
-                        "wire_members_peer_only_rollback_trust_authority",
-                    )
-                    .await;
-                }
-                self.rollback_peer_only_wire(
-                    &edge,
-                    dsl_added,
-                    WiringSides::empty(),
-                    &local,
-                    &peer_member_identity,
-                    local_spec,
-                    peer_spec,
-                )
-                .await;
-                return Err(error);
-            }
-            let event = NewMobEvent {
-                mob_id: self.definition.id.clone(),
-                timestamp: None,
-                kind: MobEventKind::MembersWired {
-                    a: AgentIdentity::from(edge.a.0.as_str()),
-                    b: AgentIdentity::from(edge.b.0.as_str()),
-                },
-            };
-            let stored = match self.events.append(event).await {
-                Ok(stored) => stored,
-                Err(error) => {
-                    if peer_trust_created {
-                        self.rollback_peer_only_trust(
+                let event = NewMobEvent {
+                    mob_id: self.definition.id.clone(),
+                    timestamp: None,
+                    kind: MobEventKind::MembersWired {
+                        a: AgentIdentity::from(edge.a.0.as_str()),
+                        b: AgentIdentity::from(edge.b.0.as_str()),
+                    },
+                };
+                let stored = match self.events.append(event).await {
+                    Ok(stored) => stored,
+                    Err(error) => {
+                        if peer_trust_created {
+                            self.rollback_peer_only_trust(
+                                &edge,
+                                peer_comms.as_ref(),
+                                &local,
+                                &local_key,
+                                "wire_members_peer_only_event_rollback_trust_authority",
+                            )
+                            .await;
+                        }
+                        self.rollback_peer_only_wire(
                             &edge,
-                            peer_comms.as_ref(),
+                            dsl_added,
+                            WiringSides::local(),
                             &local,
-                            &local_key,
-                            "wire_members_peer_only_event_rollback_trust_authority",
+                            &peer_member_identity,
+                            local_spec,
+                            peer_spec,
                         )
                         .await;
+                        return Err(MobError::from(error));
                     }
-                    self.rollback_peer_only_wire(
-                        &edge,
-                        dsl_added,
-                        WiringSides::local(),
-                        &local,
-                        &peer_member_identity,
-                        local_spec,
-                        peer_spec,
-                    )
-                    .await;
-                    return Err(MobError::from(error));
-                }
-            };
-            self.roster.write().await.apply_event(&stored);
-            return Ok(());
+                };
+                self.roster.write().await.apply_event(&stored);
+                Ok(())
+            })
+            .await;
         }
         let (local_comms, local_spec) = match local_endpoint {
             WiringEndpoint::Local { comms, spec, .. } => (comms, spec),
@@ -32292,128 +32639,82 @@ impl MobActor {
             }
         };
 
-        // Submit the DSL input. A new edge emits `WiringGraphChanged`; an
-        // existing edge emits generated local repair authority. Only a graph
-        // change means rollback must undo a machine graph mutation.
-        let authority = self.apply_wire_members_idempotent(&edge)?;
-        let dsl_added = authority.dsl_added();
-        let handoff = authority.member_handoff()?;
+        boxed_arm_future(|| async {
+            // Submit the DSL input. A new edge emits `WiringGraphChanged`; an
+            // existing edge emits generated local repair authority. Only a graph
+            // change means rollback must undo a machine graph mutation.
+            let authority = self.apply_wire_members_idempotent(&edge)?;
+            let dsl_added = authority.dsl_added();
+            let handoff = authority.member_handoff()?;
 
-        let local_peer_id = Self::trusted_peer_removal_key(&local_spec);
-        let peer_peer_id = Self::trusted_peer_removal_key(&peer_spec);
+            let local_peer_id = Self::trusted_peer_removal_key(&local_spec);
+            let peer_peer_id = Self::trusted_peer_removal_key(&peer_spec);
 
-        // A-side trust install.
-        handoff.require_peer_id_for(&peer_member_identity, &peer_peer_id)?;
-        let local_trust_created = match self
-            .apply_trusted_peer_add_report(
-                local_comms.as_ref(),
-                peer_spec.clone(),
-                handoff.wiring_authority_for(
-                    &peer_member_identity,
-                    &peer_peer_id,
-                    &self.dsl_authority,
-                )?,
-            )
-            .await
-        {
-            Ok(created) => created,
-            Err(err) => {
-                self.rollback_wire_side_effects(
-                    &edge,
-                    dsl_added,
-                    false,
-                    false,
-                    &local_comms,
-                    &peer_comms,
-                    &local_peer_id,
-                    &peer_peer_id,
-                    handoff,
+            // A-side trust install.
+            handoff.require_peer_id_for(&peer_member_identity, &peer_peer_id)?;
+            let local_trust_created = match self
+                .apply_trusted_peer_add_report(
+                    local_comms.as_ref(),
+                    peer_spec.clone(),
+                    handoff.wiring_authority_for(
+                        &peer_member_identity,
+                        &peer_peer_id,
+                        &self.dsl_authority,
+                    )?,
                 )
-                .await;
-                return Err(MobError::from(err));
-            }
-        };
+                .await
+            {
+                Ok(created) => created,
+                Err(err) => {
+                    self.rollback_wire_side_effects(
+                        &edge,
+                        dsl_added,
+                        false,
+                        false,
+                        &local_comms,
+                        &peer_comms,
+                        &local_peer_id,
+                        &peer_peer_id,
+                        handoff,
+                    )
+                    .await;
+                    return Err(MobError::from(err));
+                }
+            };
 
-        // B-side trust install.
-        handoff.require_peer_id_for(&local, &local_peer_id)?;
-        let peer_trust_created = match self
-            .apply_trusted_peer_add_report(
-                peer_comms.as_ref(),
-                local_spec.clone(),
-                handoff.wiring_authority_for(&local, &local_peer_id, &self.dsl_authority)?,
-            )
-            .await
-        {
-            Ok(created) => created,
-            Err(err) => {
-                self.rollback_wire_side_effects(
-                    &edge,
-                    dsl_added,
-                    local_trust_created,
-                    false,
-                    &local_comms,
-                    &peer_comms,
-                    &local_peer_id,
-                    &peer_peer_id,
-                    handoff,
+            // B-side trust install.
+            handoff.require_peer_id_for(&local, &local_peer_id)?;
+            let peer_trust_created = match self
+                .apply_trusted_peer_add_report(
+                    peer_comms.as_ref(),
+                    local_spec.clone(),
+                    handoff.wiring_authority_for(&local, &local_peer_id, &self.dsl_authority)?,
                 )
-                .await;
-                return Err(MobError::from(err));
-            }
-        };
+                .await
+            {
+                Ok(created) => created,
+                Err(err) => {
+                    self.rollback_wire_side_effects(
+                        &edge,
+                        dsl_added,
+                        local_trust_created,
+                        false,
+                        &local_comms,
+                        &peer_comms,
+                        &local_peer_id,
+                        &peer_peer_id,
+                        handoff,
+                    )
+                    .await;
+                    return Err(MobError::from(err));
+                }
+            };
 
-        // Notify A that B is now wired.
-        if let Err(err) = self
-            .notify_peer_added(&peer_comms, &local_spec, &peer_member_identity, &peer_entry)
-            .await
-        {
-            self.rollback_wire_side_effects(
-                &edge,
-                dsl_added,
-                local_trust_created,
-                peer_trust_created,
-                &local_comms,
-                &peer_comms,
-                &local_peer_id,
-                &peer_peer_id,
-                handoff,
-            )
-            .await;
-            return Err(err);
-        }
-
-        // Notify B that A is now wired.
-        if let Err(err) = self
-            .notify_peer_added(&local_comms, &peer_spec, &local, &local_entry)
-            .await
-        {
-            self.rollback_wire_side_effects(
-                &edge,
-                dsl_added,
-                local_trust_created,
-                peer_trust_created,
-                &local_comms,
-                &peer_comms,
-                &local_peer_id,
-                &peer_peer_id,
-                handoff,
-            )
-            .await;
-            return Err(err);
-        }
-
-        // Append MembersWired — rollback on failure.
-        let event = NewMobEvent {
-            mob_id: self.definition.id.clone(),
-            timestamp: None,
-            kind: MobEventKind::MembersWired {
-                a: AgentIdentity::from(edge.a.0.as_str()),
-                b: AgentIdentity::from(edge.b.0.as_str()),
-            },
-        };
-        let stored = match self.events.append(event).await {
-            Ok(stored) => stored,
-            Err(err) => {
+            // Notify A that B is now wired.
+            if let Err(err) = self
+                .notify_peer_added(&peer_comms, &local_spec, &peer_member_identity, &peer_entry)
+                .await
+            {
                 self.rollback_wire_side_effects(
                     &edge,
                     dsl_added,
@@ -32426,11 +32727,60 @@ impl MobActor {
                     handoff,
                 )
                 .await;
-                return Err(MobError::from(err));
+                return Err(err);
             }
-        };
-        self.roster.write().await.apply_event(&stored);
-        Ok(())
+
+            // Notify B that A is now wired.
+            if let Err(err) = self
+                .notify_peer_added(&local_comms, &peer_spec, &local, &local_entry)
+                .await
+            {
+                self.rollback_wire_side_effects(
+                    &edge,
+                    dsl_added,
+                    local_trust_created,
+                    peer_trust_created,
+                    &local_comms,
+                    &peer_comms,
+                    &local_peer_id,
+                    &peer_peer_id,
+                    handoff,
+                )
+                .await;
+                return Err(err);
+            }
+
+            // Append MembersWired — rollback on failure.
+            let event = NewMobEvent {
+                mob_id: self.definition.id.clone(),
+                timestamp: None,
+                kind: MobEventKind::MembersWired {
+                    a: AgentIdentity::from(edge.a.0.as_str()),
+                    b: AgentIdentity::from(edge.b.0.as_str()),
+                },
+            };
+            let stored = match self.events.append(event).await {
+                Ok(stored) => stored,
+                Err(err) => {
+                    self.rollback_wire_side_effects(
+                        &edge,
+                        dsl_added,
+                        local_trust_created,
+                        peer_trust_created,
+                        &local_comms,
+                        &peer_comms,
+                        &local_peer_id,
+                        &peer_peer_id,
+                        handoff,
+                    )
+                    .await;
+                    return Err(MobError::from(err));
+                }
+            };
+            self.roster.write().await.apply_event(&stored);
+            Ok(())
+        })
+        .await
     }
 
     /// New-edge wire lanes involving a placed endpoint (multi-host §10.4).
@@ -35837,6 +36187,10 @@ impl MobActor {
         self.flush_routed_effects().await
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "retirement keeps each topology, archive, deadline, and admission authority explicit"
+    )]
     async fn handle_retire_inner(
         &mut self,
         agent_identity: &AgentIdentity,
@@ -36826,16 +37180,18 @@ impl MobActor {
     ) -> Result<RespawnProgress, super::handle::MobRespawnError> {
         use super::handle::{MemberRespawnReceipt, MobRespawnError};
 
-        tracing::debug!(
-            agent_identity = %agent_identity,
-            "MobActor::handle_respawn start"
-        );
-        self.ensure_pending_spawn_alignment("handle_respawn preflight")
-            .map_err(MobRespawnError::from)?;
-        tracing::debug!(
-            agent_identity = %agent_identity,
-            "MobActor::handle_respawn preflight aligned"
-        );
+        let (placed_host, snapshot, replacement_spec, original_identity) =
+            boxed_arm_future(|| async {
+                tracing::debug!(
+                    agent_identity = %agent_identity,
+                    "MobActor::handle_respawn start"
+                );
+                self.ensure_pending_spawn_alignment("handle_respawn preflight")
+                    .map_err(MobRespawnError::from)?;
+                tracing::debug!(
+                    agent_identity = %agent_identity,
+                    "MobActor::handle_respawn preflight aligned"
+                );
 
         // ADJ-24: the machine `member_placement` fact is the placed-member
         // discriminator — never the MemberRef shape. Its peer transport shell
@@ -36909,11 +37265,11 @@ impl MobActor {
             "MobActor::handle_respawn captured snapshot"
         );
 
-        let original_identity = AgentIdentity::from(agent_identity.as_str());
-        let mut replacement_spec = super::handle::SpawnMemberSpec::new(
-            snapshot.profile_name.clone(),
-            original_identity.clone(),
-        );
+                let original_identity = AgentIdentity::from(agent_identity.as_str());
+                let mut replacement_spec = super::handle::SpawnMemberSpec::new(
+                    snapshot.profile_name.clone(),
+                    original_identity.clone(),
+                );
         replacement_spec.initial_message = initial_message;
         replacement_spec.runtime_mode = Some(snapshot.runtime_mode);
         // ADJ-24: a placed member's replacement carries the machine placement
@@ -36955,7 +37311,7 @@ impl MobActor {
                  to an explicit runtime binding"
             ))));
         }
-        if replacement_spec.placement != placed_host {
+                if replacement_spec.placement != placed_host {
             // Placement is the machine `member_placement` fact; a customizer
             // cannot re-place an existing member mid-respawn (re-placement is
             // an operator/machine decision, §9 — fail closed, never silently
@@ -36963,7 +37319,16 @@ impl MobActor {
             return Err(MobRespawnError::from(MobError::Internal(format!(
                 "spawn customizer cannot re-place respawn of '{original_identity}'"
             ))));
-        }
+                }
+
+                Ok::<_, MobRespawnError>((
+                    placed_host,
+                    snapshot,
+                    replacement_spec,
+                    original_identity,
+                ))
+            })
+            .await?;
 
         // ADJ-24: placed respawn = re-materialization — retire releases the
         // remote materialization (W-C), the replacement rides the ordinary
@@ -37146,8 +37511,9 @@ impl MobActor {
             "MobActor::handle_respawn retired previous member"
         );
 
-        // 3. Rebuild the replacement spawn preserving identity, profile, labels, mode, and peer intent.
-        let (prompt, initial_turn_prompt) = match replacement_initial_message {
+        boxed_arm_future(|| async {
+            // 3. Rebuild the replacement spawn preserving identity, profile, labels, mode, and peer intent.
+            let (prompt, initial_turn_prompt) = match replacement_initial_message {
             Some(message) => {
                 let prompt = message;
                 (prompt.clone(), Some(prompt))
@@ -37423,7 +37789,7 @@ impl MobActor {
         // 4. Provision and finalize the replacement member inline so the receipt reflects
         //    the committed canonical member/session state before we return.
         let mut respawn_trust_cleanup_uncertain = false;
-        let replacement_result: Result<super::handle::MemberSpawnReceipt, MobRespawnError> = Box::pin(async {
+        let replacement_result: Result<super::handle::MemberSpawnReceipt, MobRespawnError> = boxed_arm_future(|| async {
             tracing::debug!(
                 agent_identity = %agent_identity,
                 "MobActor::handle_respawn provisioning replacement member"
@@ -37542,7 +37908,7 @@ impl MobActor {
                 agent_identity = %agent_identity,
                 "MobActor::handle_respawn finalizing replacement spawn"
             );
-            let finalized = Box::pin(self.finalize_spawn_from_pending(
+            let finalized = boxed_arm_future(|| self.finalize_spawn_from_pending(
                     &snapshot.profile_name,
                     &agent_identity,
                     replacement_generation,
@@ -37654,7 +38020,7 @@ impl MobActor {
         let _replacement = replacement_result?;
 
         // 5. Build the receipt from the committed replacement member reference.
-        Ok(RespawnProgress::Completed(MemberRespawnReceipt::new(
+            Ok(RespawnProgress::Completed(MemberRespawnReceipt::new(
             AgentIdentity::from(agent_identity.as_str()),
             crate::ids::AgentRuntimeId::new(
                 AgentIdentity::from(agent_identity.as_str()),
@@ -37667,7 +38033,9 @@ impl MobActor {
                 .get(&agent_identity)
                 .map(|entry| entry.fence_token)
                 .unwrap_or(snapshot.old_fence_token),
-        )))
+            )))
+        })
+        .await
     }
 
     // -----------------------------------------------------------------------

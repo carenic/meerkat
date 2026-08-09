@@ -256,6 +256,12 @@ impl<'de> Deserialize<'de> for BridgeProtocolVersion {
 ///   terminal receipt.
 ///   New-command payloads stamp V4; V2/V3 remain explicitly negotiable for
 ///   their pre-V4 command vocabulary.
+/// - `4` (additive, no bump): `ReleaseMember` may reject with
+///   `RuntimeRetirementInProgress { stage }` only after structured runtime
+///   evidence proves the exact teardown remains admitted, retryable, and
+///   authority-retaining. Generic host unavailability remains `Unavailable`.
+///   Older strict receivers fail loud on the new tagged cause rather than
+///   silently treating it as a terminal release result.
 /// - `4` (additive, no bump): `DeliverMemberInput` carries the optional
 ///   delegated objective identity. `None` is omitted for byte compatibility;
 ///   a present value must fail loud on an older strict receiver rather than
@@ -2019,6 +2025,12 @@ pub enum BridgeRejectionCause {
     /// The addressed member/host is transiently unable to serve the
     /// command (observation degrades typed, never quiet).
     Unavailable,
+    /// An exact member-runtime retirement has been admitted and retains its
+    /// teardown authority, but did not converge within the bounded bridge
+    /// observation window. The controller may retry the same exact
+    /// `ReleaseMember` tuple; this cause is never used for generic host
+    /// unavailability.
+    RuntimeRetirementInProgress { stage: String },
     /// Plane-(b) control-scope denial (A9).
     ScopeDenied {
         required: WireControlScope,
@@ -4218,6 +4230,37 @@ mod tests {
         }
         let reencoded = serde_json::to_value(&decoded).expect("reserialize reply");
         assert_eq!(value, reencoded);
+    }
+
+    #[test]
+    fn bridge_reply_retirement_in_progress_round_trip_preserves_stage() {
+        let reply = BridgeReply::Rejected {
+            cause: BridgeRejectionCause::RuntimeRetirementInProgress {
+                stage: "turn_finalization_boundary".to_string(),
+            },
+            reason: "exact teardown authority retained".to_string(),
+        };
+        let value = serde_json::to_value(&reply).expect("serialize retained retirement reply");
+        assert_eq!(
+            value,
+            json!({
+                "result": "rejected",
+                "cause": {
+                    "runtime_retirement_in_progress": {
+                        "stage": "turn_finalization_boundary",
+                    },
+                },
+                "reason": "exact teardown authority retained",
+            })
+        );
+        let decoded = decode_bridge_rejection_reply(SUPERVISOR_BRIDGE_PROTOCOL_VERSION, &value)
+            .expect("retained retirement rejection decodes");
+        assert_eq!(
+            decoded.typed_cause(),
+            Some(BridgeRejectionCause::RuntimeRetirementInProgress {
+                stage: "turn_finalization_boundary".to_string(),
+            })
+        );
     }
 
     #[test]

@@ -175,10 +175,7 @@ async fn failed_release_is_typed_and_retry_converges_at_the_recorded_tuple() {
         .await
         .expect("placed spawn commits");
 
-    scripted.fail_next_release(
-        BridgeRejectionCause::Unavailable,
-        "injected release failure",
-    );
+    scripted.fail_next_release(BridgeRejectionCause::Unavailable, "host unavailable");
     let error = controlling
         .handle
         .retire(AgentIdentity::from("b2"))
@@ -187,18 +184,45 @@ async fn failed_release_is_typed_and_retry_converges_at_the_recorded_tuple() {
     assert!(
         matches!(
             &error,
-            meerkat_mob::MobError::BridgeCommandRejected {
-                cause: BridgeRejectionCause::Unavailable,
-                reason,
-            } if reason.contains("injected release failure")
+            meerkat_mob::MobError::SharedRetirementFailure(shared)
+                if matches!(
+                    shared.as_ref(),
+                    meerkat_mob::MobError::BridgeCommandRejected {
+                        cause: BridgeRejectionCause::Unavailable,
+                        ..
+                    }
+                )
         ),
-        "the injected authenticated rejection must surface unchanged, got {error:?}"
+        "generic ReleaseMember Unavailable must not claim retained retirement authority, got {error:?}"
     );
     assert_eq!(
         scripted.release_count(),
         1,
-        "an authenticated rejection certifies no effect; cleanup must not hide it behind an internal retry"
+        "the caller observes one bounded attempt before choosing the exact retry"
     );
+
+    scripted.fail_next_release(
+        BridgeRejectionCause::RuntimeRetirementInProgress {
+            stage: "turn_finalization_boundary".to_string(),
+        },
+        "exact runtime retirement remains admitted",
+    );
+    let error = controlling
+        .handle
+        .retire(AgentIdentity::from("b2"))
+        .await
+        .expect_err("retained exact retirement must surface typed in-progress");
+    assert!(
+        matches!(
+            &error,
+            meerkat_mob::MobError::MemberRetirementInProgress {
+                member_id,
+                stage,
+            } if member_id.as_str() == "b2" && stage == "turn_finalization_boundary"
+        ),
+        "dedicated retained-retirement cause must preserve exact retry authority, got {error:?}"
+    );
+    assert_eq!(scripted.release_count(), 2);
 
     // Retry converges: shell re-realization from the machine-recorded
     // (generation, fence, host) facts — SAME tuple on the wire (ADJ-10).
@@ -210,8 +234,8 @@ async fn failed_release_is_typed_and_retry_converges_at_the_recorded_tuple() {
     let payloads = scripted.received_release_payloads();
     assert_eq!(
         payloads.len(),
-        2,
-        "one failed attempt plus one caller-owned converging retry on the wire"
+        3,
+        "generic unavailable plus retained retirement plus one converging retry"
     );
     let first = &payloads[0];
     let last = payloads.last().expect("last release payload");

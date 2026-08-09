@@ -1277,15 +1277,30 @@ mod tests {
 
         let session = Session::new();
         let session_id = session.id().clone();
-        let result = Box::pin(materialize_session(
+        let reserved_admission = service
+            .reserve_create_session_admission()
+            .await
+            .expect("reserve exact actor materialization admission");
+        let result = Box::pin(materialize_session_with_reserved_admission_and_actor_slot(
             &service,
             &runtime_adapter,
             session,
             make_runtime_backed_request("scheduled-attached-session", true),
+            reserved_admission,
             {
                 let service = Arc::clone(&service);
                 let runtime_adapter = Arc::clone(&runtime_adapter);
-                move |session_id| default_persistent_executor(service, runtime_adapter, session_id)
+                move |_session_id, attachment_witness, actor_witness_slot| {
+                    Box::new(
+                        PersistentRuntimeExecutor::new_for_actor_slot_and_attachment(
+                            service,
+                            runtime_adapter,
+                            attachment_witness,
+                            actor_witness_slot,
+                            None,
+                        ),
+                    )
+                }
             },
         ))
         .await
@@ -1372,15 +1387,30 @@ mod tests {
 
         let session = Session::new();
         let session_id = session.id().clone();
-        let result = Box::pin(materialize_session(
+        let reserved_admission = service
+            .reserve_create_session_admission()
+            .await
+            .expect("reserve exact actor materialization admission");
+        let result = Box::pin(materialize_session_with_reserved_admission_and_actor_slot(
             &service,
             &runtime_adapter,
             session,
             make_runtime_backed_request("scheduled-detach-session", false),
+            reserved_admission,
             {
                 let service = Arc::clone(&service);
                 let runtime_adapter = Arc::clone(&runtime_adapter);
-                move |session_id| default_persistent_executor(service, runtime_adapter, session_id)
+                move |_session_id, attachment_witness, actor_witness_slot| {
+                    Box::new(
+                        PersistentRuntimeExecutor::new_for_actor_slot_and_attachment(
+                            service,
+                            runtime_adapter,
+                            attachment_witness,
+                            actor_witness_slot,
+                            None,
+                        ),
+                    )
+                }
             },
         ))
         .await

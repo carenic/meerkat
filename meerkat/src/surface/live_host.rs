@@ -103,6 +103,9 @@ pub struct ServiceMemberLiveHost {
     staged_sessions: Arc<StagedSessionRegistry>,
     staged_capacity_admissions: StagedCapacityAdmissions,
     runtime_adapter: Arc<MeerkatMachine>,
+    actor_witness_slots: Arc<
+        std::sync::Mutex<std::collections::HashMap<SessionId, crate::LiveSessionActorWitnessSlot>>,
+    >,
     host: Arc<LiveAdapterHost>,
     ws_state: Option<Arc<LiveWsState>>,
     base_url: Option<String>,
@@ -124,6 +127,7 @@ impl ServiceMemberLiveHost {
                 std::collections::HashMap::new(),
             )),
             runtime_adapter: config.runtime_adapter,
+            actor_witness_slots: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             host: config.host,
             ws_state: config.ws_state,
             base_url: config.base_url,
@@ -137,6 +141,7 @@ impl ServiceMemberLiveHost {
     }
 
     fn orchestrator(&self) -> LiveOrchestrator<'_> {
+        let actor_witness_slots = Arc::clone(&self.actor_witness_slots);
         LiveOrchestrator {
             service: &self.service,
             staged_sessions: &self.staged_sessions,
@@ -157,6 +162,12 @@ impl ServiceMemberLiveHost {
             instance_id: self.instance_id.as_deref(),
             backend: self.backend.as_deref(),
             ingress_reconciler: Some(&MOB_OWNED_ONLY_INGRESS),
+            actor_witness_capture: Arc::new(move |session_id, actor_witness_slot| {
+                actor_witness_slots
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(session_id, actor_witness_slot);
+            }),
         }
     }
 

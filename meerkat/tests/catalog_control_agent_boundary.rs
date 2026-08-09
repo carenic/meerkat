@@ -85,6 +85,11 @@ impl CatalogLoadRouteClient {
     }
 }
 
+fn normalized_catalog_usage() -> Usage {
+    meerkat_core::TurnUsage::host_declared(Provider::Other, "mock-model", Usage::default())
+        .into_inner()
+}
+
 #[async_trait]
 impl AgentLlmClient for CatalogLoadRouteClient {
     async fn stream_response(
@@ -114,7 +119,7 @@ impl AgentLlmClient for CatalogLoadRouteClient {
                     meta: None,
                 }],
                 StopReason::ToolUse,
-                Usage::default(),
+                normalized_catalog_usage(),
             )
         } else {
             LlmStreamResult::new(
@@ -123,7 +128,7 @@ impl AgentLlmClient for CatalogLoadRouteClient {
                     meta: None,
                 }],
                 StopReason::EndTurn,
-                Usage::default(),
+                normalized_catalog_usage(),
             )
         };
         *calls += 1;

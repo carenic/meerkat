@@ -352,7 +352,7 @@ pub use session_service::{
     AuthorizedSessionResume, MobSessionService, PersistedSessionAuthorityReadCost,
     ResumeRejectionKind, ResumeSessionLoad, ResumeVerdictTerminality, SessionResumeAuthority,
     SessionResumeLifecycle, SessionResumeMaterialization, SessionResumePreparationReceipt,
-    SessionResumeRejection, SessionResumeVerdict,
+    SessionResumeRejection, SessionResumeVerdict, materialize_nonpersistent_session_resume_verdict,
 };
 pub use spawn_policy::{SpawnPolicy, SpawnSpec};
 use spawn_profile_authority::{

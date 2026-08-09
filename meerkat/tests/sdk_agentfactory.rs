@@ -25,6 +25,21 @@ use serde_json::json;
 mod test_session_store;
 use test_session_store::TestSessionStore;
 
+fn normalized_anthropic_usage(request: &LlmRequest) -> LlmEvent {
+    LlmEvent::UsageUpdate {
+        usage: meerkat_core::TurnUsage::host_declared(
+            Provider::Anthropic,
+            &request.model,
+            Usage::default(),
+        ),
+    }
+}
+
+fn normalized_agent_usage(client: &dyn AgentLlmClient) -> Usage {
+    meerkat_core::TurnUsage::host_declared(client.provider(), client.model(), Usage::default())
+        .into_inner()
+}
+
 #[allow(dead_code)]
 #[derive(Debug, JsonSchema, Deserialize)]
 struct EchoInput {
@@ -46,7 +61,7 @@ impl LlmClient for MockLlmClient {
 
     fn stream<'a>(
         &'a self,
-        _request: &'a LlmRequest,
+        request: &'a LlmRequest,
     ) -> std::pin::Pin<
         Box<dyn futures::Stream<Item = Result<LlmEvent, meerkat_client::LlmError>> + Send + 'a>,
     > {
@@ -59,6 +74,7 @@ impl LlmClient for MockLlmClient {
                     args: json!({"message": "hello"}),
                     meta: None,
                 }),
+                Ok(normalized_anthropic_usage(request)),
                 Ok(LlmEvent::Done {
                     outcome: LlmDoneOutcome::Success {
                         stop_reason: meerkat::StopReason::ToolUse,
@@ -71,6 +87,7 @@ impl LlmClient for MockLlmClient {
                     delta: "done".to_string(),
                     meta: None,
                 }),
+                Ok(normalized_anthropic_usage(request)),
                 Ok(LlmEvent::Done {
                     outcome: LlmDoneOutcome::Success {
                         stop_reason: meerkat::StopReason::EndTurn,
@@ -145,7 +162,7 @@ impl AgentLlmClient for ImageAgentLlmClient {
                 meta: ProviderImageMetadata::NotEmitted,
             }],
             StopReason::EndTurn,
-            Usage::default(),
+            normalized_agent_usage(self),
         ))
     }
 
@@ -176,7 +193,7 @@ impl AgentLlmClient for CustomAgentLlmClient {
                 meta: None,
             }],
             StopReason::EndTurn,
-            Usage::default(),
+            normalized_agent_usage(self),
         ))
     }
 
@@ -301,6 +318,7 @@ impl LlmClient for ParamsCaptureClient {
                 delta: "ok".to_string(),
                 meta: None,
             }),
+            Ok(normalized_anthropic_usage(request)),
             Ok(LlmEvent::Done {
                 outcome: LlmDoneOutcome::Success {
                     stop_reason: meerkat::StopReason::EndTurn,

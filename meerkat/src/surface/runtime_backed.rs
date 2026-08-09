@@ -383,8 +383,7 @@ pub async fn materialize_attached_session_actor_only_with_reserved_admission<
         session,
         request,
         reserved_admission,
-        false,
-        None,
+        AttachedActorMaterializationMode::ordinary(),
     )
     .await
 }
@@ -411,8 +410,7 @@ where
             session,
             request,
             reserved_admission,
-            false,
-            None,
+            AttachedActorMaterializationMode::ordinary(),
         )
         .await;
     }
@@ -466,8 +464,7 @@ where
             session,
             request,
             reserved_admission,
-            false,
-            None,
+            AttachedActorMaterializationMode::ordinary(),
         )
         .await;
     }
@@ -515,13 +512,51 @@ pub async fn materialize_session_actor_unattached_with_reserved_admission<
             session,
             request,
             reserved_admission,
-            false,
-            None,
+            AttachedActorMaterializationMode::ordinary(),
         )
         .await;
     }
+    let (result, _actor_witness_slot) =
+        materialize_session_actor_unattached_with_reserved_admission_and_actor_slot(
+            service,
+            adapter,
+            session,
+            request,
+            reserved_admission,
+        )
+        .await?;
+    Ok(result)
+}
 
-    let (result, mut prepared, _actor_witness_slot) =
+/// Unattached actor materialization that returns the exact service-minted
+/// witness slot to the owning surface before any later executor attachment.
+///
+/// This form is intentionally unique-only. A caller that already owns an
+/// attachment must use the prepared actor-recovery path, which refreshes the
+/// retained publication handle under that attachment's mutation fence.
+pub(crate) async fn materialize_session_actor_unattached_with_reserved_admission_and_actor_slot<
+    B: SessionAgentBuilder + 'static,
+>(
+    service: &Arc<PersistentSessionService<B>>,
+    adapter: &Arc<MeerkatMachine>,
+    session: Session,
+    request: CreateSessionRequest,
+    reserved_admission: crate::RuntimeContextAdmissionGuard,
+) -> Result<(RunResult, crate::LiveSessionActorWitnessSlot), SurfaceRuntimeMaterializeError> {
+    if let Some(witness) = adapter
+        .current_executor_attachment_witness(session.id())
+        .await
+    {
+        return Err(SurfaceRuntimeMaterializeError::RuntimeDriver(
+            RuntimeDriverError::ValidationFailed {
+                reason: format!(
+                    "unattached actor materialization cannot replace committed attachment {witness:?}"
+                ),
+            },
+        ));
+    }
+
+    let (result, mut prepared, actor_witness_slot) =
         materialize_unique_session_actor_transaction_with_admission(
             service,
             adapter,
@@ -530,8 +565,22 @@ pub async fn materialize_session_actor_unattached_with_reserved_admission<
             reserved_admission,
         )
         .await?;
+    let actor_witness_is_exact = actor_witness_slot
+        .witness()
+        .is_some_and(|witness| witness.session_id() == &result.session_id && witness.is_live());
+    if !actor_witness_is_exact {
+        rollback_prepared_runtime_registration(&mut prepared, false).await;
+        return Err(SurfaceRuntimeMaterializeError::RuntimeDriver(
+            RuntimeDriverError::ValidationFailed {
+                reason: format!(
+                    "unattached actor materialization for session {} did not publish matching live actor authority",
+                    result.session_id
+                ),
+            },
+        ));
+    }
     prepared.commit_actor_unattached().await?;
-    Ok(result)
+    Ok((result, actor_witness_slot))
 }
 
 /// Reserved-admission actor reconstruction for a runtime executor that already
@@ -576,8 +625,7 @@ where
         session,
         request,
         reserved_admission,
-        true,
-        None,
+        AttachedActorMaterializationMode::under_turn_boundary(None),
     )
     .await
 }
@@ -615,8 +663,7 @@ pub async fn materialize_session_with_reserved_admission_under_runtime_turn_boun
         session,
         request,
         reserved_admission,
-        true,
-        Some(publication_refresh),
+        AttachedActorMaterializationMode::under_turn_boundary(Some(publication_refresh)),
     )
     .await
 }
@@ -788,6 +835,29 @@ async fn materialize_unique_session_actor_transaction_with_admission<
     Ok((result, prepared, actor_witness_slot))
 }
 
+struct AttachedActorMaterializationMode {
+    turn_boundary_already_held: bool,
+    publication_refresh: Option<AttachedActorPublicationRefreshFn>,
+}
+
+impl AttachedActorMaterializationMode {
+    const fn ordinary() -> Self {
+        Self {
+            turn_boundary_already_held: false,
+            publication_refresh: None,
+        }
+    }
+
+    const fn under_turn_boundary(
+        publication_refresh: Option<AttachedActorPublicationRefreshFn>,
+    ) -> Self {
+        Self {
+            turn_boundary_already_held: true,
+            publication_refresh,
+        }
+    }
+}
+
 async fn materialize_attached_session_actor_only_with_admission_and_boundary_mode<
     B: SessionAgentBuilder + 'static,
 >(
@@ -797,9 +867,12 @@ async fn materialize_attached_session_actor_only_with_admission_and_boundary_mod
     session: Session,
     mut request: CreateSessionRequest,
     reserved_admission: crate::RuntimeContextAdmissionGuard,
-    turn_boundary_already_held: bool,
-    publication_refresh: Option<AttachedActorPublicationRefreshFn>,
+    mode: AttachedActorMaterializationMode,
 ) -> Result<RunResult, SurfaceRuntimeMaterializeError> {
+    let AttachedActorMaterializationMode {
+        turn_boundary_already_held,
+        publication_refresh,
+    } = mode;
     let expected_session_id = session.id().clone();
     if witness.session_id() != &expected_session_id {
         return Err(SurfaceRuntimeMaterializeError::RuntimeDriver(

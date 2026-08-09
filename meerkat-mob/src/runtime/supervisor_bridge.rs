@@ -2486,7 +2486,7 @@ impl MobSupervisorBridge {
         let _authority_guard = deadline
             .run(self.authority_gate.read())
             .await
-            .map_err(|_| {
+            .map_err(|()| {
                 BridgeRequestFailure::BeforeSend(Self::bridge_request_timeout(
                     "authority-gate-not-acquired",
                     timeout,
@@ -2495,7 +2495,7 @@ impl MobSupervisorBridge {
         let runtime = deadline
             .run(self.runtime.read())
             .await
-            .map_err(|_| {
+            .map_err(|()| {
                 BridgeRequestFailure::BeforeSend(Self::bridge_request_timeout(
                     "runtime-not-observed",
                     timeout,
@@ -2602,6 +2602,10 @@ impl MobSupervisorBridge {
         .await
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the authenticated bridge send keeps runtime, peer, reply, correlation, and deadline authority explicit"
+    )]
     async fn send_supervisor_request_with_id<T: serde::Serialize>(
         &self,
         runtime: &Arc<meerkat_comms::CommsRuntime>,
@@ -2876,7 +2880,7 @@ impl MobSupervisorBridge {
             if let Some(result) = deadline
                 .run(self.take_buffered_response(runtime, request_envelope_id, expected_responder))
                 .await
-                .map_err(|_| {
+                .map_err(|()| {
                     Self::bridge_request_timeout(&request_envelope_id.to_string(), deadline.timeout)
                 })??
             {
@@ -2885,7 +2889,7 @@ impl MobSupervisorBridge {
             let drained = deadline
                 .run(runtime.handoff_volatile_peer_input_candidates())
                 .await
-                .map_err(|_| {
+                .map_err(|()| {
                     Self::bridge_request_timeout(&request_envelope_id.to_string(), deadline.timeout)
                 })?
                 .map_err(|error| MobError::Internal(error.to_string()))?;
@@ -2897,7 +2901,7 @@ impl MobSupervisorBridge {
                     expected_responder,
                 ))
                 .await
-                .map_err(|_| {
+                .map_err(|()| {
                     Self::bridge_request_timeout(&request_envelope_id.to_string(), deadline.timeout)
                 })??
             {

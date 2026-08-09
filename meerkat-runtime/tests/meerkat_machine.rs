@@ -2018,16 +2018,13 @@ async fn runtime_comms_terminal_response_wake_drains_requester_queue() {
     use meerkat_comms::runtime::comms_runtime::CommsRuntime as InprocCommsRuntime;
     use meerkat_core::agent::CommsRuntime as CoreCommsRuntime;
     use meerkat_core::comms::{
-        CommsCommand, InputStreamMode, PeerAddress, PeerName, PeerRoute, PeerTransport,
-        SendReceipt, TrustedPeerDescriptor,
+        CommsCommand, PeerAddress, PeerName, PeerRoute, PeerTransport, TrustedPeerDescriptor,
     };
     use meerkat_core::lifecycle::core_executor::{
         CoreApplyOutput, CoreExecutor, CoreExecutorError,
     };
     use meerkat_core::lifecycle::run_primitive::{RunApplyBoundary, RunPrimitive};
-    use meerkat_core::{
-        HandlingMode, InteractionContent, InteractionId, PeerCorrelationId, ResponseStatus,
-    };
+    use meerkat_core::{HandlingMode, InteractionId, PeerCorrelationId, ResponseStatus};
     use meerkat_runtime::PeerConvention;
     use meerkat_runtime::meerkat_machine::dsl as mm_dsl;
     use tokio::sync::Notify;
@@ -2114,24 +2111,6 @@ async fn runtime_comms_terminal_response_wake_drains_requester_queue() {
         ) -> Result<(), CoreExecutorError> {
             Ok(())
         }
-    }
-
-    async fn drain_until_nonempty(
-        runtime: &InprocCommsRuntime,
-    ) -> Vec<meerkat_core::interaction::PeerInputCandidate> {
-        tokio::time::timeout(Duration::from_secs(2), async {
-            loop {
-                let batch = CoreCommsRuntime::handoff_volatile_peer_input_candidates(runtime)
-                    .await
-                    .expect("exact volatile handoff");
-                if !batch.is_empty() {
-                    return batch;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .expect("classified inbox should receive request")
     }
 
     fn descriptor_for_runtime(
@@ -2233,42 +2212,15 @@ async fn runtime_comms_terminal_response_wake_drains_requester_queue() {
         "host-mode requester should spawn comms drain"
     );
 
-    adapter
-        .accept_input(&sid, make_prompt("keep requester busy"))
-        .await
-        .expect("accept blocking prompt");
-    tokio::time::timeout(Duration::from_secs(2), first_apply_started.notified())
-        .await
-        .expect("first apply should start");
-
-    let receipt = CoreCommsRuntime::send(
-        requester_comms.as_ref(),
-        CommsCommand::PeerRequest {
-            objective_id: None,
-            content_taint: None,
-            to: PeerRoute::with_display_name(
-                responder_comms.public_key().to_peer_id(),
-                PeerName::new(name_b.clone()).expect("responder peer name"),
-            ),
-            intent: "terminal-wake-probe".to_string(),
-            params: serde_json::json!({"probe": true}),
-            blocks: None,
-            handling_mode: HandlingMode::Queue,
-            stream: InputStreamMode::ReserveInteraction,
-        },
-    )
-    .await
-    .expect("send request");
-    let request_id = match receipt {
-        SendReceipt::PeerRequestSent { envelope_id, .. } => envelope_id,
-        other => panic!("expected PeerRequestSent, got {other:?}"),
-    };
-
-    let request_at_responder = drain_until_nonempty(responder_comms.as_ref()).await;
-    assert!(matches!(
-        request_at_responder[0].interaction.content,
-        InteractionContent::Request { .. }
-    ));
+    // This test exercises response-terminal wake behavior, not request
+    // transport. Seed the exact generated correlation authority directly;
+    // PeerRequest is DurableRuntime ingress and cannot be consumed by the
+    // volatile response handoff used below.
+    let request_id = Uuid::new_v4();
+    bindings
+        .peer_interaction()
+        .request_sent(PeerCorrelationId::from_uuid(request_id))
+        .expect("seed requester outbound request state");
     responder_bindings
         .peer_interaction()
         .request_received(
@@ -2276,6 +2228,17 @@ async fn runtime_comms_terminal_response_wake_drains_requester_queue() {
             meerkat_core::types::HandlingMode::Queue,
         )
         .expect("seed responder inbound request state");
+
+    // Hold the requester only after the outbound request lifecycle is durable.
+    // The contract under test is that the terminal response wakes this busy
+    // requester, not that request admission can bypass its active apply.
+    adapter
+        .accept_input(&sid, make_prompt("keep requester busy"))
+        .await
+        .expect("accept blocking prompt");
+    tokio::time::timeout(Duration::from_secs(2), first_apply_started.notified())
+        .await
+        .expect("first apply should start");
 
     CoreCommsRuntime::send(
         responder_comms.as_ref(),
@@ -3082,7 +3045,7 @@ async fn ensure_session_with_executor_repairs_stale_attached_driver() {
 #[tokio::test]
 async fn stop_runtime_executor_keeps_attachment_live_until_stop_completes() {
     use meerkat_core::lifecycle::core_executor::{
-        CoreApplyOutput, CoreExecutor, CoreExecutorError, CoreExecutorInterruptHandle,
+        CoreApplyOutput, CoreExecutor, CoreExecutorError,
     };
     use meerkat_core::lifecycle::run_primitive::{RunApplyBoundary, RunPrimitive};
     use tokio::sync::Notify;
@@ -3090,33 +3053,10 @@ async fn stop_runtime_executor_keeps_attachment_live_until_stop_completes() {
     struct BlockingStopExecutor {
         stop_entered: Arc<Notify>,
         release_stop: Arc<Notify>,
-        interrupt_calls: Arc<AtomicUsize>,
-    }
-
-    struct BlockingStopInterruptHandle {
-        interrupt_calls: Arc<AtomicUsize>,
-    }
-
-    #[async_trait::async_trait]
-    impl CoreExecutorInterruptHandle for BlockingStopInterruptHandle {
-        async fn hard_cancel_run_if_current(
-            &self,
-            _expected_run_id: &RunId,
-            _reason: String,
-        ) -> Result<bool, CoreExecutorError> {
-            self.interrupt_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(true)
-        }
     }
 
     #[async_trait::async_trait]
     impl CoreExecutor for BlockingStopExecutor {
-        fn interrupt_handle(&self) -> Option<Arc<dyn CoreExecutorInterruptHandle>> {
-            Some(Arc::new(BlockingStopInterruptHandle {
-                interrupt_calls: Arc::clone(&self.interrupt_calls),
-            }))
-        }
-
         async fn apply(
             &mut self,
             run_id: RunId,
@@ -3156,7 +3096,6 @@ async fn stop_runtime_executor_keeps_attachment_live_until_stop_completes() {
     let sid = SessionId::new();
     let stop_entered = Arc::new(Notify::new());
     let release_stop = Arc::new(Notify::new());
-    let interrupt_calls = Arc::new(AtomicUsize::new(0));
 
     adapter
         .register_session_with_executor(
@@ -3164,7 +3103,6 @@ async fn stop_runtime_executor_keeps_attachment_live_until_stop_completes() {
             Box::new(BlockingStopExecutor {
                 stop_entered: Arc::clone(&stop_entered),
                 release_stop: Arc::clone(&release_stop),
-                interrupt_calls: Arc::clone(&interrupt_calls),
             }),
         )
         .await
@@ -3185,11 +3123,10 @@ async fn stop_runtime_executor_keeps_attachment_live_until_stop_completes() {
         "stop must remain pending until executor stop and required cleanup acknowledge"
     );
 
-    adapter
-        .hard_cancel_current_run(&sid, "blocking stop attachment probe")
-        .await
-        .expect("attachment should remain published while stop is still in progress");
-    assert_eq!(interrupt_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        adapter.session_has_live_executor_attachment(&sid).await,
+        "attachment should remain published while stop is still in progress"
+    );
 
     release_stop.notify_one();
     tokio::time::timeout(Duration::from_secs(1), stop_task)
@@ -3207,6 +3144,10 @@ async fn stop_runtime_executor_keeps_attachment_live_until_stop_completes() {
     })
     .await
     .expect("runtime should reach Stopped after the blocking stop control is released");
+    assert!(
+        !adapter.session_has_live_executor_attachment(&sid).await,
+        "attachment should be removed after stop completes"
+    );
 
     let err = adapter
         .hard_cancel_current_run(&sid, "stopped runtime interrupt probe")

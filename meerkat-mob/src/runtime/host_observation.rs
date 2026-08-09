@@ -3502,6 +3502,13 @@ mod tests {
 
     #[async_trait::async_trait]
     impl MobSessionService for BoundarySessionService {
+        async fn materialize_session_resume_verdict(
+            &self,
+            session_id: &meerkat_core::SessionId,
+        ) -> Result<crate::SessionResumeVerdict, meerkat_core::service::SessionError> {
+            crate::materialize_nonpersistent_session_resume_verdict(self, session_id).await
+        }
+
         async fn observe_session_resume_authority(
             &self,
             _session_id: &meerkat_core::SessionId,

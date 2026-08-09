@@ -60,6 +60,16 @@ mod tests {
         }
     }
 
+    fn normalized_catalog_usage(request: &LlmRequest) -> LlmEvent {
+        LlmEvent::UsageUpdate {
+            usage: meerkat_core::TurnUsage::host_declared(
+                meerkat_core::Provider::Other,
+                &request.model,
+                meerkat_core::Usage::default(),
+            ),
+        }
+    }
+
     #[async_trait::async_trait]
     impl LlmClient for CatalogLoadClient {
         fn project_replay_messages(
@@ -96,6 +106,7 @@ mod tests {
                         args: json!({ "names": ["deferred_mcp_tool"] }),
                         meta: None,
                     }),
+                    Ok(normalized_catalog_usage(request)),
                     Ok(LlmEvent::Done {
                         outcome: LlmDoneOutcome::Success {
                             stop_reason: meerkat_core::StopReason::ToolUse,
@@ -108,6 +119,7 @@ mod tests {
                         delta: "done".to_string(),
                         meta: None,
                     }),
+                    Ok(normalized_catalog_usage(request)),
                     Ok(LlmEvent::Done {
                         outcome: LlmDoneOutcome::Success {
                             stop_reason: meerkat_core::StopReason::EndTurn,

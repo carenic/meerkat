@@ -211,6 +211,10 @@ impl MeerkatMachine {
         })
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "terminalization keeps every exact driver, mutation-gate, publication, and completion authority explicit"
+    )]
     async fn terminalize_failed_accepted_input(
         &self,
         session_id: &SessionId,

@@ -2767,7 +2767,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn retiring_active_run_persists_retired_before_dropping_live_witness() {
+    async fn retiring_active_run_persists_retired_while_retaining_live_witness() {
         let store = Arc::new(crate::store::InMemoryRuntimeStore::new());
         let runtime_id = LogicalRuntimeId::new("retire-active-run-durability");
         let runtime_store: Arc<dyn RuntimeStore> = store.clone();
@@ -2780,7 +2780,7 @@ mod tests {
             .contract_begin_run_authority(run_id.clone())
             .expect("contract run admission");
         assert_eq!(driver.runtime_state(), RuntimeState::Running);
-        assert_eq!(driver.inner_ref().current_run_id(), Some(run_id));
+        assert_eq!(driver.inner_ref().current_run_id(), Some(run_id.clone()));
         assert!(driver.inner_ref().pre_run_phase().is_some());
 
         let session_id = driver.inner_ref().session_authority_id_for_recovery();
@@ -2796,7 +2796,7 @@ mod tests {
             .expect("machine-authorized mid-run retire transition");
         }
         driver.sync_control_projection_from_dsl_authority();
-        assert_eq!(driver.runtime_state(), RuntimeState::Retired);
+        assert_eq!(driver.runtime_state(), RuntimeState::Running);
         assert!(
             driver.inner_ref().pre_run_phase().is_some(),
             "Retire commits before the live run witness is dropped"
@@ -2807,7 +2807,13 @@ mod tests {
             .await
             .expect("mid-run retire must durably commit");
 
-        assert_eq!(driver.runtime_state(), RuntimeState::Retired);
+        assert_eq!(driver.runtime_state(), RuntimeState::Running);
+        assert_eq!(driver.inner_ref().current_run_id(), Some(run_id));
+        assert_eq!(
+            driver.inner_ref().pre_run_phase(),
+            Some(RuntimeState::Retired),
+            "durable retirement must retain the live run's Retired terminal destination"
+        );
         assert_eq!(
             crate::store::load_runtime_state(store.as_ref(), &runtime_id)
                 .await

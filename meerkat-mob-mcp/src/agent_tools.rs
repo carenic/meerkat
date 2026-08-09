@@ -3581,6 +3581,13 @@ mod tests {
 
     #[async_trait]
     impl meerkat_mob::MobSessionService for RealCommsSessionSvc {
+        async fn materialize_session_resume_verdict(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<meerkat_mob::SessionResumeVerdict, SessionError> {
+            meerkat_mob::materialize_nonpersistent_session_resume_verdict(self, session_id).await
+        }
+
         async fn observe_session_resume_authority(
             &self,
             _session_id: &SessionId,
@@ -3639,6 +3646,15 @@ mod tests {
             self.archive_with_mob_lifecycle_authority(session_id).await
         }
 
+        async fn archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_before(
+            &self,
+            session_id: &SessionId,
+            _deadline: meerkat_core::time_compat::Instant,
+        ) -> Result<(), SessionError> {
+            self.archive_with_mob_lifecycle_authority_under_runtime_turn_boundary(session_id)
+                .await
+        }
+
         async fn discard_live_session_under_runtime_turn_boundary(
             &self,
             session_id: &SessionId,
@@ -3676,10 +3692,6 @@ mod tests {
             session_id: &SessionId,
         ) -> Result<EventStream, StreamError> {
             Err(StreamError::NotFound(format!("session {session_id}")))
-        }
-
-        fn supports_persistent_sessions(&self) -> bool {
-            true
         }
 
         async fn live_session_actor_registered(

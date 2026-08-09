@@ -2259,13 +2259,35 @@ impl LlmClient for OpenAiClient {
                         {
                             active_response_id = Some(response_id);
                         }
-                        // Handle response.completed event (non-streaming final response)
-                        if event.event_type == "response.completed" {
+                        // Responses API terminal events carry the same full response
+                        // object. `response.incomplete` is terminal too (for example,
+                        // when max_output_tokens is exhausted), so it must take the
+                        // same output/usage projection path as `response.completed`.
+                        if event.event_type == "response.completed"
+                            || event.event_type == "response.incomplete"
+                        {
                             if done_emitted {
                                 // Already processed a terminal event, skip
                                 continue;
                             }
+                            if event.response.is_none() {
+                                done_emitted = true;
+                                yield LlmEvent::Done {
+                                    outcome: missing_terminal_response_outcome(&event.event_type),
+                                };
+                                continue;
+                            }
                             if let Some(response_obj) = &event.response {
+                                if let Err(error) = validate_responses_terminal_status(
+                                    &event.event_type,
+                                    response_obj,
+                                ) {
+                                    done_emitted = true;
+                                    yield LlmEvent::Done {
+                                        outcome: LlmDoneOutcome::Error { error },
+                                    };
+                                    continue;
+                                }
                                 // Process output items
                                 if let Some(output) = response_obj.get("output").and_then(|o| o.as_array()) {
                                     for item in output {
@@ -2445,33 +2467,12 @@ impl LlmClient for OpenAiClient {
                                     };
                                 }
 
-                                // Determine stop reason
-                                let stop_reason = match response_obj.get("status").and_then(|s| s.as_str()) {
-                                    Some("completed") => {
-                                        // Check if there were tool calls
-                                        let has_tool_calls = response_obj.get("output")
-                                            .and_then(|o| o.as_array())
-                                            .is_some_and(|arr| arr.iter().any(|item| item.get("type").and_then(|t| t.as_str()) == Some("function_call")));
-                                        if has_tool_calls {
-                                            StopReason::ToolUse
-                                        } else {
-                                            StopReason::EndTurn
-                                        }
-                                    }
-                                    Some("incomplete") => {
-                                        match response_obj.get("incomplete_details").and_then(|d| d.get("reason")).and_then(|r| r.as_str()) {
-                                            Some("max_output_tokens") => StopReason::MaxTokens,
-                                            Some("content_filter") => StopReason::ContentFilter,
-                                            _ => StopReason::EndTurn,
-                                        }
-                                    }
-                                    Some("cancelled") => StopReason::Cancelled,
-                                    _ => StopReason::EndTurn,
-                                };
-
                                 done_emitted = true;
                                 yield LlmEvent::Done {
-                                    outcome: LlmDoneOutcome::Success { stop_reason },
+                                    outcome: responses_terminal_outcome(
+                                        &event.event_type,
+                                        response_obj,
+                                    ),
                                 };
                             }
                         }
@@ -2688,7 +2689,24 @@ impl LlmClient for OpenAiClient {
                         }
                         else if event.event_type == "response.done" {
                             // Final done event — always update usage
+                            if event.response.is_none() {
+                                done_emitted = true;
+                                yield LlmEvent::Done {
+                                    outcome: missing_terminal_response_outcome(&event.event_type),
+                                };
+                                continue;
+                            }
                             if let Some(response_obj) = &event.response {
+                                if let Err(error) = validate_responses_terminal_status(
+                                    &event.event_type,
+                                    response_obj,
+                                ) {
+                                    done_emitted = true;
+                                    yield LlmEvent::Done {
+                                        outcome: LlmDoneOutcome::Error { error },
+                                    };
+                                    continue;
+                                }
                                 if let Some(usage_obj) = response_obj.get("usage") {
                                     apply_responses_usage(&mut usage, usage_obj, &request.model);
                                     yield LlmEvent::UsageUpdate {
@@ -2700,31 +2718,12 @@ impl LlmClient for OpenAiClient {
                                 }
 
                                 if !done_emitted {
-                                    let stop_reason = match response_obj.get("status").and_then(|s| s.as_str()) {
-                                        Some("completed") => {
-                                            let has_tool_calls = response_obj.get("output")
-                                                .and_then(|o| o.as_array())
-                                                .is_some_and(|arr| arr.iter().any(|item| item.get("type").and_then(|t| t.as_str()) == Some("function_call")));
-                                            if has_tool_calls {
-                                                StopReason::ToolUse
-                                            } else {
-                                                StopReason::EndTurn
-                                            }
-                                        }
-                                        Some("incomplete") => {
-                                            match response_obj.get("incomplete_details").and_then(|d| d.get("reason")).and_then(|r| r.as_str()) {
-                                                Some("max_output_tokens") => StopReason::MaxTokens,
-                                                Some("content_filter") => StopReason::ContentFilter,
-                                                _ => StopReason::EndTurn,
-                                            }
-                                        }
-                                        Some("cancelled") => StopReason::Cancelled,
-                                        _ => StopReason::EndTurn,
-                                    };
-
                                     done_emitted = true;
                                     yield LlmEvent::Done {
-                                        outcome: LlmDoneOutcome::Success { stop_reason },
+                                        outcome: responses_terminal_outcome(
+                                            &event.event_type,
+                                            response_obj,
+                                        ),
                                     };
                                 }
                             }
@@ -2886,6 +2885,102 @@ struct ResponsesStreamEvent {
     output_index: Option<u64>,
     /// Sequence number for built-in tool streaming events.
     sequence_number: Option<u64>,
+}
+
+fn validate_responses_terminal_status(event_type: &str, response: &Value) -> Result<(), LlmError> {
+    let status = response.get("status").and_then(Value::as_str);
+    let status_is_valid_for_event = match event_type {
+        "response.completed" => status == Some("completed"),
+        "response.incomplete" => status == Some("incomplete"),
+        // Retained for compatible Responses endpoints that emit the
+        // Realtime-style terminal event used by existing integrations.
+        "response.done" => matches!(status, Some("completed" | "incomplete" | "cancelled")),
+        _ => false,
+    };
+    if !status_is_valid_for_event {
+        return Err(LlmError::StreamParseError {
+            message: format!(
+                "OpenAI {event_type} carried incompatible status {}",
+                status.unwrap_or("<missing>")
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn responses_terminal_outcome(event_type: &str, response: &Value) -> LlmDoneOutcome {
+    if let Err(error) = validate_responses_terminal_status(event_type, response) {
+        return LlmDoneOutcome::Error { error };
+    }
+
+    let status = response.get("status").and_then(Value::as_str);
+
+    let stop_reason = match status {
+        Some("completed") => {
+            let has_tool_calls = response
+                .get("output")
+                .and_then(Value::as_array)
+                .is_some_and(|items| {
+                    items.iter().any(|item| {
+                        item.get("type").and_then(Value::as_str) == Some("function_call")
+                    })
+                });
+            if has_tool_calls {
+                StopReason::ToolUse
+            } else {
+                StopReason::EndTurn
+            }
+        }
+        Some("incomplete") => {
+            let reason = response
+                .get("incomplete_details")
+                .and_then(|details| details.get("reason"))
+                .and_then(Value::as_str);
+            match reason {
+                // Accept the documented/generated-schema spellings used by
+                // OpenAI and compatible Responses endpoints.
+                Some("max_tokens" | "max_output_tokens") => StopReason::MaxTokens,
+                Some("content_filter") => StopReason::ContentFilter,
+                Some(reason) => {
+                    return LlmDoneOutcome::Error {
+                        error: LlmError::IncompleteResponse {
+                            message: format!(
+                                "OpenAI response was incomplete for unsupported reason '{reason}'"
+                            ),
+                        },
+                    };
+                }
+                None => {
+                    return LlmDoneOutcome::Error {
+                        error: LlmError::IncompleteResponse {
+                            message: "OpenAI response was incomplete without a reason".to_string(),
+                        },
+                    };
+                }
+            }
+        }
+        Some("cancelled") => StopReason::Cancelled,
+        other => {
+            return LlmDoneOutcome::Error {
+                error: LlmError::StreamParseError {
+                    message: format!(
+                        "OpenAI {event_type} carried unsupported terminal status {}",
+                        other.unwrap_or("<missing>")
+                    ),
+                },
+            };
+        }
+    };
+
+    LlmDoneOutcome::Success { stop_reason }
+}
+
+fn missing_terminal_response_outcome(event_type: &str) -> LlmDoneOutcome {
+    LlmDoneOutcome::Error {
+        error: LlmError::StreamParseError {
+            message: format!("OpenAI {event_type} event missing response object"),
+        },
+    }
 }
 
 fn apply_responses_usage(target: &mut Usage, usage: &Value, model: &str) {
@@ -3380,6 +3475,23 @@ mod tests {
         let app = Router::new()
             .route("/v1/responses", post(responses_sse))
             .with_state(payload);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test server");
+        let addr = listener.local_addr().expect("local addr");
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve test server");
+        });
+        (format!("http://{addr}"), handle)
+    }
+
+    async fn spawn_openai_stub_server_with_body(
+        payload: String,
+        seen: Arc<Mutex<Vec<Value>>>,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let app = Router::new()
+            .route("/v1/responses", post(responses_sse_with_body))
+            .with_state(StreamStubState { payload, seen });
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("bind test server");
@@ -5918,6 +6030,25 @@ mod tests {
         assert_eq!(summary[0]["text"], "I need to think");
     }
 
+    #[test]
+    fn test_response_incomplete_known_reason_vocabulary_is_typed() {
+        for (reason, expected) in [
+            ("max_tokens", StopReason::MaxTokens),
+            ("max_output_tokens", StopReason::MaxTokens),
+            ("content_filter", StopReason::ContentFilter),
+        ] {
+            let response = serde_json::json!({
+                "status": "incomplete",
+                "incomplete_details": { "reason": reason },
+                "output": []
+            });
+            assert!(matches!(
+                responses_terminal_outcome("response.incomplete", &response),
+                LlmDoneOutcome::Success { stop_reason } if stop_reason == expected
+            ));
+        }
+    }
+
     #[tokio::test]
     async fn test_stream_does_not_duplicate_text_when_completed_replays_output() {
         let payload = [
@@ -5977,6 +6108,147 @@ mod tests {
         assert_eq!(usage_updates[0].input_tokens, 100);
         assert_eq!(usage_updates[0].output_tokens, 5);
         assert_eq!(usage_updates[0].cache_read_tokens, Some(40));
+    }
+
+    #[tokio::test]
+    async fn test_stream_response_incomplete_at_4096_cap_preserves_partial_usage_and_done() {
+        let payload = [
+            r#"data: {"type":"response.incomplete","response":{"id":"resp_incomplete","status":"incomplete","incomplete_details":{"reason":"max_tokens"},"output":[{"type":"message","content":[{"type":"output_text","text":"{\"ops\":["}]}],"usage":{"input_tokens":1200,"output_tokens":4096,"output_tokens_details":{"reasoning_tokens":3072}}}}"#,
+            r#"data: {"type":"response.completed","response":{"id":"resp_late","status":"completed","output":[],"usage":{"input_tokens":1200,"output_tokens":4096}}}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n");
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (base_url, server) =
+            spawn_openai_stub_server_with_body(payload, Arc::clone(&seen)).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5.6-terra",
+            vec![Message::User(UserMessage::text("return JSON".to_string()))],
+        )
+        .with_max_tokens(4096);
+
+        let mut stream = client.stream(&request);
+        let mut text = String::new();
+        let mut usage_updates = Vec::new();
+        let mut outcomes = Vec::new();
+        while let Some(event) = stream.next().await {
+            match event.expect("stream event") {
+                LlmEvent::TextDelta { delta, .. } => text.push_str(&delta),
+                LlmEvent::UsageUpdate { usage } => usage_updates.push(usage),
+                LlmEvent::Done { outcome } => outcomes.push(outcome),
+                _ => {}
+            }
+        }
+        server.abort();
+
+        assert_eq!(text, r#"{"ops":["#);
+        assert_eq!(usage_updates.len(), 1);
+        assert_eq!(usage_updates[0].input_tokens, 1200);
+        assert_eq!(usage_updates[0].output_tokens, 4096);
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "terminal event must yield exactly one Done"
+        );
+        assert!(matches!(
+            outcomes[0],
+            LlmDoneOutcome::Success {
+                stop_reason: StopReason::MaxTokens
+            }
+        ));
+        let bodies = seen.lock().expect("seen request bodies");
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(
+            bodies[0].get("model").and_then(Value::as_str),
+            Some("gpt-5.6-terra")
+        );
+        assert_eq!(
+            bodies[0].get("max_output_tokens").and_then(Value::as_u64),
+            Some(4096),
+            "the regression must exercise the same outbound cap as the steward failure"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_stream_response_incomplete_unknown_reason_fails_closed_once() {
+        let payload = [
+            r#"data: {"type":"response.incomplete","response":{"id":"resp_incomplete","status":"incomplete","incomplete_details":{"reason":"provider_policy_changed"},"output":[],"usage":{"input_tokens":10,"output_tokens":2}}}"#,
+            "",
+        ]
+        .join("\n");
+        let (base_url, server) = spawn_openai_stub_server(payload).await;
+        let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+        let request = LlmRequest::new(
+            "gpt-5.6-terra",
+            vec![Message::User(UserMessage::text("hello".to_string()))],
+        );
+
+        let mut stream = client.stream(&request);
+        let mut outcomes = Vec::new();
+        while let Some(event) = stream.next().await {
+            if let LlmEvent::Done { outcome } = event.expect("stream event") {
+                outcomes.push(outcome);
+            }
+        }
+        server.abort();
+
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "terminal event must yield exactly one Done"
+        );
+        assert!(matches!(
+            &outcomes[0],
+            LlmDoneOutcome::Error {
+                error: LlmError::IncompleteResponse { message }
+            } if message.contains("provider_policy_changed")
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_stream_terminal_event_missing_or_incompatible_response_fails_closed() {
+        let cases = [
+            r#"data: {"type":"response.completed"}"#,
+            r#"data: {"type":"response.completed","response":{"status":"incomplete","output":[{"type":"message","content":[{"type":"output_text","text":"must not project"}]}],"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+            r#"data: {"type":"response.incomplete","response":{"output":[],"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+            r#"data: {"type":"response.incomplete","response":{"status":"completed","output":[],"usage":{"input_tokens":1,"output_tokens":1}}}"#,
+            r#"data: {"type":"response.done","response":{"status":"failed","usage":{"input_tokens":1,"output_tokens":1}}}"#,
+        ];
+
+        for terminal in cases {
+            let payload = [terminal, "data: [DONE]", ""].join("\n");
+            let (base_url, server) = spawn_openai_stub_server(payload).await;
+            let client = OpenAiClient::new_with_base_url("test-key".to_string(), base_url);
+            let request = LlmRequest::new(
+                "gpt-5.6-terra",
+                vec![Message::User(UserMessage::text("hello".to_string()))],
+            );
+
+            let events = client
+                .stream(&request)
+                .collect::<Vec<_>>()
+                .await
+                .into_iter()
+                .collect::<Result<Vec<_>, _>>()
+                .expect("terminal validation is represented by Done, not stream failure");
+            server.abort();
+
+            assert_eq!(
+                events.len(),
+                1,
+                "malformed terminal must not project output or usage: {terminal}"
+            );
+            assert!(matches!(
+                &events[0],
+                LlmEvent::Done {
+                    outcome: LlmDoneOutcome::Error {
+                        error: LlmError::StreamParseError { .. }
+                    }
+                }
+            ));
+        }
     }
 
     #[tokio::test]

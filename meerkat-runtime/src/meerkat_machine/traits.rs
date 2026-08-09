@@ -1,7 +1,6 @@
 use super::*;
 use crate::input_state::StoredInputState;
 use crate::store::{RuntimeSessionAuthority, RuntimeSessionPersistenceProfile};
-use futures::FutureExt as _;
 
 #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
 #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
@@ -1073,6 +1072,8 @@ impl MeerkatMachine {
             SharedCompletionRegistry,
             Option<mpsc::Sender<()>>,
             Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>>,
+            bool,
+            bool,
         ),
         RuntimeControlPlaneError,
     > {
@@ -1092,6 +1093,8 @@ impl MeerkatMachine {
             Arc::clone(&entry.completions),
             entry.wake_sender(),
             entry.publication_handle(),
+            entry.archive_recovered_registration,
+            entry.archive_recovered_from_quiescent,
         ))
     }
 
@@ -1309,87 +1312,133 @@ impl MeerkatMachine {
         session_id: &SessionId,
     ) -> Result<Option<super::MachineSessionArchiveLease>, RuntimeControlPlaneError> {
         let runtime_id = LogicalRuntimeId::for_session(session_id);
-        // Archive's outer turn-finalization boundary is already held. Take
-        // the stable absent-entry transaction before observing the map or
-        // durable lifecycle so a delayed capture can neither dispose nor
-        // retire a same-SessionId replacement.
-        let registration_transaction_guard =
-            self.lock_session_registration_transaction(session_id).await;
-        let mut recovered_registration_for_archive = false;
-        let (resolved_session_id, driver, _, _) = match self.lookup_entry(&runtime_id).await {
-            Ok(parts) => parts,
-            Err(RuntimeControlPlaneError::NotFound(_)) => {
-                // A process restart can leave unfinished runtime realization
-                // without a live session entry. Runtime lifecycle residue
-                // requires recovery so archive can finish process cleanup. A
-                // store-issued session-boundary authority independently
-                // requires recovery so archive can establish the singular
-                // Retired lifecycle terminal even when the old process left a
-                // clean Idle row. This is a bounded authority-row read, never
-                // a Session body parse.
-                let Some(store) = self.store.as_ref() else {
-                    return Ok(None);
-                };
-                let durable_lifecycle =
-                    crate::store::load_machine_lifecycle(store.as_ref(), &runtime_id)
-                        .await
-                        .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
-                let lifecycle_requires_archive = durable_lifecycle.as_ref().is_some_and(
-                    super::session_management::machine_lifecycle_has_runtime_archive_residue,
-                );
-                let lifecycle_is_quiescent = durable_lifecycle.as_ref().is_some_and(|lifecycle| {
-                    matches!(
-                        lifecycle.runtime_state(),
-                        RuntimeState::Retired | RuntimeState::Destroyed
-                    )
-                });
-                let durable_session_authority = if lifecycle_is_quiescent {
-                    None
-                } else {
-                    match store.session_persistence_profile() {
-                        RuntimeSessionPersistenceProfile::WholeBlobV1 => store
-                            .load_whole_blob_store_authority(&runtime_id)
-                            .await
-                            .map(|authority| authority.map(RuntimeSessionAuthority::WholeBlob))
-                            .map_err(|error| {
-                                RuntimeControlPlaneError::Internal(error.to_string())
-                            })?,
-                        RuntimeSessionPersistenceProfile::HeadCanonicalV1 => store
-                            .load_session_boundary_authority(&runtime_id)
+        // Durable observation and recovery invoke the injected RuntimeStore,
+        // so they must complete before T is acquired. The exact preparation
+        // single-flight is already published for this session. After recovery
+        // we acquire T, recheck the map, and either publish this exact candidate
+        // or discard it in favor of the concurrent registration that won T.
+        // No arbitrary store callback can therefore retain T indefinitely.
+        let (registration_transaction_guard, entry_parts) = loop {
+            let prepared_registration = match self.lookup_entry(&runtime_id).await {
+                Ok(_) => None,
+                Err(RuntimeControlPlaneError::NotFound(_)) => {
+                    // A process restart can leave unfinished runtime realization
+                    // without a live session entry. Runtime lifecycle residue
+                    // requires recovery so archive can finish process cleanup. A
+                    // store-issued session-boundary authority independently
+                    // requires recovery so archive can establish the singular
+                    // Retired lifecycle terminal even when the old process left a
+                    // clean Idle row. This is a bounded authority-row read, never
+                    // a Session body parse.
+                    let Some(store) = self.store.as_ref() else {
+                        return Ok(None);
+                    };
+                    let durable_lifecycle =
+                        crate::store::load_machine_lifecycle(store.as_ref(), &runtime_id)
                             .await
                             .map_err(|error| {
                                 RuntimeControlPlaneError::Internal(error.to_string())
-                            })?,
+                            })?;
+                    let lifecycle_requires_archive = durable_lifecycle.as_ref().is_some_and(
+                        super::session_management::machine_lifecycle_has_runtime_archive_residue,
+                    );
+                    let lifecycle_is_quiescent =
+                        durable_lifecycle.as_ref().is_some_and(|lifecycle| {
+                            matches!(
+                                lifecycle.runtime_state(),
+                                RuntimeState::Retired | RuntimeState::Destroyed
+                            )
+                        });
+                    // Retired does not prove terminal publication converged. The
+                    // durable outbox is committed before arbitrary publisher IO,
+                    // and the caller may time out after archive releases its
+                    // recovered registration. The store-owned pending-owner index
+                    // is the canonical cold retry authority in that state.
+                    let pending_terminal_authority = if lifecycle_is_quiescent {
+                        !store
+                            .load_pending_terminal_owner_ids_page(&runtime_id, None, 1)
+                            .await
+                            .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?
+                            .is_empty()
+                    } else {
+                        false
+                    };
+                    let durable_session_authority = if lifecycle_is_quiescent {
+                        None
+                    } else {
+                        match store.session_persistence_profile() {
+                            RuntimeSessionPersistenceProfile::WholeBlobV1 => store
+                                .load_whole_blob_store_authority(&runtime_id)
+                                .await
+                                .map(|authority| authority.map(RuntimeSessionAuthority::WholeBlob))
+                                .map_err(|error| {
+                                    RuntimeControlPlaneError::Internal(error.to_string())
+                                })?,
+                            RuntimeSessionPersistenceProfile::HeadCanonicalV1 => store
+                                .load_session_boundary_authority(&runtime_id)
+                                .await
+                                .map_err(|error| {
+                                    RuntimeControlPlaneError::Internal(error.to_string())
+                                })?,
+                        }
+                    };
+                    if let Some(authority) = durable_session_authority.as_ref()
+                        && (authority.session_id() != session_id
+                            || authority.profile() != store.session_persistence_profile())
+                    {
+                        return Err(RuntimeControlPlaneError::Internal(format!(
+                            "runtime {runtime_id} returned mismatched session-boundary authority while archiving {session_id}"
+                        )));
                     }
-                };
-                if let Some(authority) = durable_session_authority.as_ref()
-                    && (authority.session_id() != session_id
-                        || authority.profile() != store.session_persistence_profile())
-                {
-                    return Err(RuntimeControlPlaneError::Internal(format!(
-                        "runtime {runtime_id} returned mismatched session-boundary authority while archiving {session_id}"
-                    )));
+                    if !lifecycle_requires_archive
+                        && durable_session_authority.is_none()
+                        && !pending_terminal_authority
+                    {
+                        return Ok(None);
+                    }
+                    // Archive recovery must preserve the durable lifecycle
+                    // authority exactly long enough to drain terminal outboxes
+                    // and/or install the Retired terminal for the committed
+                    // session body. The public RegisterSession command
+                    // intentionally revives Stopped to Idle and clears that epoch
+                    // tuple; doing so here would destroy the witness required for
+                    // exact outbox adoption. Recover the entry mechanically,
+                    // without applying the user-facing revival transition.
+                    Some(
+                        self.prepare_archive_session_registration(
+                            session_id.clone(),
+                            lifecycle_is_quiescent,
+                        )
+                        .await
+                        .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?,
+                    )
                 }
-                if !lifecycle_requires_archive && durable_session_authority.is_none() {
-                    return Ok(None);
-                }
-                // Archive recovery must preserve the durable lifecycle
-                // authority exactly long enough to drain terminal outboxes
-                // and/or install the Retired terminal for the committed
-                // session body. The public RegisterSession command
-                // intentionally revives Stopped to Idle and clears that epoch
-                // tuple; doing so here would destroy the witness required for
-                // exact outbox adoption. Recover the entry mechanically,
-                // without applying the user-facing revival transition.
-                recovered_registration_for_archive = self
-                    .register_session_inner_under_registration_transaction(session_id.clone(), None)
+                Err(error) => return Err(error),
+            };
+
+            let registration_transaction_guard =
+                self.lock_session_registration_transaction(session_id).await;
+            match self.lookup_entry(&runtime_id).await {
+                Ok(parts) => break (registration_transaction_guard, parts),
+                Err(RuntimeControlPlaneError::NotFound(_)) => {
+                    let Some(prepared_registration) = prepared_registration else {
+                        // The optimistic live entry disappeared before T.
+                        // Release T before any durable observation and retry.
+                        drop(registration_transaction_guard);
+                        continue;
+                    };
+                    self.commit_prepared_archive_session_registration_under_transaction(
+                        prepared_registration,
+                    )
                     .await
-                    .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?
-                    .inserted();
-                self.lookup_entry(&runtime_id).await?
+                    .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
+                    let parts = self.lookup_entry(&runtime_id).await?;
+                    break (registration_transaction_guard, parts);
+                }
+                Err(error) => return Err(error),
             }
-            Err(error) => return Err(error),
         };
+        let (resolved_session_id, driver, _, _) = entry_parts;
         if &resolved_session_id != session_id {
             return Err(RuntimeControlPlaneError::Internal(format!(
                 "runtime {runtime_id} resolved to unexpected session {resolved_session_id} while archiving {session_id}"
@@ -1415,7 +1464,14 @@ impl MeerkatMachine {
             .lock_current_session_driver_gate(&resolved_session_id, &driver)
             .await
             .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
-        let (driver, completions, wake_tx, publication_handle) = self
+        let (
+            driver,
+            completions,
+            wake_tx,
+            publication_handle,
+            recovered_registration_for_archive,
+            recovered_from_quiescent_archive,
+        ) = self
             .capture_archive_lease_entry_under_mutation_guard(
                 &runtime_id,
                 &resolved_session_id,
@@ -1431,6 +1487,7 @@ impl MeerkatMachine {
             wake_tx,
             publication_handle,
             recovered_registration_for_archive,
+            recovered_from_quiescent_archive,
             _registration_transaction_guard: registration_transaction_guard,
             _live_lifecycle_lease: live_lifecycle_lease,
             _mutation_guard: mutation_guard,
@@ -1552,6 +1609,12 @@ impl MeerkatMachine {
         runtime_id: &LogicalRuntimeId,
         driver: &SharedDriver,
     ) -> Result<(), RuntimeControlPlaneError> {
+        let _registration_transaction_guard =
+            self.lock_session_registration_transaction(session_id).await;
+        let _mutation_guard = self
+            .lock_current_session_driver_gate(session_id, driver)
+            .await
+            .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
         let state = driver.lock().await.runtime_state();
         if !matches!(state, RuntimeState::Retired | RuntimeState::Destroyed) {
             return Err(RuntimeControlPlaneError::InvalidState { state });
@@ -1568,6 +1631,20 @@ impl MeerkatMachine {
                 return Err(RuntimeControlPlaneError::Internal(format!(
                     "archive-recovered runtime {runtime_id} was replaced before quiescent cleanup"
                 )));
+            }
+            if !entry.archive_recovered_registration {
+                return Err(RuntimeControlPlaneError::Internal(format!(
+                    "runtime {runtime_id} no longer carries its exact archive-recovered registration marker"
+                )));
+            }
+            let raw_state = crate::meerkat_machine::dsl_authority::runtime_phase_from_authority(
+                &entry
+                    .dsl_authority
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            if !matches!(raw_state, RuntimeState::Retired | RuntimeState::Destroyed) {
+                return Err(RuntimeControlPlaneError::InvalidState { state: raw_state });
             }
             if entry.wake_sender().is_some() || entry.publication_handle().is_some() {
                 return Err(RuntimeControlPlaneError::Internal(format!(
@@ -1594,6 +1671,7 @@ impl MeerkatMachine {
             wake_tx,
             publication_handle,
             recovered_registration_for_archive,
+            recovered_from_quiescent_archive: _,
             _registration_transaction_guard,
             _live_lifecycle_lease,
             _mutation_guard,
@@ -1608,6 +1686,12 @@ impl MeerkatMachine {
                 "archive-recovered quiescent runtime {runtime_id} acquired a live attachment before cleanup"
             )));
         }
+        drop(_mutation_guard);
+        #[cfg(feature = "live")]
+        drop(_live_lifecycle_lease);
+        #[cfg(not(feature = "live"))]
+        let _ = _live_lifecycle_lease;
+        drop(_registration_transaction_guard);
         self.remove_archive_recovered_registration_exact(&session_id, &runtime_id, &driver)
             .await
     }
@@ -1673,7 +1757,7 @@ impl MeerkatMachine {
             Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
         >,
         deadline: meerkat_core::time_compat::Instant,
-    ) -> Result<(), RuntimeControlPlaneError> {
+    ) -> Result<bool, RuntimeControlPlaneError> {
         let super::MachineSessionArchiveLease {
             session_id,
             runtime_id,
@@ -1681,7 +1765,8 @@ impl MeerkatMachine {
             completions,
             wake_tx: _,
             publication_handle,
-            recovered_registration_for_archive: _,
+            recovered_registration_for_archive,
+            recovered_from_quiescent_archive,
             _registration_transaction_guard: registration_transaction_guard,
             _live_lifecycle_lease: live_lifecycle_lease,
             _mutation_guard: mutation_guard,
@@ -1716,7 +1801,10 @@ impl MeerkatMachine {
         };
 
         drop(mutation_guard);
+        #[cfg(feature = "live")]
         drop(live_lifecycle_lease);
+        #[cfg(not(feature = "live"))]
+        let _ = live_lifecycle_lease;
         drop(registration_transaction_guard);
         if let Some(start_tx) = start_tx {
             let _ = start_tx.send(());
@@ -1726,12 +1814,17 @@ impl MeerkatMachine {
             .map_err(|error| match error {
                 RuntimeDriverError::RuntimeTerminalPublicationInProgress { .. } => {
                     RuntimeControlPlaneError::RetirementInProgress {
-                        runtime_id,
+                        runtime_id: runtime_id.clone(),
                         stage: "terminal_publication".to_string(),
                     }
                 }
                 other => RuntimeControlPlaneError::Internal(other.to_string()),
-            })
+            })?;
+        if recovered_registration_for_archive {
+            self.remove_archive_recovered_registration_exact(&session_id, &runtime_id, &driver)
+                .await?;
+        }
+        Ok(recovered_from_quiescent_archive)
     }
 
     /// Archive-only sibling that supplies an owned, quiescent stored-session
@@ -1890,7 +1983,7 @@ impl MeerkatMachine {
             .lock_current_session_driver_gate(&session_id, &driver)
             .await
             .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
-        let (driver, completions, wake_tx, publication_handle) = self
+        let (driver, completions, wake_tx, publication_handle, _, _) = self
             .capture_archive_lease_entry_under_mutation_guard(
                 runtime_id,
                 &resolved_session_id,
@@ -1906,6 +1999,7 @@ impl MeerkatMachine {
             wake_tx,
             publication_handle,
             recovered_registration_for_archive: false,
+            recovered_from_quiescent_archive: false,
             _registration_transaction_guard: registration_transaction_guard,
             _live_lifecycle_lease: live_lifecycle_lease,
             _mutation_guard: mutation_guard,
@@ -1933,6 +2027,7 @@ impl MeerkatMachine {
             wake_tx,
             publication_handle,
             recovered_registration_for_archive,
+            recovered_from_quiescent_archive: _,
             _registration_transaction_guard: registration_transaction_guard,
             _live_lifecycle_lease: live_lifecycle_lease,
             _mutation_guard: mutation_guard,
@@ -2054,13 +2149,16 @@ impl MeerkatMachine {
             None => None,
         };
 
+        drop(mutation_guard);
+        #[cfg(feature = "live")]
+        drop(live_lifecycle_lease);
+        #[cfg(not(feature = "live"))]
+        let _ = live_lifecycle_lease;
+        drop(registration_transaction_guard);
         if recovered_registration_for_archive {
             self.remove_archive_recovered_registration_exact(&session_id, &runtime_id, &driver)
                 .await?;
         }
-        drop(mutation_guard);
-        drop(live_lifecycle_lease);
-        drop(registration_transaction_guard);
 
         if let Some((result_rx, start_tx)) = dispatch {
             if let Some(start_tx) = start_tx {
@@ -3209,6 +3307,13 @@ mod tests {
                 .await
         });
         entered.notified().await;
+        let registration_probe = crate::tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            restarted.lock_session_registration_transaction(&session_id),
+        )
+        .await
+        .expect("wedged RuntimeStore preparation must not retain registration transaction T");
+        drop(registration_probe);
         let mut followers = Vec::new();
         for _ in 0..4 {
             let follower_machine = Arc::clone(&restarted);

@@ -2364,6 +2364,19 @@ const MEMBER_HISTORY_REPLY_MAX_BYTES: usize = 512 * 1024;
 const HARD_CANCEL_SETTLE_TIMEOUT: Duration = Duration::from_secs(4);
 const HARD_CANCEL_REASSERT_INTERVAL: Duration = Duration::from_millis(10);
 
+fn hard_cancel_attempt_requires_exact_reobservation(
+    result: &Result<bool, crate::traits::RuntimeDriverError>,
+    expected_run_id: &meerkat_core::RunId,
+) -> bool {
+    matches!(
+        result,
+        Err(crate::traits::RuntimeDriverError::InterruptDispatchOutcomeUnknown {
+            run_id,
+            ..
+        }) if run_id == expected_run_id
+    )
+}
+
 /// Map a typed observation failure to its wire rejection (DEC-P6E-4).
 fn observation_error_to_bridge_rejection(
     error: &MemberObservationError,
@@ -3590,15 +3603,37 @@ async fn serve_hard_cancel_member(
     }
     let deadline = Instant::now() + HARD_CANCEL_SETTLE_TIMEOUT;
     loop {
-        match adapter
-            .hard_cancel_run_if_current_for_member_incarnation(
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let attempt = match crate::tokio::time::timeout(
+            remaining,
+            adapter.hard_cancel_run_if_current_for_member_incarnation(
                 session_id,
                 &payload.expected_run_id,
                 &payload.expected_member,
                 payload.reason.clone(),
-            )
-            .await
+            ),
+        )
+        .await
         {
+            Ok(attempt) => attempt,
+            Err(_) => break,
+        };
+        match attempt {
+            pending
+                if hard_cancel_attempt_requires_exact_reobservation(
+                    &pending,
+                    &payload.expected_run_id,
+                ) =>
+            {
+                tracing::debug!(
+                    operation_id = %payload.operation_id,
+                    expected_run_id = %payload.expected_run_id,
+                    "hard-cancel callback remains process-owned; reobserving exact dispatch"
+                );
+            }
             // The exact expected run is no longer current (or its lifecycle is
             // terminal). This is the ONLY successful reply point. In
             // particular, a newer current run also lands here without seeing
@@ -3671,6 +3706,9 @@ async fn serve_hard_cancel_member(
                 .await;
                 return;
             }
+            // Same-run pending dispatches are handled above. A pending result
+            // naming any other run cannot inherit this operation's retry
+            // authority and therefore remains an internal contract breach.
             Err(error) => {
                 send_bridge_failure(
                     comms_runtime,
@@ -3688,21 +3726,22 @@ async fn serve_hard_cancel_member(
         }
 
         if Instant::now() >= deadline {
-            send_bridge_failure(
-                comms_runtime,
-                candidate,
-                BridgeRejectionCause::Unavailable,
-                format!(
-                    "hard-cancel operation {} timed out waiting for expected run {} to become terminal",
-                    payload.operation_id, payload.expected_run_id
-                ),
-                None,
-            )
-            .await;
-            return;
+            break;
         }
         crate::tokio::time::sleep(HARD_CANCEL_REASSERT_INTERVAL).await;
     }
+
+    send_bridge_failure(
+        comms_runtime,
+        candidate,
+        BridgeRejectionCause::Unavailable,
+        format!(
+            "hard-cancel operation {} timed out waiting for expected run {} to become terminal",
+            payload.operation_id, payload.expected_run_id
+        ),
+        None,
+    )
+    .await;
 }
 
 async fn serve_cancel_tracked_member_input(
@@ -6953,6 +6992,37 @@ mod tests {
         Arc::new(MeerkatMachine::persistent_without_blobs(Arc::new(
             crate::store::InMemoryRuntimeStore::new(),
         )))
+    }
+
+    #[test]
+    fn hard_cancel_pending_is_retryable_only_for_the_same_exact_run() {
+        let expected_run_id = meerkat_core::lifecycle::RunId::new();
+        let other_run_id = meerkat_core::lifecycle::RunId::new();
+        let pending = |run_id| {
+            Err(
+                crate::traits::RuntimeDriverError::InterruptDispatchOutcomeUnknown {
+                    run_id,
+                    reason: "custom interrupt callback is still process-owned".to_string(),
+                },
+            )
+        };
+
+        assert!(hard_cancel_attempt_requires_exact_reobservation(
+            &pending(expected_run_id.clone()),
+            &expected_run_id,
+        ));
+        assert!(!hard_cancel_attempt_requires_exact_reobservation(
+            &pending(other_run_id),
+            &expected_run_id,
+        ));
+        assert!(!hard_cancel_attempt_requires_exact_reobservation(
+            &Ok(true),
+            &expected_run_id,
+        ));
+        assert!(!hard_cancel_attempt_requires_exact_reobservation(
+            &Ok(false),
+            &expected_run_id,
+        ));
     }
 
     #[derive(Default)]

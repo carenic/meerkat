@@ -2,7 +2,7 @@ from __future__ import annotations
 
 """Generated wire types for Meerkat SDK.
 
-Contract version: 0.8.21
+Contract version: 0.8.22
 """
 
 from dataclasses import dataclass, field
@@ -11,7 +11,7 @@ from typing import Any, Literal, NotRequired, Optional, Required, TypedDict
 from .errors import MeerkatError
 
 
-CONTRACT_VERSION = "0.8.21"
+CONTRACT_VERSION = "0.8.22"
 
 
 Value = Any
@@ -3350,6 +3350,7 @@ class BridgeBindPayload:
     epoch: int
     expected_address: str
     expected_peer_id: str
+    member: dict[str, Any]
     protocol_version: BridgeProtocolVersion
     supervisor: BridgePeerSpec
 
@@ -3359,6 +3360,7 @@ class BridgeBindResponse:
     """Response to a bind command."""
     address: str
     capabilities: BridgeCapabilities
+    member_fence: dict[str, Any]
     peer_id: str
 
 
@@ -3498,8 +3500,7 @@ receiver with a typed `UnsupportedProtocolVersion` cause."""
 @dataclass
 class BridgeRetireResponse:
     """Response to a retire command."""
-    inputs_abandoned: int
-    inputs_pending_drain: int
+    outcome: dict[str, Any]
 
 
 @dataclass
@@ -6441,6 +6442,7 @@ class BridgeCommandBindMember(TypedDict, total=False):
     epoch: Required[int]
     expected_address: Required[str]
     expected_peer_id: Required[str]
+    member: Required[dict[str, Any]]
     protocol_version: Required[BridgeProtocolVersion]
     supervisor: Required[BridgePeerSpec]
 
@@ -6507,6 +6509,7 @@ class BridgeCommandCancelTrackedMemberInput(TypedDict, total=False):
 class BridgeCommandRetireMember(TypedDict, total=False):
     command: Required[Literal['retire_member']]
     epoch: Required[int]
+    member_fence: Required[dict[str, Any]]
     protocol_version: Required[BridgeProtocolVersion]
     supervisor: Required[BridgePeerSpec]
 
@@ -6800,6 +6803,12 @@ class BridgeRejectionCauseHistoryRowTooLargePayload(TypedDict, total=False):
 class BridgeRejectionCauseHistoryRowTooLarge(TypedDict, total=False):
     history_row_too_large: Required[BridgeRejectionCauseHistoryRowTooLargePayload]
 
+class BridgeRejectionCauseRuntimeRetirementInProgressPayload(TypedDict, total=False):
+    stage: Required[str]
+
+class BridgeRejectionCauseRuntimeRetirementInProgress(TypedDict, total=False):
+    runtime_retirement_in_progress: Required[BridgeRejectionCauseRuntimeRetirementInProgressPayload]
+
 class BridgeRejectionCauseScopeDeniedPayload(TypedDict, total=False):
     presented: Required[list[WireControlScope]]
     required: Required[WireControlScope]
@@ -6876,7 +6885,7 @@ class BridgeRejectionCauseSessionOwnershipConflictPayload(TypedDict, total=False
 class BridgeRejectionCauseSessionOwnershipConflict(TypedDict, total=False):
     session_ownership_conflict: Required[BridgeRejectionCauseSessionOwnershipConflictPayload]
 
-BridgeRejectionCause = Literal['not_bound'] | Literal['stale_supervisor'] | Literal['sender_mismatch'] | Literal['already_bound'] | Literal['invalid_bootstrap_token'] | Literal['unsupported_protocol_version'] | Literal['invalid_supervisor_spec'] | Literal['invalid_peer_spec'] | Literal['address_mismatch'] | Literal['unsupported'] | Literal['internal'] | Literal['stale_fence'] | BridgeRejectionCauseStaleCursor | BridgeRejectionCauseOversizedEvent | BridgeRejectionCauseHistoryRowTooLarge | Literal['unavailable'] | BridgeRejectionCauseScopeDenied | Literal['spec_digest_mismatch'] | BridgeRejectionCauseMaterializeBuildRejected | BridgeRejectionCauseModelUnresolvable | BridgeRejectionCauseAuthBindingUnresolvable | BridgeRejectionCauseMcpCommandMissing | Literal['realm_backend_unavailable'] | BridgeRejectionCauseEnvKeyMissing | BridgeRejectionCauseHostEngineVersionChanged | BridgeRejectionCauseModelNotRealtime | BridgeRejectionCauseLiveAdapterUnavailable | Literal['live_transport_unavailable'] | Literal['live_channel_already_bound'] | Literal['live_channel_not_found'] | BridgeRejectionCauseLiveTransportUnsupported | Literal['resume_session_not_found'] | BridgeRejectionCauseCapabilityMissing | Literal['launch_mode_unsupported'] | Literal['launch_mode_placement_mismatch'] | BridgeRejectionCauseSessionOwnershipConflict
+BridgeRejectionCause = Literal['not_bound'] | Literal['stale_supervisor'] | Literal['sender_mismatch'] | Literal['already_bound'] | Literal['invalid_bootstrap_token'] | Literal['unsupported_protocol_version'] | Literal['invalid_supervisor_spec'] | Literal['invalid_peer_spec'] | Literal['address_mismatch'] | Literal['unsupported'] | Literal['internal'] | Literal['bind_admission_outcome_unknown'] | Literal['stale_fence'] | BridgeRejectionCauseStaleCursor | BridgeRejectionCauseOversizedEvent | BridgeRejectionCauseHistoryRowTooLarge | Literal['unavailable'] | BridgeRejectionCauseRuntimeRetirementInProgress | BridgeRejectionCauseScopeDenied | Literal['spec_digest_mismatch'] | BridgeRejectionCauseMaterializeBuildRejected | BridgeRejectionCauseModelUnresolvable | BridgeRejectionCauseAuthBindingUnresolvable | BridgeRejectionCauseMcpCommandMissing | Literal['realm_backend_unavailable'] | BridgeRejectionCauseEnvKeyMissing | BridgeRejectionCauseHostEngineVersionChanged | BridgeRejectionCauseModelNotRealtime | BridgeRejectionCauseLiveAdapterUnavailable | Literal['live_transport_unavailable'] | Literal['live_channel_already_bound'] | Literal['live_channel_not_found'] | BridgeRejectionCauseLiveTransportUnsupported | Literal['resume_session_not_found'] | BridgeRejectionCauseCapabilityMissing | Literal['launch_mode_unsupported'] | Literal['launch_mode_placement_mismatch'] | BridgeRejectionCauseSessionOwnershipConflict
 
 # A typed reply from a member runtime (or mob host daemon) back to the
 # supervisor, and — for `MemberOperatorReply` — from the controlling host
@@ -6889,6 +6898,7 @@ BridgeRejectionCause = Literal['not_bound'] | Literal['stale_supervisor'] | Lite
 class BridgeReplyBindMember(TypedDict, total=False):
     address: Required[str]
     capabilities: Required[BridgeCapabilities]
+    member_fence: Required[dict[str, Any]]
     peer_id: Required[str]
     result: Required[Literal['bind_member']]
 
@@ -6918,8 +6928,7 @@ class BridgeReplyTrackedInputCancelled(TypedDict, total=False):
     result: Required[Literal['tracked_input_cancelled']]
 
 class BridgeReplyRetire(TypedDict, total=False):
-    inputs_abandoned: Required[int]
-    inputs_pending_drain: Required[int]
+    outcome: Required[dict[str, Any]]
     result: Required[Literal['retire']]
 
 class BridgeReplyDestroy(TypedDict, total=False):

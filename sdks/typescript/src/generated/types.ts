@@ -1,9 +1,9 @@
 // Generated wire types for Meerkat SDK
-// Contract version: 0.8.21
+// Contract version: 0.8.22
 
 import { MeerkatError } from "./errors.js";
 
-export const CONTRACT_VERSION = "0.8.21";
+export const CONTRACT_VERSION = "0.8.22";
 
 export type Value = unknown;
 
@@ -2339,6 +2339,7 @@ export interface BridgeBindPayload {
   epoch: number;
   expected_address: string;
   expected_peer_id: string;
+  member: Record<string, unknown>;
   protocol_version: BridgeProtocolVersion;
   supervisor: BridgePeerSpec;
 }
@@ -2346,6 +2347,7 @@ export interface BridgeBindPayload {
 export interface BridgeBindResponse {
   address: string;
   capabilities: BridgeCapabilities;
+  member_fence: Record<string, unknown>;
   peer_id: string;
 }
 
@@ -2433,8 +2435,7 @@ export interface BridgePeerWiringPayload {
 }
 
 export interface BridgeRetireResponse {
-  inputs_abandoned: number;
-  inputs_pending_drain: number;
+  outcome: Record<string, unknown>;
 }
 
 export interface BridgeSupervisorPayload {
@@ -3268,6 +3269,7 @@ export interface BridgeCommandBindMember {
   epoch: number;
   expected_address: string;
   expected_peer_id: string;
+  member: Record<string, unknown>;
   protocol_version: BridgeProtocolVersion;
   supervisor: BridgePeerSpec;
 }
@@ -3342,6 +3344,7 @@ export interface BridgeCommandCancelTrackedMemberInput {
 export interface BridgeCommandRetireMember {
   command: "retire_member";
   epoch: number;
+  member_fence: Record<string, unknown>;
   protocol_version: BridgeProtocolVersion;
   supervisor: BridgePeerSpec;
 }
@@ -3650,6 +3653,14 @@ export interface BridgeRejectionCauseHistoryRowTooLarge {
   history_row_too_large: BridgeRejectionCauseHistoryRowTooLargePayload;
 }
 
+export interface BridgeRejectionCauseRuntimeRetirementInProgressPayload {
+  stage: string;
+}
+
+export interface BridgeRejectionCauseRuntimeRetirementInProgress {
+  runtime_retirement_in_progress: BridgeRejectionCauseRuntimeRetirementInProgressPayload;
+}
+
 export interface BridgeRejectionCauseScopeDeniedPayload {
   presented: WireControlScope[];
   required: WireControlScope;
@@ -3750,11 +3761,12 @@ export interface BridgeRejectionCauseSessionOwnershipConflict {
   session_ownership_conflict: BridgeRejectionCauseSessionOwnershipConflictPayload;
 }
 
-export type BridgeRejectionCause = "not_bound" | "stale_supervisor" | "sender_mismatch" | "already_bound" | "invalid_bootstrap_token" | "unsupported_protocol_version" | "invalid_supervisor_spec" | "invalid_peer_spec" | "address_mismatch" | "unsupported" | "internal" | "stale_fence" | BridgeRejectionCauseStaleCursor | BridgeRejectionCauseOversizedEvent | BridgeRejectionCauseHistoryRowTooLarge | "unavailable" | BridgeRejectionCauseScopeDenied | "spec_digest_mismatch" | BridgeRejectionCauseMaterializeBuildRejected | BridgeRejectionCauseModelUnresolvable | BridgeRejectionCauseAuthBindingUnresolvable | BridgeRejectionCauseMcpCommandMissing | "realm_backend_unavailable" | BridgeRejectionCauseEnvKeyMissing | BridgeRejectionCauseHostEngineVersionChanged | BridgeRejectionCauseModelNotRealtime | BridgeRejectionCauseLiveAdapterUnavailable | "live_transport_unavailable" | "live_channel_already_bound" | "live_channel_not_found" | BridgeRejectionCauseLiveTransportUnsupported | "resume_session_not_found" | BridgeRejectionCauseCapabilityMissing | "launch_mode_unsupported" | "launch_mode_placement_mismatch" | BridgeRejectionCauseSessionOwnershipConflict;
+export type BridgeRejectionCause = "not_bound" | "stale_supervisor" | "sender_mismatch" | "already_bound" | "invalid_bootstrap_token" | "unsupported_protocol_version" | "invalid_supervisor_spec" | "invalid_peer_spec" | "address_mismatch" | "unsupported" | "internal" | "bind_admission_outcome_unknown" | "stale_fence" | BridgeRejectionCauseStaleCursor | BridgeRejectionCauseOversizedEvent | BridgeRejectionCauseHistoryRowTooLarge | "unavailable" | BridgeRejectionCauseRuntimeRetirementInProgress | BridgeRejectionCauseScopeDenied | "spec_digest_mismatch" | BridgeRejectionCauseMaterializeBuildRejected | BridgeRejectionCauseModelUnresolvable | BridgeRejectionCauseAuthBindingUnresolvable | BridgeRejectionCauseMcpCommandMissing | "realm_backend_unavailable" | BridgeRejectionCauseEnvKeyMissing | BridgeRejectionCauseHostEngineVersionChanged | BridgeRejectionCauseModelNotRealtime | BridgeRejectionCauseLiveAdapterUnavailable | "live_transport_unavailable" | "live_channel_already_bound" | "live_channel_not_found" | BridgeRejectionCauseLiveTransportUnsupported | "resume_session_not_found" | BridgeRejectionCauseCapabilityMissing | "launch_mode_unsupported" | "launch_mode_placement_mismatch" | BridgeRejectionCauseSessionOwnershipConflict;
 
 export interface BridgeReplyBindMember {
   address: string;
   capabilities: BridgeCapabilities;
+  member_fence: Record<string, unknown>;
   peer_id: string;
   result: "bind_member";
 }
@@ -3789,8 +3801,7 @@ export interface BridgeReplyTrackedInputCancelled {
 }
 
 export interface BridgeReplyRetire {
-  inputs_abandoned: number;
-  inputs_pending_drain: number;
+  outcome: Record<string, unknown>;
   result: "retire";
 }
 

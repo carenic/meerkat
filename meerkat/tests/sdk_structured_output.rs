@@ -24,6 +24,16 @@ use serde_json::{Value, json};
 mod test_session_store;
 use test_session_store::TestSessionStore;
 
+fn normalized_anthropic_usage(request: &LlmRequest) -> LlmEvent {
+    LlmEvent::UsageUpdate {
+        usage: meerkat_core::TurnUsage::host_declared(
+            meerkat_core::Provider::Anthropic,
+            &request.model,
+            meerkat_core::Usage::default(),
+        ),
+    }
+}
+
 /// Mock LLM client that returns valid JSON on extraction turn
 struct MockLlmClientWithStructuredOutput {
     calls: Arc<AtomicUsize>,
@@ -40,7 +50,7 @@ impl LlmClient for MockLlmClientWithStructuredOutput {
 
     fn stream<'a>(
         &'a self,
-        _request: &'a LlmRequest,
+        request: &'a LlmRequest,
     ) -> std::pin::Pin<
         Box<dyn futures::Stream<Item = Result<LlmEvent, meerkat_client::LlmError>> + Send + 'a>,
     > {
@@ -52,6 +62,7 @@ impl LlmClient for MockLlmClientWithStructuredOutput {
                     delta: "Let me provide the person info.".to_string(),
                     meta: None,
                 }),
+                Ok(normalized_anthropic_usage(request)),
                 Ok(LlmEvent::Done {
                     outcome: LlmDoneOutcome::Success {
                         stop_reason: meerkat::StopReason::EndTurn,
@@ -65,6 +76,7 @@ impl LlmClient for MockLlmClientWithStructuredOutput {
                     delta: r#"{"name": "Alice", "age": 30}"#.to_string(),
                     meta: None,
                 }),
+                Ok(normalized_anthropic_usage(request)),
                 Ok(LlmEvent::Done {
                     outcome: LlmDoneOutcome::Success {
                         stop_reason: meerkat::StopReason::EndTurn,
@@ -104,7 +116,7 @@ impl LlmClient for MockLlmClientWithNamedWrapper {
 
     fn stream<'a>(
         &'a self,
-        _request: &'a LlmRequest,
+        request: &'a LlmRequest,
     ) -> std::pin::Pin<
         Box<dyn futures::Stream<Item = Result<LlmEvent, meerkat_client::LlmError>> + Send + 'a>,
     > {
@@ -115,6 +127,7 @@ impl LlmClient for MockLlmClientWithNamedWrapper {
                     delta: "Working...".to_string(),
                     meta: None,
                 }),
+                Ok(normalized_anthropic_usage(request)),
                 Ok(LlmEvent::Done {
                     outcome: LlmDoneOutcome::Success {
                         stop_reason: meerkat::StopReason::EndTurn,
@@ -127,6 +140,7 @@ impl LlmClient for MockLlmClientWithNamedWrapper {
                     delta: r#"{"advisor":{"name":"Eve","age":34}}"#.to_string(),
                     meta: None,
                 }),
+                Ok(normalized_anthropic_usage(request)),
                 Ok(LlmEvent::Done {
                     outcome: LlmDoneOutcome::Success {
                         stop_reason: meerkat::StopReason::EndTurn,
@@ -156,7 +170,7 @@ impl LlmClient for MockLlmClientWithRetry {
 
     fn stream<'a>(
         &'a self,
-        _request: &'a LlmRequest,
+        request: &'a LlmRequest,
     ) -> std::pin::Pin<
         Box<dyn futures::Stream<Item = Result<LlmEvent, meerkat_client::LlmError>> + Send + 'a>,
     > {
@@ -169,6 +183,7 @@ impl LlmClient for MockLlmClientWithRetry {
                         delta: "Processing...".to_string(),
                         meta: None,
                     }),
+                    Ok(normalized_anthropic_usage(request)),
                     Ok(LlmEvent::Done {
                         outcome: LlmDoneOutcome::Success {
                             stop_reason: meerkat::StopReason::EndTurn,
@@ -183,6 +198,7 @@ impl LlmClient for MockLlmClientWithRetry {
                         delta: r#"{"name": "Bob"}"#.to_string(), // missing 'age'
                         meta: None,
                     }),
+                    Ok(normalized_anthropic_usage(request)),
                     Ok(LlmEvent::Done {
                         outcome: LlmDoneOutcome::Success {
                             stop_reason: meerkat::StopReason::EndTurn,
@@ -197,6 +213,7 @@ impl LlmClient for MockLlmClientWithRetry {
                         delta: r#"{"name": "Bob", "age": 25}"#.to_string(),
                         meta: None,
                     }),
+                    Ok(normalized_anthropic_usage(request)),
                     Ok(LlmEvent::Done {
                         outcome: LlmDoneOutcome::Success {
                             stop_reason: meerkat::StopReason::EndTurn,

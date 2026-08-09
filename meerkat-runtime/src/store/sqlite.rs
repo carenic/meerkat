@@ -1469,7 +1469,7 @@ CREATE TABLE IF NOT EXISTS runtime_direct_member_high_waters (
                     error.to_string(),
                 )
             })?;
-        if !matches!(ledger_version, None | Some(1 | 2 | 3)) {
+        if !matches!(ledger_version, None | Some(1..=3)) {
             return Err(pre_0_8_10_input_import_error(
                 RUNTIME_STORE_DOMAIN.name,
                 "<ledger>",

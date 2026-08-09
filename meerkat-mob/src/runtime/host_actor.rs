@@ -7349,13 +7349,25 @@ impl MobHostActor {
                     },
                 ),
                 Err(error) => {
-                    self.send_failure(
-                        candidate,
-                        BridgeRejectionCause::Internal,
-                        format!("member runtime release failed: {error}"),
-                        Some(reply_address),
-                    )
-                    .await;
+                    let retained_stage = crate::runtime::provisioner::MemberSessionDisposalArc::
+                        runtime_retirement_progress_stage(&error);
+                    let (cause, reason) = retained_stage.map_or_else(
+                        || (
+                            BridgeRejectionCause::Internal,
+                            format!("member runtime release failed: {error}"),
+                        ),
+                        |stage| {
+                            let reason = format!(
+                                "member runtime release remains in progress at {stage}; exact teardown authority is retained"
+                            );
+                            (
+                                BridgeRejectionCause::RuntimeRetirementInProgress { stage },
+                                reason,
+                            )
+                        },
+                    );
+                    self.send_failure(candidate, cause, reason, Some(reply_address))
+                        .await;
                     return;
                 }
             }
@@ -7381,10 +7393,27 @@ impl MobHostActor {
                     },
                 ),
                 Err(error) => {
+                    let retained_stage = crate::runtime::provisioner::MemberSessionDisposalArc::
+                        runtime_retirement_progress_stage(&error);
+                    let (cause, reason) = retained_stage.map_or_else(
+                        || (
+                            BridgeRejectionCause::Internal,
+                            format!("member session disposal failed: {error}"),
+                        ),
+                        |stage| {
+                            let reason = format!(
+                                "member session disposal remains in progress at {stage}; exact teardown authority is retained"
+                            );
+                            (
+                                BridgeRejectionCause::RuntimeRetirementInProgress { stage },
+                                reason,
+                            )
+                        },
+                    );
                     self.send_failure(
                         candidate,
-                        BridgeRejectionCause::Internal,
-                        format!("member session disposal failed: {error}"),
+                        cause,
+                        reason,
                         Some(reply_address),
                     )
                     .await;

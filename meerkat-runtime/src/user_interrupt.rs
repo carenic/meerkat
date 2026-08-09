@@ -158,9 +158,22 @@ impl MeerkatMachine {
         session_id: &SessionId,
         reason: impl Into<String>,
     ) -> Result<(), RuntimeDriverError> {
-        self.dispatch_user_interrupt(session_id, None, None, reason.into())
+        if self
+            .dispatch_user_interrupt(session_id, None, None, reason.into())
+            .await?
+        {
+            return Ok(());
+        }
+
+        let state = self
+            .existing_session_runtime_state(session_id)
             .await
-            .map(|_| ())
+            .unwrap_or(RuntimeState::Destroyed);
+        if state == RuntimeState::Destroyed {
+            Err(RuntimeDriverError::Destroyed)
+        } else {
+            Err(RuntimeDriverError::NotReady { state })
+        }
     }
 
     /// Assert a hard cancel only while `expected_run_id` remains the exact

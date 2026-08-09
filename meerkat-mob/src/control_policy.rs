@@ -352,7 +352,7 @@ pub(crate) fn machine_principal(id: &PrincipalId) -> mob_dsl::PrincipalId {
 /// legitimate mint sites (the member-tool dispatcher and the upcall
 /// executor; actor self-sends) are in-crate, so no surface crate can
 /// launder a console call onto the agent lane (§15.2 confinement).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandAuthority {
     lane: CommandAuthorityLane,
     member_operator_execution_fence: Option<MemberOperatorExecutionFence>,
@@ -371,7 +371,7 @@ pub(crate) struct MemberOperatorExecutionFence {
     pub(crate) fence_token: u64,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum CommandAuthorityLane {
     /// Console lane: a plane-(b) principal presented at a chokepoint.
     Principal(MobControlPrincipal),

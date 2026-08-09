@@ -19335,6 +19335,30 @@ default_model = "gemma"
         captured_system_prompt: Arc<Mutex<Option<String>>>,
     }
 
+    fn provider_for_successful_cli_fixture_model(model: &str) -> meerkat_core::Provider {
+        if model.starts_with("claude-") {
+            meerkat_core::Provider::Anthropic
+        } else if model.starts_with("gpt-") || model.starts_with("o1-") {
+            meerkat_core::Provider::OpenAI
+        } else if model.starts_with("gemini-") {
+            meerkat_core::Provider::Gemini
+        } else if model.starts_with("gemma-") {
+            meerkat_core::Provider::SelfHosted
+        } else {
+            meerkat_core::Provider::Other
+        }
+    }
+
+    fn normalized_cli_fixture_usage(request: &LlmRequest) -> LlmEvent {
+        LlmEvent::UsageUpdate {
+            usage: meerkat_core::TurnUsage::host_declared(
+                provider_for_successful_cli_fixture_model(&request.model),
+                &request.model,
+                Usage::default(),
+            ),
+        }
+    }
+
     #[cfg(feature = "mob")]
     struct ScriptedMobSpawnClient {
         calls: std::sync::atomic::AtomicUsize,
@@ -19361,7 +19385,7 @@ default_model = "gemma"
 
         fn stream<'a>(
             &'a self,
-            _request: &'a LlmRequest,
+            request: &'a LlmRequest,
         ) -> Pin<Box<dyn futures::Stream<Item = Result<LlmEvent, LlmError>> + Send + 'a>> {
             let call = self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let events = match call {
@@ -19384,6 +19408,7 @@ default_model = "gemma"
                         }),
                         meta: None,
                     }),
+                    Ok(normalized_cli_fixture_usage(request)),
                     Ok(LlmEvent::Done {
                         outcome: LlmDoneOutcome::Success {
                             stop_reason: meerkat_core::StopReason::ToolUse,
@@ -19406,6 +19431,7 @@ default_model = "gemma"
                         }),
                         meta: None,
                     }),
+                    Ok(normalized_cli_fixture_usage(request)),
                     Ok(LlmEvent::Done {
                         outcome: LlmDoneOutcome::Success {
                             stop_reason: meerkat_core::StopReason::ToolUse,
@@ -19417,6 +19443,7 @@ default_model = "gemma"
                         delta: "spawn complete".into(),
                         meta: None,
                     }),
+                    Ok(normalized_cli_fixture_usage(request)),
                     Ok(LlmEvent::Done {
                         outcome: LlmDoneOutcome::Success {
                             stop_reason: meerkat_core::StopReason::EndTurn,
@@ -19486,6 +19513,7 @@ default_model = "gemma"
                     delta: "ok".to_string(),
                     meta: None,
                 }),
+                Ok(normalized_cli_fixture_usage(request)),
                 Ok(LlmEvent::Done {
                     outcome: LlmDoneOutcome::Success {
                         stop_reason: meerkat_core::StopReason::EndTurn,
@@ -19932,6 +19960,13 @@ default_model = "gemma"
     #[cfg(feature = "mob")]
     #[async_trait]
     impl meerkat_mob::MobSessionService for TestMobSessionService {
+        async fn materialize_session_resume_verdict(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<meerkat_mob::SessionResumeVerdict, SessionError> {
+            meerkat_mob::materialize_nonpersistent_session_resume_verdict(self, session_id).await
+        }
+
         async fn observe_session_resume_authority(
             &self,
             _session_id: &SessionId,
@@ -20012,10 +20047,6 @@ default_model = "gemma"
             witness: &meerkat_session::LiveSessionActorWitness,
         ) -> Result<bool, SessionError> {
             Ok(self.compare_remove_actor(witness).await)
-        }
-
-        fn supports_persistent_sessions(&self) -> bool {
-            true
         }
 
         fn runtime_adapter(&self) -> Option<Arc<meerkat_runtime::MeerkatMachine>> {

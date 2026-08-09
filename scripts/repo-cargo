@@ -188,6 +188,7 @@ if [[ "${1-}" == "--doctor" ]]; then
 fi
 
 cd "${workspace_root}"
+export MEERKAT_WORKSPACE_ROOT="${workspace_root}"
 
 if [[ -n "${toolchain_spec}" ]]; then
   export RUSTUP_TOOLCHAIN="${toolchain_spec}"

@@ -1329,14 +1329,17 @@ impl DriverEntry {
         let owner_session_id = outbox.owner_session_id.to_string();
         let session_matches = state.session_id.as_ref().map(|value| value.0.as_str())
             == Some(owner_session_id.as_str());
-        let fresh_unbound_idle = state.lifecycle_phase
-            == crate::meerkat_machine::dsl::MeerkatPhase::Idle
-            && state.active_runtime_id.is_none()
+        let unbound_recovery_shell = matches!(
+            state.lifecycle_phase,
+            crate::meerkat_machine::dsl::MeerkatPhase::Idle
+                | crate::meerkat_machine::dsl::MeerkatPhase::Retired
+                | crate::meerkat_machine::dsl::MeerkatPhase::Stopped
+        ) && state.active_runtime_id.is_none()
             && state.active_fence_token.is_none()
             && state.active_runtime_generation.is_none()
             && state.active_runtime_epoch_id.is_none();
         session_matches
-            && (fresh_unbound_idle
+            && (unbound_recovery_shell
                 || (state
                     .active_runtime_id
                     .as_ref()

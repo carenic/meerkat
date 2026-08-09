@@ -8020,6 +8020,11 @@ impl MobBuilder {
             // the returned owner handle, and actor-created member tool handles
             // must all observe installations made after construction.
             let flow_target_provisioner = Arc::new(std::sync::RwLock::new(None));
+            // Every public/internal handle clone and the actor share one
+            // process-owned explicit-Resume operation registry. Caller
+            // deadlines never own its terminal result.
+            let explicit_resume_operations =
+                Arc::new(super::handle::ResumeOperationRegistry::default());
             let mut wiring = RuntimeWiring {
                 roster: roster_state.clone(),
                 dsl_authority: initial_dsl_authority,
@@ -8055,6 +8060,7 @@ impl MobBuilder {
                 phase_watch_rx: preview_phase_rx,
                 realtime_session_factory: realtime_session_factory.clone(),
                 flow_target_provisioner: Arc::clone(&flow_target_provisioner),
+                explicit_resume_operations: Arc::clone(&explicit_resume_operations),
             };
             // session_service is still live here (not consumed until start_runtime_with_components)
 
@@ -8260,6 +8266,7 @@ impl MobBuilder {
                 placed_recovery.next_carrier_fence_token,
                 !destroy_storage_finalizing,
                 flow_target_provisioner,
+                explicit_resume_operations,
                 realtime_session_factory,
                 controlling_acceptor,
                 member_live_host,
@@ -9702,6 +9709,8 @@ impl MobBuilder {
                 command_rx,
             };
             let flow_target_provisioner = Arc::new(std::sync::RwLock::new(None));
+            let explicit_resume_operations =
+                Arc::new(super::handle::ResumeOperationRegistry::default());
 
             Self::start_runtime_with_components(
                 definition,
@@ -9730,6 +9739,7 @@ impl MobBuilder {
                 1,
                 true,
                 flow_target_provisioner,
+                explicit_resume_operations,
                 realtime_session_factory,
                 controlling_acceptor,
                 member_live_host,
@@ -9772,6 +9782,7 @@ impl MobBuilder {
         flow_target_provisioner: Arc<
             std::sync::RwLock<Option<super::handle::FlowTargetProvisioner>>,
         >,
+        explicit_resume_operations: Arc<super::handle::ResumeOperationRegistry>,
         realtime_session_factory: Option<Arc<dyn meerkat_client::RealtimeSessionFactory>>,
         controlling_acceptor: Option<ControllingAcceptorConfig>,
         member_live_host: Option<Arc<dyn meerkat_runtime::member_live::MemberLiveHost>>,
@@ -9833,6 +9844,7 @@ impl MobBuilder {
                 phase_watch_rx,
                 realtime_session_factory,
                 flow_target_provisioner: Arc::clone(&flow_target_provisioner),
+                explicit_resume_operations: Arc::clone(&explicit_resume_operations),
             };
             // Row #320: the orphan budget is MobMachine state (seeded once in
             // `start_runtime` from `definition.limits.max_orphaned_turns`); the
@@ -9978,6 +9990,7 @@ impl MobBuilder {
                 flow_streams: handle.flow_streams.clone(),
                 command_tx,
                 flow_target_provisioner,
+                explicit_resume_operations,
                 tool_bundles,
                 default_llm_client,
                 retired_event_index: Arc::new(RwLock::new(retired_event_index)),
@@ -10026,6 +10039,8 @@ impl MobBuilder {
                 session_service: handle_session_service,
                 #[cfg(feature = "runtime-adapter")]
                 runtime_adapter,
+                #[cfg(feature = "runtime-adapter")]
+                shutdown_runtime_unregister_observers: HashMap::new(),
                 restore_diagnostics,
                 member_revival_locks: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
                 runtime_metadata,

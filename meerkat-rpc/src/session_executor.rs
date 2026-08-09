@@ -1209,6 +1209,13 @@ mod tests {
     #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
     #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
     impl MobSessionService for BoundaryCancelSessionService {
+        async fn materialize_session_resume_verdict(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<meerkat_mob::SessionResumeVerdict, SessionError> {
+            meerkat_mob::materialize_nonpersistent_session_resume_verdict(self, session_id).await
+        }
+
         async fn observe_session_resume_authority(
             &self,
             _session_id: &SessionId,

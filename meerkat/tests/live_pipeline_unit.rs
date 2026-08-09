@@ -63,6 +63,7 @@ mod live_pipeline {
         staged_capacity_admissions: StagedCapacityAdmissions,
         host: Arc<LiveAdapterHost>,
         ws_state: Arc<LiveWsState>,
+        actor_witness_slots: Arc<std::sync::Mutex<Vec<meerkat::LiveSessionActorWitnessSlot>>>,
         _temp: tempfile::TempDir,
     }
 
@@ -113,6 +114,7 @@ mod live_pipeline {
             )),
             host,
             ws_state,
+            actor_witness_slots: Arc::new(std::sync::Mutex::new(Vec::new())),
             _temp: temp,
         }
     }
@@ -174,6 +176,7 @@ mod live_pipeline {
         fx: &'a Fixture,
         ingress: Option<&'a dyn LiveSessionIngressReconciler>,
     ) -> LiveOrchestrator<'a> {
+        let actor_witness_slots = Arc::clone(&fx.actor_witness_slots);
         LiveOrchestrator {
             service: &fx.service,
             staged_sessions: &fx.staged_sessions,
@@ -194,6 +197,12 @@ mod live_pipeline {
             instance_id: None,
             backend: None,
             ingress_reconciler: ingress,
+            actor_witness_capture: Arc::new(move |_session_id, actor_witness_slot| {
+                actor_witness_slots
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(actor_witness_slot);
+            }),
         }
     }
 

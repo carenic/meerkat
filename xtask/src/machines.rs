@@ -4563,6 +4563,14 @@ pub fn repo_root() -> Result<PathBuf> {
     if let Some(root) = std::env::var_os("MEERKAT_MACHINE_ROOT") {
         return Ok(PathBuf::from(root));
     }
+    if let Some(root) = std::env::var_os("MEERKAT_WORKSPACE_ROOT") {
+        return Ok(PathBuf::from(root));
+    }
+    if let Ok(root) = std::env::current_dir()
+        && root.join("Cargo.toml").is_file()
+    {
+        return Ok(root);
+    }
 
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()

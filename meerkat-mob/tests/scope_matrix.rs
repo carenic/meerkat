@@ -444,7 +444,10 @@ async fn live_granted_principal_opens_end_to_end() {
         meerkat_core::Provider::Anthropic,
         meerkat_core::Provider::OpenAI,
     ];
-    opts.member_llm_client = Some(support::scripted_member_client_completing("c8b-done"));
+    opts.member_llm_client = Some(support::scripted_member_client_completing_for_provider(
+        "c8b-done",
+        meerkat_core::Provider::OpenAI,
+    ));
     let fixture = support::spawn_host_daemon_fixture(opts)
         .await
         .expect("spawn live member-host fixture");

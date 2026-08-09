@@ -58,6 +58,16 @@ mod tests {
     use meerkat_session::event_store::EventStore;
     use tokio::time::Duration;
 
+    fn normalized_openai_usage(request: &LlmRequest) -> LlmEvent {
+        LlmEvent::UsageUpdate {
+            usage: meerkat_core::TurnUsage::host_declared(
+                meerkat_core::Provider::OpenAI,
+                &request.model,
+                meerkat_core::Usage::default(),
+            ),
+        }
+    }
+
     /// Deterministic client whose compaction response actually carries the
     /// history it replaces. Normal turns still return the small `ok` response
     /// used by these persistence tests; summary calls echo prior user text so
@@ -113,6 +123,7 @@ mod tests {
                     delta: text,
                     meta: None,
                 },
+                normalized_openai_usage(request),
                 LlmEvent::Done {
                     outcome: LlmDoneOutcome::Success {
                         stop_reason: meerkat_core::StopReason::EndTurn,
@@ -178,6 +189,7 @@ mod tests {
                         delta: text.to_string(),
                         meta: None,
                     },
+                    normalized_openai_usage(request),
                     LlmEvent::Done {
                         outcome: LlmDoneOutcome::Success {
                             stop_reason: meerkat_core::StopReason::EndTurn,
@@ -239,6 +251,7 @@ mod tests {
                         delta: "callback compaction summary".to_string(),
                         meta: None,
                     },
+                    normalized_openai_usage(request),
                     LlmEvent::Done {
                         outcome: LlmDoneOutcome::Success {
                             stop_reason: meerkat_core::StopReason::EndTurn,
@@ -251,6 +264,7 @@ mod tests {
                         delta: "ok".to_string(),
                         meta: None,
                     },
+                    normalized_openai_usage(request),
                     LlmEvent::Done {
                         outcome: LlmDoneOutcome::Success {
                             stop_reason: meerkat_core::StopReason::EndTurn,
@@ -265,6 +279,7 @@ mod tests {
                         args: serde_json::json!({ "key": "after-compaction" }),
                         meta: None,
                     },
+                    normalized_openai_usage(request),
                     LlmEvent::Done {
                         outcome: LlmDoneOutcome::Success {
                             stop_reason: meerkat_core::StopReason::ToolUse,

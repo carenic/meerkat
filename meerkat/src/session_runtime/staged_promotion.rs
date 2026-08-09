@@ -40,20 +40,12 @@ pub(crate) fn surface_materialization_error_to_session_error(
     }
 }
 
-/// Materialize a staged actor through the shared exact transaction without
-/// choosing or installing a surface executor.
-///
-/// The serialized staged build may contain bindings from an earlier attempt;
-/// the shared facade replaces them with the current exact materialization
-/// witness before actor construction. A failed create therefore rolls back the
-/// exact attempt instead of leaving an actor-less `RetainedActor` claim that a
-/// retry cannot consume.
-pub(crate) async fn materialize_session_actor_unattached(
+pub(crate) async fn materialize_session_actor_unattached_with_actor_slot(
     service: &Arc<PersistentSessionService<FactoryAgentBuilder>>,
     runtime_adapter: &Arc<MeerkatMachine>,
     create_req: CreateSessionRequest,
     admission: ActiveCapacityGuard,
-) -> Result<RunResult, SessionError> {
+) -> Result<(RunResult, crate::LiveSessionActorWitnessSlot), SessionError> {
     let session = create_req
         .build
         .as_ref()
@@ -64,7 +56,7 @@ pub(crate) async fn materialize_session_actor_unattached(
                     .to_string(),
             ))
         })?;
-    crate::surface::materialize_session_actor_unattached_with_reserved_admission(
+    crate::surface::materialize_session_actor_unattached_with_reserved_admission_and_actor_slot(
         service,
         runtime_adapter,
         session,
@@ -113,6 +105,11 @@ pub type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// before the underlying turn is dispatched. Surfaces wrap their RPC
 /// hook slot into this callback shape.
 pub type PreTurnHookFn = Arc<dyn Fn() -> BoxFut<'static, ()> + Send + Sync>;
+
+/// Exact actor-slot handoff used by the direct start-turn test harness before
+/// a later surface-specific executor attachment consumes that authority.
+pub type ActorWitnessSlotCaptureFn =
+    Arc<dyn Fn(SessionId, crate::LiveSessionActorWitnessSlot) + Send + Sync>;
 
 /// Awaiter result shape for the staged-session apply-runtime-turn
 /// helpers; surfaces translate `Err(StagedTaskJoinError)` onto their
@@ -784,6 +781,7 @@ pub fn spawn_pending_create_and_start_turn_with_admission_guard(
     service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
     staged_sessions: Arc<StagedSessionRegistry>,
     runtime_adapter: Arc<MeerkatMachine>,
+    actor_witness_capture: ActorWitnessSlotCaptureFn,
     pre_turn_hook: Option<PreTurnHookFn>,
     session_id: SessionId,
     create_req: CreateSessionRequest,
@@ -803,16 +801,20 @@ pub fn spawn_pending_create_and_start_turn_with_admission_guard(
                 }),
                 false,
             ),
-            (Some(admission), false) => (
-                materialize_session_actor_unattached(
+            (Some(admission), false) => {
+                let materialized = materialize_session_actor_unattached_with_actor_slot(
                     &service,
                     &runtime_adapter,
                     create_req,
                     admission,
                 )
-                .await,
-                true,
-            ),
+                .await
+                .map(|(result, actor_witness_slot)| {
+                    actor_witness_capture(result.session_id.clone(), actor_witness_slot);
+                    result
+                });
+                (materialized, true)
+            }
             (None, true) => (
                 Err(SessionError::Agent(
                     meerkat_core::error::AgentError::InternalError(format!(

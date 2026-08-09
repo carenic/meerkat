@@ -126,12 +126,176 @@ struct PendingRetirementOperation {
     admission_rx: tokio::sync::watch::Receiver<bool>,
 }
 
+type SharedResumeResult = Arc<Result<(), Arc<MobError>>>;
+
+#[derive(Clone)]
+enum ResumeOperationState {
+    AwaitingLifecycleAdmission,
+    LifecycleAuthorityAdmitted,
+    Terminal(SharedResumeResult),
+    InvalidatedByLifecycleAuthority,
+}
+
+pub(super) struct PendingResumeOperation {
+    generation: u64,
+    deadline: Instant,
+    command_authority: crate::control_policy::CommandAuthority,
+    state_tx: tokio::sync::watch::Sender<ResumeOperationState>,
+}
+
+#[derive(Default)]
+struct ResumeOperationRegistryState {
+    generation: u64,
+    current: Vec<Arc<PendingResumeOperation>>,
+}
+
+/// Handle-clone shared custody for one process-owned explicit Resume.
+///
+/// The registry keeps the command result independently of any caller's
+/// deadline. Actor-admitted Stop/Reset/Complete/Destroy/Shutdown advances the
+/// generation and invalidates the current slot, so a predecessor Resume
+/// terminal cannot be replayed after intervening lifecycle authority.
+#[derive(Default)]
+pub(super) struct ResumeOperationRegistry {
+    state: std::sync::Mutex<ResumeOperationRegistryState>,
+}
+
+impl ResumeOperationRegistry {
+    fn get_or_insert(
+        &self,
+        deadline: Instant,
+        command_authority: &crate::control_policy::CommandAuthority,
+    ) -> (Arc<PendingResumeOperation>, bool) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(current) = state
+            .current
+            .iter()
+            .find(|current| current.command_authority == *command_authority)
+        {
+            return (Arc::clone(current), false);
+        }
+        let (state_tx, _) =
+            tokio::sync::watch::channel(ResumeOperationState::AwaitingLifecycleAdmission);
+        let pending = Arc::new(PendingResumeOperation {
+            generation: state.generation,
+            deadline,
+            command_authority: command_authority.clone(),
+            state_tx,
+        });
+        state.current.push(Arc::clone(&pending));
+        (pending, true)
+    }
+
+    pub(super) fn invalidate_after_lifecycle_admission(&self) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.generation = state.generation.wrapping_add(1);
+        for operation in state.current.drain(..) {
+            operation
+                .state_tx
+                .send_replace(ResumeOperationState::InvalidatedByLifecycleAuthority);
+        }
+    }
+
+    fn publish_if_current(
+        &self,
+        operation: &Arc<PendingResumeOperation>,
+        next: ResumeOperationState,
+    ) -> bool {
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let is_current = state.generation == operation.generation
+            && state
+                .current
+                .iter()
+                .any(|current| Arc::ptr_eq(current, operation));
+        if is_current {
+            operation.state_tx.send_replace(next);
+        }
+        is_current
+    }
+
+    fn remove_if_current(&self, operation: &Arc<PendingResumeOperation>) -> bool {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current_index = (state.generation == operation.generation)
+            .then(|| {
+                state
+                    .current
+                    .iter()
+                    .position(|current| Arc::ptr_eq(current, operation))
+            })
+            .flatten();
+        if let Some(index) = current_index {
+            state.current.swap_remove(index);
+        }
+        current_index.is_some()
+    }
+
+    fn generation_is_current(&self, generation: u64) -> bool {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .generation
+            == generation
+    }
+}
+
 fn pending_retirement_operations()
 -> &'static std::sync::Mutex<HashMap<RetirementOperationKey, Arc<PendingRetirementOperation>>> {
     static OPERATIONS: std::sync::OnceLock<
         std::sync::Mutex<HashMap<RetirementOperationKey, Arc<PendingRetirementOperation>>>,
     > = std::sync::OnceLock::new();
     OPERATIONS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn retirement_result_slot_removed_checks()
+-> &'static std::sync::Mutex<HashMap<RetirementOperationKey, u64>> {
+    static CHECKS: std::sync::OnceLock<std::sync::Mutex<HashMap<RetirementOperationKey, u64>>> =
+        std::sync::OnceLock::new();
+    CHECKS.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+pub(super) fn retirement_result_slot_removed_check_count(key: &RetirementOperationKey) -> u64 {
+    retirement_result_slot_removed_checks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(key)
+        .copied()
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+fn assert_retirement_result_slot_removed_before_publication(
+    key: &RetirementOperationKey,
+    completed: &Arc<PendingRetirementOperation>,
+) {
+    let operations = pending_retirement_operations()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    assert!(
+        operations
+            .get(key)
+            .is_none_or(|current| !Arc::ptr_eq(current, completed)),
+        "completed exact retirement slot remained joinable at result publication"
+    );
+    drop(operations);
+    *retirement_result_slot_removed_checks()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry(key.clone())
+        .or_default() += 1;
 }
 
 #[derive(Debug, Clone)]
@@ -1834,7 +1998,8 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         | MobError::PlacedCompletionCleanupPending { .. }
         | MobError::PlacedKickoffCleanupPending { .. }
         | MobError::AutonomousStopInterruptsPending { .. }
-        | MobError::LifecycleOperationPending { .. } => {
+        | MobError::LifecycleOperationPending { .. }
+        | MobError::LifecycleOperationAdmissionPending { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
         // Retirement-in-progress is a retryable lifecycle state, but it can
@@ -1849,7 +2014,9 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::MemberRetirementAdmissionPending { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
-        MobError::SharedRetirementFailure(error) => spawn_many_failure_observation(error.as_ref()),
+        MobError::SharedRetirementFailure(error) | MobError::SharedLifecycleFailure(error) => {
+            spawn_many_failure_observation(error.as_ref())
+        }
         MobError::ActorCommandChannelClosed | MobError::ActorReplyChannelClosed => {
             mob_dsl::MobSpawnManyFailureObservationKind::Internal
         }
@@ -2702,6 +2869,7 @@ pub struct MobHandle {
     /// surface layer directly).
     pub(super) realtime_session_factory: Option<Arc<dyn meerkat_client::RealtimeSessionFactory>>,
     pub(super) flow_target_provisioner: Arc<StdRwLock<Option<FlowTargetProvisioner>>>,
+    pub(super) explicit_resume_operations: Arc<ResumeOperationRegistry>,
 }
 
 impl MobHandle {
@@ -3549,6 +3717,195 @@ impl MobHandle {
             .map_err(|_| MobError::ActorReplyChannelClosed)
     }
 
+    async fn drive_resume_actor_operation(&self, operation: Arc<PendingResumeOperation>) {
+        let terminal = match operation.deadline.checked_duration_since(Instant::now()) {
+            None => Err(MobError::LifecycleOperationAdmissionPending {
+                intent: "explicit_resume".to_string(),
+                stage: "actor_command_admission",
+            }),
+            Some(remaining) => {
+                match tokio::time::timeout(remaining, self.command_tx.reserve()).await {
+                    Err(_) => Err(MobError::LifecycleOperationAdmissionPending {
+                        intent: "explicit_resume".to_string(),
+                        stage: "actor_command_admission",
+                    }),
+                    Ok(Err(_)) => Err(MobError::ActorCommandChannelClosed),
+                    Ok(Ok(permit)) => {
+                        let (reply_tx, mut reply_rx) = oneshot::channel();
+                        let (admission, mut admission_rx) =
+                            super::state::LifecycleAdmissionSignal::new();
+                        permit.send(super::scope_gate::RoutedMobCommand {
+                            authority: self.command_authority.clone(),
+                            cmd: MobCommand::ResumeLifecycle {
+                                deadline: operation.deadline,
+                                admission,
+                                reply_tx,
+                            },
+                        });
+
+                        tokio::select! {
+                            reply = &mut reply_rx => reply
+                                .map_err(|_| MobError::ActorReplyChannelClosed)
+                                .and_then(std::convert::identity),
+                            admitted = &mut admission_rx => {
+                                if admitted.is_ok() {
+                                    self.explicit_resume_operations.publish_if_current(
+                                        &operation,
+                                        ResumeOperationState::LifecycleAuthorityAdmitted,
+                                    );
+                                }
+                                reply_rx
+                                    .await
+                                    .map_err(|_| MobError::ActorReplyChannelClosed)
+                                    .and_then(std::convert::identity)
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        self.explicit_resume_operations.publish_if_current(
+            &operation,
+            ResumeOperationState::Terminal(Arc::new(terminal.map_err(Arc::new))),
+        );
+    }
+
+    fn shared_resume_error(error: &Arc<MobError>) -> MobError {
+        match error.as_ref() {
+            MobError::LifecycleOperationPending { intent } => MobError::LifecycleOperationPending {
+                intent: intent.clone(),
+            },
+            MobError::LifecycleOperationAdmissionPending { intent, stage } => {
+                MobError::LifecycleOperationAdmissionPending {
+                    intent: intent.clone(),
+                    stage,
+                }
+            }
+            _ => MobError::SharedLifecycleFailure(Arc::clone(error)),
+        }
+    }
+
+    async fn observe_resume_actor_operation(
+        &self,
+        operation: Arc<PendingResumeOperation>,
+        caller_deadline: Instant,
+    ) -> Result<(), MobError> {
+        let mut state_rx = operation.state_tx.subscribe();
+        loop {
+            let state = state_rx.borrow().clone();
+            match state {
+                ResumeOperationState::Terminal(result) => {
+                    self.explicit_resume_operations
+                        .remove_if_current(&operation);
+                    if !self
+                        .explicit_resume_operations
+                        .generation_is_current(operation.generation)
+                    {
+                        return Err(MobError::LifecycleOperationAdmissionPending {
+                            intent: "explicit_resume".to_string(),
+                            stage: "intervening_lifecycle_authority",
+                        });
+                    }
+                    return match result.as_ref() {
+                        Ok(()) => Ok(()),
+                        Err(error) => Err(Self::shared_resume_error(error)),
+                    };
+                }
+                ResumeOperationState::InvalidatedByLifecycleAuthority => {
+                    return Err(MobError::LifecycleOperationAdmissionPending {
+                        intent: "explicit_resume".to_string(),
+                        stage: "intervening_lifecycle_authority",
+                    });
+                }
+                ResumeOperationState::AwaitingLifecycleAdmission
+                | ResumeOperationState::LifecycleAuthorityAdmitted => {}
+            }
+
+            let Some(remaining) = caller_deadline.checked_duration_since(Instant::now()) else {
+                return match state {
+                    ResumeOperationState::AwaitingLifecycleAdmission => {
+                        Err(MobError::LifecycleOperationAdmissionPending {
+                            intent: "explicit_resume".to_string(),
+                            stage: "lifecycle_authority_admission",
+                        })
+                    }
+                    ResumeOperationState::LifecycleAuthorityAdmitted => {
+                        Err(MobError::LifecycleOperationPending {
+                            intent: "explicit_resume".to_string(),
+                        })
+                    }
+                    ResumeOperationState::Terminal(_)
+                    | ResumeOperationState::InvalidatedByLifecycleAuthority => unreachable!(),
+                };
+            };
+            match tokio::time::timeout(remaining, state_rx.changed()).await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => return Err(MobError::ActorReplyChannelClosed),
+                Err(_) => {}
+            }
+        }
+    }
+
+    async fn send_resume_actor_command_until(&self, deadline: Instant) -> Result<(), MobError> {
+        let (operation, is_new) = self
+            .explicit_resume_operations
+            .get_or_insert(deadline, &self.command_authority);
+        if is_new {
+            match meerkat_runtime::RuntimeCleanupTaskSpawner::acquire() {
+                Ok(cleanup_spawner) => {
+                    let task_handle = self.clone();
+                    let task_operation = Arc::clone(&operation);
+                    cleanup_spawner.spawn_detached(async move {
+                        let task_result = std::panic::AssertUnwindSafe(
+                            task_handle.drive_resume_actor_operation(Arc::clone(&task_operation)),
+                        )
+                        .catch_unwind()
+                        .await;
+                        if task_result.is_err() {
+                            task_handle.explicit_resume_operations.publish_if_current(
+                                &task_operation,
+                                ResumeOperationState::Terminal(Arc::new(Err(Arc::new(
+                                    MobError::Internal(
+                                        "process-owned explicit Resume actor command panicked"
+                                            .to_string(),
+                                    ),
+                                )))),
+                            );
+                        }
+                    });
+                }
+                Err(error) => {
+                    self.explicit_resume_operations.publish_if_current(
+                        &operation,
+                        ResumeOperationState::Terminal(Arc::new(Err(Arc::new(
+                            MobError::Internal(error.to_string()),
+                        )))),
+                    );
+                }
+            }
+        }
+        self.observe_resume_actor_operation(operation, deadline)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(super) async fn resume_until_for_test(&self, deadline: Instant) -> Result<(), MobError> {
+        self.send_resume_actor_command_until(deadline).await
+    }
+
+    #[cfg(test)]
+    pub(super) fn install_terminal_resume_result_for_test(&self, result: Result<(), MobError>) {
+        let (operation, is_new) = self.explicit_resume_operations.get_or_insert(
+            Instant::now() + Duration::from_secs(1),
+            &self.command_authority,
+        );
+        assert!(is_new, "test requires an empty explicit-Resume slot");
+        assert!(self.explicit_resume_operations.publish_if_current(
+            &operation,
+            ResumeOperationState::Terminal(Arc::new(result.map_err(Arc::new))),
+        ));
+    }
+
     pub(super) fn retirement_operation_key(
         &self,
         expected: &super::state::RetireMemberIncarnation,
@@ -3560,7 +3917,7 @@ impl MobHandle {
             // semantic id without sharing a retirement task. The detached
             // leader retains `self.events`, preventing pointer reuse until the
             // slot is removed.
-            event_store_identity: Arc::as_ptr(&self.events) as *const () as usize,
+            event_store_identity: Arc::as_ptr(&self.events).cast::<()>() as usize,
             mob_id: self.definition.id.to_string(),
             agent_identity: expected.agent_identity.clone(),
             agent_runtime_id: expected.agent_runtime_id.clone(),
@@ -3648,6 +4005,24 @@ impl MobHandle {
         agent_identity: AgentIdentity,
     ) -> Result<(), MobError> {
         let operation_deadline = Instant::now() + super::provisioner::MEMBER_RETIRE_TOTAL_TIMEOUT;
+        // Retire's absent-member convergence is still an operator action.
+        // Enter the serialized scope gate before any roster observation so a
+        // principal cannot turn an identity miss into an authorization
+        // oracle or an unauthorized idempotent success. The exact actor
+        // command revalidates again after the singleflight election. Scope
+        // admission belongs to the same absolute retirement budget: a
+        // parked actor mailbox must return typed not-yet-admitted state
+        // instead of defeating the bounded public contract.
+        let remaining = operation_deadline.saturating_duration_since(Instant::now());
+        tokio::time::timeout(
+            remaining,
+            self.admit_control_scope(mob_dsl::ControlScope::Retire),
+        )
+        .await
+        .map_err(|_| MobError::MemberRetirementAdmissionPending {
+            member_id: agent_identity.clone(),
+            stage: "control_scope_admission".to_string(),
+        })??;
         let entry = {
             let remaining = operation_deadline.saturating_duration_since(Instant::now());
             let roster = tokio::time::timeout(remaining, self.roster.read())
@@ -3714,7 +4089,6 @@ impl MobHandle {
                             ))
                         })
                         .and_then(std::convert::identity);
-                    result_tx.send_replace(Some(Arc::new(task_result.map_err(Arc::new))));
                     let mut operations = pending_retirement_operations()
                         .lock()
                         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -3724,6 +4098,19 @@ impl MobHandle {
                     {
                         operations.remove(&task_key);
                     }
+                    // Retire the exact singleflight slot before publishing its
+                    // terminal observation. A caller awakened by an
+                    // in-progress result may retry immediately; if publication
+                    // came first, that retry could rejoin this already-complete
+                    // slot and receive the same stale result without fresh
+                    // durable re-observation.
+                    drop(operations);
+                    #[cfg(test)]
+                    assert_retirement_result_slot_removed_before_publication(
+                        &task_key,
+                        &task_pending,
+                    );
+                    result_tx.send_replace(Some(Arc::new(task_result.map_err(Arc::new))));
                 });
                 pending
             }
@@ -3943,9 +4330,8 @@ impl MobHandle {
                     .await??;
                 Ok(MobMachineCommandResult::Unit)
             }
-            MobMachineCommand::Resume => {
-                self.send_actor_command(|reply_tx| MobCommand::ResumeLifecycle { reply_tx })
-                    .await??;
+            MobMachineCommand::Resume { deadline } => {
+                self.send_resume_actor_command_until(deadline).await?;
                 Ok(MobMachineCommandResult::Unit)
             }
             MobMachineCommand::Complete => {
@@ -7971,8 +8357,9 @@ impl MobHandle {
 
     /// Transition Stopped -> Running.
     pub async fn resume(&self) -> Result<(), MobError> {
+        let deadline = Instant::now() + super::provisioner::EXPLICIT_RESUME_RETIRE_TOTAL_TIMEOUT;
         match self
-            .execute_machine_command(MobMachineCommand::Resume)
+            .execute_machine_command(MobMachineCommand::Resume { deadline })
             .await?
         {
             MobMachineCommandResult::Unit => Ok(()),
@@ -8215,7 +8602,8 @@ impl MobHandle {
                 Err(
                     error @ (MobError::PlacedCompletionCleanupPending { .. }
                     | MobError::PlacedKickoffCleanupPending { .. }
-                    | MobError::AutonomousStopInterruptsPending { .. }),
+                    | MobError::AutonomousStopInterruptsPending { .. }
+                    | MobError::LifecycleOperationPending { .. }),
                 ) => {
                     if Instant::now() >= deadline {
                         return Err(error);
@@ -8226,6 +8614,12 @@ impl MobHandle {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(super) async fn shutdown_once_for_test(&self) -> Result<(), MobError> {
+        self.send_actor_command(|reply_tx| MobCommand::Shutdown { reply_tx })
+            .await?
     }
 
     /// Stop only volatile runtime tasks, preserving durable active-run and

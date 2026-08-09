@@ -82,6 +82,12 @@ pub(super) const MEMBER_RETIRE_TOTAL_TIMEOUT: Duration = Duration::from_secs(30)
 #[cfg(test)]
 pub(super) const MEMBER_RETIRE_TOTAL_TIMEOUT: Duration = Duration::from_secs(2);
 
+#[cfg(not(test))]
+pub(super) const EXPLICIT_RESUME_RETIRE_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[cfg(test)]
+pub(super) const EXPLICIT_RESUME_RETIRE_TOTAL_TIMEOUT: Duration = Duration::from_secs(2);
+
 #[cfg(all(feature = "runtime-adapter", not(test)))]
 const MEMBER_RETIRE_COOPERATIVE_GRACE: Duration = Duration::from_secs(2);
 
@@ -1010,6 +1016,8 @@ pub trait MobProvisioner: Send + Sync {
     async fn prepare_member_session_for_explicit_resume(
         &self,
         session_id: &SessionId,
+        deadline: Instant,
+        admission: Option<super::state::LifecycleAdmissionSignal>,
     ) -> Result<bool, MobError>;
     async fn ensure_runtime_session_state(&self, member_ref: &MemberRef) -> Result<(), MobError> {
         let _ = member_ref;
@@ -1212,10 +1220,18 @@ pub struct SessionBackend {
     // session identity. This map is never lifecycle truth; canonical
     // registration/attachment truth stays in MeerkatMachine.
     runtime_sessions: Arc<RwLock<HashMap<SessionId, Arc<RuntimeSessionState>>>>,
+    explicit_resume_retirements:
+        Arc<StdMutex<HashMap<SessionId, ExplicitResumeAttachmentRetirement>>>,
     // DEC-P3H-5: the extracted disposal arc, sharing this backend's
     // `runtime_sessions` sidecar map. The backend delegates its disposal
     // verbs here (one implementation, two instance owners).
     disposal: MemberSessionDisposalArc,
+}
+
+#[cfg(feature = "runtime-adapter")]
+#[derive(Clone)]
+struct ExplicitResumeAttachmentRetirement {
+    completion: Arc<Mutex<oneshot::Receiver<Result<bool, MobError>>>>,
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -1749,27 +1765,40 @@ impl MemberSessionDisposalArc {
         session_id: &SessionId,
         error: SessionError,
     ) -> MobError {
-        match error {
-            SessionError::FailedWithData { data, .. }
-                if data
-                    .get("kind")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|kind| {
-                        kind == MEMBER_RETIRE_IN_PROGRESS_KIND
-                            || kind == "runtime_retirement_in_progress"
-                    }) =>
-            {
-                MobError::RetirementInProgress {
-                    session_id: session_id.clone(),
-                    stage: data
-                        .get("stage")
-                        .and_then(serde_json::Value::as_str)
-                        .unwrap_or("runtime_teardown")
-                        .to_string(),
-                }
+        if let Some(stage) = Self::runtime_retirement_progress_stage(&error) {
+            MobError::RetirementInProgress {
+                session_id: session_id.clone(),
+                stage,
             }
-            error => MobError::from(error),
+        } else {
+            MobError::from(error)
         }
+    }
+
+    /// Classify the session owner's structured retained-retirement outcome.
+    /// Consumers must branch on these stable data fields, never Display text.
+    pub(super) fn runtime_retirement_progress_stage(error: &SessionError) -> Option<String> {
+        let SessionError::FailedWithData { data, .. } = error else {
+            return None;
+        };
+        let kind = data.get("kind").and_then(serde_json::Value::as_str)?;
+        if kind != MEMBER_RETIRE_IN_PROGRESS_KIND && kind != "runtime_retirement_in_progress" {
+            return None;
+        }
+        if data.get("retryable").and_then(serde_json::Value::as_bool) != Some(true)
+            || data
+                .get("authority_retained")
+                .and_then(serde_json::Value::as_bool)
+                != Some(true)
+        {
+            return None;
+        }
+        Some(
+            data.get("stage")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("runtime_teardown")
+                .to_string(),
+        )
     }
 
     fn retirement_remaining(
@@ -1878,7 +1907,7 @@ impl MemberSessionDisposalArc {
         let cleanup_spawner = meerkat_runtime::RuntimeCleanupTaskSpawner::acquire()
             .map_err(|error| Self::runtime_archive_error(error.to_string()))?;
         let pending_key = PendingTurnFinalizationBoundaryKey {
-            session_service_identity: Arc::as_ptr(&self.session_service) as *const () as usize,
+            session_service_identity: Arc::as_ptr(&self.session_service).cast::<()>() as usize,
             session_id: session_id.clone(),
         };
         loop {
@@ -2074,6 +2103,10 @@ impl MemberSessionDisposalArc {
         let mut observed_run = None;
         let mut cancel_requested_for = None;
         let mut hard_cancel_requested_for = None;
+        let mut pending_hard_cancel_result: Option<(
+            CoreRunId,
+            oneshot::Receiver<Result<bool, meerkat_runtime::RuntimeDriverError>>,
+        )> = None;
 
         loop {
             tracing::info!(
@@ -2110,7 +2143,47 @@ impl MemberSessionDisposalArc {
                 observed_run = Some(active_run_id.clone());
                 cancel_requested_for = None;
                 hard_cancel_requested_for = None;
+                // Any predecessor attempt remains process-owned and exact-run
+                // fenced, but its result cannot authorize control of the
+                // newly observed run. Drop only our observer.
+                pending_hard_cancel_result = None;
                 escalate_at = Instant::now() + MEMBER_RETIRE_COOPERATIVE_GRACE;
+            }
+
+            if let Some((pending_run_id, pending_result)) = pending_hard_cancel_result.as_mut() {
+                debug_assert_eq!(pending_run_id, &active_run_id);
+                match pending_result.try_recv() {
+                    Ok(Ok(true)) => {
+                        // The exact process-owned attempt was accepted. Keep
+                        // suppression in place while the machine converges.
+                        pending_hard_cancel_result = None;
+                    }
+                    Ok(Ok(false)) => {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            run_id = %active_run_id,
+                            "late exact hard-cancel reported stale while the run remained current; retaining escalation authority for retry"
+                        );
+                        pending_hard_cancel_result = None;
+                        hard_cancel_requested_for = None;
+                    }
+                    Ok(Err(error)) => {
+                        tracing::debug!(
+                            session_id = %session_id,
+                            run_id = %active_run_id,
+                            error = %error,
+                            "late exact hard-cancel rejected while the run remained current; retaining escalation authority for retry"
+                        );
+                        pending_hard_cancel_result = None;
+                        hard_cancel_requested_for = None;
+                    }
+                    Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {}
+                    Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                        return Err(Self::runtime_archive_error(format!(
+                            "process-owned exact hard-cancel task ended without a result for {session_id} run {active_run_id}"
+                        )));
+                    }
+                }
             }
 
             if cancel_requested_for.as_ref() != Some(&active_run_id) {
@@ -2187,7 +2260,7 @@ impl MemberSessionDisposalArc {
                 let task_adapter = Arc::clone(adapter);
                 let task_session_id = session_id.clone();
                 let task_run_id = active_run_id.clone();
-                let (hard_cancel_result_tx, hard_cancel_result_rx) = oneshot::channel();
+                let (hard_cancel_result_tx, mut hard_cancel_result_rx) = oneshot::channel();
                 cleanup_spawner.spawn_detached(async move {
                     let result = task_adapter
                         .hard_cancel_run_if_current(
@@ -2200,7 +2273,7 @@ impl MemberSessionDisposalArc {
                 });
                 let retain_hard_cancel_attempt = match tokio::time::timeout(
                     callback_wait,
-                    hard_cancel_result_rx,
+                    &mut hard_cancel_result_rx,
                 )
                 .await
                 {
@@ -2253,6 +2326,8 @@ impl MemberSessionDisposalArc {
                             run_id = %active_run_id,
                             "hard-cancel callback exceeded bounded wait; exact task retained until it converges or revalidates stale"
                         );
+                        pending_hard_cancel_result =
+                            Some((active_run_id.clone(), hard_cancel_result_rx));
                         true
                     }
                 };
@@ -2633,7 +2708,7 @@ impl SessionBackend {
         session_id: &SessionId,
     ) -> Option<u64> {
         let key = PendingTurnFinalizationBoundaryKey {
-            session_service_identity: Arc::as_ptr(&self.session_service) as *const () as usize,
+            session_service_identity: Arc::as_ptr(&self.session_service).cast::<()>() as usize,
             session_id: session_id.clone(),
         };
         pending_turn_finalization_boundaries()
@@ -2654,75 +2729,144 @@ impl SessionBackend {
     async fn retire_exact_attachment_for_explicit_resume(
         &self,
         session_id: &SessionId,
+        deadline: Instant,
+        admission: Option<super::state::LifecycleAdmissionSignal>,
+    ) -> Result<bool, MobError> {
+        let observer = {
+            let mut retirements = self
+                .explicit_resume_retirements
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if let Some(observer) = retirements.get(session_id) {
+                observer.clone()
+            } else {
+                if Instant::now() >= deadline {
+                    return Err(MobError::LifecycleOperationAdmissionPending {
+                        intent: "explicit_resume".to_string(),
+                        stage: "attachment_retirement_admission",
+                    });
+                }
+                let (result_tx, result_rx) = oneshot::channel();
+                let observer = ExplicitResumeAttachmentRetirement {
+                    completion: Arc::new(Mutex::new(result_rx)),
+                };
+                retirements.insert(session_id.clone(), observer.clone());
+                let backend = self.clone();
+                let task_session_id = session_id.clone();
+                tokio::spawn(async move {
+                    let result = backend
+                        .retire_exact_attachment_for_explicit_resume_owned(&task_session_id)
+                        .await;
+                    let _ = result_tx.send(result);
+                });
+                observer
+            }
+        };
+        if let Some(admission) = admission.as_ref() {
+            admission.admit();
+        }
+
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| MobError::LifecycleOperationPending {
+                intent: format!("explicit_resume_attachment_retirement:{session_id}"),
+            })?;
+        let mut completion = tokio::time::timeout(remaining, observer.completion.lock())
+            .await
+            .map_err(|_| MobError::LifecycleOperationPending {
+                intent: format!("explicit_resume_attachment_retirement:{session_id}"),
+            })?;
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| MobError::LifecycleOperationPending {
+                intent: format!("explicit_resume_attachment_retirement:{session_id}"),
+            })?;
+        let result = tokio::time::timeout(remaining, &mut *completion)
+            .await
+            .map_err(|_| MobError::LifecycleOperationPending {
+                intent: format!("explicit_resume_attachment_retirement:{session_id}"),
+            })?
+            .map_err(|error| {
+                MobError::Internal(format!(
+                    "owned explicit-resume takeover for '{session_id}' ended without a result: {error}"
+                ))
+            })?;
+        drop(completion);
+
+        let mut retirements = self
+            .explicit_resume_retirements
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if retirements
+            .get(session_id)
+            .is_some_and(|current| Arc::ptr_eq(&current.completion, &observer.completion))
+        {
+            retirements.remove(session_id);
+        }
+        drop(retirements);
+        result
+    }
+
+    async fn retire_exact_attachment_for_explicit_resume_owned(
+        &self,
+        session_id: &SessionId,
     ) -> Result<bool, MobError> {
         let Some(adapter) = self.runtime_adapter.as_ref() else {
             // Runtime-less session services retain their existing live actor;
             // there is no attachment-local sidecar to replace.
             return Ok(false);
         };
-        let boundary =
-            RuntimeTurnFinalizationBoundaryLease::acquire(&self.session_service, session_id)
-                .await?;
-        let witness = adapter
-            .current_executor_attachment_witness(session_id)
-            .await;
-        // B stabilizes the actor/attachment incarnation while the sidecar is
-        // sampled. Do not retain R while acquiring M below. An exact active
-        // sidecar in this backend proves same-handle ownership and must be
-        // reused rather than torn down.
-        let observed_sidecar = self.runtime_sessions.read().await.get(session_id).cloned();
-        if let (Some(witness), Some(sidecar)) = (&witness, &observed_sidecar)
-            && sidecar.witness() == witness
-        {
-            if !sidecar.attachment_is_active(witness) || sidecar.cleanup_scheduled() {
-                return Err(MobError::Internal(format!(
-                    "explicit resume found its exact attachment sidecar for '{session_id}' but that sidecar is not active and reusable"
-                )));
-            }
-            let exact_actor_live = sidecar
-                .actor_witness()
-                .is_some_and(|witness| witness.is_live())
-                && self
-                    .session_service
-                    .live_session_actor_registered(session_id)
+        loop {
+            let boundary =
+                RuntimeTurnFinalizationBoundaryLease::acquire(&self.session_service, session_id)
                     .await?;
-            if exact_actor_live {
-                return Ok(false);
-            }
-            // The machine attachment and sidecar still agree, but their
-            // exact actor incarnation was revoked or exited. This is not a
-            // reusable live incarnation: retire it below. Its ops registry is
-            // attachment-local machine plumbing as well, so the exact old
-            // binding is compare-removed after retirement and the ordinary
-            // explicit-resume materialization mints a coherent replacement.
-        }
-        let observed_ops_binding = self.ops_adapter.capture_session_binding_witness(session_id);
-
-        let Some(witness) = witness else {
-            // `active_ids` was observed before B. If the actor outlived its
-            // attachment (or the exact attachment disappeared while resume
-            // acquired B), the fresh backend still cannot adopt that actor.
-            // Explicit resume is authorized to discard it and reconstruct the
-            // exact actor + attachment pair through `ResumedDurable`.
-            let discard_result = self
-                .session_service
-                .discard_live_session_under_runtime_turn_boundary(session_id)
+            let witness = adapter
+                .current_executor_attachment_witness(session_id)
                 .await;
-            drop(boundary);
-            match discard_result {
-                Ok(()) | Err(SessionError::NotFound { .. }) => {
-                    self.remove_runtime_session_state(session_id, observed_sidecar.as_ref())
-                        .await;
-                    self.ops_adapter.clear_session_binding_for_explicit_resume(
-                        session_id,
-                        observed_ops_binding,
-                    )?;
-                    return Ok(true);
+            // B stabilizes the actor/attachment incarnation while the sidecar is
+            // sampled. Do not retain R while acquiring M below.
+            let observed_sidecar = self.runtime_sessions.read().await.get(session_id).cloned();
+            if let (Some(witness), Some(sidecar)) = (&witness, &observed_sidecar)
+                && sidecar.witness() == witness
+            {
+                if !sidecar.attachment_is_active(witness) || sidecar.cleanup_scheduled() {
+                    return Err(MobError::Internal(format!(
+                        "explicit resume found its exact attachment sidecar for '{session_id}' but that sidecar is not active and reusable"
+                    )));
                 }
-                Err(error) => return Err(error.into()),
+                let exact_actor_live = sidecar
+                    .actor_witness()
+                    .is_some_and(|witness| witness.is_live())
+                    && self
+                        .session_service
+                        .live_session_actor_registered(session_id)
+                        .await?;
+                if exact_actor_live {
+                    return Ok(false);
+                }
             }
-        };
-        let retirement = adapter
+            let observed_ops_binding = self.ops_adapter.capture_session_binding_witness(session_id);
+
+            let Some(witness) = witness else {
+                let discard_result = self
+                    .session_service
+                    .discard_live_session_under_runtime_turn_boundary(session_id)
+                    .await;
+                drop(boundary);
+                return match discard_result {
+                    Ok(()) | Err(SessionError::NotFound { .. }) => {
+                        self.remove_runtime_session_state(session_id, observed_sidecar.as_ref())
+                            .await;
+                        self.ops_adapter.clear_session_binding_for_explicit_resume(
+                            session_id,
+                            observed_ops_binding,
+                        )?;
+                        Ok(true)
+                    }
+                    Err(error) => Err(error.into()),
+                };
+            };
+            let retirement = adapter
             .prepare_executor_attachment_retirement_under_runtime_turn_boundary(&witness)
             .await
             .map_err(|error| {
@@ -2736,11 +2880,10 @@ impl SessionBackend {
                 ))
             })?;
 
-        // The retirement lease retains exact M. Release B before the owned
-        // teardown closes the runtime loop, whose canonical post-stop cleanup
-        // reacquires B to remove the old actor and sidecar.
-        drop(boundary);
-        let removed = retirement
+            // The retirement lease retains exact M. Release B before the
+            // process-owned teardown reacquires B for post-stop cleanup.
+            drop(boundary);
+            let retired = retirement
             .commit()
             .map_err(|error| {
                 MobError::Internal(format!(
@@ -2754,19 +2897,29 @@ impl SessionBackend {
                     "failed to complete exact explicit-resume takeover for '{session_id}': {error}"
                 ))
             })?;
-        if !removed {
-            return Err(MobError::Internal(format!(
-                "exact attachment for '{session_id}' changed during explicit-resume takeover"
-            )));
+            if !retired {
+                return Err(MobError::Internal(format!(
+                    "exact attachment for '{session_id}' changed during explicit-resume takeover"
+                )));
+            }
+
+            self.remove_runtime_session_state(session_id, observed_sidecar.as_ref())
+                .await;
+            self.ops_adapter
+                .clear_session_binding_for_explicit_resume(session_id, observed_ops_binding)?;
+            match adapter
+                .current_executor_attachment_witness(session_id)
+                .await
+            {
+                None => return Ok(true),
+                Some(current) if current == witness => {
+                    return Err(MobError::Internal(format!(
+                        "explicit-resume retirement for '{session_id}' reported success while its exact attachment remained current"
+                    )));
+                }
+                Some(_) => continue,
+            }
         }
-        // A stale sidecar in this provisioner can only belong to an older
-        // witness. Compare-and-remove it after the exact current retirement;
-        // a concurrently installed replacement can never be removed here.
-        self.remove_runtime_session_state(session_id, observed_sidecar.as_ref())
-            .await;
-        self.ops_adapter
-            .clear_session_binding_for_explicit_resume(session_id, observed_ops_binding)?;
-        Ok(true)
     }
 
     #[cfg(feature = "runtime-adapter")]
@@ -2938,6 +3091,7 @@ impl SessionBackend {
             workgraph_service,
             ops_adapter: Arc::new(super::ops_adapter::MobOpsAdapter::new()),
             runtime_sessions,
+            explicit_resume_retirements: Arc::new(StdMutex::new(HashMap::new())),
             disposal,
         }
     }
@@ -8485,8 +8639,10 @@ impl MobProvisioner for SessionBackend {
     async fn prepare_member_session_for_explicit_resume(
         &self,
         session_id: &SessionId,
+        deadline: Instant,
+        admission: Option<super::state::LifecycleAdmissionSignal>,
     ) -> Result<bool, MobError> {
-        self.retire_exact_attachment_for_explicit_resume(session_id)
+        self.retire_exact_attachment_for_explicit_resume(session_id, deadline, admission)
             .await
     }
 
@@ -8698,8 +8854,9 @@ impl MultiBackendProvisioner {
         &self,
         session_id: &SessionId,
     ) -> Result<bool, MobError> {
+        let deadline = Instant::now() + EXPLICIT_RESUME_RETIRE_TOTAL_TIMEOUT;
         self.session
-            .retire_exact_attachment_for_explicit_resume(session_id)
+            .retire_exact_attachment_for_explicit_resume(session_id, deadline, None)
             .await
     }
 
@@ -8791,7 +8948,7 @@ impl MultiBackendProvisioner {
                             && stored_pubkey == pubkey
                             && stored_session_id == session_id
                     )
-                    && expected_identity.map_or(true, |identity| record.agent_identity == *identity)
+                    && expected_identity.is_none_or(|identity| record.agent_identity == *identity)
             });
         let record = matches.next().ok_or_else(|| MobError::UnsupportedForMode {
             mode: crate::MobRuntimeMode::TurnDriven,
@@ -10435,6 +10592,7 @@ impl MobProvisioner for MultiBackendProvisioner {
             binding_generation,
             host,
         } = request;
+        let retirement_member_id = agent_identity.clone();
         let command = super::bridge_protocol::BridgeCommand::ReleaseMember(
             super::bridge_protocol::BridgeReleasePayload {
                 supervisor,
@@ -10459,6 +10617,15 @@ impl MobProvisioner for MultiBackendProvisioner {
             )
             .await?;
         if let Some(rejection) = Self::bridge_rejection_reply(command.protocol_version(), &value) {
+            if let Some(
+                super::bridge_protocol::BridgeRejectionCause::RuntimeRetirementInProgress { stage },
+            ) = rejection.typed_cause()
+            {
+                return Err(MobError::MemberRetirementInProgress {
+                    member_id: AgentIdentity::from(retirement_member_id.as_str()),
+                    stage,
+                });
+            }
             return Err(Self::bridge_rejection_error(rejection));
         }
         let released: super::bridge_protocol::BridgeMemberReleasedResponse =
@@ -11802,9 +11969,11 @@ impl MobProvisioner for MultiBackendProvisioner {
     async fn prepare_member_session_for_explicit_resume(
         &self,
         session_id: &SessionId,
+        deadline: Instant,
+        admission: Option<super::state::LifecycleAdmissionSignal>,
     ) -> Result<bool, MobError> {
         self.session
-            .retire_exact_attachment_for_explicit_resume(session_id)
+            .retire_exact_attachment_for_explicit_resume(session_id, deadline, admission)
             .await
     }
 

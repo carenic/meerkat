@@ -148,6 +148,14 @@ pub(super) async fn release_placed_attempt_or_certify_absent(
         Err(error) => error,
     };
 
+    // The host explicitly retained the exact retirement saga. Do not turn
+    // that positive authority observation into an absence probe or an inner
+    // retry whose second result hides the bounded public outcome. The caller
+    // owns the next level-triggered attempt at this same carrier tuple.
+    if matches!(&first_error, MobError::MemberRetirementInProgress { .. }) {
+        return Err(first_error);
+    }
+
     // UnknownMember is carried by the bridge's coarse `Unsupported` cause.
     // It is a definitive no-effect result, but not a cleanup failure: an
     // authenticated HostStatus under this same binding can certify the exact

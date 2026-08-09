@@ -614,6 +614,7 @@ impl LiveSessionActorWitness {
             && Arc::ptr_eq(&self.incarnation, &handle.actor_witness.incarnation)
     }
 
+    #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
     fn same_incarnation(&self, other: &Self) -> bool {
         self.session_id == other.session_id && Arc::ptr_eq(&self.incarnation, &other.incarnation)
     }
@@ -970,18 +971,6 @@ enum SessionCommand {
         reply_tx: oneshot::Sender<Option<meerkat_core::ExternalToolSurfaceSnapshot>>,
     },
     #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
-    PublishInteractionTerminalExact {
-        interaction_id: meerkat_core::interaction::InteractionId,
-        event: AgentEvent,
-        event_store: Arc<dyn crate::event_store::EventStore>,
-        reply_tx: oneshot::Sender<
-            Result<
-                meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt,
-                SessionError,
-            >,
-        >,
-    },
-    #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
     PublishInteractionTerminalsExactBatch {
         expected_actor: Option<LiveSessionActorWitness>,
         events: Vec<AgentEvent>,
@@ -1317,6 +1306,9 @@ impl RuntimeContextAdmissionGuard {
 }
 
 struct SessionTaskControl {
+    // Browser sessions retain the exact witness in the shared task-control
+    // shape, but exact durable terminal publication is native-only.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     actor_witness: LiveSessionActorWitness,
     state_tx: watch::Sender<SessionState>,
     summary_tx: watch::Sender<SessionSummaryCache>,
@@ -3007,81 +2999,6 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             )));
         }
         Ok(prepared)
-    }
-
-    #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
-    pub(crate) async fn publish_interaction_terminal_exact(
-        &self,
-        id: &SessionId,
-        interaction_id: meerkat_core::interaction::InteractionId,
-        event: AgentEvent,
-        event_store: Arc<dyn crate::event_store::EventStore>,
-    ) -> Result<
-        meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt,
-        SessionError,
-    > {
-        let sessions = self.sessions.read().await;
-        let handle = sessions
-            .get(id)
-            .ok_or_else(|| SessionError::NotFound { id: id.clone() })?;
-        let (reply_tx, reply_rx) = oneshot::channel();
-        handle
-            .command_tx
-            .send(SessionCommand::PublishInteractionTerminalExact {
-                interaction_id,
-                event,
-                event_store,
-                reply_tx,
-            })
-            .await
-            .map_err(|_| {
-                SessionError::Agent(meerkat_core::error::AgentError::InternalError(
-                    "Session task has exited".to_string(),
-                ))
-            })?;
-        reply_rx.await.map_err(|_| {
-            SessionError::Agent(meerkat_core::error::AgentError::InternalError(
-                "Session task dropped the reply channel".to_string(),
-            ))
-        })?
-    }
-
-    #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
-    pub(crate) async fn publish_interaction_terminals_exact_batch(
-        &self,
-        id: &SessionId,
-        events: Vec<AgentEvent>,
-        event_store: Arc<dyn crate::event_store::EventStore>,
-    ) -> Result<
-        Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
-        SessionError,
-    > {
-        let command_tx = self
-            .sessions
-            .read()
-            .await
-            .get(id)
-            .map(|handle| handle.command_tx.clone())
-            .ok_or_else(|| SessionError::NotFound { id: id.clone() })?;
-        let (reply_tx, reply_rx) = oneshot::channel();
-        command_tx
-            .send(SessionCommand::PublishInteractionTerminalsExactBatch {
-                expected_actor: None,
-                events,
-                event_store,
-                reply_tx,
-            })
-            .await
-            .map_err(|_| {
-                SessionError::Agent(meerkat_core::error::AgentError::InternalError(
-                    "Session task has exited".to_string(),
-                ))
-            })?;
-        reply_rx.await.map_err(|_| {
-            SessionError::Agent(meerkat_core::error::AgentError::InternalError(
-                "Session task dropped the reply channel".to_string(),
-            ))
-        })?
     }
 
     /// Publish an exact interaction-terminal batch only to the actor named by
@@ -5276,12 +5193,6 @@ async fn drain_session_task_commands<A: SessionAgent>(
                 )));
             }
             #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
-            SessionCommand::PublishInteractionTerminalExact { reply_tx, .. } => {
-                let _ = reply_tx.send(Err(SessionError::Agent(
-                    meerkat_core::error::AgentError::Cancelled,
-                )));
-            }
-            #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
             SessionCommand::PublishInteractionTerminalsExactBatch { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(SessionError::Agent(
                     meerkat_core::error::AgentError::Cancelled,
@@ -6213,67 +6124,6 @@ async fn session_task<A: SessionAgent>(
             }
             SessionCommand::ExternalToolSurfaceSnapshot { reply_tx } => {
                 let _ = reply_tx.send(agent.external_tool_surface_snapshot());
-            }
-            #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
-            SessionCommand::PublishInteractionTerminalExact {
-                interaction_id,
-                event,
-                event_store,
-                reply_tx,
-            } => {
-                let proposed_seq = match next_seq.checked_add(1) {
-                    Some(seq) => seq,
-                    None => {
-                        let _ = reply_tx.send(Err(SessionError::Agent(
-                            meerkat_core::error::AgentError::InternalError(
-                                "session event sequence overflow".to_string(),
-                            ),
-                        )));
-                        continue;
-                    }
-                };
-                let envelope = EventEnvelope::new_with_source(
-                    EventSourceIdentity::interaction(interaction_id),
-                    proposed_seq,
-                    None,
-                    event.clone(),
-                );
-                let append = event_store
-                    .append_interaction_terminal_exact(&session_id, interaction_id, &envelope)
-                    .await;
-                let result = match append {
-                    Ok(crate::event_store::ExactInteractionAppend::Inserted(stored)) => {
-                        if stored.stream_seq == proposed_seq {
-                            next_seq = proposed_seq;
-                            let _ = control.session_event_tx.send(stored.to_envelope());
-                            meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt::try_new(
-                                &stored.event,
-                                stored.seq,
-                            )
-                            .map_err(|error| SessionError::Agent(
-                                meerkat_core::error::AgentError::InternalError(error.to_string()),
-                            ))
-                        } else {
-                            Err(SessionError::Agent(
-                                meerkat_core::error::AgentError::InternalError(format!(
-                                    "exact interaction append returned stream seq {}, expected {proposed_seq}",
-                                    stored.stream_seq
-                                )),
-                            ))
-                        }
-                    }
-                    Ok(crate::event_store::ExactInteractionAppend::Replayed(stored)) => {
-                        meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt::try_new(
-                            &stored.event,
-                            stored.seq,
-                        )
-                        .map_err(|error| SessionError::Agent(
-                            meerkat_core::error::AgentError::InternalError(error.to_string()),
-                        ))
-                    }
-                    Err(error) => Err(SessionError::Store(Box::new(error))),
-                };
-                let _ = reply_tx.send(result);
             }
             #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
             SessionCommand::PublishInteractionTerminalsExactBatch {

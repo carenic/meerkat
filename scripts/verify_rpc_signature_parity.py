@@ -303,9 +303,15 @@ BASELINE_HAND_ROLLED: set[tuple[str, str, str]] = {
 # The remaining grandfathered wrappers are owned debt, not a permanent escape
 # hatch. New generated wrappers must remove entries; the whole baseline expires
 # unless renewed with an explicit owner decision.
+#
+# 2026-08-10 sdk-contracts owner review: all 239 entries remain active
+# generated-type mismatches (ts=110, py=129), and the gate reports no stale
+# entries that can be deleted without migrating their wrappers. Renew only for
+# one week of 0.8.22 release closeout, and ratchet the cap to the exact reviewed
+# count so this decision cannot admit new hand-rolled debt.
 BASELINE_HAND_ROLLED_OWNER = "sdk-contracts"
-BASELINE_HAND_ROLLED_EXPIRES = "2026-08-09"
-BASELINE_HAND_ROLLED_MAX_ENTRIES = 243
+BASELINE_HAND_ROLLED_EXPIRES = "2026-08-17"
+BASELINE_HAND_ROLLED_MAX_ENTRIES = 239
 
 
 def split_type_refs(type_ref: str | None) -> list[str]:

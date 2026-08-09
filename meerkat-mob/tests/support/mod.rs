@@ -378,6 +378,20 @@ impl HostFixtureOptions {
         self
     }
 
+    /// Compose the member-build substrate for the canonical realtime catalog
+    /// row. The portable live spec pins `gpt-realtime-2` to OpenAI, so both
+    /// preflight presence and the injected deterministic client must identify
+    /// as OpenAI rather than inheriting the plain-worker Anthropic default.
+    pub fn with_realtime_member_build(mut self) -> Self {
+        self.member_substrate = MemberSubstrateOption::PersistentTemp;
+        self.resolvable_providers = vec![meerkat_core::Provider::OpenAI];
+        self.member_llm_client = Some(scripted_member_client_completing_for_provider(
+            "live-done",
+            meerkat_core::Provider::OpenAI,
+        ));
+        self
+    }
+
     pub fn stopping_first_executor_after_ensure(mut self) -> Self {
         self.stop_first_executor_after_ensure = true;
         self
@@ -666,11 +680,29 @@ impl meerkat_core::service::SessionService for FailingOnceSessionService {
     }
 }
 
-// Ext supertraits: the T12 row exercises only the materialize create path
-// (which the wrapper intercepts) and reads — required ext items delegate to
-// the wrapped service, defaults cover the rest.
 #[async_trait::async_trait]
-impl meerkat_core::service::SessionServiceCommsExt for FailingOnceSessionService {}
+impl meerkat_core::service::SessionServiceCommsExt for FailingOnceSessionService {
+    async fn comms_runtime(
+        &self,
+        session_id: &meerkat_core::SessionId,
+    ) -> Option<Arc<dyn meerkat_core::agent::CommsRuntime>> {
+        self.inner.comms_runtime(session_id).await
+    }
+
+    async fn event_injector(
+        &self,
+        session_id: &meerkat_core::SessionId,
+    ) -> Option<Arc<dyn meerkat_core::EventInjector>> {
+        self.inner.event_injector(session_id).await
+    }
+
+    async fn interaction_event_injector(
+        &self,
+        session_id: &meerkat_core::SessionId,
+    ) -> Option<Arc<dyn meerkat_core::event_injector::SubscribableInjector>> {
+        self.inner.interaction_event_injector(session_id).await
+    }
+}
 #[async_trait::async_trait]
 impl meerkat_core::service::SessionServiceControlExt for FailingOnceSessionService {
     async fn append_system_context(
@@ -844,6 +876,18 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
             .await
     }
 
+    async fn archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_before(
+        &self,
+        session_id: &meerkat_core::SessionId,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<(), meerkat_core::service::SessionError> {
+        self.inner
+            .archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_before(
+                session_id, deadline,
+            )
+            .await
+    }
+
     async fn discard_live_session_under_runtime_turn_boundary(
         &self,
         session_id: &meerkat_core::SessionId,
@@ -859,6 +903,34 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
 
     fn runtime_adapter(&self) -> Option<Arc<MeerkatMachine>> {
         self.inner.runtime_adapter()
+    }
+
+    fn supports_runtime_turn_apply(&self) -> bool {
+        self.inner.supports_runtime_turn_apply()
+    }
+
+    async fn apply_runtime_turn(
+        &self,
+        session_id: &meerkat_core::SessionId,
+        run_id: meerkat_core::RunId,
+        req: meerkat_core::service::StartTurnRequest,
+        boundary: meerkat_core::lifecycle::run_primitive::RunApplyBoundary,
+        contributing_input_ids: Vec<meerkat_core::InputId>,
+    ) -> Result<
+        meerkat_core::lifecycle::core_executor::CoreApplyOutput,
+        meerkat_core::service::SessionError,
+    > {
+        self.inner
+            .apply_runtime_turn(session_id, run_id, req, boundary, contributing_input_ids)
+            .await
+    }
+
+    async fn cancel_all_checkpointers(&self) {
+        self.inner.cancel_all_checkpointers().await;
+    }
+
+    async fn rearm_all_checkpointers(&self) {
+        self.inner.rearm_all_checkpointers().await;
     }
 
     async fn live_session_actor_registered(
@@ -1726,11 +1798,12 @@ pub async fn spawn_host_daemon_fixture(
                     .comms(true);
             let mut builder =
                 meerkat::FactoryAgentBuilder::new(factory, meerkat::Config::default());
-            builder.default_llm_client = Some(
-                opts.member_llm_client
-                    .clone()
-                    .unwrap_or_else(|| Arc::new(meerkat_client::TestClient::default())),
-            );
+            builder.default_llm_client =
+                Some(opts.member_llm_client.clone().unwrap_or_else(|| {
+                    Arc::new(meerkat_client::TestClient::for_provider(
+                        meerkat_core::Provider::Anthropic,
+                    ))
+                }));
             let service: Arc<dyn meerkat_mob::MobSessionService> =
                 Arc::new(meerkat_session::EphemeralSessionService::new(builder, 32));
             let adapter = service
@@ -1757,9 +1830,11 @@ pub async fn spawn_host_daemon_fixture(
             let service = persistent_service_with_client(
                 &realm.paths,
                 Arc::clone(&realm.runtime_store),
-                opts.member_llm_client
-                    .clone()
-                    .unwrap_or_else(|| Arc::new(meerkat_client::TestClient::default())),
+                opts.member_llm_client.clone().unwrap_or_else(|| {
+                    Arc::new(meerkat_client::TestClient::for_provider(
+                        meerkat_core::Provider::Anthropic,
+                    ))
+                }),
             );
             // Phase 6b: the live-plane fixture half composes
             // `ServiceLiveProjection` over the CONCRETE service (the
@@ -2960,7 +3035,9 @@ pub fn persistent_service(
     persistent_service_with_client(
         paths,
         runtime_store,
-        Arc::new(meerkat_client::TestClient::default()),
+        Arc::new(meerkat_client::TestClient::for_provider(
+            meerkat_core::Provider::Anthropic,
+        )),
     )
 }
 
@@ -2971,6 +3048,15 @@ pub fn persistent_service_with_client(
     paths: &ControllingMobPaths,
     runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
     client: Arc<dyn meerkat_client::LlmClient>,
+) -> Arc<meerkat_session::PersistentSessionService<meerkat::FactoryAgentBuilder>> {
+    persistent_service_with_client_in_realm(paths, runtime_store, client, "test-realm")
+}
+
+fn persistent_service_with_client_in_realm(
+    paths: &ControllingMobPaths,
+    runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
+    client: Arc<dyn meerkat_client::LlmClient>,
+    workgraph_realm: &str,
 ) -> Arc<meerkat_session::PersistentSessionService<meerkat::FactoryAgentBuilder>> {
     paths.materialize_project_context();
     let factory = meerkat::AgentFactory::new(paths.runtime_root.join("factory-store"))
@@ -2987,7 +3073,7 @@ pub fn persistent_service_with_client(
     meerkat::surface::set_default_workgraph_namespace_grant(
         &builder,
         Some(
-            meerkat::WorkGraphNamespaceGrant::new("test-realm", "default")
+            meerkat::WorkGraphNamespaceGrant::new(workgraph_realm, "default")
                 .expect("valid test WorkGraph grant"),
         ),
     );
@@ -2996,7 +3082,7 @@ pub fn persistent_service_with_client(
         Some(Arc::new(meerkat::WorkGraphToolSurface::new(
             meerkat::WorkGraphService::with_scope(
                 Arc::new(meerkat::MemoryWorkGraphStore::new()),
-                "test-realm",
+                workgraph_realm,
                 meerkat::WorkNamespace::default(),
             ),
         ))),
@@ -3290,9 +3376,17 @@ async fn create_controlling_mob_composed(
     let paths = ControllingMobPaths::new(temp.path());
     let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
         Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
-    let service = persistent_service(&paths, Arc::clone(&runtime_store));
-
     let mob_id = meerkat_mob::MobId::from(format!("{label}-{}", uuid::Uuid::new_v4().simple()));
+    let workgraph_realm = meerkat_core::mob_realm_id(mob_id.as_str())
+        .expect("fixture mob id produces a canonical workgraph realm");
+    let service = persistent_service_with_client_in_realm(
+        &paths,
+        Arc::clone(&runtime_store),
+        Arc::new(meerkat_client::TestClient::for_provider(
+            meerkat_core::Provider::Anthropic,
+        )),
+        workgraph_realm.as_str(),
+    );
     let metadata: Arc<dyn meerkat_mob::store::MobRuntimeMetadataStore> =
         Arc::new(meerkat_mob::store::InMemoryMobRuntimeMetadataStore::new());
     let identity: Arc<dyn meerkat_mob::store::MobIdentityStore> =
@@ -4359,6 +4453,7 @@ pub fn support_event_kind(event: &meerkat_core::AgentEvent) -> &'static str {
 /// Every stream completes immediately with `text` (EndTurn).
 struct ScriptedCompletingClient {
     text: String,
+    provider: meerkat_core::Provider,
 }
 
 #[async_trait::async_trait]
@@ -4381,7 +4476,7 @@ impl meerkat_client::LlmClient for ScriptedCompletingClient {
             },
             meerkat_client::LlmEvent::UsageUpdate {
                 usage: meerkat_core::TurnUsage::host_declared(
-                    meerkat_core::Provider::Anthropic,
+                    self.provider,
                     &request.model,
                     meerkat_core::Usage::default(),
                 ),
@@ -4396,7 +4491,7 @@ impl meerkat_client::LlmClient for ScriptedCompletingClient {
     }
 
     fn provider(&self) -> meerkat_core::Provider {
-        meerkat_core::Provider::Anthropic
+        self.provider
     }
 
     async fn health_check(&self) -> Result<(), meerkat_client::LlmError> {
@@ -4406,8 +4501,18 @@ impl meerkat_client::LlmClient for ScriptedCompletingClient {
 
 /// A member client whose every turn completes with `text`.
 pub fn scripted_member_client_completing(text: &str) -> Arc<dyn meerkat_client::LlmClient> {
+    scripted_member_client_completing_for_provider(text, meerkat_core::Provider::Anthropic)
+}
+
+/// A member client whose every turn completes with `text`, while truthfully
+/// identifying as the canonical model provider exercised by the fixture.
+pub fn scripted_member_client_completing_for_provider(
+    text: &str,
+    provider: meerkat_core::Provider,
+) -> Arc<dyn meerkat_client::LlmClient> {
     Arc::new(ScriptedCompletingClient {
         text: text.to_string(),
+        provider,
     })
 }
 
@@ -4432,13 +4537,20 @@ impl meerkat_client::LlmClient for ToolThenTextClient {
 
     fn stream<'a>(
         &'a self,
-        _request: &'a meerkat_client::LlmRequest,
+        request: &'a meerkat_client::LlmRequest,
     ) -> meerkat_client::types::LlmStream<'a> {
         let events = if self.fired.swap(true, Ordering::SeqCst) {
             vec![
                 meerkat_client::LlmEvent::TextDelta {
                     delta: self.text.clone(),
                     meta: None,
+                },
+                meerkat_client::LlmEvent::UsageUpdate {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        meerkat_core::Provider::Anthropic,
+                        &request.model,
+                        meerkat_core::Usage::default(),
+                    ),
                 },
                 meerkat_client::LlmEvent::Done {
                     outcome: meerkat_client::LlmDoneOutcome::Success {
@@ -4454,6 +4566,13 @@ impl meerkat_client::LlmClient for ToolThenTextClient {
                     args: self.args.clone(),
                     meta: None,
                 },
+                meerkat_client::LlmEvent::UsageUpdate {
+                    usage: meerkat_core::TurnUsage::host_declared(
+                        meerkat_core::Provider::Anthropic,
+                        &request.model,
+                        meerkat_core::Usage::default(),
+                    ),
+                },
                 meerkat_client::LlmEvent::Done {
                     outcome: meerkat_client::LlmDoneOutcome::Success {
                         stop_reason: meerkat_core::StopReason::ToolUse,
@@ -4465,7 +4584,7 @@ impl meerkat_client::LlmClient for ToolThenTextClient {
     }
 
     fn provider(&self) -> meerkat_core::Provider {
-        meerkat_core::Provider::Other
+        meerkat_core::Provider::Anthropic
     }
 
     async fn health_check(&self) -> Result<(), meerkat_client::LlmError> {
@@ -4540,12 +4659,13 @@ impl meerkat_client::LlmClient for StallingClient {
 
     fn stream<'a>(
         &'a self,
-        _request: &'a meerkat_client::LlmRequest,
+        request: &'a meerkat_client::LlmRequest,
     ) -> meerkat_client::types::LlmStream<'a> {
         let gate = self.gate.clone();
+        let model = request.model.clone();
         Box::pin(futures::stream::unfold(
-            (gate, 0u8),
-            |(gate, emitted)| async move {
+            (gate, model, 0u8),
+            |(gate, model, emitted)| async move {
                 match emitted {
                     0 => {
                         gate.wait().await;
@@ -4554,16 +4674,26 @@ impl meerkat_client::LlmClient for StallingClient {
                                 delta: "released".to_string(),
                                 meta: None,
                             }),
-                            (gate, 1),
+                            (gate, model, 1),
                         ))
                     }
                     1 => Some((
+                        Ok(meerkat_client::LlmEvent::UsageUpdate {
+                            usage: meerkat_core::TurnUsage::host_declared(
+                                meerkat_core::Provider::Anthropic,
+                                &model,
+                                meerkat_core::Usage::default(),
+                            ),
+                        }),
+                        (gate, model, 2),
+                    )),
+                    2 => Some((
                         Ok(meerkat_client::LlmEvent::Done {
                             outcome: meerkat_client::LlmDoneOutcome::Success {
                                 stop_reason: meerkat_core::StopReason::EndTurn,
                             },
                         }),
-                        (gate, 2),
+                        (gate, model, 3),
                     )),
                     _ => None,
                 }
@@ -4572,7 +4702,7 @@ impl meerkat_client::LlmClient for StallingClient {
     }
 
     fn provider(&self) -> meerkat_core::Provider {
-        meerkat_core::Provider::Other
+        meerkat_core::Provider::Anthropic
     }
 
     async fn health_check(&self) -> Result<(), meerkat_client::LlmError> {

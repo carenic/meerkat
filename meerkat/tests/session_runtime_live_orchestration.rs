@@ -383,6 +383,7 @@ mod orchestrator_e2e {
         staged_capacity_admissions: StagedCapacityAdmissions,
         archive_runtime_cleanup: ArchiveRuntimeCleanup,
         runtime_adapter: Arc<MeerkatMachine>,
+        actor_witness_slots: Arc<std::sync::Mutex<Vec<meerkat::LiveSessionActorWitnessSlot>>>,
         _temp: tempfile::TempDir,
     }
 
@@ -414,11 +415,13 @@ mod orchestrator_e2e {
             staged_capacity_admissions,
             archive_runtime_cleanup,
             runtime_adapter,
+            actor_witness_slots: Arc::new(std::sync::Mutex::new(Vec::new())),
             _temp: temp,
         }
     }
 
     fn orchestrator(fx: &Fixture) -> LiveOrchestrator<'_> {
+        let actor_witness_slots = Arc::clone(&fx.actor_witness_slots);
         LiveOrchestrator {
             service: &fx.service,
             staged_sessions: &fx.staged_sessions,
@@ -434,6 +437,12 @@ mod orchestrator_e2e {
             instance_id: None,
             backend: None,
             ingress_reconciler: None,
+            actor_witness_capture: Arc::new(move |_session_id, actor_witness_slot| {
+                actor_witness_slots
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .push(actor_witness_slot);
+            }),
         }
     }
 

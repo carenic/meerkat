@@ -449,24 +449,24 @@ pub async fn create_session_with_params(
     // Deferred creates register on-demand through the session/* router entry
     // points; eagerly attaching here is redundant and can recurse through the
     // runtime control path before the pending session has ever been exercised.
-    if params.initial_turn != Some(InitialTurn::Deferred) {
-        if let Err(error) = runtime.ensure_runtime_executor(&session_id).await {
-            if let Err(cleanup_error) = runtime.archive_session(&session_id).await {
-                return RpcResponse::error(
-                    id,
-                    error::INTERNAL_ERROR,
-                    format!(
-                        "runtime executor registration failed: {}; staged session cleanup failed: {}",
-                        error.message, cleanup_error.message
-                    ),
-                );
-            }
+    if params.initial_turn != Some(InitialTurn::Deferred)
+        && let Err(error) = runtime.ensure_runtime_executor(&session_id).await
+    {
+        if let Err(cleanup_error) = runtime.archive_session(&session_id).await {
             return RpcResponse::error(
                 id,
                 error::INTERNAL_ERROR,
-                format!("runtime executor registration failed: {}", error.message),
+                format!(
+                    "runtime executor registration failed: {}; staged session cleanup failed: {}",
+                    error.message, cleanup_error.message
+                ),
             );
         }
+        return RpcResponse::error(
+            id,
+            error::INTERNAL_ERROR,
+            format!("runtime executor registration failed: {}", error.message),
+        );
     }
 
     if let Some(context) = request_context.as_ref() {

@@ -13,6 +13,8 @@
 #![cfg(not(target_arch = "wasm32"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+mod support;
+
 use meerkat::{
     AgentFactory, Config, FactoryAgentBuilder, SessionHistoryQuery, SessionServiceControlExt,
     SessionStore,
@@ -35,6 +37,14 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::time::{Duration, Instant, sleep};
+
+use support::FailingOnceSessionService;
+
+fn openai_test_client() -> Arc<meerkat_client::TestClient> {
+    Arc::new(meerkat_client::TestClient::for_provider(
+        meerkat_core::Provider::OpenAI,
+    ))
+}
 
 #[derive(Clone)]
 struct Paths {
@@ -92,7 +102,7 @@ fn persistent_service(
     paths.materialize_project_context();
     let factory = factory(paths);
     let mut builder = FactoryAgentBuilder::new(factory, Config::default());
-    builder.default_llm_client = Some(Arc::new(meerkat_client::TestClient::default()));
+    builder.default_llm_client = Some(openai_test_client());
     let store = Arc::new(JsonlStore::new(paths.sessions_root.clone()));
     builder.default_session_store = Some(Arc::new(StoreAdapter::new(store.clone())));
 
@@ -119,7 +129,7 @@ fn persistent_head_canonical_service(
     paths.materialize_project_context();
     let factory = factory(paths);
     let mut builder = FactoryAgentBuilder::new(factory, Config::default());
-    builder.default_llm_client = Some(Arc::new(meerkat_client::TestClient::default()));
+    builder.default_llm_client = Some(openai_test_client());
     let store = Arc::new(
         SqliteSessionStore::open(&paths.realm_db_path)
             .expect("open co-tenant SQLite session store"),
@@ -359,7 +369,7 @@ async fn run_cold_restart_scenario(reuse_runtime_store: bool, lead_mode: MobRunt
     let lead_comms_name = format!("{}/lead/lead-1", definition.id);
     let handle_1 = MobBuilder::new(definition, storage_1)
         .with_session_service(service_1.clone())
-        .with_default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+        .with_default_llm_client(openai_test_client())
         .create()
         .await
         .expect("create persistent mob");
@@ -485,7 +495,7 @@ async fn run_cold_restart_scenario(reuse_runtime_store: bool, lead_mode: MobRunt
     let storage_2 = MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage");
     let handle_2 = MobBuilder::for_resume(storage_2)
         .with_session_service(service_2.clone())
-        .with_default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+        .with_default_llm_client(openai_test_client())
         .notify_orchestrator_on_resume(false)
         .resume()
         .await
@@ -678,7 +688,7 @@ async fn mob_cold_restart_explicit_resume_revives_archived_retired_session_in_pl
     let storage_1 = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
     let handle_1 = MobBuilder::new(definition, storage_1)
         .with_session_service(service_1.clone())
-        .with_default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+        .with_default_llm_client(openai_test_client())
         .create()
         .await
         .expect("create persistent mob");
@@ -757,7 +767,7 @@ async fn mob_cold_restart_explicit_resume_revives_archived_retired_session_in_pl
     let storage_2 = MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage");
     let handle_2 = MobBuilder::for_resume(storage_2)
         .with_session_service(service_2.clone())
-        .with_default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+        .with_default_llm_client(openai_test_client())
         .notify_orchestrator_on_resume(false)
         .resume()
         .await
@@ -852,8 +862,31 @@ async fn mob_cold_restart_explicit_resume_revives_archived_retired_session_in_pl
 /// A broken wired member still needs its exact old-generation endpoint after
 /// a full service restart. The endpoint is required to retire reciprocal trust
 /// safely before spawning and wiring the replacement generation.
-#[tokio::test(flavor = "multi_thread")]
-async fn mob_cold_restart_partial_resume_respawns_wired_member() {
+#[test]
+fn mob_cold_restart_partial_resume_respawns_wired_member() {
+    run_partial_resume_respawn_with_stack(2 * 1024 * 1024, "production-stack");
+}
+
+/// Keep headroom below Tokio's production default so debug-only future
+/// construction growth fails here instead of overflowing a CI worker.
+#[test]
+fn mob_cold_restart_partial_resume_respawn_fits_compact_actor_stack() {
+    run_partial_resume_respawn_with_stack(1536 * 1024, "compact-stack");
+}
+
+fn run_partial_resume_respawn_with_stack(stack_size: usize, label: &str) {
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        // Pin the requested stack explicitly. The production selector uses
+        // Tokio's 2 MiB default, while the compact selector preserves margin
+        // against debug-only future construction growth.
+        .thread_stack_size(stack_size)
+        .build()
+        .unwrap_or_else(|error| panic!("build {label} cold-resume runtime: {error}"));
+    runtime.block_on(mob_cold_restart_partial_resume_respawns_wired_member_scenario());
+}
+
+async fn mob_cold_restart_partial_resume_respawns_wired_member_scenario() {
     let temp = tempfile::tempdir().expect("temp dir");
     let paths = Paths::new(temp.path());
     let runtime_store_1: Arc<dyn meerkat_runtime::RuntimeStore> =
@@ -865,7 +898,7 @@ async fn mob_cold_restart_partial_resume_respawns_wired_member() {
     let lead_comms_name = format!("{}/lead/lead-1", definition.id);
     let handle_1 = MobBuilder::new(definition, storage_1)
         .with_session_service(service_1.clone())
-        .with_default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+        .with_default_llm_client(openai_test_client())
         .create()
         .await
         .expect("create persistent mob");
@@ -922,7 +955,7 @@ async fn mob_cold_restart_partial_resume_respawns_wired_member() {
     let storage_2 = MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage");
     let handle_2 = MobBuilder::for_resume(storage_2)
         .with_session_service(service_2.clone())
-        .with_default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+        .with_default_llm_client(openai_test_client())
         .notify_orchestrator_on_resume(false)
         .resume()
         .await
@@ -1872,7 +1905,7 @@ async fn mob_cold_restart_resume_after_kill_between_commit_points() {
     let storage_1 = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
     let handle_1 = MobBuilder::new(mob_definition(MobRuntimeMode::TurnDriven), storage_1)
         .with_session_service(service_1.clone())
-        .with_default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+        .with_default_llm_client(openai_test_client())
         .create()
         .await
         .expect("create persistent mob");
@@ -2039,10 +2072,17 @@ async fn mob_cold_restart_resume_after_kill_between_commit_points() {
     // ---------------- Lifetime 2 (power restored) ----------------
     power_store.set_cut(false);
     let (service_2, store_2) = persistent_head_canonical_service(&paths, runtime_store.clone());
+    let persistent_owner: Arc<dyn MobSessionService> = service_2.clone();
+    let forwarding_decorator =
+        FailingOnceSessionService::new(persistent_owner, None, None, 0, false);
     let storage_2 = MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage");
     let resume_result = MobBuilder::for_resume(storage_2)
-        .with_session_service(service_2.clone())
-        .with_default_llm_client(Arc::new(meerkat_client::TestClient::default()))
+        // The transparent decorator must forward the owner's combined
+        // durable-tail verdict. Persistent actor creation consumes its exact
+        // owner-issued receipt, so inheriting a nonpersistent default would
+        // fail this power-cut recovery before materialization.
+        .with_session_service(forwarding_decorator)
+        .with_default_llm_client(openai_test_client())
         .notify_orchestrator_on_resume(false)
         .resume()
         .await;

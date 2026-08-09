@@ -26,7 +26,8 @@ use meerkat_mob::runtime::bridge_protocol::{
     MaterializeLaunchMode,
 };
 use meerkat_mob::{
-    AgentIdentity, FlowId, FlowStepDispatchRejectKind, MobError, MobRunStatus, StepId,
+    AgentIdentity, FlowId, FlowStepDispatchRejectKind, MobError, MobRespawnError, MobRunStatus,
+    StepId,
 };
 use support::{
     ControllingMob, FIXTURE_BRIDGE_TIMEOUT, HostFixtureOptions, REAL_COMMS_TEST_LOCK, StallGate,
@@ -1302,11 +1303,25 @@ async fn generation_bump_mid_step_fails_step_typed() {
             .is_empty()
     })
     .await;
-    controlling
-        .handle
-        .respawn(identity("b6"), None)
-        .await
-        .expect("respawn bumps the placed member's generation");
+    tokio::time::timeout(Duration::from_secs(95), async {
+        loop {
+            match controlling.handle.respawn(identity("b6"), None).await {
+                Ok(receipt) => break Ok(receipt),
+                Err(MobRespawnError::Mob(MobError::MemberRetirementInProgress { .. })) => {
+                    // The owning host retained the exact old-generation
+                    // teardown after its bounded observation expired. Respawn
+                    // is level-triggered at that same identity/incarnation;
+                    // retry joins/reobserves the durable Retiring saga and
+                    // cannot target the replacement before it commits.
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                Err(error) => break Err(error),
+            }
+        }
+    })
+    .await
+    .expect("respawn converges within the fixture's one outer bound")
+    .expect("respawn bumps the placed member's generation");
 
     let run = wait_for_flow_run_terminal(&controlling.handle, &run_id, RUN_WAIT).await;
     assert_eq!(

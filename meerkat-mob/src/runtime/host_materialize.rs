@@ -52,6 +52,8 @@ use crate::runtime::provisioner::{
 };
 use crate::runtime::session_service::MobSessionService;
 
+const NONSERVING_CLEANUP_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+
 // ---------------------------------------------------------------------------
 // Tier-2 preflight probe (DEC-P3H-8) — widens the tier-1 presence probe
 // ---------------------------------------------------------------------------
@@ -1001,10 +1003,11 @@ impl HostMemberMaterializer {
     /// local member), and (b) queued `DeliverMemberInput` is executed by the
     /// runtime loop's wake. No bespoke turn runner exists on the member host.
     async fn attach_member_executor(
-        &self,
+        &mut self,
+        session_id: &SessionId,
         transaction: PreparedServiceActorTransaction,
     ) -> Result<CommittedRuntimeSessionPublicationLease, MaterializeServeError> {
-        transaction
+        let result = transaction
             .prepare_host_runtime_publication_owned(
                 Arc::clone(&self.substrate.runtime_adapter),
                 Arc::clone(&self.runtime_sessions),
@@ -1012,7 +1015,18 @@ impl HostMemberMaterializer {
             .await
             .map_err(|error| MaterializeServeError::ExecutorAttach {
                 detail: error.to_string(),
-            })
+            });
+        match result {
+            Ok(publication) => Ok(publication),
+            Err(original) => match self.quiesce_unrecorded_session(session_id).await {
+                Ok(()) => Err(original),
+                Err(cleanup) => Err(MaterializeServeError::UnrecordedSessionCleanup {
+                    session_id: session_id.to_string(),
+                    original: original.to_string(),
+                    cleanup,
+                }),
+            },
+        }
     }
 
     /// Commit the controller-owned member incarnation into the local
@@ -1169,6 +1183,29 @@ impl HostMemberMaterializer {
         &mut self,
         session_id: &SessionId,
     ) -> Result<(), MaterializeServeError> {
+        let deadline = tokio::time::Instant::now() + NONSERVING_CLEANUP_GRACE;
+        tokio::time::timeout_at(
+            deadline,
+            self.quiesce_nonserving_incarnation_until(session_id, deadline),
+        )
+        .await
+        .map_err(|_| MaterializeServeError::Bindings {
+            detail: format!(
+                "non-serving incarnation {session_id} did not quiesce within {}s",
+                NONSERVING_CLEANUP_GRACE.as_secs()
+            ),
+        })?
+    }
+
+    /// Execute every exact quiescence phase under the one deadline minted at
+    /// entry. Runtime unregister calls transfer their work to process-owned
+    /// exact coordinators before waiting, so caller expiry drops only this
+    /// observation future and never the retained cleanup authority.
+    async fn quiesce_nonserving_incarnation_until(
+        &mut self,
+        session_id: &SessionId,
+        deadline: tokio::time::Instant,
+    ) -> Result<(), MaterializeServeError> {
         let old_state = self.runtime_sessions.read().await.get(session_id).cloned();
         let unregister_error = if let Some(old_state) = old_state.as_ref() {
             match self
@@ -1264,8 +1301,7 @@ impl HostMemberMaterializer {
             // is deliberately no SessionId-only fallback: if that exact hook
             // cannot prove quiescence, a delayed broad discard could erase the
             // next incarnation after this method returns.
-            const CLEANUP_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
-            tokio::time::timeout(CLEANUP_GRACE, async {
+            tokio::time::timeout_at(deadline, async {
                 loop {
                     let runtime_registered = self
                         .substrate
@@ -1339,7 +1375,7 @@ impl HostMemberMaterializer {
             .map_err(|_| MaterializeServeError::Bindings {
                 detail: format!(
                     "non-serving incarnation {session_id} did not quiesce within {}s",
-                    CLEANUP_GRACE.as_secs()
+                    NONSERVING_CLEANUP_GRACE.as_secs()
                 ),
             })??;
 
@@ -1747,28 +1783,67 @@ impl HostMemberMaterializer {
             }
         }
 
-        // Step 4 — host-seeded supervisor authority (DEC-P3H-4): the SAME
-        // staged machine seams the member drain's BindMember arm uses, with
-        // the host-authority-adjudicated payload facts. No BindMember round
-        // trip ever happens.
-        let supervisor_desc = supervisor.clone().into_trusted_peer_descriptor();
-        if let Err(error) = meerkat_runtime::comms_drain::bind_supervisor_for_materialized_session(
-            self.substrate.runtime_adapter.as_ref(),
-            &session_id,
-            member_runtime.as_ref() as &dyn CoreCommsRuntime,
-            &supervisor_desc,
-            epoch,
-        )
-        .await
+        // Consume the preparation receipt immediately after the exact
+        // machine-owned lifecycle transition. The supervisor bind below is
+        // a separate durable authority mutation and must not occur inside
+        // the lifecycle-only observation bracket carried by this receipt.
+        let route = match (resume_materialization, resume_preparation) {
+            (None, None) => {
+                crate::runtime::session_service::SessionActorMaterializationRoute::Fresh
+            }
+            (Some(crate::runtime::SessionResumeMaterialization::Active), Some(preparation)) => {
+                crate::runtime::session_service::SessionActorMaterializationRoute::Resume {
+                    preparation,
+                }
+            }
+            (Some(crate::runtime::SessionResumeMaterialization::Revivable), Some(preparation)) => {
+                let authorization = match prepared.archived_resume_authorization() {
+                    Ok(authorization) => authorization,
+                    Err(error) => {
+                        return Err(self
+                            .rollback_prepared_session_after_failure(
+                                &mut prepared,
+                                MaterializeServeError::Bindings {
+                                    detail: format!(
+                                        "failed to mint archived-resume authority for '{session_id}': {error}"
+                                    ),
+                                },
+                            )
+                            .await);
+                    }
+                };
+                crate::runtime::session_service::SessionActorMaterializationRoute::Revivable {
+                    authorization,
+                    preparation,
+                }
+            }
+            _ => {
+                return Err(MaterializeServeError::Bindings {
+                    detail: format!(
+                        "materialization for session {session_id} lost its typed resume preparation receipt"
+                    ),
+                });
+            }
+        };
+        let route = match route
+            .advance_resume_preparation_after_machine_prepare(&prepared)
+            .await
         {
-            let original = MaterializeServeError::SupervisorBind {
-                detail: error.to_string(),
-            };
-            return Err(self
-                .rollback_prepared_session_after_failure(&mut prepared, original)
-                .await);
-        }
+            Ok(route) => route,
+            Err(error) => {
+                return Err(self
+                    .rollback_prepared_session_after_failure(
+                        &mut prepared,
+                        MaterializeServeError::SessionService(error),
+                    )
+                    .await);
+            }
+        };
 
+        // Resolve the host-adjudicated supervisor descriptor now, but defer
+        // its durable machine bind until actor creation consumes the resume
+        // receipt below. No BindMember round trip ever happens.
+        let supervisor_desc = supervisor.clone().into_trusted_peer_descriptor();
         self.mount_member_operator_tools(
             &mut config,
             &decompiled,
@@ -1800,36 +1875,6 @@ impl HostMemberMaterializer {
                 ),
             }
         })?;
-        let route = match (resume_materialization, resume_preparation) {
-            (None, None) => {
-                crate::runtime::session_service::SessionActorMaterializationRoute::Fresh
-            }
-            (Some(crate::runtime::SessionResumeMaterialization::Active), Some(preparation)) => {
-                crate::runtime::session_service::SessionActorMaterializationRoute::Resume {
-                    preparation,
-                }
-            }
-            (Some(crate::runtime::SessionResumeMaterialization::Revivable), Some(preparation)) => {
-                let authorization = prepared.archived_resume_authorization().map_err(|error| {
-                    MaterializeServeError::Bindings {
-                        detail: format!(
-                            "failed to mint archived-resume authority for '{session_id}': {error}"
-                        ),
-                    }
-                })?;
-                crate::runtime::session_service::SessionActorMaterializationRoute::Revivable {
-                    authorization,
-                    preparation,
-                }
-            }
-            _ => {
-                return Err(MaterializeServeError::Bindings {
-                    detail: format!(
-                        "materialization for session {session_id} lost its typed resume preparation receipt"
-                    ),
-                });
-            }
-        };
         let actor_transaction = PreparedServiceActorTransaction::new(
             session_id.clone(),
             Arc::clone(&self.substrate.session_service),
@@ -1846,6 +1891,37 @@ impl HostMemberMaterializer {
             let original = MaterializeServeError::IdentityMismatch {
                 expected: session_id.to_string(),
                 created: created.session_id.to_string(),
+            };
+            drop(config);
+            drop(member_runtime);
+            drop(live);
+            if let Err(cleanup) = actor_transaction.abort().await {
+                return Err(MaterializeServeError::UnrecordedSessionCleanup {
+                    session_id: session_id.to_string(),
+                    original: original.to_string(),
+                    cleanup: format!(
+                        "exact actor/materialization transaction cleanup failed: {cleanup}"
+                    ),
+                });
+            }
+            return Err(original);
+        }
+
+        // The actor has now consumed the lifecycle-only resume receipt. Bind
+        // supervisor authority only after that exact observation bracket is
+        // closed, while Prepared+B and the actor transaction still own
+        // synchronous rollback for every failure.
+        if let Err(error) = meerkat_runtime::comms_drain::bind_supervisor_for_materialized_session(
+            self.substrate.runtime_adapter.as_ref(),
+            &session_id,
+            member_runtime.as_ref() as &dyn CoreCommsRuntime,
+            &supervisor_desc,
+            epoch,
+        )
+        .await
+        {
+            let original = MaterializeServeError::SupervisorBind {
+                detail: error.to_string(),
             };
             drop(config);
             drop(member_runtime);
@@ -1907,7 +1983,10 @@ impl HostMemberMaterializer {
                 return Err(original);
             }
         };
-        let runtime_publication = match self.attach_member_executor(actor_transaction).await {
+        let runtime_publication = match self
+            .attach_member_executor(&session_id, actor_transaction)
+            .await
+        {
             Ok(publication) => publication,
             Err(original) => return Err(original),
         };
@@ -2286,31 +2365,62 @@ impl HostMemberMaterializer {
                 .await);
         }
 
-        if let Err(error) = meerkat_runtime::comms_drain::bind_supervisor_for_materialized_session(
-            self.substrate.runtime_adapter.as_ref(),
-            &session_id,
-            member_runtime.as_ref() as &dyn CoreCommsRuntime,
-            supervisor,
-            epoch,
-        )
-        .await
+        let route = match resume_materialization {
+            crate::runtime::SessionResumeMaterialization::Active => {
+                crate::runtime::session_service::SessionActorMaterializationRoute::Resume {
+                    preparation: resume_preparation,
+                }
+            }
+            crate::runtime::SessionResumeMaterialization::Revivable => {
+                let authorization = match prepared.archived_resume_authorization() {
+                    Ok(authorization) => authorization,
+                    Err(error) => {
+                        drop(config);
+                        drop(member_runtime);
+                        drop(live);
+                        let original = self
+                            .rollback_prepared_session_after_failure(
+                                &mut prepared,
+                                MaterializeServeError::Bindings {
+                                    detail: format!(
+                                        "failed to mint archived-resume authority for '{session_id}': {error}"
+                                    ),
+                                },
+                            )
+                            .await;
+                        drop(materialization_boundary.take());
+                        return Err(self
+                            .preserve_snapshot_after_revival_failure(&session_id, original)
+                            .await);
+                    }
+                };
+                crate::runtime::session_service::SessionActorMaterializationRoute::Revivable {
+                    authorization,
+                    preparation: resume_preparation,
+                }
+            }
+        };
+        let route = match route
+            .advance_resume_preparation_after_machine_prepare(&prepared)
+            .await
         {
-            drop(config);
-            drop(member_runtime);
-            drop(live);
-            let original = self
-                .rollback_prepared_session_after_failure(
-                    &mut prepared,
-                    MaterializeServeError::SupervisorBind {
-                        detail: error.to_string(),
-                    },
-                )
-                .await;
-            drop(materialization_boundary.take());
-            return Err(self
-                .preserve_snapshot_after_revival_failure(&session_id, original)
-                .await);
-        }
+            Ok(route) => route,
+            Err(error) => {
+                drop(config);
+                drop(member_runtime);
+                drop(live);
+                let original = self
+                    .rollback_prepared_session_after_failure(
+                        &mut prepared,
+                        MaterializeServeError::SessionService(error),
+                    )
+                    .await;
+                drop(materialization_boundary.take());
+                return Err(self
+                    .preserve_snapshot_after_revival_failure(&session_id, original)
+                    .await);
+            }
+        };
 
         self.mount_member_operator_tools(
             &mut config,
@@ -2337,26 +2447,6 @@ impl HostMemberMaterializer {
                 ),
             }
         })?;
-        let route = match resume_materialization {
-            crate::runtime::SessionResumeMaterialization::Active => {
-                crate::runtime::session_service::SessionActorMaterializationRoute::Resume {
-                    preparation: resume_preparation,
-                }
-            }
-            crate::runtime::SessionResumeMaterialization::Revivable => {
-                let authorization = prepared.archived_resume_authorization().map_err(|error| {
-                    MaterializeServeError::Bindings {
-                        detail: format!(
-                            "failed to mint archived-resume authority for '{session_id}': {error}"
-                        ),
-                    }
-                })?;
-                crate::runtime::session_service::SessionActorMaterializationRoute::Revivable {
-                    authorization,
-                    preparation: resume_preparation,
-                }
-            }
-        };
         let actor_transaction = PreparedServiceActorTransaction::new(
             session_id.clone(),
             Arc::clone(&self.substrate.session_service),
@@ -2373,6 +2463,33 @@ impl HostMemberMaterializer {
             let original = MaterializeServeError::IdentityMismatch {
                 expected: session_id.to_string(),
                 created: created.session_id.to_string(),
+            };
+            drop(config);
+            drop(member_runtime);
+            drop(live);
+            if let Err(cleanup) = actor_transaction.abort().await {
+                return Err(MaterializeServeError::UnrecordedSessionCleanup {
+                    session_id: session_id.to_string(),
+                    original: original.to_string(),
+                    cleanup: format!(
+                        "exact actor/materialization transaction cleanup failed: {cleanup}"
+                    ),
+                });
+            }
+            return Err(original);
+        }
+
+        if let Err(error) = meerkat_runtime::comms_drain::bind_supervisor_for_materialized_session(
+            self.substrate.runtime_adapter.as_ref(),
+            &session_id,
+            member_runtime.as_ref() as &dyn CoreCommsRuntime,
+            supervisor,
+            epoch,
+        )
+        .await
+        {
+            let original = MaterializeServeError::SupervisorBind {
+                detail: error.to_string(),
             };
             drop(config);
             drop(member_runtime);
@@ -2430,7 +2547,10 @@ impl HostMemberMaterializer {
             }
             return Err(error);
         }
-        let mut runtime_publication = match self.attach_member_executor(actor_transaction).await {
+        let mut runtime_publication = match self
+            .attach_member_executor(&session_id, actor_transaction)
+            .await
+        {
             Ok(publication) => publication,
             Err(original) => return Err(original),
         };

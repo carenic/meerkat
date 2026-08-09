@@ -19,10 +19,9 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::Arc;
-use std::sync::RwLock as StdRwLock;
+use std::sync::{Arc, Mutex as StdMutex, RwLock as StdRwLock};
 #[cfg(not(target_arch = "wasm32"))]
-use std::sync::{Mutex as StdMutex, OnceLock, Weak};
+use std::sync::{OnceLock, Weak};
 
 use futures::FutureExt as _;
 use meerkat_core::lifecycle::{InputId, RunId};
@@ -1157,6 +1156,75 @@ struct UnregisterTeardownCoordinator {
     result_rx: crate::tokio::sync::watch::Receiver<Option<UnregisterTeardownResult>>,
 }
 
+/// Read-only terminal-result observer for one exact runtime unregister
+/// coordinator. The observer carries no mutation authority and cannot start a
+/// retry; it only retains the coordinator's result channel plus the opaque
+/// registration identity used for its atomic admission.
+#[derive(Clone)]
+pub struct RuntimeSessionUnregisterObserver {
+    registration: RuntimeSessionRegistrationWitness,
+    coordinator_id: uuid::Uuid,
+    result_rx: crate::tokio::sync::watch::Receiver<Option<UnregisterTeardownResult>>,
+}
+
+impl RuntimeSessionUnregisterObserver {
+    fn new(
+        registration: RuntimeSessionRegistrationWitness,
+        coordinator_id: uuid::Uuid,
+        result_rx: crate::tokio::sync::watch::Receiver<Option<UnregisterTeardownResult>>,
+    ) -> Self {
+        Self {
+            registration,
+            coordinator_id,
+            result_rx,
+        }
+    }
+
+    /// Exact registration whose coordinator result this observer follows.
+    #[must_use]
+    pub fn registration(&self) -> &RuntimeSessionRegistrationWitness {
+        &self.registration
+    }
+
+    /// Return the terminal result when published, without waiting or
+    /// acquiring runtime mutation authority.
+    pub fn try_result(&self) -> Result<Option<Result<(), RuntimeDriverError>>, RuntimeDriverError> {
+        if let Some(result) = self.result_rx.borrow().clone() {
+            return Ok(Some(result));
+        }
+        if self.result_rx.has_changed().is_err() {
+            return Err(RuntimeDriverError::Internal(format!(
+                "unregister coordinator {} closed without publishing a result for session {}",
+                self.coordinator_id,
+                self.registration.session_id()
+            )));
+        }
+        Ok(None)
+    }
+}
+
+impl std::fmt::Debug for RuntimeSessionUnregisterObserver {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("RuntimeSessionUnregisterObserver")
+            .field("registration", &self.registration)
+            .field("coordinator_id", &self.coordinator_id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Atomic admission result for exact runtime unregister observation.
+#[derive(Debug)]
+pub enum RuntimeSessionUnregisterAdmission {
+    /// The exact unregister coordinator already completed successfully.
+    Completed,
+    /// The supplied registration is absent or no longer current.
+    NotCurrent,
+    /// The exact coordinator remains process-owned; poll this observer on a
+    /// later caller retry.
+    Pending(RuntimeSessionUnregisterObserver),
+}
+
 /// Joinable result channel for the one owned ordinary-stop cleanup operation
 /// of an epoch. Completed results remain installed until a successful resume
 /// replaces the executor, or an explicit stop/unregister authorizes a retry.
@@ -1226,6 +1294,14 @@ impl UnregisterTeardownMechanicalObservations {
 struct RuntimeSessionEntry {
     /// Canonical runtime control-plane identity for this registered session.
     runtime_id: LogicalRuntimeId,
+    /// Reconstructed solely for archive convergence. This cleanup ownership
+    /// survives caller timeout; ordinary/concurrent registrations never carry
+    /// it.
+    archive_recovered_registration: bool,
+    /// The archive recovery above began from durable Retired/Destroyed truth.
+    /// This is a public-result fact only and never substitutes for cleanup
+    /// ownership.
+    archive_recovered_from_quiescent: bool,
     /// Per-session mutation gate.
     ///
     /// Serializes same-session mutating commands across the full
@@ -1380,6 +1456,18 @@ struct RuntimeSessionEntry {
     drain_slot: CommsDrainSlot,
 }
 
+/// Fully recovered persistent session entry that has not yet been published
+/// into the process-local session map. Durable observation and driver recovery
+/// happen before the stable registration transaction is acquired; publication
+/// then rechecks the map under that transaction and either installs this exact
+/// candidate or discards it in favor of the concurrent winner.
+struct PreparedArchiveSessionRegistration {
+    session_id: SessionId,
+    runtime_id: LogicalRuntimeId,
+    entry: RuntimeSessionEntry,
+    cold_recovered_generated_draining: bool,
+}
+
 #[derive(Clone)]
 struct MemberIncarnationRegistration {
     incarnation: meerkat_contracts::wire::supervisor_bridge::BridgeMemberIncarnation,
@@ -1485,6 +1573,10 @@ pub struct MachineSessionArchiveLease {
     /// touching durable lifecycle truth; a registration that predated archive
     /// must never be removed through that cleanup path.
     recovered_registration_for_archive: bool,
+    /// True only when the exact recovered registration originated from a
+    /// durable quiescent terminal. Successful convergence preserves public
+    /// duplicate-archive NotFound only for this origin.
+    recovered_from_quiescent_archive: bool,
     /// Stable absent-entry/register/unregister transaction boundary. It is
     /// acquired before the live and mutation leases and retained through any
     /// archive-only removal of the recovered entry.
@@ -3809,6 +3901,12 @@ impl MachineSessionArchiveLease {
     /// registration from durable authority.
     pub fn owns_recovered_registration(&self) -> bool {
         self.recovered_registration_for_archive
+    }
+
+    /// Whether this recovered archive registration originated from durable
+    /// Retired/Destroyed authority.
+    pub fn originated_from_quiescent_archive(&self) -> bool {
+        self.recovered_from_quiescent_archive
     }
 
     /// Exact runtime lifecycle observed while this lease owns the session's

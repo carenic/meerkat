@@ -5532,6 +5532,13 @@ async fn interrupt_session(
                 false,
             )
         }
+        Err(meerkat_runtime::RuntimeDriverError::NotFound { .. }) => {
+            meerkat_runtime::resolve_user_interrupt_public_result(
+                meerkat_runtime::UserInterruptObservation::Destroyed,
+                false,
+                false,
+            )
+        }
         Err(meerkat_runtime::RuntimeDriverError::NotReady { state }) => {
             meerkat_runtime::resolve_user_interrupt_public_result(
                 meerkat_runtime::UserInterruptObservation::NotReady(state),

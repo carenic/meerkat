@@ -1218,7 +1218,7 @@ mod tests {
 
         let mut expected = vec![
             ("session-store", 1, 4),
-            ("runtime-store", 1, 2),
+            ("runtime-store", 1, 3),
             ("schedule-store", 1, 3),
             ("workgraph", 1, 3),
             ("jobs", 1, 3),
@@ -1321,7 +1321,7 @@ mod tests {
             PersistenceError::Store(StoreError::SchemaFromTheFuture {
                 ref domain,
                 found: 99,
-                supported: 2,
+                supported: 3,
             }) if domain == "runtime-store"
         ));
 

@@ -60,6 +60,8 @@ pub use request_execution::{
 #[cfg(all(feature = "session-store", feature = "comms"))]
 pub use runtime_backed::configure_peer_ingress;
 #[cfg(feature = "session-store")]
+pub(crate) use runtime_backed::materialize_session_actor_unattached_with_reserved_admission_and_actor_slot;
+#[cfg(feature = "session-store")]
 pub use runtime_backed::{
     AttachedActorPublicationRefreshFn, PersistentRuntimeExecutor, RuntimeBackedInitialTurn,
     SurfaceRuntimeMaterializeError, build_runtime_backed_service,

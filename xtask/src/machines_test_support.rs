@@ -281,6 +281,14 @@ fn run_xtask(root: &Path, subcommand: &str, selection: &Selection) -> Result<std
 }
 
 fn workspace_root() -> Result<PathBuf> {
+    if let Some(root) = env::var_os("MEERKAT_WORKSPACE_ROOT") {
+        return Ok(PathBuf::from(root));
+    }
+    if let Ok(root) = env::current_dir()
+        && root.join("Cargo.toml").is_file()
+    {
+        return Ok(root);
+    }
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .map(Path::to_path_buf)

@@ -620,9 +620,12 @@ impl MobMcpState {
         let _ = mob_id;
 
         #[cfg(not(target_arch = "wasm32"))]
-        if self.session_service.supports_persistent_sessions()
-            && let Some(root) = &self.persistent_storage_root
-        {
+        if let Some(root) = &self.persistent_storage_root {
+            // Mob event-log persistence is owned by this explicitly bound
+            // storage root, independently of whether member session bodies
+            // are durable. Coupling the two capabilities makes a legitimate
+            // ephemeral session service silently downgrade the Mob itself to
+            // in-memory storage even though its durable root was configured.
             tokio::fs::create_dir_all(root).await.map_err(|error| {
                 MobError::Internal(format!(
                     "failed to create persistent mob root '{}': {error}",
@@ -1238,7 +1241,10 @@ impl MobMcpState {
         mob_id: &MobId,
         identity: AgentIdentity,
     ) -> Result<(), MobError> {
-        self.handle_for(mob_id).await?.retire(identity).await
+        self.admitted_handle_for(mob_id, ControlScope::Retire)
+            .await?
+            .retire(identity)
+            .await
     }
 
     #[doc(hidden)]
@@ -3804,6 +3810,13 @@ impl SessionServiceHistoryExt for LocalSessionService {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl MobSessionService for LocalSessionService {
+    async fn materialize_session_resume_verdict(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_mob::SessionResumeVerdict, SessionError> {
+        meerkat_mob::materialize_nonpersistent_session_resume_verdict(self, session_id).await
+    }
+
     async fn observe_session_resume_authority(
         &self,
         _session_id: &SessionId,
@@ -3860,6 +3873,19 @@ impl MobSessionService for LocalSessionService {
         session_id: &SessionId,
     ) -> Result<(), SessionError> {
         self.archive_with_mob_lifecycle_authority(session_id).await
+    }
+
+    async fn archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_before(
+        &self,
+        session_id: &SessionId,
+        _deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<(), SessionError> {
+        // MemberSessionDisposalArc transfers this process-local archive into
+        // its owned task before waiting on the caller's absolute deadline.
+        // Declare that deadline contract explicitly instead of inheriting the
+        // fail-closed Unsupported default.
+        self.archive_with_mob_lifecycle_authority_under_runtime_turn_boundary(session_id)
+            .await
     }
 
     async fn discard_live_session_under_runtime_turn_boundary(
@@ -3919,10 +3945,6 @@ impl MobSessionService for LocalSessionService {
                 }
             }
         })))
-    }
-
-    fn supports_persistent_sessions(&self) -> bool {
-        true
     }
 
     async fn live_session_actor_registered(
@@ -5963,6 +5985,8 @@ mod tests {
             HashMap<String, HashMap<GeneratedCommsTrustAuthoritySourceKind, TrustedPeerDescriptor>>,
         >,
         private_trusted: RwLock<HashMap<String, BTreeSet<GeneratedCommsTrustAuthoritySourceKind>>>,
+        meerkat_machine_trust_owner:
+            std::sync::RwLock<Option<meerkat_core::comms::GeneratedPeerCommsOwnerToken>>,
         mob_machine_trust_owner: RwLock<Option<Arc<dyn std::any::Any + Send + Sync>>>,
         notify: Arc<Notify>,
     }
@@ -6054,21 +6078,29 @@ mod tests {
                 trusted: RwLock::new(HashMap::new()),
                 trusted_descriptors: RwLock::new(HashMap::new()),
                 private_trusted: RwLock::new(HashMap::new()),
+                meerkat_machine_trust_owner: std::sync::RwLock::new(None),
                 mob_machine_trust_owner: RwLock::new(None),
                 notify: Arc::new(Notify::new()),
             }
         }
 
-        async fn validate_mob_trust_authority_owner(
+        async fn validate_generated_trust_authority_owner(
             &self,
             authority: &meerkat_core::comms::CommsTrustMutationAuthority,
         ) -> Result<(), SendError> {
-            if !authority.is_mob_machine_source() {
-                return Ok(());
-            }
-            let expected = self.mob_machine_trust_owner.read().await;
+            let expected_meerkat = self
+                .meerkat_machine_trust_owner
+                .read()
+                .map_err(|_| {
+                    SendError::Validation("poisoned meerkat_machine_trust_owner lock".to_string())
+                })?
+                .clone();
+            let expected_mob = self.mob_machine_trust_owner.read().await.clone();
             authority
-                .validate_raw_source_owner_token(expected.as_ref())
+                .validate_target_source_owner_token(
+                    expected_meerkat.as_ref(),
+                    expected_mob.as_ref(),
+                )
                 .map_err(SendError::Validation)
         }
 
@@ -6146,6 +6178,37 @@ mod tests {
         }
     }
 
+    impl meerkat_core::handles::PeerCommsInstallTarget for MockComms {
+        fn install_generated_peer_comms_handle(
+            &self,
+            install: meerkat_core::handles::GeneratedPeerCommsInstall,
+        ) -> Result<(), String> {
+            let target_peer_id = self.generated_peer_comms_target_endpoint()?.peer_id;
+            if install.target_peer_id() != target_peer_id {
+                return Err(format!(
+                    "generated peer-comms install targets peer_id {} but runtime peer_id is {}",
+                    install.target_peer_id(),
+                    target_peer_id
+                ));
+            }
+            let owner_token = install.owner_token();
+            let mut expected = self
+                .meerkat_machine_trust_owner
+                .write()
+                .map_err(|_| "poisoned meerkat_machine_trust_owner lock".to_string())?;
+            if let Some(existing) = expected.as_ref()
+                && !existing.same_owner(&owner_token)
+            {
+                return Err(
+                    "target runtime is already bound to a different generated MeerkatMachine trust owner"
+                        .to_string(),
+                );
+            }
+            *expected = Some(owner_token);
+            Ok(())
+        }
+    }
+
     #[async_trait]
     impl CoreCommsRuntime for MockComms {
         fn peer_id(&self) -> Option<meerkat_core::comms::PeerId> {
@@ -6174,7 +6237,8 @@ mod tests {
         ) -> Result<CommsTrustMutationResult, SendError> {
             match mutation {
                 CommsTrustMutation::AddTrustedPeer { peer, authority } => {
-                    self.validate_mob_trust_authority_owner(&authority).await?;
+                    self.validate_generated_trust_authority_owner(&authority)
+                        .await?;
                     authority
                         .validate_public_add(self.peer_id(), &peer)
                         .map_err(SendError::Validation)?;
@@ -6189,7 +6253,8 @@ mod tests {
                     Ok(CommsTrustMutationResult::Added { created })
                 }
                 CommsTrustMutation::RemoveTrustedPeer { peer_id, authority } => {
-                    self.validate_mob_trust_authority_owner(&authority).await?;
+                    self.validate_generated_trust_authority_owner(&authority)
+                        .await?;
                     let parsed_peer_id = PeerId::parse(&peer_id)
                         .map_err(|err| SendError::Validation(err.to_string()))?;
                     authority
@@ -6201,7 +6266,8 @@ mod tests {
                     Ok(CommsTrustMutationResult::Removed { removed })
                 }
                 CommsTrustMutation::AddPrivateTrustedPeer { peer, authority } => {
-                    self.validate_mob_trust_authority_owner(&authority).await?;
+                    self.validate_generated_trust_authority_owner(&authority)
+                        .await?;
                     authority
                         .validate_private_add(self.peer_id(), &peer)
                         .map_err(SendError::Validation)?;
@@ -6216,7 +6282,8 @@ mod tests {
                     Ok(CommsTrustMutationResult::Added { created })
                 }
                 CommsTrustMutation::RemovePrivateTrustedPeer { peer_id, authority } => {
-                    self.validate_mob_trust_authority_owner(&authority).await?;
+                    self.validate_generated_trust_authority_owner(&authority)
+                        .await?;
                     let parsed_peer_id = PeerId::parse(&peer_id)
                         .map_err(|err| SendError::Validation(err.to_string()))?;
                     authority
@@ -6368,42 +6435,14 @@ mod tests {
         }
 
         async fn cold_restart(&self) -> Self {
-            let actor_registry = meerkat_session::LiveSessionActorRegistry::default();
-            let sessions = self
-                .sessions
-                .read()
-                .await
-                .iter()
-                .map(|(session_id, actor)| {
-                    let witness_slot = meerkat_session::LiveSessionActorWitnessSlot::default();
-                    let witness =
-                        register_live_actor(&actor_registry, &witness_slot, session_id.clone())
-                            .expect("cold-restart fixture actor should register");
-                    (
-                        session_id.clone(),
-                        MockSessionActor {
-                            comms: Arc::new(MockComms::new(&actor.comms.name)),
-                            witness,
-                        },
-                    )
-                })
-                .collect();
             let persisted_sessions = self.persisted_sessions.read().await.clone();
             let archive_failures = self.archive_failures.read().await.clone();
-            let keep_alive_notifiers = self
-                .keep_alive_notifiers
-                .read()
-                .await
-                .keys()
-                .cloned()
-                .map(|session_id| (session_id, Arc::new(Notify::new())))
-                .collect();
             Self {
-                sessions: RwLock::new(sessions),
-                actor_registry,
+                sessions: RwLock::new(HashMap::new()),
+                actor_registry: meerkat_session::LiveSessionActorRegistry::default(),
                 persisted_sessions: RwLock::new(persisted_sessions),
                 archive_failures: RwLock::new(archive_failures),
-                keep_alive_notifiers: RwLock::new(keep_alive_notifiers),
+                keep_alive_notifiers: RwLock::new(HashMap::new()),
                 last_start_turn: RwLock::new(None),
                 counter: AtomicU64::new(self.counter.load(Ordering::Relaxed)),
                 start_turn_delay_ms: AtomicU64::new(
@@ -6432,13 +6471,17 @@ mod tests {
                 .as_ref()
                 .map(|build| build.keep_alive)
                 .unwrap_or(false);
-            let actor_materialization_permit =
-                begin_live_actor_materialization(build.as_ref().and_then(|build| {
-                    match &build.runtime_build_mode {
-                        meerkat_core::RuntimeBuildMode::SessionOwned(bindings) => Some(bindings),
+            let provided_bindings =
+                build
+                    .as_ref()
+                    .and_then(|build| match &build.runtime_build_mode {
+                        meerkat_core::RuntimeBuildMode::SessionOwned(bindings) => {
+                            Some(bindings.clone())
+                        }
                         meerkat_core::RuntimeBuildMode::StandaloneEphemeral => None,
-                    }
-                }))?;
+                    });
+            let actor_materialization_permit =
+                begin_live_actor_materialization(provided_bindings.as_ref())?;
             let name = build
                 .as_ref()
                 .and_then(|build| build.comms_name.clone())
@@ -6538,6 +6581,15 @@ mod tests {
                     })?;
             }
             let comms = Arc::new(MockComms::new(&name));
+            if let Some(bindings) = provided_bindings.as_ref() {
+                bindings
+                    .install_peer_comms_on(comms.as_ref())
+                    .map_err(|error| {
+                        SessionError::Agent(meerkat_core::error::AgentError::InternalError(
+                            format!("machine peer-comms install failed: {error}"),
+                        ))
+                    })?;
+            }
             let actor_witness = {
                 let mut sessions = self.sessions.write().await;
                 if sessions.contains_key(&sid) {
@@ -6872,6 +6924,13 @@ mod tests {
 
     #[async_trait]
     impl MobSessionService for MockSessionSvc {
+        async fn materialize_session_resume_verdict(
+            &self,
+            session_id: &SessionId,
+        ) -> Result<meerkat_mob::SessionResumeVerdict, SessionError> {
+            meerkat_mob::materialize_nonpersistent_session_resume_verdict(self, session_id).await
+        }
+
         async fn observe_session_resume_authority(
             &self,
             _session_id: &SessionId,
@@ -6930,6 +6989,15 @@ mod tests {
             self.archive_with_mob_lifecycle_authority(session_id).await
         }
 
+        async fn archive_with_mob_lifecycle_authority_under_runtime_turn_boundary_before(
+            &self,
+            session_id: &SessionId,
+            _deadline: meerkat_core::time_compat::Instant,
+        ) -> Result<(), SessionError> {
+            self.archive_with_mob_lifecycle_authority_under_runtime_turn_boundary(session_id)
+                .await
+        }
+
         async fn discard_live_session_under_runtime_turn_boundary(
             &self,
             session_id: &SessionId,
@@ -6970,10 +7038,6 @@ mod tests {
                 }
             }
             Ok(removed)
-        }
-
-        fn supports_persistent_sessions(&self) -> bool {
-            true
         }
 
         async fn live_session_actor_registered(
@@ -9701,9 +9765,9 @@ mod tests {
             .await
             .expect("resolve restored bridge session")
             .expect("restored bridge session exists");
-        assert_eq!(
+        assert_ne!(
             restored_bridge_session, respawned_bridge_session,
-            "runtime restart should restore the current materialized member binding"
+            "the explicitly nonpersistent session fixture must rotate its bridge session after a cold restart"
         );
 
         let restored_schedule_store = Arc::new(
@@ -9780,7 +9844,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_mob_destroy_removes_persistent_store_file() {
-        let svc = Arc::new(MockSessionSvc::new());
+        let svc = Arc::new(LocalSessionService::new());
+        assert!(
+            !MobSessionService::supports_persistent_sessions(svc.as_ref()),
+            "fixture must prove Mob event-log persistence independently of session-body persistence"
+        );
         let root = tempfile::tempdir().expect("tempdir");
         let state = Arc::new(
             MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
@@ -10899,6 +10967,49 @@ mod tests {
             }
             other => panic!("expected ScopeDenied({required:?}), got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn mob_retire_denies_ungranted_principal_before_member_disposal() {
+        let owner = MobMcpState::new_in_memory();
+        let mob_id = owner
+            .mob_create_definition(explicit_definition("retire-scope-gate"))
+            .await
+            .expect("create mob");
+        let identity = AgentIdentity::from("retained-worker");
+        owner
+            .mob_spawn(
+                &mob_id,
+                ProfileName::from("worker"),
+                identity.clone(),
+                Some(MobRuntimeMode::TurnDriven),
+                None,
+                None,
+            )
+            .await
+            .expect("spawn retained member fixture");
+
+        let viewer = MobMcpState::new_in_memory_as(MobControlPrincipal::External(
+            meerkat_core::auth::PrincipalId::new("retire-viewer").expect("principal"),
+        ));
+        viewer
+            .mob_insert_handle(
+                mob_id.clone(),
+                owner.handle_for(&mob_id).await.expect("owner handle"),
+            )
+            .await;
+
+        assert_required_scope(
+            &viewer
+                .mob_retire(&mob_id, identity.clone())
+                .await
+                .expect_err("ungranted principal must not retire member"),
+            ControlScope::Retire,
+        );
+        owner
+            .mob_member_status(&mob_id, &identity)
+            .await
+            .expect("scope denial must retain the member");
     }
 
     #[tokio::test]

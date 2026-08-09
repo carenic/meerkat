@@ -2789,7 +2789,7 @@ impl<'a> MachineSessionArchiveProtocol<'a> {
         lease: meerkat_runtime::MachineSessionArchiveLease,
         stored_only_publication_handle: Option<Arc<dyn CoreExecutorPublicationHandle>>,
         deadline: meerkat_core::time_compat::Instant,
-    ) -> Result<(), SessionError> {
+    ) -> Result<bool, SessionError> {
         self.runtime_adapter
             .converge_session_archive_lease_terminals_before(
                 lease,
@@ -6580,101 +6580,6 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             .map_err(|err| SessionError::Store(Box::new(err)))
     }
 
-    /// Publish one exact interaction terminal through the live session
-    /// sequencer, with the event-store append completing before the command
-    /// advances the stream sequence or broadcasts the envelope.
-    pub(crate) async fn publish_interaction_terminal_exact(
-        &self,
-        id: &SessionId,
-        interaction_id: meerkat_core::interaction::InteractionId,
-        event: meerkat_core::event::AgentEvent,
-    ) -> Result<
-        meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt,
-        SessionError,
-    > {
-        let Some(event_store) = self.event_store.clone() else {
-            return Err(SessionError::Unsupported(
-                "exact interaction terminal publication requires an EventStore".to_string(),
-            ));
-        };
-        if let Some(marker) = event_store
-            .projection_halt(id)
-            .await
-            .map_err(|error| SessionError::Store(Box::new(error)))?
-        {
-            return Err(event_projection_halted_error(
-                id,
-                Arc::new(SessionError::Store(Box::new(
-                    DurableEventProjectionHaltMarker {
-                        session_id: marker.session_id,
-                        reason: marker.reason,
-                    },
-                ))),
-            ));
-        }
-        if let Some(cause) = self.event_projection_faults.lock().await.get(id) {
-            return Err(event_projection_halted_error(id, Arc::clone(cause)));
-        }
-
-        // This method runs from the runtime loop while that loop owns the
-        // per-session mutation authority. Never acquire `recovery_gate` here:
-        // archive owns recovery_gate before asking the runtime to retire, so
-        // taking the locks in the reverse order would deadlock. A missing live
-        // task is returned as NotFound and the durable runtime outbox remains
-        // pending for the recovery drain to rematerialize outside the mutation
-        // authority.
-        self.inner
-            .publish_interaction_terminal_exact(id, interaction_id, event, event_store)
-            .await
-    }
-
-    /// Publish an ordered exact-terminal batch through one live-session
-    /// command. The EventStore validates the complete occupant set before one
-    /// optional suffix fsync; the session sequencer advances and broadcasts
-    /// only after that durable result is fully validated.
-    pub(crate) async fn publish_interaction_terminals_exact_batch(
-        &self,
-        id: &SessionId,
-        events: &[meerkat_core::event::AgentEvent],
-    ) -> Result<
-        Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
-        SessionError,
-    > {
-        if events.is_empty() {
-            return Ok(Vec::new());
-        }
-        let Some(event_store) = self.event_store.clone() else {
-            return Err(SessionError::Unsupported(
-                "exact interaction terminal publication requires an EventStore".to_string(),
-            ));
-        };
-        if let Some(marker) = event_store
-            .projection_halt(id)
-            .await
-            .map_err(|error| SessionError::Store(Box::new(error)))?
-        {
-            return Err(event_projection_halted_error(
-                id,
-                Arc::new(SessionError::Store(Box::new(
-                    DurableEventProjectionHaltMarker {
-                        session_id: marker.session_id,
-                        reason: marker.reason,
-                    },
-                ))),
-            ));
-        }
-        if let Some(cause) = self.event_projection_faults.lock().await.get(id) {
-            return Err(event_projection_halted_error(id, Arc::clone(cause)));
-        }
-
-        // Keep the same lock-order contract as the exact-single API: this is
-        // called while the runtime owns mutation authority, so recovery_gate
-        // must not be acquired here.
-        self.inner
-            .publish_interaction_terminals_exact_batch(id, events.to_vec(), event_store)
-            .await
-    }
-
     /// Publish an ordered exact-terminal batch only through the service-minted
     /// actor incarnation carried by `witness`.
     ///
@@ -9399,16 +9304,20 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         // top; never acquire runtime mutation while holding recovery.
         let (mut archive_lease, recovery_gate, recovery_guard, stored_only_publication_handle) = loop {
             let mut candidate_lease = machine_archive.prepare_archive_lease(id, deadline).await?;
-            if machine_archive.archive_lease_has_pending_terminal_dispatch(candidate_lease.as_ref())
-            {
+            let pending_dispatch = machine_archive
+                .archive_lease_has_pending_terminal_dispatch(candidate_lease.as_ref());
+            if pending_dispatch {
                 let lease = candidate_lease.take().ok_or_else(|| {
                     SessionError::Agent(AgentError::InternalError(format!(
                         "pending archive publication for session {id} lost its exact runtime lease"
                     )))
                 })?;
-                machine_archive
+                let converged_recovered_terminal = machine_archive
                     .converge_archive_lease_terminals_before(id, lease, None, deadline)
                     .await?;
+                if converged_recovered_terminal {
+                    return Err(SessionError::NotFound { id: id.clone() });
+                }
                 continue;
             }
             let recovery_gate = self.recovery_gate_for_session(id).await;
@@ -9470,7 +9379,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                     )))
                 })?;
                 drop(recovery_guard);
-                machine_archive
+                let converged_recovered_terminal = machine_archive
                     .converge_archive_lease_terminals_before(
                         id,
                         lease,
@@ -9478,6 +9387,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                         deadline,
                     )
                     .await?;
+                if converged_recovered_terminal {
+                    return Err(SessionError::NotFound { id: id.clone() });
+                }
                 // The arbitrary publication callback ran without M. Rebuild
                 // every archive observation instead of carrying a stale
                 // pre-publication document/runtime verdict forward.
@@ -9494,6 +9406,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         let archive_lease_owns_recovered_registration = archive_lease
             .as_ref()
             .is_some_and(|lease| lease.owns_recovered_registration());
+        let archive_lease_originated_from_quiescent = archive_lease
+            .as_ref()
+            .is_some_and(|lease| lease.originated_from_quiescent_archive());
         let archive_lease_has_attached_publisher = archive_lease
             .as_ref()
             .is_some_and(|lease| lease.has_attached_publication_handle());
@@ -9580,7 +9495,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                         "generated session document authority returned no archive verdict for \
                          session {id}"
                     )))
-            })?;
+                })?;
             if disposition == SessionArchiveDisposition::AlreadyArchived {
                 if archive_lease_has_attached_publisher && archive_lease.is_some() {
                     // Retirement may invoke an arbitrary actor publication
@@ -9682,6 +9597,20 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             }
         }
         .await;
+
+        // Exact quiescent cleanup reacquires runtime T then M. No later
+        // document observation uses R, so release it before that canonical
+        // runtime lock order rather than inverting R -> M against live turns.
+        drop(recovery_guard.take());
+        let archive_result = if archive_lease_originated_from_quiescent && archive_result.is_ok() {
+            // The request began from an already-quiescent durable runtime.
+            // Recovery was authorized only to converge its terminal outbox;
+            // a successful realization preserves the public duplicate-archive
+            // NotFound contract rather than widening it into a fresh archive.
+            Err(SessionError::NotFound { id: id.clone() })
+        } else {
+            archive_result
+        };
 
         let cleanup_quiescent_registration = if archive_lease_owns_recovered_registration {
             match archive_lease.as_ref() {
@@ -29016,6 +28945,10 @@ mod tests {
             .await
             .expect("create session");
         let session_id = created.session_id;
+        let actor_witness = service
+            .live_session_actor_witness(&session_id)
+            .await
+            .expect("exact terminal actor remains live");
         let mut stream = service
             .subscribe_session_events(&session_id)
             .await
@@ -29044,7 +28977,7 @@ mod tests {
         ];
 
         let first_receipts = service
-            .publish_interaction_terminals_exact_batch(&session_id, &terminals)
+            .publish_interaction_terminals_exact_batch_for_actor(&actor_witness, &terminals)
             .await
             .expect("publish exact terminal batch");
         assert_eq!(
@@ -29079,7 +29012,7 @@ mod tests {
         assert_eq!(published[2].seq, published[1].seq + 1);
 
         let replay_receipts = service
-            .publish_interaction_terminals_exact_batch(&session_id, &terminals)
+            .publish_interaction_terminals_exact_batch_for_actor(&actor_witness, &terminals)
             .await
             .expect("replay exact terminal batch");
         assert_eq!(replay_receipts, first_receipts);
@@ -29098,7 +29031,7 @@ mod tests {
             structured_output: None,
         }];
         service
-            .publish_interaction_terminals_exact_batch(&session_id, &next_terminal)
+            .publish_interaction_terminals_exact_batch_for_actor(&actor_witness, &next_terminal)
             .await
             .expect("publish terminal after replay");
         let next = tokio::time::timeout(std::time::Duration::from_secs(2), stream.next())

@@ -456,6 +456,34 @@ pub(super) enum PlacedBehaviorCompletion {
     },
 }
 
+#[derive(Clone)]
+pub(super) struct LifecycleAdmissionSignal {
+    sender: Arc<std::sync::Mutex<Option<oneshot::Sender<()>>>>,
+}
+
+impl LifecycleAdmissionSignal {
+    pub(super) fn new() -> (Self, oneshot::Receiver<()>) {
+        let (sender, receiver) = oneshot::channel();
+        (
+            Self {
+                sender: Arc::new(std::sync::Mutex::new(Some(sender))),
+            },
+            receiver,
+        )
+    }
+
+    pub(super) fn admit(&self) {
+        if let Some(sender) = self
+            .sender
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = sender.send(());
+        }
+    }
+}
+
 pub(super) enum MobCommand {
     Spawn {
         spec: Box<super::handle::SpawnMemberSpec>,
@@ -953,6 +981,8 @@ pub(super) enum MobCommand {
         reply_tx: oneshot::Sender<Result<(), MobError>>,
     },
     ResumeLifecycle {
+        deadline: meerkat_core::time_compat::Instant,
+        admission: LifecycleAdmissionSignal,
         reply_tx: oneshot::Sender<Result<(), MobError>>,
     },
     Complete {

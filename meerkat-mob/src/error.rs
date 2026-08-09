@@ -287,6 +287,13 @@ pub enum MobError {
     #[error(transparent)]
     SharedRetirementFailure(Arc<MobError>),
 
+    /// One process-owned explicit lifecycle operation is shared by concurrent
+    /// handle clones. The actor produces one owned error; this transparent
+    /// Arc preserves the exact typed cause for every joined observer without
+    /// reducing it to display text or replaying the lifecycle command.
+    #[error(transparent)]
+    SharedLifecycleFailure(Arc<MobError>),
+
     /// Supervisor rotation reached one or more remote members but did not
     /// complete, so local supervisor authority stayed at the pre-rotation
     /// epoch.
@@ -536,6 +543,11 @@ pub enum MobError {
     /// A durable lifecycle operation has fenced fresh work/runtime origin.
     #[error("mob lifecycle operation is still in progress: {intent}")]
     LifecycleOperationPending { intent: String },
+
+    /// A lifecycle command could not enter the actor mailbox before its
+    /// absolute deadline. No lifecycle authority was admitted or retained.
+    #[error("mob lifecycle operation admission is still pending at {stage}: {intent}")]
+    LifecycleOperationAdmissionPending { intent: String, stage: &'static str },
 
     /// Operation blocked by reset barrier.
     #[error("reset barrier active")]
@@ -821,7 +833,9 @@ impl MobError {
     /// layer to reclassify authentication itself.
     pub fn structured_data(&self) -> Option<serde_json::Value> {
         match self {
-            Self::SharedRetirementFailure(error) => error.structured_data(),
+            Self::SharedRetirementFailure(error) | Self::SharedLifecycleFailure(error) => {
+                error.structured_data()
+            }
             Self::SessionError(error) => error.structured_data(),
             Self::ForkMemberProvisionFailed {
                 member_id,
@@ -864,6 +878,14 @@ impl MobError {
                 "intent": intent,
                 "retryable": true,
                 "authority_retained": true,
+            })),
+            Self::LifecycleOperationAdmissionPending { intent, stage } => Some(serde_json::json!({
+                "kind": "mob_lifecycle_operation_admission_pending",
+                "intent": intent,
+                "stage": stage,
+                "deadline_reached": true,
+                "retryable": true,
+                "authority_retained": false,
             })),
             Self::SupervisorProtocolUpgradeRequired {
                 operation,
@@ -912,11 +934,14 @@ impl MobError {
         self.wire_detail()
             .map(|detail| detail.code())
             .or_else(|| match self {
-                Self::SharedRetirementFailure(error) => error.wire_error_code(),
+                Self::SharedRetirementFailure(error) | Self::SharedLifecycleFailure(error) => {
+                    error.wire_error_code()
+                }
                 Self::RetirementInProgress { .. }
                 | Self::MemberRetirementInProgress { .. }
                 | Self::MemberRetirementAdmissionPending { .. }
                 | Self::LifecycleOperationPending { .. }
+                | Self::LifecycleOperationAdmissionPending { .. }
                 | Self::DirectMemberAdoptionPending { .. } => {
                     Some(meerkat_contracts::ErrorCode::SessionBusy)
                 }
@@ -929,7 +954,9 @@ impl MobError {
 
     pub fn bridge_rejection_cause(&self) -> Option<BridgeRejectionCause> {
         match self {
-            Self::SharedRetirementFailure(error) => error.bridge_rejection_cause(),
+            Self::SharedRetirementFailure(error) | Self::SharedLifecycleFailure(error) => {
+                error.bridge_rejection_cause()
+            }
             // Cloned: `BridgeRejectionCause` carries payload variants since V4.
             Self::BridgeCommandRejected { cause, .. } => Some(cause.clone()),
             _ => None,
@@ -950,7 +977,13 @@ impl MobError {
     /// generated producer-feedback input. Actor-loop callers may continue;
     /// operation-scoped callers still return the typed failure to their user.
     pub(crate) fn is_closed_runtime_effect_refusal(&self) -> bool {
-        matches!(self, Self::RuntimeEffectRefused { .. })
+        match self {
+            Self::RuntimeEffectRefused { .. } => true,
+            Self::SharedRetirementFailure(error) | Self::SharedLifecycleFailure(error) => {
+                error.is_closed_runtime_effect_refusal()
+            }
+            _ => false,
+        }
     }
 
     /// Whether this error means the addressed target (mob, profile, member,
@@ -969,7 +1002,9 @@ impl MobError {
     /// own domain vocabularies rather than re-matching the variant list.
     pub fn failure_class(&self) -> MobFailureClass {
         match self {
-            Self::SharedRetirementFailure(error) => error.failure_class(),
+            Self::SharedRetirementFailure(error) | Self::SharedLifecycleFailure(error) => {
+                error.failure_class()
+            }
             Self::MobNotFound(_)
             | Self::ProfileNotFound(_)
             | Self::MemberNotFound(_)
@@ -1011,6 +1046,7 @@ impl MobError {
             | Self::RetirementInProgress { .. }
             | Self::MemberRetirementInProgress { .. }
             | Self::MemberRetirementAdmissionPending { .. }
+            | Self::LifecycleOperationAdmissionPending { .. }
             | Self::SupervisorProtocolUpgradeRequired { .. }
             | Self::DirectMemberAdoptionPending { .. }
             | Self::RuntimeEffectRefused { .. } => MobFailureClass::RuntimeRejected,
@@ -1034,7 +1070,9 @@ impl MobError {
     ///   `mob_rotate_supervisor_error` renderer and richer data envelope.
     pub fn wire_detail(&self) -> Option<WireMobErrorDetail> {
         match self {
-            Self::SharedRetirementFailure(error) => error.wire_detail(),
+            Self::SharedRetirementFailure(error) | Self::SharedLifecycleFailure(error) => {
+                error.wire_detail()
+            }
             Self::ScopeDenied(denial) => Some(WireMobErrorDetail::ScopeDenied(
                 WireScopeDeniedDetail::from(denial),
             )),
